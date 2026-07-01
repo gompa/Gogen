@@ -147,9 +147,6 @@ func (e *Executor) searchWithRipgrep(ctx context.Context, searchRoot, relPrefix,
 }
 
 func prefixRelPaths(body, relPrefix string) string {
-	if relPrefix == "" {
-		return body
-	}
 	var b strings.Builder
 	for _, line := range strings.Split(body, "\n") {
 		if line == "" {
