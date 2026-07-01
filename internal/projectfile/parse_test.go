@@ -139,7 +139,7 @@ func TestDiscoverPriority(t *testing.T) {
 	if !ok {
 		t.Fatal("expected config file")
 	}
-	if !strings.HasSuffix(path, ".gogen/gogen.md") {
+	if !strings.HasSuffix(path, filepath.Join(".gogen", "gogen.md")) {
 		t.Fatalf("got %q", path)
 	}
 }
