@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      - name: Install cross-compilers
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+      - name: Build linux/amd64 (CGO)
+        run: GOOS=linux GOARCH=amd64 go build -o gogen-linux-amd64 -ldflags="-s -w" .
+      - name: Build linux/arm64 (CGO)
+        run: CC=aarch64-linux-gnu-gcc GOOS=linux GOARCH=arm64 go build -o gogen-linux-arm64 -ldflags="-s -w" .
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux
+          path: gogen-linux-*
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      - name: Build darwin/amd64 (CGO)
+        run: GOOS=darwin GOARCH=amd64 go build -o gogen-darwin-amd64 -ldflags="-s -w" .
+      - name: Build darwin/arm64 (CGO)
+        run: GOOS=darwin GOARCH=arm64 go build -o gogen-darwin-arm64 -ldflags="-s -w" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: gogen-darwin-*
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      - name: Install mingw
+        run: choco install mingw -y
+      - name: Build windows/amd64 (CGO — full tree-sitter)
+        run: GOOS=windows GOARCH=amd64 CGO_ENABLED=1 go build -o gogen-windows-amd64.exe -ldflags="-s -w" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: gogen-windows-amd64.exe
+
+  release:
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: Collect binaries
+        run: |
+          mv linux/gogen-linux-* .
+          mv macos/gogen-darwin-* .
+          mv windows/gogen-windows-amd64.exe .
+          rm -rf linux macos windows
+      - name: Generate checksums
+        run: sha256sum gogen-* > checksums.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            gogen-linux-amd64
+            gogen-linux-arm64
+            gogen-darwin-amd64
+            gogen-darwin-arm64
+            gogen-windows-amd64.exe
+            checksums.txt
+          generate_release_notes: true

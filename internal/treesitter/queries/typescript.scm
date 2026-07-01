@@ -1,0 +1,6 @@
+(function_declaration name: (identifier) @name.function)
+(class_declaration name: (type_identifier) @name.class)
+(method_definition name: (property_identifier) @name.method)
+(method_definition name: (identifier) @name.method)
+(interface_declaration name: (type_identifier) @name.interface)
+(type_alias_declaration name: (type_identifier) @name.type)

@@ -1,0 +1,5 @@
+(method_declaration name: (identifier) @name.method)
+(class_declaration name: (identifier) @name.class)
+(struct_declaration name: (identifier) @name.struct)
+(interface_declaration name: (identifier) @name.interface)
+(enum_declaration name: (identifier) @name.enum)

@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: Install tools + cross-compilers
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ripgrep gcc-aarch64-linux-gnu
+      - name: Build linux/amd64
+        run: GOOS=linux GOARCH=amd64 go build -o gogen-linux-amd64 -ldflags="-s -w" .
+      - name: Test
+        run: go test -v -race ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Build linux/arm64
+        run: CC=aarch64-linux-gnu-gcc GOOS=linux GOARCH=arm64 go build -o gogen-linux-arm64 -ldflags="-s -w" .
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: Install ripgrep
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: which rg >/dev/null 2>&1 || brew install ripgrep
+      - name: Build darwin/amd64
+        run: GOOS=darwin GOARCH=amd64 go build -o gogen-darwin-amd64 -ldflags="-s -w" .
+      - name: Build darwin/arm64
+        run: GOOS=darwin GOARCH=arm64 go build -o gogen-darwin-arm64 -ldflags="-s -w" .
+      - name: Test
+        run: go test -v -race ./...
+      - name: Vet
+        run: go vet ./...
+
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: Install mingw + ripgrep
+        run: choco install mingw ripgrep -y
+      - name: Build windows/amd64
+        run: GOOS=windows GOARCH=amd64 CGO_ENABLED=1 go build -o gogen-windows-amd64.exe -ldflags="-s -w" .
+      - name: Test
+        run: go test -v -race ./...
+      - name: Vet
+        run: go vet ./...
