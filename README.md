@@ -105,7 +105,7 @@ Settings load from **environment variables**, **`.gogen/gogen.conf`** (pure YAML
 
 ### Project config (`.gogen/gogen.conf`)
 
-Machine settings in pure YAML — no front-matter delimiters:
+YAML config
 
 ```yaml
 command_safety: blocklist
