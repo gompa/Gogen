@@ -24,6 +24,7 @@ type file struct {
 	WorkingDir string        `json:"workingDir"`
 	Model      string        `json:"model"`
 	Mode       string        `json:"mode"`
+	Label      string        `json:"label,omitempty"`
 	Messages   []llm.Message `json:"messages"`
 }
 
@@ -67,6 +68,7 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 		WorkingDir: snap.WorkingDir,
 		Model:      snap.Model,
 		Mode:       snap.Mode,
+		Label:      snap.Label,
 		Messages:   snap.Messages,
 	}
 	data, err := json.MarshalIndent(out, "", "  ")
@@ -93,6 +95,7 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 		WorkingDir: f.WorkingDir,
 		Model:      f.Model,
 		Mode:       f.Mode,
+		Label:      f.Label,
 		Messages:   f.Messages,
 	}, nil
 }
@@ -127,7 +130,7 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 			ID:           id,
 			UpdatedAt:    f.Updated.UTC().Format(time.RFC3339),
 			MessageCount: len(f.Messages),
-			Label:        llm.SessionLabel(f.Messages, llm.DefaultSessionLabelMaxLen),
+			Label:        sessionLabel(f.Messages, f.Label),
 		}
 		out = append(out, entry)
 	}
@@ -170,6 +173,13 @@ func validateSessionID(id string) error {
 		return fmt.Errorf("invalid session id")
 	}
 	return nil
+}
+
+func sessionLabel(messages []llm.Message, label string) string {
+	if label != "" {
+		return label
+	}
+	return llm.SessionLabel(messages, llm.DefaultSessionLabelMaxLen)
 }
 
 // NewID generates a new session id.

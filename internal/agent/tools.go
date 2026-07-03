@@ -269,5 +269,192 @@ func BuiltinTools() []llm.Tool {
 				"required": []string{"url"},
 			},
 		},
+		{
+			Name:        "git_commit",
+			Description: "Create a git commit with the given message. Requires files to be staged first (use git_stage).",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"message": map[string]interface{}{"type": "string", "description": "Commit message"},
+				},
+				"required": []string{"message"},
+			},
+		},
+		{
+			Name:        "git_stage",
+			Description: "Stage files for commit. When paths is empty or omitted, stages all changes (git add -A).",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"paths": map[string]interface{}{
+						"type":        "array",
+						"items":       map[string]interface{}{"type": "string"},
+						"description": "Optional file paths to stage (empty = stage all)",
+					},
+				},
+			},
+		},
+		{
+			Name:        "git_branch",
+			Description: "List, create, or switch git branches. When name is provided and create=true, creates a new branch. When name is provided and create=false, switches to it. When name is empty, lists all branches.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"name":   map[string]interface{}{"type": "string", "description": "Branch name (omit to list)"},
+					"create": map[string]interface{}{"type": "boolean", "description": "If true, create a new branch; if false and name given, switch to it"},
+				},
+			},
+		},
+		{
+			Name:        "git_stash",
+			Description: "Push changes to the stash (or pop when pop=true).",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"message": map[string]interface{}{"type": "string", "description": "Optional stash message"},
+					"pop":     map[string]interface{}{"type": "boolean", "description": "If true, pop the most recent stash instead of pushing"},
+				},
+			},
+		},
+		{
+			Name:        "git_stash_list",
+			Description: "List all stash entries.",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+		},
+		{
+			Name:        "git_show",
+			Description: "Show a specific commit or range as a unified diff. When ref is empty, shows HEAD.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"ref": map[string]interface{}{"type": "string", "description": "Git ref (commit hash, tag, or range; empty = HEAD)"},
+				},
+			},
+		},
+		{
+			Name:        "copy_file",
+			Description: "Copy a file within the working directory. Creates destination directories as needed.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"source":      map[string]interface{}{"type": "string", "description": "Source file path"},
+					"destination": map[string]interface{}{"type": "string", "description": "Destination file path"},
+				},
+				"required": []string{"source", "destination"},
+			},
+		},
+		{
+			Name:        "todo_add",
+			Description: "Add a new todo item to the task tracker.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"text": map[string]interface{}{"type": "string", "description": "Todo text"},
+				},
+				"required": []string{"text"},
+			},
+		},
+		{
+			Name:        "todo_list",
+			Description: "List all todo items with their status.",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+		},
+		{
+			Name:        "todo_done",
+			Description: "Mark a todo item as completed by its ID.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"id": map[string]interface{}{"type": "integer", "description": "Todo item ID"},
+				},
+				"required": []string{"id"},
+			},
+		},
+		{
+			Name:        "todo_remove",
+			Description: "Remove a todo item entirely by its ID.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"id": map[string]interface{}{"type": "integer", "description": "Todo item ID"},
+				},
+				"required": []string{"id"},
+			},
+		},
+		{
+			Name:        "todo_clear_done",
+			Description: "Clear all completed todo items.",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+		},
+		{
+			Name:        "find_file",
+			Description: "Find files by name (case-insensitive substring match). Faster than glob_files when you know part of the filename but not the path.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"name":  map[string]interface{}{"type": "string", "description": "Filename or substring to match"},
+					"path":  map[string]interface{}{"type": "string", "description": "Optional subdirectory to search under"},
+					"limit": map[string]interface{}{"type": "integer", "description": "Max results (default 50)"},
+				},
+				"required": []string{"name"},
+			},
+		},
+		{
+			Name:        "find_definition",
+			Description: "Find which file defines a symbol (cross-file go-to-definition). Scans supported languages via tree-sitter when available; falls back to text search.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"symbol": map[string]interface{}{"type": "string", "description": "Symbol name to find (function, type, variable, etc.)"},
+					"path":   map[string]interface{}{"type": "string", "description": "Optional subdirectory to search under"},
+					"glob":   map[string]interface{}{"type": "string", "description": "Optional glob filter, e.g. *.go"},
+				},
+				"required": []string{"symbol"},
+			},
+		},
+		{
+			Name:        "session_rename",
+			Description: "Rename or label the current session for easier identification when listing sessions.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"label": map[string]interface{}{"type": "string", "description": "New session label"},
+				},
+				"required": []string{"label"},
+			},
+		},
+		{
+			Name:        "session_usage",
+			Description: "Show accumulated token usage for the session (turns, tokens in/out).",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+		},
+		{
+			Name:        "context_pin_last",
+			Description: "Pin the most recent user message so it survives context compaction. Useful to preserve critical context like requirements or error messages.",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+		},
+		{
+			Name:        "context_pins",
+			Description: "List all pinned messages that will survive context compaction.",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+		},
 	}
 }

@@ -11,6 +11,7 @@ type SessionSnapshot struct {
 	WorkingDir string
 	Model      string
 	Mode       string
+	Label      string
 	Messages   []llm.Message
 }
 
@@ -34,6 +35,7 @@ type SessionInfo struct {
 // RestoreSession loads messages, mode, and model from a snapshot.
 func (a *Agent) RestoreSession(ctx context.Context, snap SessionSnapshot) {
 	a.Messages = append([]llm.Message(nil), snap.Messages...)
+	a.SessionLabel = snap.Label
 	if m, ok := ParseMode(snap.Mode); ok {
 		a.Mode = m
 	}
@@ -56,4 +58,11 @@ func (a *Agent) RestoreSession(ctx context.Context, snap SessionSnapshot) {
 			a.Context.RefreshAfterModelChange(ctx)
 		}
 	}
+}
+
+// RenameSession sets a user-visible label for the current session and persists it.
+func (a *Agent) RenameSession(label string) (string, error) {
+	a.SessionLabel = label
+	a.persistSession()
+	return "Session label set to " + label, nil
 }

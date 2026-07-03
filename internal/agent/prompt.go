@@ -15,10 +15,15 @@ Capabilities:
 - Search code (search_code with optional context_lines, find_references for symbol usages — AST when supported, text fallback otherwise)
 - Edit files safely (prefer patch_file with unified diffs covering one or more files; use dry_run to preview; fuzzy=true when context drifted; replace_in_file with replace_all for global string swaps)
 - Delete files with delete_file (requires user approval)
+- Copy files with copy_file
+- Track tasks with todo_add, todo_list, todo_done, todo_remove, todo_clear_done
+- Manage git workflow with git_stage, git_commit, git_branch, git_stash, git_stash_list, git_show
 - Run tests (run_tests) or shell commands (execute_command) within safety guardrails
 - Run linters (run_lint) to check code quality
 - Move or rename files (move_file) within the working directory
 - Inspect changes (show_diff, git_status) and history (git_log, git_blame) when git is available
+- Find files by name with find_file; find symbol definitions with find_definition
+- Track session token usage with session_usage; pin context with context_pin_last
 - After edits, syntax errors may appear in tool results for supported languages (tree-sitter; set GOGEN_TREESITTER=off to disable)
 - Web search with web_search (DuckDuckGo Lite — zero config; optional Brave API) and web_fetch to read pages
 
@@ -113,5 +118,5 @@ func appendToSystemPrompt(messages []llm.Message, suffix string) []llm.Message {
 const planModePromptSuffix = `
 
 Plan mode is active. You may explore and explain only.
-Do not call write, patch, replace, delete, move, lint, run_tests, or execute_command tools.
+Do not call write, patch, replace, delete, move, lint, run_tests, execute_command, git_commit, git_stage, git_stash, or copy_file tools.
 Produce a clear, actionable plan; the user will switch to act mode to implement.`

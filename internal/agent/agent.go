@@ -22,10 +22,14 @@ type Agent struct {
 	ProjectFilePath   string
 	TestCommand       string
 	LintCommand       string
+	TodoManager       *TodoManager
 	projectProfile    string
 	MCPRegistry       MCPToolRegistry
 	SessionStore      SessionPersister
 	SessionID         string
+	SessionLabel      string
+	UsageAccum        UsageAccumulator
+	PinManager        *PinManager
 	lastTurnUsage     *llm.Usage
 }
 
@@ -52,6 +56,22 @@ func (a *Agent) SetMCPRegistry(reg MCPToolRegistry) {
 	a.MCPRegistry = reg
 }
 
+// pinLastUser pins the most recent user message so it survives compaction.
+func (a *Agent) pinLastUser() error {
+	if a.PinManager == nil {
+		return fmt.Errorf("pin manager is not initialized")
+	}
+	a.PinManager.PinLastUser(a.Messages)
+	return nil
+}
+
+func (a *Agent) listPins() string {
+	if a.PinManager == nil {
+		return "Pin manager is not initialized"
+	}
+	return a.PinManager.ListPins(a.Messages)
+}
+
 func (a *Agent) llmTools() []llm.Tool {
 	tools := BuiltinTools()
 	if a.MCPRegistry != nil {
@@ -68,6 +88,7 @@ func (a *Agent) persistSession() {
 		WorkingDir: a.WorkingDir,
 		Model:      a.CurrentModel(),
 		Mode:       a.Mode.String(),
+		Label:      a.SessionLabel,
 		Messages:   append([]llm.Message(nil), a.Messages...),
 	})
 }
@@ -202,6 +223,7 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 			return "", err
 		}
 		a.recordTurnUsage(result.Usage)
+		a.UsageAccum.Add(result.Usage)
 
 		if len(result.ToolCalls) == 0 && result.Content != "" {
 			finishStreamUI(h)
@@ -533,6 +555,75 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error
 	case "git_status":
 		subpath, _ := stringArgOptional(tc.Args, "path")
 		return a.Executor.GitStatus(ctx, subpath)
+	case "git_commit":
+		message, err := stringArg(tc.Args, "message")
+		if err != nil {
+			return "", err
+		}
+		return a.Executor.GitCommit(ctx, message)
+	case "git_stage":
+		paths, _ := stringSliceArg(tc.Args, "paths")
+		return a.Executor.GitStage(ctx, paths)
+	case "git_branch":
+		name, _ := stringArgOptional(tc.Args, "name")
+		create, _ := boolArgOptional(tc.Args, "create")
+		return a.Executor.GitBranch(ctx, name, create)
+	case "git_stash":
+		message, _ := stringArgOptional(tc.Args, "message")
+		pop, _ := boolArgOptional(tc.Args, "pop")
+		return a.Executor.GitStash(ctx, message, pop)
+	case "git_stash_list":
+		return a.Executor.GitStashList(ctx)
+	case "git_show":
+		ref, _ := stringArgOptional(tc.Args, "ref")
+		return a.Executor.GitDiffShow(ctx, ref)
+	case "copy_file":
+		src, err := stringArg(tc.Args, "source")
+		if err != nil {
+			return "", err
+		}
+		dst, err := stringArg(tc.Args, "destination")
+		if err != nil {
+			return "", err
+		}
+		return a.Executor.CopyFile(src, dst)
+	case "todo_add":
+		text, err := stringArg(tc.Args, "text")
+		if err != nil {
+			return "", err
+		}
+		if a.TodoManager == nil {
+			return "", fmt.Errorf("todo manager is not initialized")
+		}
+		return a.TodoManager.AddTodo(text)
+	case "todo_list":
+		if a.TodoManager == nil {
+			return "", fmt.Errorf("todo manager is not initialized")
+		}
+		return a.TodoManager.ListTodos(), nil
+	case "todo_done":
+		id, err := intArgOptional(tc.Args, "id")
+		if err != nil || id == 0 {
+			return "", fmt.Errorf("missing required argument %q", "id")
+		}
+		if a.TodoManager == nil {
+			return "", fmt.Errorf("todo manager is not initialized")
+		}
+		return a.TodoManager.DoneTodo(id)
+	case "todo_remove":
+		id, err := intArgOptional(tc.Args, "id")
+		if err != nil || id == 0 {
+			return "", fmt.Errorf("missing required argument %q", "id")
+		}
+		if a.TodoManager == nil {
+			return "", fmt.Errorf("todo manager is not initialized")
+		}
+		return a.TodoManager.RemoveTodo(id)
+	case "todo_clear_done":
+		if a.TodoManager == nil {
+			return "", fmt.Errorf("todo manager is not initialized")
+		}
+		return a.TodoManager.ClearDoneTodos()
 	case "list_definitions":
 		path, err := stringArg(tc.Args, "path")
 		if err != nil {
@@ -559,6 +650,34 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error
 			return "", err
 		}
 		return a.Executor.WebFetch(ctx, rawURL, maxBytes)
+	case "find_file":
+		name, err := stringArg(tc.Args, "name")
+		if err != nil {
+			return "", err
+		}
+		subpath, _ := stringArgOptional(tc.Args, "path")
+		limit, _ := intArgOptional(tc.Args, "limit")
+		return a.Executor.FindFile(name, subpath, limit)
+	case "find_definition":
+		symbol, err := stringArg(tc.Args, "symbol")
+		if err != nil {
+			return "", err
+		}
+		subpath, _ := stringArgOptional(tc.Args, "path")
+		glob, _ := stringArgOptional(tc.Args, "glob")
+		return a.Executor.FindDefinition(ctx, symbol, subpath, glob)
+	case "session_rename":
+		label, err := stringArg(tc.Args, "label")
+		if err != nil {
+			return "", err
+		}
+		return a.RenameSession(label)
+	case "session_usage":
+		return a.UsageAccum.Format(), nil
+	case "context_pin_last":
+		return "Pinned the last user message", a.pinLastUser()
+	case "context_pins":
+		return a.listPins(), nil
 	default:
 		return "", fmt.Errorf("unknown tool: %s", tc.Name)
 	}
