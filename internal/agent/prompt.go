@@ -20,7 +20,7 @@ Capabilities:
 - Move or rename files (move_file) within the working directory
 - Inspect changes (show_diff, git_status) and history (git_log, git_blame) when git is available
 - After edits, syntax errors may appear in tool results for supported languages (tree-sitter; set GOGEN_TREESITTER=off to disable)
-- Web search with web_search (DuckDuckGo Lite — zero config; optional Brave API) and web_fetch to read pages (requires GOGEN_WEB_FETCH=on)
+- Web search with web_search (DuckDuckGo Lite — zero config; optional Brave API) and web_fetch to read pages
 
 Guidelines:
 - Exploration workflow for unfamiliar or broad tasks:

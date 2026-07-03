@@ -259,7 +259,7 @@ func BuiltinTools() []llm.Tool {
 		},
 		{
 			Name:        "web_fetch",
-			Description: "Fetch and extract text content from a URL. Use for reading documentation, API references, or any web page. HTML is stripped to plain text. Requires GOGEN_WEB_FETCH=on to enable.",
+			Description: "Fetch and extract text content from a URL. Use for reading documentation, API references, or any web page. HTML is stripped to plain text. Set GOGEN_WEB_FETCH=off to disable.",
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{

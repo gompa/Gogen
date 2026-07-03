@@ -73,7 +73,7 @@ func ConfigureWebFetch(enabled bool, mode string, allowedDomains string) {
 
 func (e *Executor) WebFetch(ctx context.Context, rawURL string, maxBytes int) (string, error) {
 	if !webFetchEnabled() {
-		return "", fmt.Errorf("web_fetch is disabled (set GOGEN_WEB_FETCH=on to enable)")
+		return "", fmt.Errorf("web_fetch is disabled (set GOGEN_WEB_FETCH=on to re-enable)")
 	}
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {

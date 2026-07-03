@@ -30,7 +30,7 @@ const (
 // when GOGEN_WEB_SEARCH_API_KEY and GOGEN_WEB_SEARCH_BACKEND=brave are set.
 func (e *Executor) WebSearch(ctx context.Context, query string, maxResults int) (string, error) {
 	if !webFetchEnabled() {
-		return "", fmt.Errorf("web_search is disabled (set GOGEN_WEB_FETCH=on or GOGEN_WEB_SEARCH=on to enable)")
+		return "", fmt.Errorf("web_search is disabled (set GOGEN_WEB_FETCH=on or GOGEN_WEB_SEARCH=on to re-enable)")
 	}
 	query = strings.TrimSpace(query)
 	if query == "" {
