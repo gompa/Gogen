@@ -26,6 +26,7 @@ const (
 	keyRight
 	keyEnter
 	keyBackspace
+	keyDelete
 	keyTab
 	keyCtrlC
 	keyCtrlD
@@ -34,6 +35,13 @@ const (
 	keyPasteEnd
 	keyWordLeft
 	keyWordRight
+	keyHome
+	keyEnd
+	keyCtrlA
+	keyCtrlE
+	keyCtrlK
+	keyCtrlU
+	keyCtrlW
 )
 
 func readByte(r io.Reader) (byte, error) {
@@ -50,10 +58,20 @@ func parseKey(r io.Reader) (keyKind, rune, error) {
 	switch b {
 	case '\r', '\n':
 		return keyEnter, 0, nil
+	case 1:
+		return keyCtrlA, 0, nil
 	case 3:
 		return keyCtrlC, 0, nil
 	case 4:
 		return keyCtrlD, 0, nil
+	case 5:
+		return keyCtrlE, 0, nil
+	case 11:
+		return keyCtrlK, 0, nil
+	case 21:
+		return keyCtrlU, 0, nil
+	case 23:
+		return keyCtrlW, 0, nil
 	case 127, 8:
 		return keyBackspace, 0, nil
 	case '\t':
@@ -87,7 +105,22 @@ func parseKey(r io.Reader) (keyKind, rune, error) {
 			if string(params) == "201~" {
 				return keyPasteEnd, 0, nil
 			}
+			// Delete key sends \x1b[3~
+			if string(params) == "3~" {
+				return keyDelete, 0, nil
+			}
+			// Home (old \x1b[1~) and End (old \x1b[4~)
+			if string(params) == "1~" {
+				return keyHome, 0, nil
+			}
+			if string(params) == "4~" {
+				return keyEnd, 0, nil
+			}
 			last := params[len(params)-1]
+			// Other ~ sequences (e.g. CSI <n>~ for n > 3): ignore.
+			if last == '~' {
+				return keyIgnore, 0, nil
+			}
 			// Modifier 5 = Ctrl. Handles both CSI formats:
 			//   \x1b[1;5D  (xterm, most terminals)
 			//   \x1b[5D    (Linux console, some terminals)
@@ -114,6 +147,10 @@ func parseKey(r io.Reader) (keyKind, rune, error) {
 					return keyWordLeft, 0, nil
 				}
 				return keyLeft, 0, nil
+			case 'H':
+				return keyHome, 0, nil
+			case 'F':
+				return keyEnd, 0, nil
 			}
 			return keyIgnore, 0, nil
 		case 'O':
@@ -327,6 +364,47 @@ func readLineTTY(prompt string, complete lineCompleter) (string, error) {
 		}
 	}
 
+	deleteAfterCursor := func() {
+		if cursor < len(buf) {
+			buf = append(buf[:cursor], buf[cursor+1:]...)
+			redraw()
+		}
+	}
+
+	deleteWordBeforeCursor := func() {
+		if cursor == 0 {
+			return
+		}
+		// Whitespace-based backwards word deletion (readline Ctrl+W).
+		i := cursor
+		// Skip whitespace immediately left of cursor.
+		for i > 0 && buf[i-1] == ' ' {
+			i--
+		}
+		// Skip non-whitespace (the word).
+		for i > 0 && buf[i-1] != ' ' {
+			i--
+		}
+		buf = append(buf[:i], buf[cursor:]...)
+		cursor = i
+		redraw()
+	}
+
+	killToEnd := func() {
+		if cursor < len(buf) {
+			buf = buf[:cursor]
+			redraw()
+		}
+	}
+
+	killToStart := func() {
+		if cursor > 0 {
+			buf = buf[cursor:]
+			cursor = 0
+			redraw()
+		}
+	}
+
 	setLine := func(line string) {
 		buf = []rune(line)
 		cursor = len(buf)
@@ -363,8 +441,27 @@ func readLineTTY(prompt string, complete lineCompleter) (string, error) {
 				fmt.Println()
 				return "", io.EOF
 			}
+			deleteAfterCursor()
 		case keyBackspace:
 			deleteBeforeCursor()
+		case keyDelete:
+			deleteAfterCursor()
+		case keyHome, keyCtrlA:
+			if cursor > 0 {
+				cursor = 0
+				redraw()
+			}
+		case keyEnd, keyCtrlE:
+			if cursor < len(buf) {
+				cursor = len(buf)
+				redraw()
+			}
+		case keyCtrlW:
+			deleteWordBeforeCursor()
+		case keyCtrlK:
+			killToEnd()
+		case keyCtrlU:
+			killToStart()
 		case keyLeft, keyWordLeft:
 			if cursor > 0 {
 				if kind == keyWordLeft {
