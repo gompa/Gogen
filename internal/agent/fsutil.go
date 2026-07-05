@@ -147,8 +147,14 @@ func fixDoubledWorkingDirPath(absPath, workingDir string) (string, bool) {
 	}
 
 	candidate := filepath.Clean(string(filepath.Separator) + suffixSlash)
-	if _, err := os.Stat(candidate); err != nil {
-		return "", false
+	_, statErr := os.Stat(candidate)
+	if statErr != nil {
+		// Allow new files: check if the parent directory exists instead.
+		_, perr := os.Stat(filepath.Dir(candidate))
+		if perr != nil {
+			return "", false
+		}
+		return candidate, true
 	}
 	return candidate, true
 }

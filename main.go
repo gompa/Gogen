@@ -182,6 +182,7 @@ func main() {
 func applyRuntimeConfig(cfg *config.Config) {
 	treesitter.Configure(cfg.TreeSitterEnabled(), cfg.TreeSitterLangs)
 	agent.ConfigureWebFetch(cfg.WebFetchEnabled(), cfg.WebFetchMode, cfg.WebAllowedDomains)
+	agent.ConfigureWebSearch(cfg.WebSearchBackend, cfg.WebSearchAPIKey)
 	if cfg.DebugLog != "" || cfg.DebugSession != "" {
 		debuglog.Configure(cfg.DebugLog, cfg.DebugSession)
 	}

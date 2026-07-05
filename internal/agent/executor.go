@@ -81,15 +81,6 @@ func (e *Executor) ReadFileRange(path string, offset, limit int, search string) 
 		}
 		return "", fmt.Errorf("path is a directory containing: %s. Use list_files or read_file with a specific file path", strings.Join(names, ", "))
 	}
-	// Detect symlinks and binary files early so the LLM gets a
-	// helpful message instead of a cryptic error or garbage output.
-	if info.Mode()&os.ModeSymlink != 0 {
-		target, err := os.Readlink(secure)
-		if err != nil {
-			target = "(unknown)"
-		}
-		return "", fmt.Errorf("path is a symlink → %s", target)
-	}
 	if info.Mode().IsRegular() && info.Size() > 0 {
 		head := make([]byte, 512)
 		f, err := os.Open(secure)

@@ -12,7 +12,7 @@ GoGen is a self-hosted, terminal or web-based coding assistant that can explore,
 - **Command Execution** — Run shell commands with configurable safety modes (blocklist / allowlist / off)
 - **Human-in-the-Loop** — Requires explicit approval for destructive actions (file deletes)
 - **Context Management** — Auto-compacts conversation history when nearing token limits to stay within model context windows
-- **Project Config** — Separate `.gogen/gogen.conf` (YAML) for settings and `.gogen/gogen.md` (or `GOGEN.md`) for guidelines. Precedence: **env > .conf > CLI flags > defaults**.
+- **Project Config** — Separate `.gogen/gogen.conf` (YAML) for settings and `.gogen/gogen.md` (or `GOGEN.md`) for guidelines. Precedence: **env > CLI flags > .conf > defaults**.
 - **Plan Mode** — Read-only exploration via `/plan` (CLI) or web toggle; use `/act` to implement
 - **MCP Client** — Connect stdio MCP servers for extended tools (`mcp_<server>_<tool>`)
 - **Session Persistence** — Auto-save/resume conversations under `.gogen/sessions/` (set `GOGEN_SESSION_PERSIST=off` to disable)
@@ -101,7 +101,7 @@ While in CLI mode:
 
 ## Configuration
 
-Settings load from **environment variables**, **`.gogen/gogen.conf`** (pure YAML), then CLI flags. Precedence: **env > .conf > flags > defaults**.
+Settings load from **CLI flags**, **environment variables**, and **`.gogen/gogen.conf`** (pure YAML). Precedence: **env > CLI flags > .conf > defaults**.
 
 ### Project config (`.gogen/gogen.conf`)
 

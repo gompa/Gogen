@@ -8,12 +8,18 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/html"
+)
+
+var (
+	webSearchMu      sync.RWMutex
+	webSearchBackend string
+	webSearchAPIKey  string
 )
 
 const (
@@ -25,6 +31,14 @@ const (
 	// triggering aggressive bot detection on the html.duckduckgo.com endpoint.
 	ddgUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 )
+
+// ConfigureWebSearch applies runtime web search settings from merged config.
+func ConfigureWebSearch(backend, apiKey string) {
+	webSearchMu.Lock()
+	defer webSearchMu.Unlock()
+	webSearchBackend = strings.ToLower(strings.TrimSpace(backend))
+	webSearchAPIKey = strings.TrimSpace(apiKey)
+}
 
 // WebSearch runs a search query using DuckDuckGo HTML by default, or Brave API
 // when GOGEN_WEB_SEARCH_API_KEY and GOGEN_WEB_SEARCH_BACKEND=brave are set.
@@ -43,10 +57,14 @@ func (e *Executor) WebSearch(ctx context.Context, query string, maxResults int) 
 		maxResults = 20
 	}
 
-	backend := strings.ToLower(strings.TrimSpace(os.Getenv("GOGEN_WEB_SEARCH_BACKEND")))
+	webSearchMu.RLock()
+	backend := webSearchBackend
+	apiKey := webSearchAPIKey
+	webSearchMu.RUnlock()
+
 	if backend == "brave" {
-		if key := strings.TrimSpace(os.Getenv("GOGEN_WEB_SEARCH_API_KEY")); key != "" {
-			return searchBrave(ctx, query, maxResults, key)
+		if apiKey != "" {
+			return searchBrave(ctx, query, maxResults, apiKey)
 		}
 	}
 	return searchDuckDuckGoHTML(ctx, query, maxResults)
