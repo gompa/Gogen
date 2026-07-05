@@ -134,3 +134,77 @@ func TestBuildTestCommandReplacesGoEllipsis(t *testing.T) {
 		t.Fatalf("got %q want %q", got, want)
 	}
 }
+
+func TestPatchFileCRLFLineEndings(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.go")
+	original := "package main\n\nfunc main() {\n}\n"
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Diff uses CRLF line endings, as might come from a Windows LLM response.
+	diff := "--- a/main.go\r\n" +
+		"+++ b/main.go\r\n" +
+		"@@ -1,4 +1,5 @@\r\n" +
+		" package main\r\n" +
+		" \r\n" +
+		"+// crlf\r\n" +
+		" func main() {\r\n" +
+		" }\r\n"
+
+	exec := NewExecutor(dir)
+	exec.RequireDeleteApproval = false
+	_, err := exec.PatchFile(context.Background(), diff, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "// crlf") {
+		t.Fatalf("CRLF patch not applied: %q", got)
+	}
+}
+
+func TestPatchFileTrailingWhitespaceTolerance(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.go")
+	original := "package main\n\nfunc main() {\n\t// code\n}\n"
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Diff context lines have trailing spaces (common LLM artifact).
+	diff := "" +
+		"--- a/main.go\n" +
+		"+++ b/main.go\n" +
+		"@@ -2,3 +2,4 @@\n" +
+		" \n" +
+		" func main() {  \n" + // trailing spaces
+		" \t// code  \n" + // leading space for context, trailing spaces artifact
+		"+\t// new\n" +
+		" }\n"
+
+	// Should fail without fuzzy (exact mismatch on trailing spaces).
+	exec := NewExecutor(dir)
+	exec.RequireDeleteApproval = false
+	_, err := exec.PatchFile(context.Background(), diff, false, false)
+	if err == nil {
+		t.Fatal("expected strict patch to fail when context has trailing whitespace")
+	}
+
+	// Should succeed with fuzzy (whitespace-tolerant matching).
+	_, err = exec.PatchFile(context.Background(), diff, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "// new") {
+		t.Fatalf("fuzzy whitespace-tolerant patch not applied: %q", got)
+	}
+}

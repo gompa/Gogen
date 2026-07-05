@@ -196,6 +196,9 @@ func normalizePatchPath(name string) string {
 }
 
 func parseUnifiedDiff(diff string) ([]patchFile, error) {
+	// Normalize line endings: handle CRLF (Windows) and bare CR (legacy Mac).
+	diff = strings.ReplaceAll(diff, "\r\n", "\n")
+	diff = strings.ReplaceAll(diff, "\r", "\n")
 	lines := strings.Split(diff, "\n")
 	var files []patchFile
 	var current *patchFile
@@ -323,23 +326,46 @@ func applyPatchHunks(original []string, hunks []patchHunk, fuzzy bool) ([]string
 			return nil, fmt.Errorf("hunk %d/%d extends past end of file (line %d)", hi+1, len(hunks), h.oldStart+n-1)
 		}
 		actual := out[start:end]
-		if !linesEqual(actual, h.oldLines) {
-			if fuzzy {
-				if alt, ok := findHunkLocation(out, h.oldLines, start); ok {
-					start = alt
-					end = start + n
-					actual = out[start:end]
-				}
-			}
-			if !linesEqual(actual, h.oldLines) {
-				return nil, formatHunkMismatch(hi+1, len(hunks), start+1, actual, h.oldLines, fuzzy)
-			}
+		matched := findHunkMatch(out, h.oldLines, start, n, fuzzy)
+		if matched < 0 {
+			return nil, formatHunkMismatch(hi+1, len(hunks), start+1, actual, h.oldLines, fuzzy)
+		}
+		if matched != start {
+			start = matched
+			end = start + n
+			_ = actual // use the matched location; actual is reassigned below if needed
 		}
 		replacement := append([]string(nil), h.newLines...)
 		out = append(out[:start], append(replacement, out[end:]...)...)
 		lineDelta += len(replacement) - n
 	}
 	return out, nil
+}
+
+// findHunkMatch locates oldLines within lines. Returns the start index, or -1
+// if no match is found. When fuzzy is true, relocation and whitespace-tolerant
+// matching are attempted before giving up.
+func findHunkMatch(lines, oldLines []string, hint, n int, fuzzy bool) int {
+	end := hint + n
+	if end <= len(lines) && linesEqual(lines[hint:end], oldLines) {
+		return hint
+	}
+	if !fuzzy {
+		return -1
+	}
+	// Try exact relocation.
+	if alt, ok := findHunkLocation(lines, oldLines, hint); ok {
+		return alt
+	}
+	// Try whitespace-tolerant match at the current position.
+	if end <= len(lines) && linesEqualFuzzy(lines[hint:end], oldLines) {
+		return hint
+	}
+	// Try relocation with whitespace-tolerant matching.
+	if alt, ok := findHunkLocationFuzzy(lines, oldLines, hint); ok {
+		return alt
+	}
+	return -1
 }
 
 func formatHunkMismatch(hunkNum, hunkTotal, line int, actual, expected []string, fuzzy bool) error {
@@ -355,7 +381,7 @@ func formatHunkMismatch(hunkNum, hunkTotal, line int, actual, expected []string,
 		msg += fmt.Sprintf(": file has %q, patch expects %q", actual[firstDiff], expected[firstDiff])
 	}
 	if !fuzzy {
-		msg += " (try fuzzy=true or re-read the file and regenerate the diff)"
+		msg += " (fuzzy matching is disabled; re-read the file and regenerate the diff, or omit fuzzy=false)"
 	}
 	return fmt.Errorf("%s", msg)
 }
@@ -394,6 +420,52 @@ func absInt(n int) int {
 		return -n
 	}
 	return n
+}
+
+// linesEqualFuzzy is like linesEqual but normalises trailing whitespace
+// on each line. This tolerates LLM-generated diffs that add spurious
+// trailing spaces or tabs to context lines.
+func linesEqualFuzzy(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if strings.TrimRight(a[i], " \t") != strings.TrimRight(b[i], " \t") {
+			return false
+		}
+	}
+	return true
+}
+
+// findHunkLocationFuzzy is like findHunkLocation but uses
+// whitespace-tolerant line comparison.
+func findHunkLocationFuzzy(lines, oldLines []string, hint int) (int, bool) {
+	n := len(oldLines)
+	if n == 0 {
+		return hint, true
+	}
+	var matches []int
+	for i := 0; i <= len(lines)-n; i++ {
+		if linesEqualFuzzy(lines[i:i+n], oldLines) {
+			matches = append(matches, i)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return 0, false
+	case 1:
+		return matches[0], true
+	default:
+		best := matches[0]
+		bestDist := absInt(matches[0] - hint)
+		for _, m := range matches[1:] {
+			if d := absInt(m - hint); d < bestDist {
+				best = m
+				bestDist = d
+			}
+		}
+		return best, true
+	}
 }
 
 func linesEqual(a, b []string) bool {

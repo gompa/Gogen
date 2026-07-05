@@ -330,6 +330,18 @@ func boolArgOptional(args map[string]interface{}, key string) (bool, error) {
 	return b, nil
 }
 
+func boolArgDefault(args map[string]interface{}, key string, def bool) (bool, error) {
+	val, ok := args[key]
+	if !ok {
+		return def, nil
+	}
+	b, ok := val.(bool)
+	if !ok {
+		return false, fmt.Errorf("argument %q must be a boolean", key)
+	}
+	return b, nil
+}
+
 func intArgOptional(args map[string]interface{}, key string) (int, error) {
 	val, ok := args[key]
 	if !ok {
@@ -405,9 +417,15 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error
 	case "repo_overview":
 		return a.Executor.RepoOverview()
 	case "read_file":
-		path, err := stringArg(tc.Args, "path")
+		path, err := stringArgOptional(tc.Args, "file_path")
 		if err != nil {
 			return "", err
+		}
+		if path == "" {
+			path, err = stringArg(tc.Args, "path")
+			if err != nil {
+				return "", err
+			}
 		}
 		offset, err := intArgOptional(tc.Args, "offset")
 		if err != nil {
@@ -476,7 +494,7 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error
 		if err != nil {
 			return "", err
 		}
-		fuzzy, err := boolArgOptional(tc.Args, "fuzzy")
+		fuzzy, err := boolArgDefault(tc.Args, "fuzzy", true)
 		if err != nil {
 			return "", err
 		}

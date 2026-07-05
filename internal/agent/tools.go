@@ -45,12 +45,12 @@ func BuiltinTools() []llm.Tool {
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
-					"path":   map[string]interface{}{"type": "string", "description": "Path to file"},
+					"file_path": map[string]interface{}{"type": "string", "description": "Path to file"},
 					"offset": map[string]interface{}{"type": "integer", "description": "Optional 1-based starting line (default: 1)"},
 					"limit":  map[string]interface{}{"type": "integer", "description": "Optional max lines to read (default: all, capped at 10000)"},
 					"search": map[string]interface{}{"type": "string", "description": "Optional regex pattern; jumps to the first matching line and reads N lines around it"},
 				},
-				"required": []string{"path"},
+				"required": []string{"file_path"},
 			},
 		},
 		{
@@ -162,13 +162,13 @@ func BuiltinTools() []llm.Tool {
 		},
 		{
 			Name:        "patch_file",
-			Description: "Apply a unified diff to one or more files in a single call. Include multiple ---/+++/@@ sections for coordinated multi-file edits. Set dry_run=true to validate all files before writing; fuzzy=true to tolerate context drift.",
+			Description: "Apply a unified diff to one or more files in a single call. Include multiple ---/+++/@@ sections for coordinated multi-file edits. Set dry_run=true to validate all files before writing; fuzzy (default true) tolerates context drift and whitespace differences; set fuzzy=false to require exact context.",
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
 					"diff":    map[string]interface{}{"type": "string", "description": "Unified diff text (---/+++/@@ hunks; multiple files allowed)"},
 					"dry_run": map[string]interface{}{"type": "boolean", "description": "If true, validate the patch and report changes without applying"},
-					"fuzzy":   map[string]interface{}{"type": "boolean", "description": "If true, relocate hunks when exact line context no longer matches"},
+					"fuzzy":   map[string]interface{}{"type": "boolean", "description": "If false, require exact context match (default: true)"},
 				},
 				"required": []string{"diff"},
 			},

@@ -13,7 +13,7 @@ func SystemPrompt(workingDir string) string {
 Capabilities:
 - Explore files (repo_overview, list_files, glob_files, read_file with offset/limit, read_files, list_definitions)
 - Search code (search_code with optional context_lines, find_references for symbol usages — AST when supported, text fallback otherwise)
-- Edit files safely (prefer patch_file with unified diffs covering one or more files; use dry_run to preview; fuzzy=true when context drifted; replace_in_file with replace_all for global string swaps)
+- Edit files safely (prefer patch_file with unified diffs covering one or more files; use dry_run to preview; fuzzy is on by default to tolerate context drift; set fuzzy=false to require exact context; replace_in_file with replace_all for global string swaps)
 - Delete files with delete_file (requires user approval)
 - Copy files with copy_file
 - Track tasks with todo_add, todo_list, todo_done, todo_remove, todo_clear_done
@@ -32,7 +32,7 @@ Guidelines:
   1. repo_overview — top-level directories and file counts
   2. glob_files or search_code — find relevant paths or symbols by name
   3. list_definitions — outline functions/types in a file before editing; read_file for implementation detail
-  4. patch_file to edit; run_tests or show_diff to verify
+  4. patch_file to edit; run_tests or show_diff to verify (fuzzy matching is on by default)
 - Be token-efficient:
   - Use read_file offset/limit; batch related reads with read_files (max 20)
   - Prefer search_code, glob_files, and list_definitions over reading whole large files
@@ -43,7 +43,7 @@ Guidelines:
 - After edits, run run_tests or linters when appropriate and fix failures you introduce.
 - When patch_file fails:
   1. Re-read the target file (offset/limit if large)
-  2. Regenerate the diff with correct context; try dry_run=true first; try fuzzy=true if lines shifted
+  2. Regenerate the diff with correct context; try dry_run=true first; fuzzy matching is on by default
   3. After repeated failures on a small file, use write_file
 - When tests fail after your edit: read the failure output, inspect the test and code under test, fix minimally, re-run run_tests.
 - Never exfiltrate secrets, credentials, or unrelated private data.

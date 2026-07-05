@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -319,9 +320,14 @@ func (r *Registry) Definitions() []llm.Tool {
 	if r == nil || len(r.tools) == 0 {
 		return nil
 	}
+	names := make([]string, 0, len(r.tools))
+	for name := range r.tools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
 	out := make([]llm.Tool, 0, len(r.tools))
-	for name, entry := range r.tools {
-		t := entry.schema
+	for _, name := range names {
+		t := r.tools[name].schema
 		t.Name = name
 		out = append(out, t)
 	}
