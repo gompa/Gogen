@@ -288,11 +288,12 @@ func readLineTTY(prompt string, complete lineCompleter) (string, error) {
 	}
 
 	fmt.Print(linePrompt)
-	// prevCurRow tracks the cursor's row from the last redraw. Moving up
-	// prevCurRow rows always reaches the prompt row.  Embedded \x1b7/\x1b8
-	// in the display string handles cursor column positioning so there is
-	// no manual column math and no DECSC conflict with tab completion.
+	// prevCurRow tracks the cursor row offset (0-based) from the prompt
+	// line within the display.  prevTotalRows tracks the full display
+	// height from the previous redraw so we can erase old content even
+	// after the buffer shrinks.
 	prevCurRow := 0
+	prevTotalRows := 1
 
 	var buf []rune
 	cursor := 0
@@ -310,7 +311,7 @@ func readLineTTY(prompt string, complete lineCompleter) (string, error) {
 		cursorPos := len(promptRunes) + cursor
 		fullRunes := append(promptRunes, buf...)
 		var out strings.Builder
-		out.Grow(len(linePrompt) + len(buf)*2 + 12)
+		out.Grow(len(linePrompt)*3 + len(buf)*2 + 12)
 		for i, ch := range fullRunes {
 			if i == cursorPos {
 				out.WriteString("\x1b7")
@@ -326,24 +327,46 @@ func readLineTTY(prompt string, complete lineCompleter) (string, error) {
 		}
 		display := out.String()
 
-		// prevCurRow anchors us back to the prompt row.  \x1b7/\x1b8 in
-		// the display is self-contained per redraw — it does not need
-		// to survive across keystrokes.
-		if cols <= 0 {
-			fmt.Print("\r\x1b[2K" + display + "\x1b8")
-		} else {
-			if prevCurRow > 0 {
-				fmt.Printf("\x1b[%dA", prevCurRow)
-			}
-			fmt.Print("\r\x1b[J" + display + "\x1b8")
-		}
-		// Update prevCurRow for the next redraw.
+		// Compute layout for the current buffer content.  We need
+		// the total rows the display will occupy so we can
+		// pre-fill blank lines below the prompt, preventing the
+		// terminal from scrolling stale (uncleared) content into
+		// the input area.
 		layoutCols := cols
 		if layoutCols <= 0 {
 			layoutCols = 1024
 		}
-		_, curRow, _ := computeLayout(linePrompt, buf, cursor, layoutCols)
+		totalRows, curRow, _ := computeLayout(linePrompt, buf, cursor, layoutCols)
+
+		if cols <= 0 {
+			// Non-TTY fallback — clear the current line only.
+			fmt.Print("\r\x1b[2K" + display + "\x1b8")
+		} else {
+			// Move to the prompt row.
+			if prevCurRow > 0 {
+				fmt.Printf("\x1b[%dA", prevCurRow)
+			}
+			// Clear from prompt to end of screen.
+			fmt.Print("\r\x1b[J")
+
+			// Print enough blank lines to cover the taller of
+			// the previous display and the new display.  This
+			// replaces old content and pre-positions the
+			// terminal so the real display below never
+			// scrolls in stale rows.
+			needed := max(totalRows, prevTotalRows)
+			for i := 1; i < needed; i++ {
+				fmt.Print("\r\n")
+			}
+			// Move back up to the (now-clean) prompt row.
+			if needed > 1 {
+				fmt.Printf("\x1b[%dA", needed-1)
+			}
+			fmt.Print("\r\x1b[J" + display + "\x1b8")
+		}
+
 		prevCurRow = curRow
+		prevTotalRows = totalRows
 	}
 
 	insert := func(r rune) {
@@ -426,6 +449,14 @@ func readLineTTY(prompt string, complete lineCompleter) (string, error) {
 			if pasteMode {
 				insert('\n')
 				continue
+			}
+			// Move cursor past the entire display so that
+			// multiline (pasted) text scrolls up cleanly
+			// rather than remaining on screen for agent
+			// output to overwrite.
+			remaining := prevTotalRows - prevCurRow - 1
+			for i := 0; i < remaining; i++ {
+				fmt.Print("\r\n")
 			}
 			fmt.Println()
 			line := string(buf)

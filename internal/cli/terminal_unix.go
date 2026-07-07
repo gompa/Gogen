@@ -7,7 +7,9 @@ import (
 	"unsafe"
 )
 
-func terminalSize(fd int) (int, bool) {
+// terminalSize returns (columns, rows, ok).  If the ioctl fails or
+// either dimension is zero, ok is false.
+func terminalSize(fd int) (int, int, bool) {
 	type winsize struct {
 		Row, Col, XPixel, YPixel uint16
 	}
@@ -18,8 +20,8 @@ func terminalSize(fd int) (int, bool) {
 		uintptr(syscall.TIOCGWINSZ),
 		uintptr(unsafe.Pointer(&ws)),
 	)
-	if errno != 0 || ws.Col == 0 {
-		return 0, false
+	if errno != 0 || ws.Col == 0 || ws.Row == 0 {
+		return 0, 0, false
 	}
-	return int(ws.Col), true
+	return int(ws.Col), int(ws.Row), true
 }
