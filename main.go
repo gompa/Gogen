@@ -12,7 +12,6 @@ import (
 	"syscall"
 
 	"gogen/internal/agent"
-	"gogen/internal/cli"
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/debuglog"
@@ -22,6 +21,7 @@ import (
 	"gogen/internal/server"
 	"gogen/internal/session"
 	"gogen/internal/treesitter"
+	"gogen/internal/tui"
 )
 
 func main() {
@@ -174,7 +174,7 @@ func main() {
 			log.Fatal(err)
 		}
 	} else if *cliFlag {
-		c := cli.NewCLI(a, cfg)
+		c := tui.New(a, cfg)
 		c.Run(ctx)
 	}
 }
