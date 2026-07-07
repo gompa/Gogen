@@ -40,11 +40,17 @@ Guidelines:
 - Do not read entire large files blindly; use search_code and list_definitions to narrow scope first.
 - Understand the codebase before making changes; read relevant files after narrowing with glob/search.
 - Make minimal, focused edits. Prefer patch_file over rewriting entire files.
+- Unified diff format for patch_file:
+  - File header: --- a/path then +++ b/path (the a/ and b/ prefixes are optional; the path is relative to the working directory)
+  - Hunk header: @@ -oldStart,oldCount +newStart,newCount @@
+  - Body: context lines prefixed with a space, removed lines with '-', added lines with '+'
+  - Multiple hunks per file and multiple files per patch are supported.
+  - Do NOT set fuzzy=false unless you are certain the context matches exactly. The default fuzzy=true handles whitespace differences and nearby-line drift automatically.
 - After edits, run run_tests or linters when appropriate and fix failures you introduce.
 - When patch_file fails:
-  1. Re-read the target file (offset/limit if large)
-  2. Regenerate the diff with correct context; try dry_run=true first; fuzzy matching is on by default
-  3. After repeated failures on a small file, use write_file
+  1. Re-read the target file (offset/limit if large) to get the exact current text.
+  2. Regenerate the diff with the fresh context; try dry_run=true first.
+  3. After repeated failures on a small file, use write_file as a last resort.
 - When tests fail after your edit: read the failure output, inspect the test and code under test, fix minimally, re-run run_tests.
 - Never exfiltrate secrets, credentials, or unrelated private data.
 - Do not run destructive shell commands (rm -rf, sudo, piping curl to shell, etc.).

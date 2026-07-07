@@ -14,6 +14,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/reflow/wordwrap"
 )
 
 // FocusTarget indicates which component has keyboard focus.
@@ -60,7 +61,8 @@ type Model struct {
 	quitting    bool
 
 	// Chat content buffer (lines to render)
-	chatLines []string
+	chatLines      []string
+	wrappedContent string // pre-computed wrapped content for viewport
 
 	// Streaming accumulation
 	streamAssistantBuf  strings.Builder
@@ -68,6 +70,8 @@ type Model struct {
 	streamThinkingOpen  bool
 	streamToolCallNames map[int]string // index -> name
 	streamToolCallArgs  map[int]string // index -> accumulated args deltas
+	streamToolCallIDs   map[int]string // index -> call ID (for correlating results)
+	toolCallDiffs       map[string]string // call ID -> diff text (for patch_file/show_diff)
 
 	// Input history
 	inputHistory     []string
@@ -151,6 +155,8 @@ func NewModel(a *agent.Agent, cfg *config.Config) Model {
 		chatLines:         make([]string, 0),
 		streamToolCallNames: make(map[int]string),
 		streamToolCallArgs:  make(map[int]string),
+		streamToolCallIDs:   make(map[int]string),
+		toolCallDiffs:       make(map[string]string),
 		keys:              DefaultKeyMap,
 		sessionID:         "",
 		messageCount:      0,
@@ -162,7 +168,7 @@ func NewModel(a *agent.Agent, cfg *config.Config) Model {
 		m.messageCount = len(a.Messages)
 		// Build initial history
 		m.chatLines = renderMessages(a.Messages, a.WorkingDir, modelLine, a.Mode.String())
-		m.viewport.SetContent(strings.Join(m.chatLines, "\n"))
+		m.setViewportContent()
 		m.viewport.GotoBottom()
 		if stats := a.ContextStats(context.Background()); stats.Snapshot.Limit > 0 || stats.Snapshot.Used > 0 {
 			m.contextStats = stats
@@ -198,8 +204,26 @@ func (m *Model) SetSize(width, height int) {
 	m.textarea.SetWidth(width - 2)
 	m.textarea.SetHeight(textareaHeight)
 
-	m.viewport.SetContent(strings.Join(m.chatLines, "\n"))
+	m.setViewportContent()
 	m.viewport.GotoBottom()
+}
+
+// setViewportContent wraps chatLines to the viewport width and sets the content.
+func (m *Model) setViewportContent() {
+	if m.width <= 2 {
+		return
+	}
+	w := m.viewport.Width
+	if w < 10 {
+		w = 10
+	}
+	w -= m.viewport.Style.GetHorizontalFrameSize()
+	if w < 10 {
+		w = 10
+	}
+	raw := strings.Join(m.chatLines, "\n")
+	m.wrappedContent = wordwrap.String(raw, w)
+	m.viewport.SetContent(m.wrappedContent)
 }
 
 func (m *Model) Init() tea.Cmd {
@@ -303,13 +327,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case sessionRestoredMsg:
 		m.sessionID = msg.sessionID
 		m.chatLines = renderMessages(msg.messages, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())
-		m.viewport.SetContent(strings.Join(m.chatLines, "\n"))
+		m.setViewportContent()
 		m.viewport.GotoBottom()
 		return m, nil
 
 	case clearChatMsg:
 		m.chatLines = nil
-		m.viewport.SetContent("")
+		m.setViewportContent()
 		return m, nil
 	}
 
@@ -335,8 +359,7 @@ func (m Model) View() string {
 	// Build the main layout
 	statusBar := m.renderStatusBar()
 
-	// Viewport content
-	m.viewport.SetContent(strings.Join(m.chatLines, "\n"))
+	// Viewport content (already set via setViewportContent when chatLines change)
 
 	// Textarea
 	var inputArea string
@@ -389,7 +412,7 @@ func (m Model) View() string {
 // appendChatLine adds a line to the chat buffer and updates the viewport.
 func (m *Model) appendChatLine(line string) {
 	m.chatLines = append(m.chatLines, line)
-	m.viewport.SetContent(strings.Join(m.chatLines, "\n"))
+	m.setViewportContent()
 	m.viewport.GotoBottom()
 }
 
@@ -400,7 +423,7 @@ func (m *Model) appendToLastLine(text string) {
 	} else {
 		m.chatLines[len(m.chatLines)-1] += text
 	}
-	m.viewport.SetContent(strings.Join(m.chatLines, "\n"))
+	m.setViewportContent()
 	m.viewport.GotoBottom()
 }
 
@@ -411,7 +434,7 @@ func (m *Model) replaceLastLine(text string) {
 	} else {
 		m.chatLines[len(m.chatLines)-1] = text
 	}
-	m.viewport.SetContent(strings.Join(m.chatLines, "\n"))
+	m.setViewportContent()
 	m.viewport.GotoBottom()
 }
 
@@ -451,6 +474,7 @@ func (m *Model) handleStreamToolCall(index int, id string, name string) {
 	m.streamAssistantBuf.Reset()
 	m.streamToolCallNames[index] = name
 	m.streamToolCallArgs[index] = ""
+	m.streamToolCallIDs[index] = id
 	prefix := ToolCallStyle.Render("  →")
 	m.appendChatLine(prefix + " " + name + " ")
 }
@@ -473,6 +497,12 @@ func (m *Model) handleStreamToolCallFinal(index int, tc llm.ToolCall) {
 	} else {
 		m.replaceLastLine(prefix + " " + name + " " + ToolCallArgsStyle.Render(argStr))
 	}
+	// Capture diff content for patch_file calls so we can render it colored in the result
+	if tc.Name == "patch_file" {
+		if diff, ok := tc.Args["diff"].(string); ok && diff != "" {
+			m.toolCallDiffs[tc.ID] = diff
+		}
+	}
 }
 
 func (m *Model) handleStreamToolResult(id string, name string, result string, success bool) {
@@ -483,15 +513,37 @@ func (m *Model) handleStreamToolResult(id string, name string, result string, su
 		statusStyle = ToolResultFailStyle
 	}
 	mark := ToolResultMarkStyle.Render("  ↳")
+	m.appendChatLine(fmt.Sprintf("%s %s  %s", mark, name, statusStyle.Render(status)))
 
+	// For patch_file: render the original diff with colors
+	if name == "patch_file" {
+		if diff, ok := m.toolCallDiffs[id]; ok && diff != "" {
+			m.appendChatLine(DiffMetaStyle.Render("  ╭─ diff ─"))
+			for _, line := range strings.Split(renderDiff(diff), "\n") {
+				m.appendChatLine(line)
+			}
+			m.appendChatLine(DiffMetaStyle.Render("  ╰───────"))
+		}
+	}
+
+	// For show_diff: render the result as a colored diff if it looks like one
+	if name == "show_diff" && isDiffContent(result) {
+		m.appendChatLine(DiffMetaStyle.Render("  ╭─ diff ─"))
+		for _, line := range strings.Split(renderDiff(result), "\n") {
+			m.appendChatLine(line)
+		}
+		m.appendChatLine(DiffMetaStyle.Render("  ╰───────"))
+		return
+	}
+
+	// Standard output: verbose shows body, compact shows summary
 	if m.verbose {
-		m.appendChatLine(fmt.Sprintf("%s %s  %s", mark, name, statusStyle.Render(status)))
 		for _, line := range strings.Split(result, "\n") {
 			m.appendChatLine(ToolResultBodyStyle.Render("  │ " + line))
 		}
 	} else {
 		summary := summarizeResult(result, success)
-		m.appendChatLine(fmt.Sprintf("%s %s  %s  %s", mark, name, statusStyle.Render(status), DimStyle.Render(summary)))
+		m.appendChatLine(DimStyle.Render(fmt.Sprintf("  %s", summary)))
 	}
 }
 
@@ -501,6 +553,8 @@ func (m *Model) handleStreamStart() {
 	m.streamThinkingOpen = false
 	m.streamToolCallNames = make(map[int]string)
 	m.streamToolCallArgs = make(map[int]string)
+	m.streamToolCallIDs = make(map[int]string)
+	m.toolCallDiffs = make(map[string]string)
 }
 
 func (m *Model) handleStreamRoundStart() {
@@ -509,6 +563,8 @@ func (m *Model) handleStreamRoundStart() {
 	m.streamThinkingOpen = false
 	m.streamToolCallNames = make(map[int]string)
 	m.streamToolCallArgs = make(map[int]string)
+	m.streamToolCallIDs = make(map[int]string)
+	m.toolCallDiffs = make(map[string]string)
 }
 
 func (m *Model) handleStreamRoundEnd() {
@@ -524,8 +580,10 @@ func (m *Model) handleStreamRoundEnd() {
 	m.streamAssistantBuf.Reset()
 	m.streamToolCallNames = make(map[int]string)
 	m.streamToolCallArgs = make(map[int]string)
+	m.streamToolCallIDs = make(map[int]string)
+	m.toolCallDiffs = make(map[string]string)
 
-	m.viewport.SetContent(strings.Join(m.chatLines, "\n"))
+	m.setViewportContent()
 	m.viewport.GotoBottom()
 }
 
@@ -541,7 +599,7 @@ func (m *Model) handleStreamEnd() {
 		}
 	}
 
-	m.viewport.SetContent(strings.Join(m.chatLines, "\n"))
+	m.setViewportContent()
 	m.viewport.GotoBottom()
 }
 
@@ -552,6 +610,8 @@ func (m *Model) handleStreamError(err error) {
 	m.streamThinkingOpen = false
 	m.streamToolCallNames = make(map[int]string)
 	m.streamToolCallArgs = make(map[int]string)
+	m.streamToolCallIDs = make(map[int]string)
+	m.toolCallDiffs = make(map[string]string)
 	if err != nil {
 		m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Error: %v", err)))
 	}

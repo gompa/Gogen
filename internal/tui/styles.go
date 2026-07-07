@@ -42,7 +42,9 @@ var (
 	DimStyle = lipgloss.NewStyle().
 			Foreground(lipglossColor("#888888"))
 
-	UserStyle = lipgloss.NewStyle()
+	UserStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipglossColor("#CCAA00"))
 
 	// Thinking blocks
 	ThinkingTagStyle = lipgloss.NewStyle().
@@ -143,4 +145,18 @@ var (
 	// Context line (right-aligned, dim)
 	ContextLineStyle = lipgloss.NewStyle().
 				Foreground(lipglossColor("#888888"))
+
+	// Diff rendering
+	DiffAddStyle = lipgloss.NewStyle().
+			Foreground(lipglossColor("#00AA00"))
+
+	DiffDelStyle = lipgloss.NewStyle().
+			Foreground(lipglossColor("#AA0000"))
+
+	DiffHunkStyle = lipgloss.NewStyle().
+			Foreground(lipglossColor("#00AAAA"))
+
+	DiffMetaStyle = lipgloss.NewStyle().
+			Foreground(lipglossColor("#AAAA00")).
+			Bold(true)
 )

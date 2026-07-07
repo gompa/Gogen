@@ -75,7 +75,7 @@ func (m *Model) dispatchCommand(input string) (bool, bool, tea.Cmd) {
 			if len(result.History) > 0 {
 				m.chatLines = append(m.chatLines, renderMessages(result.History, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())...)
 			}
-			m.viewport.SetContent(strings.Join(m.chatLines, "\n"))
+			m.setViewportContent()
 			m.viewport.GotoBottom()
 			m.sessionID = m.agent.SessionID
 			m.messageCount = len(m.agent.Messages)
@@ -87,7 +87,7 @@ func (m *Model) dispatchCommand(input string) (bool, bool, tea.Cmd) {
 			m.appendChatLine(SystemStyle.Render(result.Output))
 			if len(result.History) > 0 {
 				m.chatLines = renderMessages(result.History, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())
-				m.viewport.SetContent(strings.Join(m.chatLines, "\n"))
+				m.setViewportContent()
 				m.viewport.GotoBottom()
 			}
 		}
@@ -167,7 +167,7 @@ func (m *Model) submitUserInput(input string) tea.Cmd {
 	m.historyIdx = len(m.inputHistory)
 
 	// Show user message in chat
-	m.appendChatLine(trimmed)
+	m.appendChatLine(UserStyle.Render(userLabel) + " " + trimmed)
 
 	// Start streaming
 	m.streaming = true

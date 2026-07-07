@@ -60,10 +60,10 @@ func renderMessages(messages []llm.Message, workingDir string, modelName string,
 	for _, h := range keep {
 		if h.role == "assistant" {
 			label := AssistantStyle.Render(assistantLabel)
-			content := DimStyle.Render(h.content)
-			lines = append(lines, label+" "+content)
+			lines = append(lines, label+" "+h.content)
 		} else {
-			lines = append(lines, h.content)
+			label := UserStyle.Render(userLabel)
+			lines = append(lines, label+" "+h.content)
 		}
 	}
 
