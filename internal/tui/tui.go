@@ -26,9 +26,8 @@ func New(a *agent.Agent, cfg *config.Config) *TUI {
 }
 
 // Run starts the Bubble Tea program loop.
-// No alt-screen and no mouse capture means the terminal handles
-// native text selection with the mouse, and scrollback is preserved.
-// Viewport navigation is keyboard-driven (PgUp/PgDown/j/k/Home/End).
+// Alt-screen is off so terminal scrollback and Shift+click text selection work.
+// Mouse reporting is on so the viewport handles wheel scrolls.
 func (t *TUI) Run(ctx context.Context) {
 	m := NewModel(t.agent, t.cfg)
 	m.ctx = ctx
@@ -36,6 +35,7 @@ func (t *TUI) Run(ctx context.Context) {
 	p := tea.NewProgram(
 		&m,
 		tea.WithContext(ctx),
+		tea.WithMouseCellMotion(),
 	)
 
 	m.program = p

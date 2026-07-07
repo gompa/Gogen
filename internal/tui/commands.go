@@ -78,7 +78,6 @@ func (m *Model) dispatchCommand(input string) (bool, bool, tea.Cmd) {
 			m.setViewportContent()
 			m.viewport.GotoBottom()
 			m.sessionID = m.agent.SessionID
-			m.messageCount = len(m.agent.Messages)
 		} else if result.Sessions != nil {
 			// Show session list modal
 			m.sessionList = result.Sessions
@@ -175,6 +174,9 @@ func (m *Model) submitUserInput(input string) tea.Cmd {
 	m.streamThinkingBuf.Reset()
 	m.streamThinkingOpen = false
 	m.streamToolCallNames = make(map[int]string)
+	m.streamToolCallArgs = make(map[int]string)
+	m.streamToolCallIDs = make(map[int]string)
+	m.toolCallDiffs = make(map[string]string)
 
 	adapter := NewStreamAdapter(m.program)
 

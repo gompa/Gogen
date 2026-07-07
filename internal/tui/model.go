@@ -83,8 +83,7 @@ type Model struct {
 	contextLine    string
 
 	// Session
-	sessionID      string
-	messageCount   int
+	sessionID string
 
 	// Completion state
 	completions    []string
@@ -92,7 +91,6 @@ type Model struct {
 	completionLine string // the full line at time of tab press
 
 	// Approval state
-	approvalReq    agent.DeleteRequest
 	approvalResult chan bool
 	approvalUI     *approvalUIState
 
@@ -159,13 +157,11 @@ func NewModel(a *agent.Agent, cfg *config.Config) Model {
 		toolCallDiffs:       make(map[string]string),
 		keys:              DefaultKeyMap,
 		sessionID:         "",
-		messageCount:      0,
 		approvalResult:    make(chan bool, 1),
 	}
 
 	if a != nil {
 		m.sessionID = a.SessionID
-		m.messageCount = len(a.Messages)
 		// Build initial history
 		m.chatLines = renderMessages(a.Messages, a.WorkingDir, modelLine, a.Mode.String())
 		m.setViewportContent()
@@ -335,9 +331,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.chatLines = nil
 		m.setViewportContent()
 		return m, nil
+
+	// Pass mouse events to the viewport for wheel scrolling
+	case tea.MouseMsg:
+		var cmd tea.Cmd
+		m.viewport, cmd = m.viewport.Update(msg)
+		cmds = append(cmds, cmd)
+		return m, tea.Batch(cmds...)
 	}
 
-	// Update textarea for cursor blink
+	// Update textarea for cursor blink and normal input
 	if m.focus == FocusInput && m.modal == ModalNone && !m.streaming {
 		var cmd tea.Cmd
 		m.textarea, cmd = m.textarea.Update(msg)
@@ -383,30 +386,50 @@ func (m Model) View() string {
 
 	// Assemble
 	main := lipgloss.JoinVertical(
-		lipgloss.Top,
+		lipgloss.Left,
 		m.viewport.View(),
 		divider,
 		inputArea,
 		statusBar,
 	)
 
-	// Modal overlay
+	// Modal overlay — renders on opaque background so nothing bleeds through
 	if m.modal != ModalNone {
-		modalContent := m.renderModal()
-		modalWidth := lipgloss.Width(modalContent)
-		modalHeight := lipgloss.Height(modalContent)
-		x := (m.width - modalWidth) / 2
-		y := (m.height - modalHeight) / 2
-		if x < 0 {
-			x = 0
-		}
-		if y < 0 {
-			y = 0
-		}
-		return placeOverlay(x, y, modalContent, main, m.width, m.height)
+		return renderModalOverlay(main, m.renderModal(), m.width, m.height)
 	}
 
 	return main
+}
+
+// renderModalOverlay dims the main view and centers the modal on top.
+func renderModalOverlay(main, modal string, width, height int) string {
+	modalWidth := lipgloss.Width(modal)
+	modalHeight := lipgloss.Height(modal)
+
+	// Pad horizontally to center
+	leftPad := max(0, (width-modalWidth)/2)
+
+	// Pad vertically to center
+	topPad := max(0, (height-modalHeight)/2)
+	bottomPad := max(0, height-modalHeight-topPad)
+
+	var b strings.Builder
+	for i := 0; i < topPad; i++ {
+		b.WriteString(strings.Repeat(" ", width) + "\n")
+	}
+	for _, line := range strings.Split(modal, "\n") {
+		b.WriteString(strings.Repeat(" ", leftPad))
+		b.WriteString(line)
+		b.WriteString(strings.Repeat(" ", max(0, width-leftPad-lipgloss.Width(line))))
+		b.WriteByte('\n')
+	}
+	for i := 0; i < bottomPad; i++ {
+		b.WriteString(strings.Repeat(" ", width) + "\n")
+	}
+
+	return lipgloss.NewStyle().
+		Background(lipgloss.Color("#1a1a1a")).
+		Render(strings.TrimRight(b.String(), "\n"))
 }
 
 // appendChatLine adds a line to the chat buffer and updates the viewport.
@@ -439,10 +462,15 @@ func (m *Model) replaceLastLine(text string) {
 }
 
 func (m *Model) handleStreamToken(token string) {
-	// Close thinking block if open
+	// Close thinking block if open — finalize it properly
 	if m.streamThinkingOpen {
 		m.streamThinkingOpen = false
-		m.appendChatLine("")
+		if m.streamThinkingBuf.Len() > 0 {
+			m.replaceLastLine(ThinkingTagStyle.Render("<thinking>" + m.streamThinkingBuf.String() + "</thinking>"))
+		} else {
+			m.replaceLastLine(ThinkingTagStyle.Render("<thinking></thinking>"))
+		}
+		m.streamThinkingBuf.Reset()
 	}
 	if m.streamAssistantBuf.Len() == 0 {
 		label := AssistantStyle.Render(assistantLabel)
@@ -641,41 +669,4 @@ func summarizeResult(result string, success bool) string {
 		return trimmed
 	}
 	return fmt.Sprintf("(%d lines, %d chars)", lines, chars)
-}
-
-// placeOverlay places a modal overlay at a specific position on top of the main view.
-func placeOverlay(x, y int, overlay, main string, width, height int) string {
-	mainLines := strings.Split(main, "\n")
-	overlayLines := strings.Split(overlay, "\n")
-
-	// Ensure we have enough lines
-	for len(mainLines) < height {
-		mainLines = append(mainLines, "")
-	}
-
-	for i := 0; i < len(overlayLines) && y+i < len(mainLines); i++ {
-		line := mainLines[y+i]
-		ovLine := overlayLines[i]
-
-		if x >= len(line) {
-			mainLines[y+i] = line + ovLine
-		} else {
-			paddedLine := line
-			for len(paddedLine) < x {
-				paddedLine += " "
-			}
-			// Use rune-based overlay to handle wide chars
-			runes := []rune(paddedLine)
-			ovRunes := []rune(ovLine)
-			for j := 0; j < len(ovRunes) && x+j < len(runes); j++ {
-				runes[x+j] = ovRunes[j]
-			}
-			if x+len(ovRunes) > len(runes) {
-				runes = append(runes, ovRunes[len(runes)-x:]...)
-			}
-			mainLines[y+i] = string(runes)
-		}
-	}
-
-	return strings.Join(mainLines, "\n")
 }

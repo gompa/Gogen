@@ -122,7 +122,7 @@ func (m *Model) renderSessionsModal() string {
 	for _, s := range m.sessionList {
 		line := fmt.Sprintf("  %s  (%d msgs)", s.ID, s.MessageCount)
 		if s.Label != "" {
-			line += fmt.Sprintf("  %q", s.Label)
+			line += fmt.Sprintf("  \"%s\"", s.Label)
 		}
 		if s.ID == m.sessionID {
 			line += "  ← current"
@@ -206,7 +206,7 @@ func (m *Model) renderHelpModal() string {
 			{"enter", "Submit input"},
 			{"ctrl+c", "Cancel turn / Quit"},
 			{"ctrl+\\", "Force quit"},
-			{"?", "Show this help"},
+			{"F1", "Show this help"},
 			{"ctrl+v", "Toggle verbose"},
 		}},
 		{"Input Editing", [][]string{
@@ -220,14 +220,11 @@ func (m *Model) renderHelpModal() string {
 			{"backspace", "Delete backward"},
 			{"tab", "Complete (/resume)"},
 		}},
-		{"History Navigation", [][]string{
-			{"↑ / ↓", "History back/forward"},
-		}},
 		{"Viewport (esc to focus)", [][]string{
-			{"↑ / ↓ / j / k", "Scroll line"},
+			{"↑ ↓ j k", "Scroll line"},
 			{"pgup / pgdn", "Scroll page"},
-			{"ctrl+u / ctrl+d", "Half-page scroll"},
 			{"home / end", "Top / bottom"},
+			{"mouse wheel", "Scroll viewport"},
 			{"i / enter", "Return to input"},
 		}},
 		{"Slash Commands", [][]string{
@@ -240,6 +237,10 @@ func (m *Model) renderHelpModal() string {
 			{"/verbose", "Toggle verbose output"},
 			{"dir <path>", "Change working dir"},
 			{"exit", "Quit GoGen"},
+		}},
+		{"Text Selection", [][]string{
+			{"shift+click", "Select text (terminal native)"},
+			{"esc", "Dismiss modal / focus viewport"},
 		}},
 	}
 
@@ -254,27 +255,14 @@ func (m *Model) renderHelpModal() string {
 		b.WriteString("\n")
 	}
 
+	b.WriteString(ModalDimStyle.Render("any key to close"))
+
 	return ModalBorderStyle.Render(b.String())
 }
 
 func (m *Model) handleHelpKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if msg.String() == "esc" || msg.String() == "q" || msg.String() == "?" {
-		m.modal = ModalNone
-		return m, nil
-	}
-	// Allow scrolling in help modal
-	if msg.String() == "up" || msg.String() == "k" {
-		return m, nil
-	}
-	if msg.String() == "down" || msg.String() == "j" {
-		return m, nil
-	}
-	if msg.String() == "pgup" {
-		return m, nil
-	}
-	if msg.String() == "pgdown" {
-		return m, nil
-	}
+	// Any key dismisses the help overlay
+	m.modal = ModalNone
 	return m, nil
 }
 
