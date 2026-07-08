@@ -13,6 +13,16 @@ func (m *Model) renderStatusBar() string {
 
 	var leftParts []string
 
+	// Transient status message (e.g. "Copied N chars") takes priority
+	if m.statusMsg != "" {
+		content := StatusBarDimStyle.Render(m.statusMsg)
+		// Center the message
+		msgWidth := lipgloss.Width(content)
+		padLeft := max(0, (m.width-msgWidth)/2)
+		result := strings.Repeat(" ", padLeft) + content
+		return StatusBarStyle.Copy().Width(m.width).Render(result)
+	}
+
 	// Mode
 	modeStr := m.agent.Mode.String()
 	if modeStr == "plan" {

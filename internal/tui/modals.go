@@ -239,7 +239,8 @@ func (m *Model) renderHelpModal() string {
 			{"exit", "Quit GoGen"},
 		}},
 		{"Text Selection", [][]string{
-			{"shift+click", "Select text (terminal native)"},
+			{"click+drag", "Select text in viewport"},
+			{"right click", "Cancel selection"},
 			{"esc", "Dismiss modal / focus viewport"},
 		}},
 	}

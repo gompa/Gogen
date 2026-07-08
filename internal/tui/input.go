@@ -149,6 +149,7 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Escape to focus viewport
 	if msg.String() == "esc" {
 		m.focus = FocusViewport
+		m.clearSelection()
 		m.textarea.Blur()
 		return m, nil
 	}
@@ -185,9 +186,11 @@ func (m *Model) handleViewportKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Focus back to input
 	switch msg.String() {
 	case "i", "enter":
+		m.clearSelection()
 		m.focus = FocusInput
 		return m, m.textarea.Focus()
 	case "esc":
+		m.clearSelection()
 		m.focus = FocusInput
 		return m, m.textarea.Focus()
 	}

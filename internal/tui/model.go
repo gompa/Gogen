@@ -103,6 +103,12 @@ type Model struct {
 
 	// Screen dimensions tracking
 	ready          bool
+
+	// Text selection (mouse drag-to-select in viewport)
+	selectionYOff int // viewport YOffset at selection start (for stable coordinates)
+	selection    *SelectionState
+	wrappedLines []string // ANSI-stripped wrapped content lines (coordinate mapping)
+	statusMsg    string   // transient message (e.g. "Copied N chars")
 }
 
 // NewModel creates a new TUI model.
@@ -158,6 +164,10 @@ func NewModel(a *agent.Agent, cfg *config.Config) Model {
 		keys:              DefaultKeyMap,
 		sessionID:         "",
 		approvalResult:    make(chan bool, 1),
+		selectionYOff:     -1,
+		selection:         nil,
+		wrappedLines:      nil,
+		statusMsg:         "",
 	}
 
 	if a != nil {
@@ -219,6 +229,10 @@ func (m *Model) setViewportContent() {
 	}
 	raw := strings.Join(m.chatLines, "\n")
 	m.wrappedContent = wordwrap.String(raw, w)
+	// Store plain (ANSI-stripped) copy for selection coordinate mapping
+	m.wrappedLines = strings.Split(stripANSI(m.wrappedContent), "\n")
+	// Content changed — clear any stale selection
+	m.clearSelection()
 	m.viewport.SetContent(m.wrappedContent)
 }
 
@@ -235,6 +249,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// Clear transient status message on any key press
+		if m.statusMsg != "" {
+			m.statusMsg = ""
+		}
 		// Global hotkeys that work regardless of focus/modal
 		switch {
 		case key.Matches(msg, m.keys.ForceQuit):
@@ -334,6 +352,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// Pass mouse events to the viewport for wheel scrolling
 	case tea.MouseMsg:
+		// Check for text selection first; wheel events fall through to viewport
+		if m.handleMouseSelection(msg) {
+			return m, nil
+		}
 		var cmd tea.Cmd
 		m.viewport, cmd = m.viewport.Update(msg)
 		cmds = append(cmds, cmd)
@@ -362,7 +384,14 @@ func (m Model) View() string {
 	// Build the main layout
 	statusBar := m.renderStatusBar()
 
-	// Viewport content (already set via setViewportContent when chatLines change)
+	// Viewport content: use selection-aware render when selecting,
+	// otherwise use the stock viewport render.
+	var vpView string
+	if m.selection != nil && m.selection.Active {
+		vpView = m.renderViewportWithSelection()
+	} else {
+		vpView = m.viewport.View()
+	}
 
 	// Textarea
 	var inputArea string
@@ -387,7 +416,7 @@ func (m Model) View() string {
 	// Assemble
 	main := lipgloss.JoinVertical(
 		lipgloss.Left,
-		m.viewport.View(),
+		vpView,
 		divider,
 		inputArea,
 		statusBar,
