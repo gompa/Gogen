@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"regexp"
 	"strings"
 )
 
@@ -203,11 +204,7 @@ func matchGlobPattern(pattern, relPath string) bool {
 	if pattern == "" {
 		return false
 	}
-	if strings.Contains(pattern, "**") {
-		pattern = strings.ReplaceAll(pattern, "**/", "")
-		pattern = strings.ReplaceAll(pattern, "/**", "")
-		pattern = strings.TrimPrefix(pattern, "**/")
-	}
+	// Handle ** (zero or more directories) by converting to a regex.
 	if !strings.Contains(pattern, "/") {
 		base := relPath
 		if idx := strings.LastIndex(relPath, "/"); idx >= 0 {
@@ -219,11 +216,48 @@ func matchGlobPattern(pattern, relPath string) bool {
 		}
 		return ok
 	}
+	if strings.Contains(pattern, "**") {
+		return matchGlobRegex(pattern, relPath)
+	}
+	// Path-based patterns without ** use filepath.Match.
 	ok, err := filepath.Match(pattern, relPath)
 	if err != nil {
 		return false
 	}
 	return ok
+}
+
+// matchGlobRegex handles glob patterns that contain ** by converting
+// them to a regular expression. ** matches zero or more path segments.
+func matchGlobRegex(pattern, path string) bool {
+	// Split pattern into segments, then convert each segment.
+	segments := strings.Split(pattern, "/")
+	var reParts []string
+	reParts = append(reParts, "^")
+	for i, seg := range segments {
+		if i > 0 {
+			reParts = append(reParts, "/")
+		}
+		if seg == "**" {
+			// First ** matches leading dirs; last ** matches trailing dirs.
+			if i == 0 {
+				reParts = append(reParts, `(?:.*/)?`)
+			} else if i == len(segments)-1 {
+				reParts = append(reParts, `.*`)
+			} else {
+				reParts = append(reParts, `(?:.*/)?`)
+			}
+		} else {
+			// Convert * and ? within a single path segment (not crossing /).
+			escaped := regexp.QuoteMeta(seg)
+			escaped = strings.ReplaceAll(escaped, `\*`, `[^/]*`)
+			escaped = strings.ReplaceAll(escaped, `\?`, `[^/]`)
+			reParts = append(reParts, escaped)
+		}
+	}
+	reParts = append(reParts, "$")
+	re := regexp.MustCompile(strings.Join(reParts, ""))
+	return re.MatchString(path)
 }
 
 // ReadFiles reads multiple files and returns them with path headers.

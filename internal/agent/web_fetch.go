@@ -36,6 +36,20 @@ var (
 	webDomains []string
 )
 
+// sharedFetchClient is reused across requests for connection pooling.
+var sharedFetchClient = &http.Client{
+	Transport: &http.Transport{
+		MaxIdleConns:    10,
+		IdleConnTimeout: 90 * time.Second,
+	},
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= webFetchMaxRedirects {
+			return fmt.Errorf("too many redirects")
+		}
+		return nil
+	},
+}
+
 // blockTags are HTML elements that introduce paragraph-like breaks.
 // This list mirrors the inline regex that was previously used in htmlToText.
 var blockTags = map[string]bool{
@@ -239,22 +253,21 @@ func fetchHTTP(ctx context.Context, rawURL string, maxBytes int) ([]byte, string
 func fetchHTTPWithUA(ctx context.Context, rawURL, userAgent string, maxBytes int) ([]byte, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, webFetchTimeout)
 	defer cancel()
-	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= webFetchMaxRedirects {
-				return fmt.Errorf("too many redirects")
+	client := *sharedFetchClient // shallow copy so CheckRedirect override is per-request
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= webFetchMaxRedirects {
+			return fmt.Errorf("too many redirects")
+		}
+		nextURL := req.URL.String()
+		for _, prev := range via {
+			if prev.URL.String() == nextURL {
+				return fmt.Errorf("redirect loop detected: %s", nextURL)
 			}
-			nextURL := req.URL.String()
-			for _, prev := range via {
-				if prev.URL.String() == nextURL {
-					return fmt.Errorf("redirect loop detected: %s", nextURL)
-				}
-			}
-			if isPrivateHost(req.URL.Host) {
-				return fmt.Errorf("redirect to private host blocked: %s", req.URL.Host)
-			}
-			return nil
-		},
+		}
+		if isPrivateHost(req.URL.Host) {
+			return fmt.Errorf("redirect to private host blocked: %s", req.URL.Host)
+		}
+		return nil
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
@@ -287,22 +300,21 @@ func fetchHTTPWithUA(ctx context.Context, rawURL, userAgent string, maxBytes int
 func fetchHTTPPost(ctx context.Context, rawURL, formBody string, maxBytes int) ([]byte, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, webFetchTimeout)
 	defer cancel()
-	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= webFetchMaxRedirects {
-				return fmt.Errorf("too many redirects")
+	client := *sharedFetchClient // shallow copy so CheckRedirect override is per-request
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= webFetchMaxRedirects {
+			return fmt.Errorf("too many redirects")
+		}
+		nextURL := req.URL.String()
+		for _, prev := range via {
+			if prev.URL.String() == nextURL {
+				return fmt.Errorf("redirect loop detected: %s", nextURL)
 			}
-			nextURL := req.URL.String()
-			for _, prev := range via {
-				if prev.URL.String() == nextURL {
-					return fmt.Errorf("redirect loop detected: %s", nextURL)
-				}
-			}
-			if isPrivateHost(req.URL.Host) {
-				return fmt.Errorf("redirect to private host blocked: %s", req.URL.Host)
-			}
-			return nil
-		},
+		}
+		if isPrivateHost(req.URL.Host) {
+			return fmt.Errorf("redirect to private host blocked: %s", req.URL.Host)
+		}
+		return nil
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL,

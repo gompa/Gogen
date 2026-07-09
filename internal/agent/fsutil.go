@@ -35,6 +35,11 @@ func writeFileAtomic(path string, content []byte, perm os.FileMode) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
+	// Preserve the existing file mode when overwriting, so execute bits
+	// on scripts are not destroyed.
+	if info, err := os.Stat(path); err == nil {
+		perm = info.Mode()
+	}
 	tmp, err := os.CreateTemp(dir, ".gogen-write-*")
 	if err != nil {
 		return err
