@@ -93,13 +93,15 @@ func (m *Model) handleApprovalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "enter", "y":
 		// Approve
-		m.program.Send(approvalResultMsg{approved: true})
+		m.approvalResult <- true
 		m.approvalUI = nil
+		m.modal = ModalNone
 		return m, nil
 	case "n", "esc":
 		// Reject
-		m.program.Send(approvalResultMsg{approved: false})
+		m.approvalResult <- false
 		m.approvalUI = nil
+		m.modal = ModalNone
 		return m, nil
 	}
 	return m, nil

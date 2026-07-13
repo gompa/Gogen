@@ -331,12 +331,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.modal = ModalApproval
 		return m, nil
 
-	// Approval result (from goroutine)
-	case approvalResultMsg:
-		m.approvalResult <- msg.approved
-		m.modal = ModalNone
-		return m, nil
-
 	// Session/modal results
 	case sessionRestoredMsg:
 		m.sessionID = msg.sessionID

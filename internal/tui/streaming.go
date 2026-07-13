@@ -61,10 +61,6 @@ type sessionRestoredMsg struct {
 
 type clearChatMsg struct{}
 
-type approvalResultMsg struct {
-	approved bool
-}
-
 // StreamAdapter adapts llm.StreamHandlers to emit Bubble Tea messages
 // that can be processed by the Model's Update method.
 type StreamAdapter struct {
