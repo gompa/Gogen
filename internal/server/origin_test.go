@@ -1,6 +1,7 @@
 package server
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"testing"
 )
@@ -51,14 +52,24 @@ func TestIsLoopbackBind(t *testing.T) {
 
 func TestCheckAuth(t *testing.T) {
 	s := &Server{authToken: "secret"}
-	req := httptest.NewRequest("GET", "http://127.0.0.1:8080/?token=secret", nil)
+	req := httptest.NewRequest("GET", "http://127.0.0.1:8080/", nil)
+	req.AddCookie(&http.Cookie{Name: authCookieName, Value: "secret"})
 	if !s.checkAuth(req) {
-		t.Fatal("query token should pass")
+		t.Fatal("cookie token should pass")
 	}
 	req = httptest.NewRequest("GET", "http://127.0.0.1:8080/", nil)
 	req.Header.Set("Authorization", "Bearer secret")
 	if !s.checkAuth(req) {
 		t.Fatal("bearer should pass")
+	}
+	req = httptest.NewRequest("GET", "http://127.0.0.1:8080/", nil)
+	req.Header.Set("X-Gogen-Token", "secret")
+	if !s.checkAuth(req) {
+		t.Fatal("header token should pass")
+	}
+	req = httptest.NewRequest("GET", "http://127.0.0.1:8080/?token=secret", nil)
+	if s.checkAuth(req) {
+		t.Fatal("query token alone should not authenticate WS/API requests")
 	}
 	req = httptest.NewRequest("GET", "http://127.0.0.1:8080/", nil)
 	if s.checkAuth(req) {

@@ -192,10 +192,10 @@ func (e *Executor) planPatch(pf patchFile, fuzzy bool) (patchPlan, string, error
 	}
 
 	return patchPlan{
-		target: target,
-		secure: secure,
+		target:  target,
+		secure:  secure,
 		updated: joinLinesPreserveTrailing(updated),
-		create: pf.oldName == "/dev/null",
+		create:  pf.oldName == "/dev/null",
 	}, label, nil
 }
 
@@ -211,6 +211,11 @@ func parseUnifiedDiff(diff string) ([]patchFile, error) {
 	diff = strings.ReplaceAll(diff, "\r\n", "\n")
 	diff = strings.ReplaceAll(diff, "\r", "\n")
 	lines := strings.Split(diff, "\n")
+	// strings.Split leaves a trailing empty element for newline-terminated input;
+	// that is not a hunk body line.
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
 	var files []patchFile
 	var current *patchFile
 	var hunk *patchHunk
@@ -257,7 +262,12 @@ func parseUnifiedDiff(diff string) ([]patchFile, error) {
 		if line == `\ No newline at end of file` {
 			continue
 		}
+		// Empty lines in a hunk body are treated as empty context lines.
+		// Unified diffs normally encode them as a single space (" "), but LLMs
+		// often emit a bare blank line instead — dropping those corrupts patches.
 		if len(line) == 0 {
+			hunk.oldLines = append(hunk.oldLines, "")
+			hunk.newLines = append(hunk.newLines, "")
 			continue
 		}
 		switch line[0] {
@@ -291,7 +301,9 @@ func parseHunkHeader(line string) (patchHunk, error) {
 	if err != nil {
 		return patchHunk{}, err
 	}
-	_ = newPart
+	if _, err := parseDiffLineCount(newPart); err != nil {
+		return patchHunk{}, err
+	}
 	return patchHunk{oldStart: oldStart}, nil
 }
 

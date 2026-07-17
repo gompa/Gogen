@@ -42,12 +42,18 @@ func Merge(pf *ProjectFile, flags FlagOverrides) *config.Config {
 		WebBind:              mergeString("GOGEN_WEB_BIND", file, "", "", def.WebBind),
 		WebAllowedOrigins:    mergeString("GOGEN_WEB_ALLOWED_ORIGINS", file, "", "", def.WebAllowedOrigins),
 		WebAuthToken:         mergeString("GOGEN_WEB_TOKEN", file, "web_auth_token", file.WebAuthToken, def.WebAuthToken),
+		WebTLSCertFile:       mergeString("GOGEN_WEB_TLS_CERT", file, "web_tls_cert_file", file.WebTLSCertFile, def.WebTLSCertFile),
+		WebTLSKeyFile:        mergeString("GOGEN_WEB_TLS_KEY", file, "web_tls_key_file", file.WebTLSKeyFile, def.WebTLSKeyFile),
+		SessionMaxCount:      mergeInt("GOGEN_SESSION_MAX_COUNT", file, "session_max_count", file.SessionMaxCount, def.SessionMaxCount),
+		SessionMaxAgeDays:    mergeInt("GOGEN_SESSION_MAX_AGE_DAYS", file, "session_max_age_days", file.SessionMaxAgeDays, def.SessionMaxAgeDays),
 		WebFetch:             mergeString("GOGEN_WEB_FETCH", file, "web_fetch", file.WebFetch, def.WebFetch),
 		WebSearch:            mergeString("GOGEN_WEB_SEARCH", file, "web_search", file.WebSearch, def.WebSearch),
 		WebSearchBackend:     mergeString("GOGEN_WEB_SEARCH_BACKEND", file, "web_search_backend", file.WebSearchBackend, def.WebSearchBackend),
 		WebSearchAPIKey:      mergeString("GOGEN_WEB_SEARCH_API_KEY", file, "web_search_api_key", file.WebSearchAPIKey, def.WebSearchAPIKey),
 		WebAllowedDomains:    mergeString("GOGEN_WEB_ALLOWED_DOMAINS", file, "web_allowed_domains", file.WebAllowedDomains, def.WebAllowedDomains),
 		WebFetchMode:         mergeString("GOGEN_WEB_FETCH_MODE", file, "web_fetch_mode", file.WebFetchMode, def.WebFetchMode),
+		CommandSandbox:       mergeString("GOGEN_COMMAND_SANDBOX", file, "command_sandbox", file.CommandSandbox, def.CommandSandbox),
+		CommandTimeoutSecs:   mergeInt("GOGEN_COMMAND_TIMEOUT_SECS", file, "command_timeout_secs", file.CommandTimeoutSecs, def.CommandTimeoutSecs),
 	}
 
 	if flags.WorkingDir != "" {

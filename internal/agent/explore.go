@@ -9,8 +9,9 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"time"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 const (
@@ -53,6 +54,13 @@ func gitPath() (string, bool) {
 
 // globRegexCache caches compiled regexes for glob patterns containing **.
 // This avoids recompiling the same regex for every file during WalkDir.
+// The cache is capped at globRegexCacheMax entries; when exceeded, the
+// entire cache is replaced to bound memory.
+const globRegexCacheMax = 100
+
+var (
+	globRegexCacheCount atomic.Int64
+)
 var globRegexCache sync.Map // pattern string -> *regexp.Regexp
 
 // ListFiles lists directory entries. When recursive is true, walks the tree (max 500 paths).
@@ -131,12 +139,13 @@ func (e *Executor) ListFiles(path string, recursive, trackedOnly bool) (string, 
 }
 
 func filterTracked(workingDir string, paths []string) []string {
-	if !cachedGitPath.ok || len(paths) == 0 {
+	git, ok := gitPath()
+	if !ok || len(paths) == 0 {
 		return paths
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, cachedGitPath.path, "ls-files", "--cached", "--others", "--exclude-standard")
+	cmd := exec.CommandContext(ctx, git, "ls-files", "--cached", "--others", "--exclude-standard")
 	cmd.Dir = workingDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -287,6 +296,11 @@ func matchGlobRegex(pattern, path string) bool {
 	reStr := strings.Join(reParts, "")
 	re := regexp.MustCompile(reStr)
 	globRegexCache.Store(pattern, re)
+	if n := globRegexCacheCount.Add(1); n > globRegexCacheMax {
+		globRegexCacheCount.Store(0)
+		globRegexCache = sync.Map{}
+		globRegexCache.Store(pattern, re) // re-store under the fresh map
+	}
 	return re.MatchString(path)
 }
 

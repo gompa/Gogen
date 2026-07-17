@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -12,35 +13,44 @@ import (
 )
 
 type Agent struct {
-	Provider          llm.LLMProvider
-	Executor          *Executor
-	Context           *contextmgr.Manager
-	Messages          []llm.Message
+	Provider llm.LLMProvider
+	Executor *Executor
+
+	// Conversation state
+	Context     *contextmgr.Manager
+	Messages    []llm.Message
+	PinManager  *PinManager
+	TodoManager *TodoManager
+
+	// Session persistence
+	SessionStore   SessionPersister
+	SessionID      string
+	SessionLabel   string
+	UsageAccum     UsageAccumulator
+	lastTurnUsage  *llm.Usage
+	lastPersistErr error
+
+	// Runtime / project
 	WorkingDir        string
 	Mode              Mode
 	ProjectGuidelines string
 	ProjectFilePath   string
 	TestCommand       string
 	LintCommand       string
-	TodoManager       *TodoManager
 	projectProfile    string
 	MCPRegistry       MCPToolRegistry
-	SessionStore      SessionPersister
-	SessionID         string
-	SessionLabel      string
-	UsageAccum        UsageAccumulator
-	PinManager        *PinManager
-	lastTurnUsage     *llm.Usage
+	toolHandlers      map[string]ToolHandler
 }
 
 func NewAgent(provider llm.LLMProvider, executor *Executor, ctxMgr *contextmgr.Manager) *Agent {
 	return &Agent{
-		Provider:   provider,
-		Executor:   executor,
-		Context:    ctxMgr,
-		Messages:   []llm.Message{},
-		WorkingDir: executor.WorkingDir,
-		Mode:       ModeAct,
+		Provider:     provider,
+		Executor:     executor,
+		Context:      ctxMgr,
+		Messages:     []llm.Message{},
+		WorkingDir:   executor.WorkingDir,
+		Mode:         ModeAct,
+		toolHandlers: BuiltinToolHandlers(),
 	}
 }
 
@@ -84,13 +94,25 @@ func (a *Agent) persistSession() {
 	if a.SessionStore == nil || a.SessionID == "" {
 		return
 	}
-	_ = a.SessionStore.Save(a.SessionID, SessionSnapshot{
+	if err := a.SessionStore.Save(a.SessionID, SessionSnapshot{
 		WorkingDir: a.WorkingDir,
 		Model:      a.CurrentModel(),
 		Mode:       a.Mode.String(),
 		Label:      a.SessionLabel,
 		Messages:   append([]llm.Message(nil), a.Messages...),
-	})
+	}); err != nil {
+		log.Printf("session save failed (id=%s): %v", a.SessionID, err)
+		a.lastPersistErr = err
+		return
+	}
+	a.lastPersistErr = nil
+}
+
+// ConsumePersistError returns and clears the last session save failure, if any.
+func (a *Agent) ConsumePersistError() error {
+	err := a.lastPersistErr
+	a.lastPersistErr = nil
+	return err
 }
 
 // SetWorkingDir updates the agent and executor working directory together.
@@ -215,6 +237,7 @@ func (a *Agent) appendToolResult(tc llm.ToolCall, result string) {
 // It returns the final accumulated response or an error.
 func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.StreamHandlers) (string, error) {
 	a.Messages = append(a.Messages, llm.Message{Role: "user", Content: input})
+	defer contextmgr.InvalidateTokenCache()
 
 	if err := a.requireModelSelected(ctx); err != nil {
 		a.Messages = a.Messages[:len(a.Messages)-1]
@@ -435,327 +458,5 @@ func coerceStringSlice(key string, val interface{}) ([]string, error) {
 		return out, nil
 	default:
 		return nil, fmt.Errorf("argument %q must be an array of strings", key)
-	}
-}
-
-func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error) {
-	if tc.ArgsError != "" {
-		return "", fmt.Errorf("invalid tool arguments: %s", tc.ArgsError)
-	}
-	if err := a.checkPlanMode(tc.Name); err != nil {
-		return "", err
-	}
-	if a.MCPRegistry != nil {
-		if names := a.MCPRegistry.ToolNames(); names != nil {
-			if _, ok := names[tc.Name]; ok {
-				return a.MCPRegistry.CallTool(ctx, tc.Name, tc.Args)
-			}
-		}
-	}
-	ctx = a.toolContext(ctx)
-	switch tc.Name {
-	case "list_files":
-		path, err := stringArg(tc.Args, "path")
-		if err != nil {
-			return "", err
-		}
-		recursive, _ := boolArgOptional(tc.Args, "recursive")
-		tracked, _ := boolArgOptional(tc.Args, "tracked_only")
-		return a.Executor.ListFiles(path, recursive, tracked)
-	case "glob_files":
-		pattern, err := stringArg(tc.Args, "pattern")
-		if err != nil {
-			return "", err
-		}
-		subpath, _ := stringArgOptional(tc.Args, "path")
-		tracked, _ := boolArgOptional(tc.Args, "tracked_only")
-		return a.Executor.GlobFiles(pattern, subpath, tracked)
-	case "repo_overview":
-		return a.Executor.RepoOverview()
-	case "read_file":
-		path, err := stringArgOptional(tc.Args, "file_path")
-		if err != nil {
-			return "", err
-		}
-		if path == "" {
-			path, err = stringArg(tc.Args, "path")
-			if err != nil {
-				return "", err
-			}
-		}
-		offset, err := intArgOptional(tc.Args, "offset")
-		if err != nil {
-			return "", err
-		}
-		limit, err := intArgOptional(tc.Args, "limit")
-		if err != nil {
-			return "", err
-		}
-		search, _ := stringArgOptional(tc.Args, "search")
-		return a.Executor.ReadFileRange(path, offset, limit, search)
-	case "read_files":
-		paths, err := stringSliceArg(tc.Args, "paths")
-		if err != nil {
-			return "", err
-		}
-		return a.Executor.ReadFiles(paths)
-	case "write_file":
-		path, err := stringArg(tc.Args, "path")
-		if err != nil {
-			return "", err
-		}
-		content, err := stringArg(tc.Args, "content")
-		if err != nil {
-			return "", err
-		}
-		err = a.Executor.WriteFile(path, content)
-		if err != nil {
-			return "", err
-		}
-		result := a.Executor.AppendSyntaxCheck("File written successfully", path)
-		if diffOut, diffErr := runDiffQuick(a.WorkingDir, path); diffErr == nil && diffOut != "" {
-			result += "\n\n" + diffOut
-		}
-		return result, nil
-	case "execute_command":
-		command, err := stringArg(tc.Args, "command")
-		if err != nil {
-			return "", err
-		}
-		return a.Executor.ExecuteCommand(ctx, command)
-	case "replace_in_file":
-		path, err := stringArg(tc.Args, "path")
-		if err != nil {
-			return "", err
-		}
-		search, err := stringArg(tc.Args, "search")
-		if err != nil {
-			return "", err
-		}
-		replace, err := stringArg(tc.Args, "replace")
-		if err != nil {
-			return "", err
-		}
-		replaceAll, err := boolArgOptional(tc.Args, "replace_all")
-		if err != nil {
-			return "", err
-		}
-		return a.Executor.ReplaceInFile(path, search, replace, replaceAll)
-	case "patch_file":
-		diff, err := stringArg(tc.Args, "diff")
-		if err != nil {
-			return "", err
-		}
-		dryRun, err := boolArgOptional(tc.Args, "dry_run")
-		if err != nil {
-			return "", err
-		}
-		fuzzy, err := boolArgDefault(tc.Args, "fuzzy", true)
-		if err != nil {
-			return "", err
-		}
-		return a.Executor.PatchFile(ctx, diff, dryRun, fuzzy)
-	case "run_tests":
-		target, _ := stringArgOptional(tc.Args, "target")
-		extra, _ := stringArgOptional(tc.Args, "extra_args")
-		return a.Executor.RunTests(ctx, target, extra, a.TestCommand)
-	case "run_lint":
-		extra, _ := stringArgOptional(tc.Args, "extra_args")
-		return a.Executor.RunLint(ctx, extra, a.LintCommand)
-	case "delete_file":
-		path, err := stringArg(tc.Args, "path")
-		if err != nil {
-			return "", err
-		}
-		return a.Executor.DeleteFile(ctx, path)
-	case "move_file":
-		src, err := stringArg(tc.Args, "source")
-		if err != nil {
-			return "", err
-		}
-		dst, err := stringArg(tc.Args, "destination")
-		if err != nil {
-			return "", err
-		}
-		return a.Executor.MoveFile(src, dst)
-	case "show_diff":
-		subpath, _ := stringArgOptional(tc.Args, "path")
-		staged, err := boolArgOptional(tc.Args, "staged")
-		if err != nil {
-			return "", err
-		}
-		return a.Executor.ShowDiff(ctx, subpath, staged)
-	case "search_code":
-		pattern, err := stringArg(tc.Args, "pattern")
-		if err != nil {
-			return "", err
-		}
-		subpath, _ := stringArgOptional(tc.Args, "path")
-		glob, _ := stringArgOptional(tc.Args, "glob")
-		contextLines, err := intArgOptional(tc.Args, "context_lines")
-		if err != nil {
-			return "", err
-		}
-		return a.Executor.SearchCode(ctx, pattern, subpath, glob, contextLines)
-	case "find_references":
-		symbol, err := stringArg(tc.Args, "symbol")
-		if err != nil {
-			return "", err
-		}
-		subpath, _ := stringArgOptional(tc.Args, "path")
-		glob, _ := stringArgOptional(tc.Args, "glob")
-		return a.Executor.FindReferences(ctx, symbol, subpath, glob)
-	case "git_log":
-		subpath, _ := stringArgOptional(tc.Args, "path")
-		limit, err := intArgOptional(tc.Args, "limit")
-		if err != nil {
-			return "", err
-		}
-		return a.Executor.GitLog(ctx, subpath, limit)
-	case "git_blame":
-		path, err := stringArg(tc.Args, "path")
-		if err != nil {
-			return "", err
-		}
-		startLine, err := intArgOptional(tc.Args, "start_line")
-		if err != nil {
-			return "", err
-		}
-		limit, err := intArgOptional(tc.Args, "limit")
-		if err != nil {
-			return "", err
-		}
-		return a.Executor.GitBlame(ctx, path, startLine, limit)
-	case "git_status":
-		subpath, _ := stringArgOptional(tc.Args, "path")
-		return a.Executor.GitStatus(ctx, subpath)
-	case "git_commit":
-		message, err := stringArg(tc.Args, "message")
-		if err != nil {
-			return "", err
-		}
-		return a.Executor.GitCommit(ctx, message)
-	case "git_stage":
-		paths, err := stringSliceArgOptional(tc.Args, "paths")
-		if err != nil {
-			return "", err
-		}
-		return a.Executor.GitStage(ctx, paths)
-	case "git_branch":
-		name, _ := stringArgOptional(tc.Args, "name")
-		create, _ := boolArgOptional(tc.Args, "create")
-		return a.Executor.GitBranch(ctx, name, create)
-	case "git_stash":
-		message, _ := stringArgOptional(tc.Args, "message")
-		pop, _ := boolArgOptional(tc.Args, "pop")
-		return a.Executor.GitStash(ctx, message, pop)
-	case "git_stash_list":
-		return a.Executor.GitStashList(ctx)
-	case "git_show":
-		ref, _ := stringArgOptional(tc.Args, "ref")
-		return a.Executor.GitDiffShow(ctx, ref)
-	case "copy_file":
-		src, err := stringArg(tc.Args, "source")
-		if err != nil {
-			return "", err
-		}
-		dst, err := stringArg(tc.Args, "destination")
-		if err != nil {
-			return "", err
-		}
-		return a.Executor.CopyFile(src, dst)
-	case "todo_add":
-		text, err := stringArg(tc.Args, "text")
-		if err != nil {
-			return "", err
-		}
-		if a.TodoManager == nil {
-			return "", fmt.Errorf("todo manager is not initialized")
-		}
-		return a.TodoManager.AddTodo(text)
-	case "todo_list":
-		if a.TodoManager == nil {
-			return "", fmt.Errorf("todo manager is not initialized")
-		}
-		return a.TodoManager.ListTodos(), nil
-	case "todo_done":
-		id, err := intArgOptional(tc.Args, "id")
-		if err != nil || id == 0 {
-			return "", fmt.Errorf("missing required argument %q", "id")
-		}
-		if a.TodoManager == nil {
-			return "", fmt.Errorf("todo manager is not initialized")
-		}
-		return a.TodoManager.DoneTodo(id)
-	case "todo_remove":
-		id, err := intArgOptional(tc.Args, "id")
-		if err != nil || id == 0 {
-			return "", fmt.Errorf("missing required argument %q", "id")
-		}
-		if a.TodoManager == nil {
-			return "", fmt.Errorf("todo manager is not initialized")
-		}
-		return a.TodoManager.RemoveTodo(id)
-	case "todo_clear_done":
-		if a.TodoManager == nil {
-			return "", fmt.Errorf("todo manager is not initialized")
-		}
-		return a.TodoManager.ClearDoneTodos()
-	case "list_definitions":
-		path, err := stringArg(tc.Args, "path")
-		if err != nil {
-			return "", err
-		}
-		return a.Executor.ListDefinitions(path)
-	case "web_search":
-		query, err := stringArg(tc.Args, "query")
-		if err != nil {
-			return "", err
-		}
-		maxResults, err := intArgOptional(tc.Args, "max_results")
-		if err != nil {
-			return "", err
-		}
-		return a.Executor.WebSearch(ctx, query, maxResults)
-	case "web_fetch":
-		rawURL, err := stringArg(tc.Args, "url")
-		if err != nil {
-			return "", err
-		}
-		maxBytes, err := intArgOptional(tc.Args, "max_bytes")
-		if err != nil {
-			return "", err
-		}
-		return a.Executor.WebFetch(ctx, rawURL, maxBytes)
-	case "find_file":
-		name, err := stringArg(tc.Args, "name")
-		if err != nil {
-			return "", err
-		}
-		subpath, _ := stringArgOptional(tc.Args, "path")
-		limit, _ := intArgOptional(tc.Args, "limit")
-		return a.Executor.FindFile(name, subpath, limit)
-	case "find_definition":
-		symbol, err := stringArg(tc.Args, "symbol")
-		if err != nil {
-			return "", err
-		}
-		subpath, _ := stringArgOptional(tc.Args, "path")
-		glob, _ := stringArgOptional(tc.Args, "glob")
-		return a.Executor.FindDefinition(ctx, symbol, subpath, glob)
-	case "session_rename":
-		label, err := stringArg(tc.Args, "label")
-		if err != nil {
-			return "", err
-		}
-		return a.RenameSession(label)
-	case "session_usage":
-		return a.UsageAccum.Format(), nil
-	case "context_pin_last":
-		return "Pinned the last user message", a.pinLastUser()
-	case "context_pins":
-		return a.listPins(), nil
-	default:
-		return "", fmt.Errorf("unknown tool: %s", tc.Name)
 	}
 }

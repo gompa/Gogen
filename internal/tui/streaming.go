@@ -1,10 +1,12 @@
 package tui
 
 import (
+	"strings"
+	"sync"
+	"time"
+
 	"gogen/internal/agent"
 	"gogen/internal/llm"
-	"strings"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -76,36 +78,54 @@ type StreamAdapter struct {
 
 // tokenBatcher coalesces stream/thinking tokens so the Bubble Tea channel
 // is not flooded with one message per token. Flushes at 32ms intervals.
+// All fields are guarded by mu because AfterFunc runs flush off the stream goroutine.
 type tokenBatcher struct {
-	send    func(tea.Msg)
-	stream  strings.Builder
-	think   strings.Builder
-	timer   *time.Timer
-	flushed func()
+	mu     sync.Mutex
+	send   func(tea.Msg)
+	stream strings.Builder
+	think  strings.Builder
+	timer  *time.Timer
 }
 
-func newTokenBatcher(send func(tea.Msg)) *tokenBatcher {
-	return &tokenBatcher{send: send}
-}
-
-func (b *tokenBatcher) scheduleFlush() {
+func (b *tokenBatcher) scheduleFlushLocked() {
 	if b.timer == nil {
 		b.timer = time.AfterFunc(32*time.Millisecond, b.flush)
 	}
 }
 
 func (b *tokenBatcher) flush() {
-	b.flushed()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.flushLocked()
+}
+
+func (b *tokenBatcher) flushLocked() {
+	if s := b.stream.String(); s != "" {
+		b.send(streamTokenMsg{token: s})
+		b.stream.Reset()
+	}
+	if s := b.think.String(); s != "" {
+		b.send(streamThinkingMsg{token: s})
+		b.think.Reset()
+	}
+	if b.timer != nil {
+		b.timer.Stop()
+		b.timer = nil
+	}
 }
 
 func (b *tokenBatcher) streamToken(token string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.stream.WriteString(token)
-	b.scheduleFlush()
+	b.scheduleFlushLocked()
 }
 
 func (b *tokenBatcher) thinkToken(token string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.think.WriteString(token)
-	b.scheduleFlush()
+	b.scheduleFlushLocked()
 }
 
 // NewStreamAdapter creates a new StreamAdapter.
@@ -115,22 +135,7 @@ func NewStreamAdapter(p *tea.Program) *StreamAdapter {
 
 // Handlers returns a full set of stream handlers that emit tea.Msg values.
 func (s *StreamAdapter) Handlers() *llm.StreamHandlers {
-	var batch tokenBatcher
-	batch.send = s.program.Send
-	batch.flushed = func() {
-		if b := batch.stream.String(); b != "" {
-			s.program.Send(streamTokenMsg{token: b})
-			batch.stream.Reset()
-		}
-		if b := batch.think.String(); b != "" {
-			s.program.Send(streamThinkingMsg{token: b})
-			batch.think.Reset()
-		}
-		if batch.timer != nil {
-			batch.timer.Stop()
-			batch.timer = nil
-		}
-	}
+	batch := &tokenBatcher{send: s.program.Send}
 
 	return &llm.StreamHandlers{
 		OnStart: func() {

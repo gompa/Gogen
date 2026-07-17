@@ -154,6 +154,10 @@ type Server struct {
 	turnMu         sync.Mutex // serializes agent-mutating work across WS clients
 	allowedOrigins map[string]struct{}
 	authToken      string
+	tlsCertFile    string
+	tlsKeyFile     string
+	connLimiter    *rateLimitState
+	upgradeLimiter *ipLimiter
 }
 
 type ModelEntry struct {
@@ -176,56 +180,69 @@ type HistoryEntry struct {
 }
 
 type WSMessage struct {
-	Type               string                 `json:"type"`
-	Content            string                 `json:"content,omitempty"`
-	Tool               string                 `json:"tool,omitempty"`
-	ToolCallID         string                 `json:"toolCallId,omitempty"`
-	Index              int                    `json:"index,omitempty"`
-	ArgsDelta          string                 `json:"argsDelta,omitempty"`
-	Args               map[string]interface{} `json:"args,omitempty"`
-	Result             string                 `json:"result,omitempty"`
-	Success            bool                   `json:"success,omitempty"`
-	ResultTruncated    bool                   `json:"resultTruncated,omitempty"`
-	WorkingDir         string                 `json:"workingDir,omitempty"`
-	Model              string                 `json:"model,omitempty"`
-	ContextLimit       int                    `json:"contextLimit,omitempty"`
-	UsedTokens         int                    `json:"usedTokens,omitempty"`
-	UsedSource         string                 `json:"usedSource,omitempty"`
-	PromptTokens       int                    `json:"promptTokens,omitempty"`
-	CompletionTokens   int                    `json:"completionTokens,omitempty"`
-	CachedTokens       int                    `json:"cachedTokens,omitempty"`
-	CompactAt          int                    `json:"compactAt,omitempty"`
-	MessageCount       int                    `json:"messageCount,omitempty"`
-	NearCompact        bool                   `json:"nearCompact,omitempty"`
-	UsedPercent        float64                `json:"usedPercent,omitempty"`
-	ToolTruncated      bool                   `json:"toolTruncated,omitempty"`
-	Models             []ModelEntry           `json:"models,omitempty"`
-	ApprovalID         string                 `json:"approvalId,omitempty"`
-	Approved           bool                   `json:"approved,omitempty"`
-	Paths              []string               `json:"paths,omitempty"`
-	Reason             string                 `json:"reason,omitempty"`
-	Mode               string                 `json:"mode,omitempty"`
-	SessionID          string                 `json:"sessionId,omitempty"`
-	SessionAction      string                 `json:"sessionAction,omitempty"`
-	Sessions           []SessionEntry         `json:"sessions,omitempty"`
-	History            []HistoryEntry          `json:"history,omitempty"`
+	Type             string                 `json:"type"`
+	Content          string                 `json:"content,omitempty"`
+	Tool             string                 `json:"tool,omitempty"`
+	ToolCallID       string                 `json:"toolCallId,omitempty"`
+	Index            int                    `json:"index,omitempty"`
+	ArgsDelta        string                 `json:"argsDelta,omitempty"`
+	Args             map[string]interface{} `json:"args,omitempty"`
+	Result           string                 `json:"result,omitempty"`
+	Success          bool                   `json:"success,omitempty"`
+	ResultTruncated  bool                   `json:"resultTruncated,omitempty"`
+	WorkingDir       string                 `json:"workingDir,omitempty"`
+	Model            string                 `json:"model,omitempty"`
+	ContextLimit     int                    `json:"contextLimit,omitempty"`
+	UsedTokens       int                    `json:"usedTokens,omitempty"`
+	UsedSource       string                 `json:"usedSource,omitempty"`
+	PromptTokens     int                    `json:"promptTokens,omitempty"`
+	CompletionTokens int                    `json:"completionTokens,omitempty"`
+	CachedTokens     int                    `json:"cachedTokens,omitempty"`
+	CompactAt        int                    `json:"compactAt,omitempty"`
+	MessageCount     int                    `json:"messageCount,omitempty"`
+	NearCompact      bool                   `json:"nearCompact,omitempty"`
+	UsedPercent      float64                `json:"usedPercent,omitempty"`
+	ToolTruncated    bool                   `json:"toolTruncated,omitempty"`
+	Models           []ModelEntry           `json:"models,omitempty"`
+	ApprovalID       string                 `json:"approvalId,omitempty"`
+	Approved         bool                   `json:"approved,omitempty"`
+	Paths            []string               `json:"paths,omitempty"`
+	Reason           string                 `json:"reason,omitempty"`
+	Mode             string                 `json:"mode,omitempty"`
+	SessionID        string                 `json:"sessionId,omitempty"`
+	SessionAction    string                 `json:"sessionAction,omitempty"`
+	Sessions         []SessionEntry         `json:"sessions,omitempty"`
+	History          []HistoryEntry         `json:"history,omitempty"`
 }
 
 func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 	allowed := parseAllowedOrigins("")
 	token := ""
+	tlsCert, tlsKey := "", ""
 	if cfg != nil {
 		allowed = parseAllowedOrigins(cfg.WebAllowedOrigins)
 		token = strings.TrimSpace(cfg.WebAuthToken)
+		tlsCert = strings.TrimSpace(cfg.WebTLSCertFile)
+		tlsKey = strings.TrimSpace(cfg.WebTLSKeyFile)
 	}
 	if token == "" {
 		token = strings.TrimSpace(os.Getenv("GOGEN_WEB_TOKEN"))
+	}
+	if tlsCert == "" {
+		tlsCert = strings.TrimSpace(os.Getenv("GOGEN_WEB_TLS_CERT"))
+	}
+	if tlsKey == "" {
+		tlsKey = strings.TrimSpace(os.Getenv("GOGEN_WEB_TLS_KEY"))
 	}
 	return &Server{
 		agent:          a,
 		config:         cfg,
 		allowedOrigins: allowed,
 		authToken:      token,
+		tlsCertFile:    tlsCert,
+		tlsKeyFile:     tlsKey,
+		connLimiter:    newRateLimitState(defaultMaxWSConns),
+		upgradeLimiter: newIPLimiter(5, 10), // 5 upgrades/sec/IP, burst 10
 	}
 }
 
@@ -348,6 +365,17 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	if s.upgradeLimiter != nil && !s.upgradeLimiter.allow(clientIP(r)) {
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+	if s.connLimiter != nil && !s.connLimiter.acquireConn() {
+		http.Error(w, "too many connections", http.StatusServiceUnavailable)
+		return
+	}
+	if s.connLimiter != nil {
+		defer s.connLimiter.releaseConn()
+	}
 	upg := s.wsUpgrader()
 	conn, err := upg.Upgrade(w, r, nil)
 	if err != nil {
@@ -370,6 +398,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	ws := newWSConn(conn)
 	defer ws.closeSend()
 	session := newWSSession(ws)
+	msgLimiter := newWSMessageLimiter()
 
 	var streamCancel context.CancelFunc
 	var streamErr chan error
@@ -401,6 +430,10 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			if err := conn.ReadJSON(&msg); err != nil {
 				close(incoming)
 				return
+			}
+			if !msgLimiter.Allow() {
+				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: rate limit exceeded"})
+				continue
 			}
 			// Complete delete approvals here so they never sit behind a main-loop
 			// turnMu.Lock() (stream holds turnMu while waiting for approval).
@@ -570,6 +603,9 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 					}
 					return
 				}
+				if persistErr := s.agent.ConsumePersistError(); persistErr != nil {
+					write(WSMessage{Type: "response", Content: fmt.Sprintf("Warning: failed to save session: %v", persistErr)})
+				}
 				tokens.flush()
 				write(WSMessage{Type: "stream_end"})
 				write(s.contextMsg(r.Context()))
@@ -638,6 +674,19 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) HandleStatic(w http.ResponseWriter, r *http.Request) {
+	secure := r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+	// Bootstrap: accept ?token= once, set HttpOnly cookie, redirect without query.
+	if s.authToken != "" {
+		if q := strings.TrimSpace(r.URL.Query().Get("token")); q != "" {
+			if q == s.authToken {
+				setAuthCookie(w, s.authToken, secure)
+				http.Redirect(w, r, r.URL.Path, http.StatusFound)
+				return
+			}
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
 	if !s.checkAuth(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -647,6 +696,7 @@ func (s *Server) HandleStatic(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write(content)
 }
 
@@ -654,8 +704,10 @@ func (s *Server) checkAuth(r *http.Request) bool {
 	if s.authToken == "" {
 		return true
 	}
-	if tok := strings.TrimSpace(r.URL.Query().Get("token")); tok != "" && tok == s.authToken {
-		return true
+	if c, err := r.Cookie(authCookieName); err == nil {
+		if strings.TrimSpace(c.Value) == s.authToken {
+			return true
+		}
 	}
 	if tok := strings.TrimSpace(r.Header.Get("X-Gogen-Token")); tok != "" && tok == s.authToken {
 		return true
@@ -675,11 +727,17 @@ func (s *Server) Start(addr string) error {
 		if s.authToken == "" {
 			return fmt.Errorf("non-loopback bind %q requires GOGEN_WEB_TOKEN (or web_auth_token) for authentication", addr)
 		}
-		log.Printf("warning: listening on non-loopback %s with token auth enabled", addr)
+		if s.tlsCertFile == "" || s.tlsKeyFile == "" {
+			return fmt.Errorf("non-loopback bind %q requires TLS: set GOGEN_WEB_TLS_CERT and GOGEN_WEB_TLS_KEY (or web_tls_cert_file / web_tls_key_file)", addr)
+		}
+		log.Printf("listening on non-loopback %s with token auth and TLS", addr)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", s.HandleWS)
 	mux.HandleFunc("/", s.HandleStatic)
+	if s.tlsCertFile != "" && s.tlsKeyFile != "" {
+		return http.ListenAndServeTLS(addr, s.tlsCertFile, s.tlsKeyFile, mux)
+	}
 	return http.ListenAndServe(addr, mux)
 }
 

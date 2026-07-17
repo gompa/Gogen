@@ -336,6 +336,7 @@ func (m *Model) renderHelpModal() string {
 		}},
 		{"Text Selection", [][]string{
 			{"click+drag", "Select text in viewport"},
+			{"ctrl+shift+c", "Copy selection"},
 			{"right click", "Cancel selection"},
 			{"esc", "Dismiss modal / focus viewport"},
 		}},

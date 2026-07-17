@@ -12,6 +12,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/muesli/reflow v0.3.0
 	github.com/openai/openai-go v1.12.0
+	github.com/tiktoken-go/tokenizer v0.8.1
 	github.com/tree-sitter-grammars/tree-sitter-hcl v1.2.0
 	github.com/tree-sitter-grammars/tree-sitter-lua v0.5.0
 	github.com/tree-sitter-grammars/tree-sitter-toml v0.7.0
@@ -34,6 +35,7 @@ require (
 	github.com/tree-sitter/tree-sitter-typescript v0.23.2
 	golang.org/x/net v0.55.0
 	golang.org/x/term v0.44.0
+	golang.org/x/time v0.15.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -44,6 +46,7 @@ require (
 	github.com/clipperhouse/displaywidth v0.9.0 // indirect
 	github.com/clipperhouse/stringish v0.1.1 // indirect
 	github.com/clipperhouse/uax29/v2 v2.5.0 // indirect
+	github.com/dlclark/regexp2/v2 v2.5.1 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
 	github.com/lucasb-eyer/go-colorful v1.3.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect

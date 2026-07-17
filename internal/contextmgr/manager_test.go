@@ -71,7 +71,7 @@ func TestShouldCompactWhenOverBudget(t *testing.T) {
 		MaxToolResultBytes:   8192,
 		CompactReserveTokens: 20,
 	})
-	big := strings.Repeat("x", 4000)
+	big := strings.Repeat("token ", 2000)
 	msgs := []llm.Message{
 		{Role: "user", Content: "task"},
 		{Role: "assistant", Content: big},

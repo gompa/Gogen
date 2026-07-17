@@ -12,9 +12,13 @@ import (
 type stubSessionStore struct {
 	sessions map[string]SessionSnapshot
 	order    []string
+	saveErr  error
 }
 
 func (s *stubSessionStore) Save(id string, snap SessionSnapshot) error {
+	if s.saveErr != nil {
+		return s.saveErr
+	}
 	if s.sessions == nil {
 		s.sessions = make(map[string]SessionSnapshot)
 	}
@@ -220,5 +224,30 @@ func TestHandleSessionCommandDeleteCurrent(t *testing.T) {
 	}
 	if a.SessionID != "fresh-id" || len(a.Messages) != 0 {
 		t.Fatalf("session=%s messages=%d", a.SessionID, len(a.Messages))
+	}
+}
+
+func TestPersistSessionRecordsError(t *testing.T) {
+	store := &stubSessionStore{saveErr: errString("disk full")}
+	a := &Agent{
+		Provider:     &statsStubProvider{},
+		WorkingDir:   "/tmp",
+		SessionStore: store,
+		SessionID:    "s1",
+		Messages:     []llm.Message{{Role: "user", Content: "hi"}},
+	}
+	a.persistSession()
+	err := a.ConsumePersistError()
+	if err == nil || !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("expected persist error, got %v", err)
+	}
+	if a.ConsumePersistError() != nil {
+		t.Fatal("expected consume to clear error")
+	}
+
+	store.saveErr = nil
+	a.persistSession()
+	if a.ConsumePersistError() != nil {
+		t.Fatal("expected successful save to clear persist error")
 	}
 }

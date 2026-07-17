@@ -27,10 +27,11 @@ var blockedCommandPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\bsu\s+-`),
 	regexp.MustCompile(`(?i)\brm\s+(-[^\s]*\s+)*-[^\s]*r[^\s]*\s+(/|\./\.\./|/\*|~|\$HOME|\$\{HOME\}|\.)`),
 	regexp.MustCompile(`(?i)\brm\s+(-[^\s]*\s+)*(/|\./\.\./|/\*|~|\$HOME|\$\{HOME\})`),
+	regexp.MustCompile(`(?i)\brm\s+(-[^\s]*\s+)*--\s+(/|~|\$HOME|\$\{HOME\})`),
 	regexp.MustCompile(`(?i)\bmkfs\b`),
 	regexp.MustCompile(`(?i)\bdd\s+(if=|of=)`),
 	regexp.MustCompile(`(?i)\bchmod\s+(-[^\s]*\s+)*777\b`),
-	regexp.MustCompile(`(?i)\bchown\s+(-[^\s]*\s+)*(-R\s+)?/`),
+	regexp.MustCompile(`(?i)\bchown\b[^\n]*/`),
 	regexp.MustCompile(`(?i)(curl|wget)[^\n|]*\|\s*(ba)?sh\b`),
 	regexp.MustCompile(`(?i)\|\s*(ba)?sh\s*(\s|$|<)`),
 	regexp.MustCompile(`(?i)\|\s*(python3?|perl|ruby|node|zsh|php)\b`),
@@ -40,9 +41,13 @@ var blockedCommandPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\breboot\b`),
 	regexp.MustCompile(`(?i)\bpoweroff\b`),
 	regexp.MustCompile(`(?i)\bkill\s+-9\s+1\b`),
-	regexp.MustCompile(`(?i)\b:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:`), // fork bomb
+	regexp.MustCompile(`(?i):\(\)\s*\{`), // fork bomb
 	regexp.MustCompile(`(?i)\bnc\s+(-[^\s]*\s+)*-e\b`),
 	regexp.MustCompile(`(?i)\b(nmap|masscan)\b`),
+	regexp.MustCompile(`(?i)\bchmod\s+(-[^\s]*\s+)*\+[xs]\s+/`),
+	regexp.MustCompile(`(?i)\btee\s+(/etc/|/usr/)`),
+	regexp.MustCompile(`(?i)>\s*/etc/`),
+	regexp.MustCompile(`(?i)\bxargs\s+(-[^\s]*\s+)*rm\b`),
 }
 
 func (g *CommandGuard) Check(command string) error {

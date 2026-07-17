@@ -253,6 +253,33 @@ func parseYAMLFrontMatter(yamlText string) (FileConfig, error) {
 	if v, ok := raw["web_auth_token"]; ok {
 		cfg.WebAuthToken = asString(v)
 	}
+	if v, ok := raw["web_tls_cert_file"]; ok {
+		cfg.WebTLSCertFile = asString(v)
+	}
+	if v, ok := raw["web_tls_key_file"]; ok {
+		cfg.WebTLSKeyFile = asString(v)
+	}
+	if v, ok := raw["session_max_count"]; ok {
+		n, err := asInt(v)
+		if err == nil {
+			cfg.SessionMaxCount = n
+		}
+	}
+	if v, ok := raw["session_max_age_days"]; ok {
+		n, err := asInt(v)
+		if err == nil {
+			cfg.SessionMaxAgeDays = n
+		}
+	}
+	if v, ok := raw["command_sandbox"]; ok {
+		cfg.CommandSandbox = asString(v)
+	}
+	if v, ok := raw["command_timeout_secs"]; ok {
+		n, err := asInt(v)
+		if err == nil {
+			cfg.CommandTimeoutSecs = n
+		}
+	}
 	if v, ok := raw["web_fetch"]; ok {
 		cfg.WebFetch = asOnOffString(v)
 	}

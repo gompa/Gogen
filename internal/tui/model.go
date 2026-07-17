@@ -321,6 +321,16 @@ func (m *Model) Init() tea.Cmd {
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
+	// Enhanced keyboard: ctrl+shift+c may arrive as an undecoded CSI sequence
+	// (kitty / xterm modifyOtherKeys) rather than a KeyMsg.
+	if _, ok := msg.(tea.KeyMsg); !ok && isCtrlShiftC(msg) {
+		if m.statusMsg != "" {
+			m.statusMsg = ""
+		}
+		m.copySelection()
+		return m, nil
+	}
+
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.SetSize(msg.Width, msg.Height)
@@ -338,6 +348,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Clear transient status message on any key press
 		if m.statusMsg != "" {
 			m.statusMsg = ""
+		}
+		if key.Matches(msg, m.keys.CopySelection) {
+			m.copySelection()
+			return m, nil
 		}
 		// Global hotkeys that work regardless of focus/modal
 		switch {
@@ -790,6 +804,11 @@ func (m *Model) handleStreamEnd() {
 	// ContextStats is read-only and local (no provider I/O) — safe on the
 	// Update thread once StreamProcessInput has returned.
 	m.refreshContextStats()
+	if m.agent != nil {
+		if err := m.agent.ConsumePersistError(); err != nil {
+			m.statusMsg = fmt.Sprintf("Warning: failed to save session: %v", err)
+		}
+	}
 	m.setViewportContent()
 	m.viewport.GotoBottom()
 }
@@ -839,6 +858,11 @@ func (m *Model) handleStreamError(err error) {
 	m.streamToolCallIDs = make(map[int]string)
 	m.toolCallDiffs = make(map[string]string)
 	m.refreshContextStats()
+	if m.agent != nil {
+		if persistErr := m.agent.ConsumePersistError(); persistErr != nil {
+			m.statusMsg = fmt.Sprintf("Warning: failed to save session: %v", persistErr)
+		}
+	}
 	if err == nil {
 		return
 	}

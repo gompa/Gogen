@@ -1,8 +1,10 @@
 package tui
 
 import (
+	"bytes"
 	"fmt"
 	"os"
+	"reflect"
 	"regexp"
 	"strings"
 	"unicode/utf8"
@@ -83,63 +85,78 @@ func (m *Model) ensureWrappedLines() {
 	m.wrappedLinesDirty = false
 }
 
-// SelectionState tracks the in-progress text selection.
+// SelectionState tracks the in-progress or finalized text selection.
+// StartX/EndX are terminal cell columns (not byte offsets) into the plain line.
 type SelectionState struct {
-	Active bool
-	StartX int // column in plain content (0-based)
-	StartY int // line in plain content (0-based)
-	EndX   int
-	EndY   int
+	Active   bool
+	Dragging bool // true while the mouse button is held during a drag
+	StartX   int  // cell column in plain content (0-based)
+	StartY   int  // line in plain content (0-based)
+	EndX     int
+	EndY     int
+}
+
+// hasSelection reports whether there is a non-empty finalized or in-progress selection.
+func (m *Model) hasSelection() bool {
+	return m.selection != nil && m.selection.Active && m.getSelectedText() != ""
 }
 
 // handleMouseSelection processes mouse events for text selection.
 // Returns true if the event was consumed (selection handled), false if
 // it should be passed through to the viewport for wheel scrolling.
 func (m *Model) handleMouseSelection(msg tea.MouseMsg) bool {
-	// Wheel events go to the viewport only when there's no active selection.
-	// During selection, we block scrolling to keep coordinates stable.
+	// Block wheel only while dragging so content coordinates stay stable.
+	// After release, scrolling is allowed and the highlight tracks content.
 	if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown ||
 		msg.Button == tea.MouseButtonWheelLeft || msg.Button == tea.MouseButtonWheelRight {
-		if m.selection != nil && m.selection.Active {
-			return true // consume wheel during selection
+		if m.selection != nil && m.selection.Dragging {
+			return true
 		}
 		return false
 	}
 
 	vpHeight := m.viewport.Height
 
-	// Active selection: motion updates endpoint, release finalizes, anything
-	// else that isn't a new left-press cancels.
 	if m.selection != nil && m.selection.Active {
 		switch {
-		case msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionMotion:
+		case m.selection.Dragging && msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionMotion:
 			x, y := m.mouseToContent(msg.X, msg.Y)
 			if x >= 0 && y >= 0 {
 				m.selection.EndX = x
 				m.selection.EndY = y
 			}
 			return true
-		case msg.Action == tea.MouseActionRelease:
+		case m.selection.Dragging && msg.Action == tea.MouseActionRelease:
+			m.selection.Dragging = false
+			m.selectionYOff = -1 // unlock scroll; coords are content-absolute
 			text := m.getSelectedText()
-			m.selection = nil
-			if text != "" {
-				if err := copyToClipboard(text); err == nil {
-					m.statusMsg = fmt.Sprintf("✓ Copied %d chars to clipboard", len(text))
-				} else {
-					m.statusMsg = fmt.Sprintf("Selected %d chars (copy failed: %v)", len(text), err)
-				}
+			if text == "" {
+				m.clearSelection()
+				m.statusMsg = ""
 			} else {
-				m.statusMsg = "(empty selection)"
+				m.statusMsg = fmt.Sprintf("Selected %d chars — ctrl+shift+c to copy", utf8.RuneCountInString(text))
 			}
 			return true
-		default:
-			// Any other mouse event (right click, new left press, etc.) cancels
+		case msg.Button == tea.MouseButtonRight &&
+			(msg.Action == tea.MouseActionPress || msg.Action == tea.MouseActionRelease):
 			m.clearSelection()
+			m.statusMsg = ""
+			return true
+		case !m.selection.Dragging && msg.Button == tea.MouseButtonLeft &&
+			msg.Action == tea.MouseActionPress && msg.Y >= 0 && msg.Y < vpHeight:
+			// Replace the existing selection; start logic below the if handles it.
+			m.clearSelection()
+		case m.selection.Dragging:
+			// Ignore other events while dragging (e.g. ButtonNone motion that
+			// some terminals emit). Do NOT clear — that was wiping the
+			// selection before the user could copy.
+			return true
+		default:
 			return false
 		}
 	}
 
-	// No active selection: look for left-press inside viewport to start one
+	// No active selection (or just cleared): left-press inside viewport starts one.
 	if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress &&
 		msg.Y >= 0 && msg.Y < vpHeight {
 		x, y := m.mouseToContent(msg.X, msg.Y)
@@ -147,11 +164,12 @@ func (m *Model) handleMouseSelection(msg tea.MouseMsg) bool {
 		if x >= 0 && y >= 0 {
 			m.selectionYOff = m.viewport.YOffset
 			m.selection = &SelectionState{
-				Active: true,
-				StartX: x,
-				StartY: y,
-				EndX:   x,
-				EndY:   y,
+				Active:   true,
+				Dragging: true,
+				StartX:   x,
+				StartY:   y,
+				EndX:     x,
+				EndY:     y,
 			}
 		}
 		return true
@@ -160,13 +178,129 @@ func (m *Model) handleMouseSelection(msg tea.MouseMsg) bool {
 	return false
 }
 
+// copySelection copies the current selection to the clipboard.
+// Returns true if a selection was present (even if copy failed).
+// On failure the selection is kept so the user can retry.
+func (m *Model) copySelection() bool {
+	text := m.getSelectedText()
+	if text == "" {
+		return false
+	}
+	if err := copyToClipboard(text); err == nil {
+		m.statusMsg = fmt.Sprintf("✓ Copied %d chars to clipboard", utf8.RuneCountInString(text))
+		m.clearSelection()
+	} else {
+		m.statusMsg = fmt.Sprintf("Copy failed: %v", err)
+	}
+	return true
+}
+
+// isCtrlShiftC reports whether msg is Ctrl+Shift+C.
+// Bubble Tea v1 only decodes that combo for special keys; modern terminals
+// often send kitty/xterm CSI sequences that arrive as an opaque []byte-based msg.
+func isCtrlShiftC(msg tea.Msg) bool {
+	if km, ok := msg.(tea.KeyMsg); ok {
+		switch km.String() {
+		case "ctrl+shift+c", "ctrl+shift+C":
+			return true
+		}
+		return false
+	}
+	b := byteSliceMsg(msg)
+	if len(b) == 0 {
+		return false
+	}
+	// kitty keyboard protocol: CSI 99 ; 6 u  (99='c', 6=ctrl+shift)
+	// xterm modifyOtherKeys:   CSI 27 ; 6 ; 99 ~
+	return bytes.Equal(b, []byte("\x1b[99;6u")) ||
+		bytes.Equal(b, []byte("\x1b[99;6U")) ||
+		bytes.Equal(b, []byte("\x1b[27;6;99~"))
+}
+
+// byteSliceMsg extracts a []byte payload from msg.
+// Bubble Tea's unknownCSISequenceMsg is an unexported defined []byte type,
+// so a plain []byte assert is not enough — reflect handles that case.
+func byteSliceMsg(msg tea.Msg) []byte {
+	if b, ok := msg.([]byte); ok {
+		return b
+	}
+	v := reflect.ValueOf(msg)
+	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
+		return append([]byte(nil), v.Bytes()...)
+	}
+	return nil
+}
+
+// runeWidth returns the terminal cell width of r (at least 1 for printable).
+func runeWidth(r rune) int {
+	w := ansi.StringWidth(string(r))
+	if w < 1 {
+		return 1
+	}
+	return w
+}
+
+// sliceByCells returns the substring of s covering terminal cells [start, end).
+func sliceByCells(s string, start, end int) string {
+	if start < 0 {
+		start = 0
+	}
+	if end <= start {
+		return ""
+	}
+	var b strings.Builder
+	col := 0
+	for _, r := range s {
+		rw := runeWidth(r)
+		next := col + rw
+		if next > start && col < end {
+			b.WriteRune(r)
+		}
+		col = next
+		if col >= end {
+			break
+		}
+	}
+	return b.String()
+}
+
+// cellsToRuneRange maps a half-open cell range to a half-open rune range in s.
+func cellsToRuneRange(s string, startCell, endCell int) (startRi, endRi int) {
+	if endCell <= startCell {
+		return 0, 0
+	}
+	col := 0
+	ri := 0
+	startRi = -1
+	for _, r := range s {
+		rw := runeWidth(r)
+		next := col + rw
+		if next > startCell && col < endCell {
+			if startRi < 0 {
+				startRi = ri
+			}
+			endRi = ri + 1
+		}
+		col = next
+		ri++
+		if col >= endCell {
+			break
+		}
+	}
+	if startRi < 0 {
+		return 0, 0
+	}
+	return startRi, endRi
+}
+
 // mouseToContent converts terminal-relative mouse coordinates to
-// content coordinates (line and column in the plain wrapped content).
+// content coordinates (line and cell column in the plain wrapped content).
 func (m *Model) mouseToContent(mouseX, mouseY int) (int, int) {
 	m.ensureWrappedLines()
-	// Account for viewport scroll position
+	// Account for viewport scroll position. While dragging, freeze to the
+	// YOffset captured at press so motion coordinates stay stable.
 	contentY := mouseY + m.viewport.YOffset
-	if m.selection != nil && m.selection.Active && m.selectionYOff >= 0 {
+	if m.selection != nil && m.selection.Dragging && m.selectionYOff >= 0 {
 		contentY = mouseY + m.selectionYOff
 	}
 	if contentY < 0 || contentY >= len(m.wrappedLines) {
@@ -181,15 +315,15 @@ func (m *Model) mouseToContent(mouseX, mouseY int) (int, int) {
 	}
 
 	line := m.wrappedLines[contentY]
-	if contentX > len(line) {
-		contentX = len(line)
+	if max := ansi.StringWidth(line); contentX > max {
+		contentX = max
 	}
 
 	return contentX, contentY
 }
 
 // getSelectedText returns the plain text currently selected, or "" if
-// nothing is selected.
+// nothing is selected. StartX/EndX are cell columns.
 func (m *Model) getSelectedText() string {
 	m.ensureWrappedLines()
 	if m.selection == nil || len(m.wrappedLines) == 0 {
@@ -212,24 +346,19 @@ func (m *Model) getSelectedText() string {
 		}
 		line := m.wrappedLines[y]
 		ls := 0
-		le := len(line)
+		le := ansi.StringWidth(line)
 		if y == startY {
 			ls = startX
 		}
 		if y == endY {
 			le = endX
 		}
-		if ls > len(line) {
-			ls = len(line)
-		}
-		if le > len(line) {
-			le = len(line)
-		}
-		if le > ls {
+		chunk := sliceByCells(line, ls, le)
+		if chunk != "" {
 			if b.Len() > 0 {
 				b.WriteByte('\n')
 			}
-			b.WriteString(line[ls:le])
+			b.WriteString(chunk)
 		}
 	}
 	return b.String()
@@ -262,9 +391,9 @@ func (m *Model) renderViewportWithSelection() string {
 	contentWidth := w - m.viewport.Style.GetHorizontalFrameSize()
 	contentHeight := h - m.viewport.Style.GetVerticalFrameSize()
 
-	// Use selection start YOffset if available, otherwise current viewport offset.
+	// Freeze scroll offset only while dragging; after release follow viewport.
 	yOff := m.viewport.YOffset
-	if m.selectionYOff >= 0 {
+	if m.selection != nil && m.selection.Dragging && m.selectionYOff >= 0 {
 		yOff = m.selectionYOff
 	}
 	styledLines := m.styledLines
@@ -295,19 +424,20 @@ func (m *Model) renderViewportWithSelection() string {
 		if ci < len(styledLines) && ci < len(m.wrappedLines) {
 			line := styledLines[ci]
 			if ci >= selSY && ci <= selEY {
+				lineWidth := ansi.StringWidth(m.wrappedLines[ci])
 				hs := 0
-				he := len(m.wrappedLines[ci])
+				he := lineWidth
 				if ci == selSY {
 					hs = selSX
 				}
 				if ci == selEY {
 					he = selEX
 				}
-				if hs > len(m.wrappedLines[ci]) {
-					hs = len(m.wrappedLines[ci])
+				if hs > lineWidth {
+					hs = lineWidth
 				}
-				if he > len(m.wrappedLines[ci]) {
-					he = len(m.wrappedLines[ci])
+				if he > lineWidth {
+					he = lineWidth
 				}
 				if hs < he {
 					line = highlightPlainRange(line, m.wrappedLines[ci], hs, he)
@@ -334,18 +464,16 @@ func (m *Model) renderViewportWithSelection() string {
 }
 
 // highlightPlainRange inserts reverse-video ANSI codes (\x1b[7m ... \x1b[27m)
-// into a styled string at a plain-text character range. It preserves all
-// existing ANSI styling while adding the selection highlight on top.
+// into a styled string over terminal cells [start, end) of the plain text.
+// It preserves all existing ANSI styling while adding the selection highlight.
 func highlightPlainRange(styled, plain string, start, end int) string {
-	if start >= end || start >= len(plain) {
+	startRi, endRi := cellsToRuneRange(plain, start, end)
+	if startRi >= endRi {
 		return styled
 	}
-	if end > len(plain) {
-		end = len(plain)
-	}
 
-	styledStart := mapPlainToStyled(start, styled)
-	styledEnd := mapPlainToStyled(end, styled)
+	styledStart := mapPlainToStyled(startRi, styled)
+	styledEnd := mapPlainToStyled(endRi, styled)
 
 	if styledStart >= styledEnd {
 		return styled
@@ -354,7 +482,7 @@ func highlightPlainRange(styled, plain string, start, end int) string {
 	return styled[:styledStart] + "\x1b[7m" + styled[styledStart:styledEnd] + "\x1b[27m" + styled[styledEnd:]
 }
 
-// mapPlainToStyled maps a plain-text character position to the corresponding
+// mapPlainToStyled maps a plain-text rune index to the corresponding
 // byte offset in an ANSI-styled string. It skips over ANSI escape sequences
 // and handles UTF-8 multi-byte characters.
 func mapPlainToStyled(plainIdx int, styled string) int {

@@ -2,13 +2,30 @@ package agent
 
 import (
 	"fmt"
+	"sync"
 
 	"gogen/internal/llm"
 )
 
+// systemPromptCache caches the formatted system prompt per working directory.
+var systemPromptCache sync.Map // workingDir string -> prompt string
+
 // SystemPrompt returns the default agent system prompt.
 func SystemPrompt(workingDir string) string {
-	return fmt.Sprintf(`You are GoGen, a coding agent working in the local repository at %s.
+	if cached, ok := systemPromptCache.Load(workingDir); ok {
+		return cached.(string)
+	}
+	// Cache the template body once (empty key) so we don't re-allocate the
+	// large template string for every distinct working directory either.
+	const templateKey = "\x00template"
+	tmpl, _ := systemPromptCache.LoadOrStore(templateKey, systemPromptTemplate())
+	prompt := fmt.Sprintf(tmpl.(string), workingDir)
+	systemPromptCache.Store(workingDir, prompt)
+	return prompt
+}
+
+func systemPromptTemplate() string {
+	return `You are GoGen, a coding agent working in the local repository at %s.
 
 Capabilities:
 - Explore files (repo_overview, list_files, glob_files, read_file with offset/limit, read_files, list_definitions)
@@ -64,7 +81,7 @@ Documentation (README, CONTRIBUTING, etc.):
 - Do not list planned or roadmap features as shipped; use TBD or omit if unimplemented.
 - Do not treat temp or scratch directories as permanent architecture.
 - README is for humans; put agent-specific runbooks in project rules files when this repo provides them.
-- After editing docs, use search_code to verify env var names, tool names, commands, and paths you mentioned appear in the repo.`, workingDir)
+- After editing docs, use search_code to verify env var names, tool names, commands, and paths you mentioned appear in the repo.`
 }
 
 func withSystemPrompt(messages []llm.Message, workingDir string) []llm.Message {

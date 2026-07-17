@@ -46,13 +46,21 @@ type Config struct {
 	WebBind           string // listen address for --web (default 127.0.0.1:8080)
 	WebAllowedOrigins string // comma-separated host allowlist; empty uses localhost defaults
 	WebAuthToken      string // required for non-loopback binds; also GOGEN_WEB_TOKEN
+	WebTLSCertFile    string // PEM cert for TLS (required with key for non-loopback)
+	WebTLSKeyFile     string // PEM key for TLS
 
-	WebFetch           string // on, off
-	WebSearch          string // on, off
-	WebSearchBackend   string // brave or "" for ddg
-	WebSearchAPIKey    string // Brave API key
-	WebAllowedDomains  string // comma-separated domain suffix allowlist
-	WebFetchMode       string // https, all
+	SessionMaxCount   int // max saved sessions per working dir (0 = default 50)
+	SessionMaxAgeDays int // delete sessions older than N days (0 = default 30)
+
+	WebFetch          string // on, off
+	WebSearch         string // on, off
+	WebSearchBackend  string // brave or "" for ddg
+	WebSearchAPIKey   string // Brave API key
+	WebAllowedDomains string // comma-separated domain suffix allowlist
+	WebFetchMode      string // https, all
+
+	CommandSandbox     string // off, bwrap (bubblewrap when available)
+	CommandTimeoutSecs int    // execute_command timeout; 0 = default 120s
 }
 
 // Defaults returns built-in default configuration values.
@@ -78,12 +86,18 @@ func Defaults() Config {
 		MCP:                  "on",
 		WebBind:              "127.0.0.1:8080",
 		WebAllowedOrigins:    "",
+		WebTLSCertFile:       "",
+		WebTLSKeyFile:        "",
+		SessionMaxCount:      50,
+		SessionMaxAgeDays:    30,
 		WebFetch:             "on",
 		WebSearch:            "on",
 		WebSearchBackend:     "",
 		WebSearchAPIKey:      "",
 		WebAllowedDomains:    "",
 		WebFetchMode:         "https",
+		CommandSandbox:       "off",
+		CommandTimeoutSecs:   120,
 	}
 }
 

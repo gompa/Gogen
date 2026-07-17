@@ -2,6 +2,7 @@ package contextmgr
 
 import (
 	"fmt"
+	"hash/fnv"
 	"sync"
 
 	"gogen/internal/llm"
@@ -22,11 +23,18 @@ func getCodec() (tokenizer.Codec, error) {
 	return codec, encErr
 }
 
+type tokenCacheEntry struct {
+	n  int
+	fp uint64 // fingerprint of role+content+tool metadata
+}
+
 // tokenCache caches token counts by message pointer to avoid re-tokenizing
 // the same messages across multiple calls to EstimateTokens within a turn.
+// Entries are validated with a content fingerprint so GC address reuse and
+// in-place mutations cannot return stale counts.
 var tokenCache struct {
 	sync.RWMutex
-	m map[any]int
+	m map[any]tokenCacheEntry
 }
 
 // initTokenCache lazily initializes the token cache map.
@@ -34,41 +42,72 @@ func initTokenCache() {
 	tokenCache.Lock()
 	defer tokenCache.Unlock()
 	if tokenCache.m == nil {
-		tokenCache.m = make(map[any]int)
+		tokenCache.m = make(map[any]tokenCacheEntry)
 	}
 }
 
-// cachedTokenCount returns the cached token count for a message, or 0 if
-// the message is not cached.
+// cachedTokenCount returns the cached token count for a message when the
+// fingerprint still matches.
 func cachedTokenCount(msg *llm.Message) (int, bool) {
 	tokenCache.RLock()
 	defer tokenCache.RUnlock()
 	if tokenCache.m == nil {
 		return 0, false
 	}
-	n, ok := tokenCache.m[msg]
-	return n, ok
+	e, ok := tokenCache.m[msg]
+	if !ok || e.fp != messageFingerprint(msg) {
+		return 0, false
+	}
+	return e.n, true
 }
 
 // storeTokenCount caches the token count for a message.
 func storeTokenCount(msg *llm.Message, n int) {
 	initTokenCache()
 	tokenCache.Lock()
-	tokenCache.m[msg] = n
+	tokenCache.m[msg] = tokenCacheEntry{n: n, fp: messageFingerprint(msg)}
 	tokenCache.Unlock()
 }
 
-// invalidateTokenCache clears all cached entries. Call this when the message
+// InvalidateTokenCache clears all cached entries. Call this when the message
 // list is compacted, messages are mutated, or between turns to bound memory.
-func invalidateTokenCache() {
+func InvalidateTokenCache() {
 	tokenCache.Lock()
 	tokenCache.m = nil
 	tokenCache.Unlock()
 }
 
+func messageFingerprint(msg *llm.Message) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(msg.Role))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(msg.Content))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(msg.ToolCallID))
+	for _, tc := range msg.ToolCalls {
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(tc.ID))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(tc.Name))
+		_, _ = h.Write([]byte{0})
+		if tc.ArgsStr != "" {
+			_, _ = h.Write([]byte(tc.ArgsStr))
+		} else {
+			for k, v := range tc.Args {
+				_, _ = h.Write([]byte(k))
+				_, _ = h.Write([]byte{0})
+				_, _ = h.Write([]byte(fmt.Sprint(v)))
+				_, _ = h.Write([]byte{0})
+			}
+		}
+	}
+	return h.Sum64()
+}
+
 // EstimateTokens approximates token count for a message list using cl100k_base
 // (GPT-family). Falls back to a bytes/4 heuristic if the tokenizer is unavailable.
-// Results are cached by message pointer to avoid re-tokenizing within a turn.
+// Results are cached by message pointer (with fingerprint validation) to avoid
+// re-tokenizing within a turn.
 func (m *Manager) EstimateTokens(messages []llm.Message) int {
 	total := 0
 	for i := range messages {

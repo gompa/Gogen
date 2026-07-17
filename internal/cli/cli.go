@@ -190,6 +190,9 @@ func (c *CLI) Run(ctx context.Context) {
 			}
 			continue
 		}
+		if err := c.agent.ConsumePersistError(); err != nil {
+			fmt.Printf("Warning: failed to save session: %v\n", err)
+		}
 		if line := agent.FormatContextBrief(c.agent.ContextStats(ctx)); line != "" {
 			fmt.Println(formatRightAlignedDimLine(line))
 		}

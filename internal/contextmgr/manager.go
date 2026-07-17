@@ -109,7 +109,6 @@ func (m *Manager) TruncateToolResult(content string) string {
 	return content[:max] + fmt.Sprintf("\n… truncated (%d chars total)", len(content))
 }
 
-
 // ContextSnapshot summarizes context window usage for display.
 type ContextSnapshot struct {
 	Limit         int
@@ -197,6 +196,9 @@ func (m *Manager) EnsureToolResultsCapped(messages []llm.Message) bool {
 		messages[i].Content = m.TruncateToolResult(messages[i].Content)
 		changed = true
 	}
+	if changed {
+		InvalidateTokenCache()
+	}
 	return changed
 }
 
@@ -263,6 +265,7 @@ func (m *Manager) CompactPinned(ctx context.Context, messages []llm.Message, pin
 	compact = append(compact, tail...)
 
 	newPinned := remapPinsAfterCompact(pinned, headIdx, oldTailStart, len(compact)-len(tail))
+	InvalidateTokenCache()
 	return compact, newPinned, nil
 }
 

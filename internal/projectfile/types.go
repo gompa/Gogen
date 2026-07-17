@@ -40,6 +40,12 @@ type FileConfig struct {
 	WebAllowedDomains    string
 	WebFetchMode         string
 	WebAuthToken         string
+	WebTLSCertFile       string
+	WebTLSKeyFile        string
+	SessionMaxCount      int
+	SessionMaxAgeDays    int
+	CommandSandbox       string
+	CommandTimeoutSecs   int
 }
 
 // ProjectFile is a loaded combined config + guidelines file.

@@ -34,9 +34,10 @@ type KeyMap struct {
 	FocusInput      key.Binding
 
 	// Global
-	Help    key.Binding
-	Quit    key.Binding
-	Verbose key.Binding
+	Help          key.Binding
+	Quit          key.Binding
+	Verbose       key.Binding
+	CopySelection key.Binding
 }
 
 var DefaultKeyMap = KeyMap{
@@ -67,9 +68,10 @@ var DefaultKeyMap = KeyMap{
 	FocusViewport:    key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "focus viewport")),
 	FocusInput:      key.NewBinding(key.WithKeys("i", "enter"), key.WithHelp("i/enter", "focus input")),
 
-	Help:    key.NewBinding(key.WithKeys("f1"), key.WithHelp("f1 / ?", "help")),
-	Quit:    key.NewBinding(key.WithKeys("ctrl+c"), key.WithHelp("ctrl+c", "quit")),
-	Verbose: key.NewBinding(key.WithKeys("ctrl+v"), key.WithHelp("ctrl+v", "toggle verbose")),
+	Help:          key.NewBinding(key.WithKeys("f1"), key.WithHelp("f1 / ?", "help")),
+	Quit:          key.NewBinding(key.WithKeys("ctrl+c"), key.WithHelp("ctrl+c", "quit")),
+	Verbose:       key.NewBinding(key.WithKeys("ctrl+v"), key.WithHelp("ctrl+v", "toggle verbose")),
+	CopySelection: key.NewBinding(key.WithKeys("ctrl+shift+c"), key.WithHelp("ctrl+shift+c", "copy selection")),
 }
 
 // FullHelp returns keybindings for the full help view.

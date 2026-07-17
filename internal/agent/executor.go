@@ -20,6 +20,8 @@ type Executor struct {
 	WorkingDir            string
 	Commands              *CommandGuard
 	RequireDeleteApproval bool
+	CommandTimeout        time.Duration // 0 = default 2 minutes
+	Sandbox               string        // off, bwrap
 }
 
 func NewExecutor(wd string) *Executor {
@@ -27,6 +29,8 @@ func NewExecutor(wd string) *Executor {
 		WorkingDir:            wd,
 		Commands:              NewCommandGuard("blocklist", nil),
 		RequireDeleteApproval: true,
+		CommandTimeout:        2 * time.Minute,
+		Sandbox:               "off",
 	}
 }
 
@@ -38,6 +42,8 @@ func NewExecutorWithGuard(wd string, guard *CommandGuard) *Executor {
 		WorkingDir:            wd,
 		Commands:              guard,
 		RequireDeleteApproval: true,
+		CommandTimeout:        2 * time.Minute,
+		Sandbox:               "off",
 	}
 }
 
@@ -256,7 +262,10 @@ func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	timeout := 5 * time.Minute
+	timeout := e.CommandTimeout
+	if timeout <= 0 {
+		timeout = 2 * time.Minute
+	}
 	if deadline, ok := ctx.Deadline(); ok {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
@@ -269,7 +278,10 @@ func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	cmd, err := e.buildShellCommand(ctx, command)
+	if err != nil {
+		return "", err
+	}
 	cmd.Dir = e.WorkingDir
 	out, err := cmd.CombinedOutput()
 	outStr := string(out)
@@ -283,6 +295,41 @@ func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, 
 		return outStr, fmt.Errorf("execution error: %w", err)
 	}
 	return outStr, nil
+}
+
+func (e *Executor) buildShellCommand(ctx context.Context, command string) (*exec.Cmd, error) {
+	sandbox := strings.ToLower(strings.TrimSpace(e.Sandbox))
+	switch sandbox {
+	case "", "off":
+		return exec.CommandContext(ctx, "sh", "-c", command), nil
+	case "bwrap":
+		path, err := exec.LookPath("bwrap")
+		if err != nil {
+			return nil, fmt.Errorf("command_sandbox=bwrap but bwrap not found on PATH: %w", err)
+		}
+		wd := e.WorkingDir
+		if wd == "" {
+			wd = "."
+		}
+		// Restrict filesystem to the working directory; keep network and
+		// basic devices so builds/tests still work. Not a full container.
+		return exec.CommandContext(ctx, path,
+			"--die-with-parent",
+			"--unshare-pid",
+			"--dev", "/dev",
+			"--proc", "/proc",
+			"--ro-bind", "/usr", "/usr",
+			"--ro-bind", "/bin", "/bin",
+			"--ro-bind", "/lib", "/lib",
+			"--ro-bind-try", "/lib64", "/lib64",
+			"--ro-bind-try", "/etc", "/etc",
+			"--bind", wd, wd,
+			"--chdir", wd,
+			"sh", "-c", command,
+		), nil
+	default:
+		return nil, fmt.Errorf("unknown command_sandbox %q (use \"off\" or \"bwrap\")", e.Sandbox)
+	}
 }
 
 func (e *Executor) ReplaceInFile(path string, search string, replace string, replaceAll bool) (string, error) {

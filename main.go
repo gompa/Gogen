@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"gogen/internal/agent"
 	"gogen/internal/cli"
@@ -130,13 +131,20 @@ func main() {
 
 	exec := agent.NewExecutorWithGuard(cfg.WorkingDir, agent.NewCommandGuard(cfg.CommandSafetyMode, agent.ParseAllowlist(cfg.CommandAllowlist)))
 	exec.RequireDeleteApproval = cfg.DeleteApproval != "off"
+	exec.Sandbox = cfg.CommandSandbox
+	if cfg.CommandTimeoutSecs > 0 {
+		exec.CommandTimeout = time.Duration(cfg.CommandTimeoutSecs) * time.Second
+	}
 	a := agent.NewAgent(provider, exec, ctxMgr)
 	a.SetProjectContext(cfg.ProjectFilePath, cfg.ProjectGuidelines, cfg.TestCommand, cfg.LintCommand)
 	a.TodoManager = agent.NewTodoManager(cfg.WorkingDir)
 	a.PinManager = agent.NewPinManager()
 
 	sessionEnabled := os.Getenv("GOGEN_SESSION_PERSIST") != "off"
-	store := session.NewStore(sessionEnabled)
+	store := session.NewStoreWithOptions(sessionEnabled, session.StoreOptions{
+		MaxCount:   cfg.SessionMaxCount,
+		MaxAgeDays: cfg.SessionMaxAgeDays,
+	})
 	a.SessionStore = store
 	a.SessionID = session.NewID()
 	if sessionEnabled {

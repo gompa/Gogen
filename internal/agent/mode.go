@@ -13,6 +13,8 @@ const (
 // ErrPlanModeBlocked is returned when a tool is disabled in plan mode.
 var ErrPlanModeBlocked = fmt.Errorf("plan mode blocked tool")
 
+// planModeAllowedTools is the intentional read-mostly subset for plan mode.
+// Mutating tools from BuiltinTools() are excluded by omission.
 var planModeAllowedTools = map[string]struct{}{
 	"repo_overview":    {},
 	"list_files":       {},
@@ -27,8 +29,8 @@ var planModeAllowedTools = map[string]struct{}{
 	"git_blame":        {},
 	"git_status":       {},
 	// git_branch omitted: create/switch mutate the repo; list via execute outside plan.
-	"git_stash_list": {},
-	"git_show":       {},
+	"git_stash_list":   {},
+	"git_show":         {},
 	"web_search":       {},
 	"web_fetch":        {},
 	"find_file":        {},
@@ -41,47 +43,16 @@ var planModeAllowedTools = map[string]struct{}{
 	"context_pins":     {},
 }
 
-var builtinToolNames = []string{
-	"list_files",
-	"repo_overview",
-	"glob_files",
-	"read_file",
-	"read_files",
-	"list_definitions",
-	"write_file",
-	"execute_command",
-	"run_tests",
-	"run_lint",
-	"replace_in_file",
-	"delete_file",
-	"move_file",
-	"patch_file",
-	"show_diff",
-	"search_code",
-	"find_references",
-	"git_log",
-	"git_blame",
-	"git_status",
-	"git_commit",
-	"git_stage",
-	"git_branch",
-	"git_stash",
-	"git_stash_list",
-	"git_show",
-	"copy_file",
-	"todo_add",
-	"todo_list",
-	"todo_done",
-	"todo_remove",
-	"todo_clear_done",
-	"find_file",
-	"find_definition",
-	"session_rename",
-	"session_usage",
-	"context_pin_last",
-	"context_pins",
-	"web_search",
-	"web_fetch",
+// builtinToolNames is derived from BuiltinTools() so schema and allowlists stay in sync.
+var builtinToolNames = deriveBuiltinToolNames()
+
+func deriveBuiltinToolNames() []string {
+	tools := BuiltinTools()
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		names = append(names, t.Name)
+	}
+	return names
 }
 
 func (m Mode) String() string {

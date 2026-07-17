@@ -69,3 +69,33 @@ func TestExecuteCommandUsesWorkingDir(t *testing.T) {
 		t.Fatalf("unexpected output: %q", out)
 	}
 }
+
+func TestExecuteCommandBwrapMissingErrors(t *testing.T) {
+	dir := t.TempDir()
+	exec := NewExecutor(dir)
+	exec.Sandbox = "bwrap"
+	// Force LookPath failure by using a PATH without bwrap.
+	t.Setenv("PATH", dir)
+
+	_, err := exec.ExecuteCommand(context.Background(), "echo hi")
+	if err == nil {
+		t.Fatal("expected error when bwrap is missing")
+	}
+	if !strings.Contains(err.Error(), "bwrap not found") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestExecuteCommandUnknownSandboxErrors(t *testing.T) {
+	dir := t.TempDir()
+	exec := NewExecutor(dir)
+	exec.Sandbox = "docker"
+
+	_, err := exec.ExecuteCommand(context.Background(), "echo hi")
+	if err == nil {
+		t.Fatal("expected error for unknown sandbox")
+	}
+	if !strings.Contains(err.Error(), "unknown command_sandbox") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
