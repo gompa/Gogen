@@ -50,7 +50,7 @@ func renderMessages(messages []llm.Message, workingDir string, modelName string,
 				mark := ToolResultMarkStyle.Render("  ↳")
 				trimmed := strings.TrimSpace(msg.Content)
 				if len(trimmed) > 200 {
-					trimmed = trimmed[:197] + "..."
+					trimmed = truncateRunes(trimmed, 197) + "..."
 				}
 				lines = append(lines, mark+" "+DimStyle.Render(trimmed))
 			}
@@ -69,7 +69,7 @@ func formatToolArgs(args map[string]interface{}) string {
 	for k, v := range args {
 		val := fmt.Sprintf("%v", v)
 		if len(val) > 80 {
-			val = val[:77] + "..."
+			val = truncateRunes(val, 77) + "..."
 		}
 		parts = append(parts, fmt.Sprintf("%s=%q", k, val))
 	}

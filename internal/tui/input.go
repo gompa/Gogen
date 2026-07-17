@@ -27,6 +27,10 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if key.Matches(msg, m.keys.CancelTurn) {
 		if m.streaming {
 			m.streaming = false
+			// Cancel the underlying LLM stream
+			if m.streamCancel != nil {
+				m.streamCancel()
+			}
 			m.streamAssistantBuf.Reset()
 			m.streamThinkingBuf.Reset()
 			m.streamThinkingOpen = false
@@ -172,6 +176,10 @@ func (m *Model) handleViewportKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if key.Matches(msg, m.keys.CancelTurn) {
 		if m.streaming {
 			m.streaming = false
+			// Cancel the underlying LLM stream
+			if m.streamCancel != nil {
+				m.streamCancel()
+			}
 			m.streamAssistantBuf.Reset()
 			m.streamThinkingBuf.Reset()
 			m.streamThinkingOpen = false

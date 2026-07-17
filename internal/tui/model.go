@@ -54,6 +54,7 @@ type Model struct {
 	// State
 	focus       FocusTarget
 	modal       ModalKind
+	streamCancel  context.CancelFunc // cancels the current streaming LLM call
 	streaming   bool
 	verbose     bool
 	width       int
@@ -62,7 +63,9 @@ type Model struct {
 
 	// Chat content buffer (lines to render)
 	chatLines      []string
+	wrappedPrefix  string // pre-wrapped content of chatLines[:len-1], ends with "\n" if non-empty
 	wrappedContent string // pre-computed wrapped content for viewport
+	styledLines    []string // wrappedContent split by "\n" (cached for selection render)
 
 	// Streaming accumulation
 	streamAssistantBuf  strings.Builder
@@ -97,6 +100,7 @@ type Model struct {
 	// Modal data
 	sessionList    []agent.SessionInfo
 	modelList      []llm.ModelInfo
+	sessionCursor  int
 
 	// Keymap
 	keys           KeyMap
@@ -108,6 +112,7 @@ type Model struct {
 	selectionYOff int // viewport YOffset at selection start (for stable coordinates)
 	selection    *SelectionState
 	wrappedLines []string // ANSI-stripped wrapped content lines (coordinate mapping)
+	wrappedLinesDirty bool
 	statusMsg    string   // transient message (e.g. "Copied N chars")
 }
 
@@ -138,6 +143,9 @@ func NewModel(a *agent.Agent, cfg *config.Config) Model {
 	ta.KeyMap.DeleteCharacterBackward = key.NewBinding(key.WithKeys("backspace"))
 
 	vp := viewport.New(80, 20)
+	// Scroll 1 line per wheel event (default is 3; lower for smoother
+	// scrolling when the mouse/terminal sends multiple events per notch).
+	vp.MouseWheelDelta = 1
 	vp.Style = ViewportStyle
 
 	verbose := cfg != nil && cfg.CLIVerbose
@@ -214,11 +222,8 @@ func (m *Model) SetSize(width, height int) {
 	m.viewport.GotoBottom()
 }
 
-// setViewportContent wraps chatLines to the viewport width and sets the content.
-func (m *Model) setViewportContent() {
-	if m.width <= 2 {
-		return
-	}
+// wrapWidth returns the available width for word-wrapping inside the viewport.
+func (m *Model) wrapWidth() int {
 	w := m.viewport.Width
 	if w < 10 {
 		w = 10
@@ -227,13 +232,69 @@ func (m *Model) setViewportContent() {
 	if w < 10 {
 		w = 10
 	}
-	raw := strings.Join(m.chatLines, "\n")
-	m.wrappedContent = wordwrap.String(raw, w)
-	// Store plain (ANSI-stripped) copy for selection coordinate mapping
-	m.wrappedLines = strings.Split(stripANSI(m.wrappedContent), "\n")
-	// Content changed — clear any stale selection
+	return w
+}
+
+// wrapLine wraps a single chat line ready for display.  It handles SGR
+// propagation so that ANSI styles are re‑emitted on every continuation line.
+func (m *Model) wrapLine(line string) []string {
+	wrapped := wordwrap.String(line, m.wrapWidth())
+	parts := strings.Split(wrapped, "\n")
+	if len(parts) > 1 {
+		sgr := extractLeadingSGR(line)
+		if sgr != "" && !strings.Contains(parts[0], "\x1b[0m") {
+			for i := 1; i < len(parts); i++ {
+				parts[i] = sgr + parts[i] + "\x1b[0m"
+			}
+		}
+	}
+	return parts
+}
+
+// buildFromPrefix computes wrappedContent from wrappedPrefix + the last chat
+// line.  All incremental updaters call this instead of the full re-wrap path.
+func (m *Model) buildFromPrefix() {
+	if len(m.chatLines) == 0 {
+		m.wrappedContent = ""
+		m.wrappedLines = nil
+		m.wrappedLinesDirty = false
+	} else {
+		lastWrapped := strings.Join(m.wrapLine(m.chatLines[len(m.chatLines)-1]), "\n")
+		m.wrappedContent = m.wrappedPrefix + lastWrapped
+		m.wrappedLinesDirty = true // lazily compute on next selection access
+	}
 	m.clearSelection()
 	m.viewport.SetContent(m.wrappedContent)
+	m.styledLines = strings.Split(m.wrappedContent, "\n")
+}
+
+// setViewportContent performs a full re-wrap of all chatLines and rebuilds
+// the incremental prefix.  Use this after window‑resize, session restore,
+// mode changes, or other events that touch the whole buffer.
+func (m *Model) setViewportContent() {
+	if m.width <= 2 {
+		return
+	}
+	var wrappedParts []string
+	for _, line := range m.chatLines {
+		wrappedParts = append(wrappedParts, m.wrapLine(line)...)
+	}
+	m.wrappedContent = strings.Join(wrappedParts, "\n")
+	m.wrappedLinesDirty = true // lazily compute on next selection access
+	m.clearSelection()
+	m.viewport.SetContent(m.wrappedContent)
+	m.styledLines = strings.Split(m.wrappedContent, "\n")
+
+	// Rebuild the prefix pointing at all lines except the last.
+	if len(m.chatLines) > 1 {
+		var prefixParts []string
+		for _, line := range m.chatLines[:len(m.chatLines)-1] {
+			prefixParts = append(prefixParts, m.wrapLine(line)...)
+		}
+		m.wrappedPrefix = strings.Join(prefixParts, "\n") + "\n"
+	} else {
+		m.wrappedPrefix = ""
+	}
 }
 
 func (m *Model) Init() tea.Cmd {
@@ -273,42 +334,70 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// Streaming messages
 	case streamStartMsg:
+		if !m.streaming {
+			return m, nil
+		}
 		m.handleStreamStart()
 		return m, nil
 
 	case streamRoundStartMsg:
+		if !m.streaming {
+			return m, nil
+		}
 		m.handleStreamRoundStart()
 		return m, nil
 
 	case streamTokenMsg:
+		if !m.streaming {
+			return m, nil
+		}
 		m.handleStreamToken(msg.token)
 		return m, nil
 
 	case streamThinkingMsg:
+		if !m.streaming {
+			return m, nil
+		}
 		m.handleStreamThinking(msg.token)
 		return m, nil
 
 	case streamToolCallMsg:
+		if !m.streaming {
+			return m, nil
+		}
 		m.handleStreamToolCall(msg.index, msg.id, msg.name)
 		return m, nil
 
 	case streamToolCallArgsMsg:
+		if !m.streaming {
+			return m, nil
+		}
 		m.handleStreamToolArgs(msg.index, msg.id, msg.delta)
 		return m, nil
 
 	case streamToolCallFinalMsg:
+		if !m.streaming {
+			return m, nil
+		}
 		m.handleStreamToolCallFinal(msg.index, msg.tc)
 		return m, nil
 
 	case streamToolResultMsg:
+		if !m.streaming {
+			return m, nil
+		}
 		m.handleStreamToolResult(msg.id, msg.name, msg.result, msg.success)
 		return m, nil
 
 	case streamRoundEndMsg:
+		if !m.streaming {
+			return m, nil
+		}
 		m.handleStreamRoundEnd()
 		return m, nil
 
 	case streamEndMsg:
+		// Always process – resets streaming state
 		m.handleStreamEnd()
 		return m, nil
 
@@ -317,6 +406,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case contextStatsMsg:
+		// Always process – may arrive after streamEndMsg
 		m.contextStats = msg.stats
 		m.contextLine = agent.FormatContextBrief(msg.stats)
 		return m, nil
@@ -450,26 +540,36 @@ func renderModalOverlay(main, modal string, width, height int) string {
 		b.WriteString(strings.Repeat(" ", width) + "\n")
 	}
 
-	return lipgloss.NewStyle().
-		Background(lipgloss.Color("#1a1a1a")).
-		Render(strings.TrimRight(b.String(), "\n"))
+	return ModalOverlayBackground.Render(strings.TrimRight(b.String(), "\n"))
 }
 
 // appendChatLine adds a line to the chat buffer and updates the viewport.
 func (m *Model) appendChatLine(line string) {
+	// Move the current last line's wrapping into the prefix so that only
+	// the *new* last line needs re-wrapping on subsequent updates.
+	if len(m.chatLines) > 0 {
+		parts := m.wrapLine(m.chatLines[len(m.chatLines)-1])
+		if m.wrappedPrefix == "" {
+			m.wrappedPrefix = strings.Join(parts, "\n")
+		} else {
+			m.wrappedPrefix += "\n" + strings.Join(parts, "\n")
+		}
+		m.wrappedPrefix += "\n"
+	}
 	m.chatLines = append(m.chatLines, line)
-	m.setViewportContent()
+	m.buildFromPrefix()
 	m.viewport.GotoBottom()
 }
 
 // appendToLastLine appends text to the last line in the chat buffer.
 func (m *Model) appendToLastLine(text string) {
 	if len(m.chatLines) == 0 {
-		m.chatLines = append(m.chatLines, text)
-	} else {
-		m.chatLines[len(m.chatLines)-1] += text
+		m.appendChatLine(text)
+		return
 	}
-	m.setViewportContent()
+	// Only the last line changes — prefix stays unchanged.
+	m.chatLines[len(m.chatLines)-1] += text
+	m.buildFromPrefix()
 	m.viewport.GotoBottom()
 }
 
@@ -480,7 +580,8 @@ func (m *Model) replaceLastLine(text string) {
 	} else {
 		m.chatLines[len(m.chatLines)-1] = text
 	}
-	m.setViewportContent()
+	// Prefix is unchanged; only the last line may have been replaced.
+	m.buildFromPrefix()
 	m.viewport.GotoBottom()
 }
 
@@ -500,7 +601,9 @@ func (m *Model) handleStreamToken(token string) {
 		m.appendChatLine(label + " ")
 	}
 	m.streamAssistantBuf.WriteString(token)
-	m.replaceLastLine(AssistantStyle.Render(assistantLabel) + " " + m.streamAssistantBuf.String())
+	// Append just the delta token rather than rebuilding the full line from
+	// the buffer; avoids O(n²) String() copy for long responses.
+	m.appendToLastLine(token)
 }
 
 func (m *Model) handleStreamThinking(token string) {
@@ -509,7 +612,7 @@ func (m *Model) handleStreamThinking(token string) {
 		m.appendChatLine(ThinkingTagStyle.Render("<thinking>"))
 	}
 	m.streamThinkingBuf.WriteString(token)
-	m.replaceLastLine(ThinkingTagStyle.Render("<thinking>" + m.streamThinkingBuf.String()))
+	m.appendToLastLine(ThinkingStyle.Render(token))
 }
 
 func (m *Model) handleStreamToolCall(index int, id string, name string) {
@@ -531,16 +634,22 @@ func (m *Model) handleStreamToolCall(index int, id string, name string) {
 }
 
 func (m *Model) handleStreamToolArgs(index int, id string, delta string) {
-	name := m.streamToolCallNames[index]
+	_, ok := m.streamToolCallNames[index]
+	if !ok {
+		return
+	}
 	m.streamToolCallArgs[index] += delta
-	prefix := ToolCallStyle.Render("  →")
-	m.replaceLastLine(prefix + " " + name + " " + ToolCallArgsStyle.Render(m.streamToolCallArgs[index]))
+	// Append just the styled delta — avoid rebuilding the full line per token.
+	m.appendToLastLine(ToolCallArgsStyle.Render(delta))
 }
 
 // handleStreamToolCallFinal replaces the streaming tool call line with the final
 // cleanly-formatted args (from the fully-parsed ToolCall).
 func (m *Model) handleStreamToolCallFinal(index int, tc llm.ToolCall) {
-	name := m.streamToolCallNames[index]
+	name, ok := m.streamToolCallNames[index]
+	if !ok {
+		return
+	}
 	prefix := ToolCallStyle.Render("  →")
 	argStr := formatToolArgs(tc.Args)
 	if argStr == "" {
@@ -643,7 +752,7 @@ func (m *Model) handleStreamEnd() {
 
 	// Update context stats
 	if m.agent != nil {
-		stats := m.agent.ContextStats(context.Background())
+		stats := m.agent.ContextStats(m.ctx)
 		if line := agent.FormatContextBrief(stats); line != "" {
 			m.contextLine = line
 			m.contextStats = stats
@@ -684,7 +793,7 @@ func summarizeResult(result string, success bool) string {
 			first = first[:idx]
 		}
 		if len(first) > 120 {
-			first = first[:117] + "..."
+			first = truncateRunes(first, 117) + "..."
 		}
 		return fmt.Sprintf("%s (%d chars)", first, chars)
 	}

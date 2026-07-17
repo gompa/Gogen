@@ -15,9 +15,71 @@ import (
 
 var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 
+// extractLeadingSGR returns the leading ANSI SGR sequence(s) from s.
+// Only call when s starts with "\x1b["; returns "" otherwise. The
+// return is safe to use as a prefix for continuation lines after
+// word-wrapping.
+func extractLeadingSGR(s string) string {
+	if !strings.HasPrefix(s, "\x1b[") {
+		return ""
+	}
+	// Scan consecutive escape sequences at the head of s. Lipgloss
+	// emits them as \x1b[##m \x1b[##m ... so we consume every one
+	// that follows directly.
+	end := 0
+	for end < len(s) {
+		if end+1 >= len(s) || s[end] != '\x1b' || s[end+1] != '[' {
+			break
+		}
+		j := end + 2 // past ESC[
+		for j < len(s) && s[j] != '\x1b' {
+			c := s[j]
+			// Terminator letters for SGR: m (lower/upper).
+			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+				j++
+				break
+			}
+			// Digits, semicolons, colons (CSI parameter bytes).
+			if (c < '0' || c > '9') && c != ';' && c != ':' {
+				// Not a valid CSI byte — stop consuming this
+				// sequence and let the outer loop exit.
+				break
+			}
+			j++
+		}
+		end = j
+	}
+	return s[:end]
+}
+
 // stripANSI removes ANSI escape sequences from a string.
 func stripANSI(s string) string {
 	return ansiRegex.ReplaceAllString(s, "")
+}
+
+// truncateRunes truncates s to at most maxRunes runes, returning the original
+// string if it is already shorter. This avoids slicing multi-byte UTF-8
+// characters mid-rune.
+func truncateRunes(s string, maxRunes int) string {
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes])
+}
+
+// ensureWrappedLines lazily computes m.wrappedLines (ANSI‑stripped) when it is
+// dirty.  This avoids expensive stripANSI + Split on every streaming token.
+func (m *Model) ensureWrappedLines() {
+	if !m.wrappedLinesDirty {
+		return
+	}
+	if m.wrappedContent == "" {
+		m.wrappedLines = nil
+	} else {
+		m.wrappedLines = strings.Split(stripANSI(m.wrappedContent), "\n")
+	}
+	m.wrappedLinesDirty = false
 }
 
 // SelectionState tracks the in-progress text selection.
@@ -100,6 +162,7 @@ func (m *Model) handleMouseSelection(msg tea.MouseMsg) bool {
 // mouseToContent converts terminal-relative mouse coordinates to
 // content coordinates (line and column in the plain wrapped content).
 func (m *Model) mouseToContent(mouseX, mouseY int) (int, int) {
+	m.ensureWrappedLines()
 	// Account for viewport scroll position
 	contentY := mouseY + m.viewport.YOffset
 	if m.selection != nil && m.selection.Active && m.selectionYOff >= 0 {
@@ -127,6 +190,7 @@ func (m *Model) mouseToContent(mouseX, mouseY int) (int, int) {
 // getSelectedText returns the plain text currently selected, or "" if
 // nothing is selected.
 func (m *Model) getSelectedText() string {
+	m.ensureWrappedLines()
 	if m.selection == nil || len(m.wrappedLines) == 0 {
 		return ""
 	}
@@ -181,6 +245,7 @@ func (m *Model) clearSelection() {
 // ANSI codes on selected text to preserve all original styling while adding
 // the selection highlight.
 func (m *Model) renderViewportWithSelection() string {
+	m.ensureWrappedLines()
 	w := m.viewport.Width
 	h := m.viewport.Height
 	if sw := m.viewport.Style.GetWidth(); sw != 0 {
@@ -201,7 +266,7 @@ func (m *Model) renderViewportWithSelection() string {
 	if m.selectionYOff >= 0 {
 		yOff = m.selectionYOff
 	}
-	styledLines := strings.Split(m.wrappedContent, "\n")
+	styledLines := m.styledLines
 
 	// Normalize selection range
 	selSY, selEY := m.selection.StartY, m.selection.EndY

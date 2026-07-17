@@ -141,7 +141,7 @@ func (d *streamDisplay) onThinkingToken(token string) {
 		return
 	}
 	d.beginThinkingBlock()
-	fmt.Print(token)
+	fmt.Print(d.styles.wrap(d.styles.dim, token))
 	d.flushOut()
 }
 
@@ -228,13 +228,13 @@ func (d *streamDisplay) onToolCall(tc llm.ToolCall) {
 }
 
 func (d *streamDisplay) onToolResult(_ string, name, result string, success bool) {
-	status := "ok"
+	statusText := "ok"
 	statusStyle := d.styles.green
 	if !success {
-		status = "failed"
+		statusText = "failed"
 		statusStyle = d.styles.red
 	}
-	status = d.styles.wrap(statusStyle, status)
+	status := d.styles.wrap(statusStyle, statusText)
 
 	mark := d.styles.wrap(d.styles.dim, "  "+toolResultMark+" ")
 	if d.verbose {
@@ -245,7 +245,31 @@ func (d *streamDisplay) onToolResult(_ string, name, result string, success bool
 		}
 	} else {
 		summary := summarizeToolResult(result, success)
-		fmt.Printf("%s%s  %s  %s\n", mark, name, status, d.styles.wrap(d.styles.dim, summary))
+		// If summary fits on one line with prefix, print normally.
+		// Otherwise wrap summary with continuation lines indented.
+		prefixVis := 4 + 2 + len(name) + 2 + len(statusText) + 2 // "  ↳  name  ok  "
+		termW := terminalColumns()
+		if termW < 40 {
+			termW = 80
+		}
+		if prefixVis+len(summary) <= termW {
+			fmt.Printf("%s%s  %s  %s\n", mark, name, status, d.styles.wrap(d.styles.dim, summary))
+		} else {
+			// Wrap summary; first line uses normal prefix, rest use indent
+			wrapW := termW - prefixVis
+			if wrapW < 20 {
+				wrapW = termW
+			}
+			wrapped := wordWrap(summary, wrapW)
+			contIndent := strings.Repeat(" ", prefixVis)
+			for i, line := range strings.Split(wrapped, "\n") {
+				if i == 0 {
+					fmt.Printf("%s%s  %s  %s\n", mark, name, status, d.styles.wrap(d.styles.dim, line))
+				} else {
+					fmt.Printf("%s%s\n", mark, d.styles.wrap(d.styles.dim, contIndent+line))
+				}
+			}
+		}
 	}
 }
 
@@ -308,4 +332,49 @@ func formatToolResultBody(result string, maxChars, maxLines int) string {
 		display += fmt.Sprintf(" (%d total chars)", len(result))
 	}
 	return display
+}
+
+// wordWrap wraps text to fit within width columns. Lines that are already
+// shorter than width are kept as-is. If width is <= 0, text is returned
+// unchanged. Uses a minimal approach: splits on spaces, and when a word
+// would cross the width boundary, starts a new line. If a single word is
+// longer than width, it is kept intact (terminal handles overflow).
+func wordWrap(text string, width int) string {
+	if width <= 0 {
+		return text
+	}
+	var out strings.Builder
+	lines := strings.Split(text, "\n")
+	for li, line := range lines {
+		if li > 0 {
+			out.WriteByte('\n')
+		}
+		if len(line) <= width {
+			out.WriteString(line)
+			continue
+		}
+		// Wrap long line
+		words := strings.Fields(line)
+		lineLen := 0
+		firstWord := true
+		for _, w := range words {
+			addLen := len(w)
+			if !firstWord {
+				addLen++ // space before word
+			}
+			if !firstWord && lineLen > 0 && lineLen+addLen > width {
+				out.WriteByte('\n')
+				lineLen = 0
+				firstWord = true
+			}
+			if !firstWord {
+				out.WriteByte(' ')
+				lineLen++
+			}
+			out.WriteString(w)
+			lineLen += len(w)
+			firstWord = false
+		}
+	}
+	return out.String()
 }

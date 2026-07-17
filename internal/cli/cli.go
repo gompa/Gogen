@@ -188,6 +188,7 @@ func formatRightAlignedDimLine(text string) string {
 		pad := width - len(plain)
 		plain = strings.Repeat(" ", pad) + plain
 	}
+	// When text is wider than terminal, print as-is (left-aligned, no truncation).
 	if os.Getenv("NO_COLOR") != "" {
 		return plain
 	}
@@ -254,13 +255,32 @@ func printHistory(messages []llm.Message) {
 		fmt.Printf("\n⋮ (%d messages, showing last 4)", total)
 	}
 	styles := newCLIStyles()
+	termWidth := terminalColumns()
+	if termWidth < 40 {
+		termWidth = 80
+	}
 	for _, h := range keep {
 		if h.role == "assistant" {
 			label := styles.wrap(styles.bold+styles.cyan, assistantLabel)
-			content := styles.wrap(styles.dim, h.content)
-			fmt.Printf("\n%s %s", label, content)
+			wrapWidth := termWidth - len(assistantLabel) - 1
+			if wrapWidth < 20 {
+				wrapWidth = termWidth
+			}
+			wrapped := wordWrap(h.content, wrapWidth)
+			indent := strings.Repeat(" ", len(assistantLabel)+1)
+			for i, line := range strings.Split(wrapped, "\n") {
+				contentStyled := styles.wrap(styles.dim, line)
+				if i == 0 {
+					fmt.Printf("\n%s %s", label, contentStyled)
+				} else {
+					fmt.Printf("\n%s %s", indent, contentStyled)
+				}
+			}
 		} else {
-			fmt.Printf("\n%s", h.content)
+			wrapped := wordWrap(h.content, termWidth)
+			for _, line := range strings.Split(wrapped, "\n") {
+				fmt.Printf("\n%s", line)
+			}
 		}
 	}
 	fmt.Println()

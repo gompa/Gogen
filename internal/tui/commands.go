@@ -81,6 +81,7 @@ func (m *Model) dispatchCommand(input string) (bool, bool, tea.Cmd) {
 		} else if result.Sessions != nil {
 			// Show session list modal
 			m.sessionList = result.Sessions
+			m.sessionCursor = 0
 			m.modal = ModalSessions
 		} else {
 			m.appendChatLine(SystemStyle.Render(result.Output))
@@ -178,20 +179,27 @@ func (m *Model) submitUserInput(input string) tea.Cmd {
 	m.streamToolCallIDs = make(map[int]string)
 	m.toolCallDiffs = make(map[string]string)
 
+	// Create cancelable context for the LLM call
+	streamCtx, cancelFn := context.WithCancel(m.ctx)
+	m.streamCancel = cancelFn
+
 	adapter := NewStreamAdapter(m.program)
+	a := m.agent
+	program := m.program
+	approver := m.makeDeleteApprover()
 
 	return func() tea.Msg {
-		_, err := m.agent.StreamProcessInput(
-			agent.ContextWithDeleteApprover(m.ctx, m.makeDeleteApprover()),
+		defer cancelFn()
+		_, err := a.StreamProcessInput(
+			agent.ContextWithDeleteApprover(streamCtx, approver),
 			trimmed,
 			adapter.Handlers(),
 		)
 		if err != nil {
 			return streamErrorMsg{err: err}
 		}
-		// Emit final end + context stats
-		m.program.Send(streamEndMsg{})
-		stats := m.agent.ContextStats(context.Background())
+		program.Send(streamEndMsg{})
+		stats := a.ContextStats(streamCtx)
 		return contextStatsMsg{stats: stats}
 	}
 }
@@ -201,6 +209,12 @@ func (m *Model) makeDeleteApprover() agent.DeleteApprover {
 	return func(ctx context.Context, req agent.DeleteRequest) (bool, error) {
 		if ctx.Err() != nil {
 			return false, ctx.Err()
+		}
+		// Drain stale value from previous approval (e.g. context cancelled
+		// while user still responded to modal).
+		select {
+		case <-m.approvalResult:
+		default:
 		}
 		// Show approval modal via Bubble Tea
 		m.program.Send(approvalRequestMsg{req: req})

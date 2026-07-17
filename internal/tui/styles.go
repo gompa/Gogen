@@ -105,6 +105,10 @@ var (
 				Background(lipglossColor("#000000")).
 				Foreground(lipglossColor("#FFFFFF"))
 
+	// Background fill for modal overlay (cached to avoid allocation per frame).
+	ModalOverlayBackground = lipgloss.NewStyle().
+				Background(lipglossColor("#1a1a1a"))
+
 	ModalBorderStyle = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
 				BorderForeground(lipglossColor("#555555")).

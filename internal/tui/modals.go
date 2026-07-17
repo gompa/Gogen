@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"gogen/internal/agent"
+	"gogen/internal/session"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -114,27 +115,70 @@ func (m *Model) renderSessionsModal() string {
 	b.WriteString(ModalTitleStyle.Render("Saved Sessions"))
 	b.WriteString("\n\n")
 
-	if len(m.sessionList) == 0 {
+	if len(m.sessionList) > 0 {
+		// Constrain visible area to fit the terminal.
+		// Reserve lines for border, title, footer, and margin.
+		reserved := 13 // border(2) + title(2) + footer(4) + top/bottom margin(5)
+		maxVisible := max(3, m.height-reserved)
+
+		// Clamp cursor.
+		if m.sessionCursor >= len(m.sessionList) {
+			m.sessionCursor = len(m.sessionList) - 1
+		}
+		if m.sessionCursor < 0 {
+			m.sessionCursor = 0
+		}
+
+		// Compute scroll window so cursor stays visible.
+		start := 0
+		if len(m.sessionList) > maxVisible {
+			start = m.sessionCursor - maxVisible/2
+			if start < 0 {
+				start = 0
+			}
+			if start > len(m.sessionList)-maxVisible {
+				start = len(m.sessionList) - maxVisible
+			}
+		}
+		end := start + maxVisible
+		if end > len(m.sessionList) {
+			end = len(m.sessionList)
+		}
+
+		if start > 0 {
+			b.WriteString(ModalDimStyle.Render(fmt.Sprintf("  ↑ %d more\n", start)))
+		}
+
+		for i := start; i < end; i++ {
+			s := m.sessionList[i]
+			line := fmt.Sprintf("  %s  (%d msgs)", s.ID, s.MessageCount)
+			if s.Label != "" {
+				line += fmt.Sprintf("  %q", s.Label)
+			}
+			if s.ID == m.sessionID {
+				line += "  ← current"
+			}
+			if i == m.sessionCursor {
+				b.WriteString(ModalHighlightStyle.Render(line))
+			} else {
+				b.WriteString(ModalDimStyle.Render(line))
+			}
+			b.WriteString("\n")
+		}
+
+		if end < len(m.sessionList) {
+			b.WriteString(ModalDimStyle.Render(fmt.Sprintf("  ↓ %d more\n", len(m.sessionList)-end)))
+		}
+	} else {
 		b.WriteString(ModalDimStyle.Render("No saved sessions."))
-		b.WriteString("\n\n")
-		b.WriteString(ModalDimStyle.Render("Press esc to close"))
-		return ModalBorderStyle.Render(b.String())
 	}
 
-	for _, s := range m.sessionList {
-		line := fmt.Sprintf("  %s  (%d msgs)", s.ID, s.MessageCount)
-		if s.Label != "" {
-			line += fmt.Sprintf("  \"%s\"", s.Label)
-		}
-		if s.ID == m.sessionID {
-			line += "  ← current"
-		}
-		b.WriteString(ModalDimStyle.Render(line))
+	if len(m.sessionList) > 0 {
+		b.WriteString("\n")
+		b.WriteString(ModalDimStyle.Render("↑↓/jk navigate  pgup/pgdn  enter resume  d delete  esc close"))
+	} else {
 		b.WriteString("\n")
 	}
-
-	b.WriteString("\n")
-	b.WriteString(ModalDimStyle.Render("resume <id>  |  resume latest  |  resume del <id>"))
 	b.WriteString("\n")
 	b.WriteString(ModalDimStyle.Render("Press esc to close"))
 
@@ -142,9 +186,42 @@ func (m *Model) renderSessionsModal() string {
 }
 
 func (m *Model) handleSessionsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if msg.String() == "esc" || msg.String() == "q" {
+	switch msg.String() {
+	case "esc", "q":
 		m.modal = ModalNone
 		return m, nil
+	case "up", "k":
+		if m.sessionCursor > 0 {
+			m.sessionCursor--
+		}
+	case "down", "j":
+		if m.sessionCursor < len(m.sessionList)-1 {
+			m.sessionCursor++
+		}
+	case "pgup":
+		page := max(1, m.height-20)
+		m.sessionCursor -= page
+		if m.sessionCursor < 0 {
+			m.sessionCursor = 0
+		}
+	case "pgdown":
+		page := max(1, m.height-20)
+		m.sessionCursor += page
+		if m.sessionCursor >= len(m.sessionList) {
+			m.sessionCursor = len(m.sessionList) - 1
+		}
+	case "home", "g":
+		m.sessionCursor = 0
+	case "end", "G":
+		m.sessionCursor = len(m.sessionList) - 1
+	case "enter":
+		if len(m.sessionList) > 0 && m.sessionCursor >= 0 && m.sessionCursor < len(m.sessionList) {
+			return m.resumeSelectedSession()
+		}
+	case "d":
+		if len(m.sessionList) > 0 && m.sessionCursor >= 0 && m.sessionCursor < len(m.sessionList) {
+			return m.deleteSelectedSession()
+		}
 	}
 	return m, nil
 }
@@ -320,6 +397,66 @@ func (m *Model) handleCompletionKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.modal = ModalNone
 		m.completions = nil
 		return m, nil
+	}
+	return m, nil
+}
+
+// resumeSelectedSession resumes the session at sessionCursor from the sessions modal.
+func (m *Model) resumeSelectedSession() (tea.Model, tea.Cmd) {
+	id := m.sessionList[m.sessionCursor].ID
+	// Skip if already on this session.
+	if id == m.sessionID {
+		m.modal = ModalNone
+		return m, nil
+	}
+	result, _, err := m.agent.HandleSessionCommand(m.ctx, "resume "+id, session.NewID())
+	if err != nil {
+		m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Session: %v", err)))
+		m.modal = ModalNone
+		return m, nil
+	}
+	if result.Action == agent.SessionActionClearChat {
+		m.chatLines = nil
+		m.chatLines = append(m.chatLines, SystemStyle.Render(result.Output))
+		if len(result.History) > 0 {
+			m.chatLines = append(m.chatLines, renderMessages(result.History, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())...)
+		}
+		m.setViewportContent()
+		m.viewport.GotoBottom()
+		m.sessionID = m.agent.SessionID
+	}
+	m.modal = ModalNone
+	return m, nil
+}
+
+// deleteSelectedSession deletes the session at sessionCursor from the sessions modal.
+func (m *Model) deleteSelectedSession() (tea.Model, tea.Cmd) {
+	id := m.sessionList[m.sessionCursor].ID
+	result, _, err := m.agent.HandleSessionCommand(m.ctx, "resume del "+id, session.NewID())
+	if err != nil {
+		m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Session: %v", err)))
+		m.modal = ModalNone
+		return m, nil
+	}
+	m.appendChatLine(SystemStyle.Render(result.Output))
+	// Remove from the local list.
+	m.sessionList = append(m.sessionList[:m.sessionCursor], m.sessionList[m.sessionCursor+1:]...)
+	if m.sessionCursor >= len(m.sessionList) {
+		m.sessionCursor = len(m.sessionList) - 1
+	}
+	if m.sessionCursor < 0 {
+		m.sessionCursor = 0
+	}
+	if len(m.sessionList) == 0 {
+		m.modal = ModalNone
+	}
+	if result.Action == agent.SessionActionClearChat {
+		// The deleted session was the *current* one; start a new session.
+		m.chatLines = nil
+		m.chatLines = append(m.chatLines, SystemStyle.Render(result.Output))
+		m.setViewportContent()
+		m.viewport.GotoBottom()
+		m.sessionID = m.agent.SessionID
 	}
 	return m, nil
 }
