@@ -3,6 +3,8 @@ package tui
 import (
 	"gogen/internal/agent"
 	"gogen/internal/llm"
+	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -72,6 +74,40 @@ type StreamAdapter struct {
 	program *tea.Program
 }
 
+// tokenBatcher coalesces stream/thinking tokens so the Bubble Tea channel
+// is not flooded with one message per token. Flushes at 32ms intervals.
+type tokenBatcher struct {
+	send    func(tea.Msg)
+	stream  strings.Builder
+	think   strings.Builder
+	timer   *time.Timer
+	flushed func()
+}
+
+func newTokenBatcher(send func(tea.Msg)) *tokenBatcher {
+	return &tokenBatcher{send: send}
+}
+
+func (b *tokenBatcher) scheduleFlush() {
+	if b.timer == nil {
+		b.timer = time.AfterFunc(32*time.Millisecond, b.flush)
+	}
+}
+
+func (b *tokenBatcher) flush() {
+	b.flushed()
+}
+
+func (b *tokenBatcher) streamToken(token string) {
+	b.stream.WriteString(token)
+	b.scheduleFlush()
+}
+
+func (b *tokenBatcher) thinkToken(token string) {
+	b.think.WriteString(token)
+	b.scheduleFlush()
+}
+
 // NewStreamAdapter creates a new StreamAdapter.
 func NewStreamAdapter(p *tea.Program) *StreamAdapter {
 	return &StreamAdapter{program: p}
@@ -79,6 +115,23 @@ func NewStreamAdapter(p *tea.Program) *StreamAdapter {
 
 // Handlers returns a full set of stream handlers that emit tea.Msg values.
 func (s *StreamAdapter) Handlers() *llm.StreamHandlers {
+	var batch tokenBatcher
+	batch.send = s.program.Send
+	batch.flushed = func() {
+		if b := batch.stream.String(); b != "" {
+			s.program.Send(streamTokenMsg{token: b})
+			batch.stream.Reset()
+		}
+		if b := batch.think.String(); b != "" {
+			s.program.Send(streamThinkingMsg{token: b})
+			batch.think.Reset()
+		}
+		if batch.timer != nil {
+			batch.timer.Stop()
+			batch.timer = nil
+		}
+	}
+
 	return &llm.StreamHandlers{
 		OnStart: func() {
 			s.program.Send(streamStartMsg{})
@@ -87,12 +140,13 @@ func (s *StreamAdapter) Handlers() *llm.StreamHandlers {
 			s.program.Send(streamRoundStartMsg{})
 		},
 		OnThinkingToken: func(token string) {
-			s.program.Send(streamThinkingMsg{token: token})
+			batch.thinkToken(token)
 		},
 		OnToken: func(token string) {
-			s.program.Send(streamTokenMsg{token: token})
+			batch.streamToken(token)
 		},
 		OnStreamEnd: func() {
+			batch.flush()
 			s.program.Send(streamRoundEndMsg{})
 		},
 		OnToolCallStart: func(index int, id, name string) {

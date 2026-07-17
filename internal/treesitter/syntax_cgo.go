@@ -136,8 +136,9 @@ func parseIssues(lang *tree_sitter.Language, content []byte) []Issue {
 		return nil
 	}
 
-	parser := tree_sitter.NewParser()
-	defer parser.Close()
+	p := parserPool.Get().(*tree_sitter.Parser)
+	defer parserPool.Put(p)
+	parser := p
 	parser.SetLanguage(lang)
 
 	tree := parser.Parse(content, nil)

@@ -109,29 +109,6 @@ func (m *Manager) TruncateToolResult(content string) string {
 	return content[:max] + fmt.Sprintf("\n… truncated (%d chars total)", len(content))
 }
 
-// EstimateTokens approximates token count for a message list.
-func (m *Manager) EstimateTokens(messages []llm.Message) int {
-	total := 0
-	for _, msg := range messages {
-		total += estimateMessageTokens(msg)
-	}
-	return total
-}
-
-func estimateMessageTokens(msg llm.Message) int {
-	tokens := (len(msg.Content) + 3) / 4
-	tokens += 4 // role/overhead
-	for _, tc := range msg.ToolCalls {
-		tokens += (len(tc.Name)+len(tc.ID)+12)/4 + 4
-		for k, v := range tc.Args {
-			tokens += (len(k)+len(fmt.Sprint(v))+4)/4 + 2
-		}
-	}
-	if msg.ToolCallID != "" {
-		tokens += (len(msg.ToolCallID) + 4) / 4
-	}
-	return tokens
-}
 
 // ContextSnapshot summarizes context window usage for display.
 type ContextSnapshot struct {
@@ -431,14 +408,6 @@ func adjustCompactTailStart(messages []llm.Message, start int) int {
 		start--
 	}
 	return start
-}
-
-func truncateForSummary(text string, maxTokens int) string {
-	maxChars := maxTokens * 4
-	if len(text) <= maxChars {
-		return text
-	}
-	return text[:maxChars] + fmt.Sprintf("\n… truncated for summarization (%d chars total)", len(text))
 }
 
 func (m *Manager) summarizeText(ctx context.Context, segment string) (string, error) {

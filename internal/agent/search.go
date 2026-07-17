@@ -277,14 +277,13 @@ func scanFileWithContext(path, relPath string, re *regexp.Regexp, contextLines, 
 	if matchLimit <= 0 {
 		return nil, nil
 	}
-	matchNums, err := findMatchLineNums(path, re, matchLimit)
-	if err != nil || len(matchNums) == 0 {
-		return nil, err
-	}
-	return fetchMatchedLines(path, relPath, matchNums, contextLines)
+	return scanFileSinglePass(path, relPath, re, contextLines, matchLimit)
 }
 
-func findMatchLineNums(path string, re *regexp.Regexp, matchLimit int) ([]int, error) {
+// scanFileSinglePass reads the file once, finds matches, and emits results
+// with context lines. Replaces the prior two-pass approach (findMatchLineNums
+// + fetchMatchedLines) to halve file I/O.
+func scanFileSinglePass(path, relPath string, re *regexp.Regexp, contextLines, matchLimit int) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -293,21 +292,31 @@ func findMatchLineNums(path string, re *regexp.Regexp, matchLimit int) ([]int, e
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), searchMaxFileBytes)
-	var matchNums []int
+	var lines []string
 	lineNum := 0
 	for scanner.Scan() {
 		lineNum++
-		if re.MatchString(scanner.Text()) {
-			matchNums = append(matchNums, lineNum)
+		lines = append(lines, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	// Find matching line numbers.
+	matchNums := make([]int, 0, matchLimit)
+	for i, line := range lines {
+		if re.MatchString(line) {
+			matchNums = append(matchNums, i+1)
 			if len(matchNums) >= matchLimit {
 				break
 			}
 		}
 	}
-	return matchNums, scanner.Err()
-}
+	if len(matchNums) == 0 {
+		return nil, nil
+	}
 
-func fetchMatchedLines(path, relPath string, matchNums []int, contextLines int) ([]string, error) {
+	// Build output set: which lines to emit and with what separator.
 	want := make(map[int]byte, len(matchNums)*(contextLines*2+1))
 	for _, n := range matchNums {
 		if contextLines <= 0 {
@@ -329,25 +338,15 @@ func fetchMatchedLines(path, relPath string, matchNums []int, contextLines int) 
 		}
 	}
 
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), searchMaxFileBytes)
 	var out []string
-	lineNum := 0
-	for scanner.Scan() {
-		lineNum++
+	for lineNum = 1; lineNum <= len(lines); lineNum++ {
 		sep, ok := want[lineNum]
 		if !ok {
 			continue
 		}
-		out = append(out, fmt.Sprintf("%s%c%d%c%s", relPath, sep, lineNum, sep, scanner.Text()))
+		out = append(out, fmt.Sprintf("%s%c%d%c%s", relPath, sep, lineNum, sep, lines[lineNum-1]))
 	}
-	return out, scanner.Err()
+	return out, nil
 }
 
 func isBinaryFile(path string) bool {

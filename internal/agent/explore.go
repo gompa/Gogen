@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"sync"
 )
 
 const (
@@ -32,6 +33,27 @@ func relDisplayPath(searchRoot, absPath string, isDir bool) (string, error) {
 	}
 	return rel, nil
 }
+
+// cachedGitPath caches the result of exec.LookPath("git") so repeated calls
+// don't re-scan PATH.
+var cachedGitPath struct {
+	sync.Once
+	path string
+	ok   bool
+}
+
+func gitPath() (string, bool) {
+	cachedGitPath.Do(func() {
+		p, err := exec.LookPath("git")
+		cachedGitPath.path = p
+		cachedGitPath.ok = err == nil
+	})
+	return cachedGitPath.path, cachedGitPath.ok
+}
+
+// globRegexCache caches compiled regexes for glob patterns containing **.
+// This avoids recompiling the same regex for every file during WalkDir.
+var globRegexCache sync.Map // pattern string -> *regexp.Regexp
 
 // ListFiles lists directory entries. When recursive is true, walks the tree (max 500 paths).
 // When trackedOnly is true, results are filtered to git-tracked files.
@@ -109,13 +131,12 @@ func (e *Executor) ListFiles(path string, recursive, trackedOnly bool) (string, 
 }
 
 func filterTracked(workingDir string, paths []string) []string {
-	_, err := exec.LookPath("git")
-	if err != nil || len(paths) == 0 {
+	if !cachedGitPath.ok || len(paths) == 0 {
 		return paths
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "ls-files", "--cached", "--others", "--exclude-standard")
+	cmd := exec.CommandContext(ctx, cachedGitPath.path, "ls-files", "--cached", "--others", "--exclude-standard")
 	cmd.Dir = workingDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -234,6 +255,9 @@ func matchGlobPattern(pattern, relPath string) bool {
 // matchGlobRegex handles glob patterns that contain ** by converting
 // them to a regular expression. ** matches zero or more path segments.
 func matchGlobRegex(pattern, path string) bool {
+	if re, ok := globRegexCache.Load(pattern); ok {
+		return re.(*regexp.Regexp).MatchString(path)
+	}
 	// Split pattern into segments, then convert each segment.
 	segments := strings.Split(pattern, "/")
 	var reParts []string
@@ -260,7 +284,9 @@ func matchGlobRegex(pattern, path string) bool {
 		}
 	}
 	reParts = append(reParts, "$")
-	re := regexp.MustCompile(strings.Join(reParts, ""))
+	reStr := strings.Join(reParts, "")
+	re := regexp.MustCompile(reStr)
+	globRegexCache.Store(pattern, re)
 	return re.MatchString(path)
 }
 

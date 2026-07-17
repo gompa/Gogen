@@ -30,12 +30,33 @@ type file struct {
 
 // Store persists sessions under .gogen/sessions/.
 type Store struct {
-	enabled bool
+	enabled    bool
+	maxCount   int
+	maxAgeDays int
 }
 
-// NewStore creates a session store.
+// StoreOptions configures retention for persisted sessions.
+type StoreOptions struct {
+	MaxCount   int // keep at most this many sessions (0 = default 50)
+	MaxAgeDays int // drop sessions older than this many days (0 = default 30)
+}
+
+// NewStore creates a session store with default retention.
 func NewStore(enabled bool) *Store {
-	return &Store{enabled: enabled}
+	return NewStoreWithOptions(enabled, StoreOptions{})
+}
+
+// NewStoreWithOptions creates a session store with custom retention.
+func NewStoreWithOptions(enabled bool, opts StoreOptions) *Store {
+	maxCount := opts.MaxCount
+	if maxCount <= 0 {
+		maxCount = 50
+	}
+	maxAge := opts.MaxAgeDays
+	if maxAge <= 0 {
+		maxAge = 30
+	}
+	return &Store{enabled: enabled, maxCount: maxCount, maxAgeDays: maxAge}
 }
 
 func (s *Store) dir(workingDir string) string {
@@ -81,7 +102,11 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(path, data, 0o600)
+	if err := writeFileAtomic(path, data, 0o600); err != nil {
+		return err
+	}
+	s.prune(snap.WorkingDir, id)
+	return nil
 }
 
 // LoadInWorkingDir loads a session from a working directory.
@@ -153,11 +178,33 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 
 // LatestID returns the most recently updated session id.
 func (s *Store) LatestID(workingDir string) (string, error) {
-	list, err := s.List(workingDir)
-	if err != nil || len(list) == 0 {
+	dir := s.dir(workingDir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
 		return "", err
 	}
-	return list[0].ID, nil
+	var latestID string
+	var latestMod time.Time
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(latestMod) {
+			latestMod = info.ModTime()
+			latestID = strings.TrimSuffix(e.Name(), ".json")
+		}
+	}
+	if latestID == "" {
+		return "", nil
+	}
+	return latestID, nil
 }
 
 // Delete removes a saved session file.
@@ -262,4 +309,36 @@ func NewID() string {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	return fmt.Sprintf("%x", b)
+}
+
+// prune deletes expired and excess sessions, always retaining keepID.
+func (s *Store) prune(workingDir, keepID string) {
+	if s == nil || !s.enabled {
+		return
+	}
+	list, err := s.List(workingDir)
+	if err != nil || len(list) == 0 {
+		return
+	}
+	cutoff := time.Now().UTC().AddDate(0, 0, -s.maxAgeDays)
+	otherBudget := s.maxCount
+	if keepID != "" {
+		otherBudget--
+		if otherBudget < 0 {
+			otherBudget = 0
+		}
+	}
+	others := 0
+	for _, entry := range list {
+		if entry.ID == keepID {
+			continue
+		}
+		updated, err := time.Parse(time.RFC3339, entry.UpdatedAt)
+		expired := err == nil && updated.Before(cutoff)
+		if expired || others >= otherBudget {
+			_ = s.Delete(workingDir, entry.ID)
+			continue
+		}
+		others++
+	}
 }

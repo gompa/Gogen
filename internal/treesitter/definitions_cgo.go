@@ -67,6 +67,14 @@ func queryForLang(langName string) (*tree_sitter.Query, error) {
 
 const maxDefinitions = 300
 
+// parserPool reuses tree-sitter parsers to avoid C FFI allocation overhead
+// on every parse call. Parsers are safe to reuse after SetLanguage.
+var parserPool = sync.Pool{
+	New: func() interface{} {
+		return tree_sitter.NewParser()
+	},
+}
+
 func listDefinitions(path string, content []byte) ([]Definition, error) {
 	langName, ok := langNameForPath(path)
 	if !ok {
@@ -78,8 +86,9 @@ func listDefinitions(path string, content []byte) ([]Definition, error) {
 	}
 
 	lang := languageFor(langName)
-	parser := tree_sitter.NewParser()
-	defer parser.Close()
+	p := parserPool.Get().(*tree_sitter.Parser)
+	defer parserPool.Put(p)
+	parser := p
 	parser.SetLanguage(lang)
 
 	tree := parser.Parse(content, nil)
