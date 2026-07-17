@@ -25,14 +25,17 @@ func NewCommandGuard(mode string, allowlist []string) *CommandGuard {
 var blockedCommandPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\bsudo\b`),
 	regexp.MustCompile(`(?i)\bsu\s+-`),
-	regexp.MustCompile(`(?i)\brm\s+(-[^\s]*\s+)*-[^\s]*r[^\s]*\s+(/|\./\.\./|/\*)`),
-	regexp.MustCompile(`(?i)\brm\s+(-[^\s]*\s+)*(/|\./\.\./|/\*)`),
+	regexp.MustCompile(`(?i)\brm\s+(-[^\s]*\s+)*-[^\s]*r[^\s]*\s+(/|\./\.\./|/\*|~|\$HOME|\$\{HOME\}|\.)`),
+	regexp.MustCompile(`(?i)\brm\s+(-[^\s]*\s+)*(/|\./\.\./|/\*|~|\$HOME|\$\{HOME\})`),
 	regexp.MustCompile(`(?i)\bmkfs\b`),
-	regexp.MustCompile(`(?i)\bdd\s+if=`),
+	regexp.MustCompile(`(?i)\bdd\s+(if=|of=)`),
 	regexp.MustCompile(`(?i)\bchmod\s+(-[^\s]*\s+)*777\b`),
 	regexp.MustCompile(`(?i)\bchown\s+(-[^\s]*\s+)*(-R\s+)?/`),
 	regexp.MustCompile(`(?i)(curl|wget)[^\n|]*\|\s*(ba)?sh\b`),
 	regexp.MustCompile(`(?i)\|\s*(ba)?sh\s*(\s|$|<)`),
+	regexp.MustCompile(`(?i)\|\s*(python3?|perl|ruby|node|zsh|php)\b`),
+	regexp.MustCompile(`(?i)\b(python3?|perl|ruby|node)\s+-[ce]\b`),
+	regexp.MustCompile(`(?i)\bfind\b[^\n]*\s-delete\b`),
 	regexp.MustCompile(`(?i)\bshutdown\b`),
 	regexp.MustCompile(`(?i)\breboot\b`),
 	regexp.MustCompile(`(?i)\bpoweroff\b`),
@@ -63,6 +66,9 @@ func (g *CommandGuard) checkAllowlist(command string) error {
 	if len(g.Allowlist) == 0 {
 		return fmt.Errorf("command blocked: allowlist mode is enabled but GOGEN_COMMAND_ALLOWLIST is empty")
 	}
+	if err := rejectShellMetacharacters(command); err != nil {
+		return err
+	}
 	lower := strings.ToLower(command)
 	for _, allowed := range g.Allowlist {
 		allowed = strings.TrimSpace(strings.ToLower(allowed))
@@ -74,6 +80,13 @@ func (g *CommandGuard) checkAllowlist(command string) error {
 		}
 	}
 	return fmt.Errorf("command blocked by allowlist: %q", command)
+}
+
+func rejectShellMetacharacters(command string) error {
+	if strings.ContainsAny(command, ";|&`$()<>\n\r") {
+		return fmt.Errorf("command blocked by allowlist: shell metacharacters are not permitted")
+	}
+	return nil
 }
 
 func (g *CommandGuard) checkBlocklist(command string) error {

@@ -2,15 +2,16 @@ package tui
 
 import (
 	"fmt"
-	"regexp"
 	"os"
+	"regexp"
 	"strings"
 	"unicode/utf8"
 
-	"github.com/aymanbagabas/go-osc52/v2"
 	"github.com/atotto/clipboard"
+	"github.com/aymanbagabas/go-osc52/v2"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
@@ -276,6 +277,18 @@ func (m *Model) renderViewportWithSelection() string {
 		selSX, selEX = selEX, selSX
 	}
 
+	// Match viewport.visibleLines: truncate (don't re-wrap) any line that
+	// still exceeds contentWidth. lipgloss MaxWidth would soft-wrap those
+	// into extra rows and shift everything below — the selection jump bug.
+	mustCut := false
+	for i := 0; i < contentHeight; i++ {
+		ci := yOff + i
+		if ci < len(styledLines) && ansi.StringWidth(styledLines[ci]) > contentWidth {
+			mustCut = true
+			break
+		}
+	}
+
 	var lines []string
 	for i := 0; i < contentHeight; i++ {
 		ci := yOff + i
@@ -299,6 +312,9 @@ func (m *Model) renderViewportWithSelection() string {
 				if hs < he {
 					line = highlightPlainRange(line, m.wrappedLines[ci], hs, he)
 				}
+			}
+			if mustCut && contentWidth > 0 {
+				line = ansi.Cut(line, 0, contentWidth)
 			}
 			lines = append(lines, line)
 		} else {

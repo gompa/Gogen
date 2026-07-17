@@ -1,13 +1,15 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"regexp"
+	"sort"
 	"strings"
+	"time"
 )
 
 const (
@@ -111,7 +113,9 @@ func filterTracked(workingDir string, paths []string) []string {
 	if err != nil || len(paths) == 0 {
 		return paths
 	}
-	cmd := exec.Command("git", "ls-files", "--cached", "--others", "--exclude-standard")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "ls-files", "--cached", "--others", "--exclude-standard")
 	cmd.Dir = workingDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {

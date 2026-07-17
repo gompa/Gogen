@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 
 	"gogen/internal/agent"
@@ -35,18 +36,33 @@ func (c *CLI) SetVerbose(v bool) {
 }
 
 func (c *CLI) Run(ctx context.Context) {
-	// Per-turn SIGINT handling: the outer ctx only catches SIGTERM for
-	// program shutdown. We catch SIGINT ourselves so we can cancel the
-	// current turn without permanently killing the session.
+	// Single SIGINT owner for the whole session: cancel the active turn only.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGINT)
 	defer signal.Stop(sigCh)
 
 	var turnCancel context.CancelFunc
+	var turnMu sync.Mutex
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-sigCh:
+				turnMu.Lock()
+				if turnCancel != nil {
+					turnCancel()
+				}
+				turnMu.Unlock()
+			}
+		}
+	}()
 	defer func() {
+		turnMu.Lock()
 		if turnCancel != nil {
 			turnCancel()
 		}
+		turnMu.Unlock()
 	}()
 
 	fmt.Printf("GoGen — %s (%s)\n", c.agent.Executor.WorkingDir, c.agent.Mode.String())
@@ -80,7 +96,11 @@ func (c *CLI) Run(ctx context.Context) {
 			fmt.Printf("Input error: %v\n", err)
 			break
 		}
-		if input == "exit" {
+		input = strings.TrimSpace(input)
+		if input == "" {
+			continue
+		}
+		if input == "exit" || input == "quit" {
 			break
 		}
 		if input == "compact" || input == "/compact" {
@@ -148,24 +168,19 @@ func (c *CLI) Run(ctx context.Context) {
 		display := newStreamDisplay(c.verbose)
 		handlers := display.handlers()
 
-		// Cancel any previous turn (should already be done).
+		turnMu.Lock()
 		if turnCancel != nil {
 			turnCancel()
 		}
 		turnCtx, tc := context.WithCancel(context.Background())
 		turnCancel = tc
-
-		// If SIGINT arrives during the turn, cancel it.
-		go func() {
-			select {
-			case <-sigCh:
-				turnCancel()
-			case <-turnCtx.Done():
-			}
-		}()
+		turnMu.Unlock()
 
 		_, streamErr := c.agent.StreamProcessInput(agent.ContextWithDeleteApprover(turnCtx, deleteApprover()), input, handlers)
+		turnMu.Lock()
 		turnCancel()
+		turnCancel = nil
+		turnMu.Unlock()
 		fmt.Println()
 		if streamErr != nil {
 			if errors.Is(streamErr, context.Canceled) {

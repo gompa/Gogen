@@ -26,9 +26,9 @@ var planModeAllowedTools = map[string]struct{}{
 	"git_log":          {},
 	"git_blame":        {},
 	"git_status":       {},
-	"git_branch":       {},
-	"git_stash_list":   {},
-	"git_show":         {},
+	// git_branch omitted: create/switch mutate the repo; list via execute outside plan.
+	"git_stash_list": {},
+	"git_show":       {},
 	"web_search":       {},
 	"web_fetch":        {},
 	"find_file":        {},

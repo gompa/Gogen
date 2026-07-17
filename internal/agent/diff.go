@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // ShowDiff returns a unified diff for the working tree using git when available.
@@ -59,7 +60,9 @@ func runDiffQuick(workingDir, path string) (string, error) {
 	if _, err := exec.LookPath("git"); err != nil {
 		return "", err
 	}
-	cmd := exec.Command("git", "diff", "--no-color", "--no-ext-diff", "--", path)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "diff", "--no-color", "--no-ext-diff", "--", path)
 	cmd.Dir = workingDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {

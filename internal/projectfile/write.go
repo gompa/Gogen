@@ -88,9 +88,13 @@ func buildFrontMatter(cfg *config.Config, opts WriteOptions) string {
 				}
 			}
 			if len(s.Env) > 0 {
-				b.WriteString("    env:\n")
-				for k, v := range s.Env {
-					b.WriteString(fmt.Sprintf("      %s: %q\n", k, v))
+				if opts.IncludeSecrets {
+					b.WriteString("    env:\n")
+					for k, v := range s.Env {
+						b.WriteString(fmt.Sprintf("      %s: %q\n", k, v))
+					}
+				} else {
+					b.WriteString("    # env: omitted (use --save-config-secrets to persist)\n")
 				}
 			}
 		}

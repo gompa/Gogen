@@ -111,7 +111,7 @@ func TestCompactPreservesHeadAndTail(t *testing.T) {
 	}
 }
 
-func TestViewForLLMKeepsFullToolResultsUnderBudget(t *testing.T) {
+func TestViewForLLMPassthrough(t *testing.T) {
 	m := NewManager(&stubProvider{}, Settings{
 		ContextLimit:       128000,
 		MaxToolResultBytes: 10,
@@ -119,26 +119,34 @@ func TestViewForLLMKeepsFullToolResultsUnderBudget(t *testing.T) {
 	original := "0123456789"
 	msgs := []llm.Message{{Role: "tool", Content: original, ToolCallID: "c1"}}
 	view := m.ViewForLLM(msgs)
-	if view[0].Content != original {
-		t.Fatalf("expected full tool result under budget, got %q", view[0].Content)
+	if len(view) != 1 || view[0].Content != original {
+		t.Fatalf("ViewForLLM should not rewrite history, got %#v", view)
 	}
 }
 
-func TestViewForLLMTruncatesWhenNearLimit(t *testing.T) {
-	m := NewManager(&stubProvider{}, Settings{
-		ContextLimit:         200,
-		CompactThreshold:     0.75,
-		MaxToolResultBytes:   5,
-		CompactReserveTokens: 20,
-	})
+func TestEnsureToolResultsCappedSticky(t *testing.T) {
+	m := NewManager(&stubProvider{}, Settings{MaxToolResultBytes: 5})
 	big := strings.Repeat("x", 4000)
 	msgs := []llm.Message{
 		{Role: "user", Content: "task"},
 		{Role: "tool", Content: big, ToolCallID: "c1"},
 	}
+	if !m.EnsureToolResultsCapped(msgs) {
+		t.Fatal("expected first pass to rewrite oversized tool result")
+	}
+	capped := msgs[1].Content
+	if capped == big || !strings.Contains(capped, "truncated") {
+		t.Fatalf("expected capped tool result, got %q", capped)
+	}
+	if m.EnsureToolResultsCapped(msgs) {
+		t.Fatal("second pass should be a no-op for stable prompt prefixes")
+	}
+	if msgs[1].Content != capped {
+		t.Fatal("capped content changed on second pass")
+	}
 	view := m.ViewForLLM(msgs)
-	if view[1].Content == big {
-		t.Fatal("expected truncated tool result near context limit")
+	if view[1].Content != capped {
+		t.Fatal("ViewForLLM must keep sticky capped content")
 	}
 }
 

@@ -10,11 +10,13 @@ import (
 	"gogen/internal/llm"
 
 	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/reflow/wordwrap"
+	"github.com/muesli/reflow/wrap"
 )
 
 // FocusTarget indicates which component has keyboard focus.
@@ -52,38 +54,43 @@ type Model struct {
 	textarea textarea.Model
 
 	// State
-	focus       FocusTarget
-	modal       ModalKind
-	streamCancel  context.CancelFunc // cancels the current streaming LLM call
-	streaming   bool
-	verbose     bool
-	width       int
-	height      int
-	quitting    bool
+	focus        FocusTarget
+	modal        ModalKind
+	streamCancel context.CancelFunc // cancels the current streaming LLM call
+	streaming    bool
+	verbose      bool
+	width        int
+	height       int
+	quitting     bool
+
+	// Wait indicator (input area) while a turn is in flight
+	spinner       spinner.Model
+	progressPhase progressPhase
+	progressLabel string
 
 	// Chat content buffer (lines to render)
 	chatLines      []string
-	wrappedPrefix  string // pre-wrapped content of chatLines[:len-1], ends with "\n" if non-empty
-	wrappedContent string // pre-computed wrapped content for viewport
+	wrappedPrefix  string   // pre-wrapped content of chatLines[:len-1], ends with "\n" if non-empty
+	wrappedContent string   // pre-computed wrapped content for viewport
 	styledLines    []string // wrappedContent split by "\n" (cached for selection render)
 
 	// Streaming accumulation
 	streamAssistantBuf  strings.Builder
 	streamThinkingBuf   strings.Builder
 	streamThinkingOpen  bool
-	streamToolCallNames map[int]string // index -> name
-	streamToolCallArgs  map[int]string // index -> accumulated args deltas
-	streamToolCallIDs   map[int]string // index -> call ID (for correlating results)
+	streamToolCallNames map[int]string    // index -> name
+	streamToolCallArgs  map[int]string    // index -> accumulated args deltas
+	streamToolCallIDs   map[int]string    // index -> call ID (for correlating results)
 	toolCallDiffs       map[string]string // call ID -> diff text (for patch_file/show_diff)
 
 	// Input history
-	inputHistory     []string
-	historyIdx       int
-	historyDraft     string
+	inputHistory []string
+	historyIdx   int
+	historyDraft string
 
 	// Context stats
-	contextStats   agent.TurnContext
-	contextLine    string
+	contextStats agent.TurnContext
+	contextLine  string
 
 	// Session
 	sessionID string
@@ -98,22 +105,22 @@ type Model struct {
 	approvalUI     *approvalUIState
 
 	// Modal data
-	sessionList    []agent.SessionInfo
-	modelList      []llm.ModelInfo
-	sessionCursor  int
+	sessionList   []agent.SessionInfo
+	modelList     []llm.ModelInfo
+	sessionCursor int
 
 	// Keymap
-	keys           KeyMap
+	keys KeyMap
 
 	// Screen dimensions tracking
-	ready          bool
+	ready bool
 
 	// Text selection (mouse drag-to-select in viewport)
-	selectionYOff int // viewport YOffset at selection start (for stable coordinates)
-	selection    *SelectionState
-	wrappedLines []string // ANSI-stripped wrapped content lines (coordinate mapping)
+	selectionYOff     int // viewport YOffset at selection start (for stable coordinates)
+	selection         *SelectionState
+	wrappedLines      []string // ANSI-stripped wrapped content lines (coordinate mapping)
 	wrappedLinesDirty bool
-	statusMsg    string   // transient message (e.g. "Copied N chars")
+	statusMsg         string // transient message (e.g. "Copied N chars")
 }
 
 // NewModel creates a new TUI model.
@@ -156,26 +163,28 @@ func NewModel(a *agent.Agent, cfg *config.Config) Model {
 	}
 
 	m := Model{
-		agent:             a,
-		cfg:               cfg,
-		viewport:          vp,
-		textarea:          ta,
-		focus:             FocusInput,
-		modal:             ModalNone,
-		streaming:         false,
-		verbose:           verbose,
-		chatLines:         make([]string, 0),
+		agent:               a,
+		cfg:                 cfg,
+		viewport:            vp,
+		textarea:            ta,
+		focus:               FocusInput,
+		modal:               ModalNone,
+		streaming:           false,
+		verbose:             verbose,
+		spinner:             newProgressSpinner(),
+		progressPhase:       progressHidden,
+		chatLines:           make([]string, 0),
 		streamToolCallNames: make(map[int]string),
 		streamToolCallArgs:  make(map[int]string),
 		streamToolCallIDs:   make(map[int]string),
 		toolCallDiffs:       make(map[string]string),
-		keys:              DefaultKeyMap,
-		sessionID:         "",
-		approvalResult:    make(chan bool, 1),
-		selectionYOff:     -1,
-		selection:         nil,
-		wrappedLines:      nil,
-		statusMsg:         "",
+		keys:                DefaultKeyMap,
+		sessionID:           "",
+		approvalResult:      make(chan bool, 1),
+		selectionYOff:       -1,
+		selection:           nil,
+		wrappedLines:        nil,
+		statusMsg:           "",
 	}
 
 	if a != nil {
@@ -237,8 +246,16 @@ func (m *Model) wrapWidth() int {
 
 // wrapLine wraps a single chat line ready for display.  It handles SGR
 // propagation so that ANSI styles are re‑emitted on every continuation line.
+//
+// wordwrap alone leaves overlong tokens (URLs, paths, etc.) wider than the
+// limit. A follow-up hard wrap breaks those so every line fits wrapWidth.
+// Without that, the normal viewport truncates with ansi.Cut while the
+// selection renderer re-wraps via lipgloss MaxWidth — causing lines to jump
+// when selecting text.
 func (m *Model) wrapLine(line string) []string {
-	wrapped := wordwrap.String(line, m.wrapWidth())
+	w := m.wrapWidth()
+	wrapped := wordwrap.String(line, w)
+	wrapped = wrap.String(wrapped, w)
 	parts := strings.Split(wrapped, "\n")
 	if len(parts) > 1 {
 		sgr := extractLeadingSGR(line)
@@ -309,6 +326,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.SetSize(msg.Width, msg.Height)
 		return m, nil
 
+	case spinner.TickMsg:
+		if !m.progressAnimating() {
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
+
 	case tea.KeyMsg:
 		// Clear transient status message on any key press
 		if m.statusMsg != "" {
@@ -317,6 +342,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Global hotkeys that work regardless of focus/modal
 		switch {
 		case key.Matches(msg, m.keys.ForceQuit):
+			if m.streamCancel != nil {
+				m.streamCancel()
+			}
+			m.dismissApproval(false)
 			m.quitting = true
 			return m, tea.Quit
 		}
@@ -338,42 +367,42 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.handleStreamStart()
-		return m, nil
+		return m, m.setProgress(progressThinking, "thinking")
 
 	case streamRoundStartMsg:
 		if !m.streaming {
 			return m, nil
 		}
 		m.handleStreamRoundStart()
-		return m, nil
+		return m, m.setProgress(progressThinking, "thinking")
 
 	case streamTokenMsg:
 		if !m.streaming {
 			return m, nil
 		}
 		m.handleStreamToken(msg.token)
-		return m, nil
+		return m, m.setProgress(progressActive, "")
 
 	case streamThinkingMsg:
 		if !m.streaming {
 			return m, nil
 		}
 		m.handleStreamThinking(msg.token)
-		return m, nil
+		return m, m.setProgress(progressActive, "")
 
 	case streamToolCallMsg:
 		if !m.streaming {
 			return m, nil
 		}
 		m.handleStreamToolCall(msg.index, msg.id, msg.name)
-		return m, nil
+		return m, m.setProgress(progressActive, "")
 
 	case streamToolCallArgsMsg:
 		if !m.streaming {
 			return m, nil
 		}
 		m.handleStreamToolArgs(msg.index, msg.id, msg.delta)
-		return m, nil
+		return m, m.setProgress(progressActive, "")
 
 	case streamToolCallFinalMsg:
 		if !m.streaming {
@@ -382,19 +411,29 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.handleStreamToolCallFinal(msg.index, msg.tc)
 		return m, nil
 
+	case streamToolExecuteMsg:
+		if !m.streaming {
+			return m, nil
+		}
+		label := "running tool"
+		if msg.name != "" {
+			label = "running " + msg.name
+		}
+		return m, m.setProgress(progressTool, label)
+
 	case streamToolResultMsg:
 		if !m.streaming {
 			return m, nil
 		}
 		m.handleStreamToolResult(msg.id, msg.name, msg.result, msg.success)
-		return m, nil
+		return m, m.setProgress(progressThinking, "thinking")
 
 	case streamRoundEndMsg:
 		if !m.streaming {
 			return m, nil
 		}
 		m.handleStreamRoundEnd()
-		return m, nil
+		return m, m.setProgress(progressThinking, "thinking")
 
 	case streamEndMsg:
 		// Always process – resets streaming state
@@ -406,7 +445,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case contextStatsMsg:
-		// Always process – may arrive after streamEndMsg
+		// Optional async refresh (session commands); stream end updates sync.
 		m.contextStats = msg.stats
 		m.contextLine = agent.FormatContextBrief(msg.stats)
 		return m, nil
@@ -480,7 +519,7 @@ func (m Model) View() string {
 	// Textarea
 	var inputArea string
 	if m.streaming {
-		inputArea = DimStyle.Render("  … processing …")
+		inputArea = m.renderProgressInput()
 	} else {
 		inputArea = m.textarea.View()
 	}
@@ -490,7 +529,7 @@ func (m Model) View() string {
 	if m.focus == FocusViewport {
 		indicator := " [SCROLL] Press i or Esc to return to input "
 		line := strings.Repeat("─", m.width)
-		divider = DividerStyle.Render(line[:max(0,m.width-len(indicator))] + indicator)
+		divider = DividerStyle.Render(line[:max(0, m.width-len(indicator))] + indicator)
 	} else if m.streaming {
 		divider = DimStyle.Render(strings.Repeat("─", m.width))
 	} else {
@@ -738,10 +777,8 @@ func (m *Model) handleStreamRoundEnd() {
 	}
 	m.streamThinkingBuf.Reset()
 	m.streamAssistantBuf.Reset()
-	m.streamToolCallNames = make(map[int]string)
-	m.streamToolCallArgs = make(map[int]string)
-	m.streamToolCallIDs = make(map[int]string)
-	m.toolCallDiffs = make(map[string]string)
+	// Keep streamToolCallNames / toolCallDiffs until OnRoundStart or turn end so
+	// OnToolCall finals and patch diffs still resolve after OnStreamEnd.
 
 	m.setViewportContent()
 	m.viewport.GotoBottom()
@@ -749,22 +786,51 @@ func (m *Model) handleStreamRoundEnd() {
 
 func (m *Model) handleStreamEnd() {
 	m.streaming = false
-
-	// Update context stats
-	if m.agent != nil {
-		stats := m.agent.ContextStats(m.ctx)
-		if line := agent.FormatContextBrief(stats); line != "" {
-			m.contextLine = line
-			m.contextStats = stats
-		}
-	}
-
+	m.clearProgress()
+	// ContextStats is read-only and local (no provider I/O) — safe on the
+	// Update thread once StreamProcessInput has returned.
+	m.refreshContextStats()
 	m.setViewportContent()
 	m.viewport.GotoBottom()
 }
 
+// refreshContextStats updates the status-bar context indicator immediately.
+// Only call when StreamProcessInput is not running (no Messages race).
+func (m *Model) refreshContextStats() {
+	if m.agent == nil {
+		m.contextStats = agent.TurnContext{}
+		m.contextLine = ""
+		return
+	}
+	ctx := m.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stats := m.agent.ContextStats(ctx)
+	m.contextStats = stats
+	m.contextLine = agent.FormatContextBrief(stats)
+}
+
+// requestContextStats refreshes the status-bar indicator asynchronously.
+// Prefer refreshContextStats from Update handlers when the stream is idle.
+func (m *Model) requestContextStats() tea.Cmd {
+	if m.agent == nil {
+		return nil
+	}
+	a := m.agent
+	ctx := m.ctx
+	return func() tea.Msg {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		return contextStatsMsg{stats: a.ContextStats(context.WithoutCancel(ctx))}
+	}
+}
+
 func (m *Model) handleStreamError(err error) {
+	wasStreaming := m.streaming
 	m.streaming = false
+	m.clearProgress()
 	m.streamAssistantBuf.Reset()
 	m.streamThinkingBuf.Reset()
 	m.streamThinkingOpen = false
@@ -772,9 +838,15 @@ func (m *Model) handleStreamError(err error) {
 	m.streamToolCallArgs = make(map[int]string)
 	m.streamToolCallIDs = make(map[int]string)
 	m.toolCallDiffs = make(map[string]string)
-	if err != nil {
-		m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Error: %v", err)))
+	m.refreshContextStats()
+	if err == nil {
+		return
 	}
+	// UI cancel already printed "Cancelled." — don't duplicate context.Canceled.
+	if !wasStreaming && (err == context.Canceled || strings.Contains(err.Error(), "context canceled")) {
+		return
+	}
+	m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Error: %v", err)))
 }
 
 func summarizeResult(result string, success bool) string {

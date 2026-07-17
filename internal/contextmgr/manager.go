@@ -95,10 +95,15 @@ func (m *Manager) EnsureContextLimit(ctx context.Context) {
 	m.limitResolved = true
 }
 
-// TruncateToolResult caps tool output stored in views sent to the LLM.
+const toolResultTruncationMarker = "\n… truncated ("
+
+// TruncateToolResult caps tool output stored in canonical history / LLM views.
 func (m *Manager) TruncateToolResult(content string) string {
 	max := m.Settings.MaxToolResultBytes
 	if max <= 0 || len(content) <= max {
+		return content
+	}
+	if strings.Contains(content, toolResultTruncationMarker) {
 		return content
 	}
 	return content[:max] + fmt.Sprintf("\n… truncated (%d chars total)", len(content))
@@ -155,13 +160,22 @@ func (m *Manager) Snapshot(canonical, llmView []llm.Message) ContextSnapshot {
 		Stored:        stored,
 		CompactAt:     compactAt,
 		MessageCount:  len(canonical),
-		ToolTruncated: m.ShouldTruncateToolResults(canonical),
+		ToolTruncated: hasTruncatedToolResults(canonical),
 		NearCompact:   used >= compactAt,
 	}
 	if limit > 0 {
 		snap.Percent = float64(used) / float64(limit)
 	}
 	return snap
+}
+
+func hasTruncatedToolResults(messages []llm.Message) bool {
+	for _, msg := range messages {
+		if msg.Role == "tool" && strings.Contains(msg.Content, toolResultTruncationMarker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) compactBudget() int {
@@ -185,23 +199,39 @@ func (m *Manager) ShouldCompact(messages []llm.Message) bool {
 	return m.EstimateTokens(messages) >= m.compactBudget()
 }
 
-// ShouldTruncateToolResults reports whether tool outputs should be shortened for the LLM view.
-func (m *Manager) ShouldTruncateToolResults(messages []llm.Message) bool {
-	if m.Settings.MaxToolResultBytes <= 0 {
+// EnsureToolResultsCapped mutates messages so every tool body fits MaxToolResultBytes.
+// Safe to call every turn; only rewrites oversized bodies (one-time sticky rewrite).
+func (m *Manager) EnsureToolResultsCapped(messages []llm.Message) bool {
+	max := m.Settings.MaxToolResultBytes
+	if max <= 0 {
 		return false
 	}
-	return m.EstimateTokens(messages) >= m.compactBudget()
-}
-
-// ViewForLLM returns messages for the model, truncating tool results only when near the limit.
-func (m *Manager) ViewForLLM(messages []llm.Message) []llm.Message {
-	if !m.ShouldTruncateToolResults(messages) {
-		return messages
+	changed := false
+	for i := range messages {
+		if messages[i].Role != "tool" || messages[i].Content == "" {
+			continue
+		}
+		if strings.Contains(messages[i].Content, toolResultTruncationMarker) {
+			continue
+		}
+		if len(messages[i].Content) <= max {
+			continue
+		}
+		messages[i].Content = m.TruncateToolResult(messages[i].Content)
+		changed = true
 	}
-	return m.ViewWithTruncation(messages)
+	return changed
 }
 
-// ViewWithTruncation returns a copy of messages with tool results truncated for the LLM.
+// ViewForLLM returns the message list sent to the model.
+// Tool results are capped in canonical history (append + EnsureToolResultsCapped),
+// not rewritten per round, so prompt-cache prefixes stay stable.
+func (m *Manager) ViewForLLM(messages []llm.Message) []llm.Message {
+	return messages
+}
+
+// ViewWithTruncation returns a copy of messages with tool results truncated.
+// Prefer EnsureToolResultsCapped for sticky in-place capping of canonical history.
 func (m *Manager) ViewWithTruncation(messages []llm.Message) []llm.Message {
 	out := make([]llm.Message, len(messages))
 	for i, msg := range messages {
@@ -216,28 +246,36 @@ func (m *Manager) ViewWithTruncation(messages []llm.Message) []llm.Message {
 // Compact replaces the middle of canonical history with an LLM-generated summary.
 // It preserves the first user message and the most recent KeepRecentMessages entries.
 func (m *Manager) Compact(ctx context.Context, messages []llm.Message) ([]llm.Message, error) {
+	out, _, err := m.CompactPinned(ctx, messages, nil)
+	return out, err
+}
+
+// CompactPinned is like Compact but keeps pinned message indices in the preserved
+// tail and returns remapped pin indices for the compacted history.
+func (m *Manager) CompactPinned(ctx context.Context, messages []llm.Message, pinned map[int]struct{}) ([]llm.Message, map[int]struct{}, error) {
 	if len(messages) <= m.Settings.KeepRecentMessages+1 {
-		return messages, nil
+		return messages, copyIntSet(pinned), nil
 	}
 
 	headIdx := firstUserIndex(messages)
 	tailStart := adjustCompactTailStart(messages, len(messages)-m.Settings.KeepRecentMessages)
+	tailStart = extendTailForPins(messages, headIdx, tailStart, pinned)
 	if tailStart <= headIdx+1 {
-		return messages, nil
+		return messages, copyIntSet(pinned), nil
 	}
 
+	oldTailStart := tailStart
 	head := []llm.Message{cloneMessage(messages[headIdx])}
 	middle := messages[headIdx+1 : tailStart]
 	tail := cloneMessages(messages[tailStart:])
 
 	summary, err := m.summarizeMiddle(ctx, middle)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	compact := make([]llm.Message, 0, 1+1+len(tail))
+	compact := make([]llm.Message, 0, headIdx+1+1+len(tail))
 	if headIdx > 0 {
-		// Preserve any messages before the first user turn (shouldn't happen, but safe).
 		compact = append(compact, cloneMessages(messages[:headIdx])...)
 	}
 	compact = append(compact, head...)
@@ -246,7 +284,58 @@ func (m *Manager) Compact(ctx context.Context, messages []llm.Message) ([]llm.Me
 		Content: summaryPrefix + summary,
 	})
 	compact = append(compact, tail...)
-	return compact, nil
+
+	newPinned := remapPinsAfterCompact(pinned, headIdx, oldTailStart, len(compact)-len(tail))
+	return compact, newPinned, nil
+}
+
+// extendTailForPins pulls the tail start earlier so every pinned index is preserved.
+func extendTailForPins(messages []llm.Message, headIdx, tailStart int, pinned map[int]struct{}) int {
+	if len(pinned) == 0 {
+		return tailStart
+	}
+	for idx := range pinned {
+		if idx <= headIdx || idx >= len(messages) {
+			continue
+		}
+		if idx < tailStart {
+			tailStart = idx
+		}
+	}
+	return adjustCompactTailStart(messages, tailStart)
+}
+
+func remapPinsAfterCompact(pinned map[int]struct{}, headIdx, oldTailStart, newTailStart int) map[int]struct{} {
+	if len(pinned) == 0 {
+		return nil
+	}
+	out := make(map[int]struct{}, len(pinned))
+	for idx := range pinned {
+		if idx < 0 {
+			continue
+		}
+		if idx <= headIdx {
+			out[idx] = struct{}{}
+			continue
+		}
+		if idx >= oldTailStart {
+			out[newTailStart+(idx-oldTailStart)] = struct{}{}
+		}
+		// Pins that fell in the summarized middle are dropped (should not happen
+		// when extendTailForPins ran first).
+	}
+	return out
+}
+
+func copyIntSet(in map[int]struct{}) map[int]struct{} {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[int]struct{}, len(in))
+	for k := range in {
+		out[k] = struct{}{}
+	}
+	return out
 }
 
 func firstUserIndex(messages []llm.Message) int {

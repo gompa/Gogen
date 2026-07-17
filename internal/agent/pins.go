@@ -77,18 +77,44 @@ func (p *PinManager) ListPins(messages []llm.Message) string {
 	return b.String()
 }
 
+// PinnedSet returns a copy of the pinned index set.
+func (p *PinManager) PinnedSet() map[int]struct{} {
+	if p == nil || len(p.pinned) == 0 {
+		return nil
+	}
+	out := make(map[int]struct{}, len(p.pinned))
+	for idx := range p.pinned {
+		out[idx] = struct{}{}
+	}
+	return out
+}
+
+// ReplacePins replaces the pin set (used after compaction remaps indices).
+func (p *PinManager) ReplacePins(pins map[int]struct{}) {
+	if p == nil {
+		return
+	}
+	if len(pins) == 0 {
+		p.pinned = make(map[int]struct{})
+		return
+	}
+	p.pinned = make(map[int]struct{}, len(pins))
+	for idx := range pins {
+		p.pinned[idx] = struct{}{}
+	}
+}
+
 // MergePinsWithTail returns the set of indices that must be kept in the tail
 // during compaction (merged with the normal keep-recent range).
 func (p *PinManager) MergePinsWithTail(tailStart int, keepRecent int) int {
-	if len(p.pinned) == 0 {
+	if p == nil || len(p.pinned) == 0 {
 		return tailStart
 	}
-	// Extend the tail start backwards to include all pinned messages.
 	for idx := range p.pinned {
 		if idx < tailStart && idx > 0 {
 			tailStart = idx
 		}
 	}
-	_ = keepRecent // available for future use
+	_ = keepRecent
 	return tailStart
 }

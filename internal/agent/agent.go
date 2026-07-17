@@ -147,12 +147,20 @@ func (a *Agent) prepareMessages(ctx context.Context) []llm.Message {
 		// whose results are still pending, confusing the LLM.
 		if len(a.Messages) > 0 && a.Messages[len(a.Messages)-1].Role == "user" {
 			if a.Context.ShouldCompact(a.Messages) {
-				compacted, err := a.Context.Compact(ctx, a.Messages)
+				var pinned map[int]struct{}
+				if a.PinManager != nil {
+					pinned = a.PinManager.PinnedSet()
+				}
+				compacted, newPins, err := a.Context.CompactPinned(ctx, a.Messages, pinned)
 				if err == nil {
 					a.Messages = compacted
+					if a.PinManager != nil {
+						a.PinManager.ReplacePins(newPins)
+					}
 				}
 			}
 		}
+		a.Context.EnsureToolResultsCapped(a.Messages)
 		view = a.Context.ViewForLLM(a.Messages)
 	}
 	view = withSystemPrompt(view, a.WorkingDir)
@@ -167,12 +175,22 @@ func (a *Agent) CompactHistory(ctx context.Context) error {
 	if len(a.Messages) <= a.Context.Settings.KeepRecentMessages+1 {
 		return fmt.Errorf("not enough history to compact (%d messages)", len(a.Messages))
 	}
-	compacted, err := a.Context.Compact(ctx, a.Messages)
+	compacted, newPins, err := a.Context.CompactPinned(ctx, a.Messages, pinnedSet(a.PinManager))
 	if err != nil {
 		return err
 	}
 	a.Messages = compacted
+	if a.PinManager != nil {
+		a.PinManager.ReplacePins(newPins)
+	}
 	return nil
+}
+
+func pinnedSet(p *PinManager) map[int]struct{} {
+	if p == nil {
+		return nil
+	}
+	return p.PinnedSet()
 }
 
 func formatToolError(result string, err error) string {
@@ -183,6 +201,9 @@ func formatToolError(result string, err error) string {
 }
 
 func (a *Agent) appendToolResult(tc llm.ToolCall, result string) {
+	if a.Context != nil {
+		result = a.Context.TruncateToolResult(result)
+	}
 	a.Messages = append(a.Messages, llm.Message{
 		Role:       "tool",
 		Content:    result,
@@ -255,9 +276,12 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 			ToolCalls: result.ToolCalls,
 		})
 
-		for _, tc := range result.ToolCalls {
+		for i, tc := range result.ToolCalls {
 			if ctx.Err() != nil {
+				// Preserve a valid tool-call/result protocol for the next turn.
+				a.appendCanceledToolResults(result.ToolCalls[i:], ctx.Err())
 				finishStreamUI(h)
+				a.persistSession()
 				return "", ctx.Err()
 			}
 			if h.OnToolCall != nil {
@@ -269,7 +293,17 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 
 			res, errTool := a.executeTool(ctx, tc)
 			if ctx.Err() != nil {
+				if errTool == nil {
+					errTool = ctx.Err()
+				}
+				res = formatToolError(res, errTool)
+				if h.OnToolResult != nil {
+					h.OnToolResult(tc.ID, tc.Name, res, false)
+				}
+				a.appendToolResult(tc, res)
+				a.appendCanceledToolResults(result.ToolCalls[i+1:], ctx.Err())
 				finishStreamUI(h)
+				a.persistSession()
 				return "", ctx.Err()
 			}
 			success := errTool == nil
@@ -284,6 +318,13 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 			a.appendToolResult(tc, res)
 		}
 		a.persistSession()
+	}
+}
+
+func (a *Agent) appendCanceledToolResults(toolCalls []llm.ToolCall, err error) {
+	msg := formatToolError("", err)
+	for _, tc := range toolCalls {
+		a.appendToolResult(tc, msg)
 	}
 }
 
@@ -367,6 +408,18 @@ func stringSliceArg(args map[string]interface{}, key string) ([]string, error) {
 	if !ok {
 		return nil, fmt.Errorf("missing required argument %q", key)
 	}
+	return coerceStringSlice(key, val)
+}
+
+func stringSliceArgOptional(args map[string]interface{}, key string) ([]string, error) {
+	val, ok := args[key]
+	if !ok {
+		return nil, nil
+	}
+	return coerceStringSlice(key, val)
+}
+
+func coerceStringSlice(key string, val interface{}) ([]string, error) {
 	switch v := val.(type) {
 	case []string:
 		return v, nil
@@ -386,6 +439,9 @@ func stringSliceArg(args map[string]interface{}, key string) ([]string, error) {
 }
 
 func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error) {
+	if tc.ArgsError != "" {
+		return "", fmt.Errorf("invalid tool arguments: %s", tc.ArgsError)
+	}
 	if err := a.checkPlanMode(tc.Name); err != nil {
 		return "", err
 	}
@@ -580,7 +636,10 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error
 		}
 		return a.Executor.GitCommit(ctx, message)
 	case "git_stage":
-		paths, _ := stringSliceArg(tc.Args, "paths")
+		paths, err := stringSliceArgOptional(tc.Args, "paths")
+		if err != nil {
+			return "", err
+		}
 		return a.Executor.GitStage(ctx, paths)
 	case "git_branch":
 		name, _ := stringArgOptional(tc.Args, "name")

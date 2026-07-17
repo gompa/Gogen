@@ -91,6 +91,9 @@ func (e *Executor) GitBranch(ctx context.Context, name string, create bool) (str
 		return "", fmt.Errorf("git is not available on PATH")
 	}
 	name = strings.TrimSpace(name)
+	if err := validateGitBranchName(name); err != nil {
+		return "", err
+	}
 
 	if name != "" && create {
 		cmd := exec.CommandContext(ctx, "git", "switch", "-c", name)
@@ -110,7 +113,7 @@ func (e *Executor) GitBranch(ctx context.Context, name string, create bool) (str
 	}
 
 	if name != "" {
-		cmd := exec.CommandContext(ctx, "git", "switch", name)
+		cmd := exec.CommandContext(ctx, "git", "switch", "--", name)
 		cmd.Dir = e.WorkingDir
 		out, err := cmd.CombinedOutput()
 		text := strings.TrimSpace(string(out))
@@ -242,10 +245,13 @@ func (e *Executor) GitDiffShow(ctx context.Context, ref string) (string, error) 
 		return "", fmt.Errorf("git is not available on PATH")
 	}
 	ref = strings.TrimSpace(ref)
+	if err := validateGitRef(ref); err != nil {
+		return "", err
+	}
 
 	args := []string{"show", "--no-color", "--no-ext-diff"}
 	if ref != "" {
-		args = append(args, ref)
+		args = append(args, "--", ref)
 	}
 
 	cmd := exec.CommandContext(ctx, "git", args...)

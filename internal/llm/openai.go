@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
@@ -77,15 +78,11 @@ func (p *OpenAIProvider) messagesToChat(messages []Message) []openai.ChatComplet
 					asst.Content.OfString = param.NewOpt(m.Content)
 				}
 				for _, tc := range m.ToolCalls {
-					argsJSON, err := json.Marshal(tc.Args)
-					if err != nil {
-						argsJSON = []byte("{}")
-					}
 					asst.ToolCalls = append(asst.ToolCalls, openai.ChatCompletionMessageToolCallParam{
 						ID: tc.ID,
 						Function: openai.ChatCompletionMessageToolCallFunctionParam{
 							Name:      tc.Name,
-							Arguments: string(argsJSON),
+							Arguments: toolCallArgumentsJSON(tc),
 						},
 					})
 				}
@@ -102,6 +99,22 @@ func (p *OpenAIProvider) messagesToChat(messages []Message) []openai.ChatComplet
 		}
 	}
 	return chatMessages
+}
+
+// toolCallArgumentsJSON returns provider-stable tool argument JSON.
+// Prefer the raw ArgsStr from the model so re-sends match the prior completion bytes.
+func toolCallArgumentsJSON(tc ToolCall) string {
+	if s := strings.TrimSpace(tc.ArgsStr); s != "" && json.Valid([]byte(s)) {
+		return tc.ArgsStr
+	}
+	if tc.Args == nil {
+		return "{}"
+	}
+	argsJSON, err := json.Marshal(tc.Args)
+	if err != nil {
+		return "{}"
+	}
+	return string(argsJSON)
 }
 
 func (p *OpenAIProvider) GenerateResponse(ctx context.Context, messages []Message, allowedTools map[string]struct{}, tools []Tool) (Response, error) {
@@ -127,9 +140,10 @@ func (p *OpenAIProvider) GenerateResponse(ctx context.Context, messages []Messag
 			return Response{}, fmt.Errorf("failed to unmarshal tool call arguments: %w", err)
 		}
 		toolCalls = append(toolCalls, ToolCall{
-			ID:   tc.ID,
-			Name: tc.Function.Name,
-			Args: args,
+			ID:      tc.ID,
+			Name:    tc.Function.Name,
+			Args:    args,
+			ArgsStr: tc.Function.Arguments,
 		})
 	}
 
@@ -171,6 +185,9 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 		Messages: chatMessages,
 		Tools:    toolsToOpenAI(tools, allowedTools),
 		Model:    p.model,
+		StreamOptions: openai.ChatCompletionStreamOptionsParam{
+			IncludeUsage: openai.Bool(true),
+		},
 	})
 	defer stream.Close()
 
@@ -198,16 +215,28 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 	}
 
 	streamDone := false
+	drainAfterDone := 0
 	for stream.Next() {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 
 		chunk := stream.Current()
-		if len(chunk.Choices) == 0 {
-			if u := usageFromOpenAI(chunk.Usage); u != nil {
-				streamUsage = u
+		// Always capture usage — with include_usage it often arrives in a
+		// trailing chunk after finish_reason (empty choices).
+		if u := usageFromOpenAI(chunk.Usage); u != nil {
+			streamUsage = u
+		}
+		if streamDone {
+			// Drain a few trailer chunks for usage, then stop (some local
+			// servers keep the HTTP stream open after finish_reason).
+			drainAfterDone++
+			if drainAfterDone >= 8 {
+				break
 			}
+			continue
+		}
+		if len(chunk.Choices) == 0 {
 			continue
 		}
 
@@ -266,10 +295,6 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 			// complete JSON, otherwise an empty keepalive between arg
 			// fragments would end the stream prematurely.
 			lastFinishReason = "tool_calls"
-			streamDone = true
-		}
-
-		if streamDone {
 			break
 		}
 	}
@@ -309,10 +334,14 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 			continue
 		}
 		var args map[string]interface{}
-		if acc.ArgsStr != "" {
+		var argsErr string
+		if strings.TrimSpace(acc.ArgsStr) == "" {
+			args = map[string]interface{}{}
+		} else {
 			parsed, parseErr := parseToolCallArgs(acc.ArgsStr)
 			if parseErr != nil {
 				args = map[string]interface{}{}
+				argsErr = parseErr.Error()
 			} else {
 				args = parsed
 			}
@@ -321,10 +350,12 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 			args = map[string]interface{}{}
 		}
 		toolCalls = append(toolCalls, ToolCall{
-			Index: acc.Index,
-			ID:    acc.ID,
-			Name:  acc.Name,
-			Args:  args,
+			Index:     acc.Index,
+			ID:        acc.ID,
+			Name:      acc.Name,
+			Args:      args,
+			ArgsStr:   acc.ArgsStr,
+			ArgsError: argsErr,
 		})
 	}
 

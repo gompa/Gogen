@@ -9,50 +9,64 @@ import (
 	"gogen/internal/llm"
 )
 
-const (
-	contextSourceAPI        = "api"
-	contextSourceEstimated  = "estimated"
-)
-
 // TurnContext summarizes context window usage for the current conversation.
 type TurnContext struct {
-	Snapshot       contextmgr.ContextSnapshot
-	LastUsage      *llm.Usage
-	UsedSource     string
-	PromptTokens   int
+	Snapshot         contextmgr.ContextSnapshot
+	LastUsage        *llm.Usage
+	PromptTokens     int
 	CompletionTokens int
+	CachedTokens     int
 }
 
 func (a *Agent) recordTurnUsage(u *llm.Usage) {
+	if u == nil {
+		return
+	}
 	a.lastTurnUsage = u
 }
 
+// ContextStats is a read-only probe of current context usage.
+// It must not mutate Messages, compact history, or call the provider.
 func (a *Agent) ContextStats(ctx context.Context) TurnContext {
-	view := a.prepareMessages(ctx)
+	_ = ctx // reserved for future cancellation of pure-local work
+	msgs := a.Messages
+	view := msgs
+	if a.Context != nil {
+		// Shallow-copy the slice header's elements so Snapshot iteration is
+		// stable even if another goroutine appends (append may reallocate).
+		// Callers must still avoid overlapping Content mutations; truncation
+		// is applied in prepareMessages, not here.
+		if n := len(msgs); n > 0 {
+			cp := make([]llm.Message, n)
+			copy(cp, msgs)
+			msgs = cp
+		}
+		view = withSystemPrompt(msgs, a.WorkingDir)
+		// Use cached profile only — do not run DetectProjectProfile here.
+		view = enrichSystemPrompt(view, a.WorkingDir, a.ProjectFilePath, a.ProjectGuidelines, a.projectProfile, a.Mode)
+	}
+
 	var snap contextmgr.ContextSnapshot
 	if a.Context != nil {
-		snap = a.Context.Snapshot(a.Messages, view)
+		snap = a.Context.Snapshot(msgs, view)
 	} else {
 		snap = contextmgr.ContextSnapshot{
-			MessageCount: len(a.Messages),
+			MessageCount: len(msgs),
 		}
 	}
 
 	stats := TurnContext{
-		Snapshot:   snap,
-		LastUsage:  a.lastTurnUsage,
-		UsedSource: contextSourceEstimated,
+		Snapshot:  snap,
+		LastUsage: a.lastTurnUsage,
 	}
 
+	// Attach last-request API counters for detail views. Snapshot.Used stays
+	// as the estimated current history size so the indicator moves as the
+	// session grows (API prompt tokens are frozen at request start).
 	if a.lastTurnUsage != nil && a.lastTurnUsage.PromptTokens > 0 {
-		stats.UsedSource = contextSourceAPI
 		stats.PromptTokens = a.lastTurnUsage.PromptTokens
 		stats.CompletionTokens = a.lastTurnUsage.CompletionTokens
-		stats.Snapshot.Used = a.lastTurnUsage.PromptTokens
-		stats.Snapshot.NearCompact = stats.Snapshot.CompactAt > 0 && stats.Snapshot.Used >= stats.Snapshot.CompactAt
-		if stats.Snapshot.Limit > 0 {
-			stats.Snapshot.Percent = float64(stats.Snapshot.Used) / float64(stats.Snapshot.Limit)
-		}
+		stats.CachedTokens = a.lastTurnUsage.CachedTokens
 	}
 
 	return stats
@@ -72,10 +86,6 @@ func FormatContextBrief(stats TurnContext) string {
 	if snap.Limit <= 0 && snap.Used <= 0 {
 		return ""
 	}
-	source := stats.UsedSource
-	if source == contextSourceAPI {
-		source = "last request"
-	}
 	line := fmt.Sprintf("context: %s / %s", formatTokenCount(snap.Used), formatTokenCount(snap.Limit))
 	if snap.Limit > 0 {
 		pct := int(snap.Percent * 100)
@@ -84,8 +94,8 @@ func FormatContextBrief(stats TurnContext) string {
 		}
 		line += fmt.Sprintf(" (%d%%)", pct)
 	}
-	if source != "" {
-		line += " · " + source
+	if stats.CachedTokens > 0 {
+		line += fmt.Sprintf(" · %s cached", formatTokenCount(stats.CachedTokens))
 	}
 	return line
 }
@@ -102,11 +112,7 @@ func FormatContextDetail(stats TurnContext) string {
 	snap := stats.Snapshot
 	var b strings.Builder
 
-	sourceLabel := "estimated"
-	if stats.UsedSource == contextSourceAPI {
-		sourceLabel = "last request (api)"
-	}
-	fmt.Fprintf(&b, "Context (%s)\n", sourceLabel)
+	fmt.Fprintf(&b, "Context (estimated)\n")
 	fmt.Fprintf(&b, "  Used:     %s / %s", formatTokenCount(snap.Used), formatTokenCount(snap.Limit))
 	if snap.Limit > 0 {
 		pct := int(snap.Percent * 100)
@@ -120,16 +126,17 @@ func FormatContextDetail(stats TurnContext) string {
 		fmt.Fprintf(&b, "  Compact:  auto at %s\n", formatTokenCount(snap.CompactAt))
 	}
 	fmt.Fprintf(&b, "  Messages: %d\n", snap.MessageCount)
-	if snap.Stored > 0 && snap.Stored != snap.Used {
-		fmt.Fprintf(&b, "  Stored:   %s tokens (canonical history)\n", formatTokenCount(snap.Stored))
-	}
 	if snap.ToolTruncated {
-		b.WriteString("  Tool truncation: active for LLM view\n")
+		b.WriteString("  Tool truncation: some results capped\n")
 	}
 	if stats.PromptTokens > 0 || stats.CompletionTokens > 0 {
-		fmt.Fprintf(&b, "  Last turn: %s in / %s out\n",
+		fmt.Fprintf(&b, "  Last turn: %s in / %s out",
 			formatTokenCount(stats.PromptTokens),
 			formatTokenCount(stats.CompletionTokens))
+		if stats.CachedTokens > 0 {
+			fmt.Fprintf(&b, " (%s cached)", formatTokenCount(stats.CachedTokens))
+		}
+		b.WriteString("\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
 }

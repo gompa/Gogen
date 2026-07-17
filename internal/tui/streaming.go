@@ -40,6 +40,11 @@ type streamToolCallFinalMsg struct {
 	tc    llm.ToolCall
 }
 
+// streamToolExecuteMsg is sent immediately before a tool runs.
+type streamToolExecuteMsg struct {
+	name string
+}
+
 // streamRoundEndMsg is sent at the end of each streaming round
 // (including intermediate tool-call rounds). It resets buffers
 // but does NOT set streaming=false.
@@ -99,7 +104,9 @@ func (s *StreamAdapter) Handlers() *llm.StreamHandlers {
 		OnToolCall: func(tc llm.ToolCall) {
 			s.program.Send(streamToolCallFinalMsg{index: tc.Index, tc: tc})
 		},
-		OnToolExecute: func(name string) {},
+		OnToolExecute: func(name string) {
+			s.program.Send(streamToolExecuteMsg{name: name})
+		},
 		OnToolResult: func(id, name, result string, success bool) {
 			s.program.Send(streamToolResultMsg{id: id, name: name, result: result, success: success})
 		},

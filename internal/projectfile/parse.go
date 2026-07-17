@@ -250,6 +250,27 @@ func parseYAMLFrontMatter(yamlText string) (FileConfig, error) {
 	if v, ok := raw["lint_command"]; ok {
 		cfg.LintCommand = asString(v)
 	}
+	if v, ok := raw["web_auth_token"]; ok {
+		cfg.WebAuthToken = asString(v)
+	}
+	if v, ok := raw["web_fetch"]; ok {
+		cfg.WebFetch = asOnOffString(v)
+	}
+	if v, ok := raw["web_search"]; ok {
+		cfg.WebSearch = asOnOffString(v)
+	}
+	if v, ok := raw["web_search_backend"]; ok {
+		cfg.WebSearchBackend = asString(v)
+	}
+	if v, ok := raw["web_search_api_key"]; ok {
+		cfg.WebSearchAPIKey = asString(v)
+	}
+	if v, ok := raw["web_allowed_domains"]; ok {
+		cfg.WebAllowedDomains = joinListOrString(v)
+	}
+	if v, ok := raw["web_fetch_mode"]; ok {
+		cfg.WebFetchMode = asString(v)
+	}
 
 	return cfg, nil
 }

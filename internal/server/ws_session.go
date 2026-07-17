@@ -36,8 +36,13 @@ func (s *wsSession) completeApproval(id string, approved bool) {
 	ch := s.approvals[id]
 	delete(s.approvals, id)
 	s.approvalMu.Unlock()
-	if ch != nil {
-		ch <- approved
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- approved:
+	default:
+		// Waiter already left (cancel) or buffer full — don't block the reader.
 	}
 }
 

@@ -1,10 +1,13 @@
 package mcp
 
-import "testing"
+import (
+	"bytes"
+	"testing"
+)
 
 func TestBytesTrimSpace(t *testing.T) {
-	got := bytesTrimSpace([]byte("  hello  \n"))
-	if string(got) != "hello" {
+	got := string(bytes.TrimSpace([]byte("  hello  \n")))
+	if got != "hello" {
 		t.Fatalf("got %q", got)
 	}
 }

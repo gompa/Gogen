@@ -39,6 +39,7 @@ type FileConfig struct {
 	WebSearchAPIKey      string
 	WebAllowedDomains    string
 	WebFetchMode         string
+	WebAuthToken         string
 }
 
 // ProjectFile is a loaded combined config + guidelines file.

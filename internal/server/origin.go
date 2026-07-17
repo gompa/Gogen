@@ -42,8 +42,11 @@ func checkWSOrigin(r *http.Request, allowed map[string]struct{}) bool {
 		allowed = defaultAllowedHosts
 	}
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	reqHost := strings.ToLower(strings.Split(r.Host, ":")[0])
+	loopback := reqHost == "localhost" || reqHost == "127.0.0.1" || reqHost == "::1" || reqHost == "[::1]"
 	if origin == "" {
-		return true
+		// Non-browser clients (curl, etc.) omit Origin. Only allow that on loopback.
+		return loopback
 	}
 	u, err := url.Parse(origin)
 	if err != nil {
@@ -54,6 +57,5 @@ func checkWSOrigin(r *http.Request, allowed map[string]struct{}) bool {
 		return true
 	}
 	// Allow the UI served from the same host (Origin host:port vs Host header).
-	reqHost := strings.ToLower(strings.Split(r.Host, ":")[0])
 	return host == reqHost
 }

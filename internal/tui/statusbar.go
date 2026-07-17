@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func (m *Model) renderStatusBar() string {
@@ -64,14 +65,26 @@ func (m *Model) renderStatusBar() string {
 		right = style.Render(m.contextLine)
 	}
 
-	// Layout: left and right with padding between
+	// Layout: left and right with padding between. Prefer keeping the context
+	// indicator visible — truncate the left side first when the bar is tight.
 	availWidth := m.width - 2 // -2 for padding
 	leftWidth := lipgloss.Width(left)
 	rightWidth := lipgloss.Width(right)
 
 	middleWidth := availWidth - leftWidth - rightWidth
 	if middleWidth < 1 {
-		middleWidth = 1
+		keepRight := rightWidth
+		if keepRight > availWidth-2 {
+			keepRight = max(0, availWidth-2)
+			right = ansi.Cut(right, 0, keepRight)
+			rightWidth = lipgloss.Width(right)
+		}
+		maxLeft := max(0, availWidth-rightWidth-1)
+		if leftWidth > maxLeft {
+			left = ansi.Cut(left, 0, maxLeft)
+			leftWidth = lipgloss.Width(left)
+		}
+		middleWidth = max(1, availWidth-leftWidth-rightWidth)
 	}
 
 	content := left + strings.Repeat(" ", middleWidth) + right

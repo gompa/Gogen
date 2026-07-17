@@ -37,13 +37,21 @@ func TestMergeToolCallDeltaMultipleTools(t *testing.T) {
 
 func TestParseToolCallArgs(t *testing.T) {
 	t.Parallel()
-	args, err := parseToolCallArgs("{")
-	if err != nil || len(args) != 0 {
-		t.Fatalf("got %#v err=%v", args, err)
+	_, err := parseToolCallArgs("{")
+	if err == nil {
+		t.Fatal("expected error for incomplete JSON")
 	}
-	args, err = parseToolCallArgs(`{"path":"x"`)
+	_, err = parseToolCallArgs(`{"path":"x"`)
+	if err == nil {
+		t.Fatal("expected error for truncated JSON")
+	}
+	args, err := parseToolCallArgs(`{"path":"x"}`)
 	if err != nil || args["path"] != "x" {
 		t.Fatalf("got %#v err=%v", args, err)
+	}
+	args, err = parseToolCallArgs("")
+	if err != nil || len(args) != 0 {
+		t.Fatalf("empty args: %#v err=%v", args, err)
 	}
 }
 
@@ -55,8 +63,9 @@ func TestToolAccumsStreamComplete(t *testing.T) {
 		want   bool
 	}{
 		{"empty", nil, false},
-		{"name only", []tcAccum{{Name: "read_file", ArgsStr: "{"}}, false},
-		{"complete empty args", []tcAccum{{Name: "read_file", ArgsStr: ""}}, true},
+		{"name only incomplete brace", []tcAccum{{Name: "read_file", ArgsStr: "{"}}, false},
+		{"name only empty args", []tcAccum{{Name: "read_file", ArgsStr: ""}}, false},
+		{"complete empty object", []tcAccum{{Name: "read_file", ArgsStr: "{}"}}, true},
 		{"complete json", []tcAccum{{Name: "read_file", ArgsStr: `{"path":"a"}`}}, true},
 		{"partial json", []tcAccum{{Name: "read_file", ArgsStr: `{"path":`}}, false},
 		{"two tools one partial", []tcAccum{

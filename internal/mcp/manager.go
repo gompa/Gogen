@@ -39,18 +39,24 @@ type toolEntry struct {
 	client *Client
 }
 
-// Client is a single MCP stdio connection.
+// Client is a single MCP stdio connection with an async read loop.
 type Client struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
-	stdout *bufio.Reader
-	mu     sync.Mutex
-	nextID atomic.Int64
+	stdout io.ReadCloser
+
+	mu       sync.Mutex
+	writeMu  sync.Mutex
+	nextID   atomic.Int64
+	pending  map[int64]chan jsonRPCResponse
+	closed   chan struct{}
+	closeOnce sync.Once
+	readerDone chan struct{}
 }
 
 type jsonRPCRequest struct {
 	JSONRPC string      `json:"jsonrpc"`
-	ID      int64       `json:"id"`
+	ID      *int64      `json:"id,omitempty"`
 	Method  string      `json:"method"`
 	Params  interface{} `json:"params,omitempty"`
 }
@@ -119,15 +125,73 @@ func startClient(s config.MCPServerConfig) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	cmd.Stderr = os.Stderr
+	// Discard stderr so MCP noise does not pollute the TUI/CLI.
+	cmd.Stderr = io.Discard
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	return &Client{
-		cmd:    cmd,
-		stdin:  stdin,
-		stdout: bufio.NewReader(stdoutPipe),
-	}, nil
+	c := &Client{
+		cmd:        cmd,
+		stdin:      stdin,
+		stdout:     stdoutPipe,
+		pending:    make(map[int64]chan jsonRPCResponse),
+		closed:     make(chan struct{}),
+		readerDone: make(chan struct{}),
+	}
+	go c.readLoop()
+	return c, nil
+}
+
+func (c *Client) readLoop() {
+	defer close(c.readerDone)
+	reader := bufio.NewReader(c.stdout)
+	skipped := 0
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			c.failPending(err)
+			return
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		var resp jsonRPCResponse
+		if err := json.Unmarshal(line, &resp); err != nil {
+			continue
+		}
+		c.mu.Lock()
+		ch, ok := c.pending[resp.ID]
+		if ok {
+			delete(c.pending, resp.ID)
+			skipped = 0
+		}
+		c.mu.Unlock()
+		if !ok {
+			skipped++
+			if skipped > mcpMaxSkippedResponses {
+				c.failPending(fmt.Errorf("mcp: too many unmatched responses; server may be broken"))
+				return
+			}
+			continue
+		}
+		select {
+		case ch <- resp:
+		default:
+		}
+	}
+}
+
+func (c *Client) failPending(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for id, ch := range c.pending {
+		select {
+		case ch <- jsonRPCResponse{Error: &jsonRPCError{Message: err.Error()}}:
+		default:
+		}
+		delete(c.pending, id)
+	}
 }
 
 func (c *Client) initialize(ctx context.Context) error {
@@ -142,8 +206,7 @@ func (c *Client) initialize(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, err = c.notify("notifications/initialized", map[string]interface{}{})
-	return err
+	return c.notify("notifications/initialized", map[string]interface{}{})
 }
 
 func (c *Client) listTools(ctx context.Context) ([]llm.Tool, error) {
@@ -195,11 +258,11 @@ func (c *Client) CallTool(ctx context.Context, name string, args map[string]inte
 		return string(raw), nil
 	}
 	var b strings.Builder
-	for i, c := range result.Content {
+	for i, part := range result.Content {
 		if i > 0 {
 			b.WriteByte('\n')
 		}
-		b.WriteString(c.Text)
+		b.WriteString(part.Text)
 	}
 	out := b.String()
 	if result.IsError {
@@ -208,62 +271,64 @@ func (c *Client) CallTool(ctx context.Context, name string, args map[string]inte
 	return out, nil
 }
 
-func (c *Client) notify(method string, params interface{}) (json.RawMessage, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	id := c.nextID.Add(1)
-	req := jsonRPCRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params}
+func (c *Client) notify(method string, params interface{}) error {
+	select {
+	case <-c.closed:
+		return fmt.Errorf("mcp client closed")
+	default:
+	}
+	req := jsonRPCRequest{JSONRPC: "2.0", Method: method, Params: params}
 	data, err := json.Marshal(req)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if _, err := c.stdin.Write(append(data, '\n')); err != nil {
-		return nil, err
-	}
-	return nil, nil
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	_, err = c.stdin.Write(append(data, '\n'))
+	return err
 }
 
 func (c *Client) call(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
 	ctx, cancel := context.WithTimeout(ctx, mcpCallTimeout)
 	defer cancel()
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	select {
+	case <-c.closed:
+		return nil, fmt.Errorf("mcp client closed")
+	default:
+	}
+
 	id := c.nextID.Add(1)
-	req := jsonRPCRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params}
+	ch := make(chan jsonRPCResponse, 1)
+	c.mu.Lock()
+	c.pending[id] = ch
+	c.mu.Unlock()
+
+	defer func() {
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
+	}()
+
+	idCopy := id
+	req := jsonRPCRequest{JSONRPC: "2.0", ID: &idCopy, Method: method, Params: params}
 	data, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := c.stdin.Write(append(data, '\n')); err != nil {
+	c.writeMu.Lock()
+	_, err = c.stdin.Write(append(data, '\n'))
+	c.writeMu.Unlock()
+	if err != nil {
 		return nil, err
 	}
-	skipped := 0
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-		line, err := c.stdout.ReadBytes('\n')
-		if err != nil {
-			return nil, err
-		}
-		line = bytesTrimSpace(line)
-		if len(line) == 0 {
-			continue
-		}
-		var resp jsonRPCResponse
-		if err := json.Unmarshal(line, &resp); err != nil {
-			continue
-		}
-		if resp.ID != id {
-			skipped++
-			if skipped > mcpMaxSkippedResponses {
-				return nil, fmt.Errorf("mcp: too many skipped responses (%d); server may be broken", skipped)
-			}
-			continue
-		}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.closed:
+		return nil, fmt.Errorf("mcp client closed")
+	case resp := <-ch:
 		if resp.Error != nil {
 			return nil, fmt.Errorf("mcp rpc error: %s", resp.Error.Message)
 		}
@@ -271,19 +336,25 @@ func (c *Client) call(ctx context.Context, method string, params interface{}) (j
 	}
 }
 
-func bytesTrimSpace(b []byte) []byte {
-	return bytes.TrimSpace(b)
-}
-
 // Close shuts down the MCP client process.
 func (c *Client) Close() error {
-	if c.stdin != nil {
-		_ = c.stdin.Close()
-	}
-	if c.cmd != nil && c.cmd.Process != nil {
-		_ = c.cmd.Process.Kill()
-		_, _ = c.cmd.Process.Wait()
-	}
+	c.closeOnce.Do(func() {
+		close(c.closed)
+		if c.stdin != nil {
+			_ = c.stdin.Close()
+		}
+		if c.stdout != nil {
+			_ = c.stdout.Close()
+		}
+		if c.cmd != nil && c.cmd.Process != nil {
+			_ = c.cmd.Process.Kill()
+			_, _ = c.cmd.Process.Wait()
+		}
+		// Wait for the reader to exit before touching pending under mu, so we
+		// never contend with readLoop.failPending on the same mutex.
+		<-c.readerDone
+		c.failPending(fmt.Errorf("mcp client closed"))
+	})
 	return nil
 }
 

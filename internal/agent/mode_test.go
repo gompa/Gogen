@@ -10,14 +10,17 @@ import (
 func TestPlanModeAllowedTools(t *testing.T) {
 	a := &Agent{Mode: ModePlan}
 	allowed := a.AllowedToolNames()
-	if len(allowed) != 25 {
-		t.Fatalf("expected 25 tools, got %d", len(allowed))
+	if len(allowed) != 24 {
+		t.Fatalf("expected 24 tools, got %d", len(allowed))
 	}
 	if _, ok := allowed["read_file"]; !ok {
 		t.Fatal("read_file should be allowed")
 	}
 	if _, ok := allowed["git_status"]; !ok {
 		t.Fatal("git_status should be allowed in plan mode")
+	}
+	if _, ok := allowed["git_branch"]; ok {
+		t.Fatal("git_branch should not be allowed in plan mode")
 	}
 	if _, ok := allowed["web_search"]; !ok {
 		t.Fatal("web_search should be allowed in plan mode")

@@ -11,6 +11,7 @@ import (
 type UsageAccumulator struct {
 	TotalPromptTokens     int
 	TotalCompletionTokens int
+	TotalCachedTokens     int
 	TotalTurns            int
 }
 
@@ -21,6 +22,7 @@ func (u *UsageAccumulator) Add(usage *llm.Usage) {
 	}
 	u.TotalPromptTokens += usage.PromptTokens
 	u.TotalCompletionTokens += usage.CompletionTokens
+	u.TotalCachedTokens += usage.CachedTokens
 	if usage.PromptTokens > 0 || usage.CompletionTokens > 0 {
 		u.TotalTurns++
 	}
@@ -34,6 +36,9 @@ func (u *UsageAccumulator) Format() string {
 		fmt.Fprintf(&b, ", %s in / %s out",
 			formatTokenCount(u.TotalPromptTokens),
 			formatTokenCount(u.TotalCompletionTokens))
+	}
+	if u.TotalCachedTokens > 0 {
+		fmt.Fprintf(&b, ", %s cached", formatTokenCount(u.TotalCachedTokens))
 	}
 	return b.String()
 }

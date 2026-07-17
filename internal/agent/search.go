@@ -46,6 +46,14 @@ func (e *Executor) SearchCode(ctx context.Context, pattern, subpath, glob string
 	if pattern == "" {
 		return "", fmt.Errorf("pattern is required")
 	}
+	if err := rejectLeadingDashArg("pattern", pattern); err != nil {
+		return "", err
+	}
+	if glob != "" {
+		if err := rejectLeadingDashArg("glob", glob); err != nil {
+			return "", err
+		}
+	}
 	if contextLines < 0 {
 		return "", fmt.Errorf("context_lines must be non-negative")
 	}
@@ -105,6 +113,14 @@ func (e *Executor) searchRoot(subpath string) (absRoot, relPrefix string, err er
 }
 
 func (e *Executor) searchWithRipgrep(ctx context.Context, searchRoot, relPrefix, pattern, glob string, contextLines int) (string, error) {
+	if err := rejectLeadingDashArg("pattern", pattern); err != nil {
+		return "", err
+	}
+	if glob != "" {
+		if err := rejectLeadingDashArg("glob", glob); err != nil {
+			return "", err
+		}
+	}
 	args := []string{
 		"-n",
 		"--no-heading",
@@ -118,7 +134,8 @@ func (e *Executor) searchWithRipgrep(ctx context.Context, searchRoot, relPrefix,
 	if glob != "" {
 		args = append(args, "--glob", glob)
 	}
-	args = append(args, pattern, ".")
+	// "--" prevents patterns like --pre=… from being treated as rg flags.
+	args = append(args, "--", pattern, ".")
 
 	cmd := exec.CommandContext(ctx, "rg", args...)
 	cmd.Dir = searchRoot

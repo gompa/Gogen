@@ -93,19 +93,36 @@ func (m *Model) handleApprovalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.approvalUI.cursor++
 		}
 	case "enter", "y":
-		// Approve
-		m.approvalResult <- true
-		m.approvalUI = nil
-		m.modal = ModalNone
+		m.dismissApproval(true)
 		return m, nil
 	case "n", "esc":
-		// Reject
-		m.approvalResult <- false
-		m.approvalUI = nil
-		m.modal = ModalNone
+		m.dismissApproval(false)
+		return m, nil
+	case "ctrl+c":
+		if m.streamCancel != nil {
+			m.streamCancel()
+		}
+		m.dismissApproval(false)
 		return m, nil
 	}
 	return m, nil
+}
+
+// dismissApproval closes the approval modal and sends a non-blocking result.
+func (m *Model) dismissApproval(approved bool) {
+	if m.modal != ModalApproval && m.approvalUI == nil {
+		return
+	}
+	m.approvalUI = nil
+	m.modal = ModalNone
+	if m.approvalResult == nil {
+		return
+	}
+	select {
+	case m.approvalResult <- approved:
+	default:
+		// Buffer full or no waiter — drop rather than block the UI thread.
+	}
 }
 
 // --- Sessions Modal ---
@@ -424,6 +441,9 @@ func (m *Model) resumeSelectedSession() (tea.Model, tea.Cmd) {
 		m.setViewportContent()
 		m.viewport.GotoBottom()
 		m.sessionID = m.agent.SessionID
+		m.modal = ModalNone
+		m.refreshContextStats()
+		return m, nil
 	}
 	m.modal = ModalNone
 	return m, nil
@@ -457,6 +477,8 @@ func (m *Model) deleteSelectedSession() (tea.Model, tea.Cmd) {
 		m.setViewportContent()
 		m.viewport.GotoBottom()
 		m.sessionID = m.agent.SessionID
+		m.refreshContextStats()
+		return m, nil
 	}
 	return m, nil
 }

@@ -21,14 +21,29 @@ func deleteApprover() agent.DeleteApprover {
 			fmt.Printf("  • %s\n", path)
 		}
 		fmt.Print("Allow delete? [y/N]: ")
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			return false, err
+
+		type result struct {
+			line string
+			err  error
 		}
-		if ctx.Err() != nil {
+		ch := make(chan result, 1)
+		go func() {
+			line, err := reader.ReadString('\n')
+			ch <- result{line, err}
+		}()
+
+		select {
+		case <-ctx.Done():
 			return false, ctx.Err()
+		case r := <-ch:
+			if r.err != nil {
+				return false, r.err
+			}
+			if ctx.Err() != nil {
+				return false, ctx.Err()
+			}
+			answer := strings.TrimSpace(strings.ToLower(r.line))
+			return answer == "y" || answer == "yes", nil
 		}
-		answer := strings.TrimSpace(strings.ToLower(line))
-		return answer == "y" || answer == "yes", nil
 	}
 }

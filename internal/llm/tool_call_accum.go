@@ -75,34 +75,26 @@ func applyToolCallDelta(tcAccums []tcAccum, idx int, tc openai.ChatCompletionChu
 
 func parseToolCallArgs(argsStr string) (map[string]interface{}, error) {
 	s := strings.TrimSpace(argsStr)
-	if s == "" || s == "{" {
+	if s == "" {
 		return map[string]interface{}{}, nil
 	}
 	var args map[string]interface{}
 	err := json.Unmarshal([]byte(s), &args)
-	if err == nil {
-		if args == nil {
-			return map[string]interface{}{}, nil
-		}
-		return args, nil
+	if err != nil {
+		return nil, err
 	}
-	if strings.HasPrefix(s, "{") && !strings.HasSuffix(s, "}") {
-		var repaired map[string]interface{}
-		if err2 := json.Unmarshal([]byte(s+"}"), &repaired); err2 == nil {
-			if repaired == nil {
-				return map[string]interface{}{}, nil
-			}
-			return repaired, nil
-		}
+	if args == nil {
+		return map[string]interface{}{}, nil
 	}
-	return nil, err
+	return args, nil
 }
 
 // toolArgsFullyReceived reports whether streamed tool arguments form complete JSON.
 func toolArgsFullyReceived(argsStr string) bool {
 	s := strings.TrimSpace(argsStr)
+	// Empty means args have not started yet (name-only delta) — not complete.
 	if s == "" {
-		return true
+		return false
 	}
 	if !strings.HasPrefix(s, "{") || !strings.HasSuffix(s, "}") {
 		return false

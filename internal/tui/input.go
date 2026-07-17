@@ -27,6 +27,7 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if key.Matches(msg, m.keys.CancelTurn) {
 		if m.streaming {
 			m.streaming = false
+			m.clearProgress()
 			// Cancel the underlying LLM stream
 			if m.streamCancel != nil {
 				m.streamCancel()
@@ -64,7 +65,7 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if quit {
 				return m, cmd
 			}
-			return m, m.textarea.Focus()
+			return m, tea.Batch(cmd, m.textarea.Focus())
 		}
 
 		// Send to agent
@@ -145,6 +146,10 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if key.Matches(msg, m.keys.DeleteForward) {
 		val := strings.TrimSpace(m.textarea.Value())
 		if val == "" {
+			if m.streamCancel != nil {
+				m.streamCancel()
+			}
+			m.dismissApproval(false)
 			m.quitting = true
 			return m, tea.Quit
 		}
@@ -176,6 +181,7 @@ func (m *Model) handleViewportKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if key.Matches(msg, m.keys.CancelTurn) {
 		if m.streaming {
 			m.streaming = false
+			m.clearProgress()
 			// Cancel the underlying LLM stream
 			if m.streamCancel != nil {
 				m.streamCancel()

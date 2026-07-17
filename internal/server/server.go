@@ -5,6 +5,7 @@ import (
 	"embed"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -33,11 +34,39 @@ type wsConn struct {
 }
 
 const (
-	wsSendQueueSize = 4096
-	wsPingInterval  = 30 * time.Second
-	wsWriteTimeout  = 30 * time.Second
-	wsReadTimeout   = 60 * time.Second
+	wsSendQueueSize   = 4096
+	wsPingInterval    = 30 * time.Second
+	wsWriteTimeout    = 30 * time.Second
+	wsReadTimeout     = 60 * time.Second
+	wsTurnAcquireWait = 150 * time.Millisecond
+	wsStreamDrainWait = 45 * time.Second
 )
+
+func drainStreamErr(ch chan error) {
+	if ch == nil {
+		return
+	}
+	select {
+	case <-ch:
+	case <-time.After(wsStreamDrainWait):
+		log.Printf("warning: timed out waiting for stream goroutine to exit")
+	}
+}
+
+// tryAcquireTurn waits briefly for turnMu (e.g. after cancelling our own stream).
+// Returns false if another client still holds the agent.
+func (s *Server) tryAcquireTurn(wait time.Duration) bool {
+	deadline := time.Now().Add(wait)
+	for {
+		if s.turnMu.TryLock() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
 
 func newWSConn(conn *websocket.Conn) *wsConn {
 	w := &wsConn{
@@ -122,7 +151,9 @@ type Server struct {
 	agent          *agent.Agent
 	config         *config.Config
 	agentMu        sync.RWMutex
+	turnMu         sync.Mutex // serializes agent-mutating work across WS clients
 	allowedOrigins map[string]struct{}
+	authToken      string
 }
 
 type ModelEntry struct {
@@ -162,6 +193,7 @@ type WSMessage struct {
 	UsedSource         string                 `json:"usedSource,omitempty"`
 	PromptTokens       int                    `json:"promptTokens,omitempty"`
 	CompletionTokens   int                    `json:"completionTokens,omitempty"`
+	CachedTokens       int                    `json:"cachedTokens,omitempty"`
 	CompactAt          int                    `json:"compactAt,omitempty"`
 	MessageCount       int                    `json:"messageCount,omitempty"`
 	NearCompact        bool                   `json:"nearCompact,omitempty"`
@@ -181,13 +213,19 @@ type WSMessage struct {
 
 func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 	allowed := parseAllowedOrigins("")
+	token := ""
 	if cfg != nil {
 		allowed = parseAllowedOrigins(cfg.WebAllowedOrigins)
+		token = strings.TrimSpace(cfg.WebAuthToken)
+	}
+	if token == "" {
+		token = strings.TrimSpace(os.Getenv("GOGEN_WEB_TOKEN"))
 	}
 	return &Server{
 		agent:          a,
 		config:         cfg,
 		allowedOrigins: allowed,
+		authToken:      token,
 	}
 }
 
@@ -208,9 +246,10 @@ func applyContextStats(msg *WSMessage, stats agent.TurnContext) {
 	if snap.Used > 0 {
 		msg.UsedTokens = snap.Used
 	}
-	msg.UsedSource = stats.UsedSource
+	msg.UsedSource = "estimated"
 	msg.PromptTokens = stats.PromptTokens
 	msg.CompletionTokens = stats.CompletionTokens
+	msg.CachedTokens = stats.CachedTokens
 	msg.CompactAt = snap.CompactAt
 	msg.MessageCount = snap.MessageCount
 	msg.NearCompact = snap.NearCompact
@@ -273,11 +312,9 @@ func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, resu
 			resp.Sessions = sessionEntries(result.Sessions, s.agent.SessionID)
 		}
 	}
-	// ContextStats may trigger a network call — compute outside the lock.
+	// ContextStats may trigger a network call — compute outside any agentMu lock.
 	ctxMsg := s.contextMsg(ctx)
-	s.agentMu.RLock()
 	cfg := s.agentConfigMsg(ctx)
-	s.agentMu.RUnlock()
 	resp.SessionID = cfg.SessionID
 	resp.Mode = cfg.Mode
 	_ = ws.writeJSON(ctxMsg)
@@ -307,6 +344,10 @@ func (s *Server) modelEntries(models []llm.ModelInfo) []ModelEntry {
 }
 
 func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
+	if !s.checkAuth(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	upg := s.wsUpgrader()
 	conn, err := upg.Upgrade(w, r, nil)
 	if err != nil {
@@ -338,7 +379,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 		if streamCancel != nil {
 			streamCancel()
 			if streamErr != nil {
-				<-streamErr
+				drainStreamErr(streamErr)
 			}
 		}
 		streamMu.Unlock()
@@ -346,7 +387,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 
 	s.agentMu.RLock()
 	cfgMsg := s.agentConfigMsg(r.Context())
-	msgs := s.agent.Messages
+	msgs := append([]llm.Message(nil), s.agent.Messages...)
 	s.agentMu.RUnlock()
 	_ = ws.writeJSON(cfgMsg)
 	if len(msgs) > 0 {
@@ -361,6 +402,12 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 				close(incoming)
 				return
 			}
+			// Complete delete approvals here so they never sit behind a main-loop
+			// turnMu.Lock() (stream holds turnMu while waiting for approval).
+			if msg.Type == "delete_approval_response" {
+				session.completeApproval(msg.ApprovalID, msg.Approved)
+				continue
+			}
 			incoming <- msg
 		}
 	}()
@@ -368,27 +415,43 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	for msg := range incoming {
 		switch msg.Type {
 		case "delete_approval_response":
+			// Already handled in the reader; keep for safety if ever enqueued.
 			session.completeApproval(msg.ApprovalID, msg.Approved)
 			continue
 		case "message":
+			// Cancel any in-flight stream BEFORE taking turnMu.
+			streamMu.Lock()
+			if streamCancel != nil {
+				streamCancel()
+				prevErr := streamErr
+				streamCancel = nil
+				streamErr = nil
+				streamMu.Unlock()
+				drainStreamErr(prevErr)
+			} else {
+				streamMu.Unlock()
+			}
+
+			if !s.tryAcquireTurn(wsTurnAcquireWait) {
+				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+				continue
+			}
 			if out, handled := s.agent.HandleModeCommand(msg.Content); handled {
-				s.agentMu.Lock()
 				_ = ws.writeJSON(s.agentConfigMsg(r.Context()))
-				s.agentMu.Unlock()
+				s.turnMu.Unlock()
 				_ = ws.writeJSON(WSMessage{Type: "response", Content: out})
 				continue
 			}
 			if out, handled := s.agent.HandleContextCommand(r.Context(), msg.Content); handled {
-				s.agentMu.RLock()
-				_ = ws.writeJSON(s.contextMsg(r.Context()))
-				s.agentMu.RUnlock()
+				ctxMsg := s.contextMsg(r.Context())
+				s.turnMu.Unlock()
+				_ = ws.writeJSON(ctxMsg)
 				_ = ws.writeJSON(WSMessage{Type: "response", Content: out})
 				continue
 			}
 			if result, handled, err := s.agent.HandleSessionCommand(r.Context(), msg.Content, sesspkg.NewID()); handled {
-				s.agentMu.Lock()
 				s.writeSessionCommandResult(ws, r.Context(), result, err)
-				s.agentMu.Unlock()
+				s.turnMu.Unlock()
 				continue
 			}
 			if out, handled, err := s.agent.HandleModelsCommand(r.Context(), msg.Content); handled {
@@ -400,34 +463,31 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 						resp.Type = "models"
 						resp.Models = s.modelEntries(models)
 					}
-					s.agentMu.RLock()
 					cfg := s.agentConfigMsg(r.Context())
-					s.agentMu.RUnlock()
 					resp.Model = cfg.Model
 					resp.ContextLimit = cfg.ContextLimit
 					resp.UsedTokens = cfg.UsedTokens
 					resp.UsedSource = cfg.UsedSource
 					resp.UsedPercent = cfg.UsedPercent
+					if strings.HasPrefix(strings.TrimSpace(msg.Content), "/models ") || strings.HasPrefix(strings.TrimSpace(msg.Content), "models ") {
+						_ = ws.writeJSON(cfg)
+					}
 				}
+				s.turnMu.Unlock()
 				_ = ws.writeJSON(resp)
-				if err == nil && (strings.HasPrefix(strings.TrimSpace(msg.Content), "/models ") || strings.HasPrefix(strings.TrimSpace(msg.Content), "models ")) {
-					s.agentMu.RLock()
-					_ = ws.writeJSON(s.agentConfigMsg(r.Context()))
-					s.agentMu.RUnlock()
-				}
 				break
 			}
 
+			// Transfer turnMu ownership to the stream goroutine (do not Unlock here).
 			streamMu.Lock()
-			if streamCancel != nil {
-				streamCancel()
-				_ = <-streamErr // drain previous goroutine's result
-			}
 			streamCtx, cancel := context.WithCancel(r.Context())
 			streamCancel = cancel
 			streamErr = make(chan error, 1)
+			errCh := streamErr
 			streamMu.Unlock()
-			go func(content string, ctx context.Context) {
+			go func(content string, ctx context.Context, done chan error) {
+				defer func() { done <- nil }()
+				defer s.turnMu.Unlock()
 				ctx = agent.ContextWithDeleteApprover(ctx, session.deleteApprover())
 				write := func(v WSMessage) {
 					if ctx.Err() != nil {
@@ -506,29 +566,40 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 						tokens.flush()
 						write(WSMessage{Type: "stream_end"})
 						write(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", err)})
+						log.Printf("stream error: %v", err)
 					}
-					if ctx.Err() != nil {
-						return
-					}
-					streamErr <- err
 					return
 				}
 				tokens.flush()
 				write(WSMessage{Type: "stream_end"})
 				write(s.contextMsg(r.Context()))
-				streamErr <- nil
-			}(msg.Content, streamCtx)
-
-			if err := <-streamErr; err != nil && streamCtx.Err() == nil {
-				log.Printf("stream error: %v", err)
-			}
-
+			}(msg.Content, streamCtx, errCh)
+			// Do not block here — keep reading so delete_approval_response can complete.
+			continue
 		case "set_mode":
+			streamMu.Lock()
+			if streamCancel != nil {
+				streamCancel()
+				prevErr := streamErr
+				streamCancel = nil
+				streamErr = nil
+				streamMu.Unlock()
+				drainStreamErr(prevErr)
+			} else {
+				streamMu.Unlock()
+			}
+			if !s.tryAcquireTurn(wsTurnAcquireWait) {
+				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+				continue
+			}
+			modeSet := false
 			if m, ok := agent.ParseMode(msg.Mode); ok {
-				s.agentMu.Lock()
 				s.agent.SetMode(m)
+				modeSet = true
+			}
+			s.turnMu.Unlock()
+			if modeSet {
 				_ = ws.writeJSON(s.agentConfigMsg(r.Context()))
-				s.agentMu.Unlock()
 			}
 			continue
 		case "config":
@@ -542,19 +613,35 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 				_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: directory does not exist: %s", absDir)})
 				continue
 			}
-			s.agentMu.Lock()
+			streamMu.Lock()
+			if streamCancel != nil {
+				streamCancel()
+				prevErr := streamErr
+				streamCancel = nil
+				streamErr = nil
+				streamMu.Unlock()
+				drainStreamErr(prevErr)
+			} else {
+				streamMu.Unlock()
+			}
+			if !s.tryAcquireTurn(wsTurnAcquireWait) {
+				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+				continue
+			}
 			s.agent.SetWorkingDir(absDir)
 			s.config.WorkingDir = absDir
-			s.agentMu.Unlock()
-			s.agentMu.RLock()
+			s.turnMu.Unlock()
 			cfg := s.agentConfigMsg(r.Context())
-			s.agentMu.RUnlock()
 			_ = ws.writeJSON(WSMessage{Type: "config", WorkingDir: absDir, Model: cfg.Model, ContextLimit: cfg.ContextLimit, UsedTokens: cfg.UsedTokens, UsedSource: cfg.UsedSource, UsedPercent: cfg.UsedPercent, CompactAt: cfg.CompactAt, MessageCount: cfg.MessageCount, NearCompact: cfg.NearCompact, ToolTruncated: cfg.ToolTruncated, Mode: cfg.Mode})
 		}
 	}
 }
 
 func (s *Server) HandleStatic(w http.ResponseWriter, r *http.Request) {
+	if !s.checkAuth(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	content, err := webAssets.ReadFile("web/index.html")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -563,9 +650,56 @@ func (s *Server) HandleStatic(w http.ResponseWriter, r *http.Request) {
 	w.Write(content)
 }
 
+func (s *Server) checkAuth(r *http.Request) bool {
+	if s.authToken == "" {
+		return true
+	}
+	if tok := strings.TrimSpace(r.URL.Query().Get("token")); tok != "" && tok == s.authToken {
+		return true
+	}
+	if tok := strings.TrimSpace(r.Header.Get("X-Gogen-Token")); tok != "" && tok == s.authToken {
+		return true
+	}
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+		tok := strings.TrimSpace(auth[7:])
+		if tok == s.authToken {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) Start(addr string) error {
+	if !isLoopbackBind(addr) {
+		if s.authToken == "" {
+			return fmt.Errorf("non-loopback bind %q requires GOGEN_WEB_TOKEN (or web_auth_token) for authentication", addr)
+		}
+		log.Printf("warning: listening on non-loopback %s with token auth enabled", addr)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", s.HandleWS)
 	mux.HandleFunc("/", s.HandleStatic)
 	return http.ListenAndServe(addr, mux)
+}
+
+func isLoopbackBind(addr string) bool {
+	host := addr
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		host = h
+	} else if strings.HasPrefix(addr, ":") {
+		host = "0.0.0.0"
+	}
+	host = strings.TrimSpace(strings.ToLower(host))
+	// Empty host in ":port" form means all interfaces.
+	if host == "" {
+		return false
+	}
+	switch host {
+	case "localhost", "127.0.0.1", "::1", "[::1]":
+		return true
+	default:
+		ip := net.ParseIP(strings.Trim(host, "[]"))
+		return ip != nil && ip.IsLoopback()
+	}
 }

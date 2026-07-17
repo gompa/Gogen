@@ -32,29 +32,44 @@ func (s *statsStubProvider) ListModels(_ context.Context) ([]llm.ModelInfo, erro
 func (s *statsStubProvider) SetModel(string) error { return nil }
 func (s *statsStubProvider) ModelName() string     { return "test-model" }
 
-func TestContextStatsUsesAPIUsage(t *testing.T) {
+func TestContextStatsUsesEstimatedHistory(t *testing.T) {
 	provider := &statsStubProvider{limit: 1000}
 	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{ContextLimit: 1000})
 	a := NewAgent(provider, &Executor{WorkingDir: "."}, ctxMgr)
 	a.Messages = []llm.Message{{Role: "user", Content: strings.Repeat("x", 4000)}}
-	a.recordTurnUsage(&llm.Usage{PromptTokens: 900, CompletionTokens: 50, TotalTokens: 950})
+	a.recordTurnUsage(&llm.Usage{PromptTokens: 900, CompletionTokens: 50, TotalTokens: 950, CachedTokens: 400})
 
 	stats := a.ContextStats(context.Background())
-	if stats.UsedSource != contextSourceAPI {
-		t.Fatalf("got source %q", stats.UsedSource)
+	if stats.Snapshot.Used == 900 {
+		t.Fatal("Used should track estimated history, not frozen API prompt tokens")
 	}
-	if stats.Snapshot.Used != 900 {
-		t.Fatalf("got used %d", stats.Snapshot.Used)
+	if stats.Snapshot.Used <= 0 {
+		t.Fatalf("expected estimated used > 0, got %d", stats.Snapshot.Used)
 	}
-	if stats.PromptTokens != 900 || stats.CompletionTokens != 50 {
+	if stats.PromptTokens != 900 || stats.CompletionTokens != 50 || stats.CachedTokens != 400 {
 		t.Fatalf("unexpected last turn usage: %+v", stats)
+	}
+}
+
+func TestContextStatsDoesNotMutateMessages(t *testing.T) {
+	provider := &statsStubProvider{limit: 200}
+	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{
+		ContextLimit:       200,
+		MaxToolResultBytes: 5,
+	})
+	a := NewAgent(provider, &Executor{WorkingDir: "."}, ctxMgr)
+	big := strings.Repeat("x", 4000)
+	a.Messages = []llm.Message{{Role: "tool", Content: big, ToolCallID: "c1"}}
+	_ = a.ContextStats(context.Background())
+	if a.Messages[0].Content != big {
+		t.Fatal("ContextStats must not mutate canonical tool results")
 	}
 }
 
 func TestFormatContextBrief(t *testing.T) {
 	line := FormatContextBrief(TurnContext{
-		UsedSource: contextSourceAPI,
 		PromptTokens: 42300,
+		CachedTokens: 30000,
 		Snapshot: contextmgr.ContextSnapshot{
 			Used:    42300,
 			Limit:   128000,
@@ -64,8 +79,20 @@ func TestFormatContextBrief(t *testing.T) {
 	if !strings.Contains(line, "42.3k / 128k") {
 		t.Fatalf("unexpected line: %q", line)
 	}
-	if !strings.Contains(line, "last request") {
-		t.Fatalf("expected source label: %q", line)
+	if strings.Contains(line, "estimated") {
+		t.Fatalf("brief should not include estimated suffix: %q", line)
+	}
+	if !strings.Contains(line, "30k cached") {
+		t.Fatalf("expected cached tokens: %q", line)
+	}
+}
+
+func TestRecordTurnUsageIgnoresNil(t *testing.T) {
+	a := NewAgent(&statsStubProvider{limit: 1000}, &Executor{WorkingDir: "."}, nil)
+	a.recordTurnUsage(&llm.Usage{PromptTokens: 10, CompletionTokens: 1, TotalTokens: 11})
+	a.recordTurnUsage(nil)
+	if a.lastTurnUsage == nil || a.lastTurnUsage.PromptTokens != 10 {
+		t.Fatalf("nil usage cleared lastTurnUsage: %+v", a.lastTurnUsage)
 	}
 }
 

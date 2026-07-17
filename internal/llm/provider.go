@@ -17,6 +17,8 @@ type Usage struct {
 	PromptTokens     int
 	CompletionTokens int
 	TotalTokens      int
+	// CachedTokens is the subset of PromptTokens served from the provider prompt cache.
+	CachedTokens int
 }
 
 // Response represents the AI agent's response.
@@ -33,6 +35,12 @@ type ToolCall struct {
 	ID    string
 	Name  string
 	Args  map[string]interface{}
+	// ArgsStr is the exact JSON arguments string from the provider.
+	// Prefer this when re-sending history so prompt-cache prefixes stay byte-stable.
+	ArgsStr string
+	// ArgsError is set when streamed tool arguments could not be parsed.
+	// Callers must not execute the tool; return this error as the tool result.
+	ArgsError string
 }
 
 // StreamCallback receives partial tokens as they arrive from a streamed response.

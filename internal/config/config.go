@@ -45,6 +45,7 @@ type Config struct {
 
 	WebBind           string // listen address for --web (default 127.0.0.1:8080)
 	WebAllowedOrigins string // comma-separated host allowlist; empty uses localhost defaults
+	WebAuthToken      string // required for non-loopback binds; also GOGEN_WEB_TOKEN
 
 	WebFetch           string // on, off
 	WebSearch          string // on, off
@@ -104,14 +105,25 @@ func (c *Config) TreeSitterEnabled() bool {
 	return v != "off" && v != "0" && v != "false"
 }
 
-// WebFetchEnabled reports whether web fetch/search tools are active.
+// WebFetchEnabled reports whether the web_fetch tool is active.
 func (c *Config) WebFetchEnabled() bool {
 	if c == nil {
 		return false
 	}
 	v := strings.ToLower(strings.TrimSpace(c.WebFetch))
-	if v == "" {
-		v = strings.ToLower(strings.TrimSpace(c.WebSearch))
-	}
 	return v == "on" || v == "1" || v == "true"
+}
+
+// WebSearchEnabled reports whether the web_search tool is active.
+func (c *Config) WebSearchEnabled() bool {
+	if c == nil {
+		return false
+	}
+	v := strings.ToLower(strings.TrimSpace(c.WebSearch))
+	return v == "on" || v == "1" || v == "true"
+}
+
+// WebToolsEnabled reports whether either web tool may use the network.
+func (c *Config) WebToolsEnabled() bool {
+	return c.WebFetchEnabled() || c.WebSearchEnabled()
 }

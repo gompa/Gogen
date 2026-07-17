@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"gogen/internal/agent"
+	"gogen/internal/cli"
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/debuglog"
@@ -25,7 +26,8 @@ import (
 )
 
 func main() {
-	cliFlag := flag.Bool("cli", false, "Run in CLI mode")
+	cliFlag := flag.Bool("cli", false, "Run interactive TUI mode")
+	classicCLIFlag := flag.Bool("classic-cli", false, "Run classic line-oriented CLI (no TUI)")
 	webFlag := flag.Bool("web", false, "Run in Web mode")
 	hostFlag := flag.String("host", "", "Listen host for --web (e.g. 0.0.0.0, default 127.0.0.1)")
 	verboseFlag := flag.Bool("verbose", false, "Show full tool output in CLI mode")
@@ -90,11 +92,21 @@ func main() {
 		return
 	}
 
-	if *cliFlag && *webFlag {
-		log.Fatal("Please specify either --cli or --web, not both")
+	modes := 0
+	if *cliFlag {
+		modes++
 	}
-	if !*cliFlag && !*webFlag {
-		log.Fatal("Please specify either --cli or --web (or --save-config)")
+	if *classicCLIFlag {
+		modes++
+	}
+	if *webFlag {
+		modes++
+	}
+	if modes > 1 {
+		log.Fatal("Please specify only one of --cli, --classic-cli, or --web")
+	}
+	if modes == 0 {
+		log.Fatal("Please specify --cli, --classic-cli, or --web (or --save-config)")
 	}
 
 	if cfg.OpenAIKey == "" {
@@ -170,9 +182,15 @@ func main() {
 			addr += ":8080"
 		}
 		fmt.Printf("Starting web server on %s\n", addr)
+		if cfg.WebAuthToken != "" {
+			fmt.Printf("Auth token required (GOGEN_WEB_TOKEN / web_auth_token)\n")
+		}
 		if err := s.Start(addr); err != nil {
 			log.Fatal(err)
 		}
+	} else if *classicCLIFlag {
+		c := cli.NewCLI(a, cfg)
+		c.Run(ctx)
 	} else if *cliFlag {
 		c := tui.New(a, cfg)
 		c.Run(ctx)
@@ -182,6 +200,7 @@ func main() {
 func applyRuntimeConfig(cfg *config.Config) {
 	treesitter.Configure(cfg.TreeSitterEnabled(), cfg.TreeSitterLangs)
 	agent.ConfigureWebFetch(cfg.WebFetchEnabled(), cfg.WebFetchMode, cfg.WebAllowedDomains)
+	agent.ConfigureWebSearchEnabled(cfg.WebSearchEnabled())
 	agent.ConfigureWebSearch(cfg.WebSearchBackend, cfg.WebSearchAPIKey)
 	if cfg.DebugLog != "" || cfg.DebugSession != "" {
 		debuglog.Configure(cfg.DebugLog, cfg.DebugSession)

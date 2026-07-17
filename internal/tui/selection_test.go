@@ -120,3 +120,22 @@ func TestSGRPropagation(t *testing.T) {
 		}
 	})
 }
+
+func TestWrapLineFitsWidth(t *testing.T) {
+	m := &Model{}
+	m.viewport.Width = 42 // wrapWidth = 42 - 2 padding = 40
+	m.viewport.Style = ViewportStyle
+
+	line := "See https://example.com/very/long/path/that/exceeds/forty/columns/easily for details"
+	parts := m.wrapLine(line)
+	w := m.wrapWidth()
+	for i, p := range parts {
+		plain := stripANSI(p)
+		if got := len([]rune(plain)); got > w {
+			t.Fatalf("part %d rune width %d > wrapWidth %d: %q", i, got, w, plain)
+		}
+	}
+	if len(parts) < 3 {
+		t.Fatalf("expected hard-wrap to split overlong URL, got %d parts: %#v", len(parts), parts)
+	}
+}

@@ -67,14 +67,21 @@ func (e *Executor) PatchFile(ctx context.Context, diff string, dryRun, fuzzy boo
 
 	var applied []string
 	snapshots := make(map[string][]byte, len(plans))
+	created := make([]string, 0)
 	for _, plan := range plans {
 		if plan.delete {
 			if err := e.requireDeleteApproval(ctx, []string{plan.target}, "patch_file"); err != nil {
-				rollbackPatches(snapshots)
+				rollbackPatches(snapshots, created)
+				return "", err
+			}
+			if data, err := os.ReadFile(plan.secure); err == nil {
+				snapshots[plan.secure] = data
+			} else if !os.IsNotExist(err) {
+				rollbackPatches(snapshots, created)
 				return "", err
 			}
 			if err := os.Remove(plan.secure); err != nil && !os.IsNotExist(err) {
-				rollbackPatches(snapshots)
+				rollbackPatches(snapshots, created)
 				return "", err
 			}
 			applied = append(applied, plan.target+" (deleted)")
@@ -84,17 +91,18 @@ func (e *Executor) PatchFile(ctx context.Context, diff string, dryRun, fuzzy boo
 		if !plan.create {
 			data, err := os.ReadFile(plan.secure)
 			if err != nil {
-				rollbackPatches(snapshots)
+				rollbackPatches(snapshots, created)
 				return "", err
 			}
 			snapshots[plan.secure] = data
 		}
 
 		if err := writeFileAtomic(plan.secure, []byte(plan.updated), 0o644); err != nil {
-			rollbackPatches(snapshots)
+			rollbackPatches(snapshots, created)
 			return "", err
 		}
 		if plan.create {
+			created = append(created, plan.secure)
 			applied = append(applied, plan.target+" (created)")
 		} else {
 			applied = append(applied, plan.target)
@@ -115,7 +123,10 @@ func appliedPaths(applied []string) []string {
 	return out
 }
 
-func rollbackPatches(snapshots map[string][]byte) {
+func rollbackPatches(snapshots map[string][]byte, created []string) {
+	for _, path := range created {
+		_ = os.Remove(path)
+	}
 	for path, data := range snapshots {
 		_ = writeFileAtomic(path, data, 0o644)
 	}

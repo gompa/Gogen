@@ -48,10 +48,13 @@ func (m *Model) dispatchCommand(input string) (bool, bool, tea.Cmd) {
 
 	// Mode commands
 	if out, handled := m.agent.HandleModeCommand(input); handled {
-		m.appendChatLine(SystemStyle.Render(out))
-		// Update chat if mode changed
 		if trimmed == "/plan" || trimmed == "plan" || trimmed == "/act" || trimmed == "act" {
 			m.chatLines = renderMessages(m.agent.Messages, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())
+			m.chatLines = append(m.chatLines, SystemStyle.Render(out))
+			m.setViewportContent()
+			m.viewport.GotoBottom()
+		} else {
+			m.appendChatLine(SystemStyle.Render(out))
 		}
 		return true, false, nil
 	}
@@ -78,6 +81,8 @@ func (m *Model) dispatchCommand(input string) (bool, bool, tea.Cmd) {
 			m.setViewportContent()
 			m.viewport.GotoBottom()
 			m.sessionID = m.agent.SessionID
+			m.refreshContextStats()
+			return true, false, nil
 		} else if result.Sessions != nil {
 			// Show session list modal
 			m.sessionList = result.Sessions
@@ -178,6 +183,7 @@ func (m *Model) submitUserInput(input string) tea.Cmd {
 	m.streamToolCallArgs = make(map[int]string)
 	m.streamToolCallIDs = make(map[int]string)
 	m.toolCallDiffs = make(map[string]string)
+	startProgress := m.setProgress(progressThinking, "thinking")
 
 	// Create cancelable context for the LLM call
 	streamCtx, cancelFn := context.WithCancel(m.ctx)
@@ -185,10 +191,9 @@ func (m *Model) submitUserInput(input string) tea.Cmd {
 
 	adapter := NewStreamAdapter(m.program)
 	a := m.agent
-	program := m.program
 	approver := m.makeDeleteApprover()
 
-	return func() tea.Msg {
+	streamCmd := func() tea.Msg {
 		defer cancelFn()
 		_, err := a.StreamProcessInput(
 			agent.ContextWithDeleteApprover(streamCtx, approver),
@@ -198,10 +203,11 @@ func (m *Model) submitUserInput(input string) tea.Cmd {
 		if err != nil {
 			return streamErrorMsg{err: err}
 		}
-		program.Send(streamEndMsg{})
-		stats := a.ContextStats(streamCtx)
-		return contextStatsMsg{stats: stats}
+		// Return streamEndMsg directly so handleStreamEnd refreshes context
+		// stats synchronously after Messages are final.
+		return streamEndMsg{}
 	}
+	return tea.Batch(startProgress, streamCmd)
 }
 
 // makeDeleteApprover creates a delete approver that shows a modal.

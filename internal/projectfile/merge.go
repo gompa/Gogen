@@ -41,6 +41,7 @@ func Merge(pf *ProjectFile, flags FlagOverrides) *config.Config {
 		LintCommand:          mergeString("", file, "lint_command", file.LintCommand, ""),
 		WebBind:              mergeString("GOGEN_WEB_BIND", file, "", "", def.WebBind),
 		WebAllowedOrigins:    mergeString("GOGEN_WEB_ALLOWED_ORIGINS", file, "", "", def.WebAllowedOrigins),
+		WebAuthToken:         mergeString("GOGEN_WEB_TOKEN", file, "web_auth_token", file.WebAuthToken, def.WebAuthToken),
 		WebFetch:             mergeString("GOGEN_WEB_FETCH", file, "web_fetch", file.WebFetch, def.WebFetch),
 		WebSearch:            mergeString("GOGEN_WEB_SEARCH", file, "web_search", file.WebSearch, def.WebSearch),
 		WebSearchBackend:     mergeString("GOGEN_WEB_SEARCH_BACKEND", file, "web_search_backend", file.WebSearchBackend, def.WebSearchBackend),

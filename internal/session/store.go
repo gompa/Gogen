@@ -51,11 +51,17 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 	if s == nil || !s.enabled || id == "" {
 		return nil
 	}
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
 	dir := s.dir(snap.WorkingDir)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	path := s.path(snap.WorkingDir, id)
+	if err := ensureUnderSessionsDir(snap.WorkingDir, path); err != nil {
+		return err
+	}
 	existing := file{Created: time.Now().UTC()}
 	if data, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(data, &existing)
@@ -75,7 +81,7 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	return writeFileAtomic(path, data, 0o600)
 }
 
 // LoadInWorkingDir loads a session from a working directory.
@@ -83,7 +89,14 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 	if s == nil || !s.enabled {
 		return agent.SessionSnapshot{}, fmt.Errorf("session persistence disabled")
 	}
-	data, err := os.ReadFile(s.path(workingDir, id))
+	if err := validateSessionID(id); err != nil {
+		return agent.SessionSnapshot{}, err
+	}
+	path := s.path(workingDir, id)
+	if err := ensureUnderSessionsDir(workingDir, path); err != nil {
+		return agent.SessionSnapshot{}, err
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return agent.SessionSnapshot{}, err
 	}
@@ -156,6 +169,9 @@ func (s *Store) Delete(workingDir, id string) error {
 		return err
 	}
 	path := s.path(workingDir, id)
+	if err := ensureUnderSessionsDir(workingDir, path); err != nil {
+		return err
+	}
 	if err := os.Remove(path); err != nil {
 		if os.IsNotExist(err) {
 			return fmt.Errorf("session not found: %s", id)
@@ -172,6 +188,63 @@ func validateSessionID(id string) error {
 	if strings.Contains(id, "/") || strings.Contains(id, "\\") || strings.Contains(id, "..") {
 		return fmt.Errorf("invalid session id")
 	}
+	if id != filepath.Base(id) {
+		return fmt.Errorf("invalid session id")
+	}
+	return nil
+}
+
+func ensureUnderSessionsDir(workingDir, path string) error {
+	sessionsDir, err := filepath.Abs(filepath.Join(workingDir, ".gogen", "sessions"))
+	if err != nil {
+		return err
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(sessionsDir, absPath)
+	if err != nil {
+		return fmt.Errorf("invalid session path")
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("invalid session path")
+	}
+	return nil
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".gogen-session-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	cleanup = false
 	return nil
 }
 

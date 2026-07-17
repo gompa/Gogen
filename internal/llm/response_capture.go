@@ -209,6 +209,7 @@ func logNonStreamResponse(model, source string, content, refusal, displayContent
 			"promptTokens":     usage.PromptTokens,
 			"completionTokens": usage.CompletionTokens,
 			"totalTokens":      usage.TotalTokens,
+			"cachedTokens":     usage.CachedTokens,
 		}
 	}
 	debuglog.WriteLLMResponse(debuglog.LLMResponseRecord{

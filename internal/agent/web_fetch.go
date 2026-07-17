@@ -30,10 +30,11 @@ var (
 	multiSpaceRE   = regexp.MustCompile(`\s{3,}`)
 	multiNewlineRE = regexp.MustCompile(`\n{3,}`)
 
-	webMu      sync.RWMutex
-	webEnabled *bool // nil until configured
-	webMode    string // "https" or "all"
-	webDomains []string
+	webMu         sync.RWMutex
+	webFetchOn    *bool // nil until configured
+	webSearchOn   *bool // nil until configured
+	webMode       string // "https" or "all"
+	webDomains    []string
 )
 
 // sharedFetchClient is reused across requests for connection pooling.
@@ -41,6 +42,7 @@ var sharedFetchClient = &http.Client{
 	Transport: &http.Transport{
 		MaxIdleConns:    10,
 		IdleConnTimeout: 90 * time.Second,
+		DialContext:     dialContextPublicOnly,
 	},
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if len(via) >= webFetchMaxRedirects {
@@ -48,6 +50,27 @@ var sharedFetchClient = &http.Client{
 		}
 		return nil
 	},
+}
+
+func dialContextPublicOnly(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	for _, ipAddr := range ips {
+		ip := ipAddr.IP
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() || ip.IsMulticast() {
+			return nil, fmt.Errorf("requests to private/internal hosts are blocked: %s", ip)
+		}
+	}
+	// Dial the original host:port so TLS SNI and HTTP/2 connection reuse keep
+	// working. IP allowlisting above rejects private targets before dial.
+	d := net.Dialer{Timeout: webFetchTimeout}
+	return d.DialContext(ctx, network, addr)
 }
 
 // blockTags are HTML elements that introduce paragraph-like breaks.
@@ -65,7 +88,7 @@ var blockTags = map[string]bool{
 func ConfigureWebFetch(enabled bool, mode string, allowedDomains string) {
 	webMu.Lock()
 	defer webMu.Unlock()
-	webEnabled = &enabled
+	webFetchOn = &enabled
 	webMode = strings.TrimSpace(strings.ToLower(mode))
 	if webMode == "" {
 		webMode = "https"
@@ -83,6 +106,13 @@ func ConfigureWebFetch(enabled bool, mode string, allowedDomains string) {
 	} else {
 		webDomains = nil
 	}
+}
+
+// ConfigureWebSearchEnabled sets whether web_search is allowed (independent of web_fetch).
+func ConfigureWebSearchEnabled(enabled bool) {
+	webMu.Lock()
+	defer webMu.Unlock()
+	webSearchOn = &enabled
 }
 
 func (e *Executor) WebFetch(ctx context.Context, rawURL string, maxBytes int) (string, error) {
@@ -139,22 +169,32 @@ func (e *Executor) WebFetch(ctx context.Context, rawURL string, maxBytes int) (s
 // webFetchEnabled reports whether the web_fetch tool is active.
 func webFetchEnabled() bool {
 	webMu.RLock()
-	if webEnabled != nil {
-		e := *webEnabled
+	if webFetchOn != nil {
+		e := *webFetchOn
 		webMu.RUnlock()
 		return e
 	}
 	webMu.RUnlock()
 	raw := strings.TrimSpace(os.Getenv("GOGEN_WEB_FETCH"))
-	if raw == "" {
-		raw = strings.TrimSpace(os.Getenv("GOGEN_WEB_SEARCH"))
+	return strings.EqualFold(raw, "on") || strings.EqualFold(raw, "1") || strings.EqualFold(raw, "true")
+}
+
+// webSearchEnabled reports whether the web_search tool is active.
+func webSearchEnabled() bool {
+	webMu.RLock()
+	if webSearchOn != nil {
+		e := *webSearchOn
+		webMu.RUnlock()
+		return e
 	}
+	webMu.RUnlock()
+	raw := strings.TrimSpace(os.Getenv("GOGEN_WEB_SEARCH"))
 	return strings.EqualFold(raw, "on") || strings.EqualFold(raw, "1") || strings.EqualFold(raw, "true")
 }
 
 func fetchMode() string {
 	webMu.RLock()
-	if webEnabled != nil {
+	if webFetchOn != nil || webSearchOn != nil {
 		m := webMode
 		webMu.RUnlock()
 		return m
@@ -169,7 +209,7 @@ func fetchMode() string {
 
 func fetchAllowedDomains() []string {
 	webMu.RLock()
-	if webEnabled != nil {
+	if webFetchOn != nil || webSearchOn != nil {
 		d := webDomains
 		webMu.RUnlock()
 		return d
@@ -251,8 +291,6 @@ func fetchHTTP(ctx context.Context, rawURL string, maxBytes int) ([]byte, string
 
 // fetchHTTPWithUA is like fetchHTTP but uses a custom User-Agent string.
 func fetchHTTPWithUA(ctx context.Context, rawURL, userAgent string, maxBytes int) ([]byte, string, error) {
-	ctx, cancel := context.WithTimeout(ctx, webFetchTimeout)
-	defer cancel()
 	client := *sharedFetchClient // shallow copy so CheckRedirect override is per-request
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if len(via) >= webFetchMaxRedirects {

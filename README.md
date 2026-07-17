@@ -51,10 +51,16 @@ CGO_ENABLED=0 go build -o gogen .
 
 ### Run
 
-**CLI mode** (interactive terminal):
+**CLI / TUI mode** (Bubble Tea interactive terminal):
 
 ```bash
 OPENAI_API_KEY=sk-... ./gogen --cli
+```
+
+**Classic CLI** (line-oriented, no TUI):
+
+```bash
+OPENAI_API_KEY=sk-... ./gogen --classic-cli
 ```
 
 **Web mode** (browser UI on `:8080`):
@@ -63,11 +69,19 @@ OPENAI_API_KEY=sk-... ./gogen --cli
 OPENAI_API_KEY=sk-... ./gogen --web
 ```
 
+Non-loopback binds (e.g. `--host 0.0.0.0`) require a token:
+
+```bash
+GOGEN_WEB_TOKEN=secret ./gogen --web --host 0.0.0.0
+# then open http://host:8080/?token=secret
+```
+
 ### Flags
 
 | Flag | Description |
 |------|-------------|
-| `--cli` | Run in interactive CLI mode |
+| `--cli` | Run interactive TUI mode |
+| `--classic-cli` | Run classic line-oriented CLI |
 | `--web` | Run in web mode (listens on `:8080`) |
 | `--host <host>` | Listen host for `--web` (e.g. `0.0.0.0`; default `127.0.0.1`; also `GOGEN_WEB_BIND` for host:port) |
 | `--dir <path>` | Set the working directory |
@@ -79,7 +93,7 @@ OPENAI_API_KEY=sk-... ./gogen --web
 
 ### CLI commands
 
-While in CLI mode:
+While in `--cli` (TUI) or `--classic-cli`:
 
 | Command | Description |
 |---------|-------------|

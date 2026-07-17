@@ -34,7 +34,7 @@ func (a *Agent) HandleSessionCommand(ctx context.Context, input, newSessionID st
 		if err != nil {
 			return SessionCommandResult{}, true, err
 		}
-		return SessionCommandResult{Output: out, Action: SessionActionClearChat}, true, nil
+		return SessionCommandResult{Output: AppendContextBrief(ctx, a, out), Action: SessionActionClearChat}, true, nil
 	case "sessions", "/sessions", "resume", "/resume":
 		out, sessions, err := a.formatSessionList()
 		if err != nil {
@@ -89,6 +89,11 @@ func (a *Agent) startNewSession(newID string) (string, error) {
 	a.SessionID = newID
 	a.Messages = nil
 	a.lastTurnUsage = nil
+	a.UsageAccum = UsageAccumulator{}
+	a.SessionLabel = ""
+	if a.PinManager != nil {
+		a.PinManager.ClearPins()
+	}
 	if a.SessionStore != nil {
 		a.persistSession()
 		if oldID != "" {

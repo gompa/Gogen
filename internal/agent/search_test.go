@@ -9,6 +9,18 @@ import (
 	"testing"
 )
 
+func TestSearchCodeRejectsDashPattern(t *testing.T) {
+	dir := t.TempDir()
+	executor := NewExecutor(dir)
+	_, err := executor.SearchCode(context.Background(), "--pre=/tmp/evil.sh", "", "", 0)
+	if err == nil {
+		t.Fatal("expected dash pattern to be rejected")
+	}
+	if !strings.Contains(err.Error(), "must not start with") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestSearchCodeGoFallback(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "hello.go"), []byte("package main\n\nfunc hello() {\n}\n"), 0o644); err != nil {
