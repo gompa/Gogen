@@ -110,14 +110,20 @@ func (m *Model) handleApprovalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // dismissApproval closes the approval modal and sends a non-blocking result.
 func (m *Model) dismissApproval(approved bool) {
+	// Only honour a dismissal if a request is currently in flight. Without
+	// this guard a stale modal-dismissal (e.g. user pressed ctrl+c after the
+	// stream was cancelled) could write into the shared channel and either
+	// leak as a stuck approver waiting on a value that will never arrive, or
+	// be silently dropped, depending on timing.
 	if m.modal != ModalApproval && m.approvalUI == nil {
 		return
 	}
 	m.approvalUI = nil
 	m.modal = ModalNone
-	if m.approvalResult == nil {
+	if m.approvalResult == nil || !m.approvalInFlight {
 		return
 	}
+	m.approvalInFlight = false
 	select {
 	case m.approvalResult <- approved:
 	default:

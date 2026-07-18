@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -52,16 +51,27 @@ func gitPath() (string, bool) {
 	return cachedGitPath.path, cachedGitPath.ok
 }
 
-// globRegexCache caches compiled regexes for glob patterns containing **.
-// This avoids recompiling the same regex for every file during WalkDir.
-// The cache is capped at globRegexCacheMax entries; when exceeded, the
-// entire cache is replaced to bound memory.
+// globRegexCache caches compiled regexes for glob patterns containing **,
+// avoiding recompilation for every file during WalkDir. The cache lives for
+// the lifetime of the process and is bounded: when it exceeds
+// globRegexCacheMax entries the whole map is dropped under the cache mutex.
+// The map is never reassigned (unlike a previous sync.Map-based design that
+// swapped the variable itself, which raced with concurrent readers/writers
+// and could discard their stores).
 const globRegexCacheMax = 100
 
+// globRegexCache is a package-level, mutex-guarded map. It must only be
+// touched via globRegexCacheGet/Store (which take globRegexMu).
 var (
-	globRegexCacheCount atomic.Int64
+	globRegexMu    sync.Mutex
+	globRegexCache = make(map[string]*regexp.Regexp)
 )
-var globRegexCache sync.Map // pattern string -> *regexp.Regexp
+
+// resetGlobRegexCacheLocked clears the glob regex cache. Caller must hold
+// globRegexMu.
+func resetGlobRegexCacheLocked() {
+	globRegexCache = make(map[string]*regexp.Regexp)
+}
 
 // ListFiles lists directory entries. When recursive is true, walks the tree (max 500 paths).
 // When trackedOnly is true, results are filtered to git-tracked files.
@@ -246,7 +256,11 @@ func matchGlobPattern(pattern, relPath string) bool {
 		}
 		ok, err := filepath.Match(pattern, base)
 		if err != nil {
-			return strings.Contains(base, strings.TrimPrefix(pattern, "*"))
+			// Malformed pattern (filepath.ErrBadPattern). The path-based
+			// branch below also treats bad patterns as no-match, so do the
+			// same here rather than silently redefining a bad glob as a
+			// substring match.
+			return false
 		}
 		return ok
 	}
@@ -264,8 +278,13 @@ func matchGlobPattern(pattern, relPath string) bool {
 // matchGlobRegex handles glob patterns that contain ** by converting
 // them to a regular expression. ** matches zero or more path segments.
 func matchGlobRegex(pattern, path string) bool {
-	if re, ok := globRegexCache.Load(pattern); ok {
-		return re.(*regexp.Regexp).MatchString(path)
+	// Fast path: read a compiled regex under the shared lock. The lookup is
+	// cheap and the regex (once compiled) is safe for concurrent use.
+	globRegexMu.Lock()
+	re, ok := globRegexCache[pattern]
+	globRegexMu.Unlock()
+	if ok {
+		return re.MatchString(path)
 	}
 	// Split pattern into segments, then convert each segment.
 	segments := strings.Split(pattern, "/")
@@ -276,7 +295,10 @@ func matchGlobRegex(pattern, path string) bool {
 			reParts = append(reParts, "/")
 		}
 		if seg == "**" {
-			// First ** matches leading dirs; last ** matches trailing dirs.
+			// Leading or middle "**" matches zero or more path segments
+			// (`(?:.*/)?`); a trailing "**" matches zero or more of any
+			// character including "/" (`.*`) so "**/*.go" and "src/**"
+			// both behave intuitively.
 			if i == 0 {
 				reParts = append(reParts, `(?:.*/)?`)
 			} else if i == len(segments)-1 {
@@ -294,13 +316,17 @@ func matchGlobRegex(pattern, path string) bool {
 	}
 	reParts = append(reParts, "$")
 	reStr := strings.Join(reParts, "")
-	re := regexp.MustCompile(reStr)
-	globRegexCache.Store(pattern, re)
-	if n := globRegexCacheCount.Add(1); n > globRegexCacheMax {
-		globRegexCacheCount.Store(0)
-		globRegexCache = sync.Map{}
-		globRegexCache.Store(pattern, re) // re-store under the fresh map
+	re = regexp.MustCompile(reStr)
+	// Insert under the lock. If this insert pushes us over the cap, clear the
+	// whole cache (under the same lock, so no concurrent stores are lost and
+	// the cap bound holds) and re-insert the current entry into the fresh map.
+	globRegexMu.Lock()
+	globRegexCache[pattern] = re
+	if len(globRegexCache) > globRegexCacheMax {
+		resetGlobRegexCacheLocked()
+		globRegexCache[pattern] = re
 	}
+	globRegexMu.Unlock()
 	return re.MatchString(path)
 }
 

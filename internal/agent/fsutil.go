@@ -1,10 +1,13 @@
 package agent
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"gogen/internal/debuglog"
 )
 
 // evalPath resolves symlinks for an existing path, or for the nearest existing
@@ -52,9 +55,20 @@ func writeFileAtomic(path string, content []byte, perm os.FileMode) error {
 		}
 	}()
 
+	// Chmod may be unsupported on some filesystems (Windows, FUSE, 9p, some
+	// network mounts). When that happens, don't fail the whole write — log
+	// a debug entry and continue. The temp file's default mode (typically
+	// 0600) will be inherited by the renamed final file, but the content
+	// write itself still succeeds.
 	if err := tmp.Chmod(perm); err != nil {
-		_ = tmp.Close()
-		return err
+		if !isChmodUnsupported(err) {
+			_ = tmp.Close()
+			return err
+		}
+		debuglog.Write("fsutil/write", "Chmod unsupported; file written with default mode", "fs-chmod-unsupported", map[string]interface{}{
+			"path": path,
+			"err":  err.Error(),
+		})
 	}
 	if _, err := tmp.Write(content); err != nil {
 		_ = tmp.Close()
@@ -72,6 +86,29 @@ func writeFileAtomic(path string, content []byte, perm os.FileMode) error {
 	}
 	cleanup = false
 	return nil
+}
+
+// isChmodUnsupported reports whether a chmod failure is a "not supported"
+// error we should ignore rather than propagate. Chmod can return ENOTSUP,
+// ENOSYS, EOPNOTSUPP, or Windows ERROR_INVALID_FUNCTION on some filesystems
+// (FUSE, 9p, network mounts) where mode bits aren't tracked.
+func isChmodUnsupported(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pe *os.PathError
+	if errors.As(err, &pe) {
+		s := pe.Err.Error()
+		if strings.Contains(s, "not supported") ||
+			strings.Contains(s, "not implemented") ||
+			strings.Contains(s, "operation not supported") {
+			return true
+		}
+	}
+	s := err.Error()
+	return strings.Contains(s, "not supported") ||
+		strings.Contains(s, "not implemented") ||
+		strings.Contains(s, "operation not supported")
 }
 
 func isWithinRoot(resolvedPath, resolvedRoot string) bool {

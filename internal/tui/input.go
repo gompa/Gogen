@@ -32,19 +32,7 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.streamCancel != nil {
 				m.streamCancel()
 			}
-			m.streamAssistantBuf.Reset()
-			m.streamAssistantLine = -1
-			m.streamThinkingBuf.Reset()
-			m.streamThinkingOpen = false
-			m.streamThinkingLine = -1
-			m.streamToolCallNames = make(map[int]string)
-			m.streamToolCallArgs = make(map[int]string)
-			m.streamToolCallIDs = make(map[int]string)
-			m.streamToolCallLines = make(map[int]int)
-			m.toolCallDiffs = make(map[string]string)
-			m.streamToolDiffCount = make(map[int]int)
-			m.streamToolDiffStart = make(map[int]int)
-			m.toolDiffShown = make(map[string]bool)
+			m.resetStreamState(false)
 			m.appendChatLine(SystemStyle.Render("Cancelled."))
 			return m, m.refocusInput()
 		}
@@ -195,19 +183,7 @@ func (m *Model) handleViewportKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.streamCancel != nil {
 				m.streamCancel()
 			}
-			m.streamAssistantBuf.Reset()
-			m.streamAssistantLine = -1
-			m.streamThinkingBuf.Reset()
-			m.streamThinkingOpen = false
-			m.streamThinkingLine = -1
-			m.streamToolCallNames = make(map[int]string)
-			m.streamToolCallArgs = make(map[int]string)
-			m.streamToolCallIDs = make(map[int]string)
-			m.streamToolCallLines = make(map[int]int)
-			m.toolCallDiffs = make(map[string]string)
-			m.streamToolDiffCount = make(map[int]int)
-			m.streamToolDiffStart = make(map[int]int)
-			m.toolDiffShown = make(map[string]bool)
+			m.resetStreamState(false)
 			m.appendChatLine(SystemStyle.Render("Cancelled."))
 			// Stay on viewport focus; blink restarts when returning to input.
 			return m, nil

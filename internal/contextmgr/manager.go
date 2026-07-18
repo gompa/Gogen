@@ -265,6 +265,10 @@ func (m *Manager) CompactPinned(ctx context.Context, messages []llm.Message, pin
 	compact = append(compact, tail...)
 
 	newPinned := remapPinsAfterCompact(pinned, headIdx, oldTailStart, len(compact)-len(tail))
+	// CompactPinned owns token-cache invalidation: the compacted slice is
+	// newly allocated, so every surviving message gets a new address and the
+	// old pointer-keyed cache entries are unreachable. Callers that reassign
+	// a.Messages from this return value must NOT invalidate again.
 	InvalidateTokenCache()
 	return compact, newPinned, nil
 }
@@ -352,11 +356,11 @@ func (m *Manager) summarizeMessages(ctx context.Context, messages []llm.Message,
 	}
 
 	mid := len(messages) / 2
-	left, err := m.summarizeMessages(ctx, messages[:mid], depth+1)
+	left, err := m.summarizeMessagesDepth(ctx, messages[:mid], depth+1)
 	if err != nil {
 		return "", err
 	}
-	right, err := m.summarizeMessages(ctx, messages[mid:], depth+1)
+	right, err := m.summarizeMessagesDepth(ctx, messages[mid:], depth+1)
 	if err != nil {
 		return "", err
 	}

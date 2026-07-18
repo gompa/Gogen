@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -10,11 +11,12 @@ import (
 )
 
 type statsStubProvider struct {
-	limit int
+	limit  int
+	models []llm.ModelInfo
 }
 
 func (s *statsStubProvider) GenerateResponse(_ context.Context, _ []llm.Message, _ map[string]struct{}, _ []llm.Tool) (llm.Response, error) {
-	return llm.Response{}, nil
+	return llm.Response{Content: "summary"}, nil
 }
 
 func (s *statsStubProvider) GenerateResponseStream(_ context.Context, _ []llm.Message, _ map[string]struct{}, _ []llm.Tool, _ *llm.StreamHandlers) (*llm.StreamResult, error) {
@@ -26,6 +28,9 @@ func (s *statsStubProvider) ModelContextLimit(_ context.Context) (int, error) {
 }
 
 func (s *statsStubProvider) ListModels(_ context.Context) ([]llm.ModelInfo, error) {
+	if s.models != nil {
+		return s.models, nil
+	}
 	return nil, nil
 }
 
@@ -107,5 +112,52 @@ func TestHandleContextCommand(t *testing.T) {
 	}
 	if !strings.Contains(out, "Context (estimated)") {
 		t.Fatalf("unexpected output: %q", out)
+	}
+}
+
+// TestCompactHistoryClearsLastTurnUsage verifies that after manual compaction
+// the per-request API counters (frozen from the pre-compaction turn) are no
+// longer reported by /context, since the history they describe was replaced.
+func TestCompactHistoryClearsLastTurnUsage(t *testing.T) {
+	provider := &statsStubProvider{limit: 1000}
+	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{
+		ContextLimit:       1000,
+		KeepRecentMessages: 2,
+	})
+	a := NewAgent(provider, &Executor{WorkingDir: "."}, ctxMgr)
+	// Enough messages to exceed KeepRecentMessages+1 for compaction.
+	for i := 0; i < 6; i++ {
+		a.Messages = append(a.Messages,
+			llm.Message{Role: "user", Content: "q " + strconv.Itoa(i)},
+			llm.Message{Role: "assistant", Content: "a " + strconv.Itoa(i)},
+		)
+	}
+	a.recordTurnUsage(&llm.Usage{PromptTokens: 900, CompletionTokens: 50, TotalTokens: 950})
+
+	if err := a.CompactHistory(context.Background()); err != nil {
+		t.Fatalf("CompactHistory: %v", err)
+	}
+	stats := a.ContextStats(context.Background())
+	if stats.PromptTokens != 0 || stats.CompletionTokens != 0 || stats.CachedTokens != 0 {
+		t.Fatalf("expected stale last-turn usage cleared after compaction, got %+v", stats)
+	}
+}
+
+// TestSelectModelClearsLastTurnUsage verifies that switching models drops the
+// previous request's API counters so /context does not show figures measured
+// against the old model's context accounting.
+func TestSelectModelClearsLastTurnUsage(t *testing.T) {
+	provider := &statsStubProvider{limit: 1000, models: []llm.ModelInfo{{ID: "test-model"}}}
+	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{ContextLimit: 1000})
+	a := NewAgent(provider, &Executor{WorkingDir: "."}, ctxMgr)
+	a.Messages = []llm.Message{{Role: "user", Content: "hi"}}
+	a.recordTurnUsage(&llm.Usage{PromptTokens: 100, CompletionTokens: 10, TotalTokens: 110})
+
+	if err := a.SelectModel(context.Background(), "test-model"); err != nil {
+		t.Fatalf("SelectModel: %v", err)
+	}
+	stats := a.ContextStats(context.Background())
+	if stats.PromptTokens != 0 || stats.CompletionTokens != 0 {
+		t.Fatalf("expected stale last-turn usage cleared after model switch, got %+v", stats)
 	}
 }

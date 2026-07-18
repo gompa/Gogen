@@ -8,6 +8,7 @@ import (
 
 	"gogen/internal/agent"
 	"gogen/internal/config"
+	"gogen/internal/debuglog"
 	"gogen/internal/llm"
 
 	"github.com/charmbracelet/bubbles/key"
@@ -73,7 +74,8 @@ type Model struct {
 	chatLines      []string
 	wrappedPrefix  string   // pre-wrapped content of chatLines[:len-1], ends with "\n" if non-empty
 	wrappedContent string   // pre-computed wrapped content for viewport
-	styledLines    []string // wrappedContent split by "\n" (cached for selection render)
+	styledLines      []string // wrappedContent split by "\n" (cached for selection render)
+	styledLinesDirty bool     // true when styledLines needs recomputation
 
 	// Streaming accumulation
 	streamAssistantBuf  strings.Builder
@@ -110,6 +112,7 @@ type Model struct {
 	// Approval state
 	approvalResult chan bool
 	approvalUI     *approvalUIState
+	approvalInFlight bool
 
 	// Modal data
 	sessionList   []agent.SessionInfo
@@ -277,8 +280,19 @@ func (m *Model) wrapLine(line string) []string {
 		parts = parts[:len(parts)-1]
 	}
 	if len(parts) > 1 {
-		sgr := extractLeadingSGR(line)
-		if sgr != "" && !strings.Contains(parts[0], "\x1b[0m") {
+		// Propagate the style that is still active at the wrap point.
+		// When a line contains multiple SGR segments (e.g. a tool-call
+		// prefix followed by dimmed args), the wrap may fall inside a
+		// segment whose SGR is not the first one on the line.
+		sgr := extractTrailingSGR(parts[0])
+		if sgr == "" && !strings.Contains(parts[0], "\x1b[0m") {
+			// No reset in parts[0]: the leading style is still open.
+			sgr = extractLeadingSGR(line)
+		}
+		if sgr == "" {
+			return parts
+		}
+		if sgr != "" {
 			for i := 1; i < len(parts); i++ {
 				if parts[i] == "" {
 					continue // skip SGR on empty continuation lines
@@ -304,7 +318,8 @@ func (m *Model) buildFromPrefix() {
 	}
 	m.clearSelection()
 	m.viewport.SetContent(m.wrappedContent)
-	m.styledLines = strings.Split(m.wrappedContent, "\n")
+	// styledLines is computed lazily in ensureStyledLines().
+	m.styledLinesDirty = true
 }
 
 // setViewportContent performs a full re-wrap of all chatLines and rebuilds
@@ -322,7 +337,8 @@ func (m *Model) setViewportContent() {
 	m.wrappedLinesDirty = true // lazily compute on next selection access
 	m.clearSelection()
 	m.viewport.SetContent(m.wrappedContent)
-	m.styledLines = strings.Split(m.wrappedContent, "\n")
+	// styledLines is computed lazily in ensureStyledLines().
+	m.styledLinesDirty = true
 
 	// Rebuild the prefix pointing at all lines except the last.
 	if len(m.chatLines) > 1 {
@@ -496,19 +512,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.modal = ModalApproval
 		return m, nil
 
-	// Session/modal results
-	case sessionRestoredMsg:
-		m.sessionID = msg.sessionID
-		m.chatLines = renderMessages(msg.messages, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())
-		m.setViewportContent()
-		m.viewport.GotoBottom()
-		return m, nil
-
-	case clearChatMsg:
-		m.chatLines = nil
-		m.setViewportContent()
-		return m, nil
-
 	// Pass mouse events to the viewport for wheel scrolling
 	case tea.MouseMsg:
 		// Check for text selection first; wheel events fall through to viewport
@@ -626,9 +629,13 @@ func (m *Model) appendChatLine(line string) {
 	if len(m.chatLines) > 0 {
 		parts := m.wrapLine(m.chatLines[len(m.chatLines)-1])
 		if m.wrappedPrefix == "" {
+			// First line: prefix is empty, so the wrapped line becomes the
+			// seed; the trailing "\n" below separates it from the new line.
 			m.wrappedPrefix = strings.Join(parts, "\n")
 		} else {
-			m.wrappedPrefix += "\n" + strings.Join(parts, "\n")
+			// wrappedPrefix already ends with "\n"; appending the wrapped
+			// line directly keeps a single separator (no blank line).
+			m.wrappedPrefix += strings.Join(parts, "\n")
 		}
 		m.wrappedPrefix += "\n"
 	}
@@ -725,8 +732,16 @@ func (m *Model) closeThinkingBlock() {
 
 // appendToStreamLine appends text to a tracked streaming line. When that line
 // is last, uses the cheap prefix rebuild; otherwise full rewrap.
+// If the recorded lineIdx is no longer valid (e.g. the chat was modified
+// concurrently), fall back to appending to the last line so the token is
+// not silently dropped. The mismatch is logged at debug level.
 func (m *Model) appendToStreamLine(lineIdx int, text string) {
 	if lineIdx < 0 || lineIdx >= len(m.chatLines) {
+		debuglog.Write("tui/stream", "appendToStreamLine: slot invalid", "stream-slot-lost", map[string]interface{}{
+			"lineIdx":  lineIdx,
+			"chatLen":  len(m.chatLines),
+			"textSize": len(text),
+		})
 		m.appendToLastLine(text)
 		return
 	}
@@ -739,8 +754,16 @@ func (m *Model) appendToStreamLine(lineIdx int, text string) {
 	m.viewport.GotoBottom()
 }
 
+// replaceStreamLine replaces text in a tracked streaming line. When that line
+// is last, uses the cheap prefix rebuild; otherwise full rewrap. If the
+// recorded lineIdx is no longer valid, fall back to the last line and log.
 func (m *Model) replaceStreamLine(lineIdx int, text string) {
 	if lineIdx < 0 || lineIdx >= len(m.chatLines) {
+		debuglog.Write("tui/stream", "replaceStreamLine: slot invalid", "stream-slot-lost", map[string]interface{}{
+			"lineIdx":  lineIdx,
+			"chatLen":  len(m.chatLines),
+			"textSize": len(text),
+		})
 		m.replaceLastLine(text)
 		return
 	}
@@ -989,7 +1012,7 @@ func (m *Model) appendChatLines(lines []string) {
 			if m.wrappedPrefix == "" {
 				m.wrappedPrefix = strings.Join(parts, "\n")
 			} else {
-				m.wrappedPrefix += "\n" + strings.Join(parts, "\n")
+				m.wrappedPrefix += strings.Join(parts, "\n")
 			}
 			m.wrappedPrefix += "\n"
 		}
@@ -999,7 +1022,11 @@ func (m *Model) appendChatLines(lines []string) {
 	m.viewport.GotoBottom()
 }
 
-func (m *Model) handleStreamStart() {
+// resetStreamState clears all per-turn streaming buffers and indices. When
+// keepToolDiffShown is true the toolDiffShown map is preserved so a patch
+// diff rendered in an earlier round is not re-shown in the next round. Pass
+// false on new-turn / cancel / error paths to wipe everything.
+func (m *Model) resetStreamState(keepToolDiffShown bool) {
 	m.streamAssistantBuf.Reset()
 	m.streamAssistantLine = -1
 	m.streamThinkingBuf.Reset()
@@ -1012,23 +1039,18 @@ func (m *Model) handleStreamStart() {
 	m.toolCallDiffs = make(map[string]string)
 	m.streamToolDiffCount = make(map[int]int)
 	m.streamToolDiffStart = make(map[int]int)
-	m.toolDiffShown = make(map[string]bool)
+	if !keepToolDiffShown {
+		m.toolDiffShown = make(map[string]bool)
+	}
+}
+
+func (m *Model) handleStreamStart() {
+	m.resetStreamState(false)
 }
 
 func (m *Model) handleStreamRoundStart() {
-	m.streamAssistantBuf.Reset()
-	m.streamAssistantLine = -1
-	m.streamThinkingBuf.Reset()
-	m.streamThinkingOpen = false
-	m.streamThinkingLine = -1
-	m.streamToolCallNames = make(map[int]string)
-	m.streamToolCallArgs = make(map[int]string)
-	m.streamToolCallIDs = make(map[int]string)
-	m.streamToolCallLines = make(map[int]int)
-	m.toolCallDiffs = make(map[string]string)
-	m.streamToolDiffCount = make(map[int]int)
-	m.streamToolDiffStart = make(map[int]int)
-	// Keep toolDiffShown across rounds — each diff is shown once per turn
+	// Keep toolDiffShown across rounds — each diff is shown once per turn.
+	m.resetStreamState(true)
 }
 
 func (m *Model) handleStreamRoundEnd() {
@@ -1096,6 +1118,18 @@ func (m *Model) refreshContextStats() {
 	m.contextLine = agent.FormatContextBrief(stats)
 }
 
+// checkPersistError surfaces any pending session-save error in the status
+// bar. Call from any code path that may have triggered Agent.persistSession
+// (slash commands, /rename tool, etc.) so silent save failures aren't lost.
+func (m *Model) checkPersistError() {
+	if m.agent == nil {
+		return
+	}
+	if err := m.agent.ConsumePersistError(); err != nil {
+		m.statusMsg = fmt.Sprintf("Warning: failed to save session: %v", err)
+	}
+}
+
 // requestContextStats refreshes the status-bar indicator asynchronously.
 // Prefer refreshContextStats from Update handlers when the stream is idle.
 func (m *Model) requestContextStats() tea.Cmd {
@@ -1119,19 +1153,7 @@ func (m *Model) handleStreamError(err error) {
 	m.streaming = false
 	m.dismissApproval(false)
 	m.clearProgress()
-	m.streamAssistantBuf.Reset()
-	m.streamAssistantLine = -1
-	m.streamThinkingBuf.Reset()
-	m.streamThinkingOpen = false
-	m.streamThinkingLine = -1
-	m.streamToolCallNames = make(map[int]string)
-	m.streamToolCallArgs = make(map[int]string)
-	m.streamToolCallIDs = make(map[int]string)
-	m.streamToolCallLines = make(map[int]int)
-	m.toolCallDiffs = make(map[string]string)
-	m.streamToolDiffCount = make(map[int]int)
-	m.streamToolDiffStart = make(map[int]int)
-	m.toolDiffShown = make(map[string]bool)
+	m.resetStreamState(false)
 	m.refreshContextStats()
 	if m.agent != nil {
 		if persistErr := m.agent.ConsumePersistError(); persistErr != nil {

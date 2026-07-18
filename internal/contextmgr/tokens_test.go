@@ -58,3 +58,43 @@ func TestEnsureToolResultsCappedInvalidatesTokenCache(t *testing.T) {
 		t.Fatalf("expected truncation marker in tool content")
 	}
 }
+
+// TestTokenCacheSurvivesMessageAppend documents the contract that callers
+// depend on: appending a new message to a slice whose earlier messages
+// are already cached must NOT discard the cached entries. The cache is
+// keyed by message pointer with a content fingerprint guard, so historical
+// entries remain valid as long as their address and content are unchanged.
+//
+// Note: we pre-allocate the slice with extra capacity so the append does
+// not reallocate the backing array; a reallocation would move the
+// existing message structs to new addresses, which is a legitimate
+// cache miss. The agent maintains spare capacity in a.Messages across
+// real turns for the same reason.
+//
+// If a future change makes the cache address-sensitive (e.g. switches to
+// indexing by slice position), this test will fail and force a re-think of
+// every place that does `append(messages, ...)` between turns.
+func TestTokenCacheSurvivesMessageAppend(t *testing.T) {
+	InvalidateTokenCache()
+	m := NewManager(nil, Settings{})
+
+	msgs := make([]llm.Message, 0, 4)
+	msgs = append(msgs,
+		llm.Message{Role: "user", Content: "first message"},
+		llm.Message{Role: "assistant", Content: "first reply"},
+	)
+	_ = m.EstimateTokens(msgs)
+	if got := TokenCacheSize(); got != 2 {
+		t.Fatalf("expected 2 cached entries after first tokenize, got %d", got)
+	}
+
+	// Simulate a turn boundary: append a new user message. The two
+	// pre-existing messages still sit at the same addresses with the same
+	// content, so their cache entries must remain valid.
+	msgs = append(msgs, llm.Message{Role: "user", Content: "second message"})
+	_ = m.EstimateTokens(msgs)
+	if got := TokenCacheSize(); got != 3 {
+		t.Fatalf("expected 3 cached entries after append, got %d", got)
+	}
+}
+

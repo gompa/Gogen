@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 
+	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
 )
 
@@ -36,9 +37,14 @@ type SessionInfo struct {
 // RestoreSession loads messages, mode, and model from a snapshot.
 func (a *Agent) RestoreSession(ctx context.Context, snap SessionSnapshot) {
 	a.Messages = append([]llm.Message(nil), snap.Messages...)
-	if snap.ProjectProfile != "" {
-		a.projectProfile = snap.ProjectProfile
-	}
+	// Cached token counts are keyed by message pointer; restoring gives
+	// every message a new address, so any old entries are dead weight.
+	contextmgr.InvalidateTokenCache()
+	// Always reset the cached project profile so it is re-detected from the
+	// current working directory. The snapshot's profile describes the
+	// project that was on disk when the session was saved, which may differ
+	// from the directory the session is being restored into.
+	a.projectProfile = ""
 	a.SessionLabel = snap.Label
 	if m, ok := ParseMode(snap.Mode); ok {
 		a.Mode = m

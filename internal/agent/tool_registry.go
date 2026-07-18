@@ -460,6 +460,12 @@ func handleSessionUsage(_ context.Context, a *Agent, _ map[string]interface{}) (
 }
 
 func handleContextPinLast(_ context.Context, a *Agent, _ map[string]interface{}) (string, error) {
+	if a.PinManager == nil {
+		// PinManager is unconditionally initialised in main(); this branch
+		// only fires in tests / custom embeds. Tell the LLM the tool is a
+		// no-op rather than returning an error that halts the turn.
+		return "Pin manager not configured; context pinning is a no-op.", nil
+	}
 	return "Pinned the last user message", a.pinLastUser()
 }
 

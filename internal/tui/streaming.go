@@ -62,13 +62,6 @@ type contextStatsMsg struct {
 	stats agent.TurnContext
 }
 
-type sessionRestoredMsg struct {
-	sessionID string
-	messages  []llm.Message
-}
-
-type clearChatMsg struct{}
-
 // StreamAdapter adapts llm.StreamHandlers to emit Bubble Tea messages
 // that can be processed by the Model's Update method.
 type StreamAdapter struct {
@@ -93,10 +86,17 @@ type tokenBatcher struct {
 	mu    sync.Mutex
 	send  func(tea.Msg)
 	segs  []tokenSeg
-	timer *time.Timer
+	timer *time.Timer // created lazily; always stopped before reuse
 }
 
 func (b *tokenBatcher) scheduleFlushLocked() {
+	// Lazily create a one-shot timer. Only start a timer if one isn't
+	// already pending. We intentionally do NOT extend the deadline on
+	// subsequent tokens (the old Stop+Reset approach delayed flushes
+	// indefinitely for fast streams). The first token in each batch
+	// sets a fixed 32ms window, guaranteeing at most 32ms of batching
+	// and keeping the UI responsive even when tokens arrive faster
+	// than the flush interval.
 	if b.timer == nil {
 		b.timer = time.AfterFunc(32*time.Millisecond, b.flush)
 	}

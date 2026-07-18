@@ -91,9 +91,12 @@ func (a *Agent) todo() (*TodoManager, error) {
 }
 
 // pinLastUser pins the most recent user message so it survives compaction.
+// When no PinManager is configured the tool degrades to a no-op (this only
+// happens in tests/custom embeds) so the LLM sees a successful acknowledgement
+// rather than a confusing error.
 func (a *Agent) pinLastUser() error {
 	if a.PinManager == nil {
-		return fmt.Errorf("pin manager is not initialized")
+		return nil
 	}
 	a.PinManager.PinLastUser(a.Messages)
 	return nil
@@ -204,6 +207,11 @@ func (a *Agent) prepareMessages(ctx context.Context) []llm.Message {
 					if a.PinManager != nil {
 						a.PinManager.ReplacePins(newPins)
 					}
+					// Compaction produced a shorter history; the last API
+					// usage counters are no longer representative, so clear
+					// them to keep /context honest. (CompactPinned already
+					// invalidated the token count cache.)
+					a.lastTurnUsage = nil
 				}
 			}
 		}
@@ -230,6 +238,10 @@ func (a *Agent) CompactHistory(ctx context.Context) error {
 	if a.PinManager != nil {
 		a.PinManager.ReplacePins(newPins)
 	}
+	// CompactPinned already invalidated the token cache (it owns invalidation
+	// on reassignment). lastTurnUsage reflects the pre-compaction request and
+	// is no longer accurate, so drop it to avoid a stale /context display.
+	a.lastTurnUsage = nil
 	return nil
 }
 
@@ -262,7 +274,6 @@ func (a *Agent) appendToolResult(tc llm.ToolCall, result string) {
 // It returns the final accumulated response or an error.
 func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.StreamHandlers) (string, error) {
 	a.Messages = append(a.Messages, llm.Message{Role: "user", Content: input})
-	defer contextmgr.InvalidateTokenCache()
 
 	if err := a.requireModelSelected(ctx); err != nil {
 		a.Messages = a.Messages[:len(a.Messages)-1]

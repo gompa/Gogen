@@ -33,6 +33,15 @@ type tokenCacheEntry struct {
 // the same messages across multiple calls to EstimateTokens within a turn.
 // Entries are validated with a content fingerprint so GC address reuse and
 // in-place mutations cannot return stale counts.
+//
+// The fingerprint is a 64-bit FNV-1a hash. A collision (two distinct message
+// bodies hashing identically while reusing the same pointer) would let a
+// stale count be served silently. With the ~birthday bound at 2^32 messages
+// (far beyond any real session) and the cache only gating an *estimate* used
+// to decide compaction timing — never correctness of tool output — this trade
+// is acceptable. If the cache ever gated a correctness-critical decision,
+// switch to a 128-bit hash (crypto/sha128 or hash/maphash with a per-process
+// seed) for defense-in-depth.
 var tokenCache struct {
 	sync.RWMutex
 	m map[any]tokenCacheEntry
@@ -71,11 +80,34 @@ func storeTokenCount(msg *llm.Message, n int) {
 }
 
 // InvalidateTokenCache clears all cached entries. Call this when the message
-// list is compacted, messages are mutated, or between turns to bound memory.
+// list is compacted, restored, or otherwise reassigned. Per-message content
+// mutations are caught by the fingerprint check inside cachedTokenCount, so
+// appending a new message to the slice does NOT require invalidation: the
+// existing entries' message pointers and fingerprints still match.
 func InvalidateTokenCache() {
 	tokenCache.Lock()
 	tokenCache.m = nil
 	tokenCache.Unlock()
+}
+
+// TokenCacheSize reports the number of cached token-count entries.
+// Intended for tests; production callers should not depend on cache size.
+func TokenCacheSize() int {
+	tokenCache.RLock()
+	defer tokenCache.RUnlock()
+	if tokenCache.m == nil {
+		return 0
+	}
+	return len(tokenCache.m)
+}
+
+func sortedToolArgKeys(args map[string]interface{}) []string {
+	keys := make([]string, 0, len(args))
+	for k := range args {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func messageFingerprint(msg *llm.Message) uint64 {
@@ -94,13 +126,7 @@ func messageFingerprint(msg *llm.Message) uint64 {
 		if tc.ArgsStr != "" {
 			_, _ = h.Write([]byte(tc.ArgsStr))
 		} else {
-			// Sort keys for deterministic fingerprints.
-			keys := make([]string, 0, len(tc.Args))
-			for k := range tc.Args {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-			for _, k := range keys {
+			for _, k := range sortedToolArgKeys(tc.Args) {
 				v := tc.Args[k]
 				_, _ = h.Write([]byte(k))
 				_, _ = h.Write([]byte{0})
@@ -161,13 +187,7 @@ func countTokensExact(msg llm.Message) (int, bool) {
 				tokens += len(ids)
 			}
 		} else {
-			// Sort keys for deterministic token counts.
-			keys := make([]string, 0, len(tc.Args))
-			for k := range tc.Args {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-			for _, k := range keys {
+			for _, k := range sortedToolArgKeys(tc.Args) {
 				v := tc.Args[k]
 				if ids, _, err := c.Encode(k); err == nil {
 					tokens += len(ids)
@@ -195,13 +215,7 @@ func estimateMessageTokensHeuristic(msg llm.Message) int {
 		if tc.ArgsStr != "" {
 			tokens += (len(tc.ArgsStr) + 3) / 4
 		} else {
-			// Sort keys for deterministic token estimates.
-			keys := make([]string, 0, len(tc.Args))
-			for k := range tc.Args {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-			for _, k := range keys {
+			for _, k := range sortedToolArgKeys(tc.Args) {
 				v := tc.Args[k]
 				tokens += (len(k)+len(fmt.Sprint(v))+4)/4 + 2
 			}

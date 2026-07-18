@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -88,11 +89,12 @@ func (e *Executor) ReadFileRange(path string, offset, limit int, search string) 
 		return "", fmt.Errorf("path is a directory containing: %s. Use list_files or read_file with a specific file path", strings.Join(names, ", "))
 	}
 	if info.Mode().IsRegular() && info.Size() > 0 {
-		head := make([]byte, 512)
-		f, err := os.Open(secure)
-		if err == nil {
+		// Binary check: read up to 512 bytes, sniff for NUL, close.
+		// Use defer for safety against future edits; Close is idempotent.
+		if f, err := os.Open(secure); err == nil {
+			head := make([]byte, 512)
 			n, _ := f.Read(head)
-			f.Close()
+			_ = f.Close()
 			if n > 0 && isBinary(head[:n]) {
 				return "", fmt.Errorf("this is a binary file (%s). Use read_file with offset/limit on text files only, or use execute_command to inspect binary content", formatByteSize(info.Size()))
 			}
@@ -308,6 +310,14 @@ func (e *Executor) buildShellCommand(ctx context.Context, command string) (*exec
 		wd := e.WorkingDir
 		if wd == "" {
 			wd = "."
+		}
+		// Resolve symlinks so the --bind/--chdir target matches what the
+		// child process will see after its own symlink traversal. Without
+		// this, a working directory that is itself a symlink (common on
+		// macOS /home -> /Users) gets bind-mounted under one path while
+		// the child ends up in the other, so writes/reads don't line up.
+		if resolved, err := filepath.EvalSymlinks(wd); err == nil {
+			wd = resolved
 		}
 		// Restrict filesystem to the working directory; keep network and
 		// basic devices so builds/tests still work. Not a full container.

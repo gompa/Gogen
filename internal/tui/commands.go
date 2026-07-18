@@ -54,12 +54,15 @@ func (m *Model) dispatchCommand(input string) (bool, bool, tea.Cmd) {
 		} else {
 			m.appendChatLine(SystemStyle.Render(out))
 		}
+		// SetMode persists the session.
+		m.checkPersistError()
 		return true, false, nil
 	}
 
 	// Context command
 	if out, handled := m.agent.HandleContextCommand(m.ctx, input); handled {
 		m.appendChatLine(SystemStyle.Render(out))
+		m.checkPersistError()
 		return true, false, nil
 	}
 
@@ -67,6 +70,9 @@ func (m *Model) dispatchCommand(input string) (bool, bool, tea.Cmd) {
 	if result, handled, err := m.agent.HandleSessionCommand(m.ctx, input, session.NewID()); handled {
 		if err != nil {
 			m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Session: %v", err)))
+			// Errors from startNewSession/deleteSessionByID may surface a
+			// half-completed persist; check anyway.
+			m.checkPersistError()
 			return true, false, nil
 		}
 		if result.Action == agent.SessionActionClearChat {
@@ -94,6 +100,8 @@ func (m *Model) dispatchCommand(input string) (bool, bool, tea.Cmd) {
 				m.viewport.GotoBottom()
 			}
 		}
+		// Session commands (new, resume, delete) persist.
+		m.checkPersistError()
 		return true, false, nil
 	}
 
@@ -125,6 +133,8 @@ func (m *Model) dispatchCommand(input string) (bool, bool, tea.Cmd) {
 			m.agent.SetWorkingDir(absDir)
 			m.appendChatLine(SystemStyle.Render(fmt.Sprintf("Changed working directory to: %s", absDir)))
 		}
+		// SetWorkingDir persists the session.
+		m.checkPersistError()
 		return true, false, nil
 	}
 
@@ -160,19 +170,7 @@ func (m *Model) submitUserInput(input string) tea.Cmd {
 
 	// Start streaming
 	m.streaming = true
-	m.streamAssistantBuf.Reset()
-	m.streamAssistantLine = -1
-	m.streamThinkingBuf.Reset()
-	m.streamThinkingOpen = false
-	m.streamThinkingLine = -1
-	m.streamToolCallNames = make(map[int]string)
-	m.streamToolCallArgs = make(map[int]string)
-	m.streamToolCallIDs = make(map[int]string)
-	m.streamToolCallLines = make(map[int]int)
-	m.toolCallDiffs = make(map[string]string)
-	m.streamToolDiffCount = make(map[int]int)
-	m.streamToolDiffStart = make(map[int]int)
-	m.toolDiffShown = make(map[string]bool)
+	m.resetStreamState(false)
 	startProgress := m.setProgress(progressThinking, "thinking")
 
 	// Create cancelable context for the LLM call
@@ -206,8 +204,14 @@ func (m *Model) makeDeleteApprover() agent.DeleteApprover {
 		if ctx.Err() != nil {
 			return false, ctx.Err()
 		}
+		// Mark this approval as in-flight BEFORE draining/sending so a stale
+		// dismissal from a previous cancelled approval cannot masquerade as
+		// this approval's response.
+		m.approvalInFlight = true
+		defer func() { m.approvalInFlight = false }()
 		// Drain stale value from previous approval (e.g. context cancelled
-		// while user still responded to modal).
+		// while user still responded to modal). The flag above guarantees
+		// any value sitting in the channel belongs to the previous approver.
 		select {
 		case <-m.approvalResult:
 		default:

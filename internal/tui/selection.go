@@ -55,6 +55,57 @@ func extractLeadingSGR(s string) string {
 	return s[:end]
 }
 
+// extractTrailingSGR returns the concatenated ANSI SGR sequences that are
+// still active at the end of s — i.e. every SGR sequence that appears after
+// the last \x1b[0m reset.  Returns "" when no SGR is active at the end.
+//
+// This is used to correctly propagate the *current* style at a wrap point,
+// which may differ from the leading style when a line contains multiple
+// independently-styled segments (e.g. a tool-call prefix followed by
+// dimmed arguments).
+func extractTrailingSGR(s string) string {
+	// Find the tail after the last reset.
+	lastReset := strings.LastIndex(s, "\x1b[0m")
+	start := 0
+	if lastReset >= 0 {
+		start = lastReset + 4
+	}
+	if start >= len(s) {
+		return ""
+	}
+	tail := s[start:]
+
+	// Scan the tail for SGR sequences — collect every one we find.
+	// Non-SGR text between them is allowed (e.g. " name \x1b[37margs").
+	idx := strings.Index(tail, "\x1b[")
+	if idx < 0 {
+		return ""
+	}
+	tail = tail[idx:] // skip any plain text before the first SGR in the tail
+
+	// Now collect consecutive SGR sequences from the head of what remains.
+	end := 0
+	for end < len(tail) {
+		if end+1 >= len(tail) || tail[end] != '\x1b' || tail[end+1] != '[' {
+			break
+		}
+		j := end + 2
+		for j < len(tail) && tail[j] != '\x1b' {
+			c := tail[j]
+			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+				j++
+				break
+			}
+			if (c < '0' || c > '9') && c != ';' && c != ':' {
+				break
+			}
+			j++
+		}
+		end = j
+	}
+	return tail[:end]
+}
+
 // stripANSI removes ANSI escape sequences from a string.
 func stripANSI(s string) string {
 	return ansiRegex.ReplaceAllString(s, "")
@@ -83,6 +134,21 @@ func (m *Model) ensureWrappedLines() {
 		m.wrappedLines = strings.Split(stripANSI(m.wrappedContent), "\n")
 	}
 	m.wrappedLinesDirty = false
+}
+
+// ensureStyledLines lazily computes m.styledLines (ANSI‑preserved split)
+// when it is dirty. This avoids the expensive Split on every streaming token
+// when no text selection is active.
+func (m *Model) ensureStyledLines() {
+	if !m.styledLinesDirty {
+		return
+	}
+	if m.wrappedContent == "" {
+		m.styledLines = nil
+	} else {
+		m.styledLines = strings.Split(m.wrappedContent, "\n")
+	}
+	m.styledLinesDirty = false
 }
 
 // SelectionState tracks the in-progress or finalized text selection.
@@ -396,6 +462,7 @@ func (m *Model) renderViewportWithSelection() string {
 	if m.selection != nil && m.selection.Dragging && m.selectionYOff >= 0 {
 		yOff = m.selectionYOff
 	}
+	m.ensureStyledLines()
 	styledLines := m.styledLines
 
 	// Normalize selection range

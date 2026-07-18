@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
 )
 
@@ -88,6 +89,9 @@ func (a *Agent) startNewSession(newID string) (string, error) {
 	}
 	a.SessionID = newID
 	a.Messages = nil
+	// Wipe any token-count cache entries — the old message pointers are
+	// being released and new conversations start from empty.
+	contextmgr.InvalidateTokenCache()
 	a.lastTurnUsage = nil
 	a.UsageAccum = UsageAccumulator{}
 	a.SessionLabel = ""
@@ -167,6 +171,8 @@ func (a *Agent) deleteSessionByID(ctx context.Context, id, newSessionID string) 
 		}
 		a.SessionID = newSessionID
 		a.Messages = nil
+		// Old message pointers are being released; drop cached token counts.
+		contextmgr.InvalidateTokenCache()
 		a.lastTurnUsage = nil
 		a.persistSession()
 		out := fmt.Sprintf("Deleted session %s (was current — started new session %s).", id, newSessionID)

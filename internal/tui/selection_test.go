@@ -108,18 +108,21 @@ func TestSGRPropagation(t *testing.T) {
 	})
 
 	t.Run("tool call — multi-styled, SGR closed early", func(t *testing.T) {
-		// Tool call prefix SGR closes before the args start.
-		// Part 0 has \x1b[0m → don't propagate prefix SGR.
+		// Tool call prefix SGR closes before the args start, but the args
+		// themselves have their own style.  The trailing SGR (args style)
+		// must be propagated so the continuation line keeps its dim color
+		// even when the first line scrolls out of view.
 		parts := []string{
 			"\x1b[38;2;204;170;0m  →\x1b[0m name \x1b[38;2;136;136;136mvery",
 			"long args here\x1b[0m",
 		}
-		if !strings.Contains(parts[0], "\x1b[0m") {
+		lastReset := strings.LastIndex(parts[0], "\x1b[0m")
+		if lastReset < 0 {
 			t.Fatal("part 0 SHOULD have reset")
 		}
-		shouldPropagate := !strings.Contains(parts[0], "\x1b[0m")
-		if shouldPropagate {
-			t.Fatal("should NOT propagate when reset is in part 0")
+		trailingSGR := extractTrailingSGR(parts[0])
+		if trailingSGR == "" {
+			t.Fatal("should propagate trailing SGR when active after last reset")
 		}
 	})
 }
