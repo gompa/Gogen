@@ -3,20 +3,12 @@ package agent
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"strings"
 )
 
 // GitStage stages files for commit.
 // When paths is empty, it uses `git add -A` to stage everything.
 func (e *Executor) GitStage(ctx context.Context, paths []string) (string, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if _, err := exec.LookPath("git"); err != nil {
-		return "", fmt.Errorf("git is not available on PATH")
-	}
-
 	args := []string{"add"}
 	if len(paths) == 0 {
 		args = append(args, "-A")
@@ -30,8 +22,10 @@ func (e *Executor) GitStage(ctx context.Context, paths []string) (string, error)
 		args = append(args, paths...)
 	}
 
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = e.WorkingDir
+	cmd, cmdErr := e.newGitCmd(ctx, args...)
+	if cmdErr != nil {
+		return "", cmdErr
+	}
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	if err != nil {
@@ -48,19 +42,15 @@ func (e *Executor) GitStage(ctx context.Context, paths []string) (string, error)
 
 // GitCommit creates a commit with the given message.
 func (e *Executor) GitCommit(ctx context.Context, message string) (string, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if _, err := exec.LookPath("git"); err != nil {
-		return "", fmt.Errorf("git is not available on PATH")
-	}
 	message = strings.TrimSpace(message)
 	if message == "" {
 		return "", fmt.Errorf("message is required")
 	}
 
-	cmd := exec.CommandContext(ctx, "git", "commit", "-m", message)
-	cmd.Dir = e.WorkingDir
+	cmd, cmdErr := e.newGitCmd(ctx, "commit", "-m", message)
+	if cmdErr != nil {
+		return "", cmdErr
+	}
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	if err != nil {
@@ -84,20 +74,16 @@ func (e *Executor) GitCommit(ctx context.Context, message string) (string, error
 // When name is non-empty and create is false, it checks out that branch.
 // When both are empty, it lists all branches with current marked.
 func (e *Executor) GitBranch(ctx context.Context, name string, create bool) (string, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if _, err := exec.LookPath("git"); err != nil {
-		return "", fmt.Errorf("git is not available on PATH")
-	}
 	name = strings.TrimSpace(name)
 	if err := validateGitBranchName(name); err != nil {
 		return "", err
 	}
 
 	if name != "" && create {
-		cmd := exec.CommandContext(ctx, "git", "switch", "-c", name)
-		cmd.Dir = e.WorkingDir
+		cmd, cmdErr := e.newGitCmd(ctx, "switch", "-c", name)
+		if cmdErr != nil {
+			return "", cmdErr
+		}
 		out, err := cmd.CombinedOutput()
 		text := strings.TrimSpace(string(out))
 		if err != nil {
@@ -113,8 +99,10 @@ func (e *Executor) GitBranch(ctx context.Context, name string, create bool) (str
 	}
 
 	if name != "" {
-		cmd := exec.CommandContext(ctx, "git", "switch", "--", name)
-		cmd.Dir = e.WorkingDir
+		cmd, cmdErr := e.newGitCmd(ctx, "switch", "--", name)
+		if cmdErr != nil {
+			return "", cmdErr
+		}
 		out, err := cmd.CombinedOutput()
 		text := strings.TrimSpace(string(out))
 		if err != nil {
@@ -131,8 +119,10 @@ func (e *Executor) GitBranch(ctx context.Context, name string, create bool) (str
 
 	// List branches: local + remote, with current marked.
 	args := []string{"branch", "-v", "-a", "--sort=-committerdate"}
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = e.WorkingDir
+	cmd, cmdErr := e.newGitCmd(ctx, args...)
+	if cmdErr != nil {
+		return "", cmdErr
+	}
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	if err != nil {
@@ -153,16 +143,11 @@ func (e *Executor) GitBranch(ctx context.Context, name string, create bool) (str
 // GitStash pushes changes to the stash, optionally with a message.
 // When pop is true, it pops the most recent stash entry instead.
 func (e *Executor) GitStash(ctx context.Context, message string, pop bool) (string, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if _, err := exec.LookPath("git"); err != nil {
-		return "", fmt.Errorf("git is not available on PATH")
-	}
-
 	if pop {
-		cmd := exec.CommandContext(ctx, "git", "stash", "pop")
-		cmd.Dir = e.WorkingDir
+		cmd, cmdErr := e.newGitCmd(ctx, "stash", "pop")
+		if cmdErr != nil {
+			return "", cmdErr
+		}
 		out, err := cmd.CombinedOutput()
 		text := strings.TrimSpace(string(out))
 		if err != nil {
@@ -187,8 +172,10 @@ func (e *Executor) GitStash(ctx context.Context, message string, pop bool) (stri
 		args = append(args, "-m", message)
 	}
 
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = e.WorkingDir
+	cmd, cmdErr := e.newGitCmd(ctx, args...)
+	if cmdErr != nil {
+		return "", cmdErr
+	}
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	if err != nil {
@@ -209,15 +196,10 @@ func (e *Executor) GitStash(ctx context.Context, message string, pop bool) (stri
 
 // GitStashList lists all stash entries.
 func (e *Executor) GitStashList(ctx context.Context) (string, error) {
-	if ctx == nil {
-		ctx = context.Background()
+	cmd, cmdErr := e.newGitCmd(ctx, "stash", "list")
+	if cmdErr != nil {
+		return "", cmdErr
 	}
-	if _, err := exec.LookPath("git"); err != nil {
-		return "", fmt.Errorf("git is not available on PATH")
-	}
-
-	cmd := exec.CommandContext(ctx, "git", "stash", "list")
-	cmd.Dir = e.WorkingDir
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	if err != nil {
@@ -238,12 +220,6 @@ func (e *Executor) GitStashList(ctx context.Context) (string, error) {
 // GitDiffShow returns a unified diff for a specific commit or range.
 // When range is empty, shows the diff for HEAD.
 func (e *Executor) GitDiffShow(ctx context.Context, ref string) (string, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if _, err := exec.LookPath("git"); err != nil {
-		return "", fmt.Errorf("git is not available on PATH")
-	}
 	ref = strings.TrimSpace(ref)
 	if err := validateGitRef(ref); err != nil {
 		return "", err
@@ -254,8 +230,10 @@ func (e *Executor) GitDiffShow(ctx context.Context, ref string) (string, error) 
 		args = append(args, "--", ref)
 	}
 
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = e.WorkingDir
+	cmd, cmdErr := e.newGitCmd(ctx, args...)
+	if cmdErr != nil {
+		return "", cmdErr
+	}
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	if err != nil {

@@ -8,8 +8,10 @@ import (
 	"strings"
 	"time"
 
+	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	"gogen/internal/projectfile"
 )
 
 type Agent struct {
@@ -66,6 +68,28 @@ func (a *Agent) SetMCPRegistry(reg MCPToolRegistry) {
 	a.MCPRegistry = reg
 }
 
+// SaveConfig writes the effective configuration to the project file.
+// Returns the config path, guidelines path, and any error.
+func (a *Agent) SaveConfig(cfg *config.Config, includeSecrets bool) (cfgPath, guidelinesPath string, err error) {
+	if cfg == nil {
+		return "", "", fmt.Errorf("config not available")
+	}
+	effective := *cfg
+	effective.OpenAIModel = a.CurrentModel()
+	cfgPath = projectfile.DefaultSavePath(a.WorkingDir)
+	guidelinesPath = projectfile.DefaultGuidelinesSavePath(a.WorkingDir)
+	err = projectfile.SaveConfig(cfgPath, guidelinesPath, &effective, a.ProjectGuidelines, projectfile.WriteOptions{IncludeSecrets: includeSecrets})
+	return
+}
+
+// todo ensures the TodoManager is initialized and returns it.
+func (a *Agent) todo() (*TodoManager, error) {
+	if a.TodoManager == nil {
+		return nil, fmt.Errorf("todo manager is not initialized")
+	}
+	return a.TodoManager, nil
+}
+
 // pinLastUser pins the most recent user message so it survives compaction.
 func (a *Agent) pinLastUser() error {
 	if a.PinManager == nil {
@@ -95,11 +119,12 @@ func (a *Agent) persistSession() {
 		return
 	}
 	if err := a.SessionStore.Save(a.SessionID, SessionSnapshot{
-		WorkingDir: a.WorkingDir,
-		Model:      a.CurrentModel(),
-		Mode:       a.Mode.String(),
-		Label:      a.SessionLabel,
-		Messages:   append([]llm.Message(nil), a.Messages...),
+		WorkingDir:     a.WorkingDir,
+		Model:          a.CurrentModel(),
+		Mode:           a.Mode.String(),
+		Label:          a.SessionLabel,
+		ProjectProfile: a.projectProfile,
+		Messages:       append([]llm.Message(nil), a.Messages...),
 	}); err != nil {
 		log.Printf("session save failed (id=%s): %v", a.SessionID, err)
 		a.lastPersistErr = err

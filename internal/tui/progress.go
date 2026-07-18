@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"strings"
+
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -44,23 +46,39 @@ func (m *Model) clearProgress() {
 	m.progressLabel = ""
 }
 
+// renderProgressInput draws the wait indicator in the input band.
+// It is padded to the textarea height so the layout does not jump when a turn
+// starts or ends (viewport height is sized for the textarea, not 1 line).
 func (m *Model) renderProgressInput() string {
+	var line string
 	switch m.progressPhase {
 	case progressThinking:
 		label := m.progressLabel
 		if label == "" {
 			label = "thinking"
 		}
-		return DimStyle.Render("  " + m.spinner.View() + " " + label)
+		line = DimStyle.Render("  " + m.spinner.View() + " " + label)
 	case progressTool:
 		label := m.progressLabel
 		if label == "" {
 			label = "running tool"
 		}
-		return DimStyle.Render("  " + m.spinner.View() + " " + label)
+		line = DimStyle.Render("  " + m.spinner.View() + " " + label)
 	case progressActive:
-		return DimStyle.Render("  streaming…")
+		line = DimStyle.Render("  streaming…")
 	default:
-		return DimStyle.Render("  … processing …")
+		line = DimStyle.Render("  … processing …")
 	}
+	return padInputBand(line, m.textarea.Height())
+}
+
+// padInputBand ensures the input area occupies exactly height rows.
+func padInputBand(line string, height int) string {
+	if height < 1 {
+		height = 1
+	}
+	if height == 1 {
+		return line
+	}
+	return line + strings.Repeat("\n", height-1)
 }

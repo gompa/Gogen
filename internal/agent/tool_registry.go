@@ -348,17 +348,19 @@ func handleTodoAdd(_ context.Context, a *Agent, args map[string]interface{}) (st
 	if err != nil {
 		return "", err
 	}
-	if a.TodoManager == nil {
-		return "", fmt.Errorf("todo manager is not initialized")
+	tm, err := a.todo()
+	if err != nil {
+		return "", err
 	}
-	return a.TodoManager.AddTodo(text)
+	return tm.AddTodo(text)
 }
 
 func handleTodoList(_ context.Context, a *Agent, _ map[string]interface{}) (string, error) {
-	if a.TodoManager == nil {
-		return "", fmt.Errorf("todo manager is not initialized")
+	tm, err := a.todo()
+	if err != nil {
+		return "", err
 	}
-	return a.TodoManager.ListTodos(), nil
+	return tm.ListTodos(), nil
 }
 
 func handleTodoDone(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
@@ -366,10 +368,11 @@ func handleTodoDone(_ context.Context, a *Agent, args map[string]interface{}) (s
 	if err != nil || id == 0 {
 		return "", fmt.Errorf("missing required argument %q", "id")
 	}
-	if a.TodoManager == nil {
-		return "", fmt.Errorf("todo manager is not initialized")
+	tm, err := a.todo()
+	if err != nil {
+		return "", err
 	}
-	return a.TodoManager.DoneTodo(id)
+	return tm.DoneTodo(id)
 }
 
 func handleTodoRemove(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
@@ -377,17 +380,19 @@ func handleTodoRemove(_ context.Context, a *Agent, args map[string]interface{}) 
 	if err != nil || id == 0 {
 		return "", fmt.Errorf("missing required argument %q", "id")
 	}
-	if a.TodoManager == nil {
-		return "", fmt.Errorf("todo manager is not initialized")
+	tm, err := a.todo()
+	if err != nil {
+		return "", err
 	}
-	return a.TodoManager.RemoveTodo(id)
+	return tm.RemoveTodo(id)
 }
 
 func handleTodoClearDone(_ context.Context, a *Agent, _ map[string]interface{}) (string, error) {
-	if a.TodoManager == nil {
-		return "", fmt.Errorf("todo manager is not initialized")
+	tm, err := a.todo()
+	if err != nil {
+		return "", err
 	}
-	return a.TodoManager.ClearDoneTodos()
+	return tm.ClearDoneTodos()
 }
 
 func handleListDefinitions(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {

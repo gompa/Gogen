@@ -8,11 +8,12 @@ import (
 
 // SessionSnapshot is persisted conversation state.
 type SessionSnapshot struct {
-	WorkingDir string
-	Model      string
-	Mode       string
-	Label      string
-	Messages   []llm.Message
+	WorkingDir     string
+	Model          string
+	Mode           string
+	Label          string
+	ProjectProfile string
+	Messages       []llm.Message
 }
 
 // SessionPersister stores and loads agent sessions.
@@ -35,6 +36,9 @@ type SessionInfo struct {
 // RestoreSession loads messages, mode, and model from a snapshot.
 func (a *Agent) RestoreSession(ctx context.Context, snap SessionSnapshot) {
 	a.Messages = append([]llm.Message(nil), snap.Messages...)
+	if snap.ProjectProfile != "" {
+		a.projectProfile = snap.ProjectProfile
+	}
 	a.SessionLabel = snap.Label
 	if m, ok := ParseMode(snap.Mode); ok {
 		a.Mode = m

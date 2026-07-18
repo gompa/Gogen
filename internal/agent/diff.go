@@ -11,13 +11,6 @@ import (
 
 // ShowDiff returns a unified diff for the working tree using git when available.
 func (e *Executor) ShowDiff(ctx context.Context, path string, staged bool) (string, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if _, err := exec.LookPath("git"); err != nil {
-		return "", fmt.Errorf("git is not available on PATH; show_diff requires a git repository")
-	}
-
 	args := []string{"diff", "--no-color", "--no-ext-diff"}
 	if staged {
 		args = append(args, "--cached")
@@ -29,8 +22,10 @@ func (e *Executor) ShowDiff(ctx context.Context, path string, staged bool) (stri
 		args = append(args, "--", path)
 	}
 
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = e.WorkingDir
+	cmd, cmdErr := e.newGitCmd(ctx, args...)
+	if cmdErr != nil {
+		return "", cmdErr
+	}
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	if err != nil {

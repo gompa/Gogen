@@ -11,6 +11,9 @@ func (m *Model) renderStatusBar() string {
 	if m.width <= 0 {
 		return ""
 	}
+	if m.agent == nil {
+		return StatusBarStyle.Copy().Width(m.width).Render("")
+	}
 
 	var leftParts []string
 

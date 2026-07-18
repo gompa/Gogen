@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -103,6 +104,7 @@ func topLevelLayout(workingDir string) string {
 	if len(dirs) == 0 {
 		return ""
 	}
+	sort.Strings(dirs)
 	if len(dirs) > 12 {
 		dirs = dirs[:12]
 		dirs = append(dirs, "…")

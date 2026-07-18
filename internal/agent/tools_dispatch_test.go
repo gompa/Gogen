@@ -37,3 +37,10 @@ func TestShowDiffStagedBoolAccepted(t *testing.T) {
 		t.Fatalf("bool staged should be accepted, got: %v", err)
 	}
 }
+
+// TestToolsSync ensures every built-in tool definition has a matching handler and vice versa.
+func TestToolsSync(t *testing.T) {
+	if err := ValidateToolSync(); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 
+	"gogen/internal/debuglog"
+
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
 	"github.com/openai/openai-go/packages/param"
@@ -15,6 +17,8 @@ import (
 type OpenAIProvider struct {
 	client openai.Client
 	model  string
+	// promptCacheKey scopes provider-side prompt caching (defaults to none).
+	promptCacheKey param.Opt[string]
 }
 
 func (p *OpenAIProvider) ModelName() string {
@@ -42,6 +46,15 @@ func NewOpenAIProvider(apiKey string, model string, baseURL string) *OpenAIProvi
 		client: openai.NewClient(opts...),
 		model:  model,
 	}
+}
+
+// SetPromptCacheKey sets a stable key for provider-side prompt caching
+// (maps to the OpenAI prompt_cache_key parameter). An empty key disables.
+// Use a value derived from the working directory to keep cache hits
+// scoped per-project while avoiding cross-user leakage.
+func (p *OpenAIProvider) SetPromptCacheKey(key string) {
+	if key == "" { p.promptCacheKey = param.Opt[string]{}; return }
+	p.promptCacheKey = param.NewOpt(key)
 }
 
 func toolsToOpenAI(tools []Tool, allowed map[string]struct{}) []openai.ChatCompletionToolParam {
@@ -107,6 +120,26 @@ func toolCallArgumentsJSON(tc ToolCall) string {
 	if s := strings.TrimSpace(tc.ArgsStr); s != "" && json.Valid([]byte(s)) {
 		return tc.ArgsStr
 	}
+
+	// Falling back to re-marshaling breaks byte-level prompt-cache prefix
+	// stability. Log this so cache misses can be traced to a root cause.
+	if tc.ArgsStr != "" {
+		// ArgsStr was set but invalid JSON — indicates a provider bug or
+		// a message that was hand-constructed without preserving ArgsStr.
+		debuglog.Write("llm/tool_args", "toolCallArgumentsJSON: ArgsStr invalid, re-marshaling",
+			"", map[string]interface{}{
+				"name":    tc.Name,
+				"id":      tc.ID,
+				"argsStr": tc.ArgsStr,
+			})
+	} else if len(tc.Args) > 0 {
+		debuglog.Write("llm/tool_args", "toolCallArgumentsJSON: ArgsStr empty, re-marshaling from map",
+			"", map[string]interface{}{
+				"name": tc.Name,
+				"id":   tc.ID,
+			})
+	}
+
 	if tc.Args == nil {
 		return "{}"
 	}
@@ -119,11 +152,15 @@ func toolCallArgumentsJSON(tc ToolCall) string {
 
 func (p *OpenAIProvider) GenerateResponse(ctx context.Context, messages []Message, allowedTools map[string]struct{}, tools []Tool) (Response, error) {
 	chatMessages := p.messagesToChat(messages)
-	resp, err := p.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+	params := openai.ChatCompletionNewParams{
 		Messages: chatMessages,
 		Tools:    toolsToOpenAI(tools, allowedTools),
 		Model:    p.model,
-	})
+	}
+	if p.promptCacheKey.Valid() {
+		params.PromptCacheKey = p.promptCacheKey
+	}
+	resp, err := p.client.Chat.Completions.New(ctx, params)
 
 	if err != nil {
 		return Response{}, fmt.Errorf("openai api error: %w", err)
@@ -181,14 +218,18 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 	}
 
 	chatMessages := p.messagesToChat(messages)
-	stream := p.client.Chat.Completions.NewStreaming(ctx, openai.ChatCompletionNewParams{
+	params := openai.ChatCompletionNewParams{
 		Messages: chatMessages,
 		Tools:    toolsToOpenAI(tools, allowedTools),
 		Model:    p.model,
 		StreamOptions: openai.ChatCompletionStreamOptionsParam{
 			IncludeUsage: openai.Bool(true),
 		},
-	})
+	}
+	if p.promptCacheKey.Valid() {
+		params.PromptCacheKey = p.promptCacheKey
+	}
+	stream := p.client.Chat.Completions.NewStreaming(ctx, params)
 	defer stream.Close()
 
 	var fullContent string

@@ -17,7 +17,7 @@ GoGen is a self-hosted, terminal or web-based coding assistant that can explore,
 - **MCP Client** — Connect stdio MCP servers for extended tools (`mcp_<server>_<tool>`)
 - **Session Persistence** — Auto-save/resume conversations under `.gogen/sessions/` (set `GOGEN_SESSION_PERSIST=off` to disable)
 - **Project Rules** — Guidelines from project file body, or rules-only files (`.gogen/rules.md`, plain `GOGEN.md`)
-- **Two Modes** — Interactive CLI or web-based UI via WebSocket
+- **Two Modes** — Interactive TUI or web-based UI via WebSocket
 
 ## Supported Languages
 
@@ -51,16 +51,15 @@ CGO_ENABLED=0 go build -o gogen .
 
 ### Run
 
-**CLI / TUI mode** (Bubble Tea interactive terminal):
+**TUI mode** (Bubble Tea interactive terminal):
 
 ```bash
-OPENAI_API_KEY=sk-... ./gogen --cli
+OPENAI_API_KEY=sk-... ./gogen
 ```
 
-**Classic CLI** (line-oriented, no TUI):
-
+With a workspace directory:
 ```bash
-OPENAI_API_KEY=sk-... ./gogen --classic-cli
+OPENAI_API_KEY=sk-... ./gogen /path/to/project
 ```
 
 **Web mode** (browser UI on `:8080`):
@@ -80,8 +79,6 @@ GOGEN_WEB_TOKEN=secret ./gogen --web --host 0.0.0.0
 
 | Flag | Description |
 |------|-------------|
-| `--cli` | Run interactive TUI mode |
-| `--classic-cli` | Run classic line-oriented CLI |
 | `--web` | Run in web mode (listens on `:8080`) |
 | `--host <host>` | Listen host for `--web` (e.g. `0.0.0.0`; default `127.0.0.1`; also `GOGEN_WEB_BIND` for host:port) |
 | `--dir <path>` | Set the working directory |
@@ -91,9 +88,11 @@ GOGEN_WEB_TOKEN=secret ./gogen --web --host 0.0.0.0
 | `--save-config-secrets` | Include `openai_api_key` when using `--save-config` |
 | `--save-config-path <file>` | Output path for `--save-config` config file (default `.gogen/gogen.conf`) |
 
-### CLI commands
+The first positional argument is also treated as the working directory (overridden by `--dir`).
 
-While in `--cli` (TUI) or `--classic-cli`:
+### TUI commands
+
+While in the TUI:
 
 | Command | Description |
 |---------|-------------|
@@ -224,7 +223,7 @@ export GOGEN_WORKING_DIR=/path/to/your/project
 export GOGEN_COMMAND_SAFETY=blocklist
 export GOGEN_DELETE_APPROVAL=required
 
-./gogen --cli
+./gogen
 ```
 
 ## Architecture
@@ -236,7 +235,7 @@ main.go
     ├── projectfile/ — GOGEN.md front matter parse/merge/write
     ├── mcp/         — MCP stdio client and tool registry
     ├── session/     — Conversation persistence
-    ├── cli/         — Interactive terminal interface
+    ├── tui/         — Interactive terminal interface (Bubble Tea)
     ├── config/      — Environment-based configuration
     ├── contextmgr/  — Conversation context management and auto-compaction
     ├── llm/         — OpenAI API integration, model-aware token limits

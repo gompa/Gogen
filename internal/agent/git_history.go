@@ -18,12 +18,6 @@ const (
 
 // GitLog returns recent commit history, optionally scoped to a path.
 func (e *Executor) GitLog(ctx context.Context, path string, limit int) (string, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if _, err := exec.LookPath("git"); err != nil {
-		return "", fmt.Errorf("git is not available on PATH")
-	}
 	if limit <= 0 {
 		limit = gitLogDefaultLimit
 	}
@@ -39,8 +33,10 @@ func (e *Executor) GitLog(ctx context.Context, path string, limit int) (string, 
 		args = append(args, "--", path)
 	}
 
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = e.WorkingDir
+	cmd, cmdErr := e.newGitCmd(ctx, args...)
+	if cmdErr != nil {
+		return "", cmdErr
+	}
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	if err != nil {
@@ -64,14 +60,8 @@ func (e *Executor) GitLog(ctx context.Context, path string, limit int) (string, 
 
 // GitBlame returns line attribution for a file within an optional line range.
 func (e *Executor) GitBlame(ctx context.Context, path string, startLine, limit int) (string, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	if strings.TrimSpace(path) == "" {
 		return "", fmt.Errorf("path is required")
-	}
-	if _, err := exec.LookPath("git"); err != nil {
-		return "", fmt.Errorf("git is not available on PATH")
 	}
 	if _, err := e.securePath(path); err != nil {
 		return "", err
@@ -94,8 +84,10 @@ func (e *Executor) GitBlame(ctx context.Context, path string, startLine, limit i
 		"--", path,
 	}
 
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = e.WorkingDir
+	cmd, cmdErr := e.newGitCmd(ctx, args...)
+	if cmdErr != nil {
+		return "", cmdErr
+	}
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	if err != nil {

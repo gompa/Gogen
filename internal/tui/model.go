@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -76,13 +77,19 @@ type Model struct {
 
 	// Streaming accumulation
 	streamAssistantBuf  strings.Builder
+	streamAssistantLine int // chatLines index for the live assistant line (-1 if none)
 	streamThinkingBuf   strings.Builder
 	streamThinkingOpen  bool
+	streamThinkingLine  int               // chatLines index for the open thinking line (-1 if none)
 	streamToolCallNames map[int]string    // index -> name
 	streamToolCallArgs  map[int]string    // index -> accumulated args deltas
 	streamToolCallIDs   map[int]string    // index -> call ID (for correlating results)
+	streamToolCallLines map[int]int       // index -> chatLines index where the tool call line was added
 	toolCallDiffs       map[string]string // call ID -> diff text (for patch_file/show_diff)
 
+	streamToolDiffCount map[int]int     // index -> number of diff lines already rendered progressively
+	streamToolDiffStart map[int]int     // index -> chatLines index where the first diff line is (after top border)
+	toolDiffShown       map[string]bool // call ID -> true if diff was shown progressively (skip in result)
 	// Input history
 	inputHistory []string
 	historyIdx   int
@@ -174,10 +181,16 @@ func NewModel(a *agent.Agent, cfg *config.Config) Model {
 		spinner:             newProgressSpinner(),
 		progressPhase:       progressHidden,
 		chatLines:           make([]string, 0),
+		streamAssistantLine: -1,
+		streamThinkingLine:  -1,
 		streamToolCallNames: make(map[int]string),
 		streamToolCallArgs:  make(map[int]string),
 		streamToolCallIDs:   make(map[int]string),
+		streamToolCallLines: make(map[int]int),
 		toolCallDiffs:       make(map[string]string),
+		streamToolDiffCount: make(map[int]int),
+		streamToolDiffStart: make(map[int]int),
+		toolDiffShown:       make(map[string]bool),
 		keys:                DefaultKeyMap,
 		sessionID:           "",
 		approvalResult:      make(chan bool, 1),
@@ -257,10 +270,19 @@ func (m *Model) wrapLine(line string) []string {
 	wrapped := wordwrap.String(line, w)
 	wrapped = wrap.String(wrapped, w)
 	parts := strings.Split(wrapped, "\n")
+	// Strip trailing empty elements caused by a trailing newline.
+	// Without this, a trailing \n creates a blank visual line that
+	// flickers during streaming or persists in the final output.
+	for len(parts) > 1 && parts[len(parts)-1] == "" {
+		parts = parts[:len(parts)-1]
+	}
 	if len(parts) > 1 {
 		sgr := extractLeadingSGR(line)
 		if sgr != "" && !strings.Contains(parts[0], "\x1b[0m") {
 			for i := 1; i < len(parts); i++ {
+				if parts[i] == "" {
+					continue // skip SGR on empty continuation lines
+				}
 				parts[i] = sgr + parts[i] + "\x1b[0m"
 			}
 		}
@@ -452,11 +474,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case streamEndMsg:
 		// Always process – resets streaming state
 		m.handleStreamEnd()
-		return m, nil
+		return m, m.refocusInput()
 
 	case streamErrorMsg:
 		m.handleStreamError(msg.err)
-		return m, nil
+		return m, m.refocusInput()
 
 	case contextStatsMsg:
 		// Optional async refresh (session commands); stream end updates sync.
@@ -543,7 +565,8 @@ func (m Model) View() string {
 	if m.focus == FocusViewport {
 		indicator := " [SCROLL] Press i or Esc to return to input "
 		line := strings.Repeat("─", m.width)
-		divider = DividerStyle.Render(line[:max(0, m.width-len(indicator))] + indicator)
+		keep := max(0, m.width-len(indicator))
+		divider = DividerStyle.Render(sliceByRuneCount(line, keep) + indicator)
 	} else if m.streaming {
 		divider = DimStyle.Render(strings.Repeat("─", m.width))
 	} else {
@@ -639,61 +662,200 @@ func (m *Model) replaceLastLine(text string) {
 }
 
 func (m *Model) handleStreamToken(token string) {
-	// Close thinking block if open — finalize it properly
-	if m.streamThinkingOpen {
-		m.streamThinkingOpen = false
-		if m.streamThinkingBuf.Len() > 0 {
-			m.replaceLastLine(ThinkingTagStyle.Render("<thinking>" + m.streamThinkingBuf.String() + "</thinking>"))
-		} else {
-			m.replaceLastLine(ThinkingTagStyle.Render("<thinking></thinking>"))
-		}
-		m.streamThinkingBuf.Reset()
-	}
+	m.closeThinkingBlock()
 	if m.streamAssistantBuf.Len() == 0 {
 		label := AssistantStyle.Render(assistantLabel)
+		m.streamAssistantLine = len(m.chatLines)
 		m.appendChatLine(label + " ")
 	}
 	m.streamAssistantBuf.WriteString(token)
-	// Append just the delta token rather than rebuilding the full line from
-	// the buffer; avoids O(n²) String() copy for long responses.
-	m.appendToLastLine(token)
+	m.appendToStreamLine(m.streamAssistantLine, token)
 }
 
 func (m *Model) handleStreamThinking(token string) {
-	if !m.streamThinkingOpen {
-		m.streamThinkingOpen = true
-		m.appendChatLine(ThinkingTagStyle.Render("<thinking>"))
+	// Guard: if tool calls are already in progress, thinking tokens belong
+	// before them (OpenAI protocol ensures this ordering).  Silently ignore
+	// post-tool-call thinking to avoid placing it below tool call lines.
+	if len(m.streamToolCallNames) > 0 {
+		return
 	}
 	m.streamThinkingBuf.WriteString(token)
-	m.appendToLastLine(ThinkingStyle.Render(token))
+
+	if !m.streamThinkingOpen {
+		m.streamThinkingOpen = true
+		m.streamThinkingLine = len(m.chatLines)
+		m.appendChatLine(ThinkingTagStyle.Render("<thinking>"))
+	}
+
+	// Rebuild the thinking line cleanly from the accumulated buffer.  This
+	// avoids two problems with per-delta append+style: (1) interleaved
+	// \x1b[0m codes destabilise word-wrap (line height jumps when the block
+	// closes and normalises the styling), and (2) whitespace-only tokens
+	// that the batcher splits into standalone segments are silently dropped
+	// from the display by TrimSpace, only to re-appear after close.
+	// When the buffer ends with a newline, wrapLine splits it into an extra
+	// blank visual line that will flash away when the next token fills it in
+	// or when </thinking> replaces it on close.  Trim trailing newlines so
+	// the streaming display stays stable.
+	displayBuf := strings.TrimRight(m.streamThinkingBuf.String(), "\n")
+	m.replaceStreamLine(m.streamThinkingLine, ThinkingStyle.Render("<thinking>"+displayBuf))
+}
+
+// closeThinkingBlock finalizes an open thinking line in place (not necessarily
+// the last chat line — assistant text or tool calls may have been appended).
+func (m *Model) closeThinkingBlock() {
+	if !m.streamThinkingOpen {
+		return
+	}
+	m.streamThinkingOpen = false
+	var line string
+	if m.streamThinkingBuf.Len() > 0 {
+		line = ThinkingTagStyle.Render("<thinking>" + m.streamThinkingBuf.String() + "</thinking>")
+	} else {
+		line = ThinkingTagStyle.Render("<thinking></thinking>")
+	}
+	m.replaceStreamLine(m.streamThinkingLine, line)
+	m.streamThinkingBuf.Reset()
+	m.streamThinkingLine = -1
+	// Reset assistant state so content tokens arriving after this thinking
+	// block create a new line below it, preserving temporal order.
+	m.streamAssistantBuf.Reset()
+	m.streamAssistantLine = -1
+}
+
+// appendToStreamLine appends text to a tracked streaming line. When that line
+// is last, uses the cheap prefix rebuild; otherwise full rewrap.
+func (m *Model) appendToStreamLine(lineIdx int, text string) {
+	if lineIdx < 0 || lineIdx >= len(m.chatLines) {
+		m.appendToLastLine(text)
+		return
+	}
+	m.chatLines[lineIdx] += text
+	if lineIdx == len(m.chatLines)-1 {
+		m.buildFromPrefix()
+	} else {
+		m.setViewportContent()
+	}
+	m.viewport.GotoBottom()
+}
+
+func (m *Model) replaceStreamLine(lineIdx int, text string) {
+	if lineIdx < 0 || lineIdx >= len(m.chatLines) {
+		m.replaceLastLine(text)
+		return
+	}
+	m.chatLines[lineIdx] = text
+	if lineIdx == len(m.chatLines)-1 {
+		m.buildFromPrefix()
+	} else {
+		m.setViewportContent()
+	}
+	m.viewport.GotoBottom()
 }
 
 func (m *Model) handleStreamToolCall(index int, id string, name string) {
 	// Close thinking if open — finalize the block in chat
-	if m.streamThinkingOpen {
-		m.streamThinkingOpen = false
-		if m.streamThinkingBuf.Len() > 0 {
-			m.replaceLastLine(ThinkingTagStyle.Render("<thinking>" + m.streamThinkingBuf.String() + "</thinking>"))
-		}
-		m.streamThinkingBuf.Reset()
-	}
+	m.closeThinkingBlock()
 	// Close assistant buffer (text tokens before tool call are shown as-is in chat)
 	m.streamAssistantBuf.Reset()
+	m.streamAssistantLine = -1
 	m.streamToolCallNames[index] = name
 	m.streamToolCallArgs[index] = ""
 	m.streamToolCallIDs[index] = id
+	m.streamToolCallLines[index] = len(m.chatLines) // appendChatLine will add at this index
 	prefix := ToolCallStyle.Render("  →")
-	m.appendChatLine(prefix + " " + name + " ")
+	m.appendChatLine(prefix + " " + name)
 }
 
 func (m *Model) handleStreamToolArgs(index int, id string, delta string) {
-	_, ok := m.streamToolCallNames[index]
-	if !ok {
+	lineIdx, ok := m.streamToolCallLines[index]
+	if !ok || lineIdx < 0 || lineIdx >= len(m.chatLines) {
 		return
 	}
 	m.streamToolCallArgs[index] += delta
-	// Append just the styled delta — avoid rebuilding the full line per token.
-	m.appendToLastLine(ToolCallArgsStyle.Render(delta))
+	raw := m.streamToolCallArgs[index]
+
+	// For patch_file: progressively render diff content as it streams in.
+	// This avoids a jarring "pop-up" of the entire diff block in the result.
+	if m.streamToolCallNames[index] == "patch_file" {
+		if diff, ok := extractDiffValue(raw); ok && diff != "" {
+			rendered := renderDiff(diff)
+			renderedLines := strings.Split(rendered, "\n")
+			prevCount := m.streamToolDiffCount[index]
+			newCount := len(renderedLines)
+
+			// First time we're showing diff lines: add the top border
+			if prevCount == 0 {
+				m.chatLines = append(m.chatLines, DiffMetaStyle.Render("  ╭─ diff ─"))
+				m.streamToolDiffStart[index] = len(m.chatLines)
+			}
+
+			diffStart := m.streamToolDiffStart[index]
+			// Update existing diff lines (content may have grown within a line)
+			for i := 0; i < prevCount && i < newCount; i++ {
+				m.chatLines[diffStart+i] = "  "+renderedLines[i]
+			}
+			// Append new diff lines
+			for i := prevCount; i < newCount; i++ {
+				m.chatLines = append(m.chatLines, "  "+renderedLines[i])
+			}
+			m.streamToolDiffCount[index] = newCount
+
+			if lineIdx == len(m.chatLines)-1 {
+				m.buildFromPrefix()
+			} else {
+				m.setViewportContent()
+			}
+			m.viewport.GotoBottom()
+		}
+		// Don't try to parse JSON for the args line; diff values are huge and
+		// formatToolArgs would just truncate them. Show a clean compact line.
+		prefix := ToolCallStyle.Render("  →")
+		shortArgs := formatArgsCompact(raw, 120)
+		toolName := m.streamToolCallNames[index]
+		if shortArgs == "" {
+			m.chatLines[lineIdx] = prefix + " " + toolName
+		} else {
+			m.chatLines[lineIdx] = prefix + " " + toolName + " " + ToolCallArgsStyle.Render(shortArgs)
+		}
+		if lineIdx == len(m.chatLines)-1 {
+			m.buildFromPrefix()
+		}
+		m.viewport.GotoBottom()
+		return
+	}
+
+	// Only show args once JSON is fully parseable.  Raw / truncated JSON
+	// varies in length enough to cause the line to re-wrap and make
+	// content below jump when handleStreamToolCallFinal normalises it.
+	args, parseErr := parseInlineJSONArgs(raw)
+	if parseErr != nil {
+		return
+	}
+
+	// Format the same way handleStreamToolCallFinal does, so the line is
+	// already in its final form when that fires.  This eliminates the jump
+	// entirely for multi-key args and only leaves the minimal name→name+args
+	// transition for tools whose last arg key completes the JSON.
+	if len(args) == 0 {
+		return
+	}
+	argStr := formatToolArgs(args)
+
+	// Rebuild the line cleanly from the accumulated buffer so there is a
+	// single contiguous SGR wrapper.  Per-delta styling produces interleaved
+	// \x1b[0m sequences that destabilise word-wrap, causing the line height
+	// to jump when handleStreamToolCallFinal normalises the styling.
+	name := m.streamToolCallNames[index]
+	prefix := ToolCallStyle.Render("  →")
+	m.chatLines[lineIdx] = prefix + " " + name + " " + ToolCallArgsStyle.Render(argStr)
+
+	if lineIdx == len(m.chatLines)-1 {
+		m.buildFromPrefix()
+	} else {
+		m.setViewportContent()
+	}
+	m.viewport.GotoBottom()
 }
 
 // handleStreamToolCallFinal replaces the streaming tool call line with the final
@@ -703,22 +865,58 @@ func (m *Model) handleStreamToolCallFinal(index int, tc llm.ToolCall) {
 	if !ok {
 		return
 	}
+	lineIdx, ok := m.streamToolCallLines[index]
+	if !ok || lineIdx < 0 || lineIdx >= len(m.chatLines) {
+		return
+	}
 	prefix := ToolCallStyle.Render("  →")
 	argStr := formatToolArgs(tc.Args)
 	if argStr == "" {
-		m.replaceLastLine(prefix + " " + name)
+		m.chatLines[lineIdx] = prefix + " " + name
 	} else {
-		m.replaceLastLine(prefix + " " + name + " " + ToolCallArgsStyle.Render(argStr))
+		m.chatLines[lineIdx] = prefix + " " + name + " " + ToolCallArgsStyle.Render(argStr)
 	}
-	// Capture diff content for patch_file calls so we can render it colored in the result
+	if lineIdx == len(m.chatLines)-1 {
+		m.buildFromPrefix()
+	} else {
+		m.setViewportContent()
+	}
+	m.viewport.GotoBottom()
+
+	// Capture diff content for patch_file calls so we can render it in the result
+	// (fallback if progressive rendering didn't cover the full diff).
 	if tc.Name == "patch_file" {
 		if diff, ok := tc.Args["diff"].(string); ok && diff != "" {
 			m.toolCallDiffs[tc.ID] = diff
+			// If we already rendered diff lines progressively, close the border
+			// and mark so the result handler skips the block render.
+			if m.streamToolDiffCount[index] > 0 {
+				m.chatLines = append(m.chatLines, DiffMetaStyle.Render("  ╰───────"))
+				m.buildFromPrefix()
+				m.viewport.GotoBottom()
+				m.toolDiffShown[tc.ID] = true
+			}
 		}
 	}
 }
 
+// parseInlineJSONArgs attempts to parse incomplete streaming JSON args.
+// Returns the parsed map on success; nil+error when JSON is not yet complete.
+func parseInlineJSONArgs(raw string) (map[string]interface{}, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" || !strings.HasPrefix(s, "{") {
+		return nil, fmt.Errorf("incomplete")
+	}
+	var args map[string]interface{}
+	err := json.Unmarshal([]byte(s), &args)
+	return args, err
+}
+
 func (m *Model) handleStreamToolResult(id string, name string, result string, success bool) {
+	// Collect all new lines first, then append in a batch so the viewport
+	// rebuilds once instead of on every appendChatLine call.
+	var newLines []string
+
 	status := "ok"
 	statusStyle := ToolResultOKStyle
 	if !success {
@@ -726,71 +924,123 @@ func (m *Model) handleStreamToolResult(id string, name string, result string, su
 		statusStyle = ToolResultFailStyle
 	}
 	mark := ToolResultMarkStyle.Render("  ↳")
-	m.appendChatLine(fmt.Sprintf("%s %s  %s", mark, name, statusStyle.Render(status)))
+	newLines = append(newLines, fmt.Sprintf("%s %s  %s", mark, name, statusStyle.Render(status)))
 
 	// For patch_file: render the original diff with colors
+	showDiffResult := name == "show_diff" && isDiffContent(result)
 	if name == "patch_file" {
-		if diff, ok := m.toolCallDiffs[id]; ok && diff != "" {
-			m.appendChatLine(DiffMetaStyle.Render("  ╭─ diff ─"))
-			for _, line := range strings.Split(renderDiff(diff), "\n") {
-				m.appendChatLine(line)
+		// If diff was already shown progressively during arg streaming,
+		// skip the full block render.
+		if m.toolDiffShown[id] {
+			// Summary only — border was already closed in handleStreamToolCallFinal
+			if m.verbose {
+				for _, line := range strings.Split(result, "\n") {
+					newLines = append(newLines, ToolResultBodyStyle.Render("  │ "+line))
+				}
+			} else {
+				summary := summarizeResult(result, success)
+				newLines = append(newLines, DimStyle.Render(fmt.Sprintf("  %s", summary)))
 			}
-			m.appendChatLine(DiffMetaStyle.Render("  ╰───────"))
+		} else if diff, ok := m.toolCallDiffs[id]; ok && diff != "" {
+			rendered := renderDiff(diff)
+			if rendered != "" {
+				newLines = append(newLines, DiffMetaStyle.Render("  ╭─ diff ─"))
+				for _, line := range strings.Split(rendered, "\n") {
+					newLines = append(newLines, line)
+				}
+				newLines = append(newLines, DiffMetaStyle.Render("  ╰───────"))
+			}
 		}
-	}
-
-	// For show_diff: render the result as a colored diff if it looks like one
-	if name == "show_diff" && isDiffContent(result) {
-		m.appendChatLine(DiffMetaStyle.Render("  ╭─ diff ─"))
-		for _, line := range strings.Split(renderDiff(result), "\n") {
-			m.appendChatLine(line)
+	} else if showDiffResult {
+		rendered := renderDiff(result)
+		if rendered != "" {
+			newLines = append(newLines, DiffMetaStyle.Render("  ╭─ diff ─"))
+			for _, line := range strings.Split(rendered, "\n") {
+				newLines = append(newLines, line)
+			}
+			newLines = append(newLines, DiffMetaStyle.Render("  ╰───────"))
 		}
-		m.appendChatLine(DiffMetaStyle.Render("  ╰───────"))
-		return
-	}
-
-	// Standard output: verbose shows body, compact shows summary
-	if m.verbose {
+	} else if m.verbose {
 		for _, line := range strings.Split(result, "\n") {
-			m.appendChatLine(ToolResultBodyStyle.Render("  │ " + line))
+			newLines = append(newLines, ToolResultBodyStyle.Render("  │ "+line))
 		}
 	} else {
 		summary := summarizeResult(result, success)
-		m.appendChatLine(DimStyle.Render(fmt.Sprintf("  %s", summary)))
+		newLines = append(newLines, DimStyle.Render(fmt.Sprintf("  %s", summary)))
 	}
+
+	// If this already came from a diff path, stop — don't double-append.
+	if showDiffResult {
+		m.appendChatLines(newLines)
+		return
+	}
+
+	m.appendChatLines(newLines)
+}
+
+// appendChatLines adds multiple lines to chat and rebuilds the viewport once.
+func (m *Model) appendChatLines(lines []string) {
+	if len(lines) == 0 {
+		return
+	}
+	for _, line := range lines {
+		if len(m.chatLines) > 0 {
+			parts := m.wrapLine(m.chatLines[len(m.chatLines)-1])
+			if m.wrappedPrefix == "" {
+				m.wrappedPrefix = strings.Join(parts, "\n")
+			} else {
+				m.wrappedPrefix += "\n" + strings.Join(parts, "\n")
+			}
+			m.wrappedPrefix += "\n"
+		}
+		m.chatLines = append(m.chatLines, line)
+	}
+	m.buildFromPrefix()
+	m.viewport.GotoBottom()
 }
 
 func (m *Model) handleStreamStart() {
 	m.streamAssistantBuf.Reset()
+	m.streamAssistantLine = -1
 	m.streamThinkingBuf.Reset()
 	m.streamThinkingOpen = false
+	m.streamThinkingLine = -1
 	m.streamToolCallNames = make(map[int]string)
 	m.streamToolCallArgs = make(map[int]string)
 	m.streamToolCallIDs = make(map[int]string)
+	m.streamToolCallLines = make(map[int]int)
 	m.toolCallDiffs = make(map[string]string)
+	m.streamToolDiffCount = make(map[int]int)
+	m.streamToolDiffStart = make(map[int]int)
+	m.toolDiffShown = make(map[string]bool)
 }
 
 func (m *Model) handleStreamRoundStart() {
 	m.streamAssistantBuf.Reset()
+	m.streamAssistantLine = -1
 	m.streamThinkingBuf.Reset()
 	m.streamThinkingOpen = false
+	m.streamThinkingLine = -1
 	m.streamToolCallNames = make(map[int]string)
 	m.streamToolCallArgs = make(map[int]string)
 	m.streamToolCallIDs = make(map[int]string)
+	m.streamToolCallLines = make(map[int]int)
 	m.toolCallDiffs = make(map[string]string)
+	m.streamToolDiffCount = make(map[int]int)
+	m.streamToolDiffStart = make(map[int]int)
+	// Keep toolDiffShown across rounds — each diff is shown once per turn
 }
 
 func (m *Model) handleStreamRoundEnd() {
-	if m.streamThinkingOpen {
-		m.streamThinkingOpen = false
-		if m.streamThinkingBuf.Len() > 0 {
-			m.replaceLastLine(ThinkingTagStyle.Render("<thinking>" + m.streamThinkingBuf.String() + "</thinking>"))
-		} else if len(m.chatLines) > 0 {
-			m.replaceLastLine(ThinkingTagStyle.Render("<thinking></thinking>"))
-		}
+	// Trim trailing newlines from the assistant content line before
+	// finalizing the round, so intermediate display doesn't have trailing
+	// blank lines.
+	if m.streamAssistantLine >= 0 && m.streamAssistantLine < len(m.chatLines) {
+		m.chatLines[m.streamAssistantLine] = strings.TrimRight(m.chatLines[m.streamAssistantLine], "\n")
 	}
-	m.streamThinkingBuf.Reset()
+	m.closeThinkingBlock()
 	m.streamAssistantBuf.Reset()
+	m.streamAssistantLine = -1
 	// Keep streamToolCallNames / toolCallDiffs until OnRoundStart or turn end so
 	// OnToolCall finals and patch diffs still resolve after OnStreamEnd.
 
@@ -799,6 +1049,13 @@ func (m *Model) handleStreamRoundEnd() {
 }
 
 func (m *Model) handleStreamEnd() {
+	// Trim trailing newlines from the assistant content line before
+	// finalizing, so the display doesn't end with a blank line.
+	if m.streamAssistantLine >= 0 && m.streamAssistantLine < len(m.chatLines) {
+		m.chatLines[m.streamAssistantLine] = strings.TrimRight(m.chatLines[m.streamAssistantLine], "\n")
+	}
+	m.closeThinkingBlock()
+	m.dismissApproval(false)
 	m.streaming = false
 	m.clearProgress()
 	// ContextStats is read-only and local (no provider I/O) — safe on the
@@ -811,6 +1068,15 @@ func (m *Model) handleStreamEnd() {
 	}
 	m.setViewportContent()
 	m.viewport.GotoBottom()
+}
+
+// refocusInput restarts the textarea cursor blink after streaming (blink ticks
+// are ignored while streaming==true, so the blink loop must be restarted).
+func (m *Model) refocusInput() tea.Cmd {
+	if m.focus != FocusInput || m.modal != ModalNone {
+		return nil
+	}
+	return m.textarea.Focus()
 }
 
 // refreshContextStats updates the status-bar context indicator immediately.
@@ -846,17 +1112,26 @@ func (m *Model) requestContextStats() tea.Cmd {
 	}
 }
 
+
+
 func (m *Model) handleStreamError(err error) {
 	wasStreaming := m.streaming
 	m.streaming = false
+	m.dismissApproval(false)
 	m.clearProgress()
 	m.streamAssistantBuf.Reset()
+	m.streamAssistantLine = -1
 	m.streamThinkingBuf.Reset()
 	m.streamThinkingOpen = false
+	m.streamThinkingLine = -1
 	m.streamToolCallNames = make(map[int]string)
 	m.streamToolCallArgs = make(map[int]string)
 	m.streamToolCallIDs = make(map[int]string)
+	m.streamToolCallLines = make(map[int]int)
 	m.toolCallDiffs = make(map[string]string)
+	m.streamToolDiffCount = make(map[int]int)
+	m.streamToolDiffStart = make(map[int]int)
+	m.toolDiffShown = make(map[string]bool)
 	m.refreshContextStats()
 	if m.agent != nil {
 		if persistErr := m.agent.ConsumePersistError(); persistErr != nil {
@@ -871,6 +1146,19 @@ func (m *Model) handleStreamError(err error) {
 		return
 	}
 	m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Error: %v", err)))
+}
+
+// sliceByRuneCount returns the prefix of s containing at most n runes.
+// Uses rune-counting so it does not split multi-byte UTF-8 characters.
+func sliceByRuneCount(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if n >= len(runes) {
+		return s
+	}
+	return string(runes[:n])
 }
 
 func summarizeResult(result string, success bool) string {

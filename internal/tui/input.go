@@ -33,11 +33,20 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.streamCancel()
 			}
 			m.streamAssistantBuf.Reset()
+			m.streamAssistantLine = -1
 			m.streamThinkingBuf.Reset()
 			m.streamThinkingOpen = false
+			m.streamThinkingLine = -1
 			m.streamToolCallNames = make(map[int]string)
+			m.streamToolCallArgs = make(map[int]string)
+			m.streamToolCallIDs = make(map[int]string)
+			m.streamToolCallLines = make(map[int]int)
+			m.toolCallDiffs = make(map[string]string)
+			m.streamToolDiffCount = make(map[int]int)
+			m.streamToolDiffStart = make(map[int]int)
+			m.toolDiffShown = make(map[string]bool)
 			m.appendChatLine(SystemStyle.Render("Cancelled."))
-			return m, nil
+			return m, m.refocusInput()
 		}
 		m.quitting = true
 		return m, tea.Quit
@@ -187,10 +196,20 @@ func (m *Model) handleViewportKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.streamCancel()
 			}
 			m.streamAssistantBuf.Reset()
+			m.streamAssistantLine = -1
 			m.streamThinkingBuf.Reset()
 			m.streamThinkingOpen = false
+			m.streamThinkingLine = -1
 			m.streamToolCallNames = make(map[int]string)
+			m.streamToolCallArgs = make(map[int]string)
+			m.streamToolCallIDs = make(map[int]string)
+			m.streamToolCallLines = make(map[int]int)
+			m.toolCallDiffs = make(map[string]string)
+			m.streamToolDiffCount = make(map[int]int)
+			m.streamToolDiffStart = make(map[int]int)
+			m.toolDiffShown = make(map[string]bool)
 			m.appendChatLine(SystemStyle.Render("Cancelled."))
+			// Stay on viewport focus; blink restarts when returning to input.
 			return m, nil
 		}
 		m.quitting = true
@@ -214,9 +233,10 @@ func (m *Model) handleViewportKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		r := msg.Runes[0]
 		if r >= 32 && r < 127 {
 			m.focus = FocusInput
-			m.textarea.Focus()
-			m.textarea, _ = m.textarea.Update(msg)
-			return m, nil
+			focusCmd := m.textarea.Focus()
+			var updateCmd tea.Cmd
+			m.textarea, updateCmd = m.textarea.Update(msg)
+			return m, tea.Batch(focusCmd, updateCmd)
 		}
 	}
 
@@ -256,7 +276,3 @@ func (m *Model) handleViewportKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func isWordRune(r rune) bool {
-	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
-		(r >= '0' && r <= '9') || r == '_'
-}

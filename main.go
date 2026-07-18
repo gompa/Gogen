@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"os"
 	"os/signal"
@@ -13,7 +16,6 @@ import (
 	"time"
 
 	"gogen/internal/agent"
-	"gogen/internal/cli"
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/debuglog"
@@ -27,8 +29,6 @@ import (
 )
 
 func main() {
-	cliFlag := flag.Bool("cli", false, "Run interactive TUI mode")
-	classicCLIFlag := flag.Bool("classic-cli", false, "Run classic line-oriented CLI (no TUI)")
 	webFlag := flag.Bool("web", false, "Run in Web mode")
 	hostFlag := flag.String("host", "", "Listen host for --web (e.g. 0.0.0.0, default 127.0.0.1)")
 	verboseFlag := flag.Bool("verbose", false, "Show full tool output in CLI mode")
@@ -43,6 +43,11 @@ func main() {
 	workingDir := "."
 	if *dirFlag != "" {
 		workingDir = *dirFlag
+	} else if args := flag.Args(); len(args) > 0 {
+		workingDir = args[0]
+		if len(args) > 1 {
+			log.Fatal("Only one positional argument (working directory) is accepted")
+		}
 	}
 	absWD, err := filepath.Abs(workingDir)
 	if err != nil {
@@ -93,23 +98,6 @@ func main() {
 		return
 	}
 
-	modes := 0
-	if *cliFlag {
-		modes++
-	}
-	if *classicCLIFlag {
-		modes++
-	}
-	if *webFlag {
-		modes++
-	}
-	if modes > 1 {
-		log.Fatal("Please specify only one of --cli, --classic-cli, or --web")
-	}
-	if modes == 0 {
-		log.Fatal("Please specify --cli, --classic-cli, or --web (or --save-config)")
-	}
-
 	if cfg.OpenAIKey == "" {
 		log.Fatal("OPENAI_API_KEY environment variable is not set")
 	}
@@ -117,6 +105,11 @@ func main() {
 	applyRuntimeConfig(cfg)
 
 	provider := llm.NewOpenAIProvider(cfg.OpenAIKey, cfg.OpenAIModel, cfg.OpenAIURL)
+
+	// Derive a stable prompt-cache key from the working directory so
+	// provider-side prefix caches survive sequential requests.
+	promptKey := projectPromptCacheKey(cfg.WorkingDir)
+	provider.SetPromptCacheKey(promptKey)
 
 	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{
 		ContextLimit:         cfg.ContextLimit,
@@ -196,13 +189,11 @@ func main() {
 		if err := s.Start(addr); err != nil {
 			log.Fatal(err)
 		}
-	} else if *classicCLIFlag {
-		c := cli.NewCLI(a, cfg)
-		c.Run(ctx)
-	} else if *cliFlag {
-		c := tui.New(a, cfg)
-		c.Run(ctx)
+		return
 	}
+	// Default: TUI mode.
+	c := tui.New(a, cfg)
+	c.Run(ctx)
 }
 
 func applyRuntimeConfig(cfg *config.Config) {
@@ -213,4 +204,15 @@ func applyRuntimeConfig(cfg *config.Config) {
 	if cfg.DebugLog != "" || cfg.DebugSession != "" {
 		debuglog.Configure(cfg.DebugLog, cfg.DebugSession)
 	}
+}
+
+// projectPromptCacheKey returns a stable, short hash of the working directory
+// for use as an OpenAI prompt_cache_key. This keeps provider-side cache hits
+// scoped per-project without leaking paths.
+func projectPromptCacheKey(workingDir string) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(workingDir))
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], h.Sum64())
+	return hex.EncodeToString(b[:])
 }

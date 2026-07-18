@@ -148,21 +148,10 @@ func formatTokenCount(n int) string {
 	if n < 1000 {
 		return fmt.Sprintf("%d", n)
 	}
-	if n < 10000 {
-		whole := n / 1000
-		frac := (n % 1000) / 100
-		if frac == 0 {
-			return fmt.Sprintf("%dk", whole)
-		}
-		return fmt.Sprintf("%d.%dk", whole, frac)
+	whole := n / 1000
+	frac := (n % 1000) / 100
+	if frac == 0 {
+		return fmt.Sprintf("%dk", whole)
 	}
-	if n < 1000000 {
-		whole := n / 1000
-		frac := (n % 1000) / 100
-		if frac == 0 {
-			return fmt.Sprintf("%dk", whole)
-		}
-		return fmt.Sprintf("%d.%dk", whole, frac)
-	}
-	return fmt.Sprintf("%d", n)
+	return fmt.Sprintf("%d.%dk", whole, frac)
 }

@@ -3,12 +3,10 @@ package tui
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
 	"gogen/internal/agent"
-	"gogen/internal/projectfile"
 	"gogen/internal/session"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -121,7 +119,7 @@ func (m *Model) dispatchCommand(input string) (bool, bool, tea.Cmd) {
 	if strings.HasPrefix(trimmed, "dir ") {
 		newDir := strings.TrimSpace(strings.TrimPrefix(trimmed, "dir "))
 		absDir, err := filepath.Abs(newDir)
-		if err != nil || !dirExists(absDir) {
+		if err != nil || !agent.DirExists(absDir) {
 			m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Error: directory does not exist: %s", newDir)))
 		} else {
 			m.agent.SetWorkingDir(absDir)
@@ -134,28 +132,14 @@ func (m *Model) dispatchCommand(input string) (bool, bool, tea.Cmd) {
 }
 
 func (m *Model) saveConfig(includeSecrets bool) error {
-	if m.cfg == nil {
-		return fmt.Errorf("config not available")
-	}
-	effective := *m.cfg
-	effective.OpenAIModel = m.agent.CurrentModel()
-	cfgPath := projectfile.DefaultSavePath(m.agent.WorkingDir)
-	guidelinesPath := projectfile.DefaultGuidelinesSavePath(m.agent.WorkingDir)
-	if err := projectfile.SaveConfig(cfgPath, guidelinesPath, &effective, m.agent.ProjectGuidelines, projectfile.WriteOptions{IncludeSecrets: includeSecrets}); err != nil {
+	cfgPath, guidelinesPath, err := m.agent.SaveConfig(m.cfg, includeSecrets)
+	if err != nil {
 		return err
 	}
 	m.appendChatLine(SystemStyle.Render(fmt.Sprintf("Wrote config to %s", cfgPath)))
 	m.appendChatLine(SystemStyle.Render(fmt.Sprintf("Wrote guidelines to %s", guidelinesPath)))
 	m.appendChatLine(SystemStyle.Render("Note: environment variables still override file values at runtime."))
 	return nil
-}
-
-func dirExists(path string) bool {
-	info, err := os.Stat(path)
-	if err != nil {
-		return false
-	}
-	return info.IsDir()
 }
 
 // submitUserInput sends user input to the agent for processing.
@@ -177,12 +161,18 @@ func (m *Model) submitUserInput(input string) tea.Cmd {
 	// Start streaming
 	m.streaming = true
 	m.streamAssistantBuf.Reset()
+	m.streamAssistantLine = -1
 	m.streamThinkingBuf.Reset()
 	m.streamThinkingOpen = false
+	m.streamThinkingLine = -1
 	m.streamToolCallNames = make(map[int]string)
 	m.streamToolCallArgs = make(map[int]string)
 	m.streamToolCallIDs = make(map[int]string)
+	m.streamToolCallLines = make(map[int]int)
 	m.toolCallDiffs = make(map[string]string)
+	m.streamToolDiffCount = make(map[int]int)
+	m.streamToolDiffStart = make(map[int]int)
+	m.toolDiffShown = make(map[string]bool)
 	startProgress := m.setProgress(progressThinking, "thinking")
 
 	// Create cancelable context for the LLM call

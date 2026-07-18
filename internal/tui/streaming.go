@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"strings"
 	"sync"
 	"time"
 
@@ -76,15 +75,25 @@ type StreamAdapter struct {
 	program *tea.Program
 }
 
+// tokenSeg is one coalesced run of either content or thinking tokens.
+// Adjacent tokens of the same kind are merged; kind switches preserve order.
+type tokenSeg struct {
+	think bool
+	text  string
+}
+
 // tokenBatcher coalesces stream/thinking tokens so the Bubble Tea channel
 // is not flooded with one message per token. Flushes at 32ms intervals.
 // All fields are guarded by mu because AfterFunc runs flush off the stream goroutine.
+//
+// Segments are flushed in arrival order. Flushing all content before all
+// thinking (or the reverse) would reverse interleaved batches and make
+// <thinking> tags appear mid-sentence or as tiny one-word blocks.
 type tokenBatcher struct {
-	mu     sync.Mutex
-	send   func(tea.Msg)
-	stream strings.Builder
-	think  strings.Builder
-	timer  *time.Timer
+	mu    sync.Mutex
+	send  func(tea.Msg)
+	segs  []tokenSeg
+	timer *time.Timer
 }
 
 func (b *tokenBatcher) scheduleFlushLocked() {
@@ -100,32 +109,46 @@ func (b *tokenBatcher) flush() {
 }
 
 func (b *tokenBatcher) flushLocked() {
-	if s := b.stream.String(); s != "" {
-		b.send(streamTokenMsg{token: s})
-		b.stream.Reset()
+	for _, seg := range b.segs {
+		if seg.text == "" {
+			continue
+		}
+		if seg.think {
+			b.send(streamThinkingMsg{token: seg.text})
+		} else {
+			b.send(streamTokenMsg{token: seg.text})
+		}
 	}
-	if s := b.think.String(); s != "" {
-		b.send(streamThinkingMsg{token: s})
-		b.think.Reset()
-	}
+	b.segs = b.segs[:0]
 	if b.timer != nil {
 		b.timer.Stop()
 		b.timer = nil
 	}
 }
 
+func (b *tokenBatcher) appendLocked(think bool, token string) {
+	if token == "" {
+		return
+	}
+	n := len(b.segs)
+	if n > 0 && b.segs[n-1].think == think {
+		b.segs[n-1].text += token
+	} else {
+		b.segs = append(b.segs, tokenSeg{think: think, text: token})
+	}
+	b.scheduleFlushLocked()
+}
+
 func (b *tokenBatcher) streamToken(token string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.stream.WriteString(token)
-	b.scheduleFlushLocked()
+	b.appendLocked(false, token)
 }
 
 func (b *tokenBatcher) thinkToken(token string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.think.WriteString(token)
-	b.scheduleFlushLocked()
+	b.appendLocked(true, token)
 }
 
 // NewStreamAdapter creates a new StreamAdapter.

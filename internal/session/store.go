@@ -17,15 +17,16 @@ import (
 const version = 1
 
 type file struct {
-	Version    int           `json:"version"`
-	ID         string        `json:"id"`
-	Created    time.Time     `json:"created"`
-	Updated    time.Time     `json:"updated"`
-	WorkingDir string        `json:"workingDir"`
-	Model      string        `json:"model"`
-	Mode       string        `json:"mode"`
-	Label      string        `json:"label,omitempty"`
-	Messages   []llm.Message `json:"messages"`
+	Version        int           `json:"version"`
+	ID             string        `json:"id"`
+	Created        time.Time     `json:"created"`
+	Updated        time.Time     `json:"updated"`
+	WorkingDir     string        `json:"workingDir"`
+	Model          string        `json:"model"`
+	Mode           string        `json:"mode"`
+	Label          string        `json:"label,omitempty"`
+	ProjectProfile string        `json:"projectProfile,omitempty"`
+	Messages       []llm.Message `json:"messages"`
 }
 
 // Store persists sessions under .gogen/sessions/.
@@ -88,15 +89,16 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 		_ = json.Unmarshal(data, &existing)
 	}
 	out := file{
-		Version:    version,
-		ID:         id,
-		Created:    existing.Created,
-		Updated:    time.Now().UTC(),
-		WorkingDir: snap.WorkingDir,
-		Model:      snap.Model,
-		Mode:       snap.Mode,
-		Label:      snap.Label,
-		Messages:   snap.Messages,
+		Version:        version,
+		ID:             id,
+		Created:        existing.Created,
+		Updated:        time.Now().UTC(),
+		WorkingDir:     snap.WorkingDir,
+		Model:          snap.Model,
+		Mode:           snap.Mode,
+		Label:          snap.Label,
+		ProjectProfile: snap.ProjectProfile,
+		Messages:       snap.Messages,
 	}
 	data, err := json.MarshalIndent(out, "", "  ")
 	if err != nil {
@@ -130,11 +132,12 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 		return agent.SessionSnapshot{}, err
 	}
 	return agent.SessionSnapshot{
-		WorkingDir: f.WorkingDir,
-		Model:      f.Model,
-		Mode:       f.Mode,
-		Label:      f.Label,
-		Messages:   f.Messages,
+		WorkingDir:     f.WorkingDir,
+		Model:          f.Model,
+		Mode:           f.Mode,
+		Label:          f.Label,
+		ProjectProfile: f.ProjectProfile,
+		Messages:       f.Messages,
 	}, nil
 }
 

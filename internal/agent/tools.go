@@ -1,6 +1,16 @@
 package agent
 
-import "gogen/internal/llm"
+import (
+	"fmt"
+
+	"gogen/internal/llm"
+)
+
+// ToolDef pairs a tool definition with its handler. See ValidateToolSync.
+type ToolDef struct {
+	Definition llm.Tool
+	Handler    ToolHandler
+}
 
 // BuiltinTools returns built-in tool definitions for the LLM.
 func BuiltinTools() []llm.Tool {
@@ -467,4 +477,29 @@ func BuiltinTools() []llm.Tool {
 			},
 		},
 	}
+}
+
+// ValidateToolSync checks that BuiltinTools and BuiltinToolHandlers agree
+// on every tool name. Call this from unit tests to catch drift.
+func ValidateToolSync() error {
+	defs := BuiltinTools()
+	handlers := BuiltinToolHandlers()
+	for _, d := range defs {
+		if _, ok := handlers[d.Name]; !ok {
+			return fmt.Errorf("tool %q has definition but no handler", d.Name)
+		}
+	}
+	for name := range handlers {
+		found := false
+		for _, d := range defs {
+			if d.Name == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("tool %q has handler but no definition", name)
+		}
+	}
+	return nil
 }

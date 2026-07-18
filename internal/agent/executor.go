@@ -229,28 +229,26 @@ func (e *Executor) ReadFileRange(path string, offset, limit int, search string) 
 	return body, nil
 }
 
-func formatByteSize(n int64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
-	}
-	div, exp := int64(unit), 0
-	for v := n / unit; v >= unit && exp < len("KMGTPE")-1; v /= unit {
-		if div > (1<<63-1)/unit {
-			break
-		}
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
-}
-
 func (e *Executor) WriteFile(path string, content string) error {
 	secure, err := e.securePath(path)
 	if err != nil {
 		return err
 	}
 	return writeFileAtomic(secure, []byte(content), 0o644)
+}
+
+// newGitCmd creates a *exec.Cmd for running git subcommands.
+// It handles nil ctx normalisation and PATH lookup automatically.
+func (e *Executor) newGitCmd(ctx context.Context, args ...string) (*exec.Cmd, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		return nil, fmt.Errorf("git is not available on PATH")
+	}
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = e.WorkingDir
+	return cmd, nil
 }
 
 func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, error) {

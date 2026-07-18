@@ -1,6 +1,7 @@
 package contextmgr
 
 import (
+	"sort"
 	"fmt"
 	"hash/fnv"
 	"sync"
@@ -93,7 +94,14 @@ func messageFingerprint(msg *llm.Message) uint64 {
 		if tc.ArgsStr != "" {
 			_, _ = h.Write([]byte(tc.ArgsStr))
 		} else {
-			for k, v := range tc.Args {
+			// Sort keys for deterministic fingerprints.
+			keys := make([]string, 0, len(tc.Args))
+			for k := range tc.Args {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				v := tc.Args[k]
 				_, _ = h.Write([]byte(k))
 				_, _ = h.Write([]byte{0})
 				_, _ = h.Write([]byte(fmt.Sprint(v)))
@@ -153,7 +161,14 @@ func countTokensExact(msg llm.Message) (int, bool) {
 				tokens += len(ids)
 			}
 		} else {
-			for k, v := range tc.Args {
+			// Sort keys for deterministic token counts.
+			keys := make([]string, 0, len(tc.Args))
+			for k := range tc.Args {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				v := tc.Args[k]
 				if ids, _, err := c.Encode(k); err == nil {
 					tokens += len(ids)
 				}
@@ -180,7 +195,14 @@ func estimateMessageTokensHeuristic(msg llm.Message) int {
 		if tc.ArgsStr != "" {
 			tokens += (len(tc.ArgsStr) + 3) / 4
 		} else {
-			for k, v := range tc.Args {
+			// Sort keys for deterministic token estimates.
+			keys := make([]string, 0, len(tc.Args))
+			for k := range tc.Args {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				v := tc.Args[k]
 				tokens += (len(k)+len(fmt.Sprint(v))+4)/4 + 2
 			}
 		}
