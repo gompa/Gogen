@@ -100,6 +100,15 @@ type Model struct {
 	// Context stats
 	contextStats agent.TurnContext
 	contextLine  string
+	// contextStreamBaseUsed/contextStreamEstAdded support a live, approximate
+	// context-indicator update while a turn is streaming. Reading a.Messages
+	// during streaming (via refreshContextStats) races with the streaming
+	// goroutine mutating it, so instead we snapshot the last authoritative
+	// Used count at stream start and add a cheap local estimate for tokens
+	// arriving via already-safe (Update-thread) stream messages. The exact
+	// count is restored via refreshContextStats() once streaming ends.
+	contextStreamBaseUsed int
+	contextStreamEstAdded int
 
 	// Session
 	sessionID string
@@ -280,30 +289,60 @@ func (m *Model) wrapLine(line string) []string {
 		parts = parts[:len(parts)-1]
 	}
 	if len(parts) > 1 {
-		// Propagate the style that is still active at the wrap point.
-		// When a line contains multiple SGR segments (e.g. a tool-call
-		// prefix followed by dimmed args), the wrap may fall inside a
-		// segment whose SGR is not the first one on the line.
-		sgr := extractTrailingSGR(parts[0])
-		if sgr == "" && !strings.Contains(parts[0], "\x1b[0m") {
+		// Propagate the style that is active at each wrap point, tracked
+		// as a running state across every part rather than computed once
+		// from parts[0]. A styled segment can begin partway through a
+		// later continuation line (e.g. a plain tool-call prefix followed
+		// by dimmed args that themselves span several more wrapped
+		// lines), so the active style must be re-derived after each part
+		// — otherwise everything past the part where the style *first*
+		// turns up loses it entirely once earlier lines scroll out of
+		// view (and, when a line hands off between two different
+		// styles, a stale one can leak into text that should carry the
+		// next style instead).
+		active := extractTrailingSGR(parts[0])
+		if active == "" && !strings.Contains(parts[0], "\x1b[0m") {
 			// No reset in parts[0]: the leading style is still open.
-			sgr = extractLeadingSGR(line)
+			active = extractLeadingSGR(line)
 		}
-		if sgr == "" {
-			return parts
-		}
-		if sgr != "" {
-			for i := 1; i < len(parts); i++ {
-				if parts[i] == "" {
-					continue // skip SGR on empty continuation lines
-				}
-				parts[i] = sgr + parts[i] + "\x1b[0m"
+		for i := 1; i < len(parts); i++ {
+			if parts[i] == "" {
+				continue // skip SGR on empty continuation lines
 			}
+			orig := parts[i]
+			if active != "" {
+				parts[i] = active + orig + "\x1b[0m"
+			}
+			// Re-derive the active style for the *next* part from this
+			// part's own (pre-propagation) content.
+			if trailing := extractTrailingSGR(orig); trailing != "" {
+				active = trailing
+			} else if strings.Contains(orig, "\x1b[0m") {
+				// This part closes with its own reset and nothing
+				// styled after it: the style that was active has ended.
+				active = ""
+			}
+			// else: orig has no SGR of its own at all — whatever was
+			// active carries over unchanged into the next part.
 		}
 	}
 	return parts
 }
 
+// Perf note (investigated 2025): during streaming, viewport rendering cost is
+// dominated by lipgloss.Style.Render and ansi.StringWidth.  The existing code
+// already avoids re-wrapping the entire conversation (buildFromPrefix only
+// wraps the last line) and batches tokens at 32 ms intervals (tokenBatcher).
+// However, each viewport.SetContent call in the bubbles viewport library calls
+// findLongestLineWidth, which recomputes ansi.StringWidth on *every* line of
+// the full conversation, not just visible lines.  The only way to avoid that
+// would be to avoid SetContent (not possible – the viewport needs to know the
+// new content for scroll-position), or to modify the viewport library itself.
+// Spinner ticks (~12 fps) also trigger View() → viewport render cycles even
+// though the spinner lives in the progress bar, not the viewport.  This is
+// inherent bubbletea/lipgloss overhead; no further optimisation is feasible
+// without significant refactoring of the rendering stack.
+//
 // buildFromPrefix computes wrappedContent from wrappedPrefix + the last chat
 // line.  All incremental updaters call this instead of the full re-wrap path.
 func (m *Model) buildFromPrefix() {
@@ -677,6 +716,7 @@ func (m *Model) handleStreamToken(token string) {
 	}
 	m.streamAssistantBuf.WriteString(token)
 	m.appendToStreamLine(m.streamAssistantLine, token)
+	m.bumpContextEstimate(token)
 }
 
 func (m *Model) handleStreamThinking(token string) {
@@ -687,6 +727,7 @@ func (m *Model) handleStreamThinking(token string) {
 		return
 	}
 	m.streamThinkingBuf.WriteString(token)
+	m.bumpContextEstimate(token)
 
 	if !m.streamThinkingOpen {
 		m.streamThinkingOpen = true
@@ -797,6 +838,7 @@ func (m *Model) handleStreamToolArgs(index int, id string, delta string) {
 	}
 	m.streamToolCallArgs[index] += delta
 	raw := m.streamToolCallArgs[index]
+	m.bumpContextEstimate(delta)
 
 	// For patch_file: progressively render diff content as it streams in.
 	// This avoids a jarring "pop-up" of the entire diff block in the result.
@@ -1046,6 +1088,10 @@ func (m *Model) resetStreamState(keepToolDiffShown bool) {
 
 func (m *Model) handleStreamStart() {
 	m.resetStreamState(false)
+	// Snapshot the last authoritative context usage as the baseline for the
+	// live streaming estimate (see bumpContextEstimate).
+	m.contextStreamBaseUsed = m.contextStats.Snapshot.Used
+	m.contextStreamEstAdded = 0
 }
 
 func (m *Model) handleStreamRoundStart() {
@@ -1099,6 +1145,49 @@ func (m *Model) refocusInput() tea.Cmd {
 		return nil
 	}
 	return m.textarea.Focus()
+}
+
+// estimateTokenCount is a cheap, tokenizer-free approximation (~4 chars per
+// token for English-like text) used only to keep the context indicator
+// moving live during streaming. It is intentionally rough — the exact count
+// is restored by refreshContextStats() as soon as streaming ends.
+func estimateTokenCount(s string) int {
+	if s == "" {
+		return 0
+	}
+	n := (len(s) + 3) / 4
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// bumpContextEstimate updates the status-bar context indicator with an
+// approximate running total while a turn is streaming. It never reads
+// a.Messages (which would race with the streaming goroutine mutating it) —
+// it only combines the baseline captured in handleStreamStart with a local
+// character-based estimate of text that has already safely arrived on the
+// Update thread via stream messages.
+func (m *Model) bumpContextEstimate(delta string) {
+	if delta == "" {
+		return
+	}
+	if m.contextStreamBaseUsed <= 0 && m.contextStats.Snapshot.Limit <= 0 {
+		// No baseline yet (e.g. first turn before any refresh) — nothing
+		// meaningful to show until refreshContextStats() runs.
+		return
+	}
+	m.contextStreamEstAdded += estimateTokenCount(delta)
+	snap := m.contextStats.Snapshot
+	snap.Used = m.contextStreamBaseUsed + m.contextStreamEstAdded
+	if snap.Limit > 0 {
+		snap.Percent = float64(snap.Used) / float64(snap.Limit)
+	}
+	display := m.contextStats
+	display.Snapshot = snap
+	if line := agent.FormatContextBrief(display); line != "" {
+		m.contextLine = line + " (est.)"
+	}
 }
 
 // refreshContextStats updates the status-bar context indicator immediately.

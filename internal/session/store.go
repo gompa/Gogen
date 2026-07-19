@@ -315,14 +315,38 @@ func NewID() string {
 }
 
 // prune deletes expired and excess sessions, always retaining keepID.
+// Uses file mtimes so it does not need to open or parse any session files.
 func (s *Store) prune(workingDir, keepID string) {
 	if s == nil || !s.enabled {
 		return
 	}
-	list, err := s.List(workingDir)
-	if err != nil || len(list) == 0 {
+	entries, err := os.ReadDir(s.dir(workingDir))
+	if err != nil {
 		return
 	}
+	type item struct {
+		id      string
+		updated time.Time
+	}
+	var items []item
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		items = append(items, item{
+			id:      strings.TrimSuffix(e.Name(), ".json"),
+			updated: info.ModTime().UTC(),
+		})
+	}
+	if len(items) == 0 {
+		return
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].updated.After(items[j].updated) })
+
 	cutoff := time.Now().UTC().AddDate(0, 0, -s.maxAgeDays)
 	otherBudget := s.maxCount
 	if keepID != "" {
@@ -332,14 +356,13 @@ func (s *Store) prune(workingDir, keepID string) {
 		}
 	}
 	others := 0
-	for _, entry := range list {
-		if entry.ID == keepID {
+	for _, it := range items {
+		if it.id == keepID {
 			continue
 		}
-		updated, err := time.Parse(time.RFC3339, entry.UpdatedAt)
-		expired := err == nil && updated.Before(cutoff)
+		expired := it.updated.Before(cutoff)
 		if expired || others >= otherBudget {
-			_ = s.Delete(workingDir, entry.ID)
+			_ = s.Delete(workingDir, it.id)
 			continue
 		}
 		others++

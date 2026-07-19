@@ -125,6 +125,44 @@ func TestSGRPropagation(t *testing.T) {
 			t.Fatal("should propagate trailing SGR when active after last reset")
 		}
 	})
+
+	t.Run("styled segment starts partway through a later line and itself spans 3+ wraps", func(t *testing.T) {
+		// Regression test: a plain prefix + name is followed by a long
+		// dimmed args value that only becomes active partway through the
+		// second wrapped line, and itself needs several more wrapped
+		// lines. Every wrapped line from the point the style first turns
+		// up onward must carry it — previously the propagation logic only
+		// looked at parts[0], so once the style appeared later than that,
+		// none of the following continuation lines received it and the
+		// styling silently vanished as soon as earlier lines scrolled out
+		// of view.
+		m := &Model{}
+		m.viewport.Width = 42 // wrapWidth = 42 - 2 padding = 40
+		m.viewport.Style = ViewportStyle
+
+		dimSGR := "\x1b[38;2;136;136;136m"
+		prefix := "\x1b[38;2;204;170;0m  →\x1b[0m read_file "
+		args := dimSGR + strings.Repeat("very long argument text ", 6) + "\x1b[0m"
+		line := prefix + args
+
+		parts := m.wrapLine(line)
+		if len(parts) < 4 {
+			t.Fatalf("expected line to wrap into at least 4 parts, got %d: %#v", len(parts), parts)
+		}
+
+		seenStyle := false
+		for i, p := range parts {
+			if strings.Contains(p, dimSGR) {
+				seenStyle = true
+			}
+			if seenStyle && p != "" && !strings.HasPrefix(p, "\x1b[") {
+				t.Fatalf("part %d lost styling after the dim style should have carried forward: %q", i, p)
+			}
+		}
+		if !seenStyle {
+			t.Fatal("test setup issue: dim style never appeared in any wrapped part")
+		}
+	})
 }
 
 func TestWrapLineFitsWidth(t *testing.T) {
