@@ -14,9 +14,9 @@ import (
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/muesli/reflow/wordwrap"
 	"github.com/muesli/reflow/wrap"
 )
@@ -52,7 +52,7 @@ type Model struct {
 	program *tea.Program
 
 	// Components
-	viewport viewport.Model
+	viewport Viewport
 	textarea textarea.Model
 
 	// State
@@ -71,9 +71,10 @@ type Model struct {
 	progressLabel string
 
 	// Chat content buffer (lines to render)
-	chatLines      []string
-	wrappedPrefix  string   // pre-wrapped content of chatLines[:len-1], ends with "\n" if non-empty
-	wrappedContent string   // pre-computed wrapped content for viewport
+	chatLines       []string
+	wrappedPrefix   string   // pre-wrapped content of chatLines[:len-1], ends with "\n" if non-empty
+	wrappedContent  string   // pre-computed wrapped content for viewport
+	maxWrappedWidth int      // cached max line width (incremental, avoids O(N) scan)
 	styledLines      []string // wrappedContent split by "\n" (cached for selection render)
 	styledLinesDirty bool     // true when styledLines needs recomputation
 
@@ -139,7 +140,13 @@ type Model struct {
 	selection         *SelectionState
 	wrappedLines      []string // ANSI-stripped wrapped content lines (coordinate mapping)
 	wrappedLinesDirty bool
-	statusMsg         string // transient message (e.g. "Copied N chars")
+	// Render caches — recomputed only when inputs change.
+	dividerCache       string
+	dividerCacheWidth  int
+	dividerCacheFocus  FocusTarget
+	dividerCacheStream bool
+	statusBarDirty     bool
+	statusMsg          string // transient message (e.g. "Copied N chars")
 }
 
 // NewModel creates a new TUI model.
@@ -168,7 +175,7 @@ func NewModel(a *agent.Agent, cfg *config.Config) Model {
 	ta.KeyMap.DeleteCharacterForward = key.NewBinding(key.WithKeys("ctrl+d", "delete"))
 	ta.KeyMap.DeleteCharacterBackward = key.NewBinding(key.WithKeys("backspace"))
 
-	vp := viewport.New(80, 20)
+	vp := NewViewport(80, 20)
 	// Scroll 1 line per wheel event (default is 3; lower for smoother
 	// scrolling when the mouse/terminal sends multiple events per notch).
 	vp.MouseWheelDelta = 1
@@ -192,7 +199,7 @@ func NewModel(a *agent.Agent, cfg *config.Config) Model {
 		verbose:             verbose,
 		spinner:             newProgressSpinner(),
 		progressPhase:       progressHidden,
-		chatLines:           make([]string, 0),
+		chatLines:           make([]string, 0, 64), // pre-allocate to reduce GC during streaming
 		streamAssistantLine: -1,
 		streamThinkingLine:  -1,
 		streamToolCallNames: make(map[int]string),
@@ -329,34 +336,34 @@ func (m *Model) wrapLine(line string) []string {
 	return parts
 }
 
-// Perf note (investigated 2025): during streaming, viewport rendering cost is
-// dominated by lipgloss.Style.Render and ansi.StringWidth.  The existing code
-// already avoids re-wrapping the entire conversation (buildFromPrefix only
-// wraps the last line) and batches tokens at 32 ms intervals (tokenBatcher).
-// However, each viewport.SetContent call in the bubbles viewport library calls
-// findLongestLineWidth, which recomputes ansi.StringWidth on *every* line of
-// the full conversation, not just visible lines.  The only way to avoid that
-// would be to avoid SetContent (not possible – the viewport needs to know the
-// new content for scroll-position), or to modify the viewport library itself.
-// Spinner ticks (~12 fps) also trigger View() → viewport render cycles even
-// though the spinner lives in the progress bar, not the viewport.  This is
-// inherent bubbletea/lipgloss overhead; no further optimisation is feasible
-// without significant refactoring of the rendering stack.
-//
 // buildFromPrefix computes wrappedContent from wrappedPrefix + the last chat
 // line.  All incremental updaters call this instead of the full re-wrap path.
+//
+// During streaming, this is the hot path called on every token batch (~32 ms).
+// We compute the max line width incrementally: only the last line changes, so
+// we measure its width and update the cached max.  SetContentMax uses the
+// pre-computed width, skipping the O(N) ansi.StringWidth scan of the full
+// conversation that the stock bubbles viewport performs.
 func (m *Model) buildFromPrefix() {
 	if len(m.chatLines) == 0 {
 		m.wrappedContent = ""
 		m.wrappedLines = nil
 		m.wrappedLinesDirty = false
+		m.maxWrappedWidth = 0
 	} else {
-		lastWrapped := strings.Join(m.wrapLine(m.chatLines[len(m.chatLines)-1]), "\n")
+		lastParts := m.wrapLine(m.chatLines[len(m.chatLines)-1])
+		lastWrapped := strings.Join(lastParts, "\n")
 		m.wrappedContent = m.wrappedPrefix + lastWrapped
-		m.wrappedLinesDirty = true // lazily compute on next selection access
+		m.wrappedLinesDirty = true
+		// Incremental max width: only scan the newly wrapped last line.
+		for _, p := range lastParts {
+			if w := ansi.StringWidth(p); w > m.maxWrappedWidth {
+				m.maxWrappedWidth = w
+			}
+		}
 	}
 	m.clearSelection()
-	m.viewport.SetContent(m.wrappedContent)
+	m.viewport.SetContentMax(m.wrappedContent, m.maxWrappedWidth)
 	// styledLines is computed lazily in ensureStyledLines().
 	m.styledLinesDirty = true
 }
@@ -375,7 +382,15 @@ func (m *Model) setViewportContent() {
 	m.wrappedContent = strings.Join(wrappedParts, "\n")
 	m.wrappedLinesDirty = true // lazily compute on next selection access
 	m.clearSelection()
-	m.viewport.SetContent(m.wrappedContent)
+	// Full re-scan of all lines — acceptable because this is called rarely
+	// (resize, session restore, mode changes).
+	m.maxWrappedWidth = 0
+	for _, p := range wrappedParts {
+		if w := ansi.StringWidth(p); w > m.maxWrappedWidth {
+			m.maxWrappedWidth = w
+		}
+	}
+	m.viewport.SetContentMax(m.wrappedContent, m.maxWrappedWidth)
 	// styledLines is computed lazily in ensureStyledLines().
 	m.styledLinesDirty = true
 
@@ -573,7 +588,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-func (m Model) View() string {
+func (m *Model) View() string {
 	if !m.ready {
 		return "Initializing..."
 	}
@@ -582,8 +597,6 @@ func (m Model) View() string {
 		return ""
 	}
 
-	// Build the main layout
-	statusBar := m.renderStatusBar()
 
 	// Viewport content: use selection-aware render when selecting,
 	// otherwise use the stock viewport render.
@@ -602,18 +615,27 @@ func (m Model) View() string {
 		inputArea = m.textarea.View()
 	}
 
-	// Divider with focus indicator
-	var divider string
-	if m.focus == FocusViewport {
-		indicator := " [SCROLL] Press i or Esc to return to input "
-		line := strings.Repeat("─", m.width)
-		keep := max(0, m.width-len(indicator))
-		divider = DividerStyle.Render(sliceByRuneCount(line, keep) + indicator)
-	} else if m.streaming {
-		divider = DimStyle.Render(strings.Repeat("─", m.width))
-	} else {
-		divider = DividerStyle.Render(strings.Repeat("─", m.width))
+	// Divider with focus indicator.  Cache the rendered string and only
+	// rebuild when width, focus, or streaming state change.
+	dividerDirty := m.dividerCacheWidth != m.width ||
+		m.dividerCacheFocus != m.focus ||
+		m.dividerCacheStream != m.streaming
+	if dividerDirty {
+		if m.focus == FocusViewport {
+			indicator := " [SCROLL] Press i or Esc to return to input "
+			line := strings.Repeat("─", m.width)
+			keep := max(0, m.width-len(indicator))
+			m.dividerCache = DividerStyle.Render(sliceByRuneCount(line, keep) + indicator)
+		} else if m.streaming {
+			m.dividerCache = DimStyle.Render(strings.Repeat("─", m.width))
+		} else {
+			m.dividerCache = DividerStyle.Render(strings.Repeat("─", m.width))
+		}
+		m.dividerCacheWidth = m.width
+		m.dividerCacheFocus = m.focus
+		m.dividerCacheStream = m.streaming
 	}
+	divider := m.dividerCache
 
 	// Assemble
 	main := lipgloss.JoinVertical(
@@ -621,7 +643,7 @@ func (m Model) View() string {
 		vpView,
 		divider,
 		inputArea,
-		statusBar,
+		m.renderStatusBar(),
 	)
 
 	// Modal overlay — renders on opaque background so nothing bleeds through

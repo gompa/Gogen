@@ -18,6 +18,13 @@ const (
 	progressTool                          // a tool is executing
 )
 
+// Pre-rendered static progress lines so DimStyle.Render is not called every
+// frame for content that never changes between renders.
+var (
+	progressStreamingLine  = DimStyle.Render("  streaming…")
+	progressProcessingLine = DimStyle.Render("  … processing …")
+)
+
 func newProgressSpinner() spinner.Model {
 	return spinner.New(
 		spinner.WithSpinner(spinner.MiniDot),
@@ -63,11 +70,11 @@ func (m *Model) renderProgressInput() string {
 		if label == "" {
 			label = "running tool"
 		}
-		line = DimStyle.Render("  " + m.spinner.View() + " " + label)
+		line = DimStyle.Render("  "+m.spinner.View()+" "+label)
 	case progressActive:
-		line = DimStyle.Render("  streaming…")
+		line = progressStreamingLine
 	default:
-		line = DimStyle.Render("  … processing …")
+		line = progressProcessingLine
 	}
 	return padInputBand(line, m.textarea.Height())
 }
