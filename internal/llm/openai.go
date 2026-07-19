@@ -65,8 +65,10 @@ func (p *OpenAIProvider) listModels(ctx context.Context) []openai.Model {
 
 func NewOpenAIProvider(apiKey string, model string, baseURL string) *OpenAIProvider {
 	opts := []option.RequestOption{
-		option.WithAPIKey(apiKey),
 		option.WithHTTPClient(newSSEHTTPClient()),
+	}
+	if apiKey != "" {
+		opts = append(opts, option.WithAPIKey(apiKey))
 	}
 	if baseURL != "" {
 		opts = append(opts, option.WithBaseURL(baseURL))
@@ -78,11 +80,14 @@ func NewOpenAIProvider(apiKey string, model string, baseURL string) *OpenAIProvi
 	}
 	if isOpencodeURL(baseURL) {
 		newClient := func(url string) *openai.Client {
-			c := openai.NewClient(
-				option.WithAPIKey(apiKey),
+			nopts := []option.RequestOption{
 				option.WithHTTPClient(newSSEHTTPClient()),
 				option.WithBaseURL(url),
-			)
+			}
+			if apiKey != "" {
+				nopts = append(nopts, option.WithAPIKey(apiKey))
+			}
+			c := openai.NewClient(nopts...)
 			return &c
 		}
 		p.zenClient = newClient(openCodeZenBaseURL)

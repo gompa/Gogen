@@ -103,7 +103,7 @@ func main() {
 	}
 
 	if cfg.OpenAIKey == "" {
-		log.Fatal("OPENAI_API_KEY environment variable is not set")
+		fmt.Fprintf(os.Stderr, "Warning: OPENAI_API_KEY is not set. Some endpoints may require an API key.\n")
 	}
 
 	applyRuntimeConfig(cfg)
