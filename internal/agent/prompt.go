@@ -61,7 +61,7 @@ Guidelines:
   - File header: --- a/path then +++ b/path (the a/ and b/ prefixes are optional; the path is relative to the working directory)
   - Hunk header: @@ -oldStart,oldCount +newStart,newCount @@
   - Body: context lines prefixed with a space, removed lines with '-', added lines with '+'
-  - Multiple hunks per file and multiple files per patch are supported.
+  - Multiple hunks per file and multiple files per patch are supported (including git-style diff --git sections).
   - Do NOT set fuzzy=false unless you are certain the context matches exactly. The default fuzzy=true handles whitespace differences and nearby-line drift automatically.
 - After edits, run run_tests or linters when appropriate and fix failures you introduce.
 - When patch_file fails:

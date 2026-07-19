@@ -174,9 +174,17 @@ type SessionEntry struct {
 	Current      bool   `json:"current,omitempty"`
 }
 
+type HistoryToolCall struct {
+	ID   string                 `json:"id"`
+	Name string                 `json:"name"`
+	Args map[string]interface{} `json:"args,omitempty"`
+}
+
 type HistoryEntry struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string            `json:"role"`
+	Content    string            `json:"content,omitempty"`
+	ToolCalls  []HistoryToolCall `json:"toolCalls,omitempty"`
+	ToolCallID string            `json:"toolCallId,omitempty"`
 }
 
 type WSMessage struct {
@@ -314,10 +322,37 @@ func sessionEntries(list []agent.SessionInfo, currentID string) []SessionEntry {
 func historyEntries(msgs []llm.Message) []HistoryEntry {
 	out := make([]HistoryEntry, 0, len(msgs))
 	for _, m := range msgs {
-		if m.Role == "user" || m.Role == "assistant" {
-			if m.Content != "" {
-				out = append(out, HistoryEntry{Role: m.Role, Content: m.Content})
+		switch m.Role {
+		case "user":
+			if m.Content == "" {
+				continue
 			}
+			out = append(out, HistoryEntry{Role: m.Role, Content: m.Content})
+		case "assistant":
+			if m.Content == "" && len(m.ToolCalls) == 0 {
+				continue
+			}
+			entry := HistoryEntry{Role: m.Role, Content: m.Content}
+			if len(m.ToolCalls) > 0 {
+				entry.ToolCalls = make([]HistoryToolCall, len(m.ToolCalls))
+				for i, tc := range m.ToolCalls {
+					entry.ToolCalls[i] = HistoryToolCall{
+						ID:   tc.ID,
+						Name: tc.Name,
+						Args: tc.Args,
+					}
+				}
+			}
+			out = append(out, entry)
+		case "tool":
+			if m.Content == "" && m.ToolCallID == "" {
+				continue
+			}
+			out = append(out, HistoryEntry{
+				Role:       m.Role,
+				Content:    m.Content,
+				ToolCallID: m.ToolCallID,
+			})
 		}
 	}
 	return out
@@ -466,6 +501,19 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 		case "fs_write":
 			s.handleFSWriteMessage(ws, msg)
 			continue
+		case "cancel":
+			streamMu.Lock()
+			if streamCancel != nil {
+				streamCancel()
+				prevErr := streamErr
+				streamCancel = nil
+				streamErr = nil
+				streamMu.Unlock()
+				drainStreamErr(prevErr)
+			} else {
+				streamMu.Unlock()
+			}
+			continue
 		case "message":
 			// Cancel any in-flight stream BEFORE taking turnMu.
 			streamMu.Lock()
@@ -536,6 +584,10 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			go func(content string, ctx context.Context, done chan error) {
 				defer func() { done <- nil }()
 				defer s.turnMu.Unlock()
+				defer func() {
+					// Always notify the client the turn is over (success, error, or cancel).
+					_ = ws.writeJSON(WSMessage{Type: "turn_end"})
+				}()
 				ctx = agent.ContextWithDeleteApprover(ctx, session.deleteApprover())
 				write := func(v WSMessage) {
 					if ctx.Err() != nil {
@@ -590,11 +642,15 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 							Args:       tc.Args,
 						})
 					},
+					OnToolExecute: func(name string) {
+						write(WSMessage{Type: "tool_execute", Tool: name})
+					},
 					OnToolResult: func(id, name, result string, success bool) {
 						truncated := false
-						const maxResult = 4096
-						if len(result) > maxResult {
-							result = result[:maxResult] + fmt.Sprintf("\n… truncated (%d bytes total)", len(result))
+						const maxResult = 128 * 1024
+						origLen := len(result)
+						if origLen > maxResult {
+							result = result[:maxResult] + fmt.Sprintf("\n… truncated (%d bytes total)", origLen)
 							truncated = true
 						}
 						write(WSMessage{
@@ -610,6 +666,11 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 
 				_, err := s.agent.StreamProcessInput(ctx, content, handlers)
 				if err != nil {
+					if ctx.Err() != nil {
+						tokens.flush()
+						_ = ws.writeJSON(WSMessage{Type: "cancelled", Content: "Cancelled."})
+						return
+					}
 					if ctx.Err() == nil {
 						tokens.flush()
 						write(WSMessage{Type: "stream_end"})

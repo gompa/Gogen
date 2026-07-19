@@ -6,62 +6,185 @@
     <title>GoGen AI Agent</title>
     <link rel="stylesheet" href="/monaco/editor.main.css">
     <style>
-        body { font-family: sans-serif; margin: 0; display: flex; flex-direction: column; height: 100vh; }
+        :root {
+            --bg: #1e1e1e;
+            --bg-elevated: #252526;
+            --bg-input: #3c3c3c;
+            --bg-hover: #2a2d2e;
+            --bg-active: #37373d;
+            --border: #3c3c3c;
+            --border-subtle: #2d2d2d;
+            --fg: #d4d4d4;
+            --fg-muted: #858585;
+            --fg-dim: #6a6a6a;
+            --accent: #569cd6;
+            --accent-soft: rgba(86, 156, 214, 0.18);
+            --success: #4ec9b0;
+            --success-bg: rgba(46, 160, 67, 0.18);
+            --error: #f14c4c;
+            --error-bg: rgba(248, 81, 73, 0.18);
+            --warn: #dcdcaa;
+            --warn-bg: rgba(210, 153, 34, 0.18);
+            --user-bg: rgba(86, 156, 214, 0.15);
+            --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+            --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+        }
+        * { box-sizing: border-box; }
+        body {
+            font-family: var(--sans);
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            background: var(--bg);
+            color: var(--fg);
+        }
         #top-tabs {
-            display: flex; gap: 0; border-bottom: 1px solid #ccc; background: #f7f7f7;
+            display: flex;
+            gap: 0;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg-elevated);
             flex-shrink: 0;
         }
         .main-tab {
-            padding: 10px 18px; border: none; background: transparent; cursor: pointer;
-            border-bottom: 2px solid transparent; font-weight: 600;
+            padding: 10px 18px;
+            border: none;
+            background: transparent;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            font-weight: 600;
+            color: var(--fg-muted);
         }
-        .main-tab.active { border-bottom-color: #283593; color: #283593; background: #fff; }
+        .main-tab:hover { color: var(--fg); background: var(--bg-hover); }
+        .main-tab.active {
+            border-bottom-color: var(--accent);
+            color: var(--fg);
+            background: var(--bg);
+        }
         #main-panes { flex: 1; min-height: 0; display: flex; }
         .pane { display: none; flex: 1; min-height: 0; min-width: 0; }
         .pane.active { display: flex; }
 
-        #sidebar { width: 300px; background: #f0f0f0; border-right: 1px solid #ccc; display: flex; flex-direction: column; padding: 20px; box-sizing: border-box; overflow-y: auto; flex-shrink: 0; }
-        #chat-container { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
-        #messages { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 10px; }
-        #input-area { padding: 20px; border-top: 1px solid #ccc; display: flex; gap: 10px; }
-        .message { padding: 10px; border-radius: 8px; max-width: 80%; white-space: pre-wrap; word-break: break-word; }
-        .user { background: #e3f2fd; align-self: flex-end; }
-        .assistant { background: #f5f5f5; align-self: flex-start; }
-        .system { background: #fff3cd; align-self: center; text-align: center; font-size: 0.8em; }
-        input, button { padding: 10px; border: 1px solid #ccc; border-radius: 4px; }
+        #sidebar {
+            width: 300px;
+            background: var(--bg-elevated);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            padding: 16px;
+            overflow-y: auto;
+            flex-shrink: 0;
+        }
+        #sidebar h3 { margin: 0 0 12px; font-size: 0.95em; font-weight: 600; color: var(--fg); }
+        #sidebar label {
+            display: block;
+            font-size: 0.75em;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: var(--fg-muted);
+            margin-bottom: 4px;
+        }
+        #sidebar hr {
+            border: none;
+            border-top: 1px solid var(--border);
+            margin: 14px 0;
+        }
+        #chat-container { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg); }
+        #messages { flex: 1; overflow-y: auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 10px; }
+        #messages > * { flex-shrink: 0; }
+        #input-area {
+            padding: 12px 16px;
+            border-top: 1px solid var(--border);
+            display: flex;
+            gap: 8px;
+            background: var(--bg-elevated);
+        }
+        #cancel-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        #cancel-btn:not(:disabled) {
+            background: var(--error-bg);
+            border-color: #7a3030;
+            color: #ff7b72;
+        }
+        .message {
+            padding: 10px 12px;
+            border-radius: 4px;
+            max-width: 80%;
+            white-space: pre-wrap;
+            word-break: break-word;
+            flex-shrink: 0;
+            border: 1px solid var(--border-subtle);
+        }
+        .user {
+            background: var(--user-bg);
+            border-color: rgba(86, 156, 214, 0.35);
+            align-self: flex-end;
+            color: var(--fg);
+        }
+        .assistant {
+            background: var(--bg-elevated);
+            align-self: flex-start;
+            color: var(--fg);
+        }
+        .system {
+            background: transparent;
+            border-color: transparent;
+            align-self: center;
+            text-align: center;
+            font-size: 0.8em;
+            color: var(--fg-muted);
+        }
+        input, button {
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            background: var(--bg-input);
+            color: var(--fg);
+            font-family: inherit;
+        }
+        input::placeholder { color: var(--fg-dim); }
+        input:focus, button:focus {
+            outline: 1px solid var(--accent);
+            outline-offset: -1px;
+        }
+        button {
+            cursor: pointer;
+            background: var(--bg-active);
+        }
+        button:hover:not(:disabled) { background: #404045; }
         #message-input { flex: 1; }
-        #working-dir-input { width: 100%; margin-bottom: 10px; box-sizing: border-box; }
-        .cursor::after { content: '▊'; animation: blink 1s infinite; }
+        #working-dir-input { width: 100%; margin-bottom: 8px; }
+        .cursor::after { content: '|'; animation: blink 1s infinite; color: var(--accent); }
         @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
-        .thinking { color: #888; font-style: italic; }
-        .thinking-block { color: #888; font-style: italic; white-space: pre-wrap; }
+        .thinking { color: var(--fg-muted); font-style: italic; }
+        .thinking-block { color: var(--fg-muted); font-style: italic; white-space: pre-wrap; }
 
         .tool-card {
             align-self: flex-start;
-            background: #fafafa;
-            border: 1px solid #e0e0e0;
-            border-radius: 8px;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border);
+            border-radius: 4px;
             max-width: 95%;
             width: 100%;
             overflow: hidden;
             font-size: 0.9em;
+            flex-shrink: 0;
         }
         .tool-call-header {
             display: flex;
             align-items: center;
             gap: 8px;
             padding: 8px 12px;
-            background: #e8eaf6;
+            background: var(--bg-active);
             cursor: pointer;
             user-select: none;
         }
-        .tool-call-header:hover { background: #c5cae9; }
-        .tool-icon { font-size: 1.1em; }
-        .tool-name { font-weight: bold; font-family: monospace; color: #283593; }
+        .tool-call-header:hover { background: #404045; }
+        .tool-icon { display: none; }
+        .tool-name { font-weight: 600; font-family: var(--mono); color: var(--accent); }
         .tool-args {
-            font-family: monospace;
+            font-family: var(--mono);
             font-size: 0.85em;
-            color: #555;
+            color: var(--fg-muted);
             margin-left: 4px;
             overflow: hidden;
             text-overflow: ellipsis;
@@ -69,26 +192,26 @@
             max-width: 50%;
         }
         .tool-args-streaming {
-            font-family: monospace;
+            font-family: var(--mono);
             font-size: 0.85em;
-            color: #666;
+            color: var(--fg-muted);
             padding: 4px 12px 8px;
             white-space: pre-wrap;
             word-break: break-all;
-            background: #f5f5f5;
-            border-top: 1px solid #e0e0e0;
+            background: var(--bg);
+            border-top: 1px solid var(--border-subtle);
         }
         .tool-toggle {
             margin-left: auto;
-            font-size: 0.8em;
-            color: #888;
-            transition: transform 0.2s;
+            font-size: 0.75em;
+            color: var(--fg-dim);
+            transition: transform 0.15s;
         }
         .tool-toggle.collapsed { transform: rotate(-90deg); }
         .tool-result-body {
             display: flex;
             flex-direction: column;
-            border-top: 1px solid #e0e0e0;
+            border-top: 1px solid var(--border-subtle);
         }
         .tool-result-body.collapsed { display: none; }
         .tool-status-bar {
@@ -96,135 +219,279 @@
             align-items: center;
             gap: 6px;
             padding: 4px 12px;
-            font-size: 0.8em;
-            font-weight: bold;
+            font-size: 0.75em;
+            font-weight: 600;
+            font-family: var(--mono);
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
         }
-        .tool-status-bar.success { background: #e8f5e9; color: #2e7d32; }
-        .tool-status-bar.error { background: #ffebee; color: #c62828; }
+        .tool-status-bar.success { background: var(--success-bg); color: var(--success); }
+        .tool-status-bar.error { background: var(--error-bg); color: #ff7b72; }
         .tool-result-content {
             padding: 8px 12px;
-            font-family: monospace;
+            font-family: var(--mono);
             font-size: 0.85em;
             white-space: pre-wrap;
             word-break: break-word;
-            max-height: 300px;
+            max-height: min(70vh, 720px);
             overflow-y: auto;
-            background: #fff;
+            background: var(--bg);
+            color: var(--fg);
         }
-        .tool-result-content.error-content { color: #c62828; }
+        .tool-result-content.error-content { color: #ff7b72; }
         .monaco-tool-host {
             height: 280px;
-            border-top: 1px solid #e0e0e0;
-            background: #1e1e1e;
+            min-height: 280px;
+            max-height: 280px;
+            border-top: 1px solid var(--border-subtle);
+            background: var(--bg);
+            position: relative;
+            width: 100%;
+            flex-shrink: 0;
+            overflow: hidden;
         }
+        .monaco-tool-editor {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+        }
+        .diff-fallback {
+            margin: 0;
+            padding: 8px 12px;
+            position: absolute;
+            inset: 0;
+            overflow: auto;
+            box-sizing: border-box;
+            color: var(--fg);
+            font-family: var(--mono);
+            font-size: 12px;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .monaco-tool-host .gogen-diff-add { background: rgba(46, 160, 67, 0.22) !important; color: #3fb950 !important; }
+        .monaco-tool-host .gogen-diff-del { background: rgba(248, 81, 73, 0.22) !important; color: #ff7b72 !important; }
+        .monaco-tool-host .gogen-diff-hunk { background: rgba(86, 156, 214, 0.18) !important; color: #c586c0 !important; }
+        .monaco-tool-host .gogen-diff-meta { color: #858585 !important; }
+        .monaco-tool-host .diff-fallback .gogen-diff-add { background: rgba(46, 160, 67, 0.22); color: #3fb950; display: inline; }
+        .monaco-tool-host .diff-fallback .gogen-diff-del { background: rgba(248, 81, 73, 0.22); color: #ff7b72; display: inline; }
+        .monaco-tool-host .diff-fallback .gogen-diff-hunk { background: rgba(86, 156, 214, 0.18); color: #c586c0; display: inline; }
+        .monaco-tool-host .diff-fallback .gogen-diff-meta { color: #858585; display: inline; }
+        .monaco-tool-host .gogen-diff-add-margin { background: #2ea043 !important; width: 3px !important; margin-left: 3px; }
+        .monaco-tool-host .gogen-diff-del-margin { background: #f85149 !important; width: 3px !important; margin-left: 3px; }
+        .monaco-tool-host .gogen-diff-hunk-margin { background: #569cd6 !important; width: 3px !important; margin-left: 3px; }
         .tool-waiting {
             padding: 6px 12px;
             font-size: 0.85em;
-            color: #888;
+            color: var(--fg-muted);
             font-style: italic;
-            border-top: 1px solid #e0e0e0;
-            background: #f5f5f5;
+            border-top: 1px solid var(--border-subtle);
+            background: var(--bg);
         }
 
         #delete-approval-overlay {
             display: none;
             position: fixed;
             inset: 0;
-            background: rgba(0, 0, 0, 0.45);
+            background: rgba(0, 0, 0, 0.55);
             align-items: center;
             justify-content: center;
             z-index: 1000;
         }
         #delete-approval-overlay.active { display: flex; }
         #delete-approval-dialog {
-            background: #fff;
-            border-radius: 8px;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border);
+            border-radius: 4px;
             padding: 20px;
             max-width: 480px;
             width: 90%;
-            box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+            box-shadow: 0 8px 32px rgba(0,0,0,0.45);
+            color: var(--fg);
         }
-        #delete-approval-dialog h3 { margin-top: 0; }
+        #delete-approval-dialog h3 { margin-top: 0; color: var(--fg); }
         #delete-approval-paths {
-            font-family: monospace;
-            background: #fff3cd;
+            font-family: var(--mono);
+            background: var(--warn-bg);
+            border: 1px solid rgba(210, 153, 34, 0.35);
             padding: 12px;
-            border-radius: 4px;
+            border-radius: 3px;
             margin: 12px 0;
             white-space: pre-wrap;
+            color: var(--warn);
         }
         #delete-approval-actions {
             display: flex;
             gap: 10px;
             justify-content: flex-end;
         }
-        #delete-approval-actions button.deny { background: #ffebee; }
-        #delete-approval-actions button.allow { background: #e8f5e9; }
+        #delete-approval-actions button.deny {
+            background: var(--error-bg);
+            border-color: #7a3030;
+            color: #ff7b72;
+        }
+        #delete-approval-actions button.allow {
+            background: var(--success-bg);
+            border-color: #2d6a4f;
+            color: var(--success);
+        }
 
-        #context-info { font-size:0.85em;margin-bottom:4px;font-family:monospace;white-space:pre-wrap; }
+        #context-info { font-size:0.85em;margin-bottom:4px;font-family:var(--mono);white-space:pre-wrap; color: var(--fg); }
         #context-bar-wrap {
-            height: 8px;
-            background: #e0e0e0;
-            border-radius: 4px;
+            height: 6px;
+            background: var(--bg-input);
+            border-radius: 2px;
             overflow: hidden;
             margin: 0 0 12px 0;
         }
         #context-bar {
             height: 100%;
             width: 0%;
-            background: #4caf50;
+            background: var(--success);
             transition: width 0.3s ease, background 0.3s ease;
         }
-        #context-bar.warn { background: #ff9800; }
-        #context-bar.danger { background: #f44336; }
+        #context-bar.warn { background: #d29922; }
+        #context-bar.danger { background: var(--error); }
+        #model-info, #mode-info, #session-info, #status { color: var(--fg); }
 
         /* Editor workspace */
-        #editor-pane { flex-direction: row; }
+        #editor-pane { flex-direction: row; background: var(--bg); }
         #editor-sidebar {
-            width: 280px; flex-shrink: 0; border-right: 1px solid #ccc;
-            display: flex; flex-direction: column; background: #fafafa; min-height: 0;
+            width: 280px;
+            flex-shrink: 0;
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            background: var(--bg-elevated);
+            min-height: 0;
         }
         #editor-sidebar h4 {
-            margin: 0; padding: 10px 12px; font-size: 0.85em;
-            border-bottom: 1px solid #e0e0e0; background: #f0f0f0;
+            margin: 0;
+            padding: 10px 12px;
+            font-size: 0.75em;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: var(--fg-muted);
+            border-bottom: 1px solid var(--border);
+            background: var(--bg-elevated);
         }
         #file-tree, #unstaged-list {
-            overflow-y: auto; padding: 6px 8px; font-size: 0.85em; font-family: monospace;
+            overflow-y: auto;
+            padding: 6px 8px;
+            font-size: 0.85em;
+            font-family: var(--mono);
+            color: var(--fg);
         }
         #file-tree { flex: 1; min-height: 0; }
-        #unstaged-wrap { border-top: 1px solid #ccc; max-height: 40%; display: flex; flex-direction: column; min-height: 0; }
+        #unstaged-wrap {
+            border-top: 1px solid var(--border);
+            max-height: 40%;
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+        }
         #unstaged-list { flex: 1; min-height: 0; }
         .tree-item, .unstaged-item {
-            padding: 3px 4px; cursor: pointer; border-radius: 3px; white-space: nowrap;
-            overflow: hidden; text-overflow: ellipsis;
+            padding: 3px 6px;
+            cursor: pointer;
+            border-radius: 2px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
-        .tree-item:hover, .unstaged-item:hover { background: #e8eaf6; }
+        .tree-item:hover, .unstaged-item:hover { background: var(--bg-hover); }
+        .tree-item.dir { color: var(--accent); }
+        .tree-item.file { color: var(--fg); }
         .tree-children { padding-left: 14px; }
-        #editor-main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+        #editor-main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg); }
         #editor-toolbar {
-            display: flex; align-items: center; gap: 8px; padding: 6px 10px;
-            border-bottom: 1px solid #ccc; background: #f7f7f7; flex-shrink: 0;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 10px;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg-elevated);
+            flex-shrink: 0;
         }
-        #editor-toolbar button { padding: 6px 10px; font-size: 0.85em; }
-        #editor-path-label { font-family: monospace; font-size: 0.85em; color: #444; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        #editor-toolbar button { padding: 5px 10px; font-size: 0.8em; }
+        #editor-path-label {
+            font-family: var(--mono);
+            font-size: 0.85em;
+            color: var(--fg-muted);
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
         #editor-tabs {
-            display: flex; gap: 2px; padding: 4px 6px 0; background: #ececec;
-            border-bottom: 1px solid #ccc; overflow-x: auto; flex-shrink: 0; min-height: 32px;
+            display: flex;
+            gap: 1px;
+            padding: 4px 6px 0;
+            background: var(--bg-elevated);
+            border-bottom: 1px solid var(--border);
+            overflow-x: auto;
+            flex-shrink: 0;
+            min-height: 32px;
         }
         .file-tab {
-            display: flex; align-items: center; gap: 6px; padding: 6px 10px;
-            background: #ddd; border-radius: 6px 6px 0 0; cursor: pointer;
-            font-size: 0.85em; font-family: monospace; max-width: 180px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 10px;
+            background: var(--bg-active);
+            border-radius: 3px 3px 0 0;
+            cursor: pointer;
+            font-size: 0.85em;
+            font-family: var(--mono);
+            max-width: 180px;
+            color: var(--fg-muted);
+            border: 1px solid transparent;
+            border-bottom: none;
         }
-        .file-tab.active { background: #fff; border: 1px solid #ccc; border-bottom-color: #fff; }
+        .file-tab.active {
+            background: var(--bg);
+            color: var(--fg);
+            border-color: var(--border);
+            border-bottom-color: var(--bg);
+        }
         .file-tab-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .file-tab-close {
-            border: none; background: transparent; cursor: pointer; padding: 0 2px;
-            font-size: 1em; line-height: 1; color: #666;
+            border: none;
+            background: transparent;
+            cursor: pointer;
+            padding: 0 2px;
+            font-size: 1em;
+            line-height: 1;
+            color: var(--fg-dim);
         }
-        #monaco-wrap { flex: 1; position: relative; min-height: 0; }
+        .file-tab-close:hover { color: var(--fg); }
+        #monaco-wrap { flex: 1; position: relative; min-height: 0; background: var(--bg); }
         #monaco-host, #monaco-diff-host { position: absolute; inset: 0; }
         #monaco-diff-host { display: none; }
+        .thought-card {
+            padding: 6px 10px;
+            border-left: 2px solid var(--border);
+            margin: 4px 0;
+            max-width: 80%;
+            align-self: flex-start;
+            color: var(--fg-muted);
+        }
+        .btn-link {
+            margin: 4px 12px 8px;
+            padding: 4px 8px;
+            font-size: 0.8em;
+            cursor: pointer;
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--accent);
+        }
+        .btn-link:hover { background: var(--bg-hover); }
+        #btn-refresh-explorer {
+            float: right;
+            padding: 2px 8px;
+            font-size: 0.75em;
+        }
     </style>
 </head>
 <body>
@@ -260,12 +527,13 @@
                 <div id="input-area">
                     <input type="text" id="message-input" placeholder="Ask the agent... (/models to switch)" autofocus>
                     <button id="send-btn">Send</button>
+                    <button id="cancel-btn" disabled title="Cancel current turn">Cancel</button>
                 </div>
             </div>
         </div>
         <div id="editor-pane" class="pane">
             <div id="editor-sidebar">
-                <h4>Files <button type="button" id="btn-refresh-explorer" style="float:right;padding:2px 8px;font-size:0.8em;">Refresh</button></h4>
+                <h4>Files <button type="button" id="btn-refresh-explorer">Refresh</button></h4>
                 <div id="file-tree"></div>
                 <div id="unstaged-wrap">
                     <h4>Unstaged changes</h4>
@@ -307,6 +575,7 @@
             disposeChatEditors,
             mountDiffEditor,
             updateDiffEditor,
+            updateDiffFallback,
             extractDiffValue,
             initMonaco,
         } from '/editor.js';
@@ -314,6 +583,7 @@
         const messagesDiv = document.getElementById('messages');
         const inputArea = document.getElementById('message-input');
         const sendBtn = document.getElementById('send-btn');
+        const cancelBtn = document.getElementById('cancel-btn');
         const dirInput = document.getElementById('working-dir-input');
         const setDirBtn = document.getElementById('set-dir-btn');
         const statusDiv = document.getElementById('status');
@@ -371,7 +641,7 @@
         function showDeleteApproval(data) {
             pendingDeleteApprovalId = data.approvalId;
             deleteReason.textContent = data.reason ? `Requested by: ${data.reason}` : 'The agent wants to delete files.';
-            deletePaths.textContent = (data.paths || []).map(p => `• ${p}`).join('\n');
+            deletePaths.textContent = (data.paths || []).map(p => `- ${p}`).join('\n');
             deleteOverlay.classList.add('active');
             inputArea.disabled = true;
             sendBtn.disabled = true;
@@ -412,8 +682,14 @@
         }
 
         function updateContextInfo(data) {
+            lastContextData = data || lastContextData;
             const used = data.usedTokens || 0;
             const limit = data.contextLimit || 0;
+            if (data.usedSource !== 'estimated') {
+                contextBaseUsed = used;
+                contextLimit = limit;
+                contextEstAdded = 0;
+            }
             const source = data.usedSource === 'api' ? 'last request' : (used > 0 ? 'estimated' : '');
 
             if (used <= 0 && limit <= 0) {
@@ -430,7 +706,7 @@
             }
             if (source) text += ` · ${source}`;
             if (data.messageCount > 0) text += `\n${data.messageCount} messages`;
-            if (data.nearCompact) text += '\n⚠ near auto-compact';
+            if (data.nearCompact) text += '\nnear auto-compact';
             if (data.toolTruncated) text += '\nTool results truncated';
             contextInfoDiv.textContent = text;
 
@@ -466,6 +742,9 @@
             endStream();
             streamingToolCards = {};
             pendingToolCards = {};
+            historyToolCallArgs = {};
+            toolsStartedThisTurn = false;
+            setTurnActive(false);
         }
 
         let pendingSessionResponse = false;
@@ -478,6 +757,147 @@
         let pendingToolCards = {};
         let streamingToolCards = {};
         let toolCallCounter = 0;
+        let turnActive = false;
+        let toolsStartedThisTurn = false;
+        let contextBaseUsed = 0;
+        let contextLimit = 0;
+        let contextEstAdded = 0;
+        let lastContextData = null;
+        // Map toolCallId → args for history replay of patch_file diffs
+        let historyToolCallArgs = {};
+
+        function setTurnActive(active) {
+            turnActive = !!active;
+            if (cancelBtn) cancelBtn.disabled = !turnActive;
+            if (sendBtn) sendBtn.disabled = false; // send cancels+restarts; keep enabled
+            if (!active) {
+                toolsStartedThisTurn = false;
+            }
+        }
+
+        function estimateTokenCount(text) {
+            if (!text) return 0;
+            // Rough char/4 estimate matching TUI streaming estimate spirit.
+            return Math.max(1, Math.ceil(String(text).length / 4));
+        }
+
+        function bumpContextEstimate(delta) {
+            if (!delta || (contextBaseUsed <= 0 && contextLimit <= 0)) return;
+            contextEstAdded += estimateTokenCount(delta);
+            const used = contextBaseUsed + contextEstAdded;
+            const data = Object.assign({}, lastContextData || {}, {
+                usedTokens: used,
+                contextLimit: contextLimit || (lastContextData && lastContextData.contextLimit) || 0,
+                usedSource: 'estimated',
+                usedPercent: contextLimit > 0 ? used / contextLimit : 0,
+            });
+            // Mark estimated in the text via updateContextInfo source label
+            updateContextInfo(data);
+            // Append est marker
+            if (contextInfoDiv.textContent && !contextInfoDiv.textContent.includes('(est.)')) {
+                contextInfoDiv.textContent += ' (est.)';
+            }
+        }
+
+        // Collapse only when output is genuinely large (DOM / scroll cost).
+        const BIG_RESULT_CHARS = 32000;
+        const BIG_RESULT_LINES = 400;
+        const BIG_ARG_CHARS = 4000;
+
+        function isResultReallyBig(text) {
+            const s = text || '';
+            if (!s) return false;
+            if (s.length > BIG_RESULT_CHARS) return true;
+            // Avoid split on huge strings when length already qualifies.
+            let lines = 1;
+            for (let i = 0; i < s.length; i++) {
+                if (s.charCodeAt(i) === 10) {
+                    lines++;
+                    if (lines > BIG_RESULT_LINES) return true;
+                }
+            }
+            return false;
+        }
+
+        function summarizeResult(result, success) {
+            const trimmed = (result || '').trim();
+            if (!trimmed) return success ? '(empty)' : '(no output)';
+            // Show full output unless it's really big.
+            if (!isResultReallyBig(trimmed)) return trimmed;
+            const lines = trimmed.split('\n').length;
+            const chars = trimmed.length;
+            if (!success) {
+                let first = trimmed.split('\n')[0];
+                if (first.length > 200) first = first.slice(0, 197) + '...';
+                return `${first}\n\n… (${lines} lines, ${chars} chars)`;
+            }
+            return `(large output: ${lines} lines, ${chars} chars)`;
+        }
+
+        function appendExpandableResult(body, result, success, truncated) {
+            const content = document.createElement('div');
+            content.className = `tool-result-content ${success ? '' : 'error-content'}`;
+            const full = result || '';
+            const summary = summarizeResult(full, success);
+            content.textContent = summary;
+            body.appendChild(content);
+            if (summary !== full.trim() && (full.trim() || truncated)) {
+                const expandBtn = document.createElement('button');
+                expandBtn.textContent = truncated ? 'Show received output' : 'Show full output';
+                expandBtn.className = 'btn-link';
+                expandBtn.onclick = () => {
+                    content.textContent = full;
+                    expandBtn.remove();
+                };
+                body.appendChild(expandBtn);
+            }
+        }
+
+        function parseInlineJSONArgs(raw) {
+            const s = (raw || '').trim();
+            if (!s.startsWith('{')) return null;
+            try {
+                return JSON.parse(s);
+            } catch (_) {
+                return null;
+            }
+        }
+
+        function formatArgsCompact(rawJSON, maxLen = BIG_ARG_CHARS) {
+            const args = parseInlineJSONArgs(rawJSON);
+            if (!args || typeof args !== 'object') return '';
+            const parts = [];
+            for (const [k, v] of Object.entries(args)) {
+                if (k === 'diff') continue;
+                let val = typeof v === 'string' ? v : String(v);
+                if (val.length > maxLen) val = val.slice(0, maxLen - 3) + '...';
+                parts.push(`${k}=${JSON.stringify(val)}`);
+            }
+            return parts.length ? `(${parts.join(', ')})` : '';
+        }
+
+        function abortInFlightUI(message) {
+            finalizeThinking();
+            endStream();
+            removeThinkingStatus();
+            // Remove waiting spinners on pending cards
+            for (const id of Object.keys(pendingToolCards)) {
+                const cardInfo = pendingToolCards[id];
+                if (cardInfo && cardInfo.waiting) {
+                    cardInfo.waiting.remove();
+                    cardInfo.waiting = null;
+                }
+            }
+            for (const idx of Object.keys(streamingToolCards)) {
+                const cardInfo = streamingToolCards[idx];
+                if (cardInfo && cardInfo.argsStream) {
+                    cardInfo.argsStream.classList.remove('cursor');
+                }
+            }
+            streamingToolCards = {};
+            // Keep completed pending cards; clear only in-flight stream map
+            if (message) appendMessage('system', message);
+        }
 
         function appendMessage(role, text) {
             const msgDiv = document.createElement('div');
@@ -504,6 +924,7 @@
         function appendStreamToken(token) {
             if (currentStreamSpan) {
                 currentStreamSpan.textContent += token;
+                bumpContextEstimate(token);
                 messagesDiv.scrollTop = messagesDiv.scrollHeight;
             }
         }
@@ -527,10 +948,13 @@
         }
 
         function appendThinkingToken(token) {
+            // Match TUI: ignore thinking once any tool call has started this turn.
+            if (toolsStartedThisTurn) return;
             if (!currentThinkingSpan) {
                 showThinking();
             }
             currentThinkingSpan.textContent += token;
+            bumpContextEstimate(token);
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
         }
 
@@ -552,33 +976,29 @@
             }
 
             const header = document.createElement('div');
-            header.style.cssText = 'display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;font-size:0.85em;color:#888;padding:2px 0;';
-            const icon = document.createElement('span');
-            icon.textContent = '🤔';
+            header.style.cssText = 'display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;font-size:0.85em;color:var(--fg-muted);padding:2px 0;';
             const label = document.createElement('span');
             label.style.fontStyle = 'italic';
-            label.textContent = 'Thought';
+            label.textContent = 'Thinking';
             const toggle = document.createElement('span');
-            toggle.textContent = '▼';
+            toggle.textContent = '▾';
             toggle.style.fontSize = '0.8em';
-            header.appendChild(icon);
             header.appendChild(label);
             header.appendChild(toggle);
 
             const body = document.createElement('div');
-            body.style.cssText = 'font-size:0.85em;color:#888;font-style:italic;white-space:pre-wrap;padding:4px 0 0 24px;';
+            body.style.cssText = 'font-size:0.85em;color:var(--fg-muted);font-style:italic;white-space:pre-wrap;padding:4px 0 0 0;';
             body.textContent = content;
 
             div.innerHTML = '';
-            div.className = '';
+            div.className = 'thought-card';
             div.appendChild(header);
             div.appendChild(body);
-            div.style.cssText = 'padding:6px 10px;border-left:3px solid #ddd;margin:4px 0;max-width:80%;align-self:flex-start;';
 
             header.addEventListener('click', () => {
                 const collapsed = body.style.display === 'none';
                 body.style.display = collapsed ? '' : 'none';
-                toggle.textContent = collapsed ? '▼' : '▶';
+                toggle.textContent = collapsed ? '▾' : '▸';
             });
         }
 
@@ -594,13 +1014,14 @@
             if (!args || typeof args !== 'object') return '';
             const parts = [];
             for (const [key, value] of Object.entries(args)) {
+                // Diffs are shown in Monaco; keep the header compact.
                 if (key === 'diff' && typeof value === 'string') {
                     parts.push(`diff=<${value.length} chars>`);
                     continue;
                 }
                 let displayValue;
-                if (typeof value === 'string' && value.length > 80) {
-                    displayValue = `"${value.substring(0, 77)}..."`;
+                if (typeof value === 'string' && value.length > BIG_ARG_CHARS) {
+                    displayValue = `"${value.substring(0, BIG_ARG_CHARS - 3)}..."`;
                 } else if (typeof value === 'string') {
                     displayValue = `"${value}"`;
                 } else {
@@ -628,7 +1049,6 @@
 
             const icon = document.createElement('span');
             icon.className = 'tool-icon';
-            icon.textContent = '🔧';
 
             const toolName = document.createElement('span');
             toolName.className = 'tool-name';
@@ -640,7 +1060,7 @@
 
             const toggle = document.createElement('span');
             toggle.className = 'tool-toggle';
-            toggle.textContent = '▼';
+            toggle.textContent = '▾';
 
             header.appendChild(icon);
             header.appendChild(toolName);
@@ -653,6 +1073,8 @@
 
             card.appendChild(header);
 
+            // Always prepare a diff host for patch_file; other streaming tools
+            // keep the raw args stream until finalized.
             if (streaming && name === 'patch_file') {
                 monacoHost = document.createElement('div');
                 monacoHost.className = 'monaco-tool-host';
@@ -662,10 +1084,18 @@
                 argsStream.className = 'tool-args-streaming cursor';
                 argsStream.textContent = '(';
                 card.appendChild(argsStream);
+            } else if (name === 'patch_file' && args && typeof args.diff === 'string') {
+                monacoHost = document.createElement('div');
+                monacoHost.className = 'monaco-tool-host';
+                card.appendChild(monacoHost);
+                waiting = document.createElement('div');
+                waiting.className = 'tool-waiting';
+                waiting.textContent = 'executing...';
+                card.appendChild(waiting);
             } else {
                 waiting = document.createElement('div');
                 waiting.className = 'tool-waiting';
-                waiting.textContent = '⏳ executing...';
+                waiting.textContent = 'executing...';
                 card.appendChild(waiting);
             }
 
@@ -689,11 +1119,15 @@
                 argsStream,
                 monacoHost,
                 monacoEditor: null,
+                monacoMounting: null,
+                toolName: name,
+                args: args || {},
                 rawArgs: '',
                 pendingDiff: '',
                 rafScheduled: false,
                 scheduleDiffUpdate(text) {
-                    this.pendingDiff = text;
+                    this.pendingDiff = text || '';
+                    updateDiffFallback(this.monacoHost, this.pendingDiff);
                     if (this.rafScheduled) return;
                     this.rafScheduled = true;
                     requestAnimationFrame(() => {
@@ -706,40 +1140,107 @@
             return cardInfo;
         }
 
+        async function ensurePatchViewer(cardInfo, diffText) {
+            if (!cardInfo) return;
+            if (diffText != null && diffText !== '') {
+                cardInfo.pendingDiff = diffText;
+            }
+            if (!cardInfo.monacoHost) {
+                // Upgrade a non-diff streaming card into a patch viewer.
+                if (cardInfo.argsStream) {
+                    cardInfo.argsStream.remove();
+                    cardInfo.argsStream = null;
+                }
+                cardInfo.monacoHost = document.createElement('div');
+                cardInfo.monacoHost.className = 'monaco-tool-host';
+                // Insert before waiting/status if present
+                const waiting = cardInfo.card.querySelector('.tool-waiting');
+                if (waiting) cardInfo.card.insertBefore(cardInfo.monacoHost, waiting);
+                else cardInfo.card.appendChild(cardInfo.monacoHost);
+            }
+            updateDiffFallback(cardInfo.monacoHost, cardInfo.pendingDiff || '');
+
+            if (cardInfo.monacoEditor) {
+                if (cardInfo.pendingDiff) updateDiffEditor(cardInfo.monacoEditor, cardInfo.pendingDiff);
+                return;
+            }
+            if (cardInfo.monacoMounting) {
+                await cardInfo.monacoMounting;
+                if (cardInfo.monacoEditor && cardInfo.pendingDiff) {
+                    updateDiffEditor(cardInfo.monacoEditor, cardInfo.pendingDiff);
+                }
+                return;
+            }
+            cardInfo.monacoMounting = mountDiffEditor(cardInfo.monacoHost, cardInfo.pendingDiff || '')
+                .then((ed) => {
+                    cardInfo.monacoEditor = ed;
+                    if (ed && cardInfo.pendingDiff) updateDiffEditor(ed, cardInfo.pendingDiff);
+                    return ed;
+                })
+                .catch((err) => {
+                    console.warn('patch viewer monaco failed', err);
+                    updateDiffFallback(cardInfo.monacoHost, cardInfo.pendingDiff || '');
+                    return null;
+                })
+                .finally(() => {
+                    cardInfo.monacoMounting = null;
+                });
+            await cardInfo.monacoMounting;
+        }
+
         function startStreamingToolCard(index, name) {
             finalizeThinking();
             endStream();
+            toolsStartedThisTurn = true;
             const cardInfo = createToolCard(name, {}, { streaming: true, streamIndex: index });
-            if (name === 'patch_file' && cardInfo.monacoHost) {
-                mountDiffEditor(cardInfo.monacoHost, '').then((ed) => {
-                    cardInfo.monacoEditor = ed;
-                    if (cardInfo.pendingDiff) updateDiffEditor(ed, cardInfo.pendingDiff);
-                });
-            }
             streamingToolCards[index] = cardInfo;
+            if (name === 'patch_file') {
+                ensurePatchViewer(cardInfo, '').catch(() => {});
+            }
             return cardInfo;
         }
 
         function appendStreamingToolArgs(index, argsDelta) {
             const cardInfo = streamingToolCards[index];
             if (!cardInfo) return;
-            if (cardInfo.monacoHost) {
-                cardInfo.rawArgs = (cardInfo.rawArgs || '') + argsDelta;
-                const extracted = extractDiffValue(cardInfo.rawArgs);
-                if (extracted.ok) cardInfo.scheduleDiffUpdate(extracted.value);
+            cardInfo.rawArgs = (cardInfo.rawArgs || '') + (argsDelta || '');
+            bumpContextEstimate(argsDelta);
+
+            const tool = cardInfo.toolName;
+            const extracted = extractDiffValue(cardInfo.rawArgs);
+            if (tool === 'patch_file' || extracted.ok) {
+                cardInfo.toolName = 'patch_file';
+                if (extracted.ok) {
+                    ensurePatchViewer(cardInfo, extracted.value).catch(() => {});
+                } else {
+                    ensurePatchViewer(cardInfo, cardInfo.pendingDiff || '').catch(() => {});
+                }
+                // Compact non-diff keys in the header once JSON is parseable.
+                const compact = formatArgsCompact(cardInfo.rawArgs);
+                if (compact) cardInfo.toolArgs.textContent = compact;
                 messagesDiv.scrollTop = messagesDiv.scrollHeight;
                 return;
             }
-            if (cardInfo.argsStream) {
-                cardInfo.argsStream.textContent += argsDelta;
-                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+
+            // Non-patch tools: show compact args only when JSON is complete enough.
+            const compact = formatArgsCompact(cardInfo.rawArgs);
+            if (compact) {
+                cardInfo.toolArgs.textContent = compact;
+                if (cardInfo.argsStream) {
+                    cardInfo.argsStream.remove();
+                    cardInfo.argsStream = null;
+                }
+            } else if (cardInfo.argsStream) {
+                // Keep a short placeholder instead of dumping raw JSON.
+                cardInfo.argsStream.textContent = '…';
             }
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
         }
 
         function finalizeStreamingToolCard(index, id, name, args) {
             let cardInfo = streamingToolCards[index];
             if (!cardInfo) {
-                cardInfo = createToolCard(name, args);
+                cardInfo = createToolCard(name, args || {});
             } else {
                 delete streamingToolCards[index];
                 if (cardInfo.argsStream) {
@@ -748,82 +1249,109 @@
                     cardInfo.argsStream = null;
                 }
                 cardInfo.toolArgs.textContent = formatToolArgs(args);
-
-                if (name === 'patch_file' && args && typeof args.diff === 'string' && cardInfo.monacoHost) {
-                    cardInfo.scheduleDiffUpdate(args.diff);
-                }
+                cardInfo.args = args || {};
 
                 if (!cardInfo.waiting) {
                     const waiting = document.createElement('div');
                     waiting.className = 'tool-waiting';
-                    waiting.textContent = '⏳ executing...';
+                    waiting.textContent = 'executing...';
                     cardInfo.card.appendChild(waiting);
                     cardInfo.waiting = waiting;
                 }
             }
 
-            cardInfo.toolName = name;
+            cardInfo.toolName = name || cardInfo.toolName;
+            cardInfo.args = args || cardInfo.args || {};
             if (id) {
                 pendingToolCards[id] = cardInfo;
+            }
+
+            // patch_file: the diff lives in args, not the later tool_result summary.
+            if ((name === 'patch_file' || cardInfo.toolName === 'patch_file') && args && typeof args.diff === 'string') {
+                ensurePatchViewer(cardInfo, args.diff).catch(() => {});
             }
             return cardInfo;
         }
 
         async function updateToolCardWithResult(cardInfo, result, success, truncated, toolName) {
-            const { card, waiting, toggle } = cardInfo;
+            const { card, waiting } = cardInfo;
             if (waiting) waiting.remove();
+            cardInfo.waiting = null;
 
             const body = document.createElement('div');
             body.className = 'tool-result-body';
 
             const statusBar = document.createElement('div');
             statusBar.className = `tool-status-bar ${success ? 'success' : 'error'}`;
-            statusBar.textContent = success ? '✅ Success' : '❌ Error';
+            statusBar.textContent = success ? 'OK' : 'FAILED';
             body.appendChild(statusBar);
 
-            const isDiffTool = toolName === 'patch_file' || toolName === 'show_diff';
-            const looksLikeDiff = typeof result === 'string' && (
-                result.includes('@@') || result.startsWith('diff ') || result.startsWith('--- ')
-            );
+            const name = toolName || cardInfo.toolName || '';
+            const argsDiff = cardInfo.args && typeof cardInfo.args.diff === 'string' ? cardInfo.args.diff : '';
+            const pending = cardInfo.pendingDiff || argsDiff;
 
-            if (isDiffTool && success && (toolName === 'show_diff' || looksLikeDiff)) {
-                // show_diff: mount Monaco with the result. patch_file: keep streamed editor if present.
-                if (toolName === 'show_diff' || !cardInfo.monacoHost) {
-                    const host = document.createElement('div');
-                    host.className = 'monaco-tool-host';
-                    body.appendChild(host);
-                    card.appendChild(body);
-                    await mountDiffEditor(host, result || '');
-                } else {
-                    // patch_file already has live Monaco; append status only
-                    card.appendChild(body);
+            if (name === 'patch_file') {
+                // Ensure the patch (from args) is visible; result is usually a short summary.
+                if (pending) {
+                    await ensurePatchViewer(cardInfo, pending);
                 }
-            } else if (toolName === 'patch_file' && cardInfo.monacoHost) {
-                // Non-diff textual result (e.g. applied summary) under the live editor
-                const content = document.createElement('div');
-                content.className = `tool-result-content ${success ? '' : 'error-content'}`;
-                content.textContent = result;
-                body.appendChild(content);
+                if (result) {
+                    appendExpandableResult(body, result, success, truncated);
+                }
                 card.appendChild(body);
+            } else if (name === 'show_diff') {
+                const host = document.createElement('div');
+                host.className = 'monaco-tool-host';
+                body.appendChild(host);
+                card.appendChild(body);
+                await mountDiffEditor(host, result || '');
             } else {
-                const content = document.createElement('div');
-                content.className = `tool-result-content ${success ? '' : 'error-content'}`;
-                content.textContent = result;
-                body.appendChild(content);
-                if (truncated) {
-                    const expandBtn = document.createElement('button');
-                    expandBtn.textContent = 'Show full output';
-                    expandBtn.style.cssText = 'margin:4px 12px 8px;padding:4px 8px;font-size:0.8em;cursor:pointer;';
-                    expandBtn.onclick = () => {
-                        content.textContent = result;
-                        expandBtn.remove();
-                    };
-                    body.appendChild(expandBtn);
-                }
+                appendExpandableResult(body, result, success, truncated);
                 card.appendChild(body);
             }
 
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        async function replayHistory(history) {
+            historyToolCallArgs = {};
+            for (const h of history) {
+                if (h.role === 'user') {
+                    appendMessage('user', h.content || '');
+                } else if (h.role === 'assistant') {
+                    if (h.content) appendMessage('assistant', h.content);
+                    if (Array.isArray(h.toolCalls)) {
+                        for (const tc of h.toolCalls) {
+                            historyToolCallArgs[tc.id] = tc.args || {};
+                            const cardInfo = createToolCard(tc.name, tc.args || {});
+                            cardInfo.toolName = tc.name;
+                            cardInfo.args = tc.args || {};
+                            if (tc.name === 'patch_file' && tc.args && typeof tc.args.diff === 'string') {
+                                if (cardInfo.waiting) {
+                                    cardInfo.waiting.remove();
+                                    cardInfo.waiting = null;
+                                }
+                                await ensurePatchViewer(cardInfo, tc.args.diff);
+                            }
+                            if (tc.id) pendingToolCards[tc.id] = cardInfo;
+                        }
+                    }
+                } else if (h.role === 'tool') {
+                    const id = h.toolCallId;
+                    let cardInfo = id ? pendingToolCards[id] : null;
+                    const args = (id && historyToolCallArgs[id]) || {};
+                    const name = cardInfo ? cardInfo.toolName : '';
+                    if (!cardInfo) {
+                        // Orphan tool result — create a minimal card
+                        cardInfo = createToolCard(name || 'tool', args);
+                        cardInfo.toolName = name || 'tool';
+                        cardInfo.args = args;
+                    }
+                    if (id) delete pendingToolCards[id];
+                    const success = !String(h.content || '').trim().startsWith('Error:');
+                    await updateToolCardWithResult(cardInfo, h.content || '', success, false, cardInfo.toolName);
+                }
+            }
         }
 
         function connect() {
@@ -842,6 +1370,8 @@
                 if (handleServerMessage(data)) return;
 
                 if (data.type === 'thinking') {
+                    setTurnActive(true);
+                    if (toolsStartedThisTurn) return;
                     finalizeThinking();
                     const div = document.createElement('div');
                     div.id = 'status-thinking';
@@ -849,9 +1379,27 @@
                     div.textContent = 'thinking...';
                     messagesDiv.appendChild(div);
                     messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                } else if (data.type === 'waiting') {
+                    setTurnActive(true);
+                    removeThinkingStatus();
+                    let el = document.getElementById('status-waiting');
+                    if (!el) {
+                        el = document.createElement('div');
+                        el.id = 'status-waiting';
+                        el.className = 'message assistant thinking';
+                        messagesDiv.appendChild(el);
+                    }
+                    el.textContent = 'waiting for model...';
+                    messagesDiv.scrollTop = messagesDiv.scrollHeight;
                 } else if (data.type === 'thinking_token') {
+                    setTurnActive(true);
+                    const w = document.getElementById('status-waiting');
+                    if (w) w.remove();
                     appendThinkingToken(data.content || '');
                 } else if (data.type === 'stream') {
+                    setTurnActive(true);
+                    const w = document.getElementById('status-waiting');
+                    if (w) w.remove();
                     finalizeThinking();
                     if (!currentStreamDiv) startStream();
                     appendStreamToken(data.content);
@@ -859,19 +1407,38 @@
                     finalizeThinking();
                     endStream();
                 } else if (data.type === 'tool_call_start') {
+                    setTurnActive(true);
+                    const w = document.getElementById('status-waiting');
+                    if (w) w.remove();
                     startStreamingToolCard(data.index, data.tool);
                 } else if (data.type === 'tool_call_delta') {
                     finalizeThinking();
                     if (!streamingToolCards[data.index]) {
                         startStreamingToolCard(data.index, data.tool || 'tool');
+                    } else if (data.tool) {
+                        streamingToolCards[data.index].toolName = data.tool;
                     }
                     appendStreamingToolArgs(data.index, data.argsDelta || '');
                 } else if (data.type === 'tool_call') {
                     finalizeThinking();
                     endStream();
+                    toolsStartedThisTurn = true;
                     finalizeStreamingToolCard(data.index, data.toolCallId, data.tool, data.args || {});
+                } else if (data.type === 'tool_execute') {
+                    // Update waiting text on the matching pending card if present
+                    const name = data.tool || '';
+                    for (const id of Object.keys(pendingToolCards)) {
+                        const cardInfo = pendingToolCards[id];
+                        if (cardInfo && cardInfo.waiting && (!name || cardInfo.toolName === name)) {
+                            cardInfo.waiting.textContent = name ? `running ${name}...` : 'executing...';
+                        }
+                    }
+                    if (name) {
+                        statusDiv.innerText = `Status: running ${name}`;
+                    }
                 } else if (data.type === 'tool_result') {
                     finalizeThinking();
+                    statusDiv.innerText = 'Status: Connected';
                     const cardInfo = pendingToolCards[data.toolCallId];
                     if (cardInfo) {
                         updateToolCardWithResult(
@@ -885,6 +1452,16 @@
                     } else {
                         appendMessage('system', `[${data.tool}] ${data.result}`);
                     }
+                } else if (data.type === 'cancelled') {
+                    abortInFlightUI(data.content || 'Cancelled.');
+                    setTurnActive(false);
+                    statusDiv.innerText = 'Status: Connected';
+                } else if (data.type === 'turn_end') {
+                    setTurnActive(false);
+                    statusDiv.innerText = 'Status: Connected';
+                    removeThinkingStatus();
+                    const w = document.getElementById('status-waiting');
+                    if (w) w.remove();
                 } else if (data.type === 'clear_chat') {
                     clearChat();
                     pendingSessionResponse = true;
@@ -913,9 +1490,14 @@
                     updateContextInfo(data);
                 } else if (data.type === 'history') {
                     if (data.history) {
-                        for (const h of data.history) {
-                            appendMessage(h.role, h.content);
-                        }
+                        replayHistory(data.history).catch((err) => {
+                            console.warn('history replay failed', err);
+                            for (const h of data.history) {
+                                if (h.role === 'user' || h.role === 'assistant') {
+                                    if (h.content) appendMessage(h.role, h.content);
+                                }
+                            }
+                        });
                     }
                 } else if (data.type === 'config') {
                     applyServerConfig(data);
@@ -944,17 +1526,39 @@
                 appendMessage('system', 'Not connected — wait for reconnection.');
                 return;
             }
+            if (turnActive) {
+                // Sending while busy cancels the current turn (same as TUI interrupt + new prompt).
+                ws.send(JSON.stringify({ type: 'cancel' }));
+                abortInFlightUI(null);
+            }
             appendMessage('user', text);
             streamingToolCards = {};
             pendingToolCards = {};
+            toolsStartedThisTurn = false;
+            contextEstAdded = 0;
+            statusDiv.innerText = 'Status: running...';
             ws.send(JSON.stringify({ type: 'message', content: text }));
             inputArea.value = '';
+        };
+
+        cancelBtn.onclick = () => {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            if (!turnActive) return;
+            ws.send(JSON.stringify({ type: 'cancel' }));
+            // Tear down immediately; server also emits cancelled + turn_end.
+            abortInFlightUI(null);
+            setTurnActive(false);
+            statusDiv.innerText = 'Status: Connected';
         };
 
         inputArea.onkeydown = (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
                 sendBtn.onclick();
+            }
+            if (e.key === 'Escape' && turnActive) {
+                e.preventDefault();
+                cancelBtn.onclick();
             }
         };
 
@@ -964,6 +1568,7 @@
             ws.send(JSON.stringify({ type: 'config', workingDir: dir }));
         };
 
+        setTurnActive(false);
         connect();
     </script>
 </body>

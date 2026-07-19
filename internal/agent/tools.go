@@ -181,11 +181,11 @@ func BuiltinTools() []llm.Tool {
 						"description": "Unified diff text. Format:\n" +
 							"Each file section starts with '--- a/path' and '+++ b/path' (a/ and b/ prefixes are optional).\n" +
 							"Then one or more hunks: '@@ -oldStart,oldCount +newStart,newCount @@' followed by context lines (space prefix), removed lines (minus prefix), and added lines (plus prefix).\n" +
-							"Multi-file patches stack multiple ---/+++/@@ sections back-to-back.\n\n" +
+							"Multi-file patches stack multiple ---/+++/@@ sections back-to-back (blank lines or 'diff --git' headers between files are OK).\n\n" +
 							"Example (single file, single hunk):\n" +
-							"--- a/main.go\n+++ b/main.go\n@@ -1,4 +1,5 @@\n package main\n \n+// new comment\n func main() {\n }\n\n" +
+							"--- a/main.go\n+++ b/main.go\n@@ -1,4 +1,5 @@\n package main\n \n+// new comment\n func main() {\n }\n" +
 							"Example (two files):\n" +
-							"--- a/foo.go\n+++ b/foo.go\n@@ -3,2 +3,3 @@\n  x := 1\n+ y := 2\n  z := 3\n--- a/bar.go\n+++ b/bar.go\n@@ -10,1 +10,2 @@\n  result := compute()\n+ cache(result)\n",
+							"--- a/foo.go\n+++ b/foo.go\n@@ -3,2 +3,3 @@\n x := 1\n+y := 2\n z := 3\n--- a/bar.go\n+++ b/bar.go\n@@ -10,1 +10,2 @@\n result := compute()\n+cache(result)\n",
 					},
 					"dry_run": map[string]interface{}{"type": "boolean", "description": "If true, validate the patch and report what would change without writing. Set to false (or omit) to actually apply."},
 					"fuzzy":   map[string]interface{}{"type": "boolean", "description": "If false, require exact byte-for-byte context match. Omit or set true (the default) to tolerate: trailing whitespace on context lines, context lines shifted by a few lines (e.g. when a file header was added above the target region), and whitespace-only differences between context and the actual file. You almost always want the default (fuzzy=true)."},

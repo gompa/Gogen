@@ -182,9 +182,9 @@ func main() {
 		s := server.NewServer(a, cfg)
 		addr := cfg.WebBind
 		if addr == "" {
-			addr = "127.0.0.1:8080"
+			addr = "127.0.0.1:8081"
 		} else if !strings.Contains(addr, ":") {
-			addr += ":8080"
+			addr += ":8081"
 		}
 		fmt.Printf("Starting web server on %s\n", addr)
 		if cfg.WebAuthToken != "" {

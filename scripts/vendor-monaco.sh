@@ -18,7 +18,7 @@ npm install "monaco-editor@${MONACO_VERSION}" esbuild --no-fund --no-audit
 
 mkdir -p "$OUT"
 
-# Entry that re-exports the full editor API (languages included via editor.main).
+# Entry that re-exports the full editor API.
 cat > entry.mjs <<'EOF'
 import * as monaco from 'monaco-editor';
 export default monaco;

@@ -87,7 +87,7 @@ func TestPatchFileDryRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(msg, "Dry run OK") || !strings.Contains(msg, "would modify") {
+	if !strings.Contains(msg, "Dry run OK") || !strings.Contains(msg, "would change") {
 		t.Fatalf("unexpected dry run message: %s", msg)
 	}
 	got, err := os.ReadFile(path)

@@ -1,7 +1,25 @@
 // Monaco editor workspace for GoGen web UI.
-// Loaded as a module from index.html after MonacoEnvironment is set.
 
 import monaco from '/monaco/editor.bundle.js';
+
+// Must be set before any editor/worker is created.
+self.MonacoEnvironment = {
+  getWorker(_workerId, label) {
+    const map = {
+      json: '/monaco/json.worker.js',
+      css: '/monaco/css.worker.js',
+      scss: '/monaco/css.worker.js',
+      less: '/monaco/css.worker.js',
+      html: '/monaco/html.worker.js',
+      handlebars: '/monaco/html.worker.js',
+      razor: '/monaco/html.worker.js',
+      typescript: '/monaco/ts.worker.js',
+      javascript: '/monaco/ts.worker.js',
+    };
+    const url = map[label] || '/monaco/editor.worker.js';
+    return new Worker(url, { type: 'module' });
+  },
+};
 
 export const GOGEN_UI = {
   // Flip to false for inline (unified-style) DiffEditor rendering.
@@ -52,25 +70,83 @@ function wsRequest(type, payload = {}) {
 
 export async function initMonaco() {
   if (monacoReady) return monaco;
-  self.MonacoEnvironment = {
-    getWorker(_workerId, label) {
-      const map = {
-        json: '/monaco/json.worker.js',
-        css: '/monaco/css.worker.js',
-        scss: '/monaco/css.worker.js',
-        less: '/monaco/css.worker.js',
-        html: '/monaco/html.worker.js',
-        handlebars: '/monaco/html.worker.js',
-        razor: '/monaco/html.worker.js',
-        typescript: '/monaco/ts.worker.js',
-        javascript: '/monaco/ts.worker.js',
-      };
-      const url = map[label] || '/monaco/editor.worker.js';
-      return new Worker(url, { type: 'module' });
+
+  // Monaco 0.52+ no longer ships a built-in unified-diff highlighter.
+  if (!monaco.languages.getLanguages().some((l) => l.id === 'diff')) {
+    monaco.languages.register({ id: 'diff' });
+  }
+  monaco.languages.setMonarchTokensProvider('diff', {
+    tokenizer: {
+      root: [
+        [/^\+\+\+.*$/, 'meta.diff.header'],
+        [/^---.*$/, 'meta.diff.header'],
+        [/^diff .*$/, 'meta.diff'],
+        [/^index .*$/, 'comment'],
+        [/^@@.*@@.*$/, 'meta.diff.hunk'],
+        [/^\+.*$/, 'markup.inserted'],
+        [/^-.*$/, 'markup.deleted'],
+      ],
     },
-  };
+  });
+
+  // Strong diff colors for unified patches (language tokens + decorations).
+  monaco.editor.defineTheme('gogen-dark', {
+    base: 'vs-dark',
+    inherit: true,
+    rules: [
+      { token: 'comment', foreground: '6A9955' },
+      { token: 'meta.diff', foreground: '569CD6' },
+      { token: 'meta.diff.header', foreground: '569CD6', fontStyle: 'bold' },
+      { token: 'meta.diff.hunk', foreground: 'C586C0' },
+      { token: 'markup.inserted', foreground: '4EC9B0' },
+      { token: 'markup.deleted', foreground: 'F14C4C' },
+    ],
+    colors: {
+      'diffEditor.insertedTextBackground': '#2ea04340',
+      'diffEditor.removedTextBackground': '#f8514940',
+      'diffEditor.insertedLineBackground': '#2ea04326',
+      'diffEditor.removedLineBackground': '#f8514926',
+      'editorGutter.addedBackground': '#2ea043',
+      'editorGutter.deletedBackground': '#f85149',
+      'editorGutter.modifiedBackground': '#d29922',
+    },
+  });
+  monaco.editor.setTheme('gogen-dark');
   monacoReady = true;
   return monaco;
+}
+
+/** Colorize unified-diff lines via decorations (works even if language tokens are missing). */
+export function applyUnifiedDiffDecorations(ed) {
+  if (!ed) return;
+  const model = ed.getModel();
+  if (!model) return;
+  const lineCount = model.getLineCount();
+  const decorations = [];
+  for (let i = 1; i <= lineCount; i++) {
+    const text = model.getLineContent(i);
+    let cls = null;
+    if (text.startsWith('+++') || text.startsWith('---') || text.startsWith('diff ') || text.startsWith('index ')) {
+      cls = 'gogen-diff-meta';
+    } else if (text.startsWith('@@')) {
+      cls = 'gogen-diff-hunk';
+    } else if (text.startsWith('+')) {
+      cls = 'gogen-diff-add';
+    } else if (text.startsWith('-')) {
+      cls = 'gogen-diff-del';
+    }
+    if (!cls) continue;
+    decorations.push({
+      range: new monaco.Range(i, 1, i, model.getLineMaxColumn(i)),
+      options: {
+        isWholeLine: true,
+        className: cls,
+        marginClassName: cls + '-margin',
+      },
+    });
+  }
+  const prev = ed.__gogenDiffDecorations || [];
+  ed.__gogenDiffDecorations = ed.deltaDecorations(prev, decorations);
 }
 
 function ensureEditors() {
@@ -79,6 +155,7 @@ function ensureEditors() {
   if (!editor) {
     editor = monaco.editor.create(host, {
       automaticLayout: true,
+      theme: 'gogen-dark',
       minimap: { enabled: false },
       fontSize: 13,
       wordWrap: 'on',
@@ -114,9 +191,12 @@ function showDiffPane() {
     diffEditor = monaco.editor.createDiffEditor(diffHost, {
       automaticLayout: true,
       readOnly: true,
+      theme: 'gogen-dark',
       renderSideBySide: GOGEN_UI.diffRenderSideBySide,
       minimap: { enabled: false },
       fontSize: 13,
+      renderIndicators: true,
+      originalEditable: false,
     });
   } else {
     diffEditor.updateOptions({ renderSideBySide: GOGEN_UI.diffRenderSideBySide });
@@ -146,7 +226,7 @@ function updateDirtyIndicators() {
     if (mode === 'diff' && activePath) {
       label.textContent = `${activePath} (unstaged diff)`;
     } else if (activePath) {
-      label.textContent = isDirty(activePath) ? `${activePath} •` : activePath;
+      label.textContent = isDirty(activePath) ? `${activePath} *` : activePath;
     } else {
       label.textContent = 'No file open';
     }
@@ -163,7 +243,7 @@ function renderTabs() {
     tab.title = path;
     const name = document.createElement('span');
     name.className = 'file-tab-name';
-    name.textContent = (isDirty(path) ? '• ' : '') + basename(path);
+    name.textContent = (isDirty(path) ? '* ' : '') + basename(path);
     const close = document.createElement('button');
     close.className = 'file-tab-close';
     close.type = 'button';
@@ -444,23 +524,65 @@ export function extractDiffValue(rawJSON) {
 
 export async function mountDiffEditor(container, value, opts = {}) {
   await initMonaco();
+  // Keep a fallback <pre> so diffs remain visible if Monaco layout/workers fail.
   container.innerHTML = '';
   container.classList.add('monaco-tool-host');
-  const ed = monaco.editor.create(container, {
-    value: value || '',
-    language: 'diff',
-    readOnly: true,
-    automaticLayout: true,
-    minimap: { enabled: false },
-    fontSize: 12,
-    wordWrap: 'off',
-    scrollBeyondLastLine: false,
-    lineNumbers: 'off',
-    folding: false,
-    ...opts,
-  });
-  chatEditors.add(ed);
-  return ed;
+
+  const fallback = document.createElement('pre');
+  fallback.className = 'diff-fallback';
+  container.appendChild(fallback);
+  updateDiffFallback(container, value || '');
+
+  try {
+    const host = document.createElement('div');
+    host.className = 'monaco-tool-editor';
+    host.style.visibility = 'hidden';
+    container.appendChild(host);
+
+    const ed = monaco.editor.create(host, {
+      value: value || '',
+      language: 'diff',
+      readOnly: true,
+      theme: 'gogen-dark',
+      // Fixed host size — avoid ResizeObserver fighting flex layout.
+      automaticLayout: false,
+      minimap: { enabled: false },
+      fontSize: 12,
+      wordWrap: 'on',
+      scrollBeyondLastLine: false,
+      lineNumbers: 'on',
+      folding: false,
+      renderLineHighlight: 'none',
+      ...opts,
+    });
+    chatEditors.add(ed);
+    applyUnifiedDiffDecorations(ed);
+
+    const layoutFixed = () => {
+      const w = container.clientWidth || host.clientWidth;
+      const h = container.clientHeight || 280;
+      if (w > 0 && h > 0) {
+        ed.layout({ width: w, height: h });
+      }
+    };
+
+    // Layout after the tool card has a real width in the flex column.
+    requestAnimationFrame(() => {
+      try {
+        layoutFixed();
+        // Prefer Monaco once it has painted; hide plain fallback.
+        if (host.clientWidth > 0 && host.clientHeight > 0) {
+          fallback.style.display = 'none';
+          host.style.visibility = 'visible';
+          layoutFixed();
+        }
+      } catch (_) { /* keep fallback visible */ }
+    });
+    return ed;
+  } catch (err) {
+    console.warn('monaco diff mount failed, using text fallback', err);
+    return null;
+  }
 }
 
 export function updateDiffEditor(ed, value) {
@@ -469,8 +591,43 @@ export function updateDiffEditor(ed, value) {
   if (!model) return;
   if (model.getValue() === value) return;
   model.setValue(value);
+  applyUnifiedDiffDecorations(ed);
   const line = model.getLineCount();
   ed.revealLine(line);
+  requestAnimationFrame(() => {
+    try {
+      const dom = ed.getDomNode();
+      const parent = dom && dom.parentElement;
+      const host = parent && parent.parentElement;
+      const w = (host && host.clientWidth) || (dom && dom.clientWidth) || 0;
+      const h = (host && host.clientHeight) || 280;
+      if (w > 0) ed.layout({ width: w, height: h });
+    } catch (_) { /* ignore */ }
+  });
+}
+
+/** Update fallback <pre> inside a monaco-tool-host (always kept in sync). */
+export function updateDiffFallback(container, value) {
+  if (!container) return;
+  const pre = container.querySelector('.diff-fallback');
+  if (!pre) return;
+  // Colorize plain-text fallback so diffs stay readable if Monaco fails.
+  const text = value || '';
+  pre.textContent = '';
+  for (const line of text.split('\n')) {
+    const span = document.createElement('span');
+    span.textContent = line + '\n';
+    if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('diff ') || line.startsWith('index ')) {
+      span.className = 'gogen-diff-meta';
+    } else if (line.startsWith('@@')) {
+      span.className = 'gogen-diff-hunk';
+    } else if (line.startsWith('+')) {
+      span.className = 'gogen-diff-add';
+    } else if (line.startsWith('-')) {
+      span.className = 'gogen-diff-del';
+    }
+    pre.appendChild(span);
+  }
 }
 
 export function disposeChatEditors() {

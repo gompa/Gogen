@@ -43,7 +43,7 @@ type Config struct {
 	TestCommand       string
 	LintCommand       string
 
-	WebBind           string // listen address for --web (default 127.0.0.1:8080)
+	WebBind           string // listen address for --web (default 127.0.0.1:8081)
 	WebAllowedOrigins string // comma-separated host allowlist; empty uses localhost defaults
 	WebAuthToken      string // required for non-loopback binds; also GOGEN_WEB_TOKEN
 	WebTLSCertFile    string // PEM cert for TLS (required with key for non-loopback)
@@ -84,7 +84,7 @@ func Defaults() Config {
 		DebugLog:             "",
 		DebugSession:         "",
 		MCP:                  "on",
-		WebBind:              "127.0.0.1:8080",
+		WebBind:              "127.0.0.1:8081",
 		WebAllowedOrigins:    "",
 		WebTLSCertFile:       "",
 		WebTLSKeyFile:        "",

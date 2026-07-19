@@ -168,6 +168,62 @@ func TestPatchFileCRLFLineEndings(t *testing.T) {
 	}
 }
 
+func TestPatchFileOnDiskCRLF(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.go")
+	// File on disk uses CRLF (Windows checkout), patch uses LF.
+	original := "package main\r\n\r\nfunc main() {\r\n}\r\n"
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	diff := "" +
+		"--- a/main.go\n" +
+		"+++ b/main.go\n" +
+		"@@ -1,4 +1,5 @@\n" +
+		" package main\n" +
+		" \n" +
+		"+// from-lf-patch\n" +
+		" func main() {\n" +
+		" }\n"
+
+	exec := NewExecutor(dir)
+	exec.RequireDeleteApproval = false
+	_, err := exec.PatchFile(context.Background(), diff, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "// from-lf-patch") {
+		t.Fatalf("on-disk CRLF file not patched: %q", got)
+	}
+}
+
+func TestPatchFileRejectsEmptyHunks(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.go")
+	original := "package main\n"
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Malformed @@ without recognizable -/+ sections should not silently succeed.
+	diff := "--- a/main.go\n+++ b/main.go\n@@ broken @@\n package main\n"
+	exec := NewExecutor(dir)
+	_, err := exec.PatchFile(context.Background(), diff, false, true)
+	if err == nil {
+		t.Fatal("expected malformed hunk header to fail")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != original {
+		t.Fatalf("file should be unchanged: %q", got)
+	}
+}
+
 func TestPatchFileTrailingWhitespaceTolerance(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "main.go")

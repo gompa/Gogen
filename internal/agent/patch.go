@@ -167,11 +167,24 @@ func (e *Executor) planPatch(pf patchFile, fuzzy bool) (patchPlan, string, error
 	}
 
 	if pf.newName == "/dev/null" {
-		return patchPlan{target: target, secure: secure, delete: true}, target + " (would delete)", nil
+		return patchPlan{target: target, secure: secure, delete: true}, target + " (validated delete)", nil
+	}
+
+	isCreate := pf.oldName == "/dev/null"
+	if !isCreate && len(pf.hunks) == 0 {
+		return patchPlan{}, target, fmt.Errorf("no hunks found (check @@ headers use the form '@@ -start,count +start,count @@' with a space after @@)")
+	}
+
+	if isCreate {
+		if _, err := os.Stat(secure); err == nil {
+			return patchPlan{}, target, fmt.Errorf("file already exists; use a modify patch (--- a/%s) instead of creating from /dev/null", target)
+		} else if !os.IsNotExist(err) {
+			return patchPlan{}, target, err
+		}
 	}
 
 	var original []string
-	if pf.oldName != "/dev/null" {
+	if !isCreate {
 		data, err := os.ReadFile(secure)
 		if err != nil {
 			return patchPlan{}, target, fmt.Errorf("read: %w", err)
@@ -184,26 +197,58 @@ func (e *Executor) planPatch(pf patchFile, fuzzy bool) (patchPlan, string, error
 		return patchPlan{}, target, err
 	}
 
-	label := target
-	if pf.oldName == "/dev/null" {
-		label = target + " (would create)"
-	} else {
-		label = target + " (would modify)"
+	label := target + " (validated)"
+	if isCreate {
+		label = target + " (validated create)"
 	}
 
 	return patchPlan{
 		target:  target,
 		secure:  secure,
 		updated: joinLinesPreserveTrailing(updated),
-		create:  pf.oldName == "/dev/null",
+		create:  isCreate,
 	}, label, nil
 }
 
 func normalizePatchPath(name string) string {
 	name = strings.TrimSpace(name)
+	// Git diffs often append a tab + timestamp: "path\t2024-01-01 12:00:00.000000000 +0000"
+	if i := strings.IndexByte(name, '\t'); i >= 0 {
+		name = name[:i]
+	}
+	// Some tools use a space before an ISO-ish timestamp instead of a tab.
+	if i := strings.IndexByte(name, ' '); i >= 0 {
+		rest := strings.TrimSpace(name[i+1:])
+		if looksLikePatchTimestamp(rest) {
+			name = name[:i]
+		}
+	}
+	name = strings.TrimSpace(name)
+	if len(name) >= 2 {
+		if (name[0] == '"' && name[len(name)-1] == '"') || (name[0] == '\'' && name[len(name)-1] == '\'') {
+			name = name[1 : len(name)-1]
+		}
+	}
 	name = strings.TrimPrefix(name, "a/")
 	name = strings.TrimPrefix(name, "b/")
 	return filepath.Clean(name)
+}
+
+func looksLikePatchTimestamp(s string) bool {
+	if s == "" {
+		return false
+	}
+	// ISO date / epoch-style: "2024-01-01 ..."
+	if s[0] >= '0' && s[0] <= '9' {
+		return true
+	}
+	lower := strings.ToLower(s)
+	for _, day := range []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"} {
+		if strings.HasPrefix(lower, day) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseUnifiedDiff(diff string) ([]patchFile, error) {
@@ -226,14 +271,33 @@ func parseUnifiedDiff(diff string) ([]patchFile, error) {
 		}
 		hunk = nil
 	}
+	flushFile := func() {
+		flushHunk()
+		if current != nil {
+			files = append(files, *current)
+			current = nil
+		}
+	}
 
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
+		// Git multi-file diffs insert these between file sections.
+		if strings.HasPrefix(line, "diff --git ") {
+			flushFile()
+			continue
+		}
+		if hunk == nil && (strings.HasPrefix(line, "index ") ||
+			strings.HasPrefix(line, "old mode ") ||
+			strings.HasPrefix(line, "new mode ") ||
+			strings.HasPrefix(line, "new file mode ") ||
+			strings.HasPrefix(line, "deleted file mode ") ||
+			strings.HasPrefix(line, "similarity index ") ||
+			strings.HasPrefix(line, "rename from ") ||
+			strings.HasPrefix(line, "rename to ")) {
+			continue
+		}
 		if strings.HasPrefix(line, "--- ") {
-			flushHunk()
-			if current != nil {
-				files = append(files, *current)
-			}
+			flushFile()
 			current = &patchFile{oldName: strings.TrimSpace(strings.TrimPrefix(line, "--- "))}
 			continue
 		}
@@ -244,7 +308,7 @@ func parseUnifiedDiff(diff string) ([]patchFile, error) {
 			current.newName = strings.TrimSpace(strings.TrimPrefix(line, "+++ "))
 			continue
 		}
-		if strings.HasPrefix(line, "@@ ") {
+		if strings.HasPrefix(line, "@@") {
 			flushHunk()
 			if current == nil {
 				return nil, fmt.Errorf("malformed diff: hunk before file header")
@@ -265,7 +329,12 @@ func parseUnifiedDiff(diff string) ([]patchFile, error) {
 		// Empty lines in a hunk body are treated as empty context lines.
 		// Unified diffs normally encode them as a single space (" "), but LLMs
 		// often emit a bare blank line instead — dropping those corrupts patches.
+		// Exception: blanks that only separate file sections must not become context.
 		if len(line) == 0 {
+			if isPatchFileBoundaryAhead(lines, i+1) {
+				flushHunk()
+				continue
+			}
 			hunk.oldLines = append(hunk.oldLines, "")
 			hunk.newLines = append(hunk.newLines, "")
 			continue
@@ -280,23 +349,40 @@ func parseUnifiedDiff(diff string) ([]patchFile, error) {
 		case '+':
 			hunk.newLines = append(hunk.newLines, line[1:])
 		default:
-			return nil, fmt.Errorf("malformed hunk line: %q", line)
+			return nil, fmt.Errorf("malformed hunk line: %q (context lines need a leading space)", line)
 		}
 	}
-	flushHunk()
-	if current != nil {
-		files = append(files, *current)
-	}
+	flushFile()
 	return files, nil
 }
 
+// isPatchFileBoundaryAhead reports whether the next non-empty line starts a new
+// file section (or only trailing blanks remain). Used so blank separators between
+// files are not absorbed as empty hunk context.
+func isPatchFileBoundaryAhead(lines []string, from int) bool {
+	for j := from; j < len(lines); j++ {
+		if lines[j] == "" {
+			continue
+		}
+		return strings.HasPrefix(lines[j], "--- ") || strings.HasPrefix(lines[j], "diff --git ")
+	}
+	return true
+}
+
 func parseHunkHeader(line string) (patchHunk, error) {
-	parts := strings.Fields(line)
-	if len(parts) < 3 {
+	// Accept both "@@ -1,4 +1,5 @@" and compacted "@@-1,4 +1,5@@".
+	rest := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "@@"))
+	rest = strings.TrimSuffix(rest, "@@")
+	rest = strings.TrimSpace(rest)
+	parts := strings.Fields(rest)
+	if len(parts) < 2 {
 		return patchHunk{}, fmt.Errorf("invalid hunk header: %q", line)
 	}
-	oldPart := strings.TrimPrefix(parts[1], "-")
-	newPart := strings.TrimPrefix(parts[2], "+")
+	oldPart := strings.TrimPrefix(parts[0], "-")
+	newPart := strings.TrimPrefix(parts[1], "+")
+	if oldPart == parts[0] || newPart == parts[1] {
+		return patchHunk{}, fmt.Errorf("invalid hunk header: %q", line)
+	}
 	oldStart, err := parseDiffLineCount(oldPart)
 	if err != nil {
 		return patchHunk{}, err
@@ -336,28 +422,37 @@ func applyPatchHunks(original []string, hunks []patchHunk, fuzzy bool) ([]string
 		n := len(h.oldLines)
 		if n == 0 {
 			if len(h.newLines) > 0 {
+				if start > len(out) {
+					start = len(out)
+				}
 				out = append(out[:start], append(append([]string(nil), h.newLines...), out[start:]...)...)
 				lineDelta += len(h.newLines)
 			}
 			continue
 		}
-		if start > len(out) {
-			return nil, fmt.Errorf("hunk %d/%d starts at line %d but file has %d lines", hi+1, len(hunks), h.oldStart, len(out)-lineDelta)
-		}
-		end := start + n
-		if end > len(out) {
+		inBounds := start <= len(out) && start+n <= len(out)
+		if !inBounds && !fuzzy {
+			if start > len(out) {
+				return nil, fmt.Errorf("hunk %d/%d starts at line %d but file has %d lines", hi+1, len(hunks), h.oldStart, len(out)-lineDelta)
+			}
 			return nil, fmt.Errorf("hunk %d/%d extends past end of file (line %d)", hi+1, len(hunks), h.oldStart+n-1)
 		}
-		actual := out[start:end]
-		matched := findHunkMatch(out, h.oldLines, start, n, fuzzy)
+		hint := start
+		if hint > len(out) {
+			hint = len(out)
+		}
+		var actual []string
+		if inBounds {
+			actual = out[start : start+n]
+		} else if hint < len(out) {
+			actual = out[hint:]
+		}
+		matched := findHunkMatch(out, h.oldLines, hint, n, fuzzy)
 		if matched < 0 {
-			return nil, formatHunkMismatch(hi+1, len(hunks), start+1, actual, h.oldLines, fuzzy)
+			return nil, formatHunkMismatch(hi+1, len(hunks), hint+1, actual, h.oldLines, fuzzy)
 		}
-		if matched != start {
-			start = matched
-			end = start + n
-			_ = actual // use the matched location; actual is reassigned below if needed
-		}
+		start = matched
+		end := start + n
 		replacement := append([]string(nil), h.newLines...)
 		out = append(out[:start], append(replacement, out[end:]...)...)
 		lineDelta += len(replacement) - n
@@ -402,9 +497,13 @@ func formatHunkMismatch(hunkNum, hunkTotal, line int, actual, expected []string,
 	msg := fmt.Sprintf("hunk %d/%d context mismatch at line %d", hunkNum, hunkTotal, line+firstDiff)
 	if firstDiff < len(actual) && firstDiff < len(expected) {
 		msg += fmt.Sprintf(": file has %q, patch expects %q", actual[firstDiff], expected[firstDiff])
+	} else if len(actual) == 0 {
+		msg += ": hunk context not found in file"
 	}
 	if !fuzzy {
 		msg += " (fuzzy matching is disabled; re-read the file and regenerate the diff, or omit fuzzy=false)"
+	} else {
+		msg += " (re-read the file and regenerate the diff with exact current context)"
 	}
 	return fmt.Errorf("%s", msg)
 }
@@ -453,7 +552,7 @@ func linesEqualFuzzy(a, b []string) bool {
 		return false
 	}
 	for i := range a {
-		if strings.TrimRight(a[i], " \t") != strings.TrimRight(b[i], " \t") {
+		if strings.TrimRight(a[i], " \t\r") != strings.TrimRight(b[i], " \t\r") {
 			return false
 		}
 	}
@@ -507,6 +606,9 @@ func splitLinesPreserveTrailing(s string) []string {
 	if s == "" {
 		return nil
 	}
+	// Normalize CRLF/CR on disk so patches with LF context still match Windows checkouts.
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
 	lines := strings.Split(strings.TrimSuffix(s, "\n"), "\n")
 	return lines
 }
