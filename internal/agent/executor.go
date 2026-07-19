@@ -246,6 +246,20 @@ func (e *Executor) WriteFile(path string, content string) error {
 	return writeFileAtomic(secure, []byte(content), 0o644)
 }
 
+// OverwriteFile creates or overwrites a file under the working directory.
+func (e *Executor) OverwriteFile(path string, content string) error {
+	secure, err := e.securePath(path)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(secure, []byte(content), 0o644)
+}
+
+// ReadFileRawBytes returns the exact file bytes without ReadFileRange headers.
+func (e *Executor) ReadFileRawBytes(path string) ([]byte, error) {
+	return e.readFileRaw(path)
+}
+
 // newGitCmd creates a *exec.Cmd for running git subcommands.
 // It handles nil ctx normalisation and PATH lookup automatically.
 func (e *Executor) newGitCmd(ctx context.Context, args ...string) (*exec.Cmd, error) {
@@ -258,6 +272,11 @@ func (e *Executor) newGitCmd(ctx context.Context, args ...string) (*exec.Cmd, er
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = e.WorkingDir
 	return cmd, nil
+}
+
+// NewGitCmd is the exported form of newGitCmd for server/web helpers.
+func (e *Executor) NewGitCmd(ctx context.Context, args ...string) (*exec.Cmd, error) {
+	return e.newGitCmd(ctx, args...)
 }
 
 func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, error) {

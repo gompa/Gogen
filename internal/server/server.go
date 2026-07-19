@@ -21,7 +21,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-//go:embed web/*
+//go:embed all:web
 var webAssets embed.FS
 
 type wsConn struct {
@@ -213,6 +213,15 @@ type WSMessage struct {
 	SessionAction    string                 `json:"sessionAction,omitempty"`
 	Sessions         []SessionEntry         `json:"sessions,omitempty"`
 	History          []HistoryEntry         `json:"history,omitempty"`
+	// Filesystem / git editor APIs
+	Path       string           `json:"path,omitempty"`
+	Language   string           `json:"language,omitempty"`
+	Error      string           `json:"error,omitempty"`
+	Entries    []FSEntry        `json:"entries,omitempty"`
+	GitEntries []GitStatusEntry `json:"gitEntries,omitempty"`
+	Original   string           `json:"original,omitempty"`
+	Modified   string           `json:"modified,omitempty"`
+	RequestID  string           `json:"requestId,omitempty"`
 }
 
 func NewServer(a *agent.Agent, cfg *config.Config) *Server {
@@ -450,6 +459,12 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 		case "delete_approval_response":
 			// Already handled in the reader; keep for safety if ever enqueued.
 			session.completeApproval(msg.ApprovalID, msg.Approved)
+			continue
+		case "fs_list", "fs_read", "git_status", "git_file_diff":
+			s.handleFSReadMessage(ws, r.Context(), msg)
+			continue
+		case "fs_write":
+			s.handleFSWriteMessage(ws, msg)
 			continue
 		case "message":
 			// Cancel any in-flight stream BEFORE taking turnMu.
@@ -691,13 +706,62 @@ func (s *Server) HandleStatic(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	content, err := webAssets.ReadFile("web/index.html")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+
+	path := r.URL.Path
+	if path == "/" || path == "" {
+		content, err := webAssets.ReadFile("web/index.html")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		_, _ = w.Write(content)
 		return
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write(content)
+
+	// Serve embedded assets under /monaco/... (and future static paths).
+	rel := strings.TrimPrefix(path, "/")
+	if strings.Contains(rel, "..") {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	name := "web/" + rel
+	content, err := webAssets.ReadFile(name)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", contentTypeForExt(filepath.Ext(name)))
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	_, _ = w.Write(content)
+}
+
+func contentTypeForExt(ext string) string {
+	switch strings.ToLower(ext) {
+	case ".html":
+		return "text/html; charset=utf-8"
+	case ".js", ".mjs":
+		return "text/javascript; charset=utf-8"
+	case ".css":
+		return "text/css; charset=utf-8"
+	case ".ttf":
+		return "font/ttf"
+	case ".woff":
+		return "font/woff"
+	case ".woff2":
+		return "font/woff2"
+	case ".json":
+		return "application/json; charset=utf-8"
+	case ".svg":
+		return "image/svg+xml"
+	case ".png":
+		return "image/png"
+	case ".map":
+		return "application/json"
+	default:
+		return "application/octet-stream"
+	}
 }
 
 func (s *Server) checkAuth(r *http.Request) bool {

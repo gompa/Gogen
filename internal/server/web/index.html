@@ -4,10 +4,24 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>GoGen AI Agent</title>
+    <link rel="stylesheet" href="/monaco/editor.main.css">
     <style>
-        body { font-family: sans-serif; margin: 0; display: flex; height: 100vh; }
-        #sidebar { width: 300px; background: #f0f0f0; border-right: 1px solid #ccc; display: flex; flex-direction: column; padding: 20px; box-sizing: border-box; }
-        #chat-container { flex: 1; display: flex; flex-direction: column; height: 100vh; }
+        body { font-family: sans-serif; margin: 0; display: flex; flex-direction: column; height: 100vh; }
+        #top-tabs {
+            display: flex; gap: 0; border-bottom: 1px solid #ccc; background: #f7f7f7;
+            flex-shrink: 0;
+        }
+        .main-tab {
+            padding: 10px 18px; border: none; background: transparent; cursor: pointer;
+            border-bottom: 2px solid transparent; font-weight: 600;
+        }
+        .main-tab.active { border-bottom-color: #283593; color: #283593; background: #fff; }
+        #main-panes { flex: 1; min-height: 0; display: flex; }
+        .pane { display: none; flex: 1; min-height: 0; min-width: 0; }
+        .pane.active { display: flex; }
+
+        #sidebar { width: 300px; background: #f0f0f0; border-right: 1px solid #ccc; display: flex; flex-direction: column; padding: 20px; box-sizing: border-box; overflow-y: auto; flex-shrink: 0; }
+        #chat-container { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
         #messages { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 10px; }
         #input-area { padding: 20px; border-top: 1px solid #ccc; display: flex; gap: 10px; }
         .message { padding: 10px; border-radius: 8px; max-width: 80%; white-space: pre-wrap; word-break: break-word; }
@@ -16,19 +30,19 @@
         .system { background: #fff3cd; align-self: center; text-align: center; font-size: 0.8em; }
         input, button { padding: 10px; border: 1px solid #ccc; border-radius: 4px; }
         #message-input { flex: 1; }
-        #working-dir-input { width: 100%; margin-bottom: 10px; }
+        #working-dir-input { width: 100%; margin-bottom: 10px; box-sizing: border-box; }
         .cursor::after { content: '▊'; animation: blink 1s infinite; }
         @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
         .thinking { color: #888; font-style: italic; }
         .thinking-block { color: #888; font-style: italic; white-space: pre-wrap; }
 
-        /* Tool call/result styling */
         .tool-card {
             align-self: flex-start;
             background: #fafafa;
             border: 1px solid #e0e0e0;
             border-radius: 8px;
-            max-width: 80%;
+            max-width: 95%;
+            width: 100%;
             overflow: hidden;
             font-size: 0.9em;
         }
@@ -41,9 +55,7 @@
             cursor: pointer;
             user-select: none;
         }
-        .tool-call-header:hover {
-            background: #c5cae9;
-        }
+        .tool-call-header:hover { background: #c5cae9; }
         .tool-icon { font-size: 1.1em; }
         .tool-name { font-weight: bold; font-family: monospace; color: #283593; }
         .tool-args {
@@ -51,6 +63,10 @@
             font-size: 0.85em;
             color: #555;
             margin-left: 4px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            max-width: 50%;
         }
         .tool-args-streaming {
             font-family: monospace;
@@ -96,6 +112,11 @@
             background: #fff;
         }
         .tool-result-content.error-content { color: #c62828; }
+        .monaco-tool-host {
+            height: 280px;
+            border-top: 1px solid #e0e0e0;
+            background: #1e1e1e;
+        }
         .tool-waiting {
             padding: 6px 12px;
             font-size: 0.85em;
@@ -156,35 +177,114 @@
         }
         #context-bar.warn { background: #ff9800; }
         #context-bar.danger { background: #f44336; }
+
+        /* Editor workspace */
+        #editor-pane { flex-direction: row; }
+        #editor-sidebar {
+            width: 280px; flex-shrink: 0; border-right: 1px solid #ccc;
+            display: flex; flex-direction: column; background: #fafafa; min-height: 0;
+        }
+        #editor-sidebar h4 {
+            margin: 0; padding: 10px 12px; font-size: 0.85em;
+            border-bottom: 1px solid #e0e0e0; background: #f0f0f0;
+        }
+        #file-tree, #unstaged-list {
+            overflow-y: auto; padding: 6px 8px; font-size: 0.85em; font-family: monospace;
+        }
+        #file-tree { flex: 1; min-height: 0; }
+        #unstaged-wrap { border-top: 1px solid #ccc; max-height: 40%; display: flex; flex-direction: column; min-height: 0; }
+        #unstaged-list { flex: 1; min-height: 0; }
+        .tree-item, .unstaged-item {
+            padding: 3px 4px; cursor: pointer; border-radius: 3px; white-space: nowrap;
+            overflow: hidden; text-overflow: ellipsis;
+        }
+        .tree-item:hover, .unstaged-item:hover { background: #e8eaf6; }
+        .tree-children { padding-left: 14px; }
+        #editor-main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+        #editor-toolbar {
+            display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+            border-bottom: 1px solid #ccc; background: #f7f7f7; flex-shrink: 0;
+        }
+        #editor-toolbar button { padding: 6px 10px; font-size: 0.85em; }
+        #editor-path-label { font-family: monospace; font-size: 0.85em; color: #444; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        #editor-tabs {
+            display: flex; gap: 2px; padding: 4px 6px 0; background: #ececec;
+            border-bottom: 1px solid #ccc; overflow-x: auto; flex-shrink: 0; min-height: 32px;
+        }
+        .file-tab {
+            display: flex; align-items: center; gap: 6px; padding: 6px 10px;
+            background: #ddd; border-radius: 6px 6px 0 0; cursor: pointer;
+            font-size: 0.85em; font-family: monospace; max-width: 180px;
+        }
+        .file-tab.active { background: #fff; border: 1px solid #ccc; border-bottom-color: #fff; }
+        .file-tab-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .file-tab-close {
+            border: none; background: transparent; cursor: pointer; padding: 0 2px;
+            font-size: 1em; line-height: 1; color: #666;
+        }
+        #monaco-wrap { flex: 1; position: relative; min-height: 0; }
+        #monaco-host, #monaco-diff-host { position: absolute; inset: 0; }
+        #monaco-diff-host { display: none; }
     </style>
 </head>
 <body>
-    <div id="sidebar">
-        <h3>Configuration</h3>
-        <label>Working Directory:</label>
-        <input type="text" id="working-dir-input" placeholder="/path/to/dir">
-        <button id="set-dir-btn">Set Working Directory</button>
-        <hr>
-        <label>Model:</label>
-        <div id="model-info" style="font-size:0.85em;margin-bottom:12px;font-family:monospace;">—</div>
-        <label>Context:</label>
-        <div id="context-info">—</div>
-        <div id="context-bar-wrap"><div id="context-bar"></div></div>
-        <label>Mode:</label>
-        <div style="display:flex;gap:8px;margin-bottom:12px;">
-            <button id="mode-act-btn">Act</button>
-            <button id="mode-plan-btn">Plan</button>
-        </div>
-        <div id="mode-info" style="font-size:0.85em;margin-bottom:12px;">act</div>
-        <label>Session:</label>
-        <div id="session-info" style="font-size:0.85em;margin-bottom:12px;font-family:monospace;">—</div>
-        <div id="status">Status: Disconnected</div>
+    <div id="top-tabs">
+        <button type="button" class="main-tab active" data-pane="chat">Chat</button>
+        <button type="button" class="main-tab" data-pane="editor">Editor</button>
     </div>
-    <div id="chat-container">
-        <div id="messages"></div>
-        <div id="input-area">
-            <input type="text" id="message-input" placeholder="Ask the agent... (/models to switch)" autofocus>
-            <button id="send-btn">Send</button>
+    <div id="main-panes">
+        <div id="chat-pane" class="pane active">
+            <div id="sidebar">
+                <h3>Configuration</h3>
+                <label>Working Directory:</label>
+                <input type="text" id="working-dir-input" placeholder="/path/to/dir">
+                <button id="set-dir-btn">Set Working Directory</button>
+                <hr>
+                <label>Model:</label>
+                <div id="model-info" style="font-size:0.85em;margin-bottom:12px;font-family:monospace;">—</div>
+                <label>Context:</label>
+                <div id="context-info">—</div>
+                <div id="context-bar-wrap"><div id="context-bar"></div></div>
+                <label>Mode:</label>
+                <div style="display:flex;gap:8px;margin-bottom:12px;">
+                    <button id="mode-act-btn">Act</button>
+                    <button id="mode-plan-btn">Plan</button>
+                </div>
+                <div id="mode-info" style="font-size:0.85em;margin-bottom:12px;">act</div>
+                <label>Session:</label>
+                <div id="session-info" style="font-size:0.85em;margin-bottom:12px;font-family:monospace;">—</div>
+                <div id="status">Status: Disconnected</div>
+            </div>
+            <div id="chat-container">
+                <div id="messages"></div>
+                <div id="input-area">
+                    <input type="text" id="message-input" placeholder="Ask the agent... (/models to switch)" autofocus>
+                    <button id="send-btn">Send</button>
+                </div>
+            </div>
+        </div>
+        <div id="editor-pane" class="pane">
+            <div id="editor-sidebar">
+                <h4>Files <button type="button" id="btn-refresh-explorer" style="float:right;padding:2px 8px;font-size:0.8em;">Refresh</button></h4>
+                <div id="file-tree"></div>
+                <div id="unstaged-wrap">
+                    <h4>Unstaged changes</h4>
+                    <div id="unstaged-list"></div>
+                </div>
+            </div>
+            <div id="editor-main">
+                <div id="editor-toolbar">
+                    <span id="editor-path-label">No file open</span>
+                    <button type="button" id="btn-diff-layout" title="Toggle DiffEditor side-by-side vs inline">Side-by-side</button>
+                    <button type="button" id="btn-save-file">Save</button>
+                    <button type="button" id="btn-save-all">Save all</button>
+                </div>
+                <div id="editor-tabs"></div>
+                <div id="monaco-wrap">
+                    <div id="monaco-host"></div>
+                    <div id="monaco-diff-host"></div>
+                </div>
+            </div>
         </div>
     </div>
     <div id="delete-approval-overlay">
@@ -198,7 +298,19 @@
             </div>
         </div>
     </div>
-    <script>
+    <script type="module">
+        import {
+            setWebSocket,
+            handleServerMessage,
+            setupEditorUI,
+            refreshExplorer,
+            disposeChatEditors,
+            mountDiffEditor,
+            updateDiffEditor,
+            extractDiffValue,
+            initMonaco,
+        } from '/editor.js';
+
         const messagesDiv = document.getElementById('messages');
         const inputArea = document.getElementById('message-input');
         const sendBtn = document.getElementById('send-btn');
@@ -218,6 +330,23 @@
         const deleteAllowBtn = document.getElementById('delete-allow-btn');
         const deleteDenyBtn = document.getElementById('delete-deny-btn');
         let pendingDeleteApprovalId = null;
+
+        // Main Chat | Editor tabs
+        document.querySelectorAll('.main-tab').forEach((btn) => {
+            btn.addEventListener('click', async () => {
+                document.querySelectorAll('.main-tab').forEach((b) => b.classList.remove('active'));
+                document.querySelectorAll('.pane').forEach((p) => p.classList.remove('active'));
+                btn.classList.add('active');
+                const pane = document.getElementById(btn.dataset.pane + '-pane');
+                if (pane) pane.classList.add('active');
+                if (btn.dataset.pane === 'editor') {
+                    await initMonaco();
+                    await refreshExplorer();
+                }
+            });
+        });
+
+        setupEditorUI();
 
         function respondDeleteApproval(approved) {
             if (!pendingDeleteApprovalId || !ws || ws.readyState !== WebSocket.OPEN) {
@@ -325,9 +454,14 @@
             if (data.sessionId) {
                 sessionInfoDiv.textContent = data.sessionId;
             }
+            // Refresh explorer when working dir changes
+            if (document.getElementById('editor-pane').classList.contains('active')) {
+                refreshExplorer().catch(() => {});
+            }
         }
 
         function clearChat() {
+            disposeChatEditors();
             messagesDiv.innerHTML = '';
             endStream();
             streamingToolCards = {};
@@ -341,9 +475,7 @@
         let currentStreamSpan = null;
         let currentThinkingDiv = null;
         let currentThinkingSpan = null;
-        // Map from tool call ID to pending tool card (waiting for result)
         let pendingToolCards = {};
-        // Map from stream index to in-progress tool cards
         let streamingToolCards = {};
         let toolCallCounter = 0;
 
@@ -407,9 +539,6 @@
             if (el) el.remove();
         }
 
-        // finalizeThinking collapses the active thinking block into an
-        // expandable "🤔 Thought" card instead of deleting it.  Call this
-        // when the LLM moves from thinking to streaming or tool calls.
         function finalizeThinking() {
             removeThinkingStatus();
             if (!currentThinkingDiv) return;
@@ -432,7 +561,6 @@
             const toggle = document.createElement('span');
             toggle.textContent = '▼';
             toggle.style.fontSize = '0.8em';
-            toggle.style.transition = 'transform 0.2s';
             header.appendChild(icon);
             header.appendChild(label);
             header.appendChild(toggle);
@@ -454,16 +582,6 @@
             });
         }
 
-        // removeThinking deletes the active thinking block without collapsing.
-        function removeThinking() {
-            removeThinkingStatus();
-            if (currentThinkingDiv) {
-                currentThinkingDiv.remove();
-                currentThinkingDiv = null;
-                currentThinkingSpan = null;
-            }
-        }
-
         function endStream() {
             if (currentStreamDiv) {
                 currentStreamDiv.classList.remove('cursor');
@@ -476,6 +594,10 @@
             if (!args || typeof args !== 'object') return '';
             const parts = [];
             for (const [key, value] of Object.entries(args)) {
+                if (key === 'diff' && typeof value === 'string') {
+                    parts.push(`diff=<${value.length} chars>`);
+                    continue;
+                }
                 let displayValue;
                 if (typeof value === 'string' && value.length > 80) {
                     displayValue = `"${value.substring(0, 77)}..."`;
@@ -501,7 +623,6 @@
                 card.dataset.streamIndex = String(streamIndex);
             }
 
-            // Header (tool call info)
             const header = document.createElement('div');
             header.className = 'tool-call-header';
 
@@ -528,18 +649,23 @@
 
             let waiting = null;
             let argsStream = null;
+            let monacoHost = null;
 
-            if (streaming) {
+            card.appendChild(header);
+
+            if (streaming && name === 'patch_file') {
+                monacoHost = document.createElement('div');
+                monacoHost.className = 'monaco-tool-host';
+                card.appendChild(monacoHost);
+            } else if (streaming) {
                 argsStream = document.createElement('div');
                 argsStream.className = 'tool-args-streaming cursor';
                 argsStream.textContent = '(';
-                card.appendChild(header);
                 card.appendChild(argsStream);
             } else {
                 waiting = document.createElement('div');
                 waiting.className = 'tool-waiting';
                 waiting.textContent = '⏳ executing...';
-                card.appendChild(header);
                 card.appendChild(waiting);
             }
 
@@ -551,22 +677,60 @@
                 const body = card.querySelector('.tool-result-body');
                 if (body) body.classList.toggle('collapsed', collapsed);
                 if (argsStream) argsStream.classList.toggle('collapsed', collapsed);
+                if (monacoHost) monacoHost.style.display = collapsed ? 'none' : 'block';
             });
 
-            return { cardId, card, waiting, toggle, toolArgs, argsStream, setCollapsed: (c) => { toggle.classList.toggle('collapsed', c); } };
+            const cardInfo = {
+                cardId,
+                card,
+                waiting,
+                toggle,
+                toolArgs,
+                argsStream,
+                monacoHost,
+                monacoEditor: null,
+                rawArgs: '',
+                pendingDiff: '',
+                rafScheduled: false,
+                scheduleDiffUpdate(text) {
+                    this.pendingDiff = text;
+                    if (this.rafScheduled) return;
+                    this.rafScheduled = true;
+                    requestAnimationFrame(() => {
+                        this.rafScheduled = false;
+                        if (this.monacoEditor) updateDiffEditor(this.monacoEditor, this.pendingDiff);
+                    });
+                },
+                setCollapsed: (c) => { toggle.classList.toggle('collapsed', c); },
+            };
+            return cardInfo;
         }
 
         function startStreamingToolCard(index, name) {
             finalizeThinking();
             endStream();
             const cardInfo = createToolCard(name, {}, { streaming: true, streamIndex: index });
+            if (name === 'patch_file' && cardInfo.monacoHost) {
+                mountDiffEditor(cardInfo.monacoHost, '').then((ed) => {
+                    cardInfo.monacoEditor = ed;
+                    if (cardInfo.pendingDiff) updateDiffEditor(ed, cardInfo.pendingDiff);
+                });
+            }
             streamingToolCards[index] = cardInfo;
             return cardInfo;
         }
 
         function appendStreamingToolArgs(index, argsDelta) {
             const cardInfo = streamingToolCards[index];
-            if (cardInfo && cardInfo.argsStream) {
+            if (!cardInfo) return;
+            if (cardInfo.monacoHost) {
+                cardInfo.rawArgs = (cardInfo.rawArgs || '') + argsDelta;
+                const extracted = extractDiffValue(cardInfo.rawArgs);
+                if (extracted.ok) cardInfo.scheduleDiffUpdate(extracted.value);
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                return;
+            }
+            if (cardInfo.argsStream) {
                 cardInfo.argsStream.textContent += argsDelta;
                 messagesDiv.scrollTop = messagesDiv.scrollHeight;
             }
@@ -585,60 +749,87 @@
                 }
                 cardInfo.toolArgs.textContent = formatToolArgs(args);
 
-                const waiting = document.createElement('div');
-                waiting.className = 'tool-waiting';
-                waiting.textContent = '⏳ executing...';
-                cardInfo.card.appendChild(waiting);
-                cardInfo.waiting = waiting;
+                if (name === 'patch_file' && args && typeof args.diff === 'string' && cardInfo.monacoHost) {
+                    cardInfo.scheduleDiffUpdate(args.diff);
+                }
+
+                if (!cardInfo.waiting) {
+                    const waiting = document.createElement('div');
+                    waiting.className = 'tool-waiting';
+                    waiting.textContent = '⏳ executing...';
+                    cardInfo.card.appendChild(waiting);
+                    cardInfo.waiting = waiting;
+                }
             }
 
+            cardInfo.toolName = name;
             if (id) {
                 pendingToolCards[id] = cardInfo;
             }
             return cardInfo;
         }
 
-        function updateToolCardWithResult(cardInfo, result, success, truncated) {
+        async function updateToolCardWithResult(cardInfo, result, success, truncated, toolName) {
             const { card, waiting, toggle } = cardInfo;
+            if (waiting) waiting.remove();
 
-            // Remove waiting message
-            waiting.remove();
-
-            // Create result body
             const body = document.createElement('div');
             body.className = 'tool-result-body';
 
-            // Status bar
             const statusBar = document.createElement('div');
             statusBar.className = `tool-status-bar ${success ? 'success' : 'error'}`;
             statusBar.textContent = success ? '✅ Success' : '❌ Error';
-
-            // Result content
-            const content = document.createElement('div');
-            content.className = `tool-result-content ${success ? '' : 'error-content'}`;
-            content.textContent = result;
-
             body.appendChild(statusBar);
-            body.appendChild(content);
 
-            if (truncated) {
-                const expandBtn = document.createElement('button');
-                expandBtn.textContent = 'Show full output';
-                expandBtn.style.cssText = 'margin:4px 12px 8px;padding:4px 8px;font-size:0.8em;cursor:pointer;';
-                expandBtn.onclick = () => {
-                    content.textContent = result;
-                    expandBtn.remove();
-                };
-                body.appendChild(expandBtn);
+            const isDiffTool = toolName === 'patch_file' || toolName === 'show_diff';
+            const looksLikeDiff = typeof result === 'string' && (
+                result.includes('@@') || result.startsWith('diff ') || result.startsWith('--- ')
+            );
+
+            if (isDiffTool && success && (toolName === 'show_diff' || looksLikeDiff)) {
+                // show_diff: mount Monaco with the result. patch_file: keep streamed editor if present.
+                if (toolName === 'show_diff' || !cardInfo.monacoHost) {
+                    const host = document.createElement('div');
+                    host.className = 'monaco-tool-host';
+                    body.appendChild(host);
+                    card.appendChild(body);
+                    await mountDiffEditor(host, result || '');
+                } else {
+                    // patch_file already has live Monaco; append status only
+                    card.appendChild(body);
+                }
+            } else if (toolName === 'patch_file' && cardInfo.monacoHost) {
+                // Non-diff textual result (e.g. applied summary) under the live editor
+                const content = document.createElement('div');
+                content.className = `tool-result-content ${success ? '' : 'error-content'}`;
+                content.textContent = result;
+                body.appendChild(content);
+                card.appendChild(body);
+            } else {
+                const content = document.createElement('div');
+                content.className = `tool-result-content ${success ? '' : 'error-content'}`;
+                content.textContent = result;
+                body.appendChild(content);
+                if (truncated) {
+                    const expandBtn = document.createElement('button');
+                    expandBtn.textContent = 'Show full output';
+                    expandBtn.style.cssText = 'margin:4px 12px 8px;padding:4px 8px;font-size:0.8em;cursor:pointer;';
+                    expandBtn.onclick = () => {
+                        content.textContent = result;
+                        expandBtn.remove();
+                    };
+                    body.appendChild(expandBtn);
+                }
+                card.appendChild(body);
             }
 
-            card.appendChild(body);
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
         }
 
         function connect() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+            setWebSocket(ws);
 
             ws.onopen = () => {
                 clearTimeout(reconnectTimer);
@@ -648,6 +839,8 @@
 
             ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
+                if (handleServerMessage(data)) return;
+
                 if (data.type === 'thinking') {
                     finalizeThinking();
                     const div = document.createElement('div');
@@ -681,7 +874,13 @@
                     finalizeThinking();
                     const cardInfo = pendingToolCards[data.toolCallId];
                     if (cardInfo) {
-                        updateToolCardWithResult(cardInfo, data.result, data.success !== false, data.resultTruncated);
+                        updateToolCardWithResult(
+                            cardInfo,
+                            data.result,
+                            data.success !== false,
+                            data.resultTruncated,
+                            data.tool || cardInfo.toolName
+                        );
                         delete pendingToolCards[data.toolCallId];
                     } else {
                         appendMessage('system', `[${data.tool}] ${data.result}`);
@@ -725,7 +924,7 @@
                 } else if (data.type === 'delete_approval') {
                     showDeleteApproval(data);
                 }
-            }
+            };
 
             ws.onclose = () => {
                 statusDiv.innerText = 'Status: Disconnected';
