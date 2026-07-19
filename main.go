@@ -21,6 +21,7 @@ import (
 	"gogen/internal/debuglog"
 	"gogen/internal/llm"
 	"gogen/internal/mcp"
+	"gogen/internal/profiling"
 	"gogen/internal/projectfile"
 	"gogen/internal/server"
 	"gogen/internal/session"
@@ -39,6 +40,9 @@ func main() {
 	saveConfigPathFlag := flag.String("save-config-path", "", "Output path for --save-config (default .gogen/gogen.md)")
 
 	flag.Parse()
+
+	profiling.Start()
+	defer profiling.Stop()
 
 	workingDir := "."
 	if *dirFlag != "" {
