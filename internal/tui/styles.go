@@ -15,10 +15,14 @@ func init() {
 	if noColor {
 		ansiHighlightOn = ""
 		ansiDimOn = ""
+		ansiPromptOn = ""
+		ansiCyanOn = ""
 		ansiReset = ""
 	} else {
 		ansiHighlightOn = "\x1b[1m\x1b[38;2;0;170;170m"
 		ansiDimOn = "\x1b[38;2;136;136;136m"
+		ansiPromptOn = "\x1b[38;2;204;170;0m"
+		ansiCyanOn = "\x1b[38;2;0;170;170m"
 		// Only reset foreground + bold, never background.
 		// This keeps the overlay's #1a1a1a background alive past
 		// the end of styled text, preventing black gaps and bleed.
@@ -26,13 +30,16 @@ func init() {
 	}
 }
 
-// ansiHighlightOn / ansiDimOn are the start of each modal-row style.
-// ansiReset reverts only foreground/bold so that the modal overlay's
-// background (set by ModalOverlayBackground) is never killed mid-line.
+// Raw ANSI prefixes for modal rendering.  We emit only the *start* of
+// each sequence inside a border box; ansiReset (foreground+bold only,
+// never background) follows the text.  This keeps the overlay's #1a1a1a
+// background alive through the entire line.
 var (
-	ansiHighlightOn string
-	ansiDimOn       string
-	ansiReset       string
+	ansiHighlightOn string // bold cyan
+	ansiDimOn       string // gray
+	ansiPromptOn    string // yellow
+	ansiCyanOn      string // cyan (no bold)
+	ansiReset       string // \x1b[39m\x1b[22m — fg+bold only
 )
 
 func lipglossColor(hex string) lipgloss.Color {

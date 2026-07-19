@@ -59,29 +59,39 @@ func (m *Model) renderApprovalModal() string {
 		return ""
 	}
 
-	var b strings.Builder
-	b.WriteString(ModalTitleStyle.Render("Delete Approval Required"))
-	b.WriteString("\n\n")
-	b.WriteString(ModalDimStyle.Render(fmt.Sprintf("Reason: %s", m.approvalUI.reason)))
-	b.WriteString("\n\n")
-	b.WriteString("Files to delete:\n")
-	for _, p := range m.approvalUI.paths {
-		b.WriteString(fmt.Sprintf("  • %s\n", p))
-	}
-	b.WriteString("\n")
-	b.WriteString(ModalPromptStyle.Render("Allow delete?"))
+	var rows []styleLine
 
-	noStyle := ModalDimStyle
-	yesStyle := ModalDimStyle
+	// Title
+	rows = append(rows, styleLine{text: "Delete Approval Required", highlight: true})
+	rows = append(rows, styleLine{text: "", highlight: false})
+
+	// Reason
+	reason := fmt.Sprintf("Reason: %s", m.approvalUI.reason)
+	rows = append(rows, styleLine{text: reason, highlight: false})
+	rows = append(rows, styleLine{text: "", highlight: false})
+
+	// File list
+	rows = append(rows, styleLine{text: "Files to delete:", preStyled: true})
+	for _, p := range m.approvalUI.paths {
+		rows = append(rows, styleLine{text: "  • " + p, preStyled: true})
+	}
+	rows = append(rows, styleLine{text: "", preStyled: true})
+
+	// Prompt + buttons (pre-styled line with inline highlights)
+	noStyle := ansiDimOn
+	yesStyle := ansiDimOn
 	if m.approvalUI.cursor == 0 {
-		noStyle = ModalHighlightStyle
+		noStyle = ansiHighlightOn
 	}
 	if m.approvalUI.cursor == 1 {
-		yesStyle = ModalHighlightStyle
+		yesStyle = ansiHighlightOn
 	}
-	b.WriteString(fmt.Sprintf("  [%s]  [%s]", noStyle.Render("No"), yesStyle.Render("Yes")))
+	promptLine := ansiPromptOn + "Allow delete?" + ansiReset +
+		"  [" + noStyle + "No" + ansiReset +
+		"]  [" + yesStyle + "Yes" + ansiReset + "]"
+	rows = append(rows, styleLine{text: promptLine, preStyled: true})
 
-	return ModalBorderStyle.Render(b.String())
+	return renderBorderedModal(rows)
 }
 
 func (m *Model) handleApprovalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -264,15 +274,18 @@ func (m *Model) handleSessionsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 type styleLine struct {
 	text      string
-	highlight bool
+	highlight bool // if true, apply ansiHighlightOn; if false, ansiDimOn
+	preStyled bool // if true, text already contains ANSI; don't add prefix
+	prompt    bool // if true and preStyled, use ansiPromptOn instead of highlight/dim
 }
 
 // renderBorderedModal draws a plain border box around styled text lines.
 // Uses ansiHighlightOn / ansiDimOn + ansiReset (foreground-only reset,
 // never touches background) so the overlay's #1a1a1a background survives
 // through the entire line, including right-hand padding.
+// When preStyled is true the line is emitted as-is (caller embeds ANSI).
 func renderBorderedModal(rows []styleLine) string {
-	// Compute max visible width of plain text.
+	// Compute max visible width of plain text (strip ANSI for measurement).
 	maxW := 0
 	for _, r := range rows {
 		w := lipgloss.Width(r.text)
@@ -280,7 +293,6 @@ func renderBorderedModal(rows []styleLine) string {
 			maxW = w
 		}
 	}
-	// Content area: 2 spaces left padding + text + 2 spaces right padding.
 	innerW := maxW + 4
 
 	top := "╭" + strings.Repeat("─", innerW) + "╮"
@@ -291,14 +303,19 @@ func renderBorderedModal(rows []styleLine) string {
 	b.WriteByte('\n')
 	for _, r := range rows {
 		b.WriteString("│  ")
-		if r.highlight {
-			b.WriteString(ansiHighlightOn)
+		if r.preStyled {
+			// Caller already embedded ANSI — emit verbatim.
+			b.WriteString(r.text)
 		} else {
-			b.WriteString(ansiDimOn)
+			if r.highlight {
+				b.WriteString(ansiHighlightOn)
+			} else {
+				b.WriteString(ansiDimOn)
+			}
+			b.WriteString(r.text)
+			b.WriteString(ansiReset)
 		}
-		b.WriteString(r.text)
-		b.WriteString(ansiReset)
-		// Fill remaining content width.
+		// Fill remaining content width after text.
 		pad := maxW - lipgloss.Width(r.text)
 		if pad > 0 {
 			b.WriteString(strings.Repeat(" ", pad))
@@ -461,10 +478,6 @@ func (m *Model) loadSelectedModel() (tea.Model, tea.Cmd) {
 // --- Help Modal ---
 
 func (m *Model) renderHelpModal() string {
-	var b strings.Builder
-	b.WriteString(ModalTitleStyle.Render("Keybindings"))
-	b.WriteString("\n\n")
-
 	sections := []struct {
 		title string
 		binds [][]string
@@ -513,20 +526,30 @@ func (m *Model) renderHelpModal() string {
 		}},
 	}
 
+	var rows []styleLine
+
+	// Title
+	rows = append(rows, styleLine{text: "Keybindings", highlight: true})
+	rows = append(rows, styleLine{text: "", highlight: false})
+
 	for _, sec := range sections {
-		b.WriteString(ModalDimStyle.Render(sec.title))
-		b.WriteString("\n")
+		// Section header
+		rows = append(rows, styleLine{text: sec.title, highlight: false})
 		for _, bind := range sec.binds {
-			key := HelpKeyStyle.Render(bind[0])
-			desc := HelpDescStyle.Render(bind[1])
-			b.WriteString(fmt.Sprintf("  %-24s %s\n", key, desc))
+			key := bind[0]
+			desc := bind[1]
+			// Pre-style: cyan key, plain desc, 24-char key column
+			keyCol := ansiCyanOn + key + ansiReset
+			line := fmt.Sprintf("  %-24s %s", keyCol, desc)
+			rows = append(rows, styleLine{text: line, preStyled: true})
 		}
-		b.WriteString("\n")
+		rows = append(rows, styleLine{text: "", highlight: false})
 	}
 
-	b.WriteString(ModalDimStyle.Render("any key to close"))
+	// Footer
+	rows = append(rows, styleLine{text: "any key to close", highlight: false})
 
-	return ModalBorderStyle.Render(b.String())
+	return renderBorderedModal(rows)
 }
 
 func (m *Model) handleHelpKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -541,18 +564,23 @@ func (m *Model) renderCompletionModal() string {
 	if len(m.completions) == 0 {
 		return ""
 	}
+	// Build a single line with inline highlights separated by "  ".
 	var b strings.Builder
 	for i, c := range m.completions {
 		if i == m.completionIdx {
-			b.WriteString(ModalHighlightStyle.Render(c))
+			b.WriteString(ansiHighlightOn)
 		} else {
-			b.WriteString(ModalDimStyle.Render(c))
+			b.WriteString(ansiDimOn)
 		}
+		b.WriteString(c)
+		b.WriteString(ansiReset)
 		if i < len(m.completions)-1 {
 			b.WriteString("  ")
 		}
 	}
-	return ModalBorderStyle.Render(b.String())
+	return renderBorderedModal([]styleLine{
+		{text: b.String(), preStyled: true},
+	})
 }
 
 func (m *Model) handleCompletionKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {

@@ -236,7 +236,8 @@ func (e *Executor) WriteFile(path string, content string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(secure); err == nil {
+	_, err = os.Stat(secure)
+	if err == nil {
 		return fmt.Errorf("file already exists: %s. Use patch_file or replace_in_file to edit existing files instead of write_file", path)
 	}
 	if !os.IsNotExist(err) {
