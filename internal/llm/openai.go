@@ -14,9 +14,23 @@ import (
 	"github.com/openai/openai-go/shared"
 )
 
+const (
+	openCodeZenBaseURL = "https://opencode.ai/zen/v1/"
+	openCodeGoBaseURL = "https://opencode.ai/zen/go/v1/"
+)
+
+// isOpencodeURL reports whether baseURL points to an OpenCode endpoint that
+// should also expose the Go model family at openCodeGoBaseURL.
+func isOpencodeURL(baseURL string) bool {
+	return strings.Contains(baseURL, "opencode.ai")
+}
+
 type OpenAIProvider struct {
-	client openai.Client
-	model  string
+	client      openai.Client            // primary (user-configured; fallback for non-OpenCode)
+	zenClient   *openai.Client           // OpenCode Zen endpoint
+	goClient    *openai.Client           // OpenCode Go endpoint
+	model       string
+	modelClient map[string]*openai.Client // model ID → client routing
 	// promptCacheKey scopes provider-side prompt caching (defaults to none).
 	promptCacheKey param.Opt[string]
 }
@@ -26,10 +40,25 @@ func (p *OpenAIProvider) ModelName() string {
 }
 
 func (p *OpenAIProvider) listModels(ctx context.Context) []openai.Model {
+	p.modelClient = make(map[string]*openai.Client)
 	var models []openai.Model
-	pager := p.client.Models.ListAutoPaging(ctx)
-	for pager.Next() {
-		models = append(models, pager.Current())
+
+	query := func(c *openai.Client) {
+		pager := c.Models.ListAutoPaging(ctx)
+		for pager.Next() {
+			m := pager.Current()
+			models = append(models, m)
+			p.modelClient[m.ID] = c
+		}
+	}
+
+	if p.zenClient != nil && p.goClient != nil {
+		// OpenCode: query both endpoints independently.
+		query(p.zenClient)
+		query(p.goClient)
+	} else {
+		// Non-OpenCode: just the primary client.
+		query(&p.client)
 	}
 	return models
 }
@@ -42,10 +71,24 @@ func NewOpenAIProvider(apiKey string, model string, baseURL string) *OpenAIProvi
 	if baseURL != "" {
 		opts = append(opts, option.WithBaseURL(baseURL))
 	}
-	return &OpenAIProvider{
-		client: openai.NewClient(opts...),
-		model:  model,
+	p := &OpenAIProvider{
+		client:      openai.NewClient(opts...),
+		model:       model,
+		modelClient: make(map[string]*openai.Client),
 	}
+	if isOpencodeURL(baseURL) {
+		newClient := func(url string) *openai.Client {
+			c := openai.NewClient(
+				option.WithAPIKey(apiKey),
+				option.WithHTTPClient(newSSEHTTPClient()),
+				option.WithBaseURL(url),
+			)
+			return &c
+		}
+		p.zenClient = newClient(openCodeZenBaseURL)
+		p.goClient = newClient(openCodeGoBaseURL)
+	}
+	return p
 }
 
 // SetPromptCacheKey sets a stable key for provider-side prompt caching
@@ -55,6 +98,37 @@ func NewOpenAIProvider(apiKey string, model string, baseURL string) *OpenAIProvi
 func (p *OpenAIProvider) SetPromptCacheKey(key string) {
 	if key == "" { p.promptCacheKey = param.Opt[string]{}; return }
 	p.promptCacheKey = param.NewOpt(key)
+}
+
+// clientForModel returns the openai.Client that should serve the currently
+// selected model.  When modelClient has been populated by a ListModels call
+// the lookup is cheap; otherwise it does a one-time discovery probe against
+// both endpoints to populate the cache.
+func (p *OpenAIProvider) clientForModel() *openai.Client {
+	if p.modelClient == nil {
+		p.modelClient = make(map[string]*openai.Client)
+	}
+	if c, ok := p.modelClient[p.model]; ok {
+		return c
+	}
+	// Discovery: probe Zen first, then Go (deterministic order).
+	if p.zenClient != nil {
+		_, err := p.zenClient.Models.Get(context.Background(), p.model)
+		if err == nil {
+			p.modelClient[p.model] = p.zenClient
+			return p.zenClient
+		}
+	}
+	if p.goClient != nil {
+		_, err := p.goClient.Models.Get(context.Background(), p.model)
+		if err == nil {
+			p.modelClient[p.model] = p.goClient
+			return p.goClient
+		}
+	}
+	// Fallback to primary.
+	p.modelClient[p.model] = &p.client
+	return &p.client
 }
 
 func toolsToOpenAI(tools []Tool, allowed map[string]struct{}) []openai.ChatCompletionToolParam {
@@ -160,7 +234,7 @@ func (p *OpenAIProvider) GenerateResponse(ctx context.Context, messages []Messag
 	if p.promptCacheKey.Valid() {
 		params.PromptCacheKey = p.promptCacheKey
 	}
-	resp, err := p.client.Chat.Completions.New(ctx, params)
+	resp, err := p.clientForModel().Chat.Completions.New(ctx, params)
 
 	if err != nil {
 		return Response{}, fmt.Errorf("openai api error: %w", err)
@@ -229,7 +303,7 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 	if p.promptCacheKey.Valid() {
 		params.PromptCacheKey = p.promptCacheKey
 	}
-	stream := p.client.Chat.Completions.NewStreaming(ctx, params)
+	stream := p.clientForModel().Chat.Completions.NewStreaming(ctx, params)
 	defer stream.Close()
 
 	var fullContent string
@@ -449,7 +523,24 @@ func (p *OpenAIProvider) ModelContextLimit(ctx context.Context) (int, error) {
 		}
 	}
 
-	if model, err := p.client.Models.Get(ctx, p.model); err == nil {
+	// Try the model's known client first, then the other endpoint as a
+	// fallback (important when one endpoint is temporarily unreachable).
+	clients := []*openai.Client{p.clientForModel()}
+	if p.zenClient != nil && p.goClient != nil {
+		known := p.clientForModel()
+		if known == p.zenClient {
+			clients = append(clients, p.goClient)
+		} else if known == p.goClient {
+			clients = append(clients, p.zenClient)
+		} else {
+			clients = append(clients, p.zenClient, p.goClient)
+		}
+	}
+	for _, c := range clients {
+		model, err := c.Models.Get(ctx, p.model)
+		if err != nil {
+			continue
+		}
 		if limit := parseContextLimitFromJSON(model.RawJSON()); limit > 0 {
 			return limit, nil
 		}
