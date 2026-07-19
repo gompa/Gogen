@@ -12,7 +12,28 @@ var (
 
 func init() {
 	noColor = os.Getenv("NO_COLOR") != ""
+	if noColor {
+		ansiHighlightOn = ""
+		ansiDimOn = ""
+		ansiReset = ""
+	} else {
+		ansiHighlightOn = "\x1b[1m\x1b[38;2;0;170;170m"
+		ansiDimOn = "\x1b[38;2;136;136;136m"
+		// Only reset foreground + bold, never background.
+		// This keeps the overlay's #1a1a1a background alive past
+		// the end of styled text, preventing black gaps and bleed.
+		ansiReset = "\x1b[39m\x1b[22m"
+	}
 }
+
+// ansiHighlightOn / ansiDimOn are the start of each modal-row style.
+// ansiReset reverts only foreground/bold so that the modal overlay's
+// background (set by ModalOverlayBackground) is never killed mid-line.
+var (
+	ansiHighlightOn string
+	ansiDimOn       string
+	ansiReset       string
+)
 
 func lipglossColor(hex string) lipgloss.Color {
 	if noColor {
@@ -122,8 +143,10 @@ var (
 			Foreground(lipglossColor("#888888"))
 
 	ModalHighlightStyle = lipgloss.NewStyle().
-				Foreground(lipglossColor("#000000")).
-				Background(lipglossColor("#00AAAA"))
+				// Uses foreground+bold instead of background to avoid
+				// color bleeding into the border padding of modal boxes.
+				Foreground(lipglossColor("#00AAAA")).
+				Bold(true)
 
 	ModalPromptStyle = lipgloss.NewStyle().
 				Foreground(lipglossColor("#CCAA00"))

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/lipgloss"
+
 	"gogen/internal/agent"
 	"gogen/internal/session"
 
@@ -134,78 +136,87 @@ func (m *Model) dismissApproval(approved bool) {
 // --- Sessions Modal ---
 
 func (m *Model) renderSessionsModal() string {
-	var b strings.Builder
-	b.WriteString(ModalTitleStyle.Render("Saved Sessions"))
-	b.WriteString("\n\n")
-
-	if len(m.sessionList) > 0 {
-		// Constrain visible area to fit the terminal.
-		// Reserve lines for border, title, footer, and margin.
-		reserved := 13 // border(2) + title(2) + footer(4) + top/bottom margin(5)
-		maxVisible := max(3, m.height-reserved)
-
-		// Clamp cursor.
-		if m.sessionCursor >= len(m.sessionList) {
-			m.sessionCursor = len(m.sessionList) - 1
-		}
-		if m.sessionCursor < 0 {
-			m.sessionCursor = 0
-		}
-
-		// Compute scroll window so cursor stays visible.
-		start := 0
-		if len(m.sessionList) > maxVisible {
-			start = m.sessionCursor - maxVisible/2
-			if start < 0 {
-				start = 0
-			}
-			if start > len(m.sessionList)-maxVisible {
-				start = len(m.sessionList) - maxVisible
-			}
-		}
-		end := start + maxVisible
-		if end > len(m.sessionList) {
-			end = len(m.sessionList)
-		}
-
-		if start > 0 {
-			b.WriteString(ModalDimStyle.Render(fmt.Sprintf("  ↑ %d more\n", start)))
-		}
-
-		for i := start; i < end; i++ {
-			s := m.sessionList[i]
-			line := fmt.Sprintf("  %s  (%d msgs)", s.ID, s.MessageCount)
-			if s.Label != "" {
-				line += fmt.Sprintf("  %q", s.Label)
-			}
-			if s.ID == m.sessionID {
-				line += "  ← current"
-			}
-			if i == m.sessionCursor {
-				b.WriteString(ModalHighlightStyle.Render(line))
-			} else {
-				b.WriteString(ModalDimStyle.Render(line))
-			}
-			b.WriteString("\n")
-		}
-
-		if end < len(m.sessionList) {
-			b.WriteString(ModalDimStyle.Render(fmt.Sprintf("  ↓ %d more\n", len(m.sessionList)-end)))
-		}
-	} else {
-		b.WriteString(ModalDimStyle.Render("No saved sessions."))
+	if len(m.sessionList) == 0 {
+		return renderBorderedModal([]styleLine{
+			{text: "Saved Sessions", highlight: true},
+			{text: "", highlight: false},
+			{text: "No saved sessions.", highlight: false},
+			{text: "", highlight: false},
+			{text: "Press esc to close", highlight: false},
+		})
 	}
 
-	if len(m.sessionList) > 0 {
-		b.WriteString("\n")
-		b.WriteString(ModalDimStyle.Render("↑↓/jk navigate  pgup/pgdn  enter resume  d delete  esc close"))
-	} else {
-		b.WriteString("\n")
-	}
-	b.WriteString("\n")
-	b.WriteString(ModalDimStyle.Render("Press esc to close"))
+	// Constrain visible area to fit the terminal.
+	reserved := 13 // border(2) + title(2) + footer(4) + top/bottom margin(5)
+	maxVisible := max(3, m.height-reserved)
 
-	return ModalBorderStyle.Render(b.String())
+	// Clamp cursor.
+	if m.sessionCursor >= len(m.sessionList) {
+		m.sessionCursor = len(m.sessionList) - 1
+	}
+	if m.sessionCursor < 0 {
+		m.sessionCursor = 0
+	}
+
+	// Compute scroll window so cursor stays visible.
+	start := 0
+	if len(m.sessionList) > maxVisible {
+		start = m.sessionCursor - maxVisible/2
+		if start < 0 {
+			start = 0
+		}
+		if start > len(m.sessionList)-maxVisible {
+			start = len(m.sessionList) - maxVisible
+		}
+	}
+	end := start + maxVisible
+	if end > len(m.sessionList) {
+		end = len(m.sessionList)
+	}
+
+	var rows []styleLine
+
+	// Title
+	rows = append(rows, styleLine{text: "Saved Sessions", highlight: true})
+	rows = append(rows, styleLine{text: "", highlight: false})
+
+	// Overflow indicator (top)
+	if start > 0 {
+		rows = append(rows, styleLine{
+			text: fmt.Sprintf("  ↑ %d more", start), highlight: false,
+		})
+	}
+
+	// Session entries
+	for i := start; i < end; i++ {
+		s := m.sessionList[i]
+		line := fmt.Sprintf("  %s  (%d msgs)", s.ID, s.MessageCount)
+		if s.Label != "" {
+			line += fmt.Sprintf("  %q", s.Label)
+		}
+		if s.ID == m.sessionID {
+			line += "  ← current"
+		}
+		rows = append(rows, styleLine{
+			text:      line,
+			highlight: i == m.sessionCursor,
+		})
+	}
+
+	// Overflow indicator (bottom)
+	if end < len(m.sessionList) {
+		rows = append(rows, styleLine{
+			text: fmt.Sprintf("  ↓ %d more", len(m.sessionList)-end), highlight: false,
+		})
+	}
+
+	// Footer
+	rows = append(rows, styleLine{text: "", highlight: false})
+	rows = append(rows, styleLine{
+		text: "↑↓/jk navigate  pgup/pgdn  enter resume  d delete  esc close", highlight: false,
+	})
+
+	return renderBorderedModal(rows)
 }
 
 func (m *Model) handleSessionsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -249,47 +260,201 @@ func (m *Model) handleSessionsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// --- Bordered modal helpers ---
+
+type styleLine struct {
+	text      string
+	highlight bool
+}
+
+// renderBorderedModal draws a plain border box around styled text lines.
+// Uses ansiHighlightOn / ansiDimOn + ansiReset (foreground-only reset,
+// never touches background) so the overlay's #1a1a1a background survives
+// through the entire line, including right-hand padding.
+func renderBorderedModal(rows []styleLine) string {
+	// Compute max visible width of plain text.
+	maxW := 0
+	for _, r := range rows {
+		w := lipgloss.Width(r.text)
+		if w > maxW {
+			maxW = w
+		}
+	}
+	// Content area: 2 spaces left padding + text + 2 spaces right padding.
+	innerW := maxW + 4
+
+	top := "╭" + strings.Repeat("─", innerW) + "╮"
+	bot := "╰" + strings.Repeat("─", innerW) + "╯"
+
+	var b strings.Builder
+	b.WriteString(top)
+	b.WriteByte('\n')
+	for _, r := range rows {
+		b.WriteString("│  ")
+		if r.highlight {
+			b.WriteString(ansiHighlightOn)
+		} else {
+			b.WriteString(ansiDimOn)
+		}
+		b.WriteString(r.text)
+		b.WriteString(ansiReset)
+		// Fill remaining content width.
+		pad := maxW - lipgloss.Width(r.text)
+		if pad > 0 {
+			b.WriteString(strings.Repeat(" ", pad))
+		}
+		b.WriteString("  │")
+		b.WriteByte('\n')
+	}
+	b.WriteString(bot)
+	return b.String()
+}
+
 // --- Models Modal ---
 
 func (m *Model) renderModelsModal() string {
-	var b strings.Builder
-	b.WriteString(ModalTitleStyle.Render("Available Models"))
-	b.WriteString("\n\n")
-
 	if len(m.modelList) == 0 {
-		b.WriteString(ModalDimStyle.Render("No models available."))
-		b.WriteString("\n\n")
-		b.WriteString(ModalDimStyle.Render("Press esc to close"))
-		return ModalBorderStyle.Render(b.String())
+		return renderBorderedModal([]styleLine{
+			{text: "Available Models", highlight: true},
+			{text: "", highlight: false},
+			{text: "No models available.", highlight: false},
+			{text: "", highlight: false},
+			{text: "Press esc to close", highlight: false},
+		})
 	}
 
-	for i, mdl := range m.modelList {
-		marker := " "
-		if mdl.Current {
-			marker = "*"
+	// Constrain visible area to fit the terminal.
+	reserved := 13 // border(2) + title(2) + footer(4) + top/bottom margin(5)
+	maxVisible := max(3, m.height-reserved)
+
+	// Clamp cursor.
+	if m.modelCursor >= len(m.modelList) {
+		m.modelCursor = len(m.modelList) - 1
+	}
+	if m.modelCursor < 0 {
+		m.modelCursor = 0
+	}
+
+	// Compute scroll window so cursor stays visible.
+	start := 0
+	if len(m.modelList) > maxVisible {
+		start = m.modelCursor - maxVisible/2
+		if start < 0 {
+			start = 0
 		}
+		if start > len(m.modelList)-maxVisible {
+			start = len(m.modelList) - maxVisible
+		}
+	}
+	end := start + maxVisible
+	if end > len(m.modelList) {
+		end = len(m.modelList)
+	}
+
+	// Build plain-text lines first so we can compute the max content width.
+	var rows []styleLine
+
+	// Title
+	rows = append(rows, styleLine{text: "Available Models", highlight: true})
+	rows = append(rows, styleLine{text: "", highlight: false})
+
+	// Overflow indicator (top)
+	if start > 0 {
+		rows = append(rows, styleLine{
+			text: fmt.Sprintf("  ↑ %d more", start), highlight: false,
+		})
+	}
+
+	// Model entries
+	for i := start; i < end; i++ {
+		mdl := m.modelList[i]
 		line := fmt.Sprintf("  %2d. %s", i+1, mdl.ID)
 		if mdl.ContextLimit > 0 {
-			line += fmt.Sprintf("  (n_ctx=%d)", mdl.ContextLimit)
+			line += fmt.Sprintf("  (context: %d tokens)", mdl.ContextLimit)
 		}
-		line += " " + marker
-		b.WriteString(ModalDimStyle.Render(line))
-		b.WriteString("\n")
+		if mdl.Current {
+			line += " *"
+		}
+		rows = append(rows, styleLine{
+			text:      line,
+			highlight: i == m.modelCursor,
+		})
 	}
 
-	b.WriteString("\n")
-	b.WriteString(ModalDimStyle.Render("Use /models <number> or /models <name> to switch."))
-	b.WriteString("\n")
-	b.WriteString(ModalDimStyle.Render("Press esc to close"))
+	// Overflow indicator (bottom)
+	if end < len(m.modelList) {
+		rows = append(rows, styleLine{
+			text: fmt.Sprintf("  ↓ %d more", len(m.modelList)-end), highlight: false,
+		})
+	}
 
-	return ModalBorderStyle.Render(b.String())
+	// Footer
+	rows = append(rows, styleLine{text: "", highlight: false})
+	rows = append(rows, styleLine{
+		text: "↑↓/jk navigate  enter load  esc close", highlight: false,
+	})
+
+	return renderBorderedModal(rows)
 }
 
 func (m *Model) handleModelsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if msg.String() == "esc" || msg.String() == "q" {
+	switch msg.String() {
+	case "esc", "q":
+		m.modal = ModalNone
+		return m, nil
+	case "up", "k":
+		if m.modelCursor > 0 {
+			m.modelCursor--
+		}
+	case "down", "j":
+		if m.modelCursor < len(m.modelList)-1 {
+			m.modelCursor++
+		}
+	case "pgup":
+		page := max(1, m.height-20)
+		m.modelCursor -= page
+		if m.modelCursor < 0 {
+			m.modelCursor = 0
+		}
+	case "pgdown":
+		page := max(1, m.height-20)
+		m.modelCursor += page
+		if m.modelCursor >= len(m.modelList) {
+			m.modelCursor = len(m.modelList) - 1
+		}
+	case "enter":
+		if len(m.modelList) > 0 && m.modelCursor >= 0 && m.modelCursor < len(m.modelList) {
+			return m.loadSelectedModel()
+		}
+	}
+	return m, nil
+}
+
+// loadSelectedModel switches to the model at modelCursor from the models modal.
+func (m *Model) loadSelectedModel() (tea.Model, tea.Cmd) {
+	mdl := m.modelList[m.modelCursor]
+	// Skip if already on this model.
+	if mdl.Current {
 		m.modal = ModalNone
 		return m, nil
 	}
+	if err := m.agent.SelectModel(m.ctx, mdl.ID); err != nil {
+		m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Models: %v", err)))
+		m.modal = ModalNone
+		return m, nil
+	}
+	limit := m.agent.ContextLimit()
+	msg := fmt.Sprintf("Switched to model: %s", m.agent.CurrentModel())
+	if limit > 0 {
+		msg += fmt.Sprintf(" (context: %d tokens)", limit)
+	}
+	m.appendChatLine(SystemStyle.Render(msg))
+	m.refreshContextStats()
+	// Re-render chat lines with updated model line
+	m.chatLines = renderMessages(m.agent.Messages, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())
+	m.setViewportContent()
+	m.viewport.GotoBottom()
+	m.modal = ModalNone
 	return m, nil
 }
 

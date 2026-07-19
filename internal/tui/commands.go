@@ -115,6 +115,20 @@ func (m *Model) dispatchCommand(input string) (bool, bool, tea.Cmd) {
 
 	// Models command
 	if out, handled, err := m.agent.HandleModelsCommand(m.ctx, input); handled {
+		// If no selector, show interactive modal
+		arg := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(trimmed, "/models"), "models"))
+		if arg == "" {
+			list, listErr := m.agent.ListModels(m.ctx)
+			if listErr != nil {
+				m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Models: %v", listErr)))
+			} else {
+				m.modelList = list
+				m.modelCursor = 0
+				m.modal = ModalModels
+			}
+			return true, false, nil
+		}
+		// Has selector — do inline switch
 		if err != nil {
 			m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Models: %v", err)))
 		} else {

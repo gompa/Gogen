@@ -127,7 +127,8 @@ type Model struct {
 	// Modal data
 	sessionList   []agent.SessionInfo
 	modelList     []llm.ModelInfo
-	sessionCursor int
+	sessionCursor    int
+	modelCursor int
 
 	// Keymap
 	keys KeyMap
