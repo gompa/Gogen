@@ -121,12 +121,16 @@ func (a *Agent) persistSession() {
 	if a.SessionStore == nil || a.SessionID == "" {
 		return
 	}
+	// Detect before save so even early persists (e.g. right after a user
+	// message, before prepareMessages) store a sticky profile for resume.
+	profile := a.ensureProjectProfile()
 	if err := a.SessionStore.Save(a.SessionID, SessionSnapshot{
 		WorkingDir:     a.WorkingDir,
 		Model:          a.CurrentModel(),
 		Mode:           a.Mode.String(),
 		Label:          a.SessionLabel,
-		ProjectProfile: a.projectProfile,
+		ProjectProfile: profile,
+		Todos:          todoSnapshot(a.TodoManager),
 		Messages:       append([]llm.Message(nil), a.Messages...),
 	}); err != nil {
 		log.Printf("session save failed (id=%s): %v", a.SessionID, err)
@@ -150,7 +154,41 @@ func (a *Agent) SetWorkingDir(dir string) {
 	if a.Executor != nil {
 		a.Executor.WorkingDir = dir
 	}
+	if a.TodoManager != nil {
+		a.TodoManager.SetWorkingDir(dir)
+	}
 	a.persistSession()
+}
+
+func todoSnapshot(m *TodoManager) *TodoList {
+	if m == nil {
+		return nil
+	}
+	return m.Snapshot()
+}
+
+// ImportLegacyTodos adopts a project-level `.gogen/todos.json` into the current
+// session once, then persists the session so the todos become session-scoped.
+func (a *Agent) ImportLegacyTodos() bool {
+	if a.TodoManager == nil || !a.TodoManager.ImportLegacyFile() {
+		return false
+	}
+	a.persistTodos()
+	return true
+}
+
+// persistTodos writes todo changes: with the session when persistence is on,
+// otherwise to the legacy project-level todos file.
+func (a *Agent) persistTodos() {
+	if a.SessionStore != nil && a.SessionID != "" {
+		a.persistSession()
+		return
+	}
+	if a.TodoManager != nil {
+		if err := a.TodoManager.saveLegacy(); err != nil {
+			log.Printf("todo save failed: %v", err)
+		}
+	}
 }
 
 func (a *Agent) ensureProjectProfile() string {
@@ -274,9 +312,12 @@ func (a *Agent) appendToolResult(tc llm.ToolCall, result string) {
 // It returns the final accumulated response or an error.
 func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.StreamHandlers) (string, error) {
 	a.Messages = append(a.Messages, llm.Message{Role: "user", Content: input})
+	// Persist immediately so a failed/cancelled turn does not drop the user message.
+	a.persistSession()
 
 	if err := a.requireModelSelected(ctx); err != nil {
 		a.Messages = a.Messages[:len(a.Messages)-1]
+		a.persistSession()
 		return "", err
 	}
 
@@ -287,6 +328,7 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 	for first := true; ; first = false {
 		if ctx.Err() != nil {
 			finishStreamUI(h)
+			a.persistSession()
 			return "", ctx.Err()
 		}
 		view := a.prepareMessages(ctx)
@@ -300,6 +342,7 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 		result, err := a.Provider.GenerateResponseStream(ctx, view, a.AllowedToolNames(), a.llmTools(), h)
 		if err != nil {
 			finishStreamUI(h)
+			a.persistSession()
 			return "", err
 		}
 		a.recordTurnUsage(result.Usage)

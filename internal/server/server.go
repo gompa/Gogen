@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gogen/internal/agent"
@@ -24,11 +26,14 @@ import (
 //go:embed all:web
 var webAssets embed.FS
 
+var errWSClosed = errors.New("websocket closed")
+
 type wsConn struct {
 	conn *websocket.Conn
 	mu   sync.Mutex
 
 	sendQ chan WSMessage
+	quit  chan struct{} // closed by closeSend to stop writers + writeLoop
 	done  chan struct{} // closed when writeLoop exits, so writeJSON fails fast
 	once  sync.Once
 }
@@ -72,6 +77,7 @@ func newWSConn(conn *websocket.Conn) *wsConn {
 	w := &wsConn{
 		conn:  conn,
 		sendQ: make(chan WSMessage, wsSendQueueSize),
+		quit:  make(chan struct{}),
 		done:  make(chan struct{}),
 	}
 	go w.writeLoop()
@@ -89,12 +95,15 @@ func (w *wsConn) writeLoop() {
 	defer ticker.Stop()
 	for {
 		select {
-		case msg, ok := <-w.sendQ:
-			if !ok {
+		case <-w.quit:
+			return
+		case msg := <-w.sendQ:
+			w.mu.Lock()
+			if err := w.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout)); err != nil {
+				w.mu.Unlock()
+				log.Printf("websocket set write deadline: %v", err)
 				return
 			}
-			w.mu.Lock()
-			_ = w.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 			err := w.conn.WriteJSON(msg)
 			w.mu.Unlock()
 			if err != nil {
@@ -106,7 +115,11 @@ func (w *wsConn) writeLoop() {
 			// never reach the browser. A failed ping kills the writer,
 			// triggering teardown + reconnect via the deferred Close.
 			w.mu.Lock()
-			_ = w.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+			if err := w.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout)); err != nil {
+				w.mu.Unlock()
+				log.Printf("websocket set write deadline: %v", err)
+				return
+			}
 			err := w.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second))
 			w.mu.Unlock()
 			if err != nil {
@@ -118,29 +131,47 @@ func (w *wsConn) writeLoop() {
 
 func (w *wsConn) closeSend() {
 	w.once.Do(func() {
-		close(w.sendQ)
+		// Signal quit instead of closing sendQ so concurrent writeJSON
+		// sends cannot panic on a closed channel.
+		close(w.quit)
 	})
 }
 
 func (w *wsConn) writeJSON(v WSMessage) error {
+	err := w.enqueueJSON(v)
+	if err != nil && !errors.Is(err, errWSClosed) {
+		log.Printf("websocket write (%s): %v", v.Type, err)
+	}
+	return err
+}
+
+func (w *wsConn) enqueueJSON(v WSMessage) error {
 	if w == nil || w.conn == nil {
-		return fmt.Errorf("websocket closed")
+		return errWSClosed
 	}
 	select {
+	case <-w.quit:
+		return errWSClosed
 	case <-w.done:
-		return fmt.Errorf("websocket closed")
+		return errWSClosed
 	default:
 	}
 	select {
 	case w.sendQ <- v:
 		return nil
+	case <-w.quit:
+		return errWSClosed
+	case <-w.done:
+		return errWSClosed
 	default:
 		// Queue full: block briefly rather than stall the LLM stream reader forever.
 		select {
 		case w.sendQ <- v:
 			return nil
+		case <-w.quit:
+			return errWSClosed
 		case <-w.done:
-			return fmt.Errorf("websocket closed")
+			return errWSClosed
 		case <-time.After(5 * time.Second):
 			return fmt.Errorf("websocket send queue full")
 		}
@@ -433,9 +464,13 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	// the read deadline elapses, ReadJSON fails, and HandleWS tears down —
 	// which closes the write side too. This is what surfaces half-open
 	// connections that would otherwise freeze the UI silently.
-	conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+	if err := conn.SetReadDeadline(time.Now().Add(wsReadTimeout)); err != nil {
+		log.Printf("websocket set read deadline: %v", err)
+	}
 	conn.SetPongHandler(func(string) error {
-		_ = conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+		if err := conn.SetReadDeadline(time.Now().Add(wsReadTimeout)); err != nil {
+			log.Printf("websocket set read deadline: %v", err)
+		}
 		return nil
 	})
 
@@ -581,7 +616,13 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			streamErr = make(chan error, 1)
 			errCh := streamErr
 			streamMu.Unlock()
-			go func(content string, ctx context.Context, done chan error) {
+			go func(content string, ctx context.Context, cancel context.CancelFunc, done chan error) {
+				defer func() {
+					streamMu.Lock()
+					streamCancel = nil
+					streamErr = nil
+					streamMu.Unlock()
+				}()
 				defer func() { done <- nil }()
 				defer s.turnMu.Unlock()
 				defer func() {
@@ -589,11 +630,20 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 					_ = ws.writeJSON(WSMessage{Type: "turn_end"})
 				}()
 				ctx = agent.ContextWithDeleteApprover(ctx, session.deleteApprover())
+				var writeFailed atomic.Bool
+				failWrite := sync.Once{}
 				write := func(v WSMessage) {
 					if ctx.Err() != nil {
 						return
 					}
 					if err := ws.writeJSON(v); err != nil {
+						// Do not keep streaming into a full/dead queue — cancel
+						// the LLM and tear down so the browser reconnects.
+						writeFailed.Store(true)
+						failWrite.Do(func() {
+							cancel()
+							_ = ws.conn.Close()
+						})
 						return
 					}
 				}
@@ -617,6 +667,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 						write(WSMessage{Type: "stream_end"})
 					},
 					OnToolCallStart: func(index int, id, name string) {
+						tokens.flush()
 						write(WSMessage{
 							Type:       "tool_call_start",
 							Tool:       name,
@@ -634,6 +685,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 						})
 					},
 					OnToolCall: func(tc llm.ToolCall) {
+						tokens.flush()
 						write(WSMessage{
 							Type:       "tool_call",
 							Tool:       tc.Name,
@@ -668,7 +720,9 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 				if err != nil {
 					if ctx.Err() != nil {
 						tokens.flush()
-						_ = ws.writeJSON(WSMessage{Type: "cancelled", Content: "Cancelled."})
+						if !writeFailed.Load() {
+							_ = ws.writeJSON(WSMessage{Type: "cancelled", Content: "Cancelled."})
+						}
 						return
 					}
 					if ctx.Err() == nil {
@@ -685,7 +739,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 				tokens.flush()
 				write(WSMessage{Type: "stream_end"})
 				write(s.contextMsg(r.Context()))
-			}(msg.Content, streamCtx, errCh)
+			}(msg.Content, streamCtx, cancel, errCh)
 			// Do not block here — keep reading so delete_approval_response can complete.
 			continue
 		case "set_mode":

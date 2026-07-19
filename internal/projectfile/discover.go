@@ -69,15 +69,28 @@ func DiscoverGuidelinesPath(workingDir string) (string, bool) {
 }
 
 // extractMarkdownBody returns the content after YAML front matter (--- … ---).
+// Uses the same closing-delimiter rules as ParseContent/findClosingDelimiter so
+// discovery and parsing agree (including files that end with --- and no trailing
+// newline). Returns "" if front matter is opened but not closed. Without front
+// matter, returns the content with trailing newlines stripped (same as ParseContent).
 func extractMarkdownBody(content string) string {
-	if !strings.HasPrefix(strings.TrimRight(content, "\n"), "---") {
-		return content
+	trimmed := strings.TrimRight(content, "\n")
+	if !strings.HasPrefix(trimmed, "---") {
+		return trimmed
 	}
-	idx := strings.Index(content[3:], "\n---")
-	if idx < 0 {
+	rest := trimmed[3:]
+	if strings.HasPrefix(rest, "\n") {
+		rest = rest[1:]
+	} else if strings.HasPrefix(rest, "\r\n") {
+		rest = rest[2:]
+	} else {
 		return ""
 	}
-	return strings.TrimLeft(content[3+idx+4:], "\n")
+	closeAt, closeLen, err := findClosingDelimiter(rest)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimLeft(rest[closeAt+closeLen:], "\n")
 }
 
 // DefaultSavePath returns the canonical write paths for --save-config.

@@ -42,6 +42,10 @@ type tokenCacheEntry struct {
 // is acceptable. If the cache ever gated a correctness-critical decision,
 // switch to a 128-bit hash (crypto/sha128 or hash/maphash with a per-process
 // seed) for defense-in-depth.
+//
+// Memory for entries of compacted/removed messages persists until
+// InvalidateTokenCache is called. That is intentional and fine: the map is
+// bounded by session size, and fingerprint checks prevent stale reads.
 var tokenCache struct {
 	sync.RWMutex
 	m map[any]tokenCacheEntry

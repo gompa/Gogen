@@ -29,38 +29,109 @@ type TodoList struct {
 	NextID int        `json:"next_id"`
 }
 
-// TodoManager handles todo operations.
+// TodoManager handles in-memory todo operations for the current session.
+// Persistence is via SessionSnapshot (or a legacy file when sessions are disabled).
 type TodoManager struct {
 	workingDir string
 	todos      *TodoList
 }
 
-// NewTodoManager creates or loads a todo manager.
+// NewTodoManager creates an empty todo manager for workingDir.
 func NewTodoManager(workingDir string) *TodoManager {
-	todos, err := loadTodos(workingDir)
-	if err != nil {
-		todos = &TodoList{Items: []TodoItem{}, NextID: 1}
-	}
 	return &TodoManager{
 		workingDir: workingDir,
-		todos:      todos,
+		todos:      &TodoList{Items: []TodoItem{}, NextID: 1},
 	}
 }
 
-func loadTodos(workingDir string) (*TodoList, error) {
-	path := filepath.Join(workingDir, todoFilePath)
+// Snapshot returns a deep copy of the current todo list for session persistence.
+func (m *TodoManager) Snapshot() *TodoList {
+	if m == nil || m.todos == nil {
+		return &TodoList{Items: []TodoItem{}, NextID: 1}
+	}
+	out := &TodoList{
+		Items:  append([]TodoItem(nil), m.todos.Items...),
+		NextID: m.todos.NextID,
+	}
+	if out.NextID < 1 {
+		out.NextID = 1
+	}
+	return out
+}
+
+// Replace replaces the in-memory todo list with a copy of list.
+func (m *TodoManager) Replace(list *TodoList) {
+	if m == nil {
+		return
+	}
+	if list == nil {
+		m.Clear()
+		return
+	}
+	next := list.NextID
+	if next < 1 {
+		next = 1
+	}
+	m.todos = &TodoList{
+		Items:  append([]TodoItem(nil), list.Items...),
+		NextID: next,
+	}
+}
+
+// Clear removes all todos from the current session.
+func (m *TodoManager) Clear() {
+	if m == nil {
+		return
+	}
+	m.todos = &TodoList{Items: []TodoItem{}, NextID: 1}
+}
+
+// Empty reports whether there are no todo items.
+func (m *TodoManager) Empty() bool {
+	return m == nil || m.todos == nil || len(m.todos.Items) == 0
+}
+
+// SetWorkingDir updates the directory used for legacy file fallback.
+func (m *TodoManager) SetWorkingDir(dir string) {
+	if m == nil {
+		return
+	}
+	m.workingDir = dir
+}
+
+// ImportLegacyFile loads `.gogen/todos.json` once into this manager and renames
+// the file so it is not re-imported on later startups.
+func (m *TodoManager) ImportLegacyFile() bool {
+	if m == nil || m.workingDir == "" || !m.Empty() {
+		return false
+	}
+	path := filepath.Join(m.workingDir, todoFilePath)
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return false
 	}
 	var todos TodoList
 	if err := json.Unmarshal(data, &todos); err != nil {
-		return nil, err
+		return false
 	}
-	return &todos, nil
+	if len(todos.Items) == 0 {
+		_ = os.Remove(path)
+		return false
+	}
+	m.Replace(&todos)
+	bak := path + ".migrated"
+	if err := os.Rename(path, bak); err != nil {
+		// Still imported into memory; best-effort remove so we do not keep
+		// re-reading a stuck legacy file on every start.
+		_ = os.Remove(path)
+	}
+	return true
 }
 
-func (m *TodoManager) save() error {
+func (m *TodoManager) saveLegacy() error {
+	if m == nil || m.workingDir == "" {
+		return nil
+	}
 	path := filepath.Join(m.workingDir, todoFilePath)
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -90,9 +161,6 @@ func (m *TodoManager) AddTodo(text string) (string, error) {
 	}
 	m.todos.NextID++
 	m.todos.Items = append(m.todos.Items, item)
-	if err := m.save(); err != nil {
-		return "", err
-	}
 	return fmt.Sprintf("Added todo #%d: %s", item.ID, text), nil
 }
 
@@ -105,9 +173,6 @@ func (m *TodoManager) DoneTodo(id int) (string, error) {
 			}
 			m.todos.Items[i].Status = "done"
 			m.todos.Items[i].DoneAt = time.Now().UTC()
-			if err := m.save(); err != nil {
-				return "", err
-			}
 			return fmt.Sprintf("Marked todo #%d as done: %s", id, item.Text), nil
 		}
 	}
@@ -119,9 +184,6 @@ func (m *TodoManager) RemoveTodo(id int) (string, error) {
 	for i, item := range m.todos.Items {
 		if item.ID == id {
 			m.todos.Items = append(m.todos.Items[:i], m.todos.Items[i+1:]...)
-			if err := m.save(); err != nil {
-				return "", err
-			}
 			return fmt.Sprintf("Removed todo #%d: %s", id, item.Text), nil
 		}
 	}
@@ -165,8 +227,5 @@ func (m *TodoManager) ClearDoneTodos() (string, error) {
 		return "No completed todos to clear", nil
 	}
 	m.todos.Items = remaining
-	if err := m.save(); err != nil {
-		return "", err
-	}
 	return fmt.Sprintf("Cleared %d completed todos", cleared), nil
 }

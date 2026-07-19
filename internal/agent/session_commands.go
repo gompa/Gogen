@@ -98,6 +98,9 @@ func (a *Agent) startNewSession(newID string) (string, error) {
 	if a.PinManager != nil {
 		a.PinManager.ClearPins()
 	}
+	if a.TodoManager != nil {
+		a.TodoManager.Clear()
+	}
 	if a.SessionStore != nil {
 		a.persistSession()
 		if oldID != "" {
@@ -122,7 +125,6 @@ func (a *Agent) resumeSessionByID(ctx context.Context, id string) (string, error
 	}
 	a.RestoreSession(ctx, snap)
 	a.SessionID = id
-	a.lastTurnUsage = nil
 	label := llm.SessionLabel(snap.Messages, llm.DefaultSessionLabelMaxLen)
 	var out string
 	if label != "" {
@@ -174,6 +176,14 @@ func (a *Agent) deleteSessionByID(ctx context.Context, id, newSessionID string) 
 		// Old message pointers are being released; drop cached token counts.
 		contextmgr.InvalidateTokenCache()
 		a.lastTurnUsage = nil
+		a.UsageAccum = UsageAccumulator{}
+		a.SessionLabel = ""
+		if a.PinManager != nil {
+			a.PinManager.ClearPins()
+		}
+		if a.TodoManager != nil {
+			a.TodoManager.Clear()
+		}
 		a.persistSession()
 		out := fmt.Sprintf("Deleted session %s (was current — started new session %s).", id, newSessionID)
 		return AppendContextBrief(ctx, a, out), SessionActionClearChat, nil

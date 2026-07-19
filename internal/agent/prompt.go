@@ -7,21 +7,19 @@ import (
 	"gogen/internal/llm"
 )
 
-// systemPromptCache caches the formatted system prompt per working directory.
-var systemPromptCache sync.Map // workingDir string -> prompt string
+// systemPromptTemplateOnce caches the large template body once. Per-working-
+// directory prompts are not cached: sprintf with a single %s is cheap, and
+// long-lived processes that change working directories would otherwise grow an
+// unbounded map.
+var systemPromptTemplateOnce sync.Once
+var systemPromptTmpl string
 
 // SystemPrompt returns the default agent system prompt.
 func SystemPrompt(workingDir string) string {
-	if cached, ok := systemPromptCache.Load(workingDir); ok {
-		return cached.(string)
-	}
-	// Cache the template body once (empty key) so we don't re-allocate the
-	// large template string for every distinct working directory either.
-	const templateKey = "\x00template"
-	tmpl, _ := systemPromptCache.LoadOrStore(templateKey, systemPromptTemplate())
-	prompt := fmt.Sprintf(tmpl.(string), workingDir)
-	systemPromptCache.Store(workingDir, prompt)
-	return prompt
+	systemPromptTemplateOnce.Do(func() {
+		systemPromptTmpl = systemPromptTemplate()
+	})
+	return fmt.Sprintf(systemPromptTmpl, workingDir)
 }
 
 func systemPromptTemplate() string {

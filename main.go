@@ -153,6 +153,11 @@ func main() {
 			}
 		}
 	}
+	// One-time migration: adopt project-global todos.json into the current
+	// session when it has no todos yet, then rename the legacy file.
+	if a.ImportLegacyTodos() {
+		fmt.Fprintf(os.Stderr, "Migrated legacy todos into session %s\n", a.SessionID)
+	}
 	if name := provider.ModelName(); name != "" {
 		fmt.Fprintf(os.Stderr, "Model: %s\n", name)
 	} else {
@@ -168,6 +173,8 @@ func main() {
 			a.SetMCPRegistry(reg)
 			fmt.Fprintf(os.Stderr, "MCP tools: %d\n", len(reg.ToolNames()))
 		}
+	} else if !cfg.MCPEnabled() && len(cfg.MCPServers) > 0 {
+		fmt.Fprintf(os.Stderr, "MCP servers configured but mcp is off; set mcp: on or GOGEN_MCP=on to enable\n")
 	}
 	if mcpMgr != nil {
 		defer mcpMgr.Close()
@@ -190,9 +197,17 @@ func main() {
 		if cfg.WebAuthToken != "" {
 			fmt.Printf("Auth token required (GOGEN_WEB_TOKEN / web_auth_token)\n")
 		}
-		if err := s.Start(addr); err != nil {
-			log.Fatal(err)
-		}
+		// Start the web server in the background so the UI is accessible
+		// immediately, even while other initialization (e.g. fetching model
+		// context limits from the LLM API) is still in progress.
+		done := make(chan struct{})
+		go func() {
+			if err := s.Start(addr); err != nil {
+				log.Printf("web server error: %v", err)
+			}
+			close(done)
+		}()
+		<-done
 		return
 	}
 	// Default: TUI mode.

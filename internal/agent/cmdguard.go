@@ -22,6 +22,12 @@ func NewCommandGuard(mode string, allowlist []string) *CommandGuard {
 	return &CommandGuard{Mode: mode, Allowlist: allowlist}
 }
 
+// blockedCommandPatterns targets destructive / privilege-escalation / remote-
+// execution patterns. It intentionally does not block general shell execution
+// helpers such as eval, bash -c, or sh -c: execute_command is meant to run
+// arbitrary developer commands, and blocking those builtins without also
+// blocking every equivalent (source, command substitution, scripts) would be
+// inconsistent security theater. Use allowlist mode for tighter control.
 var blockedCommandPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\bsudo\b`),
 	regexp.MustCompile(`(?i)\bsu\s+-`),

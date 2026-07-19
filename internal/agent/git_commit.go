@@ -225,9 +225,11 @@ func (e *Executor) GitDiffShow(ctx context.Context, ref string) (string, error) 
 		return "", err
 	}
 
+	// Ref must come before any "--" pathspec separator; after "--" git
+	// treats the argument as a path, not a revision/range.
 	args := []string{"show", "--no-color", "--no-ext-diff"}
 	if ref != "" {
-		args = append(args, "--", ref)
+		args = append(args, ref)
 	}
 
 	cmd, cmdErr := e.newGitCmd(ctx, args...)

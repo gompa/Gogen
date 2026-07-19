@@ -51,14 +51,14 @@ func BuiltinTools() []llm.Tool {
 		},
 		{
 			Name:        "read_file",
-			Description: "Read content of a single file. Use offset/limit for large files (1-based line numbers). Use 'search' to jump to the first line matching a pattern.",
+			Description: "Read content of a single file. Without search: offset/limit are a 1-based line window. With search: jumps to the first matching line; offset is context lines around the match (default 10) and limit is max lines returned — not a starting line number.",
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
 					"file_path": map[string]interface{}{"type": "string", "description": "Path to file"},
-					"offset": map[string]interface{}{"type": "integer", "description": "Optional 1-based starting line (default: 1)"},
-					"limit":  map[string]interface{}{"type": "integer", "description": "Optional max lines to read (default: all, capped at 10000)"},
-					"search": map[string]interface{}{"type": "string", "description": "Optional regex pattern; jumps to the first matching line and reads N lines around it"},
+					"offset": map[string]interface{}{"type": "integer", "description": "Without search: 1-based starting line (default 1). With search: lines of context before/after the match (default 10) — not a starting line."},
+					"limit":  map[string]interface{}{"type": "integer", "description": "Without search: max lines to read (default all, capped at 10000). With search: max lines returned around the match."},
+					"search": map[string]interface{}{"type": "string", "description": "Optional regex; jump to first matching line. When set, offset means context lines (not start line) and limit caps the window size."},
 				},
 				"required": []string{"file_path"},
 			},

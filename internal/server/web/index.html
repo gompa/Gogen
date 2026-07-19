@@ -948,7 +948,8 @@
         }
 
         function appendThinkingToken(token) {
-            // Match TUI: ignore thinking once any tool call has started this turn.
+            // Match TUI: ignore thinking after tool calls start in this round.
+            // Cleared again on the next round's "thinking" (OnRoundStart).
             if (toolsStartedThisTurn) return;
             if (!currentThinkingSpan) {
                 showThinking();
@@ -1371,7 +1372,11 @@
 
                 if (data.type === 'thinking') {
                     setTurnActive(true);
-                    if (toolsStartedThisTurn) return;
+                    // New model round (OnStart / OnRoundStart): clear per-round
+                    // tool state so reasoning shows again, matching TUI.
+                    toolsStartedThisTurn = false;
+                    streamingToolCards = {};
+                    statusDiv.innerText = 'Status: thinking...';
                     finalizeThinking();
                     const div = document.createElement('div');
                     div.id = 'status-thinking';
@@ -1381,6 +1386,7 @@
                     messagesDiv.scrollTop = messagesDiv.scrollHeight;
                 } else if (data.type === 'waiting') {
                     setTurnActive(true);
+                    statusDiv.innerText = 'Status: waiting for model...';
                     removeThinkingStatus();
                     let el = document.getElementById('status-waiting');
                     if (!el) {
@@ -1393,11 +1399,13 @@
                     messagesDiv.scrollTop = messagesDiv.scrollHeight;
                 } else if (data.type === 'thinking_token') {
                     setTurnActive(true);
+                    statusDiv.innerText = 'Status: thinking...';
                     const w = document.getElementById('status-waiting');
                     if (w) w.remove();
                     appendThinkingToken(data.content || '');
                 } else if (data.type === 'stream') {
                     setTurnActive(true);
+                    statusDiv.innerText = 'Status: running...';
                     const w = document.getElementById('status-waiting');
                     if (w) w.remove();
                     finalizeThinking();
@@ -1438,7 +1446,8 @@
                     }
                 } else if (data.type === 'tool_result') {
                     finalizeThinking();
-                    statusDiv.innerText = 'Status: Connected';
+                    // Stay busy until turn_end — more rounds may follow.
+                    statusDiv.innerText = 'Status: thinking...';
                     const cardInfo = pendingToolCards[data.toolCallId];
                     if (cardInfo) {
                         updateToolCardWithResult(
@@ -1514,6 +1523,10 @@
                 endStream();
                 streamingToolCards = {};
                 pendingToolCards = {};
+                setTurnActive(false);
+                removeThinkingStatus();
+                const w = document.getElementById('status-waiting');
+                if (w) w.remove();
                 clearTimeout(reconnectTimer);
                 reconnectTimer = setTimeout(connect, 3000);
             };
@@ -1529,6 +1542,7 @@
             if (turnActive) {
                 // Sending while busy cancels the current turn (same as TUI interrupt + new prompt).
                 ws.send(JSON.stringify({ type: 'cancel' }));
+                setTurnActive(false);
                 abortInFlightUI(null);
             }
             appendMessage('user', text);

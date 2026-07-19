@@ -251,3 +251,91 @@ func TestPersistSessionRecordsError(t *testing.T) {
 		t.Fatal("expected successful save to clear persist error")
 	}
 }
+
+func TestRestoreSessionKeepsProjectProfileSameDir(t *testing.T) {
+	a := &Agent{WorkingDir: "/tmp/project", projectProfile: "stale"}
+	a.RestoreSession(context.Background(), SessionSnapshot{
+		WorkingDir:     "/tmp/project",
+		ProjectProfile: "Working directory: /tmp/project\nTop-level directories: cmd/, internal/\n",
+		Messages:       []llm.Message{{Role: "user", Content: "hi"}},
+	})
+	if a.projectProfile != "Working directory: /tmp/project\nTop-level directories: cmd/, internal/\n" {
+		t.Fatalf("projectProfile=%q", a.projectProfile)
+	}
+}
+
+func TestRestoreSessionClearsProjectProfileDifferentDir(t *testing.T) {
+	a := &Agent{WorkingDir: "/tmp/other", projectProfile: "stale"}
+	a.RestoreSession(context.Background(), SessionSnapshot{
+		WorkingDir:     "/tmp/project",
+		ProjectProfile: "Working directory: /tmp/project\n",
+		Messages:       []llm.Message{{Role: "user", Content: "hi"}},
+	})
+	if a.projectProfile != "" {
+		t.Fatalf("expected empty projectProfile, got %q", a.projectProfile)
+	}
+}
+
+func TestRestoreSessionClearsProjectProfileWhenMissing(t *testing.T) {
+	a := &Agent{WorkingDir: "/tmp/project", projectProfile: "stale"}
+	a.RestoreSession(context.Background(), SessionSnapshot{
+		WorkingDir: "/tmp/project",
+		Messages:   []llm.Message{{Role: "user", Content: "hi"}},
+	})
+	if a.projectProfile != "" {
+		t.Fatalf("expected empty projectProfile, got %q", a.projectProfile)
+	}
+}
+
+func TestRestoreSessionClearsPinsAndUsage(t *testing.T) {
+	pins := NewPinManager()
+	pins.pinned[0] = struct{}{}
+	pins.pinned[3] = struct{}{}
+	a := &Agent{
+		WorkingDir:    "/tmp/project",
+		PinManager:    pins,
+		lastTurnUsage: &llm.Usage{PromptTokens: 100, CachedTokens: 80},
+		UsageAccum:    UsageAccumulator{TotalPromptTokens: 500, TotalCompletionTokens: 50, TotalCachedTokens: 200, TotalTurns: 3},
+		Messages:      []llm.Message{{Role: "user", Content: "old"}},
+	}
+	a.RestoreSession(context.Background(), SessionSnapshot{
+		WorkingDir:     "/tmp/project",
+		ProjectProfile: "profile",
+		Messages:       []llm.Message{{Role: "user", Content: "restored"}},
+	})
+	if len(a.PinManager.PinnedIndices()) != 0 {
+		t.Fatalf("pins not cleared: %v", a.PinManager.PinnedIndices())
+	}
+	if a.lastTurnUsage != nil {
+		t.Fatalf("lastTurnUsage=%v, want nil", a.lastTurnUsage)
+	}
+	if a.UsageAccum != (UsageAccumulator{}) {
+		t.Fatalf("UsageAccum=%+v, want zero", a.UsageAccum)
+	}
+	if a.projectProfile != "profile" {
+		t.Fatalf("projectProfile=%q", a.projectProfile)
+	}
+}
+
+func TestPersistSessionStoresProjectProfile(t *testing.T) {
+	dir := t.TempDir()
+	store := &stubSessionStore{}
+	a := &Agent{
+		Provider:     &statsStubProvider{},
+		WorkingDir:   dir,
+		SessionStore: store,
+		SessionID:    "s1",
+		Messages:     []llm.Message{{Role: "user", Content: "hi"}},
+	}
+	a.persistSession()
+	snap, ok := store.sessions["s1"]
+	if !ok {
+		t.Fatal("session not saved")
+	}
+	if snap.ProjectProfile == "" {
+		t.Fatal("expected projectProfile to be detected and saved")
+	}
+	if a.projectProfile == "" {
+		t.Fatal("expected in-memory projectProfile to be set")
+	}
+}

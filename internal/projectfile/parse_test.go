@@ -143,3 +143,27 @@ func TestDiscoverPriority(t *testing.T) {
 		t.Fatalf("got %q", path)
 	}
 }
+
+func TestExtractMarkdownBodyMatchesParseContent(t *testing.T) {
+	cases := []string{
+		"---\ncommand_safety: off\n---\n# Rules\n",
+		"---\ncommand_safety: off\n---", // closing --- at EOF, no trailing newline
+		"---\r\ncommand_safety: off\r\n---\r\n# Rules\r\n",
+		"# plain guidelines\n",
+		"---\nno closing delimiter",
+	}
+	for _, content := range cases {
+		body := extractMarkdownBody(content)
+		pf, err := ParseContent("GOGEN.md", content)
+		if err != nil {
+			if body != "" {
+				t.Fatalf("ParseContent failed but extractMarkdownBody=%q for %q: %v", body, content, err)
+			}
+			continue
+		}
+		want := pf.Guidelines
+		if body != want {
+			t.Fatalf("extractMarkdownBody=%q ParseContent.Guidelines=%q for %q", body, want, content)
+		}
+	}
+}

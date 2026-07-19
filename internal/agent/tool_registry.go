@@ -352,7 +352,12 @@ func handleTodoAdd(_ context.Context, a *Agent, args map[string]interface{}) (st
 	if err != nil {
 		return "", err
 	}
-	return tm.AddTodo(text)
+	out, err := tm.AddTodo(text)
+	if err != nil {
+		return "", err
+	}
+	a.persistTodos()
+	return out, nil
 }
 
 func handleTodoList(_ context.Context, a *Agent, _ map[string]interface{}) (string, error) {
@@ -372,7 +377,12 @@ func handleTodoDone(_ context.Context, a *Agent, args map[string]interface{}) (s
 	if err != nil {
 		return "", err
 	}
-	return tm.DoneTodo(id)
+	out, err := tm.DoneTodo(id)
+	if err != nil {
+		return "", err
+	}
+	a.persistTodos()
+	return out, nil
 }
 
 func handleTodoRemove(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
@@ -384,7 +394,12 @@ func handleTodoRemove(_ context.Context, a *Agent, args map[string]interface{}) 
 	if err != nil {
 		return "", err
 	}
-	return tm.RemoveTodo(id)
+	out, err := tm.RemoveTodo(id)
+	if err != nil {
+		return "", err
+	}
+	a.persistTodos()
+	return out, nil
 }
 
 func handleTodoClearDone(_ context.Context, a *Agent, _ map[string]interface{}) (string, error) {
@@ -392,7 +407,12 @@ func handleTodoClearDone(_ context.Context, a *Agent, _ map[string]interface{}) 
 	if err != nil {
 		return "", err
 	}
-	return tm.ClearDoneTodos()
+	out, err := tm.ClearDoneTodos()
+	if err != nil {
+		return "", err
+	}
+	a.persistTodos()
+	return out, nil
 }
 
 func handleListDefinitions(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {

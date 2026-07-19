@@ -83,7 +83,7 @@ func Defaults() Config {
 		CLIVerbose:           false,
 		DebugLog:             "",
 		DebugSession:         "",
-		MCP:                  "on",
+		MCP:                  "off",
 		WebBind:              "127.0.0.1:8081",
 		WebAllowedOrigins:    "",
 		WebTLSCertFile:       "",
@@ -102,12 +102,13 @@ func Defaults() Config {
 }
 
 // MCPEnabled reports whether MCP integration is active.
+// Opt-in: servers in project config are not started unless mcp is explicitly enabled.
 func (c *Config) MCPEnabled() bool {
 	if c == nil {
-		return true
+		return false
 	}
 	v := strings.ToLower(strings.TrimSpace(c.MCP))
-	return v != "off" && v != "0" && v != "false"
+	return v == "on" || v == "1" || v == "true"
 }
 
 // TreeSitterEnabled reports whether tree-sitter checks are active.

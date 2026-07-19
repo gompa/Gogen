@@ -1,7 +1,10 @@
 package session
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"gogen/internal/agent"
 	"gogen/internal/llm"
@@ -29,5 +32,39 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 	if loaded.Mode != "plan" {
 		t.Fatalf("mode=%q", loaded.Mode)
+	}
+}
+
+func TestLatestIDUsesUpdatedNotMtime(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(true)
+
+	if err := store.Save("older", agent.SessionSnapshot{
+		WorkingDir: dir,
+		Messages:   []llm.Message{{Role: "user", Content: "older"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	if err := store.Save("newer", agent.SessionSnapshot{
+		WorkingDir: dir,
+		Messages:   []llm.Message{{Role: "user", Content: "newer"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Touch the older file so mtime is newer than "newer".
+	olderPath := filepath.Join(dir, ".gogen", "sessions", "older.json")
+	future := time.Now().Add(time.Hour)
+	if err := os.Chtimes(olderPath, future, future); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := store.LatestID(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "newer" {
+		t.Fatalf("LatestID=%q want %q (should use Updated, not mtime)", got, "newer")
 	}
 }

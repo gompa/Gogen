@@ -123,6 +123,7 @@ YAML config
 ```yaml
 command_safety: blocklist
 openai_model: gpt-4o
+mcp: on
 mcp_servers:
   - name: fetch
     command: npx
@@ -194,7 +195,7 @@ After each agent turn, GoGen shows context usage in the CLI (dim line) and web U
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GOGEN_MCP` | on | Set to `off` to disable MCP |
+| `GOGEN_MCP` | off | Set to `on` to enable MCP (also set `mcp: on` in project config) |
 | `GOGEN_MCP_SERVERS` | *(empty)* | JSON array of `{name, command, args, env}` (overrides file) |
 
 ### Sessions and debug

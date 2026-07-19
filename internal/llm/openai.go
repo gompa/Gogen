@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -39,9 +40,10 @@ func (p *OpenAIProvider) ModelName() string {
 	return p.model
 }
 
-func (p *OpenAIProvider) listModels(ctx context.Context) []openai.Model {
+func (p *OpenAIProvider) listModels(ctx context.Context) ([]openai.Model, error) {
 	p.modelClient = make(map[string]*openai.Client)
 	var models []openai.Model
+	var errs []error
 
 	query := func(c *openai.Client) {
 		pager := c.Models.ListAutoPaging(ctx)
@@ -49,6 +51,9 @@ func (p *OpenAIProvider) listModels(ctx context.Context) []openai.Model {
 			m := pager.Current()
 			models = append(models, m)
 			p.modelClient[m.ID] = c
+		}
+		if err := pager.Err(); err != nil {
+			errs = append(errs, err)
 		}
 	}
 
@@ -60,7 +65,10 @@ func (p *OpenAIProvider) listModels(ctx context.Context) []openai.Model {
 		// Non-OpenCode: just the primary client.
 		query(&p.client)
 	}
-	return models
+	if len(models) == 0 && len(errs) > 0 {
+		return nil, errors.Join(errs...)
+	}
+	return models, nil
 }
 
 func NewOpenAIProvider(apiKey string, model string, baseURL string) *OpenAIProvider {
@@ -507,7 +515,7 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 }
 
 func (p *OpenAIProvider) ModelContextLimit(ctx context.Context) (int, error) {
-	models := p.listModels(ctx)
+	models, _ := p.listModels(ctx)
 
 	if len(models) == 1 {
 		sole := models[0]
@@ -559,7 +567,10 @@ func (p *OpenAIProvider) ModelContextLimit(ctx context.Context) (int, error) {
 }
 
 func (p *OpenAIProvider) ListModels(ctx context.Context) ([]ModelInfo, error) {
-	models := p.listModels(ctx)
+	models, err := p.listModels(ctx)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]ModelInfo, 0, len(models))
 	current := p.model
 	for _, m := range models {

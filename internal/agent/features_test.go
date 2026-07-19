@@ -264,3 +264,44 @@ func TestPatchFileTrailingWhitespaceTolerance(t *testing.T) {
 		t.Fatalf("fuzzy whitespace-tolerant patch not applied: %q", got)
 	}
 }
+
+func TestPatchFileRejectsDuplicateTarget(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.go")
+	original := "package main\n\nfunc main() {\n}\n"
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	diff := "" +
+		"--- a/main.go\n" +
+		"+++ b/main.go\n" +
+		"@@ -1,4 +1,5 @@\n" +
+		" package main\n" +
+		" \n" +
+		"+// first\n" +
+		" func main() {\n" +
+		" }\n" +
+		"--- a/main.go\n" +
+		"+++ b/main.go\n" +
+		"@@ -1,4 +1,5 @@\n" +
+		" package main\n" +
+		" \n" +
+		"+// second\n" +
+		" func main() {\n" +
+		" }\n"
+
+	exec := NewExecutor(dir)
+	exec.RequireDeleteApproval = false
+	_, err := exec.PatchFile(context.Background(), diff, false, false)
+	if err == nil {
+		t.Fatal("expected error for duplicate patch target")
+	}
+	got, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	if string(got) != original {
+		t.Fatalf("file should be unchanged on duplicate reject: %q", got)
+	}
+}

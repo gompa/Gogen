@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -45,6 +46,7 @@ func (e *Executor) PatchFile(ctx context.Context, diff string, dryRun, fuzzy boo
 	var plans []patchPlan
 	var okFiles []string
 	var failFiles []string
+	seenTargets := make(map[string]struct{})
 
 	for _, pf := range files {
 		plan, label, err := e.planPatch(pf, fuzzy)
@@ -52,6 +54,11 @@ func (e *Executor) PatchFile(ctx context.Context, diff string, dryRun, fuzzy boo
 			failFiles = append(failFiles, fmt.Sprintf("%s: %v", label, err))
 			continue
 		}
+		if _, dup := seenTargets[plan.secure]; dup {
+			failFiles = append(failFiles, fmt.Sprintf("%s: duplicate path in patch; combine into one file section", plan.target))
+			continue
+		}
+		seenTargets[plan.secure] = struct{}{}
 		plans = append(plans, plan)
 		okFiles = append(okFiles, label)
 	}
@@ -125,10 +132,14 @@ func appliedPaths(applied []string) []string {
 
 func rollbackPatches(snapshots map[string][]byte, created []string) {
 	for _, path := range created {
-		_ = os.Remove(path)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			log.Printf("patch rollback: remove %s: %v", path, err)
+		}
 	}
 	for path, data := range snapshots {
-		_ = writeFileAtomic(path, data, 0o644)
+		if err := writeFileAtomic(path, data, 0o644); err != nil {
+			log.Printf("patch rollback: restore %s: %v", path, err)
+		}
 	}
 }
 
@@ -229,6 +240,10 @@ func normalizePatchPath(name string) string {
 			name = name[1 : len(name)-1]
 		}
 	}
+	// Strip the conventional unified-diff a/ and b/ prefixes. This matches
+	// git/patch tooling and cannot distinguish a literal path that starts
+	// with "a/" or "b/" (e.g. a repo file named a/foo.go) — a known
+	// limitation of the unified diff format.
 	name = strings.TrimPrefix(name, "a/")
 	name = strings.TrimPrefix(name, "b/")
 	return filepath.Clean(name)

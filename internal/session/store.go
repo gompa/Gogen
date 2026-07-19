@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -17,16 +18,17 @@ import (
 const version = 1
 
 type file struct {
-	Version        int           `json:"version"`
-	ID             string        `json:"id"`
-	Created        time.Time     `json:"created"`
-	Updated        time.Time     `json:"updated"`
-	WorkingDir     string        `json:"workingDir"`
-	Model          string        `json:"model"`
-	Mode           string        `json:"mode"`
-	Label          string        `json:"label,omitempty"`
-	ProjectProfile string        `json:"projectProfile,omitempty"`
-	Messages       []llm.Message `json:"messages"`
+	Version        int             `json:"version"`
+	ID             string          `json:"id"`
+	Created        time.Time       `json:"created"`
+	Updated        time.Time       `json:"updated"`
+	WorkingDir     string          `json:"workingDir"`
+	Model          string          `json:"model"`
+	Mode           string          `json:"mode"`
+	Label          string          `json:"label,omitempty"`
+	ProjectProfile string          `json:"projectProfile,omitempty"`
+	Todos          *agent.TodoList `json:"todos,omitempty"`
+	Messages       []llm.Message   `json:"messages"`
 }
 
 // Store persists sessions under .gogen/sessions/.
@@ -86,7 +88,12 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 	}
 	existing := file{Created: time.Now().UTC()}
 	if data, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(data, &existing)
+		var prev file
+		if err := json.Unmarshal(data, &prev); err != nil {
+			log.Printf("session save: ignoring corrupt session file %s: %v", path, err)
+		} else if !prev.Created.IsZero() {
+			existing.Created = prev.Created
+		}
 	}
 	out := file{
 		Version:        version,
@@ -98,6 +105,7 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 		Mode:           snap.Mode,
 		Label:          snap.Label,
 		ProjectProfile: snap.ProjectProfile,
+		Todos:          snap.Todos,
 		Messages:       snap.Messages,
 	}
 	data, err := json.MarshalIndent(out, "", "  ")
@@ -137,6 +145,7 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 		Mode:           f.Mode,
 		Label:          f.Label,
 		ProjectProfile: f.ProjectProfile,
+		Todos:          f.Todos,
 		Messages:       f.Messages,
 	}, nil
 }
@@ -180,6 +189,9 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 }
 
 // LatestID returns the most recently updated session id.
+// Uses the Updated field in each session JSON (not file mtime), so copied or
+// restored files cannot displace the true latest. Only the updated timestamp
+// is decoded — messages and other fields are skipped for a cheap scan.
 func (s *Store) LatestID(workingDir string) (string, error) {
 	dir := s.dir(workingDir)
 	entries, err := os.ReadDir(dir)
@@ -190,22 +202,25 @@ func (s *Store) LatestID(workingDir string) (string, error) {
 		return "", err
 	}
 	var latestID string
-	var latestMod time.Time
+	var latestUpdated time.Time
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
 			continue
 		}
-		info, err := e.Info()
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
 		if err != nil {
 			continue
 		}
-		if info.ModTime().After(latestMod) {
-			latestMod = info.ModTime()
+		var meta struct {
+			Updated time.Time `json:"updated"`
+		}
+		if err := json.Unmarshal(data, &meta); err != nil || meta.Updated.IsZero() {
+			continue
+		}
+		if meta.Updated.After(latestUpdated) {
+			latestUpdated = meta.Updated
 			latestID = strings.TrimSuffix(e.Name(), ".json")
 		}
-	}
-	if latestID == "" {
-		return "", nil
 	}
 	return latestID, nil
 }

@@ -65,8 +65,9 @@ func (e *Executor) readFileRaw(path string) ([]byte, error) {
 }
 
 // ReadFileRange reads a file with optional 1-based line offset and line limit.
-// When search is non-empty, offset and limit are applied relative to the first
-// matching line (regex match).
+// When search is non-empty, semantics change: the function jumps to the first
+// regex match, offset is treated as context lines around that match (default 10,
+// not a starting line number), and limit caps the total lines returned.
 func (e *Executor) ReadFileRange(path string, offset, limit int, search string) (string, error) {
 	secure, err := e.securePath(path)
 	if err != nil {
@@ -129,9 +130,13 @@ func (e *Executor) ReadFileRange(path string, offset, limit int, search string) 
 		if len(allLines) == 0 {
 			return "File is empty", nil
 		}
+		re, err := regexp.Compile(search)
+		if err != nil {
+			return "", fmt.Errorf("invalid search pattern: %w", err)
+		}
 		matchLine := 0
 		for i, line := range allLines {
-			if matched, _ := regexp.MatchString(search, line); matched {
+			if re.MatchString(line) {
 				matchLine = i + 1
 				break
 			}
@@ -210,10 +215,11 @@ func (e *Executor) ReadFileRange(path string, offset, limit int, search string) 
 	}
 	totalLines := lineNum
 	if totalLines == 0 {
+		msg := fmt.Sprintf("File has %d lines; offset %d is past end.", totalLines, start)
 		if header.Len() > 0 {
-			return header.String() + fmt.Sprintf("File has %d lines; offset %d is past end.", totalLines, start), nil
+			return header.String() + msg, nil
 		}
-		return fmt.Sprintf("File has %d lines; offset %d is past end.", totalLines, start), nil
+		return msg, nil
 	}
 
 	end := start + len(selected) - 1
