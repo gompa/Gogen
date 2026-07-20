@@ -254,7 +254,7 @@ func (a *Agent) prepareMessages(ctx context.Context) []llm.Message {
 			}
 		}
 		a.Context.EnsureToolResultsCapped(a.Messages)
-		view = a.Context.ViewForLLM(a.Messages)
+		view = a.Messages
 	}
 	view = withSystemPrompt(view, a.WorkingDir)
 	return enrichSystemPrompt(view, a.WorkingDir, a.ProjectFilePath, a.ProjectGuidelines, a.ensureProjectProfile(), a.Mode)
@@ -350,14 +350,14 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 
 		if len(result.ToolCalls) == 0 && result.Content != "" {
 			finishStreamUI(h)
-			a.Messages = append(a.Messages, llm.Message{Role: "assistant", Content: result.Content})
+			a.Messages = append(a.Messages, llm.Message{Role: "assistant", Content: result.Content, Reasoning: result.Reasoning})
 			a.persistSession()
 			return result.Content, nil
 		}
 
 		if len(result.ToolCalls) == 0 && result.Content == "" {
 			finishStreamUI(h)
-			a.Messages = append(a.Messages, llm.Message{Role: "assistant", Content: ""})
+			a.Messages = append(a.Messages, llm.Message{Role: "assistant", Content: "", Reasoning: result.Reasoning})
 			a.persistSession()
 			return "", nil
 		}
@@ -375,6 +375,7 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 		a.Messages = append(a.Messages, llm.Message{
 			Role:      "assistant",
 			Content:   result.Content,
+			Reasoning: result.Reasoning,
 			ToolCalls: result.ToolCalls,
 		})
 

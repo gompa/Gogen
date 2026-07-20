@@ -321,6 +321,7 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 
 	var fullContent string
 	var fullRefusal string
+	var fullReasoning string
 	var lastFinishReason string
 	var streamUsage *Usage
 	var tcAccums []tcAccum
@@ -370,7 +371,7 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 
 		choice := chunk.Choices[0]
 		delta := choice.Delta
-		extras.addFromDelta(delta, onThinking)
+		extras.addFromDelta(delta, onThinking, &fullReasoning)
 
 		if delta.Content != "" {
 			fullContent += delta.Content
@@ -450,6 +451,7 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 		}
 		return &StreamResult{
 			Content:       resp.Content,
+			Reasoning:     resp.Reasoning,
 			ToolCalls:     resp.ToolCalls,
 			Usage:         resp.Usage,
 			PartialStream: len(tcAccums) > 0 || fullContent != "" || extras.textLen() > 0,
@@ -509,6 +511,7 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 
 	return &StreamResult{
 		Content:   content,
+		Reasoning: fullReasoning,
 		ToolCalls: toolCalls,
 		Usage:     streamUsage,
 	}, nil

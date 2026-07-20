@@ -28,55 +28,67 @@ type SessionCommandResult struct {
 // HandleSessionCommand processes /new, /resume, and sessions commands.
 // newSessionID is required for /new (call session.NewID() from the caller).
 func (a *Agent) HandleSessionCommand(ctx context.Context, input, newSessionID string) (SessionCommandResult, bool, error) {
-	trimmed := strings.TrimSpace(input)
-	switch trimmed {
-	case "/new", "new":
+	cmd, args := parseSessionCommand(input)
+	switch cmd {
+	case "new":
 		out, err := a.startNewSession(newSessionID)
 		if err != nil {
 			return SessionCommandResult{}, true, err
 		}
 		return SessionCommandResult{Output: AppendContextBrief(ctx, a, out), Action: SessionActionClearChat}, true, nil
-	case "sessions", "/sessions", "resume", "/resume":
+	case "sessions", "resume":
+		if args != "" {
+			return a.handleResumeArg(ctx, args, newSessionID)
+		}
 		out, sessions, err := a.formatSessionList()
 		if err != nil {
 			return SessionCommandResult{}, true, err
 		}
 		return SessionCommandResult{Output: out, Sessions: sessions}, true, nil
 	}
-	if strings.HasPrefix(trimmed, "resume ") || strings.HasPrefix(trimmed, "/resume ") {
-		id := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(trimmed, "/resume"), "resume"))
-		if id == "" {
-			out, sessions, err := a.formatSessionList()
-			if err != nil {
-				return SessionCommandResult{}, true, err
-			}
-			return SessionCommandResult{Output: out, Sessions: sessions}, true, nil
+	return SessionCommandResult{}, false, nil
+}
+
+// parseSessionCommand splits input into (command, args), stripping a leading "/".
+func parseSessionCommand(input string) (cmd, args string) {
+	trimmed := strings.TrimSpace(input)
+	trimmed = strings.TrimPrefix(trimmed, "/")
+	parts := strings.SplitN(trimmed, " ", 2)
+	cmd = strings.ToLower(parts[0])
+	if len(parts) > 1 {
+		args = strings.TrimSpace(parts[1])
+	}
+	return cmd, args
+}
+
+// handleResumeArg routes "del", "latest", or session-ID sub-commands.
+func (a *Agent) handleResumeArg(ctx context.Context, args, newSessionID string) (SessionCommandResult, bool, error) {
+	if args == "del" {
+		return SessionCommandResult{}, true, fmt.Errorf("usage: resume del <id>")
+	}
+	if strings.HasPrefix(args, "del ") {
+		delID := strings.TrimSpace(strings.TrimPrefix(args, "del"))
+		if delID == "" {
+			return SessionCommandResult{}, true, fmt.Errorf("usage: resume del <id>")
 		}
-		if strings.HasPrefix(id, "del ") || id == "del" {
-			delID := strings.TrimSpace(strings.TrimPrefix(id, "del"))
-			if delID == "" {
-				return SessionCommandResult{}, true, fmt.Errorf("usage: resume del <id>")
-			}
-			out, action, err := a.deleteSessionByID(ctx, delID, newSessionID)
-			if err != nil {
-				return SessionCommandResult{}, true, err
-			}
-			return SessionCommandResult{Output: out, Action: action}, true, nil
+		out, action, err := a.deleteSessionByID(ctx, delID, newSessionID)
+		if err != nil {
+			return SessionCommandResult{}, true, err
 		}
-		if id == "latest" {
-			out, err := a.resumeLatestSession(ctx)
-			if err != nil {
-				return SessionCommandResult{}, true, err
-			}
-			return SessionCommandResult{Output: out, Action: SessionActionClearChat, History: a.Messages}, true, nil
-		}
-		out, err := a.resumeSessionByID(ctx, id)
+		return SessionCommandResult{Output: out, Action: action}, true, nil
+	}
+	if args == "latest" {
+		out, err := a.resumeLatestSession(ctx)
 		if err != nil {
 			return SessionCommandResult{}, true, err
 		}
 		return SessionCommandResult{Output: out, Action: SessionActionClearChat, History: a.Messages}, true, nil
 	}
-	return SessionCommandResult{}, false, nil
+	out, err := a.resumeSessionByID(ctx, args)
+	if err != nil {
+		return SessionCommandResult{}, true, err
+	}
+	return SessionCommandResult{Output: out, Action: SessionActionClearChat, History: a.Messages}, true, nil
 }
 
 func (a *Agent) startNewSession(newID string) (string, error) {

@@ -214,6 +214,7 @@ type HistoryToolCall struct {
 type HistoryEntry struct {
 	Role       string            `json:"role"`
 	Content    string            `json:"content,omitempty"`
+	Reasoning  string            `json:"reasoning,omitempty"`
 	ToolCalls  []HistoryToolCall `json:"toolCalls,omitempty"`
 	ToolCallID string            `json:"toolCallId,omitempty"`
 }
@@ -360,10 +361,10 @@ func historyEntries(msgs []llm.Message) []HistoryEntry {
 			}
 			out = append(out, HistoryEntry{Role: m.Role, Content: m.Content})
 		case "assistant":
-			if m.Content == "" && len(m.ToolCalls) == 0 {
+			if m.Content == "" && len(m.ToolCalls) == 0 && m.Reasoning == "" {
 				continue
 			}
-			entry := HistoryEntry{Role: m.Role, Content: m.Content}
+			entry := HistoryEntry{Role: m.Role, Content: m.Content, Reasoning: m.Reasoning}
 			if len(m.ToolCalls) > 0 {
 				entry.ToolCalls = make([]HistoryToolCall, len(m.ToolCalls))
 				for i, tc := range m.ToolCalls {

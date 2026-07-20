@@ -30,3 +30,37 @@ func TestHistoryEntriesIncludesTools(t *testing.T) {
 		t.Fatalf("tool entry: %#v", got[2])
 	}
 }
+
+func TestHistoryEntriesIncludesReasoning(t *testing.T) {
+	msgs := []llm.Message{
+		{Role: "user", Content: "explain"},
+		{
+			Role:      "assistant",
+			Content:   "The answer is 42",
+			Reasoning: "Let me think about this...",
+		},
+		{
+			Role:      "assistant",
+			Content:   "",
+			Reasoning: "Only reasoning, no content",
+		},
+		{
+			Role:      "assistant",
+			Content:   "Just content",
+			Reasoning: "",
+		},
+	}
+	got := historyEntries(msgs)
+	if len(got) != 4 {
+		t.Fatalf("len=%d want 4: %#v", len(got), got)
+	}
+	if got[1].Reasoning != "Let me think about this..." {
+		t.Fatalf("reasoning = %q", got[1].Reasoning)
+	}
+	if got[2].Reasoning != "Only reasoning, no content" {
+		t.Fatalf("reasoning-only entry: %#v", got[2])
+	}
+	if got[3].Reasoning != "" {
+		t.Fatalf("content-only entry should have empty reasoning: %q", got[3].Reasoning)
+	}
+}

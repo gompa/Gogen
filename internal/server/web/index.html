@@ -1320,6 +1320,18 @@
                 if (h.role === 'user') {
                     appendMessage('user', h.content || '');
                 } else if (h.role === 'assistant') {
+                    // Skip when reasoning was promoted into content (same text).
+                    if (h.reasoning && h.reasoning !== h.content) {
+                        const div = document.createElement('div');
+                        div.className = 'message assistant thinking-block';
+                        const open = document.createElement('span');
+                        open.textContent = '<thinking>';
+                        const close = document.createElement('span');
+                        close.textContent = '</thinking>';
+                        div.append(open, document.createTextNode(h.reasoning), close);
+                        chatContainer.appendChild(div);
+                        chatContainer.scrollTop = chatContainer.scrollHeight;
+                    }
                     if (h.content) appendMessage('assistant', h.content);
                     if (Array.isArray(h.toolCalls)) {
                         for (const tc of h.toolCalls) {

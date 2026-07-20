@@ -33,23 +33,50 @@ func extraFieldShouldDisplay(key string) bool {
 		strings.Contains(lower, "thought")
 }
 
-func (a extraFieldAccums) addFromDelta(delta openai.ChatCompletionChunkChoiceDelta, onThinking func(string)) {
+func (a extraFieldAccums) addFromDelta(delta openai.ChatCompletionChunkChoiceDelta, onThinking func(string), fullReasoning *string) {
+	emit := a.thinkingEmitter(onThinking, fullReasoning)
 	extraCount := 0
 	for key, field := range delta.JSON.ExtraFields {
 		if !field.Valid() {
 			continue
 		}
 		extraCount++
-		a.ingestPiece(key, field.Raw(), onThinking)
+		a.ingestPiece(key, field.Raw(), emit)
 	}
 	// llama.cpp exposes reasoning via ExtraFields; re-parsing RawJSON every
 	// chunk was doubling work and stalling the stream loop on large sessions.
 	if extraCount == 0 {
-		ingestRawDeltaObject(delta.RawJSON(), a, onThinking, nil)
+		ingestRawDeltaObject(delta.RawJSON(), a, emit, nil)
 	}
 }
 
-func ingestRawDeltaObject(raw string, a extraFieldAccums, onThinking func(string), skipKeys map[string]struct{}) {
+// thinkingEmitter deduplicates reasoning/thinking pieces within a single delta.
+// Some providers emit the same text under multiple keys (e.g. reasoning_content
+// and reasoning) in one chunk; emitting each copy produces the interleaved
+// "Now I have aNow I have a" duplication seen in the TUI.
+func (a extraFieldAccums) thinkingEmitter(onThinking func(string), fullReasoning *string) func(key, piece string) {
+	var seen map[string]struct{}
+	return func(key, piece string) {
+		if !extraFieldShouldDisplay(key) || piece == "" {
+			return
+		}
+		if seen == nil {
+			seen = make(map[string]struct{})
+		}
+		if _, dup := seen[piece]; dup {
+			return
+		}
+		seen[piece] = struct{}{}
+		if fullReasoning != nil {
+			*fullReasoning += piece
+		}
+		if onThinking != nil {
+			onThinking(piece)
+		}
+	}
+}
+
+func ingestRawDeltaObject(raw string, a extraFieldAccums, emit func(key, piece string), skipKeys map[string]struct{}) {
 	if raw == "" {
 		return
 	}
@@ -66,11 +93,11 @@ func ingestRawDeltaObject(raw string, a extraFieldAccums, onThinking func(string
 				continue
 			}
 		}
-		a.ingestPiece(key, string(val), onThinking)
+		a.ingestPiece(key, string(val), emit)
 	}
 }
 
-func (a extraFieldAccums) ingestPiece(key, raw string, onThinking func(string)) {
+func (a extraFieldAccums) ingestPiece(key, raw string, emit func(key, piece string)) {
 	if raw == "" || raw == "null" {
 		return
 	}
@@ -82,8 +109,8 @@ func (a extraFieldAccums) ingestPiece(key, raw string, onThinking func(string)) 
 		a[key] = &strings.Builder{}
 	}
 	a[key].WriteString(piece)
-	if onThinking != nil && extraFieldShouldDisplay(key) {
-		onThinking(piece)
+	if emit != nil {
+		emit(key, piece)
 	}
 }
 

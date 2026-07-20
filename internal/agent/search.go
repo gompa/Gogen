@@ -113,14 +113,6 @@ func (e *Executor) searchRoot(subpath string) (absRoot, relPrefix string, err er
 }
 
 func (e *Executor) searchWithRipgrep(ctx context.Context, searchRoot, relPrefix, pattern, glob string, contextLines int) (string, error) {
-	if err := rejectLeadingDashArg("pattern", pattern); err != nil {
-		return "", err
-	}
-	if glob != "" {
-		if err := rejectLeadingDashArg("glob", glob); err != nil {
-			return "", err
-		}
-	}
 	args := []string{
 		"-n",
 		"--no-heading",

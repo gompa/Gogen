@@ -56,3 +56,22 @@ func TestAssistantContinuesAfterLateThinking(t *testing.T) {
 		t.Fatalf("line 2 = %q, want content after thinking", m.chatLines[2])
 	}
 }
+
+func TestThinkingDuplicateTokensShowInterleaved(t *testing.T) {
+	m := Model{
+		chatLines:           nil,
+		streamAssistantLine: -1,
+		streamThinkingLine:  -1,
+	}
+	m.viewport.Width = 200
+
+	// Simulates upstream emitting the same delta twice (duplicate extra fields).
+	m.handleStreamThinking("Now I have a")
+	m.handleStreamThinking("Now I have a")
+
+	got := m.streamThinkingBuf.String()
+	want := "Now I have aNow I have a"
+	if got != want {
+		t.Fatalf("buffer = %q, want %q (TUI faithfully appends duplicate upstream tokens)", got, want)
+	}
+}

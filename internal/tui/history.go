@@ -52,7 +52,13 @@ func renderMessages(messages []llm.Message, workingDir string, modelName string,
 				lines = append(lines, label+" "+msg.Content)
 			}
 		case "assistant":
-			if msg.Content != "" {
+			// Always render thinking block when reasoning is present.
+			if msg.Reasoning != "" {
+				lines = append(lines, ThinkingTagStyle.Render("<thinking>"+msg.Reasoning+"</thinking>"))
+			}
+			// Skip the assistant content line when it duplicates the reasoning
+			// (happens when the model only emitted reasoning with no content).
+			if msg.Content != "" && msg.Content != msg.Reasoning {
 				label := AssistantStyle.Render(assistantLabel)
 				lines = append(lines, label+" "+msg.Content)
 			}

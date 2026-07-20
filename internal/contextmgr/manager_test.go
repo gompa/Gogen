@@ -111,19 +111,6 @@ func TestCompactPreservesHeadAndTail(t *testing.T) {
 	}
 }
 
-func TestViewForLLMPassthrough(t *testing.T) {
-	m := NewManager(&stubProvider{}, Settings{
-		ContextLimit:       128000,
-		MaxToolResultBytes: 10,
-	})
-	original := "0123456789"
-	msgs := []llm.Message{{Role: "tool", Content: original, ToolCallID: "c1"}}
-	view := m.ViewForLLM(msgs)
-	if len(view) != 1 || view[0].Content != original {
-		t.Fatalf("ViewForLLM should not rewrite history, got %#v", view)
-	}
-}
-
 func TestEnsureToolResultsCappedSticky(t *testing.T) {
 	m := NewManager(&stubProvider{}, Settings{MaxToolResultBytes: 5})
 	big := strings.Repeat("x", 4000)
@@ -144,24 +131,11 @@ func TestEnsureToolResultsCappedSticky(t *testing.T) {
 	if msgs[1].Content != capped {
 		t.Fatal("capped content changed on second pass")
 	}
-	view := m.ViewForLLM(msgs)
-	if view[1].Content != capped {
-		t.Fatal("ViewForLLM must keep sticky capped content")
+	if msgs[1].Content != capped {
+		t.Fatal("sticky capped content was lost")
 	}
 }
 
-func TestViewWithTruncationDoesNotMutateCanonical(t *testing.T) {
-	m := NewManager(&stubProvider{}, Settings{MaxToolResultBytes: 5})
-	original := "0123456789"
-	msgs := []llm.Message{{Role: "tool", Content: original, ToolCallID: "c1"}}
-	view := m.ViewWithTruncation(msgs)
-	if msgs[0].Content != original {
-		t.Fatal("canonical message was mutated")
-	}
-	if view[0].Content == original {
-		t.Fatal("expected truncated view")
-	}
-}
 
 func TestSnapshot(t *testing.T) {
 	m := NewManager(&stubProvider{}, Settings{

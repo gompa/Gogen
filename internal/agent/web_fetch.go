@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -13,8 +12,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/net/html"
 )
 
 const (
@@ -25,19 +22,138 @@ const (
 	webFetchOutputLimit  = 64 * 1024 // max bytes returned in the tool result string
 )
 
-var (
-	fetchPrivateRE = regexp.MustCompile(`^127\.|^10\.|^172\.(1[6-9]|2[0-9]|3[01])\.|^192\.168\.|^0\.0\.0\.0$|^::1$|^fe80:`)
-	multiSpaceRE   = regexp.MustCompile(`\s{3,}`)
-	multiNewlineRE = regexp.MustCompile(`\n{3,}`)
+var fetchPrivateRE = regexp.MustCompile(`^127\.|^10\.|^172\.(1[6-9]|2[0-9]|3[01])\.|^192\.168\.|^0\.0\.0\.0$|^::1$|^fe80:`)
 
-	webMu         sync.RWMutex
-	webFetchOn    *bool // nil until configured
-	webSearchOn   *bool // nil until configured
-	webMode       string // "https" or "all"
-	webDomains    []string
-)
+// webCfg holds all runtime web fetch/search configuration behind a single mutex.
+var webCfg webCfgState
+
+type webCfgState struct {
+	mu            sync.RWMutex
+	fetchOn       *bool   // nil until configured
+	searchOn      *bool   // nil until configured
+	fetchMode     string  // "https" or "all"
+	fetchDomains  []string // domain allowlist for fetch
+	searchBackend string  // "brave" or ""
+	searchAPIKey  string
+}
+
+func (c *webCfgState) isFetchOn() bool {
+	c.mu.RLock()
+	if c.fetchOn != nil {
+		v := *c.fetchOn
+		c.mu.RUnlock()
+		return v
+	}
+	c.mu.RUnlock()
+	raw := strings.TrimSpace(os.Getenv("GOGEN_WEB_FETCH"))
+	return strings.EqualFold(raw, "on") || strings.EqualFold(raw, "1") || strings.EqualFold(raw, "true")
+}
+
+func (c *webCfgState) isSearchOn() bool {
+	c.mu.RLock()
+	if c.searchOn != nil {
+		v := *c.searchOn
+		c.mu.RUnlock()
+		return v
+	}
+	c.mu.RUnlock()
+	raw := strings.TrimSpace(os.Getenv("GOGEN_WEB_SEARCH"))
+	return strings.EqualFold(raw, "on") || strings.EqualFold(raw, "1") || strings.EqualFold(raw, "true")
+}
+
+func (c *webCfgState) mode() string {
+	c.mu.RLock()
+	if c.fetchOn != nil || c.searchOn != nil {
+		m := c.fetchMode
+		c.mu.RUnlock()
+		return m
+	}
+	c.mu.RUnlock()
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("GOGEN_WEB_FETCH_MODE")))
+	if mode == "" {
+		mode = "https"
+	}
+	return mode
+}
+
+func (c *webCfgState) allowedDomains() []string {
+	c.mu.RLock()
+	if c.fetchOn != nil || c.searchOn != nil {
+		d := c.fetchDomains
+		c.mu.RUnlock()
+		return d
+	}
+	c.mu.RUnlock()
+	raw := strings.TrimSpace(os.Getenv("GOGEN_WEB_ALLOWED_DOMAINS"))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(strings.ToLower(p))
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func (c *webCfgState) searchBE() string {
+	c.mu.RLock()
+	b := c.searchBackend
+	c.mu.RUnlock()
+	return b
+}
+
+func (c *webCfgState) searchKey() string {
+	c.mu.RLock()
+	k := c.searchAPIKey
+	c.mu.RUnlock()
+	return k
+}
+
+// ConfigureWebFetch applies runtime web fetch settings from merged config.
+func ConfigureWebFetch(enabled bool, mode string, allowedDomains string) {
+	webCfg.mu.Lock()
+	defer webCfg.mu.Unlock()
+	webCfg.fetchOn = &enabled
+	webCfg.fetchMode = strings.TrimSpace(strings.ToLower(mode))
+	if webCfg.fetchMode == "" {
+		webCfg.fetchMode = "https"
+	}
+	if strings.TrimSpace(allowedDomains) != "" {
+		parts := strings.Split(allowedDomains, ",")
+		list := make([]string, 0, len(parts))
+		for _, p := range parts {
+			p = strings.TrimSpace(strings.ToLower(p))
+			if p != "" {
+				list = append(list, p)
+			}
+		}
+		webCfg.fetchDomains = list
+	} else {
+		webCfg.fetchDomains = nil
+	}
+}
+
+// ConfigureWebSearchEnabled sets whether web_search is allowed (independent of web_fetch).
+func ConfigureWebSearchEnabled(enabled bool) {
+	webCfg.mu.Lock()
+	defer webCfg.mu.Unlock()
+	webCfg.searchOn = &enabled
+}
+
+// ConfigureWebSearch applies runtime web search settings from merged config.
+func ConfigureWebSearch(backend, apiKey string) {
+	webCfg.mu.Lock()
+	defer webCfg.mu.Unlock()
+	webCfg.searchBackend = strings.ToLower(strings.TrimSpace(backend))
+	webCfg.searchAPIKey = strings.TrimSpace(apiKey)
+}
 
 // sharedFetchClient is reused across requests for connection pooling.
+// CheckRedirect enforces max redirects, loop detection, and private-host blocking.
 var sharedFetchClient = &http.Client{
 	Transport: &http.Transport{
 		MaxIdleConns:    10,
@@ -48,8 +164,79 @@ var sharedFetchClient = &http.Client{
 		if len(via) >= webFetchMaxRedirects {
 			return fmt.Errorf("too many redirects")
 		}
+		nextURL := req.URL.String()
+		for _, prev := range via {
+			if prev.URL.String() == nextURL {
+				return fmt.Errorf("redirect loop detected: %s", nextURL)
+			}
+		}
+		if isPrivateHost(req.URL.Host) {
+			return fmt.Errorf("redirect to private host blocked: %s", req.URL.Host)
+		}
 		return nil
 	},
+}
+
+// fetchRequest describes a single HTTP fetch operation.
+type fetchRequest struct {
+	URL      string // target URL
+	Method   string // "GET" (default) or "POST"
+	UA       string // User-Agent (default "gogen/1.0")
+	Body     string // form-encoded body for POST requests
+	MaxBytes int    // max response body bytes to read
+}
+
+// doFetch performs a single HTTP request with SSRF protection and redirect
+// enforcement. It uses the shared client (dialContextPublicOnly + CheckRedirect)
+// so private/internal hosts are blocked at both the dial and redirect level.
+func doFetch(ctx context.Context, req fetchRequest) ([]byte, string, error) {
+	if req.Method == "" {
+		req.Method = http.MethodGet
+	}
+	ua := req.UA
+	if ua == "" {
+		ua = "gogen/1.0"
+	}
+
+	var httpReq *http.Request
+	var err error
+
+	if req.Method == http.MethodPost {
+		httpReq, err = http.NewRequestWithContext(ctx, http.MethodPost, req.URL,
+			strings.NewReader(req.Body))
+	} else {
+		httpReq, err = http.NewRequestWithContext(ctx, http.MethodGet, req.URL, nil)
+	}
+	if err != nil {
+		return nil, req.URL, fmt.Errorf("request: %w", err)
+	}
+
+	httpReq.Header.Set("User-Agent", ua)
+	httpReq.Header.Set("Accept", "text/html,text/plain,application/xhtml+xml")
+	if req.Method == http.MethodPost {
+		httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+
+	resp, err := sharedFetchClient.Do(httpReq)
+	if err != nil {
+		return nil, req.URL, fmt.Errorf("fetch: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return nil, resp.Request.URL.String(), fmt.Errorf("http %d", resp.StatusCode)
+	}
+
+	maxBytes := req.MaxBytes
+	if maxBytes <= 0 {
+		maxBytes = webFetchDefaultMax
+	}
+	limited := io.LimitReader(resp.Body, int64(maxBytes))
+	body, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, resp.Request.URL.String(), fmt.Errorf("read body: %w", err)
+	}
+	return body, resp.Request.URL.String(), nil
 }
 
 func dialContextPublicOnly(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -71,195 +258,6 @@ func dialContextPublicOnly(ctx context.Context, network, addr string) (net.Conn,
 	// working. IP allowlisting above rejects private targets before dial.
 	d := net.Dialer{Timeout: webFetchTimeout}
 	return d.DialContext(ctx, network, addr)
-}
-
-// blockTags are HTML elements that introduce paragraph-like breaks.
-// This list mirrors the inline regex that was previously used in htmlToText.
-var blockTags = map[string]bool{
-	"br": true, "p": true, "li": true, "tr": true,
-	"h1": true, "h2": true, "h3": true, "h4": true, "h5": true, "h6": true,
-	"div": true, "section": true, "article": true, "header": true, "footer": true,
-	"nav": true, "aside": true, "main": true, "figure": true, "figcaption": true,
-	"blockquote": true, "pre": true, "table": true, "ul": true, "ol": true,
-	"dl": true, "dt": true, "dd": true, "form": true, "fieldset": true,
-}
-
-// ConfigureWebFetch applies runtime web fetch settings from merged config.
-func ConfigureWebFetch(enabled bool, mode string, allowedDomains string) {
-	webMu.Lock()
-	defer webMu.Unlock()
-	webFetchOn = &enabled
-	webMode = strings.TrimSpace(strings.ToLower(mode))
-	if webMode == "" {
-		webMode = "https"
-	}
-	if strings.TrimSpace(allowedDomains) != "" {
-		parts := strings.Split(allowedDomains, ",")
-		list := make([]string, 0, len(parts))
-		for _, p := range parts {
-			p = strings.TrimSpace(strings.ToLower(p))
-			if p != "" {
-				list = append(list, p)
-			}
-		}
-		webDomains = list
-	} else {
-		webDomains = nil
-	}
-}
-
-// ConfigureWebSearchEnabled sets whether web_search is allowed (independent of web_fetch).
-func ConfigureWebSearchEnabled(enabled bool) {
-	webMu.Lock()
-	defer webMu.Unlock()
-	webSearchOn = &enabled
-}
-
-func (e *Executor) WebFetch(ctx context.Context, rawURL string, maxBytes int) (string, error) {
-	if !webFetchEnabled() {
-		return "", fmt.Errorf("web_fetch is disabled (set GOGEN_WEB_FETCH=on to re-enable)")
-	}
-	rawURL = strings.TrimSpace(rawURL)
-	if rawURL == "" {
-		return "", fmt.Errorf("url is required")
-	}
-
-	if maxBytes <= 0 {
-		maxBytes = webFetchDefaultMax
-	}
-	if maxBytes > webFetchHardMax {
-		maxBytes = webFetchHardMax
-	}
-
-	parsed, err := validateFetchURL(rawURL)
-	if err != nil {
-		return "", err
-	}
-
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	ctx, cancel := context.WithTimeout(ctx, webFetchTimeout)
-	defer cancel()
-
-	body, finalURL, err := fetchHTTP(ctx, parsed.String(), maxBytes)
-	if err != nil {
-		return "", err
-	}
-
-	text := htmlToText(body)
-
-	// Build result.
-	var b strings.Builder
-	if finalURL != parsed.String() {
-		fmt.Fprintf(&b, "Final URL (after redirects): %s\n\n", finalURL)
-	}
-	if len(text) > webFetchOutputLimit {
-		fmt.Fprintf(&b, "Content (first %d of %d bytes):\n", webFetchOutputLimit, len(text))
-		b.WriteString(text[:webFetchOutputLimit])
-		fmt.Fprintf(&b, "\n\n… truncated (%d bytes total)", len(text))
-	} else if text == "" {
-		b.WriteString("(empty body)")
-	} else {
-		b.WriteString(text)
-	}
-	return b.String(), nil
-}
-
-// webFetchEnabled reports whether the web_fetch tool is active.
-func webFetchEnabled() bool {
-	webMu.RLock()
-	if webFetchOn != nil {
-		e := *webFetchOn
-		webMu.RUnlock()
-		return e
-	}
-	webMu.RUnlock()
-	raw := strings.TrimSpace(os.Getenv("GOGEN_WEB_FETCH"))
-	return strings.EqualFold(raw, "on") || strings.EqualFold(raw, "1") || strings.EqualFold(raw, "true")
-}
-
-// webSearchEnabled reports whether the web_search tool is active.
-func webSearchEnabled() bool {
-	webMu.RLock()
-	if webSearchOn != nil {
-		e := *webSearchOn
-		webMu.RUnlock()
-		return e
-	}
-	webMu.RUnlock()
-	raw := strings.TrimSpace(os.Getenv("GOGEN_WEB_SEARCH"))
-	return strings.EqualFold(raw, "on") || strings.EqualFold(raw, "1") || strings.EqualFold(raw, "true")
-}
-
-func fetchMode() string {
-	webMu.RLock()
-	if webFetchOn != nil || webSearchOn != nil {
-		m := webMode
-		webMu.RUnlock()
-		return m
-	}
-	webMu.RUnlock()
-	mode := strings.ToLower(strings.TrimSpace(os.Getenv("GOGEN_WEB_FETCH_MODE")))
-	if mode == "" {
-		mode = "https"
-	}
-	return mode
-}
-
-func fetchAllowedDomains() []string {
-	webMu.RLock()
-	if webFetchOn != nil || webSearchOn != nil {
-		d := webDomains
-		webMu.RUnlock()
-		return d
-	}
-	webMu.RUnlock()
-	raw := strings.TrimSpace(os.Getenv("GOGEN_WEB_ALLOWED_DOMAINS"))
-	if raw == "" {
-		return nil
-	}
-	parts := strings.Split(raw, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(strings.ToLower(p))
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-func validateFetchURL(rawURL string) (*url.URL, error) {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid URL: %w", err)
-	}
-	// Block private/internal hosts on the initial URL (redirects are also checked).
-	if isPrivateHost(u.Host) {
-		return nil, fmt.Errorf("requests to private/internal hosts are blocked: %s", u.Hostname())
-	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return nil, fmt.Errorf("web_fetch only supports http/https URLs (got %q)", u.Scheme)
-	}
-	// Enforce HTTPS-only unless explicitly allowed.
-	if fetchMode() == "https" && u.Scheme != "https" {
-		return nil, fmt.Errorf("web_fetch requires https (got %s). Set GOGEN_WEB_FETCH_MODE=all for http", u.Scheme)
-	}
-	if allowedDomains := fetchAllowedDomains(); len(allowedDomains) > 0 {
-		ok := false
-		host := strings.ToLower(u.Hostname())
-		for _, d := range allowedDomains {
-			if host == d || strings.HasSuffix(host, "."+d) {
-				ok = true
-				break
-			}
-		}
-		if !ok {
-			return nil, fmt.Errorf("domain %q is not in GOGEN_WEB_ALLOWED_DOMAINS", u.Hostname())
-		}
-	}
-	return u, nil
 }
 
 func isPrivateHost(host string) bool {
@@ -285,161 +283,88 @@ func isPrivateHost(host string) bool {
 	return false
 }
 
-func fetchHTTP(ctx context.Context, rawURL string, maxBytes int) ([]byte, string, error) {
-	return fetchHTTPWithUA(ctx, rawURL, "gogen/1.0", maxBytes)
-}
-
-// fetchHTTPWithUA is like fetchHTTP but uses a custom User-Agent string.
-func fetchHTTPWithUA(ctx context.Context, rawURL, userAgent string, maxBytes int) ([]byte, string, error) {
-	client := *sharedFetchClient // shallow copy so CheckRedirect override is per-request
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if len(via) >= webFetchMaxRedirects {
-			return fmt.Errorf("too many redirects")
-		}
-		nextURL := req.URL.String()
-		for _, prev := range via {
-			if prev.URL.String() == nextURL {
-				return fmt.Errorf("redirect loop detected: %s", nextURL)
-			}
-		}
-		if isPrivateHost(req.URL.Host) {
-			return fmt.Errorf("redirect to private host blocked: %s", req.URL.Host)
-		}
-		return nil
+func (e *Executor) WebFetch(ctx context.Context, rawURL string, maxBytes int) (string, error) {
+	if !webCfg.isFetchOn() {
+		return "", fmt.Errorf("web_fetch is disabled (set GOGEN_WEB_FETCH=on to re-enable)")
+	}
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return "", fmt.Errorf("url is required")
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if maxBytes <= 0 {
+		maxBytes = webFetchDefaultMax
+	}
+	if maxBytes > webFetchHardMax {
+		maxBytes = webFetchHardMax
+	}
+
+	parsed, err := validateFetchURL(rawURL)
 	if err != nil {
-		return nil, rawURL, fmt.Errorf("request: %w", err)
-	}
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Accept", "text/html,text/plain,application/xhtml+xml")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, rawURL, fmt.Errorf("fetch: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return nil, resp.Request.URL.String(), fmt.Errorf("http %d", resp.StatusCode)
+		return "", err
 	}
 
-	limited := io.LimitReader(resp.Body, int64(maxBytes))
-	body, err := io.ReadAll(limited)
-	if err != nil {
-		return nil, resp.Request.URL.String(), fmt.Errorf("read body: %w", err)
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	return body, resp.Request.URL.String(), nil
-}
-
-// fetchHTTPPost performs an HTTP POST with form-encoded body. Used by DDG Lite
-// search to avoid CAPTCHA (GET requests to DDG Lite trigger bot detection).
-func fetchHTTPPost(ctx context.Context, rawURL, formBody string, maxBytes int) ([]byte, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, webFetchTimeout)
 	defer cancel()
-	client := *sharedFetchClient // shallow copy so CheckRedirect override is per-request
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if len(via) >= webFetchMaxRedirects {
-			return fmt.Errorf("too many redirects")
-		}
-		nextURL := req.URL.String()
-		for _, prev := range via {
-			if prev.URL.String() == nextURL {
-				return fmt.Errorf("redirect loop detected: %s", nextURL)
-			}
-		}
-		if isPrivateHost(req.URL.Host) {
-			return fmt.Errorf("redirect to private host blocked: %s", req.URL.Host)
-		}
-		return nil
-	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL,
-		strings.NewReader(formBody))
+	body, finalURL, err := doFetch(ctx, fetchRequest{
+		URL:      parsed.String(),
+		MaxBytes: maxBytes,
+	})
 	if err != nil {
-		return nil, rawURL, fmt.Errorf("request: %w", err)
-	}
-	req.Header.Set("User-Agent", "gogen/1.0")
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "text/html,text/plain")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, rawURL, fmt.Errorf("fetch: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return nil, resp.Request.URL.String(), fmt.Errorf("http %d", resp.StatusCode)
+		return "", err
 	}
 
-	limited := io.LimitReader(resp.Body, int64(maxBytes))
-	body, err := io.ReadAll(limited)
-	if err != nil {
-		return nil, resp.Request.URL.String(), fmt.Errorf("read body: %w", err)
+	text := htmlToText(body)
+
+	// Build result.
+	var b strings.Builder
+	if finalURL != parsed.String() {
+		fmt.Fprintf(&b, "Final URL (after redirects): %s\n\n", finalURL)
 	}
-	return body, resp.Request.URL.String(), nil
+	if len(text) > webFetchOutputLimit {
+		fmt.Fprintf(&b, "Content (first %d of %d bytes):\n", webFetchOutputLimit, len(text))
+		b.WriteString(text[:webFetchOutputLimit])
+		fmt.Fprintf(&b, "\n\n… truncated (%d bytes total)", len(text))
+	} else if text == "" {
+		b.WriteString("(empty body)")
+	} else {
+		b.WriteString(text)
+	}
+	return b.String(), nil
 }
 
-func htmlToText(body []byte) string {
-	z := html.NewTokenizer(bytes.NewReader(body))
-	var b strings.Builder
-
-	var (
-		skipDepth int    // > 0 when inside a <script>, <style>, <head>, or <noscript>
-		skipTag   string // tag name that opened the skip region
-	)
-
-	for {
-		tt := z.Next()
-		if tt == html.ErrorToken {
-			break
+func validateFetchURL(rawURL string) (*url.URL, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid URL: %w", err)
+	}
+	// Block private/internal hosts on the initial URL (redirects are also checked).
+	if isPrivateHost(u.Host) {
+		return nil, fmt.Errorf("requests to private/internal hosts are blocked: %s", u.Hostname())
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("web_fetch only supports http/https URLs (got %q)", u.Scheme)
+	}
+	// Enforce HTTPS-only unless explicitly allowed.
+	if webCfg.mode() == "https" && u.Scheme != "https" {
+		return nil, fmt.Errorf("web_fetch requires https (got %s). Set GOGEN_WEB_FETCH_MODE=all for http", u.Scheme)
+	}
+	if allowedDomains := webCfg.allowedDomains(); len(allowedDomains) > 0 {
+		ok := false
+		host := strings.ToLower(u.Hostname())
+		for _, d := range allowedDomains {
+			if host == d || strings.HasSuffix(host, "."+d) {
+				ok = true
+				break
+			}
 		}
-		tok := z.Token()
-
-		switch tt {
-		case html.StartTagToken, html.SelfClosingTagToken:
-			if skipDepth > 0 {
-				if tok.Data == skipTag {
-					skipDepth++
-				}
-				continue
-			}
-			switch tok.Data {
-			case "script", "style", "head", "noscript":
-				skipTag = tok.Data
-				skipDepth = 1
-			case "br", "hr":
-				b.WriteByte('\n')
-			default:
-				if blockTags[tok.Data] {
-					b.WriteByte('\n')
-				}
-			}
-
-		case html.EndTagToken:
-			if skipDepth > 0 {
-				if tok.Data == skipTag {
-					skipDepth--
-				}
-				continue
-			}
-			if blockTags[tok.Data] {
-				b.WriteByte('\n')
-			}
-
-		case html.TextToken:
-			if skipDepth > 0 {
-				continue
-			}
-			b.WriteString(tok.Data)
+		if !ok {
+			return nil, fmt.Errorf("domain %q is not in GOGEN_WEB_ALLOWED_DOMAINS", u.Hostname())
 		}
 	}
-
-	text := html.UnescapeString(b.String())
-	// Collapse whitespace.
-	text = multiNewlineRE.ReplaceAllString(text, "\n\n")
-	text = multiSpaceRE.ReplaceAllString(text, "  ")
-	return strings.TrimSpace(text)
+	return u, nil
 }

@@ -202,26 +202,6 @@ func (m *Manager) EnsureToolResultsCapped(messages []llm.Message) bool {
 	return changed
 }
 
-// ViewForLLM returns the message list sent to the model.
-// Tool results are capped in canonical history (append + EnsureToolResultsCapped),
-// not rewritten per round, so prompt-cache prefixes stay stable.
-func (m *Manager) ViewForLLM(messages []llm.Message) []llm.Message {
-	return messages
-}
-
-// ViewWithTruncation returns a copy of messages with tool results truncated.
-// Prefer EnsureToolResultsCapped for sticky in-place capping of canonical history.
-func (m *Manager) ViewWithTruncation(messages []llm.Message) []llm.Message {
-	out := make([]llm.Message, len(messages))
-	for i, msg := range messages {
-		out[i] = cloneMessage(msg)
-		if msg.Role == "tool" && msg.Content != "" {
-			out[i].Content = m.TruncateToolResult(msg.Content)
-		}
-	}
-	return out
-}
-
 // Compact replaces the middle of canonical history with an LLM-generated summary.
 // It preserves the first user message and the most recent KeepRecentMessages entries.
 func (m *Manager) Compact(ctx context.Context, messages []llm.Message) ([]llm.Message, error) {
@@ -476,6 +456,7 @@ func cloneMessage(msg llm.Message) llm.Message {
 	out := llm.Message{
 		Role:       msg.Role,
 		Content:    msg.Content,
+		Reasoning:  msg.Reasoning,
 		ToolCallID: msg.ToolCallID,
 	}
 	if len(msg.ToolCalls) > 0 {

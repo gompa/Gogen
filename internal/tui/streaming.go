@@ -87,6 +87,10 @@ type tokenBatcher struct {
 	send  func(tea.Msg)
 	segs  []tokenSeg
 	timer *time.Timer // created lazily; always stopped before reuse
+	// closed is set by Close() at stream round end to prevent the
+	// timer goroutine from delivering stale thinking/content tokens
+	// after the thinking block has already been finalized.
+	closed bool
 }
 
 func (b *tokenBatcher) scheduleFlushLocked() {
@@ -109,6 +113,7 @@ func (b *tokenBatcher) flush() {
 }
 
 func (b *tokenBatcher) flushLocked() {
+	b.closed = false // timer-fired flush: batch is empty, safe to reopen
 	for _, seg := range b.segs {
 		if seg.text == "" {
 			continue
@@ -126,8 +131,26 @@ func (b *tokenBatcher) flushLocked() {
 	}
 }
 
+// Close drains all pending segments, stops the timer, and sets the closed
+// flag so that any late-arriving timer goroutine flush is a no-op. Called
+// at stream round end (OnStreamEnd / OnToolCallStart) to prevent stale
+// thinking tokens from creating duplicate <thinking> blocks in the TUI.
+func (b *tokenBatcher) Close() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.segs = b.segs[:0]
+	b.closed = true
+	if b.timer != nil {
+		b.timer.Stop()
+		b.timer = nil
+	}
+}
+
 func (b *tokenBatcher) appendLocked(think bool, token string) {
 	if token == "" {
+		return
+	}
+	if b.closed {
 		return
 	}
 	n := len(b.segs)
@@ -162,9 +185,15 @@ func (s *StreamAdapter) Handlers() *llm.StreamHandlers {
 
 	return &llm.StreamHandlers{
 		OnStart: func() {
+			batch.mu.Lock()
+			batch.closed = false
+			batch.mu.Unlock()
 			s.program.Send(streamStartMsg{})
 		},
 		OnRoundStart: func() {
+			batch.mu.Lock()
+			batch.closed = false
+			batch.mu.Unlock()
 			s.program.Send(streamRoundStartMsg{})
 		},
 		OnThinkingToken: func(token string) {
@@ -175,6 +204,7 @@ func (s *StreamAdapter) Handlers() *llm.StreamHandlers {
 		},
 		OnStreamEnd: func() {
 			batch.flush()
+			batch.Close()
 			s.program.Send(streamRoundEndMsg{})
 		},
 		OnToolCallStart: func(index int, id, name string) {

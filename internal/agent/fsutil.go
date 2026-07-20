@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"gogen/internal/debuglog"
 )
@@ -96,6 +97,11 @@ func isChmodUnsupported(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EOPNOTSUPP) {
+		return true
+	}
+	// Fallback: Windows ERROR_INVALID_FUNCTION or other platform-specific
+	// errors that don't map to standard POSIX codes.
 	var pe *os.PathError
 	if errors.As(err, &pe) {
 		s := pe.Err.Error()
@@ -172,8 +178,11 @@ func resolveExecutorPath(workingDir, path string) (string, error) {
 	return joined, nil
 }
 
-// fixDoubledWorkingDirPath repairs paths like
-// /wd/home/user/project/file when the model passed home/user/project/file.
+// fixDoubledWorkingDirPath detects when filepath.Join(WD, path) produced a
+// doubled WD prefix (e.g. model passes "a/b/file" → joined to "/a/b/a/b/file").
+// When the suffix after the first WD prefix itself starts with the WD path
+// (from root), the model intended an absolute-like path; we return the correct
+// resolution by treating the suffix as the intended absolute path.
 func fixDoubledWorkingDirPath(absPath, workingDir string) (string, bool) {
 	wd, err := filepath.Abs(workingDir)
 	if err != nil {
@@ -189,14 +198,16 @@ func fixDoubledWorkingDirPath(absPath, workingDir string) (string, bool) {
 	suffix := strings.TrimPrefix(absPath, prefix)
 	wdFromRoot := strings.TrimPrefix(filepath.ToSlash(wd), "/")
 	suffixSlash := filepath.ToSlash(suffix)
+	// Check if the suffix contains the WD path again (doubled prefix).
 	if suffixSlash != wdFromRoot && !strings.HasPrefix(suffixSlash, wdFromRoot+"/") {
 		return "", false
 	}
 
+	// The suffix is the intended absolute-like path; prepend "/" to resolve.
 	candidate := filepath.Clean(string(filepath.Separator) + suffixSlash)
 	_, statErr := os.Stat(candidate)
 	if statErr != nil {
-		// Allow new files: check if the parent directory exists instead.
+		// For new files, verify the parent directory exists.
 		_, perr := os.Stat(filepath.Dir(candidate))
 		if perr != nil {
 			return "", false

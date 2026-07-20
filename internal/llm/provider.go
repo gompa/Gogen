@@ -67,6 +67,7 @@ type StreamHandlers struct {
 // StreamResult holds the final accumulated response from a streamed call.
 type StreamResult struct {
 	Content       string
+	Reasoning     string // reasoning/thinking content accumulated during streaming
 	ToolCalls     []ToolCall
 	Usage         *Usage
 	PartialStream bool // true when streaming failed after partial output before fallback
@@ -93,6 +94,7 @@ type LLMProvider interface {
 type Message struct {
 	Role       string
 	Content    string
+	Reasoning  string     // reasoning/thinking content from the model
 	ToolCalls  []ToolCall // set on assistant messages that invoke tools
 	ToolCallID string     // set on tool result messages
 }
