@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"gogen/internal/agent"
+	"gogen/internal/ioutil"
 	"gogen/internal/llm"
 )
 
@@ -278,39 +279,9 @@ func ensureUnderSessionsDir(workingDir, path string) error {
 	return nil
 }
 
+// writeFileAtomic is a convenience wrapper around ioutil.WriteFileAtomic.
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".gogen-session-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpName)
-		}
-	}()
-	if err := tmp.Chmod(perm); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	cleanup = false
-	return nil
+	return ioutil.WriteFileAtomic(path, data, perm)
 }
 
 func sessionLabel(messages []llm.Message, label string) string {

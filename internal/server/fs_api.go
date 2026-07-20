@@ -17,6 +17,21 @@ const (
 	fsReadMaxBytes   = 2 * 1024 * 1024
 )
 
+// validateTextFile checks if data is valid text content suitable for the editor.
+// It rejects binary files (NUL bytes), oversized files, and invalid UTF-8.
+func validateTextFile(data []byte, maxSize int) error {
+	if bytes.IndexByte(data, 0) >= 0 {
+		return fmt.Errorf("binary file not supported")
+	}
+	if len(data) > maxSize {
+		return fmt.Errorf("file too large (%d bytes; max %d)", len(data), maxSize)
+	}
+	if !utf8.Valid(data) {
+		return fmt.Errorf("file is not valid UTF-8")
+	}
+	return nil
+}
+
 type FSEntry struct {
 	Name  string `json:"name"`
 	Path  string `json:"path"`
@@ -137,14 +152,8 @@ func (s *Server) fsRead(path string) (content, language string, err error) {
 	if err != nil {
 		return "", "", err
 	}
-	if len(data) > fsReadMaxBytes {
-		return "", "", fmt.Errorf("file too large (%d bytes; max %d)", len(data), fsReadMaxBytes)
-	}
-	if bytes.IndexByte(data, 0) >= 0 {
-		return "", "", fmt.Errorf("binary file not supported")
-	}
-	if !utf8.Valid(data) {
-		return "", "", fmt.Errorf("file is not valid UTF-8")
+	if err := validateTextFile(data, fsReadMaxBytes); err != nil {
+		return "", "", err
 	}
 	return string(data), languageFromPath(path), nil
 }
@@ -255,14 +264,8 @@ func readWorkingTreeText(exec *agent.Executor, path string) (string, error) {
 		}
 		return "", err
 	}
-	if bytes.IndexByte(data, 0) >= 0 {
-		return "", fmt.Errorf("binary file not supported")
-	}
-	if len(data) > fsReadMaxBytes {
-		return "", fmt.Errorf("file too large (%d bytes; max %d)", len(data), fsReadMaxBytes)
-	}
-	if !utf8.Valid(data) {
-		return "", fmt.Errorf("file is not valid UTF-8")
+	if err := validateTextFile(data, fsReadMaxBytes); err != nil {
+		return "", err
 	}
 	return string(data), nil
 }
@@ -280,14 +283,8 @@ func gitShowHEAD(ctx context.Context, exec *agent.Executor, path string) (string
 		}
 		return "", fmt.Errorf("%s", msg)
 	}
-	if bytes.IndexByte(out, 0) >= 0 {
-		return "", fmt.Errorf("binary file not supported")
-	}
-	if len(out) > fsReadMaxBytes {
-		return "", fmt.Errorf("file too large (%d bytes; max %d)", len(out), fsReadMaxBytes)
-	}
-	if !utf8.Valid(out) {
-		return "", fmt.Errorf("file is not valid UTF-8")
+	if err := validateTextFile(out, fsReadMaxBytes); err != nil {
+		return "", err
 	}
 	return string(out), nil
 }

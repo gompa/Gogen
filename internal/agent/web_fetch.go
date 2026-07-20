@@ -37,6 +37,12 @@ type webCfgState struct {
 	searchAPIKey  string
 }
 
+// checkEnvToggle checks if an environment variable is set to "on", "1", or "true".
+func checkEnvToggle(envVar string) bool {
+	raw := strings.TrimSpace(os.Getenv(envVar))
+	return strings.EqualFold(raw, "on") || strings.EqualFold(raw, "1") || strings.EqualFold(raw, "true")
+}
+
 func (c *webCfgState) isFetchOn() bool {
 	c.mu.RLock()
 	if c.fetchOn != nil {
@@ -45,8 +51,7 @@ func (c *webCfgState) isFetchOn() bool {
 		return v
 	}
 	c.mu.RUnlock()
-	raw := strings.TrimSpace(os.Getenv("GOGEN_WEB_FETCH"))
-	return strings.EqualFold(raw, "on") || strings.EqualFold(raw, "1") || strings.EqualFold(raw, "true")
+	return checkEnvToggle("GOGEN_WEB_FETCH")
 }
 
 func (c *webCfgState) isSearchOn() bool {
@@ -57,8 +62,7 @@ func (c *webCfgState) isSearchOn() bool {
 		return v
 	}
 	c.mu.RUnlock()
-	raw := strings.TrimSpace(os.Getenv("GOGEN_WEB_SEARCH"))
-	return strings.EqualFold(raw, "on") || strings.EqualFold(raw, "1") || strings.EqualFold(raw, "true")
+	return checkEnvToggle("GOGEN_WEB_SEARCH")
 }
 
 func (c *webCfgState) mode() string {

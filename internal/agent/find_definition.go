@@ -25,22 +25,39 @@ func (e *Executor) FindDefinition(ctx context.Context, symbol, subpath, glob str
 		return "", err
 	}
 
-	// Try tree-sitter first for supported languages.
-	astDefs, err := e.findDefinitionAST(ctx, searchRoot, relPrefix, glob, symbol)
+	// Use AST fallback pattern: try AST first, then text search
+	fallback := &ASTFallback[[]string]{
+		ASTFunc: func() ([]string, error) {
+			return e.findDefinitionAST(ctx, searchRoot, relPrefix, glob, symbol)
+		},
+		TextFunc: func() ([]string, error) {
+			return e.findDefinitionText(ctx, subpath, glob, symbol)
+		},
+		HasResult: func(defs []string) bool {
+			return len(defs) > 0
+		},
+	}
+
+	defs, err := fallback.Run()
 	if err != nil {
 		return "", err
 	}
-	if len(astDefs) > 0 {
-		var b strings.Builder
-		b.WriteString(fmt.Sprintf("Definition(s) for %q (via AST):\n", symbol))
-		for _, def := range astDefs {
-			b.WriteString(def + "\n")
-		}
-		b.WriteString(fmt.Sprintf("\n(%d definition(s) found)", len(astDefs)))
-		return b.String(), nil
+
+	if len(defs) == 0 {
+		return fmt.Sprintf("No definition found for %q", symbol), nil
 	}
 
-	// Fallback: text search for "func <symbol>", "type <symbol>", "var <symbol>", etc.
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("Definition(s) for %q:\n", symbol))
+	for _, def := range defs {
+		b.WriteString(def + "\n")
+	}
+	b.WriteString(fmt.Sprintf("\n(%d definition(s) found)", len(defs)))
+	return b.String(), nil
+}
+
+// findDefinitionText performs text-based search for symbol definitions.
+func (e *Executor) findDefinitionText(ctx context.Context, subpath, glob, symbol string) ([]string, error) {
 	patterns := []string{
 		`(?m)\bfunc\s+` + regexp.QuoteMeta(symbol) + `\s*\(`,
 		`(?m)\bfunc\s*\([^)]*\)\s+` + regexp.QuoteMeta(symbol) + `\s*\(`,
@@ -71,18 +88,7 @@ func (e *Executor) FindDefinition(ctx context.Context, symbol, subpath, glob str
 			break
 		}
 	}
-
-	if len(allDefs) == 0 {
-		return fmt.Sprintf("No definition found for %q", symbol), nil
-	}
-
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Definition(s) for %q (text search):\n", symbol))
-	for _, def := range allDefs {
-		b.WriteString(def + "\n")
-	}
-	b.WriteString(fmt.Sprintf("\n(%d result(s) — use read_file to inspect)", len(allDefs)))
-	return b.String(), nil
+	return allDefs, nil
 }
 
 func (e *Executor) findDefinitionAST(ctx context.Context, searchRoot, relPrefix, glob, symbol string) ([]string, error) {

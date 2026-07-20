@@ -53,6 +53,12 @@ func BuiltinToolHandlers() map[string]ToolHandler {
 		"session_usage":    handleSessionUsage,
 		"context_pin_last": handleContextPinLast,
 		"context_pins":     handleContextPins,
+		"rename_symbol":      handleRenameSymbol,
+		"multi_edit":         handleMultiEdit,
+		"call_graph":         handleCallGraph,
+		"dependency_analysis": handleDependencyAnalysis,
+		"extract_function":   handleExtractFunction,
+		"generate_test":      handleGenerateTest,
 	}
 }
 
@@ -491,4 +497,90 @@ func handleContextPinLast(_ context.Context, a *Agent, _ map[string]interface{})
 
 func handleContextPins(_ context.Context, a *Agent, _ map[string]interface{}) (string, error) {
 	return a.listPins(), nil
+}
+
+func handleRenameSymbol(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+	oldName, err := stringArg(args, "old_name")
+	if err != nil {
+		return "", err
+	}
+	newName, err := stringArg(args, "new_name")
+	if err != nil {
+		return "", err
+	}
+	subpath, _ := stringArgOptional(args, "path")
+	glob, _ := stringArgOptional(args, "glob")
+	dryRun, _ := boolArgOptional(args, "dry_run")
+	return a.Executor.RenameSymbol(ctx, oldName, newName, subpath, glob, dryRun)
+}
+
+func handleMultiEdit(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+	pattern, err := stringArg(args, "pattern")
+	if err != nil {
+		return "", err
+	}
+	search, err := stringArg(args, "search")
+	if err != nil {
+		return "", err
+	}
+	replace, err := stringArg(args, "replace")
+	if err != nil {
+		return "", err
+	}
+	dryRun, _ := boolArgOptional(args, "dry_run")
+	return a.Executor.MultiEdit(ctx, pattern, search, replace, dryRun)
+}
+
+func handleCallGraph(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+	symbol, err := stringArg(args, "symbol")
+	if err != nil {
+		return "", err
+	}
+	subpath, _ := stringArgOptional(args, "path")
+	glob, _ := stringArgOptional(args, "glob")
+	direction, _ := stringArgOptional(args, "direction")
+	return a.Executor.CallGraph(ctx, symbol, subpath, glob, direction)
+}
+
+func handleDependencyAnalysis(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+	symbol, err := stringArg(args, "symbol")
+	if err != nil {
+		return "", err
+	}
+	subpath, _ := stringArgOptional(args, "path")
+	return a.Executor.DependencyAnalysis(ctx, symbol, subpath)
+}
+
+func handleExtractFunction(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+	file, err := stringArg(args, "file")
+	if err != nil {
+		return "", err
+	}
+	startLine, err := intArgOptional(args, "start_line")
+	if err != nil || startLine == 0 {
+		return "", fmt.Errorf("missing required argument %q", "start_line")
+	}
+	endLine, err := intArgOptional(args, "end_line")
+	if err != nil || endLine == 0 {
+		return "", fmt.Errorf("missing required argument %q", "end_line")
+	}
+	funcName, err := stringArg(args, "func_name")
+	if err != nil {
+		return "", err
+	}
+	return a.Executor.ExtractFunction(ctx, file, startLine, endLine, funcName)
+}
+
+func handleGenerateTest(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+	funcName, err := stringArg(args, "func_name")
+	if err != nil {
+		return "", err
+	}
+	file, _ := stringArgOptional(args, "file")
+	styleStr, _ := stringArgOptional(args, "style")
+	style := TestStyle(styleStr)
+	if style == "" {
+		style = TestStyleSubtests
+	}
+	return a.Executor.GenerateTest(ctx, funcName, file, style)
 }

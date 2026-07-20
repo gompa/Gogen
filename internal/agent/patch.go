@@ -523,14 +523,16 @@ func formatHunkMismatch(hunkNum, hunkTotal, line int, actual, expected []string,
 	return fmt.Errorf("%s", msg)
 }
 
-func findHunkLocation(lines, oldLines []string, hint int) (int, bool) {
+// findHunkLocationWith locates oldLines within lines using the given comparison function.
+// Returns the best match index (closest to hint) and true, or 0 and false if no match.
+func findHunkLocationWith(lines, oldLines []string, hint int, cmp func([]string, []string) bool) (int, bool) {
 	n := len(oldLines)
 	if n == 0 {
 		return hint, true
 	}
 	var matches []int
 	for i := 0; i <= len(lines)-n; i++ {
-		if linesEqual(lines[i:i+n], oldLines) {
+		if cmp(lines[i:i+n], oldLines) {
 			matches = append(matches, i)
 		}
 	}
@@ -550,6 +552,10 @@ func findHunkLocation(lines, oldLines []string, hint int) (int, bool) {
 		}
 		return best, true
 	}
+}
+
+func findHunkLocation(lines, oldLines []string, hint int) (int, bool) {
+	return findHunkLocationWith(lines, oldLines, hint, linesEqual)
 }
 
 func absInt(n int) int {
@@ -577,32 +583,7 @@ func linesEqualFuzzy(a, b []string) bool {
 // findHunkLocationFuzzy is like findHunkLocation but uses
 // whitespace-tolerant line comparison.
 func findHunkLocationFuzzy(lines, oldLines []string, hint int) (int, bool) {
-	n := len(oldLines)
-	if n == 0 {
-		return hint, true
-	}
-	var matches []int
-	for i := 0; i <= len(lines)-n; i++ {
-		if linesEqualFuzzy(lines[i:i+n], oldLines) {
-			matches = append(matches, i)
-		}
-	}
-	switch len(matches) {
-	case 0:
-		return 0, false
-	case 1:
-		return matches[0], true
-	default:
-		best := matches[0]
-		bestDist := absInt(matches[0] - hint)
-		for _, m := range matches[1:] {
-			if d := absInt(m - hint); d < bestDist {
-				best = m
-				bestDist = d
-			}
-		}
-		return best, true
-	}
+	return findHunkLocationWith(lines, oldLines, hint, linesEqualFuzzy)
 }
 
 func linesEqual(a, b []string) bool {

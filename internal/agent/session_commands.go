@@ -61,6 +61,24 @@ func parseSessionCommand(input string) (cmd, args string) {
 	return cmd, args
 }
 
+// resetSessionState clears all session-related state for starting fresh.
+// This is used when creating a new session or replacing a deleted current session.
+func (a *Agent) resetSessionState() {
+	a.Messages = nil
+	// Wipe any token-count cache entries — the old message pointers are
+	// being released and new conversations start from empty.
+	contextmgr.InvalidateTokenCache()
+	a.lastTurnUsage = nil
+	a.UsageAccum = UsageAccumulator{}
+	a.SessionLabel = ""
+	if a.PinManager != nil {
+		a.PinManager.ClearPins()
+	}
+	if a.TodoManager != nil {
+		a.TodoManager.Clear()
+	}
+}
+
 // handleResumeArg routes "del", "latest", or session-ID sub-commands.
 func (a *Agent) handleResumeArg(ctx context.Context, args, newSessionID string) (SessionCommandResult, bool, error) {
 	if args == "del" {
@@ -100,19 +118,7 @@ func (a *Agent) startNewSession(newID string) (string, error) {
 		a.persistSession()
 	}
 	a.SessionID = newID
-	a.Messages = nil
-	// Wipe any token-count cache entries — the old message pointers are
-	// being released and new conversations start from empty.
-	contextmgr.InvalidateTokenCache()
-	a.lastTurnUsage = nil
-	a.UsageAccum = UsageAccumulator{}
-	a.SessionLabel = ""
-	if a.PinManager != nil {
-		a.PinManager.ClearPins()
-	}
-	if a.TodoManager != nil {
-		a.TodoManager.Clear()
-	}
+	a.resetSessionState()
 	if a.SessionStore != nil {
 		a.persistSession()
 		if oldID != "" {
@@ -184,18 +190,7 @@ func (a *Agent) deleteSessionByID(ctx context.Context, id, newSessionID string) 
 			return "", SessionActionNone, fmt.Errorf("session id is required")
 		}
 		a.SessionID = newSessionID
-		a.Messages = nil
-		// Old message pointers are being released; drop cached token counts.
-		contextmgr.InvalidateTokenCache()
-		a.lastTurnUsage = nil
-		a.UsageAccum = UsageAccumulator{}
-		a.SessionLabel = ""
-		if a.PinManager != nil {
-			a.PinManager.ClearPins()
-		}
-		if a.TodoManager != nil {
-			a.TodoManager.Clear()
-		}
+		a.resetSessionState()
 		a.persistSession()
 		out := fmt.Sprintf("Deleted session %s (was current — started new session %s).", id, newSessionID)
 		return AppendContextBrief(ctx, a, out), SessionActionClearChat, nil
