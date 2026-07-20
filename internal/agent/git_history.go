@@ -27,7 +27,7 @@ func (e *Executor) GitLog(ctx context.Context, path string, limit int) (string, 
 
 	args := []string{"log", "--oneline", "--no-decorate", "-n", strconv.Itoa(limit)}
 	if strings.TrimSpace(path) != "" {
-		if _, err := e.securePath(path); err != nil {
+		if _, err := e.SecurePath(path); err != nil {
 			return "", err
 		}
 		args = append(args, "--", path)
@@ -63,7 +63,7 @@ func (e *Executor) GitBlame(ctx context.Context, path string, startLine, limit i
 	if strings.TrimSpace(path) == "" {
 		return "", fmt.Errorf("path is required")
 	}
-	if _, err := e.securePath(path); err != nil {
+	if _, err := e.SecurePath(path); err != nil {
 		return "", err
 	}
 	if startLine <= 0 {
@@ -84,7 +84,7 @@ func (e *Executor) GitBlame(ctx context.Context, path string, startLine, limit i
 		"--", path,
 	}
 
-	cmd, cmdErr := e.newGitCmd(ctx, args...)
+	cmd, cmdErr := e.NewGitCmd(ctx, args...)
 	if cmdErr != nil {
 		return "", cmdErr
 	}

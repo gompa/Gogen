@@ -172,7 +172,7 @@ func (e *Executor) planPatch(pf patchFile, fuzzy bool) (patchPlan, string, error
 		return patchPlan{}, "", fmt.Errorf("could not determine target file from diff headers")
 	}
 
-	secure, err := e.securePath(target)
+	secure, err := e.SecurePath(target)
 	if err != nil {
 		return patchPlan{}, target, err
 	}

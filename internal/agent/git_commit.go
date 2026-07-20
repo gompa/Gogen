@@ -18,7 +18,7 @@ type gitCmdResult struct {
 // Non-empty text is returned alongside the error when the command produces output
 // but still fails (e.g. git prints a message then exits non-zero).
 func (e *Executor) runGitCommand(ctx context.Context, args []string) (string, error) {
-	cmd, err := e.newGitCmd(ctx, args...)
+	cmd, err := e.NewGitCmd(ctx, args...)
 	if err != nil {
 		return "", err
 	}
@@ -49,7 +49,7 @@ func (e *Executor) GitStage(ctx context.Context, paths []string) (string, error)
 		args = append(args, "-A")
 	} else {
 		for _, p := range paths {
-			if _, err := e.securePath(p); err != nil {
+			if _, err := e.SecurePath(p); err != nil {
 				return "", err
 			}
 		}

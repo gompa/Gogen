@@ -136,6 +136,27 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.modal = ModalCompletion
 			return m, nil
 		}
+		if completions := agent.SlashCommandCompletions(line, false, true); len(completions) > 0 {
+			if len(completions) == 1 {
+				m.textarea.Reset()
+				m.textarea.SetValue(completions[0] + " ")
+				m.textarea.CursorEnd()
+				return m, m.textarea.Focus()
+			}
+			cp := agent.LongestCommonPrefix(completions)
+			trimmed := strings.TrimRight(line, " \t")
+			if len(cp) > len(trimmed) {
+				m.textarea.Reset()
+				m.textarea.SetValue(cp)
+				m.textarea.CursorEnd()
+				return m, m.textarea.Focus()
+			}
+			m.completions = completions
+			m.completionIdx = 0
+			m.completionLine = line
+			m.modal = ModalCompletion
+			return m, nil
+		}
 		return m, nil
 	}
 

@@ -98,6 +98,51 @@
             display: flex;
             gap: 8px;
             background: var(--bg-elevated);
+            position: relative;
+        }
+        #slash-suggest {
+            display: none;
+            position: absolute;
+            left: 16px;
+            right: 16px;
+            bottom: 100%;
+            margin-bottom: 4px;
+            max-height: 220px;
+            overflow-y: auto;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.35);
+            z-index: 20;
+        }
+        #slash-suggest.open { display: block; }
+        .slash-item {
+            display: flex;
+            align-items: baseline;
+            gap: 12px;
+            padding: 8px 12px;
+            cursor: pointer;
+            font-family: var(--mono);
+            font-size: 0.9em;
+        }
+        .slash-item:hover, .slash-item.active {
+            background: var(--accent-soft);
+        }
+        .slash-item .slash-name {
+            color: var(--accent);
+            min-width: 7.5em;
+            flex-shrink: 0;
+        }
+        .slash-item .slash-desc {
+            color: var(--fg-muted);
+            font-family: var(--sans);
+            font-size: 0.92em;
+        }
+        #input-wrap {
+            flex: 1;
+            position: relative;
+            display: flex;
+            min-width: 0;
         }
         #cancel-btn:disabled { opacity: 0.4; cursor: not-allowed; }
         #cancel-btn:not(:disabled) {
@@ -125,6 +170,86 @@
             align-self: flex-start;
             color: var(--fg);
         }
+        .message.md {
+            white-space: normal;
+            line-height: 1.45;
+        }
+        .message.md > *:first-child { margin-top: 0; }
+        .message.md > *:last-child { margin-bottom: 0; }
+        .message.md p { margin: 0.45em 0; }
+        .message.md h1, .message.md h2, .message.md h3, .message.md h4 {
+            margin: 0.65em 0 0.35em;
+            font-weight: 600;
+            line-height: 1.3;
+            color: var(--fg);
+        }
+        .message.md h1 { font-size: 1.25em; }
+        .message.md h2 { font-size: 1.15em; }
+        .message.md h3 { font-size: 1.05em; }
+        .message.md h4 { font-size: 1em; }
+        .message.md ul, .message.md ol {
+            margin: 0.4em 0;
+            padding-left: 1.4em;
+        }
+        .message.md li { margin: 0.15em 0; }
+        .message.md li > p { margin: 0.2em 0; }
+        .message.md code {
+            font-family: var(--mono);
+            font-size: 0.9em;
+            background: var(--bg);
+            padding: 0.1em 0.35em;
+            border-radius: 3px;
+            border: 1px solid var(--border-subtle);
+        }
+        .message.md pre {
+            margin: 0.5em 0;
+            padding: 10px 12px;
+            overflow-x: auto;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+        }
+        .message.md pre code {
+            padding: 0;
+            border: none;
+            background: transparent;
+            font-size: 0.85em;
+        }
+        /* Monaco colorize joins lines with <br>; avoid pre doubling newlines. */
+        .message.md pre code.monaco-colorized {
+            white-space: normal;
+            display: block;
+        }
+        .message.md pre code.monaco-colorized .mtk1,
+        .message.md pre code.monaco-colorized span {
+            font-family: var(--mono);
+        }
+        .message.md a { color: var(--accent); }
+        .message.md blockquote {
+            margin: 0.5em 0;
+            padding: 0.15em 0 0.15em 0.85em;
+            border-left: 3px solid var(--border);
+            color: var(--fg-muted);
+        }
+        .message.md table {
+            border-collapse: collapse;
+            margin: 0.5em 0;
+            font-size: 0.9em;
+            display: block;
+            overflow-x: auto;
+            max-width: 100%;
+        }
+        .message.md th, .message.md td {
+            border: 1px solid var(--border);
+            padding: 4px 8px;
+        }
+        .message.md th { background: var(--bg-active); }
+        .message.md hr {
+            border: none;
+            border-top: 1px solid var(--border);
+            margin: 0.8em 0;
+        }
+        .message.md img { max-width: 100%; height: auto; }
         .system {
             background: transparent;
             border-color: transparent;
@@ -133,7 +258,7 @@
             font-size: 0.8em;
             color: var(--fg-muted);
         }
-        input, button {
+        input, button, select {
             padding: 8px 12px;
             border: 1px solid var(--border);
             border-radius: 3px;
@@ -142,16 +267,22 @@
             font-family: inherit;
         }
         input::placeholder { color: var(--fg-dim); }
-        input:focus, button:focus {
+        input:focus, button:focus, select:focus {
             outline: 1px solid var(--accent);
             outline-offset: -1px;
+        }
+        #model-select {
+            width: 100%;
+            margin-bottom: 12px;
+            font-family: var(--mono);
+            font-size: 0.85em;
         }
         button {
             cursor: pointer;
             background: var(--bg-active);
         }
         button:hover:not(:disabled) { background: #404045; }
-        #message-input { flex: 1; }
+        #message-input { flex: 1; min-width: 0; width: 100%; }
         #working-dir-input { width: 100%; margin-bottom: 8px; }
         .cursor::after { content: '|'; animation: blink 1s infinite; color: var(--accent); }
         @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
@@ -239,6 +370,12 @@
             color: var(--fg);
         }
         .tool-result-content.error-content { color: #ff7b72; }
+        .tool-result-content.monaco-colorized {
+            white-space: normal;
+        }
+        .tool-result-content.monaco-colorized span {
+            font-family: var(--mono);
+        }
         .monaco-tool-host {
             height: 280px;
             min-height: 280px;
@@ -509,6 +646,7 @@
                 <hr>
                 <label>Model:</label>
                 <div id="model-info" style="font-size:0.85em;margin-bottom:12px;font-family:monospace;">—</div>
+                <select id="model-select" aria-label="Select model" hidden></select>
                 <label>Context:</label>
                 <div id="context-info">—</div>
                 <div id="context-bar-wrap"><div id="context-bar"></div></div>
@@ -525,7 +663,10 @@
             <div id="chat-container">
                 <div id="messages"></div>
                 <div id="input-area">
-                    <input type="text" id="message-input" placeholder="Ask the agent... (/models to switch)" autofocus>
+                    <div id="input-wrap">
+                        <div id="slash-suggest" role="listbox" aria-label="Slash command suggestions"></div>
+                        <input type="text" id="message-input" placeholder="Ask the agent... (type / for commands)" autofocus autocomplete="off">
+                    </div>
                     <button id="send-btn">Send</button>
                     <button id="cancel-btn" disabled title="Cancel current turn">Cancel</button>
                 </div>
@@ -578,16 +719,25 @@
             updateDiffFallback,
             extractDiffValue,
             initMonaco,
+            colorizeCodeBlocks,
+            colorizeElement,
+            languageFromPath,
         } from '/editor.js';
+        import { marked } from '/vendor/marked.esm.js';
+        import DOMPurify from '/vendor/dompurify.esm.js';
+
+        marked.use({ gfm: true, breaks: true });
 
         const messagesDiv = document.getElementById('messages');
         const inputArea = document.getElementById('message-input');
         const sendBtn = document.getElementById('send-btn');
         const cancelBtn = document.getElementById('cancel-btn');
+        const slashSuggest = document.getElementById('slash-suggest');
         const dirInput = document.getElementById('working-dir-input');
         const setDirBtn = document.getElementById('set-dir-btn');
         const statusDiv = document.getElementById('status');
         const modelInfoDiv = document.getElementById('model-info');
+        const modelSelect = document.getElementById('model-select');
         const contextInfoDiv = document.getElementById('context-info');
         const contextBar = document.getElementById('context-bar');
         const modeInfoDiv = document.getElementById('mode-info');
@@ -600,6 +750,78 @@
         const deleteAllowBtn = document.getElementById('delete-allow-btn');
         const deleteDenyBtn = document.getElementById('delete-deny-btn');
         let pendingDeleteApprovalId = null;
+
+        // Keep in sync with agent.SlashCommands (Web: true).
+        const SLASH_COMMANDS = [
+            { name: '/help', description: 'Show available commands' },
+            { name: '/plan', description: 'Switch to plan (read-only) mode' },
+            { name: '/act', description: 'Switch to act mode' },
+            { name: '/mode', description: 'Show current mode' },
+            { name: '/models', description: 'List or switch models' },
+            { name: '/context', description: 'Context usage details' },
+            { name: '/new', description: 'Start a new session' },
+            { name: '/resume', description: 'List, restore, or delete sessions' },
+        ];
+        let slashMatches = [];
+        let slashIndex = 0;
+
+        function hideSlashSuggest() {
+            slashSuggest.classList.remove('open');
+            slashSuggest.innerHTML = '';
+            slashMatches = [];
+            slashIndex = 0;
+        }
+
+        function matchSlashCommands(value) {
+            if (!value.startsWith('/')) return [];
+            const token = value.split(/\s/, 1)[0].toLowerCase();
+            // Don't suggest once the user has typed args.
+            if (/\s/.test(value)) return [];
+            return SLASH_COMMANDS.filter((c) => c.name.startsWith(token));
+        }
+
+        function renderSlashSuggest() {
+            if (slashMatches.length === 0) {
+                hideSlashSuggest();
+                return;
+            }
+            if (slashIndex >= slashMatches.length) slashIndex = 0;
+            if (slashIndex < 0) slashIndex = slashMatches.length - 1;
+            slashSuggest.innerHTML = '';
+            slashMatches.forEach((cmd, i) => {
+                const el = document.createElement('div');
+                el.className = 'slash-item' + (i === slashIndex ? ' active' : '');
+                el.setAttribute('role', 'option');
+                el.setAttribute('aria-selected', i === slashIndex ? 'true' : 'false');
+                el.innerHTML = '<span class="slash-name"></span><span class="slash-desc"></span>';
+                el.querySelector('.slash-name').textContent = cmd.name;
+                el.querySelector('.slash-desc').textContent = cmd.description;
+                el.onmousedown = (e) => {
+                    e.preventDefault();
+                    applySlashCompletion(cmd.name);
+                };
+                slashSuggest.appendChild(el);
+            });
+            slashSuggest.classList.add('open');
+            const active = slashSuggest.querySelector('.slash-item.active');
+            if (active) active.scrollIntoView({ block: 'nearest' });
+        }
+
+        function updateSlashSuggest() {
+            slashMatches = matchSlashCommands(inputArea.value);
+            slashIndex = 0;
+            renderSlashSuggest();
+        }
+
+        function applySlashCompletion(name) {
+            inputArea.value = name + ' ';
+            hideSlashSuggest();
+            inputArea.focus();
+        }
+
+        function slashSuggestOpen() {
+            return slashSuggest.classList.contains('open') && slashMatches.length > 0;
+        }
 
         // Main Chat | Editor tabs
         document.querySelectorAll('.main-tab').forEach((btn) => {
@@ -673,13 +895,58 @@
             return frac === 0 ? `${whole}k` : `${whole}.${frac}k`;
         }
 
+        let availableModels = [];
+
         function updateModelInfo(model) {
-            if (!model) {
-                modelInfoDiv.textContent = '—';
+            if (availableModels.length > 1) {
+                modelInfoDiv.hidden = true;
+                modelSelect.hidden = false;
+                if (model && [...modelSelect.options].some((o) => o.value === model)) {
+                    modelSelect.value = model;
+                } else if (!model) {
+                    modelSelect.value = '';
+                }
                 return;
             }
-            modelInfoDiv.textContent = model;
+            modelSelect.hidden = true;
+            modelInfoDiv.hidden = false;
+            modelInfoDiv.textContent = model || '—';
         }
+
+        function updateModelSelect(models, current) {
+            availableModels = Array.isArray(models) ? models : [];
+            modelSelect.innerHTML = '';
+            if (availableModels.length > 1) {
+                const placeholder = document.createElement('option');
+                placeholder.value = '';
+                placeholder.disabled = true;
+                placeholder.textContent = 'Select a model…';
+                modelSelect.appendChild(placeholder);
+                for (const m of availableModels) {
+                    const opt = document.createElement('option');
+                    opt.value = m.id;
+                    opt.textContent = m.contextLimit
+                        ? `${m.id} (${formatTokenCount(m.contextLimit)})`
+                        : m.id;
+                    modelSelect.appendChild(opt);
+                }
+                const selected = current || availableModels.find((m) => m.current)?.id || '';
+                if (selected && [...modelSelect.options].some((o) => o.value === selected)) {
+                    modelSelect.value = selected;
+                    placeholder.selected = false;
+                } else {
+                    placeholder.selected = true;
+                }
+            }
+            updateModelInfo(current || availableModels.find((m) => m.current)?.id || '');
+        }
+
+        modelSelect.onchange = () => {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            const id = modelSelect.value;
+            if (!id) return;
+            ws.send(JSON.stringify({ type: 'set_model', model: id }));
+        };
 
         function updateContextInfo(data) {
             lastContextData = data || lastContextData;
@@ -739,6 +1006,10 @@
         function clearChat() {
             disposeChatEditors();
             messagesDiv.innerHTML = '';
+            if (streamRenderTimer) {
+                clearTimeout(streamRenderTimer);
+                streamRenderTimer = null;
+            }
             endStream();
             streamingToolCards = {};
             pendingToolCards = {};
@@ -751,7 +1022,8 @@
         let ws;
         let reconnectTimer;
         let currentStreamDiv = null;
-        let currentStreamSpan = null;
+        let currentStreamRaw = '';
+        let streamRenderTimer = null;
         let currentThinkingDiv = null;
         let currentThinkingSpan = null;
         let pendingToolCards = {};
@@ -834,23 +1106,40 @@
             return `(large output: ${lines} lines, ${chars} chars)`;
         }
 
-        function appendExpandableResult(body, result, success, truncated) {
+        function appendExpandableResult(body, result, success, truncated, options = {}) {
+            const { language = '' } = options;
             const content = document.createElement('div');
             content.className = `tool-result-content ${success ? '' : 'error-content'}`;
             const full = result || '';
             const summary = summarizeResult(full, success);
             content.textContent = summary;
             body.appendChild(content);
+
+            const canHighlight = success && language && language !== 'plaintext';
+            const showingFull = summary === full.trim();
+            if (canHighlight && showingFull) {
+                colorizeElement(content, language);
+            }
+
             if (summary !== full.trim() && (full.trim() || truncated)) {
                 const expandBtn = document.createElement('button');
                 expandBtn.textContent = truncated ? 'Show received output' : 'Show full output';
                 expandBtn.className = 'btn-link';
                 expandBtn.onclick = () => {
                     content.textContent = full;
+                    content.classList.remove('monaco-colorized');
+                    delete content.dataset.monacoColorized;
+                    if (canHighlight) colorizeElement(content, language);
                     expandBtn.remove();
                 };
                 body.appendChild(expandBtn);
             }
+        }
+
+        function readFilePathFromArgs(args) {
+            if (!args || typeof args !== 'object') return '';
+            const p = args.file_path || args.path || '';
+            return typeof p === 'string' ? p : '';
         }
 
         function parseInlineJSONArgs(raw) {
@@ -899,34 +1188,72 @@
             if (message) appendMessage('system', message);
         }
 
+        function renderMarkdownHTML(text) {
+            const raw = marked.parse(text || '', { async: false });
+            return DOMPurify.sanitize(raw, { USE_PROFILES: { html: true } });
+        }
+
+        // Colorize runs on the same cadence as markdown; stale async runs are dropped via _gogenHlGen.
+        function setMessageMarkdown(el, text) {
+            el.classList.add('md');
+            el._gogenHlGen = (el._gogenHlGen || 0) + 1;
+            el.innerHTML = renderMarkdownHTML(text);
+            colorizeCodeBlocks(el);
+        }
+
         function appendMessage(role, text) {
             const msgDiv = document.createElement('div');
             msgDiv.className = `message ${role}`;
-            const span = document.createElement('span');
-            span.textContent = text;
-            msgDiv.appendChild(span);
+            if (role === 'assistant') {
+                setMessageMarkdown(msgDiv, text);
+            } else {
+                const span = document.createElement('span');
+                span.textContent = text;
+                msgDiv.appendChild(span);
+            }
             messagesDiv.appendChild(msgDiv);
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
             return msgDiv;
         }
 
+        function flushStreamRender() {
+            if (streamRenderTimer) {
+                clearTimeout(streamRenderTimer);
+                streamRenderTimer = null;
+            }
+            if (!currentStreamDiv) return;
+            const keepCursor = currentStreamDiv.classList.contains('cursor');
+            setMessageMarkdown(currentStreamDiv, currentStreamRaw);
+            if (keepCursor) currentStreamDiv.classList.add('cursor');
+        }
+
+        function scheduleStreamRender() {
+            if (streamRenderTimer) return;
+            streamRenderTimer = setTimeout(() => {
+                streamRenderTimer = null;
+                flushStreamRender();
+            }, 80);
+        }
+
         function startStream() {
+            if (streamRenderTimer) {
+                clearTimeout(streamRenderTimer);
+                streamRenderTimer = null;
+            }
             const msgDiv = document.createElement('div');
-            msgDiv.className = 'message assistant cursor';
-            const span = document.createElement('span');
-            msgDiv.appendChild(span);
+            msgDiv.className = 'message assistant cursor md';
             messagesDiv.appendChild(msgDiv);
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
             currentStreamDiv = msgDiv;
-            currentStreamSpan = span;
+            currentStreamRaw = '';
         }
 
         function appendStreamToken(token) {
-            if (currentStreamSpan) {
-                currentStreamSpan.textContent += token;
-                bumpContextEstimate(token);
-                messagesDiv.scrollTop = messagesDiv.scrollHeight;
-            }
+            if (!currentStreamDiv) return;
+            currentStreamRaw += token;
+            bumpContextEstimate(token);
+            scheduleStreamRender();
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
         }
 
         function showThinking() {
@@ -1005,10 +1332,11 @@
 
         function endStream() {
             if (currentStreamDiv) {
+                flushStreamRender();
                 currentStreamDiv.classList.remove('cursor');
             }
             currentStreamDiv = null;
-            currentStreamSpan = null;
+            currentStreamRaw = '';
         }
 
         function formatToolArgs(args) {
@@ -1306,6 +1634,12 @@
                 body.appendChild(host);
                 card.appendChild(body);
                 await mountDiffEditor(host, result || '');
+            } else if (name === 'read_file') {
+                const path = readFilePathFromArgs(cardInfo.args);
+                appendExpandableResult(body, result, success, truncated, {
+                    language: languageFromPath(path),
+                });
+                card.appendChild(body);
             } else {
                 appendExpandableResult(body, result, success, truncated);
                 card.appendChild(body);
@@ -1329,8 +1663,8 @@
                         const close = document.createElement('span');
                         close.textContent = '</thinking>';
                         div.append(open, document.createTextNode(h.reasoning), close);
-                        chatContainer.appendChild(div);
-                        chatContainer.scrollTop = chatContainer.scrollHeight;
+                        messagesDiv.appendChild(div);
+                        messagesDiv.scrollTop = messagesDiv.scrollHeight;
                     }
                     if (h.content) appendMessage('assistant', h.content);
                     if (Array.isArray(h.toolCalls)) {
@@ -1376,6 +1710,7 @@
                 clearTimeout(reconnectTimer);
                 statusDiv.innerText = 'Status: Connected';
                 appendMessage('system', 'Connected to GoGen server');
+                ws.send(JSON.stringify({ type: 'list_models' }));
             };
 
             ws.onmessage = (event) => {
@@ -1504,11 +1839,20 @@
                         appendMessage('assistant', data.content);
                     }
                 } else if (data.type === 'models') {
-                    finalizeThinking();
-                    endStream();
-                    if (data.content) appendMessage('assistant', data.content);
-                    if (data.model) updateModelInfo(data.model);
-                    updateContextInfo(data);
+                    if (data.content) {
+                        finalizeThinking();
+                        endStream();
+                        appendMessage('assistant', data.content);
+                    }
+                    if (data.models) {
+                        updateModelSelect(data.models, data.model);
+                    } else if (data.model) {
+                        updateModelInfo(data.model);
+                    }
+                    // list_models replies omit context stats — don't wipe the indicator
+                    if (data.contextLimit || data.usedTokens || data.usedSource) {
+                        updateContextInfo(data);
+                    }
                 } else if (data.type === 'history') {
                     if (data.history) {
                         replayHistory(data.history).catch((err) => {
@@ -1557,6 +1901,7 @@
                 setTurnActive(false);
                 abortInFlightUI(null);
             }
+            hideSlashSuggest();
             appendMessage('user', text);
             streamingToolCards = {};
             pendingToolCards = {};
@@ -1577,7 +1922,48 @@
             statusDiv.innerText = 'Status: Connected';
         };
 
+        inputArea.addEventListener('input', updateSlashSuggest);
+        inputArea.addEventListener('blur', () => {
+            // Delay so mousedown on a suggestion can fire first.
+            setTimeout(hideSlashSuggest, 150);
+        });
+
         inputArea.onkeydown = (e) => {
+            if (slashSuggestOpen()) {
+                if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    slashIndex = (slashIndex + 1) % slashMatches.length;
+                    renderSlashSuggest();
+                    return;
+                }
+                if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    slashIndex = (slashIndex - 1 + slashMatches.length) % slashMatches.length;
+                    renderSlashSuggest();
+                    return;
+                }
+                if (e.key === 'Tab') {
+                    e.preventDefault();
+                    applySlashCompletion(slashMatches[slashIndex].name);
+                    return;
+                }
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    const selected = slashMatches[slashIndex].name;
+                    const token = inputArea.value.split(/\s/, 1)[0];
+                    if (token.toLowerCase() !== selected.toLowerCase()) {
+                        e.preventDefault();
+                        applySlashCompletion(selected);
+                        return;
+                    }
+                    hideSlashSuggest();
+                    // fall through to send
+                }
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    hideSlashSuggest();
+                    return;
+                }
+            }
             if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
                 sendBtn.onclick();

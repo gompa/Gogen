@@ -8,11 +8,11 @@ import (
 
 // MoveFile renames or moves a file within the working directory.
 func (e *Executor) MoveFile(src, dst string) (string, error) {
-	srcSecure, err := e.securePath(src)
+	srcSecure, err := e.SecurePath(src)
 	if err != nil {
 		return "", err
 	}
-	dstSecure, err := e.securePath(dst)
+	dstSecure, err := e.SecurePath(dst)
 	if err != nil {
 		return "", err
 	}

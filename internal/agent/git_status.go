@@ -12,7 +12,7 @@ import (
 func (e *Executor) GitStatus(ctx context.Context, path string) (string, error) {
 	args := []string{"status", "--short"}
 	if strings.TrimSpace(path) != "" {
-		if _, err := e.securePath(path); err != nil {
+		if _, err := e.SecurePath(path); err != nil {
 			return "", err
 		}
 		args = append(args, "--", path)

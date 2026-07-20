@@ -24,7 +24,7 @@ func (e *Executor) ExtractFunction(ctx context.Context, file string, startLine, 
 		return "", fmt.Errorf("file and function name are required")
 	}
 
-	secure, err := e.securePath(file)
+	secure, err := e.SecurePath(file)
 	if err != nil {
 		return "", err
 	}

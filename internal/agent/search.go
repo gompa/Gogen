@@ -90,7 +90,7 @@ func (e *Executor) searchRoot(subpath string) (absRoot, relPrefix string, err er
 		abs, err := filepath.Abs(e.WorkingDir)
 		return abs, "", err
 	}
-	secure, err := e.securePath(subpath)
+	secure, err := e.SecurePath(subpath)
 	if err != nil {
 		return "", "", err
 	}
@@ -223,7 +223,11 @@ func (e *Executor) searchWithGo(ctx context.Context, searchRoot, relPrefix, patt
 			return nil
 		}
 
-		fileMatches, err := scanFileWithContext(path, rel, re, contextLines, searchMaxMatches-len(matches))
+		limit := searchMaxMatches - len(matches)
+		if limit <= 0 {
+			return nil
+		}
+		fileMatches, err := scanFileSinglePass(path, rel, re, contextLines, limit)
 		if err != nil {
 			return nil
 		}
@@ -263,13 +267,6 @@ func compileSearchPattern(pattern string) (*regexp.Regexp, error) {
 		}
 	}
 	return re, nil
-}
-
-func scanFileWithContext(path, relPath string, re *regexp.Regexp, contextLines, matchLimit int) ([]string, error) {
-	if matchLimit <= 0 {
-		return nil, nil
-	}
-	return scanFileSinglePass(path, relPath, re, contextLines, matchLimit)
 }
 
 // scanFileSinglePass reads the file once, finds matches, and emits results

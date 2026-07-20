@@ -16,7 +16,7 @@ func (e *Executor) ShowDiff(ctx context.Context, path string, staged bool) (stri
 		args = append(args, "--cached")
 	}
 	if strings.TrimSpace(path) != "" {
-		if _, err := e.securePath(path); err != nil {
+		if _, err := e.SecurePath(path); err != nil {
 			return "", err
 		}
 		args = append(args, "--", path)

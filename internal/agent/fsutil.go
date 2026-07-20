@@ -48,7 +48,7 @@ func writeFileAtomic(path string, content []byte, perm os.FileMode) error {
 	return ioutil.WriteFileAtomic(path, content, perm)
 }
 
-func (e *Executor) securePath(path string) (string, error) {
+func (e *Executor) SecurePath(path string) (string, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return "", fmt.Errorf("path is required")
@@ -74,11 +74,6 @@ func (e *Executor) securePath(path string) (string, error) {
 		return "", fmt.Errorf("path %s is outside of working directory %s", path, absWD)
 	}
 	return resolvedPath, nil
-}
-
-// SecurePath resolves path under the working directory and rejects escapes.
-func (e *Executor) SecurePath(path string) (string, error) {
-	return e.securePath(path)
 }
 
 // resolveExecutorPath maps a user/model path to an absolute path under the working directory.

@@ -8,7 +8,7 @@ import (
 
 // DeleteFile removes a file after user approval when required.
 func (e *Executor) DeleteFile(ctx context.Context, path string) (string, error) {
-	secure, err := e.securePath(path)
+	secure, err := e.SecurePath(path)
 	if err != nil {
 		return "", err
 	}

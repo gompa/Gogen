@@ -36,8 +36,10 @@ type SessionInfo struct {
 	Label        string
 }
 
-// RestoreSession loads messages, mode, and model from a snapshot.
-func (a *Agent) RestoreSession(ctx context.Context, snap SessionSnapshot) {
+// RestoreSessionLocal loads messages, mode, and model from a snapshot without
+// contacting the provider. Prefer this at process startup so the UI can come
+// up before model validation / context-limit lookup.
+func (a *Agent) RestoreSessionLocal(snap SessionSnapshot) {
 	a.Messages = append([]llm.Message(nil), snap.Messages...)
 	// Cached token counts are keyed by message pointer; restoring gives
 	// every message a new address, so any old entries are dead weight.
@@ -69,23 +71,37 @@ func (a *Agent) RestoreSession(ctx context.Context, snap SessionSnapshot) {
 	}
 	if snap.Model != "" {
 		_ = a.Provider.SetModel(snap.Model)
+	}
+}
+
+// ValidateRestoredModel checks that model still exists at the provider and
+// refreshes the context limit. Safe to run in the background after startup.
+func (a *Agent) ValidateRestoredModel(ctx context.Context, model string) {
+	if model != "" {
 		models, err := a.Provider.ListModels(ctx)
 		if err == nil {
 			found := false
 			for _, m := range models {
-				if m.ID == snap.Model {
+				if m.ID == model {
 					found = true
 					break
 				}
 			}
-			if !found {
+			if !found && a.Provider.ModelName() == model {
 				_ = a.Provider.SetModel("")
 			}
 		}
-		if a.Context != nil {
-			a.Context.RefreshAfterModelChange(ctx)
-		}
 	}
+	if a.Context != nil {
+		a.Context.RefreshAfterModelChange(ctx)
+	}
+}
+
+// RestoreSession loads messages, mode, and model from a snapshot, then
+// validates the model against the provider (network).
+func (a *Agent) RestoreSession(ctx context.Context, snap SessionSnapshot) {
+	a.RestoreSessionLocal(snap)
+	a.ValidateRestoredModel(ctx, snap.Model)
 }
 
 // sameWorkingDir reports whether two working-directory paths refer to the same location.

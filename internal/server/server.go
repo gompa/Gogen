@@ -568,6 +568,11 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
 				continue
 			}
+			if out, handled := agent.HandleHelpCommand(msg.Content, true, false); handled {
+				s.turnMu.Unlock()
+				_ = ws.writeJSON(WSMessage{Type: "response", Content: out})
+				continue
+			}
 			if out, handled := s.agent.HandleModeCommand(msg.Content); handled {
 				_ = ws.writeJSON(s.agentConfigMsg(r.Context()))
 				s.turnMu.Unlock()
@@ -742,6 +747,43 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 				write(s.contextMsg(r.Context()))
 			}(msg.Content, streamCtx, cancel, errCh)
 			// Do not block here — keep reading so delete_approval_response can complete.
+			continue
+		case "list_models":
+			models, err := s.agent.ListModels(r.Context())
+			if err != nil {
+				_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", err)})
+				continue
+			}
+			_ = ws.writeJSON(WSMessage{
+				Type:   "models",
+				Model:  s.agent.CurrentModel(),
+				Models: s.modelEntries(models),
+			})
+			continue
+		case "set_model":
+			streamMu.Lock()
+			if streamCancel != nil {
+				streamCancel()
+				prevErr := streamErr
+				streamCancel = nil
+				streamErr = nil
+				streamMu.Unlock()
+				drainStreamErr(prevErr)
+			} else {
+				streamMu.Unlock()
+			}
+			if !s.tryAcquireTurn(wsTurnAcquireWait) {
+				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+				continue
+			}
+			err := s.agent.SelectModel(r.Context(), msg.Model)
+			cfg := s.agentConfigMsg(r.Context())
+			s.turnMu.Unlock()
+			if err != nil {
+				_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", err)})
+				continue
+			}
+			_ = ws.writeJSON(cfg)
 			continue
 		case "set_mode":
 			streamMu.Lock()

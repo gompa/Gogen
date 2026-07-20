@@ -16,7 +16,7 @@ func (e *Executor) AppendSyntaxCheck(result string, paths ...string) string {
 		if strings.Contains(path, "(deleted)") || strings.TrimSpace(path) == "" {
 			continue
 		}
-		content, err := e.readFileRaw(path)
+		content, err := e.ReadFileRawBytes(path)
 		if err != nil {
 			continue
 		}

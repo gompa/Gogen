@@ -46,7 +46,7 @@ func (e *Executor) GenerateTest(ctx context.Context, funcName, file string, styl
 		}
 	}
 
-	secure, err := e.securePath(file)
+	secure, err := e.SecurePath(file)
 	if err != nil {
 		return "", err
 	}

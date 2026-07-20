@@ -486,7 +486,7 @@ func (m *Model) renderHelpModal() string {
 			{"enter", "Submit input"},
 			{"ctrl+c", "Cancel turn / Quit"},
 			{"ctrl+\\", "Force quit"},
-			{"F1", "Show this help"},
+			{"F1 / /help", "Show this help"},
 			{"ctrl+v", "Toggle verbose"},
 		}},
 		{"Input Editing", [][]string{
@@ -498,7 +498,7 @@ func (m *Model) renderHelpModal() string {
 			{"ctrl+left/right", "Word left/right"},
 			{"ctrl+d", "Delete forward / EOF quit"},
 			{"backspace", "Delete backward"},
-			{"tab", "Complete (/resume)"},
+			{"tab", "Complete slash cmds"},
 		}},
 		{"Viewport (esc to focus)", [][]string{
 			{"↑ ↓ j k", "Scroll line"},
@@ -508,15 +508,18 @@ func (m *Model) renderHelpModal() string {
 			{"i / enter", "Return to input"},
 		}},
 		{"Slash Commands", [][]string{
+			{"/help", "Show this help"},
 			{"/plan / /act", "Toggle plan/act mode"},
+			{"/mode", "Show current mode"},
 			{"/models", "List/switch models"},
 			{"/context", "Context usage details"},
 			{"/new", "Start new session"},
 			{"/resume", "List/restore/delete sessions"},
 			{"/compact", "Compact history"},
 			{"/verbose", "Toggle verbose output"},
+			{"/save-config", "Write config to .gogen/"},
 			{"dir <path>", "Change working dir"},
-			{"exit", "Quit GoGen"},
+			{"/exit", "Quit GoGen"},
 		}},
 		{"Text Selection", [][]string{
 			{"click+drag", "Select text in viewport"},
@@ -608,6 +611,10 @@ func (m *Model) handleCompletionKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 				m.textarea.Reset()
 				m.textarea.SetValue(prefix + newArg)
+				m.textarea.CursorEnd()
+			} else if strings.HasPrefix(strings.TrimRight(m.completionLine, " \t"), "/") {
+				m.textarea.Reset()
+				m.textarea.SetValue(m.completions[m.completionIdx] + " ")
 				m.textarea.CursorEnd()
 			}
 		}

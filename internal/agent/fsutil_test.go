@@ -16,7 +16,7 @@ func TestSecurePathAbsoluteWithinWorkingDir(t *testing.T) {
 	}
 	exec := NewExecutor(dir)
 
-	got, err := exec.securePath(readme)
+	got, err := exec.SecurePath(readme)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestSecurePathAbsoluteWithoutLeadingSlash(t *testing.T) {
 	exec := NewExecutor(dir)
 
 	withoutSlash := strings.TrimPrefix(filepath.ToSlash(readme), "/")
-	got, err := exec.securePath(withoutSlash)
+	got, err := exec.SecurePath(withoutSlash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func TestSecurePathRelative(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := NewExecutor(dir)
-	got, err := exec.securePath("go.mod")
+	got, err := exec.SecurePath("go.mod")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestSecurePathBlocksSymlinkEscape(t *testing.T) {
 	}
 
 	exec := NewExecutor(root)
-	_, err := exec.ReadFile(filepath.Join("escape", "secret.txt"))
+	_, err := exec.ReadFileRange(filepath.Join("escape", "secret.txt"), 0, 0, "")
 	if err == nil {
 		t.Fatal("expected symlink escape to be blocked")
 	}

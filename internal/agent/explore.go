@@ -76,7 +76,7 @@ func resetGlobRegexCacheLocked() {
 // ListFiles lists directory entries. When recursive is true, walks the tree (max 500 paths).
 // When trackedOnly is true, results are filtered to git-tracked files.
 func (e *Executor) ListFiles(path string, recursive, trackedOnly bool) (string, error) {
-	secure, err := e.securePath(path)
+	secure, err := e.SecurePath(path)
 	if err != nil {
 		return "", err
 	}
@@ -348,7 +348,7 @@ func (e *Executor) ReadFiles(paths []string) (string, error) {
 		if path == "" {
 			continue
 		}
-		secure, err := e.securePath(path)
+		secure, err := e.SecurePath(path)
 		if err != nil {
 			return "", err
 		}

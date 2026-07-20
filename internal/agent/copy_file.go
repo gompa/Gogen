@@ -10,11 +10,11 @@ import (
 // CopyFile copies a file within the working directory.
 // When createDirs is true, destination directories are created as needed.
 func (e *Executor) CopyFile(src, dst string) (string, error) {
-	srcSecure, err := e.securePath(src)
+	srcSecure, err := e.SecurePath(src)
 	if err != nil {
 		return "", err
 	}
-	dstSecure, err := e.securePath(dst)
+	dstSecure, err := e.SecurePath(dst)
 	if err != nil {
 		return "", err
 	}

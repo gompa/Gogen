@@ -17,6 +17,12 @@ import (
 func (m *Model) dispatchCommand(input string) (bool, bool, tea.Cmd) {
 	trimmed := strings.TrimSpace(input)
 
+	// help
+	if trimmed == "help" || trimmed == "/help" {
+		m.modal = ModalHelp
+		return true, false, nil
+	}
+
 	// exit
 	if trimmed == "exit" || trimmed == "/exit" || trimmed == "quit" || trimmed == "/quit" {
 		// Session saving happens automatically via the agent

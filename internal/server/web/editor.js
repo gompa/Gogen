@@ -1,6 +1,6 @@
 // Monaco editor workspace for GoGen web UI.
 
-import monaco from '/monaco/editor.bundle.js';
+let monaco = null;
 
 // Must be set before any editor/worker is created.
 self.MonacoEnvironment = {
@@ -34,6 +34,7 @@ let mode = 'edit'; // 'edit' | 'diff'
 let editor = null;
 let diffEditor = null;
 let monacoReady = false;
+let monacoInitPromise = null;
 let wsRef = null;
 let reqCounter = 0;
 const pendingReqs = new Map();
@@ -70,50 +71,265 @@ function wsRequest(type, payload = {}) {
 
 export async function initMonaco() {
   if (monacoReady) return monaco;
+  if (monacoInitPromise) return monacoInitPromise;
 
-  // Monaco 0.52+ no longer ships a built-in unified-diff highlighter.
-  if (!monaco.languages.getLanguages().some((l) => l.id === 'diff')) {
-    monaco.languages.register({ id: 'diff' });
-  }
-  monaco.languages.setMonarchTokensProvider('diff', {
-    tokenizer: {
-      root: [
-        [/^\+\+\+.*$/, 'meta.diff.header'],
-        [/^---.*$/, 'meta.diff.header'],
-        [/^diff .*$/, 'meta.diff'],
-        [/^index .*$/, 'comment'],
-        [/^@@.*@@.*$/, 'meta.diff.hunk'],
-        [/^\+.*$/, 'markup.inserted'],
-        [/^-.*$/, 'markup.deleted'],
+  // Dynamic import: avoids blocking the WebSocket connection on a 3.8 MB download.
+  monacoInitPromise = (async () => {
+    const mod = await import('/monaco/editor.bundle.js');
+    monaco = mod.default;
+    // Monaco 0.52+ no longer ships a built-in unified-diff highlighter.
+    if (!monaco.languages.getLanguages().some((l) => l.id === 'diff')) {
+      monaco.languages.register({ id: 'diff' });
+    }
+    monaco.languages.setMonarchTokensProvider('diff', {
+      tokenizer: {
+        root: [
+          [/^\+\+\+.*$/, 'meta.diff.header'],
+          [/^---.*$/, 'meta.diff.header'],
+          [/^diff .*$/, 'meta.diff'],
+          [/^index .*$/, 'comment'],
+          [/^@@.*@@.*$/, 'meta.diff.hunk'],
+          [/^\+.*$/, 'markup.inserted'],
+          [/^-.*$/, 'markup.deleted'],
+        ],
+      },
+    });
+
+    // Strong diff colors for unified patches (language tokens + decorations).
+    monaco.editor.defineTheme('gogen-dark', {
+      base: 'vs-dark',
+      inherit: true,
+      rules: [
+        { token: 'comment', foreground: '6A9955' },
+        { token: 'meta.diff', foreground: '569CD6' },
+        { token: 'meta.diff.header', foreground: '569CD6', fontStyle: 'bold' },
+        { token: 'meta.diff.hunk', foreground: 'C586C0' },
+        { token: 'markup.inserted', foreground: '4EC9B0' },
+        { token: 'markup.deleted', foreground: 'F14C4C' },
       ],
-    },
-  });
+      colors: {
+        'diffEditor.insertedTextBackground': '#2ea04340',
+        'diffEditor.removedTextBackground': '#f8514940',
+        'diffEditor.insertedLineBackground': '#2ea04326',
+        'diffEditor.removedLineBackground': '#f8514926',
+        'editorGutter.addedBackground': '#2ea043',
+        'editorGutter.deletedBackground': '#f85149',
+        'editorGutter.modifiedBackground': '#d29922',
+      },
+    });
+    monaco.editor.setTheme('gogen-dark');
+    monacoReady = true;
+    return monaco;
+  })();
 
-  // Strong diff colors for unified patches (language tokens + decorations).
-  monaco.editor.defineTheme('gogen-dark', {
-    base: 'vs-dark',
-    inherit: true,
-    rules: [
-      { token: 'comment', foreground: '6A9955' },
-      { token: 'meta.diff', foreground: '569CD6' },
-      { token: 'meta.diff.header', foreground: '569CD6', fontStyle: 'bold' },
-      { token: 'meta.diff.hunk', foreground: 'C586C0' },
-      { token: 'markup.inserted', foreground: '4EC9B0' },
-      { token: 'markup.deleted', foreground: 'F14C4C' },
-    ],
-    colors: {
-      'diffEditor.insertedTextBackground': '#2ea04340',
-      'diffEditor.removedTextBackground': '#f8514940',
-      'diffEditor.insertedLineBackground': '#2ea04326',
-      'diffEditor.removedLineBackground': '#f8514926',
-      'editorGutter.addedBackground': '#2ea043',
-      'editorGutter.deletedBackground': '#f85149',
-      'editorGutter.modifiedBackground': '#d29922',
-    },
-  });
-  monaco.editor.setTheme('gogen-dark');
-  monacoReady = true;
-  return monaco;
+  try {
+    return await monacoInitPromise;
+  } catch (err) {
+    monacoInitPromise = null;
+    throw err;
+  }
+}
+
+// Common fence aliases → Monaco language ids.
+const LANG_ALIASES = {
+  js: 'javascript',
+  jsx: 'javascript',
+  mjs: 'javascript',
+  cjs: 'javascript',
+  ts: 'typescript',
+  tsx: 'typescript',
+  py: 'python',
+  rb: 'ruby',
+  sh: 'shell',
+  bash: 'shell',
+  zsh: 'shell',
+  yml: 'yaml',
+  md: 'markdown',
+  golang: 'go',
+  rs: 'rust',
+  cs: 'csharp',
+  csharp: 'csharp',
+  kt: 'kotlin',
+  plaintext: 'plaintext',
+  text: 'plaintext',
+  plain: 'plaintext',
+  console: 'shell',
+};
+
+function resolveMonacoLanguage(langHint) {
+  if (!monaco || !langHint) return null;
+  let id = String(langHint).trim().toLowerCase();
+  if (!id) return null;
+  id = LANG_ALIASES[id] || id;
+  const langs = monaco.languages.getLanguages();
+  if (langs.some((l) => l.id === id)) return id;
+  for (const l of langs) {
+    if (l.aliases?.some((a) => String(a).toLowerCase() === id)) return l.id;
+    if (l.extensions?.some((ext) => ext === `.${id}` || ext.slice(1).toLowerCase() === id)) {
+      return l.id;
+    }
+  }
+  return null;
+}
+
+/** Map a file path to a Monaco language id (mirrors server languageFromPath). */
+export function languageFromPath(path) {
+  if (!path) return 'plaintext';
+  const base = String(path).split(/[/\\]/).pop() || '';
+  const dot = base.lastIndexOf('.');
+  const ext = dot >= 0 ? base.slice(dot).toLowerCase() : '';
+  switch (ext) {
+    case '.go':
+    case '.mod':
+      return 'go';
+    case '.js':
+    case '.mjs':
+    case '.cjs':
+    case '.jsx':
+      return 'javascript';
+    case '.ts':
+    case '.tsx':
+      return 'typescript';
+    case '.json':
+      return 'json';
+    case '.md':
+    case '.markdown':
+      return 'markdown';
+    case '.html':
+    case '.htm':
+      return 'html';
+    case '.css':
+      return 'css';
+    case '.scss':
+      return 'scss';
+    case '.less':
+      return 'less';
+    case '.yaml':
+    case '.yml':
+      return 'yaml';
+    case '.toml':
+      return 'ini';
+    case '.xml':
+      return 'xml';
+    case '.sh':
+    case '.bash':
+    case '.zsh':
+      return 'shell';
+    case '.py':
+      return 'python';
+    case '.rs':
+      return 'rust';
+    case '.java':
+      return 'java';
+    case '.c':
+    case '.h':
+      return 'c';
+    case '.cpp':
+    case '.cc':
+    case '.cxx':
+    case '.hpp':
+      return 'cpp';
+    case '.cs':
+      return 'csharp';
+    case '.sql':
+      return 'sql';
+    case '.rb':
+      return 'ruby';
+    case '.php':
+      return 'php';
+    case '.swift':
+      return 'swift';
+    case '.kt':
+      return 'kotlin';
+    case '.lua':
+      return 'lua';
+    case '.r':
+      return 'r';
+    case '.diff':
+    case '.patch':
+      return 'diff';
+    default:
+      return 'plaintext';
+  }
+}
+
+/**
+ * Colorize a single element's textContent with Monaco.
+ * langHint may be a language id or a file path.
+ */
+export async function colorizeElement(el, langHint) {
+  if (!el) return;
+  const gen = (el._gogenHlGen = (el._gogenHlGen || 0) + 1);
+  let m;
+  try {
+    m = await initMonaco();
+  } catch (err) {
+    console.warn('monaco colorize init failed', err);
+    return;
+  }
+  if (el._gogenHlGen !== gen || !el.isConnected) return;
+
+  let lang = resolveMonacoLanguage(langHint);
+  if (!lang && langHint && String(langHint).includes('.')) {
+    lang = resolveMonacoLanguage(languageFromPath(langHint));
+  }
+  if (!lang || lang === 'plaintext') return;
+
+  const source = el.textContent || '';
+  if (!source.trim()) return;
+
+  try {
+    const html = await m.editor.colorize(source, lang, {});
+    if (el._gogenHlGen !== gen || !el.isConnected) return;
+    el.innerHTML = html;
+    el.dataset.monacoColorized = '1';
+    el.classList.add('monaco-colorized');
+  } catch (_) {
+    // Unknown / unloaded language — leave plain text.
+  }
+}
+
+/**
+ * Syntax-highlight fenced code blocks under root using Monaco's colorize API.
+ * Safe to call repeatedly; skips already-highlighted nodes. Stale runs are dropped
+ * when root is re-rendered (generation counter).
+ */
+export async function colorizeCodeBlocks(root) {
+  if (!root || !root.querySelectorAll) return;
+  const codes = root.querySelectorAll('pre code');
+  if (!codes.length) return;
+
+  const gen = (root._gogenHlGen = (root._gogenHlGen || 0) + 1);
+  let m;
+  try {
+    m = await initMonaco();
+  } catch (err) {
+    console.warn('monaco colorize init failed', err);
+    return;
+  }
+  if (root._gogenHlGen !== gen || !root.isConnected) return;
+
+  for (const code of codes) {
+    if (root._gogenHlGen !== gen || !code.isConnected) return;
+    if (code.dataset.monacoColorized === '1') continue;
+
+    const classMatch = /(?:^|\s)language-(\S+)/.exec(code.className || '');
+    const lang = resolveMonacoLanguage(classMatch ? classMatch[1] : '');
+    if (!lang || lang === 'plaintext') continue;
+
+    const source = code.textContent || '';
+    if (!source.trim()) continue;
+
+    try {
+      const html = await m.editor.colorize(source, lang, {});
+      if (root._gogenHlGen !== gen || !code.isConnected) return;
+      code.innerHTML = html;
+      code.dataset.monacoColorized = '1';
+      code.classList.add('monaco-colorized');
+    } catch (_) {
+      // Unknown / unloaded language — leave plain text.
+    }
+  }
 }
 
 /** Colorize unified-diff lines via decorations (works even if language tokens are missing). */

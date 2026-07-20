@@ -9,7 +9,7 @@ import (
 
 // ListDefinitions returns an outline of named symbols in a source file.
 func (e *Executor) ListDefinitions(path string) (string, error) {
-	content, err := e.readFileRaw(path)
+	content, err := e.ReadFileRawBytes(path)
 	if err != nil {
 		return "", err
 	}

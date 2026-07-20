@@ -48,16 +48,12 @@ func NewExecutorWithGuard(wd string, guard *CommandGuard) *Executor {
 	}
 }
 
-func (e *Executor) ReadFile(path string) (string, error) {
-	return e.ReadFileRange(path, 0, 0, "")
-}
-
 // readFileRaw reads the full raw bytes of a file without the headers or
 // truncation that ReadFileRange applies. It is intended for consumers that
 // need the exact file content (e.g. tree-sitter parsing), where prepended
 // "Lines X-Y of Z" headers would corrupt the parse.
-func (e *Executor) readFileRaw(path string) ([]byte, error) {
-	secure, err := e.securePath(path)
+func (e *Executor) ReadFileRawBytes(path string) ([]byte, error) {
+	secure, err := e.SecurePath(path)
 	if err != nil {
 		return nil, err
 	}
@@ -69,7 +65,7 @@ func (e *Executor) readFileRaw(path string) ([]byte, error) {
 // regex match, offset is treated as context lines around that match (default 10,
 // not a starting line number), and limit caps the total lines returned.
 func (e *Executor) ReadFileRange(path string, offset, limit int, search string) (string, error) {
-	secure, err := e.securePath(path)
+	secure, err := e.SecurePath(path)
 	if err != nil {
 		return "", err
 	}
@@ -238,7 +234,7 @@ func (e *Executor) ReadFileRange(path string, offset, limit int, search string) 
 }
 
 func (e *Executor) WriteFile(path string, content string) error {
-	secure, err := e.securePath(path)
+	secure, err := e.SecurePath(path)
 	if err != nil {
 		return err
 	}
@@ -254,16 +250,11 @@ func (e *Executor) WriteFile(path string, content string) error {
 
 // OverwriteFile creates or overwrites a file under the working directory.
 func (e *Executor) OverwriteFile(path string, content string) error {
-	secure, err := e.securePath(path)
+	secure, err := e.SecurePath(path)
 	if err != nil {
 		return err
 	}
 	return writeFileAtomic(secure, []byte(content), 0o644)
-}
-
-// ReadFileRawBytes returns the exact file bytes without ReadFileRange headers.
-func (e *Executor) ReadFileRawBytes(path string) ([]byte, error) {
-	return e.readFileRaw(path)
 }
 
 // newGitCmd creates a *exec.Cmd for running git subcommands.
@@ -373,7 +364,7 @@ func (e *Executor) buildShellCommand(ctx context.Context, command string) (*exec
 }
 
 func (e *Executor) ReplaceInFile(path string, search string, replace string, replaceAll bool) (string, error) {
-	secure, err := e.securePath(path)
+	secure, err := e.SecurePath(path)
 	if err != nil {
 		return "", err
 	}
