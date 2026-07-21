@@ -9,9 +9,17 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
+
+// SearchMatch is one structured hit from SearchCodeMatches (no context lines).
+type SearchMatch struct {
+	Path string `json:"path"`
+	Line int    `json:"line"`
+	Text string `json:"text"`
+}
 
 const (
 	searchMaxMatches      = 200
@@ -39,6 +47,70 @@ func shouldSkipSearchEntry(name string, isDir bool) bool {
 		}
 	}
 	return strings.HasPrefix(name, ".") && name != "."
+}
+
+// SearchCodeMatches returns structured matches (context_lines=0) for UI find-in-files.
+// truncated is true when the result set hit search caps.
+func (e *Executor) SearchCodeMatches(ctx context.Context, pattern, subpath, glob string) (matches []SearchMatch, truncated bool, err error) {
+	out, err := e.SearchCode(ctx, pattern, subpath, glob, 0)
+	if err != nil {
+		return nil, false, err
+	}
+	currentFile := ""
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "…") || strings.Contains(line, "truncated") {
+			truncated = true
+			continue
+		}
+		if strings.HasPrefix(line, "No matches") || strings.HasPrefix(line, "(") {
+			continue
+		}
+
+		// Try match line first: "lineNum:content" in compact format.
+		if num, content, ok := parseCompactMatchLine(line); ok {
+			if currentFile != "" {
+				matches = append(matches, SearchMatch{Path: currentFile, Line: num, Text: content})
+			}
+			continue
+		}
+
+		// Otherwise treat as a filename line setting the current file context.
+		if file, ok := parseSearchFileLine(line); ok {
+			currentFile = file
+		}
+	}
+	return matches, truncated, nil
+}
+
+// parseSearchFileLine checks if line is a standalone filename (no ':digit:' pattern).
+func parseSearchFileLine(line string) (string, bool) {
+	// A file line has no ':' followed by digits followed by ':'.
+	if _, _, ok := splitSearchLine(line); ok {
+		return "", false // It's a structured line, not a bare filename.
+	}
+	// Bare filename lines don't contain ':digit:' patterns.
+	return line, true
+}
+
+// parseCompactMatchLine parses "line:content" from compact format.
+func parseCompactMatchLine(line string) (num int, content string, ok bool) {
+	// Compact format: "lineNum:content" where lineNum is at the start.
+	i := 0
+	for i < len(line) && line[i] >= '0' && line[i] <= '9' {
+		i++
+	}
+	if i == 0 || i >= len(line) || line[i] != ':' {
+		return 0, "", false
+	}
+	n, convErr := strconv.Atoi(line[:i])
+	if convErr != nil || n < 1 {
+		return 0, "", false
+	}
+	return n, line[i+1:], true
 }
 
 // SearchCode finds pattern matches using system rg when available, otherwise a Go fallback.
@@ -354,10 +426,73 @@ func isBinaryFile(path string) bool {
 	return false
 }
 
+// compactSearchOutput rewrites lines of the form "filepath:line:content" or
+// "filepath-line-content" so that the filepath appears on its own line only
+// when it changes, and subsequent lines for the same file show just
+// "line:content" (or "line-content" for context lines).  Separator lines
+// like "--" are passed through unchanged.
+func compactSearchOutput(body string) string {
+	var b strings.Builder
+	prevFile := ""
+	for _, line := range strings.Split(body, "\n") {
+		if line == "" {
+			b.WriteByte('\n')
+			continue
+		}
+
+		// Separator lines from ripgrep context output (e.g. "--").
+		if line == "--" {
+			b.WriteString("--\n")
+			prevFile = ""
+			continue
+		}
+
+		// Try to split off the leading filepath.
+		// Matched lines use ':', context lines use '-'.
+		// We look for "filepathSepNumSepRest" where sep is ':' or '-'.
+		file, rest, ok := splitSearchLine(line)
+		if !ok {
+			// Not a structured line (e.g. truncation notice); pass through.
+			b.WriteString(line)
+			b.WriteByte('\n')
+			continue
+		}
+
+		if file != prevFile {
+			b.WriteString(file)
+			b.WriteByte('\n')
+			prevFile = file
+		}
+		b.WriteString(rest)
+		b.WriteByte('\n')
+	}
+	return strings.TrimSuffix(b.String(), "\n")
+}
+
+// splitSearchLine splits "filepathSepNumSepRest" into (filepath, "numSepRest", true).
+// The separator sep is either ':' (matched line) or '-' (context line).
+func splitSearchLine(line string) (file, rest string, ok bool) {
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if c != ':' && c != '-' {
+			continue
+		}
+		j := i + 1
+		for j < len(line) && line[j] >= '0' && line[j] <= '9' {
+			j++
+		}
+		if j > i+1 && j < len(line) && (line[j] == ':' || line[j] == '-') {
+			return line[:i], line[i+1:], true
+		}
+	}
+	return "", "", false
+}
+
 func formatSearchOutput(engine, relPrefix, body string) string {
 	if engine == "rg" {
 		body = prefixRelPaths(body, relPrefix)
 	}
+	body = compactSearchOutput(body)
 	if engine == "go" {
 		return body + "\n(search: go fallback; install ripgrep for faster search)"
 	}

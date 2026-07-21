@@ -65,8 +65,8 @@ func parseSessionCommand(input string) (cmd, args string) {
 // This is used when creating a new session or replacing a deleted current session.
 func (a *Agent) resetSessionState() {
 	a.Messages = nil
-	// Wipe any token-count cache entries — the old message pointers are
-	// being released and new conversations start from empty.
+	// Wipe token-count cache entries — old content is gone and new
+	// conversations start from empty.
 	contextmgr.InvalidateTokenCache()
 	a.lastTurnUsage = nil
 	a.UsageAccum = UsageAccumulator{}
@@ -141,8 +141,13 @@ func (a *Agent) resumeSessionByID(ctx context.Context, id string) (string, error
 	if err != nil {
 		return "", err
 	}
-	a.RestoreSession(ctx, snap)
+	// Restore locally so the client gets history immediately. Provider
+	// validation / context-limit refresh runs in the background (same as
+	// process startup) and must not block the resume WS response.
+	model := snap.Model
+	a.RestoreSessionLocal(snap)
 	a.SessionID = id
+	go a.ValidateRestoredModel(context.Background(), model)
 	label := llm.SessionLabel(snap.Messages, llm.DefaultSessionLabelMaxLen)
 	var out string
 	if label != "" {
@@ -223,4 +228,9 @@ func (a *Agent) formatSessionList() (string, []SessionInfo, error) {
 	}
 	b.WriteString("\nUse: resume <id>  |  resume latest  |  resume del <id>")
 	return b.String(), list, nil
+}
+
+// FormatSessionListForUI returns saved sessions without the slash-command help text.
+func (a *Agent) FormatSessionListForUI() (string, []SessionInfo, error) {
+	return a.formatSessionList()
 }

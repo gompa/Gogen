@@ -1060,9 +1060,13 @@ func (m *Model) handleStreamToolResult(id string, name string, result string, su
 	// If this already came from a diff path, stop — don't double-append.
 	if showDiffResult {
 		m.appendChatLines(newLines)
+		// Account for tool result tokens in the live context estimate even
+		// when the visual block was already rendered during arg streaming.
+		m.bumpContextEstimate(result)
 		return
 	}
 
+	m.bumpContextEstimate(result)
 	m.appendChatLines(newLines)
 }
 

@@ -4,7 +4,6 @@ import (
 	"context"
 	"path/filepath"
 
-	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
 )
 
@@ -41,9 +40,8 @@ type SessionInfo struct {
 // up before model validation / context-limit lookup.
 func (a *Agent) RestoreSessionLocal(snap SessionSnapshot) {
 	a.Messages = append([]llm.Message(nil), snap.Messages...)
-	// Cached token counts are keyed by message pointer; restoring gives
-	// every message a new address, so any old entries are dead weight.
-	contextmgr.InvalidateTokenCache()
+	// Token counts are keyed by content fingerprint, so entries from the
+	// previous session remain valid as long as the content hasn't changed.
 	// Keep the sticky project profile when resuming in the same working
 	// directory so the system-prompt prefix stays byte-stable for provider
 	// prompt caching. Re-detect only when the directory changed (or the

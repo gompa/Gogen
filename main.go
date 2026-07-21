@@ -122,9 +122,6 @@ func main() {
 		MaxToolResultBytes:   cfg.MaxToolResultBytes,
 		CompactReserveTokens: cfg.CompactReserveTokens,
 	})
-	initCtx := context.Background()
-	ctxMgr.EnsureContextLimit(initCtx)
-	cfg.OpenAIModel = provider.ModelName()
 
 	exec := agent.NewExecutorWithGuard(cfg.WorkingDir, agent.NewCommandGuard(cfg.CommandSafetyMode, agent.ParseAllowlist(cfg.CommandAllowlist)))
 	exec.RequireDeleteApproval = cfg.DeleteApproval != "off"
@@ -144,11 +141,14 @@ func main() {
 	})
 	a.SessionStore = store
 	a.SessionID = session.NewID()
+	// Local-only restore: avoid blocking startup on provider ListModels.
+	var restoredModel string
 	if sessionEnabled {
 		if latest, err := store.LatestID(cfg.WorkingDir); err == nil && latest != "" {
 			if snap, err := store.LoadInWorkingDir(cfg.WorkingDir, latest); err == nil {
-				a.RestoreSession(context.Background(), snap)
+				a.RestoreSessionLocal(snap)
 				a.SessionID = latest
+				restoredModel = snap.Model
 				fmt.Fprintf(os.Stderr, "Session %s (%d msgs)\n", latest, len(a.Messages))
 			}
 		}
@@ -165,20 +165,25 @@ func main() {
 	}
 
 	var mcpMgr *mcp.Manager
-	if cfg.MCPEnabled() && len(cfg.MCPServers) > 0 {
-		mcpMgr, err = mcp.NewManager(cfg.MCPServers)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "MCP init error: %v\n", err)
-		} else if reg := mcpMgr.Registry(); reg != nil {
-			a.SetMCPRegistry(reg)
-			fmt.Fprintf(os.Stderr, "MCP tools: %d\n", len(reg.ToolNames()))
+	initMCP := func() {
+		if cfg.MCPEnabled() && len(cfg.MCPServers) > 0 {
+			var mcpErr error
+			mcpMgr, mcpErr = mcp.NewManager(cfg.MCPServers)
+			if mcpErr != nil {
+				fmt.Fprintf(os.Stderr, "MCP init error: %v\n", mcpErr)
+			} else if reg := mcpMgr.Registry(); reg != nil {
+				a.SetMCPRegistry(reg)
+				fmt.Fprintf(os.Stderr, "MCP tools: %d\n", len(reg.ToolNames()))
+			}
+		} else if !cfg.MCPEnabled() && len(cfg.MCPServers) > 0 {
+			fmt.Fprintf(os.Stderr, "MCP servers configured but mcp is off; set mcp: on or GOGEN_MCP=on to enable\n")
 		}
-	} else if !cfg.MCPEnabled() && len(cfg.MCPServers) > 0 {
-		fmt.Fprintf(os.Stderr, "MCP servers configured but mcp is off; set mcp: on or GOGEN_MCP=on to enable\n")
 	}
-	if mcpMgr != nil {
-		defer mcpMgr.Close()
-	}
+	defer func() {
+		if mcpMgr != nil {
+			_ = mcpMgr.Close()
+		}
+	}()
 
 	// Only catch SIGTERM for program-level shutdown. SIGINT is handled
 	// per-turn inside the CLI so a single Ctrl+C does not ruin the session.
@@ -197,9 +202,8 @@ func main() {
 		if cfg.WebAuthToken != "" {
 			fmt.Printf("Auth token required (GOGEN_WEB_TOKEN / web_auth_token)\n")
 		}
-		// Start the web server in the background so the UI is accessible
-		// immediately, even while other initialization (e.g. fetching model
-		// context limits from the LLM API) is still in progress.
+		// Listen first so the UI can connect immediately. Provider model
+		// validation and context-limit lookup continue in the background.
 		done := make(chan struct{})
 		go func() {
 			if err := s.Start(addr); err != nil {
@@ -207,9 +211,17 @@ func main() {
 			}
 			close(done)
 		}()
+		initMCP()
+		go func() {
+			a.ValidateRestoredModel(context.Background(), restoredModel)
+			cfg.OpenAIModel = provider.ModelName()
+		}()
 		<-done
 		return
 	}
+
+	initMCP()
+	a.ValidateRestoredModel(context.Background(), restoredModel)
 	// Default: TUI mode.
 	c := tui.New(a, cfg)
 	c.Run(ctx)

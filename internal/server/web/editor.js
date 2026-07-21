@@ -39,9 +39,20 @@ let wsRef = null;
 let reqCounter = 0;
 const pendingReqs = new Map();
 const chatEditors = new Set(); // disposable Monaco editors in chat tool cards
+let toastFn = null;
+let searchDebounceTimer = null;
+let searchGen = 0;
 
 function $(id) {
   return document.getElementById(id);
+}
+
+export function setToastHandler(fn) {
+  toastFn = typeof fn === 'function' ? fn : null;
+}
+
+function toast(message, kind = 'info') {
+  if (toastFn) toastFn(message, kind);
 }
 
 export function setWebSocket(ws) {
@@ -382,6 +393,47 @@ function ensureEditors() {
     });
     editor.onDidChangeModelContent(() => {
       updateDirtyIndicators();
+      updateUndoRedoButtons();
+    });
+
+    // --- Context menu: add selection reference to chat input ---
+    editor.addAction({
+      id: 'gogen-add-reference-to-chat',
+      label: 'Add Reference to Chat',
+      contextMenuGroupId: 'navigation',
+      contextMenuOrder: 1.5,
+      run(ed) {
+        const selection = ed.getSelection();
+        if (!selection || !activePath) return;
+        const startLine = selection.startLineNumber;
+        const endLine = selection.endLineNumber;
+        const hasSelection = !selection.isEmpty();
+
+        // Build the reference string
+        let ref;
+        if (hasSelection && startLine !== endLine) {
+          ref = `@${activePath}:${startLine}-${endLine}`;
+        } else {
+          ref = `@${activePath}:${startLine}`;
+        }
+
+        const inputEl = document.getElementById('message-input');
+        if (!inputEl) return;
+
+        // Insert reference at cursor or append
+        const start = inputEl.selectionStart;
+        const end = inputEl.selectionEnd;
+        const before = inputEl.value.slice(0, start);
+        const after = inputEl.value.slice(end);
+        const spacer = before && !before.endsWith(' ') && !before.endsWith('\n') ? ' ' : '';
+        inputEl.value = before + spacer + ref + after;
+        // Move cursor after the inserted reference
+        const cursorPos = start + spacer.length + ref.length;
+        inputEl.selectionStart = cursorPos;
+        inputEl.selectionEnd = cursorPos;
+        inputEl.focus();
+        inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+      },
     });
   }
 }
@@ -447,6 +499,34 @@ function updateDirtyIndicators() {
       label.textContent = 'No file open';
     }
   }
+  updateUndoRedoButtons();
+}
+
+function updateUndoRedoButtons() {
+  const undoBtn = $('btn-undo');
+  const redoBtn = $('btn-redo');
+  const canEdit = mode === 'edit' && editor && editor.getModel();
+  let canUndo = false;
+  let canRedo = false;
+  if (canEdit) {
+    // Monaco does not expose stack depth; enable whenever an editable model is active.
+    canUndo = true;
+    canRedo = true;
+  }
+  if (undoBtn) undoBtn.disabled = !canUndo;
+  if (redoBtn) redoBtn.disabled = !canRedo;
+}
+
+export function editorUndo() {
+  if (mode !== 'edit' || !editor) return;
+  editor.focus();
+  editor.trigger('toolbar', 'undo', null);
+}
+
+export function editorRedo() {
+  if (mode !== 'edit' || !editor) return;
+  editor.focus();
+  editor.trigger('toolbar', 'redo', null);
 }
 
 function renderTabs() {
@@ -517,9 +597,32 @@ function disposeBuffer(path) {
 
 async function closeTab(path) {
   if (isDirty(path)) {
-    if (!window.confirm(`Close ${basename(path)} and discard unsaved changes?`)) return;
+    const confirmed = await showCloseTabModal(basename(path));
+    if (!confirmed) return;
   }
   disposeBuffer(path);
+}
+
+function showCloseTabModal(filename) {
+  return new Promise((resolve) => {
+    const overlay = document.getElementById('close-tab-overlay');
+    const filenameEl = document.getElementById('close-tab-filename');
+    const discardBtn = document.getElementById('close-tab-discard-btn');
+    const keepBtn = document.getElementById('close-tab-keep-btn');
+    if (!overlay) { resolve(window.confirm(`Close ${filename} and discard unsaved changes?`)); return; }
+    filenameEl.textContent = `${filename} has unsaved changes that will be lost.`;
+    overlay.classList.add('active');
+    const cleanup = (result) => {
+      overlay.classList.remove('active');
+      discardBtn.removeEventListener('click', onDiscard);
+      keepBtn.removeEventListener('click', onKeep);
+      resolve(result);
+    };
+    const onDiscard = () => cleanup(true);
+    const onKeep = () => cleanup(false);
+    discardBtn.addEventListener('click', onDiscard);
+    keepBtn.addEventListener('click', onKeep);
+  });
 }
 
 function activatePath(path) {
@@ -539,24 +642,43 @@ function activatePath(path) {
   updateDirtyIndicators();
 }
 
-async function openFile(path) {
+async function openFile(path, line) {
   await initMonaco();
   ensureEditors();
   if (buffers.has(path)) {
     activatePath(path);
-    return;
+  } else {
+    let data;
+    try {
+      data = await wsRequest('fs_read', { path });
+    } catch (err) {
+      toast(`Cannot open ${basename(path)}: ${err.message || 'read failed'}`, 'error');
+      return;
+    }
+    if (data.error) {
+      toast(`Cannot open ${basename(path)}: ${data.error}`, 'error');
+      return;
+    }
+    const model = monaco.editor.createModel(data.content || '', data.language || 'plaintext');
+    buffers.set(path, {
+      model,
+      viewState: null,
+      savedVersionId: model.getAlternativeVersionId(),
+      lastUsed: Date.now(),
+    });
+    openOrder.push(path);
+    await enforceTabCap();
+    activatePath(path);
   }
-  const data = await wsRequest('fs_read', { path });
-  const model = monaco.editor.createModel(data.content || '', data.language || 'plaintext');
-  buffers.set(path, {
-    model,
-    viewState: null,
-    savedVersionId: model.getAlternativeVersionId(),
-    lastUsed: Date.now(),
-  });
-  openOrder.push(path);
-  await enforceTabCap();
-  activatePath(path);
+  if (line && line > 0 && editor) {
+    editor.revealLineInCenter(line);
+    editor.setPosition({ lineNumber: line, column: 1 });
+    editor.focus();
+  }
+}
+
+export async function openFileAtLine(path, line) {
+  await openFile(path, line);
 }
 
 async function savePath(path) {
@@ -567,9 +689,10 @@ async function savePath(path) {
     b.savedVersionId = b.model.getAlternativeVersionId();
     updateDirtyIndicators();
     await refreshGitStatus();
+    toast(`Saved ${basename(path)}`, 'success');
     return true;
   } catch (err) {
-    window.alert(`Save failed: ${err.message}`);
+    toast(`Save failed: ${err.message}`, 'error');
     return false;
   }
 }
@@ -580,12 +703,21 @@ async function saveActive() {
 }
 
 async function saveAll() {
+  const loading = document.getElementById('save-all-loading');
+  if (loading) loading.classList.add('active');
+  let any = false;
   for (const path of [...openOrder]) {
     if (isDirty(path)) {
+      any = true;
       const ok = await savePath(path);
-      if (!ok) return;
+      if (!ok) {
+        if (loading) loading.classList.remove('active');
+        return;
+      }
     }
   }
+  if (loading) loading.classList.remove('active');
+  if (any) toast('All files saved', 'success');
 }
 
 async function openUnstagedDiff(path) {
@@ -608,7 +740,7 @@ async function openUnstagedDiff(path) {
       if (prev.modified) prev.modified.dispose();
     }
   } catch (err) {
-    window.alert(`Diff failed: ${err.message}`);
+    toast(`Diff failed: ${err.message}`, 'error');
     showEditPane();
   }
   updateDirtyIndicators();
@@ -652,7 +784,7 @@ async function loadTree(path, container) {
       container.appendChild(row);
       container.appendChild(child);
     } else {
-      row.onclick = () => openFile(ent.path).catch((e) => window.alert(e.message));
+      row.onclick = () => openFile(ent.path);
       container.appendChild(row);
     }
   }
@@ -674,7 +806,7 @@ async function refreshGitStatus() {
       row.className = 'unstaged-item';
       row.textContent = `${ent.status}  ${ent.path}`;
       row.title = ent.path;
-      row.onclick = () => openUnstagedDiff(ent.path).catch((e) => window.alert(e.message));
+      row.onclick = () => openUnstagedDiff(ent.path);
       list.appendChild(row);
     }
   } catch (err) {
@@ -688,12 +820,119 @@ export async function refreshExplorer() {
   await refreshGitStatus();
 }
 
+export function focusFindInFiles() {
+  switchToEditorPane();
+  const input = $('find-in-files-input');
+  if (input) {
+    input.focus();
+    input.select();
+  }
+}
+
+function switchToEditorPane() {
+  document.querySelectorAll('.main-tab').forEach((t) => {
+    t.classList.toggle('active', t.dataset.pane === 'editor');
+  });
+  document.querySelectorAll('.pane').forEach((p) => {
+    p.classList.toggle('active', p.id === 'editor-pane');
+  });
+  initMonaco().then(() => refreshExplorer()).catch(() => {});
+}
+
+async function runFindInFiles(pattern) {
+  const results = $('find-in-files-results');
+  if (!results) return;
+  const q = (pattern || '').trim();
+  if (!q) {
+    results.textContent = '';
+    return;
+  }
+  const gen = ++searchGen;
+  results.textContent = 'Searching…';
+  try {
+    const data = await wsRequest('fs_search', { pattern: q });
+    if (gen !== searchGen) return;
+    const matches = data.matches || [];
+    results.innerHTML = '';
+    if (!matches.length) {
+      results.textContent = 'No matches';
+      return;
+    }
+    if (data.truncated) {
+      const note = document.createElement('div');
+      note.className = 'search-note';
+      note.textContent = 'Results truncated';
+      results.appendChild(note);
+    }
+    for (const m of matches) {
+      const row = document.createElement('div');
+      row.className = 'search-result';
+      row.title = `${m.path}:${m.line}`;
+      const loc = document.createElement('div');
+      loc.className = 'search-result-loc';
+      loc.textContent = `${m.path}:${m.line}`;
+      const text = document.createElement('div');
+      text.className = 'search-result-text';
+      text.textContent = m.text || '';
+      row.appendChild(loc);
+      row.appendChild(text);
+      row.onclick = () => {
+        openFile(m.path, m.line).catch((e) => toast(e.message, 'error'));
+      };
+      results.appendChild(row);
+    }
+  } catch (err) {
+    if (gen !== searchGen) return;
+    results.textContent = err.message;
+    toast(`Search failed: ${err.message}`, 'error');
+  }
+}
+
+// --- Search & Replace ---
+
+/**
+ * Replace all occurrences of `search` with `replace` across matching files.
+ * Uses the backend `fs_replace` message which performs a safe text replacement.
+ * @param {string} [scopePath] - If provided, restrict replacement to this file.
+ */
+async function runReplaceAll(searchPattern, replacement, scopePath) {
+  const results = $('find-in-files-results');
+  if (!results) return;
+  const q = (searchPattern || '').trim();
+  const r = (replacement || '');
+  if (!q) {
+    toast('Search pattern is empty', 'error');
+    return;
+  }
+  const gen = ++searchGen;
+  results.textContent = 'Replacing…';
+  try {
+    const payload = { pattern: q, replacement: r };
+    if (scopePath) payload.path = scopePath;
+    const data = await wsRequest('fs_replace', payload);
+    if (gen !== searchGen) return;
+    if (data.replaced && data.replaced > 0) {
+      toast(`Replaced ${data.replaced} occurrence(s) in ${data.fileCount || '?'} file(s)`, 'success');
+      // Re-run the search to show updated results
+      runFindInFiles(searchPattern);
+    } else {
+      results.textContent = 'No matches to replace';
+    }
+  } catch (err) {
+    if (gen !== searchGen) return;
+    results.textContent = err.message;
+    toast(`Replace failed: ${err.message}`, 'error');
+  }
+}
+
 export function setupEditorUI() {
   $('btn-refresh-explorer')?.addEventListener('click', () => {
-    refreshExplorer().catch((e) => window.alert(e.message));
+    refreshExplorer().catch((e) => toast(e.message, 'error'));
   });
   $('btn-save-file')?.addEventListener('click', () => saveActive());
   $('btn-save-all')?.addEventListener('click', () => saveAll());
+  $('btn-undo')?.addEventListener('click', () => editorUndo());
+  $('btn-redo')?.addEventListener('click', () => editorRedo());
   $('btn-diff-layout')?.addEventListener('click', () => {
     GOGEN_UI.diffRenderSideBySide = !GOGEN_UI.diffRenderSideBySide;
     if (diffEditor) {
@@ -702,7 +941,175 @@ export function setupEditorUI() {
     const btn = $('btn-diff-layout');
     if (btn) btn.textContent = GOGEN_UI.diffRenderSideBySide ? 'Side-by-side' : 'Inline';
   });
+  const searchInput = $('find-in-files-input');
+  if (searchInput) {
+    searchInput.addEventListener('input', () => {
+      clearTimeout(searchDebounceTimer);
+      searchDebounceTimer = setTimeout(() => {
+        runFindInFiles(searchInput.value);
+      }, 250);
+    });
+    searchInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        clearTimeout(searchDebounceTimer);
+        runFindInFiles(searchInput.value);
+      }
+    });
+  }
+  // Keyboard shortcut: Ctrl+H opens the replace field
+  document.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'h') {
+      e.preventDefault();
+      if (e.shiftKey) {
+        // Ctrl+Shift+H: toggle sidebar replace row
+        const row = $('find-in-files-replace-row');
+        if (row) {
+          row.classList.toggle('open');
+          if (row.classList.contains('open')) {
+            $('find-in-files-replace-input')?.focus();
+          } else {
+            $('find-in-files-input')?.focus();
+          }
+        }
+      } else {
+        // Ctrl+H: open Monaco's built-in find/replace widget
+        if (editor) {
+          editor.getAction('editor.action.startFindReplaceAction').run();
+        }
+      }
+    }
+  });
+
+  // --- Replace toggle & preview modal ---
+
+  // Toggle replace row visibility
+  $('btn-toggle-replace')?.addEventListener('click', () => {
+    const row = $('find-in-files-replace-row');
+    if (!row) return;
+    row.classList.toggle('open');
+    if (row.classList.contains('open')) {
+      $('find-in-files-replace-input')?.focus();
+    }
+  });
+
+  /**
+   * Build the preview HTML for the replace modal.
+   * Highlights the search term inside each matching line.
+   */
+  function buildPreviewHTML(matches, search, replacement) {
+    // Group by file
+    const byFile = new Map();
+    for (const m of matches) {
+      if (!byFile.has(m.path)) byFile.set(m.path, []);
+      byFile.get(m.path).push(m);
+    }
+
+    let html = '';
+    for (const [file, fileMatches] of byFile) {
+      html += `<div class="rp-file-header">${escHTML(file)}</div>`;
+      for (const m of fileMatches) {
+        const line = m.text || '';
+        const highlighted = highlightMatch(line, search);
+        html += `<div class="rp-line">`
+          + `<span class="rp-line-num">${m.line}</span>`
+          + `<span class="rp-line-old">${highlighted}</span>`
+          + `<span class="rp-arrow">→</span>`
+          + `<span class="rp-line-new">${highlightMatch(line, search, replacement)}</span>`
+          + `</div>`;
+      }
+    }
+    return html;
+  }
+
+  /** Escape HTML entities. */
+  function escHTML(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  /**
+   * Highlight `search` inside `text`.
+   * If `replacement` is provided, show the replaced version instead.
+   */
+  function highlightMatch(text, search, replacement) {
+    // Split on search term (case-sensitive literal)
+    const parts = text.split(search);
+    const display = replacement !== undefined ? replacement : search;
+    const cls = replacement !== undefined ? 'rp-highlight' : 'rp-highlight';
+    return parts.map((p, i) => {
+      let out = escHTML(p);
+      if (i < parts.length - 1) {
+        out += `<span class="${cls}">${escHTML(display)}</span>`;
+      }
+      return out;
+    }).join('');
+  }
+
+  /**
+   * Show the replace preview modal.
+   * Returns a Promise that resolves to true (confirm) or false (cancel).
+   */
+  function showReplacePreview(matches, search, replacement, scopeLabel) {
+    return new Promise((resolve) => {
+      const overlay = $('replace-preview-overlay');
+      const summary = $('replace-preview-summary');
+      const body = $('replace-preview-body');
+      const confirmBtn = $('rp-confirm');
+      const cancelBtn = $('rp-cancel');
+      if (!overlay) { resolve(window.confirm(`Replace ${matches.length} occurrence(s)?`)); return; }
+
+      // Set summary
+      const fileCount = new Set(matches.map(m => m.path)).size;
+      summary.textContent = `${matches.length} occurrence(s) in ${fileCount} file(s)${scopeLabel ? ' — ' + scopeLabel : ''}`;
+      body.innerHTML = buildPreviewHTML(matches, search, replacement);
+      overlay.classList.add('active');
+
+      const cleanup = (result) => {
+        overlay.classList.remove('active');
+        confirmBtn.removeEventListener('click', onConfirm);
+        cancelBtn.removeEventListener('click', onCancel);
+        overlay.removeEventListener('click', onBackdrop);
+        resolve(result);
+      };
+      const onConfirm = () => cleanup(true);
+      const onCancel = () => cleanup(false);
+      const onBackdrop = (e) => { if (e.target === overlay) cleanup(false); };
+      confirmBtn.addEventListener('click', onConfirm);
+      cancelBtn.addEventListener('click', onCancel);
+      overlay.addEventListener('click', onBackdrop);
+    });
+  }
+
+  // Shared handler: search first, then show preview modal, then apply on confirm
+  async function handleReplace(scopePath, scopeLabel) {
+    const search = $('find-in-files-input')?.value || '';
+    const replacement = $('find-in-files-replace-input')?.value || '';
+    if (!search.trim()) { toast('Search pattern is empty', 'error'); return; }
+    try {
+      const data = await wsRequest('fs_search', { pattern: search, ...(scopePath ? { path: scopePath } : {}) });
+      const matches = data.matches || [];
+      if (!matches.length) { toast('No matches found', 'info'); return; }
+      const confirmed = await showReplacePreview(matches, search, replacement, scopeLabel);
+      if (confirmed) {
+        await runReplaceAll(search, replacement, scopePath);
+      }
+    } catch (err) {
+      toast(`Search failed: ${err.message}`, 'error');
+    }
+  }
+
+  $('btn-replace-one')?.addEventListener('click', () => {
+    if (!activePath) { toast('No file open', 'error'); return; }
+    handleReplace(activePath, `scope: ${activePath}`);
+  });
+  $('btn-replace-all')?.addEventListener('click', () => {
+    handleReplace(null, 'all files');
+  });
+
+  updateUndoRedoButtons();
 }
+
+export { saveAll, saveActive };
 
 // --- Chat tool-card Monaco helpers ---
 
@@ -825,8 +1232,12 @@ export function updateDiffEditor(ed, value) {
 /** Update fallback <pre> inside a monaco-tool-host (always kept in sync). */
 export function updateDiffFallback(container, value) {
   if (!container) return;
-  const pre = container.querySelector('.diff-fallback');
-  if (!pre) return;
+  let pre = container.querySelector('.diff-fallback');
+  if (!pre) {
+    pre = document.createElement('pre');
+    pre.className = 'diff-fallback';
+    container.appendChild(pre);
+  }
   // Colorize plain-text fallback so diffs stay readable if Monaco fails.
   const text = value || '';
   pre.textContent = '';

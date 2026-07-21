@@ -1,6 +1,8 @@
 package server
 
-import "context"
+import (
+	"context"
+)
 
 func (s *Server) handleFSReadMessage(ws *wsConn, ctx context.Context, msg WSMessage) {
 	reqID := msg.RequestID
@@ -24,6 +26,17 @@ func (s *Server) handleFSReadMessage(ws *wsConn, ctx context.Context, msg WSMess
 		} else {
 			resp.Success = true
 			resp.Content = content
+		}
+		_ = ws.writeJSON(resp)
+	case "fs_search":
+		matches, truncated, err := s.fsSearch(ctx, msg.Pattern, path, msg.Glob)
+		resp := WSMessage{Type: "fs_search_result", Path: path, RequestID: reqID, Pattern: msg.Pattern}
+		if err != nil {
+			resp.Error = err.Error()
+		} else {
+			resp.Success = true
+			resp.Matches = matches
+			resp.Truncated = truncated
 		}
 		_ = ws.writeJSON(resp)
 	case "git_status":
@@ -50,6 +63,17 @@ func (s *Server) handleFSReadMessage(ws *wsConn, ctx context.Context, msg WSMess
 			resp.Success = true
 			resp.Original = original
 			resp.Modified = modified
+		}
+		_ = ws.writeJSON(resp)
+	case "fs_replace":
+		replaced, fileCount, err := s.fsReplace(ctx, msg.Pattern, msg.Replacement, msg.Path, msg.Glob)
+		resp := WSMessage{Type: "fs_replace_result", Path: path, RequestID: reqID, Pattern: msg.Pattern}
+		if err != nil {
+			resp.Error = err.Error()
+		} else {
+			resp.Success = true
+			resp.Replaced = replaced
+			resp.FileCount = fileCount
 		}
 		_ = ws.writeJSON(resp)
 	}

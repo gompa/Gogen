@@ -25,18 +25,17 @@ func getCodec() (tokenizer.Codec, error) {
 }
 
 type tokenCacheEntry struct {
-	n  int
-	fp uint64 // fingerprint of role+content+tool metadata
+	n int
 }
 
-// tokenCache caches token counts by message pointer to avoid re-tokenizing
-// the same messages across multiple calls to EstimateTokens within a turn.
-// Entries are validated with a content fingerprint so GC address reuse and
-// in-place mutations cannot return stale counts.
+// tokenCache caches token counts by content fingerprint to avoid
+// re-tokenizing the same messages across multiple calls to EstimateTokens.
+// Keying by fingerprint (instead of pointer) means copies of the same
+// message — e.g. from ContextStats' defensive copy — hit the cache.
 //
 // The fingerprint is a 64-bit FNV-1a hash. A collision (two distinct message
-// bodies hashing identically while reusing the same pointer) would let a
-// stale count be served silently. With the ~birthday bound at 2^32 messages
+// bodies hashing identically) would let a stale count be served silently.
+// With the ~birthday bound at 2^32 messages
 // (far beyond any real session) and the cache only gating an *estimate* used
 // to decide compaction timing — never correctness of tool output — this trade
 // is acceptable. If the cache ever gated a correctness-critical decision,
@@ -44,11 +43,11 @@ type tokenCacheEntry struct {
 // seed) for defense-in-depth.
 //
 // Memory for entries of compacted/removed messages persists until
-// InvalidateTokenCache is called. That is intentional and fine: the map is
-// bounded by session size, and fingerprint checks prevent stale reads.
+// InvalidateTokenCache is called. That is intentional and fine: the map
+// is bounded by session size and entry counts are correct for their key.
 var tokenCache struct {
 	sync.RWMutex
-	m map[any]tokenCacheEntry
+	m map[uint64]tokenCacheEntry
 }
 
 // initTokenCache lazily initializes the token cache map.
@@ -56,20 +55,21 @@ func initTokenCache() {
 	tokenCache.Lock()
 	defer tokenCache.Unlock()
 	if tokenCache.m == nil {
-		tokenCache.m = make(map[any]tokenCacheEntry)
+		tokenCache.m = make(map[uint64]tokenCacheEntry)
 	}
 }
 
 // cachedTokenCount returns the cached token count for a message when the
 // fingerprint still matches.
 func cachedTokenCount(msg *llm.Message) (int, bool) {
+	fp := messageFingerprint(msg)
 	tokenCache.RLock()
 	defer tokenCache.RUnlock()
 	if tokenCache.m == nil {
 		return 0, false
 	}
-	e, ok := tokenCache.m[msg]
-	if !ok || e.fp != messageFingerprint(msg) {
+	e, ok := tokenCache.m[fp]
+	if !ok {
 		return 0, false
 	}
 	return e.n, true
@@ -78,8 +78,9 @@ func cachedTokenCount(msg *llm.Message) (int, bool) {
 // storeTokenCount caches the token count for a message.
 func storeTokenCount(msg *llm.Message, n int) {
 	initTokenCache()
+	fp := messageFingerprint(msg)
 	tokenCache.Lock()
-	tokenCache.m[msg] = tokenCacheEntry{n: n, fp: messageFingerprint(msg)}
+	tokenCache.m[fp] = tokenCacheEntry{n: n}
 	tokenCache.Unlock()
 }
 

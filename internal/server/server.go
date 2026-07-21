@@ -254,14 +254,21 @@ type WSMessage struct {
 	Sessions         []SessionEntry         `json:"sessions,omitempty"`
 	History          []HistoryEntry         `json:"history,omitempty"`
 	// Filesystem / git editor APIs
-	Path       string           `json:"path,omitempty"`
-	Language   string           `json:"language,omitempty"`
-	Error      string           `json:"error,omitempty"`
-	Entries    []FSEntry        `json:"entries,omitempty"`
-	GitEntries []GitStatusEntry `json:"gitEntries,omitempty"`
-	Original   string           `json:"original,omitempty"`
-	Modified   string           `json:"modified,omitempty"`
-	RequestID  string           `json:"requestId,omitempty"`
+	Path       string              `json:"path,omitempty"`
+	Pattern    string              `json:"pattern,omitempty"`
+	Glob       string              `json:"glob,omitempty"`
+	Language   string              `json:"language,omitempty"`
+	Error      string              `json:"error,omitempty"`
+	Entries    []FSEntry           `json:"entries,omitempty"`
+	GitEntries []GitStatusEntry    `json:"gitEntries,omitempty"`
+	Matches    []agent.SearchMatch `json:"matches,omitempty"`
+	Truncated  bool                `json:"truncated,omitempty"`
+	Original   string              `json:"original,omitempty"`
+	Modified   string              `json:"modified,omitempty"`
+	RequestID  string              `json:"requestId,omitempty"`
+	Replacement string             `json:"replacement,omitempty"`
+	Replaced   int                 `json:"replaced,omitempty"`
+	FileCount  int                 `json:"fileCount,omitempty"`
 }
 
 func NewServer(a *agent.Agent, cfg *config.Config) *Server {
@@ -337,6 +344,20 @@ func (s *Server) agentConfigMsg(ctx context.Context) WSMessage {
 	return msg
 }
 
+// agentConfigMsgBasic returns a config message without the expensive
+// context-stats computation.  Use this on initial WS connect so the
+// client receives config + history immediately; context stats follow
+// via a separate "context" message.
+func (s *Server) agentConfigMsgBasic() WSMessage {
+	return WSMessage{
+		Type:       "config",
+		WorkingDir: s.agent.Executor.WorkingDir,
+		Model:      s.agent.CurrentModel(),
+		Mode:       s.agent.Mode.String(),
+		SessionID:  s.agent.SessionID,
+	}
+}
+
 func sessionEntries(list []agent.SessionInfo, currentID string) []SessionEntry {
 	out := make([]SessionEntry, len(list))
 	for i, s := range list {
@@ -405,16 +426,15 @@ func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, resu
 			resp.Sessions = sessionEntries(result.Sessions, s.agent.SessionID)
 		}
 	}
-	// ContextStats may trigger a network call — compute outside any agentMu lock.
-	ctxMsg := s.contextMsg(ctx)
 	cfg := s.agentConfigMsg(ctx)
 	resp.SessionID = cfg.SessionID
 	resp.Mode = cfg.Mode
-	_ = ws.writeJSON(ctxMsg)
+	// Send history before context so the client can start painting immediately.
 	_ = ws.writeJSON(resp)
 	if len(result.History) > 0 {
 		_ = ws.writeJSON(WSMessage{Type: "history", History: historyEntries(result.History)})
 	}
+	_ = ws.writeJSON(s.contextMsg(ctx))
 	_ = ws.writeJSON(cfg)
 }
 
@@ -495,13 +515,23 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	s.agentMu.RLock()
-	cfgMsg := s.agentConfigMsg(r.Context())
 	msgs := append([]llm.Message(nil), s.agent.Messages...)
+	cfgMsg := s.agentConfigMsgBasic()
 	s.agentMu.RUnlock()
 	_ = ws.writeJSON(cfgMsg)
 	if len(msgs) > 0 {
 		_ = ws.writeJSON(WSMessage{Type: "history", History: historyEntries(msgs)})
 	}
+
+	// Compute context stats asynchronously so the client can start
+	// painting history immediately.  The context message arrives
+	// shortly after; the client already handles late context updates.
+	go func() {
+		s.agentMu.RLock()
+		ctxMsg := s.contextMsg(r.Context())
+		s.agentMu.RUnlock()
+		_ = ws.writeJSON(ctxMsg)
+	}()
 
 	incoming := make(chan WSMessage, 8)
 	go func() {
@@ -531,11 +561,69 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			// Already handled in the reader; keep for safety if ever enqueued.
 			session.completeApproval(msg.ApprovalID, msg.Approved)
 			continue
-		case "fs_list", "fs_read", "git_status", "git_file_diff":
+		case "fs_list", "fs_read", "fs_search", "git_status", "git_file_diff", "fs_replace":
 			s.handleFSReadMessage(ws, r.Context(), msg)
 			continue
 		case "fs_write":
 			s.handleFSWriteMessage(ws, msg)
+			continue
+		case "list_sessions":
+			_, sessions, err := s.agent.FormatSessionListForUI()
+			if err != nil {
+				_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", err)})
+				continue
+			}
+			_ = ws.writeJSON(WSMessage{
+				Type:      "sessions",
+				Sessions:  sessionEntries(sessions, s.agent.SessionID),
+				SessionID: s.agent.SessionID,
+			})
+			continue
+		case "session_new":
+			streamMu.Lock()
+			if streamCancel != nil {
+				streamCancel()
+				prevErr := streamErr
+				streamCancel = nil
+				streamErr = nil
+				streamMu.Unlock()
+				drainStreamErr(prevErr)
+			} else {
+				streamMu.Unlock()
+			}
+			if !s.tryAcquireTurn(wsTurnAcquireWait) {
+				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+				continue
+			}
+			result, _, err := s.agent.HandleSessionCommand(r.Context(), "/new", sesspkg.NewID())
+			s.writeSessionCommandResult(ws, r.Context(), result, err)
+			s.turnMu.Unlock()
+			continue
+		case "session_resume":
+			streamMu.Lock()
+			if streamCancel != nil {
+				streamCancel()
+				prevErr := streamErr
+				streamCancel = nil
+				streamErr = nil
+				streamMu.Unlock()
+				drainStreamErr(prevErr)
+			} else {
+				streamMu.Unlock()
+			}
+			if !s.tryAcquireTurn(wsTurnAcquireWait) {
+				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+				continue
+			}
+			id := strings.TrimSpace(msg.SessionID)
+			if id == "" {
+				s.turnMu.Unlock()
+				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: sessionId is required"})
+				continue
+			}
+			result, _, err := s.agent.HandleSessionCommand(r.Context(), "resume "+id, sesspkg.NewID())
+			s.writeSessionCommandResult(ws, r.Context(), result, err)
+			s.turnMu.Unlock()
 			continue
 		case "cancel":
 			streamMu.Lock()

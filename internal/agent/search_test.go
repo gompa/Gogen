@@ -9,6 +9,46 @@ import (
 	"testing"
 )
 
+func TestSplitSearchLine(t *testing.T) {
+	file, rest, ok := splitSearchLine("pkg/a.go:3:var Target = 1")
+	if !ok || file != "pkg/a.go" || rest != "3:var Target = 1" {
+		t.Fatalf("unexpected result: %q, %q, %v", file, rest, ok)
+	}
+	file, rest, ok = splitSearchLine("file:with:colons.txt:12:a:b:c")
+	if !ok || file != "file:with:colons.txt" || rest != "12:a:b:c" {
+		t.Fatalf("unexpected result: %q, %q, %v", file, rest, ok)
+	}
+	file, rest, ok = splitSearchLine("No matches found")
+	if ok {
+		t.Fatal("should reject non-match lines")
+	}
+}
+
+func TestSearchCodeMatches(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "hello.go"), []byte("package main\n\nfunc hello() {\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	executor := NewExecutor(dir)
+	matches, _, err := executor.SearchCodeMatches(context.Background(), "func hello", "", "*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) == 0 {
+		t.Fatal("expected at least one match")
+	}
+	found := false
+	for _, m := range matches {
+		if strings.Contains(m.Path, "hello.go") && strings.Contains(m.Text, "func hello") && m.Line > 0 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("unexpected matches: %+v", matches)
+	}
+}
+
 func TestSearchCodeRejectsDashPattern(t *testing.T) {
 	dir := t.TempDir()
 	executor := NewExecutor(dir)
@@ -72,7 +112,7 @@ func TestSearchCodeSubpath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "pkg/a.go:3:var Target = 1") {
+	if !strings.Contains(out, "pkg/a.go") || !strings.Contains(out, "3:var Target = 1") {
 		t.Fatalf("unexpected output: %q", out)
 	}
 }
