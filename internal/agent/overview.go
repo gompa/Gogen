@@ -47,7 +47,7 @@ func (e *Executor) RepoOverview() (string, error) {
 		if err != nil {
 			return nil
 		}
-		top := firstPathSegment(rel)
+		top := firstPathSegment(filepath.ToSlash(rel))
 		if top == "" {
 			// Root-level file
 			rootFiles = append(rootFiles, name)
