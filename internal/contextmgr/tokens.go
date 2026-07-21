@@ -1,9 +1,9 @@
 package contextmgr
 
 import (
-	"sort"
 	"fmt"
 	"hash/fnv"
+	"sort"
 	"sync"
 
 	"gogen/internal/llm"
@@ -88,7 +88,7 @@ func storeTokenCount(msg *llm.Message, n int) {
 // list is compacted, restored, or otherwise reassigned. Per-message content
 // mutations are caught by the fingerprint check inside cachedTokenCount, so
 // appending a new message to the slice does NOT require invalidation: the
-// existing entries' message pointers and fingerprints still match.
+// existing entries' fingerprints still match.
 func InvalidateTokenCache() {
 	tokenCache.Lock()
 	tokenCache.m = nil

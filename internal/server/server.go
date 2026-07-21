@@ -254,21 +254,21 @@ type WSMessage struct {
 	Sessions         []SessionEntry         `json:"sessions,omitempty"`
 	History          []HistoryEntry         `json:"history,omitempty"`
 	// Filesystem / git editor APIs
-	Path       string              `json:"path,omitempty"`
-	Pattern    string              `json:"pattern,omitempty"`
-	Glob       string              `json:"glob,omitempty"`
-	Language   string              `json:"language,omitempty"`
-	Error      string              `json:"error,omitempty"`
-	Entries    []FSEntry           `json:"entries,omitempty"`
-	GitEntries []GitStatusEntry    `json:"gitEntries,omitempty"`
-	Matches    []agent.SearchMatch `json:"matches,omitempty"`
-	Truncated  bool                `json:"truncated,omitempty"`
-	Original   string              `json:"original,omitempty"`
-	Modified   string              `json:"modified,omitempty"`
-	RequestID  string              `json:"requestId,omitempty"`
-	Replacement string             `json:"replacement,omitempty"`
-	Replaced   int                 `json:"replaced,omitempty"`
-	FileCount  int                 `json:"fileCount,omitempty"`
+	Path        string              `json:"path,omitempty"`
+	Pattern     string              `json:"pattern,omitempty"`
+	Glob        string              `json:"glob,omitempty"`
+	Language    string              `json:"language,omitempty"`
+	Error       string              `json:"error,omitempty"`
+	Entries     []FSEntry           `json:"entries,omitempty"`
+	GitEntries  []GitStatusEntry    `json:"gitEntries,omitempty"`
+	Matches     []agent.SearchMatch `json:"matches,omitempty"`
+	Truncated   bool                `json:"truncated,omitempty"`
+	Original    string              `json:"original,omitempty"`
+	Modified    string              `json:"modified,omitempty"`
+	RequestID   string              `json:"requestId,omitempty"`
+	Replacement string              `json:"replacement,omitempty"`
+	Replaced    int                 `json:"replaced,omitempty"`
+	FileCount   int                 `json:"fileCount,omitempty"`
 }
 
 func NewServer(a *agent.Agent, cfg *config.Config) *Server {
@@ -1032,7 +1032,10 @@ func (s *Server) checkAuth(r *http.Request) bool {
 	return false
 }
 
-func (s *Server) Start(addr string) error {
+// Start serves the web UI until ctx is cancelled or the listener fails.
+// On cancel it gracefully shuts down the HTTP server so callers can flush
+// session state (e.g. Ctrl+C / SIGTERM in --web mode).
+func (s *Server) Start(ctx context.Context, addr string) error {
 	if !isLoopbackBind(addr) {
 		if s.authToken == "" {
 			return fmt.Errorf("non-loopback bind %q requires GOGEN_WEB_TOKEN (or web_auth_token) for authentication", addr)
@@ -1045,10 +1048,35 @@ func (s *Server) Start(addr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", s.HandleWS)
 	mux.HandleFunc("/", s.HandleStatic)
-	if s.tlsCertFile != "" && s.tlsKeyFile != "" {
-		return http.ListenAndServeTLS(addr, s.tlsCertFile, s.tlsKeyFile, mux)
+	srv := &http.Server{Addr: addr, Handler: mux}
+
+	errCh := make(chan error, 1)
+	go func() {
+		var err error
+		if s.tlsCertFile != "" && s.tlsKeyFile != "" {
+			err = srv.ListenAndServeTLS(s.tlsCertFile, s.tlsKeyFile)
+		} else {
+			err = srv.ListenAndServe()
+		}
+		errCh <- err
+	}()
+
+	select {
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+		err := <-errCh
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case err := <-errCh:
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
 	}
-	return http.ListenAndServe(addr, mux)
 }
 
 func isLoopbackBind(addr string) bool {

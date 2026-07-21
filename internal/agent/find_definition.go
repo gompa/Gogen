@@ -58,31 +58,33 @@ func (e *Executor) FindDefinition(ctx context.Context, symbol, subpath, glob str
 
 // findDefinitionText performs text-based search for symbol definitions.
 func (e *Executor) findDefinitionText(ctx context.Context, subpath, glob, symbol string) ([]string, error) {
-	patterns := []string{
-		`(?m)\bfunc\s+` + regexp.QuoteMeta(symbol) + `\s*\(`,
-		`(?m)\bfunc\s*\([^)]*\)\s+` + regexp.QuoteMeta(symbol) + `\s*\(`,
-		`(?m)\btype\s+` + regexp.QuoteMeta(symbol) + `\s+(struct|interface|func|type)`,
-		`(?m)\bvar\s+` + regexp.QuoteMeta(symbol) + `\b`,
-		`(?m)\bconst\s+` + regexp.QuoteMeta(symbol) + `\b`,
-		`(?m)\blet\s+` + regexp.QuoteMeta(symbol) + `\b`,
-		`(?m)\bclass\s+` + regexp.QuoteMeta(symbol) + `\b`,
-		`(?m)\bdef\s+` + regexp.QuoteMeta(symbol) + `\s*\(`,
+	// Combine all definition patterns into a single alternation to avoid
+	// spawning ripgrep (or walking the tree) 8 separate times.
+	q := regexp.QuoteMeta(symbol)
+	pattern := `(?m)(?:` +
+		`\bfunc\s+` + q + `\s*\(` + `|` +
+		`\bfunc\s*\([^)]*\)\s+` + q + `\s*\(` + `|` +
+		`\btype\s+` + q + `\s+(struct|interface|func|type)` + `|` +
+		`\bvar\s+` + q + `\b` + `|` +
+		`\bconst\s+` + q + `\b` + `|` +
+		`\blet\s+` + q + `\b` + `|` +
+		`\bclass\s+` + q + `\b` + `|` +
+		`\bdef\s+` + q + `\s*\(` +
+		`)`
+
+	out, err := e.SearchCode(ctx, pattern, subpath, glob, 0)
+	if err != nil {
+		return nil, err
+	}
+	if strings.HasPrefix(out, "No matches") {
+		return nil, nil
 	}
 
 	var allDefs []string
-	for _, pattern := range patterns {
-		out, err := e.SearchCode(ctx, pattern, subpath, glob, 0)
-		if err != nil {
-			continue
-		}
-		if strings.HasPrefix(out, "No matches") {
-			continue
-		}
-		lines := strings.Split(out, "\n")
-		for _, line := range lines {
-			if strings.Contains(line, symbol) {
-				allDefs = append(allDefs, line)
-			}
+	lines := strings.Split(out, "\n")
+	for _, line := range lines {
+		if strings.Contains(line, symbol) {
+			allDefs = append(allDefs, line)
 		}
 		if len(allDefs) >= 20 {
 			break
@@ -150,7 +152,7 @@ func (e *Executor) findDefinitionAST(ctx context.Context, searchRoot, relPrefix,
 			return nil
 		}
 		for _, def := range defList {
-			if strings.EqualFold(def.Name, symbol) {
+			if def.Name == symbol {
 				defs = append(defs, fmt.Sprintf("%s:%d (%s)", rel, def.Line, def.Kind))
 				if len(defs) >= 20 {
 					return nil

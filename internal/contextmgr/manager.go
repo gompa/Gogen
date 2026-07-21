@@ -168,6 +168,8 @@ func (m *Manager) compactBudget() int {
 }
 
 // ShouldCompact reports whether messages exceed the compaction threshold.
+// Relies on EstimateTokens' per-message fingerprint cache; do not stash a
+// sticky total here — it goes stale when messages are appended across turns.
 func (m *Manager) ShouldCompact(messages []llm.Message) bool {
 	if len(messages) <= m.Settings.KeepRecentMessages+1 {
 		return false

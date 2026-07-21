@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"gogen/internal/debuglog"
 
@@ -17,7 +19,10 @@ import (
 
 const (
 	openCodeZenBaseURL = "https://opencode.ai/zen/v1/"
-	openCodeGoBaseURL = "https://opencode.ai/zen/go/v1/"
+	openCodeGoBaseURL  = "https://opencode.ai/zen/go/v1/"
+	// modelsCacheTTL avoids repeated full catalog fetches during startup
+	// (ValidateRestoredModel → ListModels + ModelContextLimit) and /models flows.
+	modelsCacheTTL = 60 * time.Second
 )
 
 // isOpencodeURL reports whether baseURL points to an OpenCode endpoint that
@@ -27,48 +32,142 @@ func isOpencodeURL(baseURL string) bool {
 }
 
 type OpenAIProvider struct {
-	client      openai.Client            // primary (user-configured; fallback for non-OpenCode)
-	zenClient   *openai.Client           // OpenCode Zen endpoint
-	goClient    *openai.Client           // OpenCode Go endpoint
+	client      openai.Client             // primary (user-configured; fallback for non-OpenCode)
+	zenClient   *openai.Client            // OpenCode Zen endpoint
+	goClient    *openai.Client            // OpenCode Go endpoint
 	model       string
 	modelClient map[string]*openai.Client // model ID → client routing
 	// promptCacheKey scopes provider-side prompt caching (defaults to none).
 	promptCacheKey param.Opt[string]
+
+	modelsMu       sync.Mutex
+	modelsCache    []openai.Model
+	modelsCachedAt time.Time // zero means no successful cache entry
+	modelsFetch    *modelsFetch
+}
+
+type modelsFetch struct {
+	done   chan struct{}
+	models []openai.Model
+	err    error
 }
 
 func (p *OpenAIProvider) ModelName() string {
 	return p.model
 }
 
-func (p *OpenAIProvider) listModels(ctx context.Context) ([]openai.Model, error) {
-	p.modelClient = make(map[string]*openai.Client)
-	var models []openai.Model
-	var errs []error
+func (p *OpenAIProvider) cachedModelsLocked() ([]openai.Model, bool) {
+	if p.modelsCachedAt.IsZero() || time.Since(p.modelsCachedAt) >= modelsCacheTTL {
+		return nil, false
+	}
+	return p.modelsCache, true
+}
 
-	query := func(c *openai.Client) {
+func (p *OpenAIProvider) listModels(ctx context.Context) ([]openai.Model, error) {
+	p.modelsMu.Lock()
+	if models, ok := p.cachedModelsLocked(); ok {
+		out := append([]openai.Model(nil), models...)
+		p.modelsMu.Unlock()
+		return out, nil
+	}
+	if f := p.modelsFetch; f != nil {
+		p.modelsMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-f.done:
+			if f.err != nil {
+				return nil, f.err
+			}
+			return append([]openai.Model(nil), f.models...), nil
+		}
+	}
+	f := &modelsFetch{done: make(chan struct{})}
+	p.modelsFetch = f
+	p.modelsMu.Unlock()
+
+	models, routing, err := p.fetchModels(ctx)
+
+	p.modelsMu.Lock()
+	f.models, f.err = models, err
+	if err == nil {
+		p.modelsCache = models
+		p.modelsCachedAt = time.Now()
+		if routing != nil {
+			p.modelClient = routing
+		}
+	}
+	p.modelsFetch = nil
+	close(f.done)
+	p.modelsMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return append([]openai.Model(nil), models...), nil
+}
+
+// fetchModels loads the model catalog from the provider. OpenCode zen and go
+// endpoints are queried in parallel.
+func (p *OpenAIProvider) fetchModels(ctx context.Context) ([]openai.Model, map[string]*openai.Client, error) {
+	type result struct {
+		models  []openai.Model
+		routing map[string]*openai.Client
+		err     error
+	}
+	query := func(c *openai.Client) result {
+		var models []openai.Model
+		routing := make(map[string]*openai.Client)
 		pager := c.Models.ListAutoPaging(ctx)
 		for pager.Next() {
 			m := pager.Current()
 			models = append(models, m)
-			p.modelClient[m.ID] = c
+			routing[m.ID] = c
 		}
-		if err := pager.Err(); err != nil {
-			errs = append(errs, err)
-		}
+		return result{models: models, routing: routing, err: pager.Err()}
 	}
 
 	if p.zenClient != nil && p.goClient != nil {
-		// OpenCode: query both endpoints independently.
-		query(p.zenClient)
-		query(p.goClient)
-	} else {
-		// Non-OpenCode: just the primary client.
-		query(&p.client)
+		var zenRes, goRes result
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			zenRes = query(p.zenClient)
+		}()
+		go func() {
+			defer wg.Done()
+			goRes = query(p.goClient)
+		}()
+		wg.Wait()
+
+		routing := make(map[string]*openai.Client, len(zenRes.routing)+len(goRes.routing))
+		models := make([]openai.Model, 0, len(zenRes.models)+len(goRes.models))
+		models = append(models, zenRes.models...)
+		for id, c := range zenRes.routing {
+			routing[id] = c
+		}
+		models = append(models, goRes.models...)
+		for id, c := range goRes.routing {
+			routing[id] = c
+		}
+		var errs []error
+		if zenRes.err != nil {
+			errs = append(errs, zenRes.err)
+		}
+		if goRes.err != nil {
+			errs = append(errs, goRes.err)
+		}
+		if len(models) == 0 && len(errs) > 0 {
+			return nil, nil, errors.Join(errs...)
+		}
+		return models, routing, nil
 	}
-	if len(models) == 0 && len(errs) > 0 {
-		return nil, errors.Join(errs...)
+
+	res := query(&p.client)
+	if len(res.models) == 0 && res.err != nil {
+		return nil, nil, res.err
 	}
-	return models, nil
+	return res.models, res.routing, nil
 }
 
 func NewOpenAIProvider(apiKey string, model string, baseURL string) *OpenAIProvider {
@@ -118,30 +217,48 @@ func (p *OpenAIProvider) SetPromptCacheKey(key string) {
 // the lookup is cheap; otherwise it does a one-time discovery probe against
 // both endpoints to populate the cache.
 func (p *OpenAIProvider) clientForModel() *openai.Client {
+	p.modelsMu.Lock()
 	if p.modelClient == nil {
 		p.modelClient = make(map[string]*openai.Client)
 	}
 	if c, ok := p.modelClient[p.model]; ok {
+		p.modelsMu.Unlock()
 		return c
 	}
+	model := p.model
+	p.modelsMu.Unlock()
+
 	// Discovery: probe Zen first, then Go (deterministic order).
+	// Do not hold modelsMu across network I/O.
+	var chosen *openai.Client
 	if p.zenClient != nil {
-		_, err := p.zenClient.Models.Get(context.Background(), p.model)
+		_, err := p.zenClient.Models.Get(context.Background(), model)
 		if err == nil {
-			p.modelClient[p.model] = p.zenClient
-			return p.zenClient
+			chosen = p.zenClient
 		}
 	}
-	if p.goClient != nil {
-		_, err := p.goClient.Models.Get(context.Background(), p.model)
+	if chosen == nil && p.goClient != nil {
+		_, err := p.goClient.Models.Get(context.Background(), model)
 		if err == nil {
-			p.modelClient[p.model] = p.goClient
-			return p.goClient
+			chosen = p.goClient
 		}
 	}
-	// Fallback to primary.
-	p.modelClient[p.model] = &p.client
-	return &p.client
+	if chosen == nil {
+		chosen = &p.client
+	}
+
+	p.modelsMu.Lock()
+	if p.modelClient == nil {
+		p.modelClient = make(map[string]*openai.Client)
+	}
+	// Another goroutine may have filled this in while we were probing.
+	if c, ok := p.modelClient[model]; ok {
+		p.modelsMu.Unlock()
+		return c
+	}
+	p.modelClient[model] = chosen
+	p.modelsMu.Unlock()
+	return chosen
 }
 
 func toolsToOpenAI(tools []Tool, allowed map[string]struct{}) []openai.ChatCompletionToolParam {

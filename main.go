@@ -185,10 +185,14 @@ func main() {
 		}
 	}()
 
-	// Only catch SIGTERM for program-level shutdown. SIGINT is handled
-	// per-turn inside the CLI so a single Ctrl+C does not ruin the session.
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
+	// Catch SIGTERM and SIGINT for program-level shutdown. In TUI mode
+	// SIGINT is also handled per-turn (cancel vs quit); cancelling this
+	// context on a second Ctrl+C / quit path is harmless. In web mode,
+	// Start watches ctx so Ctrl+C shuts the HTTP server down cleanly and
+	// the deferred FlushSession runs.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+	defer a.FlushSession()
 
 	if *webFlag {
 		s := server.NewServer(a, cfg)
@@ -204,24 +208,25 @@ func main() {
 		}
 		// Listen first so the UI can connect immediately. Provider model
 		// validation and context-limit lookup continue in the background.
-		done := make(chan struct{})
+		errCh := make(chan error, 1)
 		go func() {
-			if err := s.Start(addr); err != nil {
-				log.Printf("web server error: %v", err)
-			}
-			close(done)
+			errCh <- s.Start(ctx, addr)
 		}()
 		initMCP()
 		go func() {
 			a.ValidateRestoredModel(context.Background(), restoredModel)
 			cfg.OpenAIModel = provider.ModelName()
 		}()
-		<-done
+		if err := <-errCh; err != nil {
+			log.Printf("web server error: %v", err)
+		}
 		return
 	}
 
 	initMCP()
-	a.ValidateRestoredModel(context.Background(), restoredModel)
+	// Provider model validation and context-limit lookup continue in the
+	// background so the TUI can open immediately (same as web mode).
+	go a.ValidateRestoredModel(context.Background(), restoredModel)
 	// Default: TUI mode.
 	c := tui.New(a, cfg)
 	c.Run(ctx)

@@ -46,6 +46,18 @@ func mergeToolCallDelta(
 	}
 
 	if mapIdx, ok := tcIndexMap[tcIdx]; ok {
+		// Some servers reuse index 0 for every sequential tool call. A new
+		// non-empty ID means a distinct call — do not append onto the prior one.
+		if tc.ID != "" && tcAccums[mapIdx].ID != "" && tc.ID != tcAccums[mapIdx].ID {
+			tcIndexMap[tcIdx] = len(tcAccums)
+			tcAccums = append(tcAccums, tcAccum{
+				Index:   tcIdx,
+				ID:      tc.ID,
+				Name:    tc.Function.Name,
+				ArgsStr: tc.Function.Arguments,
+			})
+			return tcAccums, len(tcAccums) - 1
+		}
 		return applyToolCallDelta(tcAccums, mapIdx, tc)
 	}
 
@@ -68,9 +80,38 @@ func applyToolCallDelta(tcAccums []tcAccum, idx int, tc openai.ChatCompletionChu
 		acc.Name = tc.Function.Name
 	}
 	if tc.Function.Arguments != "" {
-		acc.ArgsStr += tc.Function.Arguments
+		acc.ArgsStr = mergeToolArgsDelta(acc.ArgsStr, tc.Function.Arguments)
 	}
 	return tcAccums, idx
+}
+
+// mergeToolArgsDelta combines streamed argument fragments.
+// Providers may send true deltas, cumulative snapshots, or full-object replays;
+// naive concatenation of the latter two yields "invalid character '{' ..." errors.
+func mergeToolArgsDelta(existing, delta string) string {
+	if delta == "" {
+		return existing
+	}
+	if existing == "" {
+		return delta
+	}
+	// Cumulative snapshot: each chunk re-sends args from the start.
+	if strings.HasPrefix(delta, existing) {
+		return delta
+	}
+	// Exact replay of the same fragment/object.
+	if delta == existing {
+		return existing
+	}
+	// Already-complete JSON followed by another object start — ignore the replay
+	// (common when servers re-emit the finished arguments blob).
+	if toolArgsFullyReceived(existing) {
+		trimmed := strings.TrimSpace(delta)
+		if trimmed == strings.TrimSpace(existing) || strings.HasPrefix(trimmed, "{") {
+			return existing
+		}
+	}
+	return existing + delta
 }
 
 func parseToolCallArgs(argsStr string) (map[string]interface{}, error) {
@@ -80,13 +121,18 @@ func parseToolCallArgs(argsStr string) (map[string]interface{}, error) {
 	}
 	var args map[string]interface{}
 	err := json.Unmarshal([]byte(s), &args)
-	if err != nil {
-		return nil, err
+	if err == nil {
+		if args == nil {
+			return map[string]interface{}{}, nil
+		}
+		return args, nil
 	}
-	if args == nil {
-		return map[string]interface{}{}, nil
+	// Recovery for duplicated complete objects: {"a":1}{"a":1}
+	dec := json.NewDecoder(strings.NewReader(s))
+	if decErr := dec.Decode(&args); decErr == nil && args != nil {
+		return args, nil
 	}
-	return args, nil
+	return nil, err
 }
 
 // toolArgsFullyReceived reports whether streamed tool arguments form complete JSON.

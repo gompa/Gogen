@@ -14,6 +14,10 @@ import (
 	"gogen/internal/projectfile"
 )
 
+// persistMinInterval is the minimum time between debounced session writes.
+// Final boundaries (turn complete, errors) bypass this via flushSession().
+const persistMinInterval = 5 * time.Second
+
 type Agent struct {
 	Provider llm.LLMProvider
 	Executor *Executor
@@ -31,6 +35,11 @@ type Agent struct {
 	UsageAccum     UsageAccumulator
 	lastTurnUsage  *llm.Usage
 	lastPersistErr error
+	// sessionDirty tracks whether in-memory state differs from disk.
+	// All session persistence methods (persistSession, FlushSession, doPersist)
+	// are called exclusively from the agent's owner goroutine, so no mutex is needed.
+	sessionDirty     bool
+	lastPersistTime  time.Time // timestamp of last actual disk write
 
 	// Runtime / project
 	WorkingDir        string
@@ -117,13 +126,44 @@ func (a *Agent) llmTools() []llm.Tool {
 	return tools
 }
 
+// persistSession marks the session dirty and writes to disk only if the
+// minimum interval since the last write has elapsed.  This coalesces
+// rapid-fire saves during multi-tool turns into at most one write per
+// persistMinInterval.  For final boundaries (turn complete, errors,
+// context cancellation) use flushSession instead.
 func (a *Agent) persistSession() {
+	a.sessionDirty = true
 	if a.SessionStore == nil || a.SessionID == "" {
 		return
 	}
-	// Detect before save so even early persists (e.g. right after a user
-	// message, before prepareMessages) store a sticky profile for resume.
+	// Skip if debounced — no point computing hash or doing I/O.
+	if !a.lastPersistTime.IsZero() && time.Since(a.lastPersistTime) < persistMinInterval {
+		return
+	}
+	a.doPersist()
+}
+
+// FlushSession forces an immediate disk write regardless of debounce timing.
+// Use at final boundaries: turn complete, errors, context cancellation, and quit.
+func (a *Agent) FlushSession() {
+	a.sessionDirty = true
+	if a.SessionStore == nil || a.SessionID == "" {
+		return
+	}
+	a.doPersist()
+}
+
+// doPersist is the actual write — called by persistSession/flushSession.
+// Callers (persistSession, FlushSession) already validate SessionStore/SessionID;
+// this method only checks the dirty flag.
+func (a *Agent) doPersist() {
+	// Skip if nothing changed since the last save.
+	if !a.sessionDirty {
+		return
+	}
 	profile := a.ensureProjectProfile()
+	// Only copy messages now that we know we'll write.
+	msgs := append([]llm.Message(nil), a.Messages...)
 	if err := a.SessionStore.Save(a.SessionID, SessionSnapshot{
 		WorkingDir:     a.WorkingDir,
 		Model:          a.CurrentModel(),
@@ -131,13 +171,15 @@ func (a *Agent) persistSession() {
 		Label:          a.SessionLabel,
 		ProjectProfile: profile,
 		Todos:          todoSnapshot(a.TodoManager),
-		Messages:       append([]llm.Message(nil), a.Messages...),
+		Messages:       msgs,
 	}); err != nil {
 		log.Printf("session save failed (id=%s): %v", a.SessionID, err)
 		a.lastPersistErr = err
 		return
 	}
 	a.lastPersistErr = nil
+	a.lastPersistTime = time.Now()
+	a.sessionDirty = false
 }
 
 // ConsumePersistError returns and clears the last session save failure, if any.
@@ -157,7 +199,7 @@ func (a *Agent) SetWorkingDir(dir string) {
 	if a.TodoManager != nil {
 		a.TodoManager.SetWorkingDir(dir)
 	}
-	a.persistSession()
+	a.FlushSession()
 }
 
 func todoSnapshot(m *TodoManager) *TodoList {
@@ -181,7 +223,7 @@ func (a *Agent) ImportLegacyTodos() bool {
 // otherwise to the legacy project-level todos file.
 func (a *Agent) persistTodos() {
 	if a.SessionStore != nil && a.SessionID != "" {
-		a.persistSession()
+		a.FlushSession()
 		return
 	}
 	if a.TodoManager != nil {
@@ -313,11 +355,11 @@ func (a *Agent) appendToolResult(tc llm.ToolCall, result string) {
 func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.StreamHandlers) (string, error) {
 	a.Messages = append(a.Messages, llm.Message{Role: "user", Content: input})
 	// Persist immediately so a failed/cancelled turn does not drop the user message.
-	a.persistSession()
+	a.FlushSession()
 
 	if err := a.requireModelSelected(ctx); err != nil {
 		a.Messages = a.Messages[:len(a.Messages)-1]
-		a.persistSession()
+		a.FlushSession()
 		return "", err
 	}
 
@@ -328,7 +370,7 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 	for first := true; ; first = false {
 		if ctx.Err() != nil {
 			finishStreamUI(h)
-			a.persistSession()
+			a.FlushSession()
 			return "", ctx.Err()
 		}
 		view := a.prepareMessages(ctx)
@@ -342,7 +384,7 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 		result, err := a.Provider.GenerateResponseStream(ctx, view, a.AllowedToolNames(), a.llmTools(), h)
 		if err != nil {
 			finishStreamUI(h)
-			a.persistSession()
+			a.FlushSession()
 			return "", err
 		}
 		a.recordTurnUsage(result.Usage)
@@ -351,14 +393,14 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 		if len(result.ToolCalls) == 0 && result.Content != "" {
 			finishStreamUI(h)
 			a.Messages = append(a.Messages, llm.Message{Role: "assistant", Content: result.Content, Reasoning: result.Reasoning})
-			a.persistSession()
+			a.FlushSession()
 			return result.Content, nil
 		}
 
 		if len(result.ToolCalls) == 0 && result.Content == "" {
 			finishStreamUI(h)
 			a.Messages = append(a.Messages, llm.Message{Role: "assistant", Content: "", Reasoning: result.Reasoning})
-			a.persistSession()
+			a.FlushSession()
 			return "", nil
 		}
 
@@ -384,7 +426,7 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 				// Preserve a valid tool-call/result protocol for the next turn.
 				a.appendCanceledToolResults(result.ToolCalls[i:], ctx.Err())
 				finishStreamUI(h)
-				a.persistSession()
+				a.FlushSession()
 				return "", ctx.Err()
 			}
 			if h.OnToolCall != nil {
@@ -406,7 +448,7 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 				a.appendToolResult(tc, res)
 				a.appendCanceledToolResults(result.ToolCalls[i+1:], ctx.Err())
 				finishStreamUI(h)
-				a.persistSession()
+				a.FlushSession()
 				return "", ctx.Err()
 			}
 			success := errTool == nil

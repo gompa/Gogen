@@ -54,9 +54,11 @@ func (e *Executor) MultiEdit(ctx context.Context, pattern, search, replace strin
 			continue
 		}
 
+		// Compute the result content (needed for NewCount in both paths)
+		newContent := strings.ReplaceAll(content, search, replace)
+
 		if !dryRun {
 			// Apply the replacement
-			newContent := strings.ReplaceAll(content, search, replace)
 			if err := e.WriteFile(file, newContent); err != nil {
 				continue
 			}
@@ -66,7 +68,7 @@ func (e *Executor) MultiEdit(ctx context.Context, pattern, search, replace strin
 		changes = append(changes, FileChange{
 			Path:     file,
 			OldCount: oldCount,
-			NewCount: strings.Count(replace, search),
+			NewCount: strings.Count(newContent, search),
 		})
 		totalChanges += oldCount
 	}

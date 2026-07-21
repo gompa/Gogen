@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -410,13 +411,24 @@ func scanFileSinglePass(path, relPath string, re *regexp.Regexp, contextLines, m
 	return out, nil
 }
 
+// binaryProbePool reuses 8KB buffers for binary-file detection to avoid
+// allocating a new buffer on every file walked during search.
+var binaryProbePool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, searchBinaryProbe)
+		return &b
+	},
+}
+
 func isBinaryFile(path string) bool {
 	f, err := os.Open(path)
 	if err != nil {
 		return true
 	}
 	defer f.Close()
-	buf := make([]byte, searchBinaryProbe)
+	bp := binaryProbePool.Get().(*[]byte)
+	defer binaryProbePool.Put(bp)
+	buf := *bp
 	n, _ := f.Read(buf)
 	for i := 0; i < n; i++ {
 		if buf[i] == 0 {

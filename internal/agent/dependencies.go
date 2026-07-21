@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -122,12 +121,9 @@ func (e *Executor) findIndirectDependents(ctx context.Context, directDependents 
 	indirect := make(map[string]bool)
 
 	for _, dep := range directDependents {
-		// Extract filename without extension
-		fileName := filepath.Base(dep)
-		nameWithoutExt := strings.TrimSuffix(fileName, filepath.Ext(fileName))
-
-		// Search for references to this file
-		pattern := regexp.QuoteMeta(nameWithoutExt)
+		// Search for references to the relative path (e.g. "internal/agent/utils").
+		// This is more precise than searching for just the filename stem.
+		pattern := regexp.QuoteMeta(dep)
 		results, err := e.SearchCode(ctx, pattern, subpath, "", 0)
 		if err != nil {
 			continue

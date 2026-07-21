@@ -18,6 +18,10 @@ type SymbolRef struct {
 	Content string // Line content
 }
 
+// ErrNoResults is returned by ASTFallback.Run() when both AST and text search
+// fail to produce results.
+var ErrNoResults = errors.New("no results found in AST or text search")
+
 // ASTFallback is a generic helper that tries AST-based search first,
 // then falls back to text-based search if AST returns no results.
 // This eliminates code duplication across rename, call_graph, dependencies,
@@ -37,7 +41,11 @@ func (a *ASTFallback[T]) Run() (T, error) {
 	// AST failed or returned no results, try text fallback
 	textResult, textErr := a.TextFunc()
 	if textErr != nil {
-		return result, err // Return original error if text also fails
+		// Both paths failed. Return the more informative error.
+		if err != nil {
+			return result, err
+		}
+		return result, fmt.Errorf("%w: %v", ErrNoResults, textErr)
 	}
 	return textResult, nil
 }

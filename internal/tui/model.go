@@ -453,7 +453,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.streamCancel()
 			}
 			m.dismissApproval(false)
-			m.quitting = true
+			m.flushAndQuit()
 			return m, tea.Quit
 		}
 
@@ -1232,6 +1232,15 @@ func (m *Model) refreshContextStats() {
 	stats := m.agent.ContextStats(ctx)
 	m.contextStats = stats
 	m.contextLine = agent.FormatContextBrief(stats)
+}
+
+// flushAndQuit forces a final session write before the program exits.
+// Without this, the 5 s debounce could drop the last few seconds of state.
+func (m *Model) flushAndQuit() {
+	m.quitting = true
+	if m.agent != nil {
+		m.agent.FlushSession()
+	}
 }
 
 // checkPersistError surfaces any pending session-save error in the status

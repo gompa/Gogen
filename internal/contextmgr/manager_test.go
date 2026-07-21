@@ -83,6 +83,31 @@ func TestShouldCompactWhenOverBudget(t *testing.T) {
 	}
 }
 
+// Regression: a prior ShouldCompact call must not freeze the decision when
+// the message list later grows past the compaction budget.
+func TestShouldCompactSeesGrowthAcrossCalls(t *testing.T) {
+	InvalidateTokenCache()
+	m := NewManager(&stubProvider{}, Settings{
+		ContextLimit:         8000,
+		CompactThreshold:     0.5,
+		KeepRecentMessages:   2,
+		MaxToolResultBytes:   8192,
+		CompactReserveTokens: 0,
+	})
+	msgs := []llm.Message{{Role: "system", Content: "sys"}}
+	for i := 0; i < 6; i++ {
+		msgs = append(msgs, llm.Message{Role: "user", Content: "u"})
+		msgs = append(msgs, llm.Message{Role: "assistant", Content: "a"})
+	}
+	if m.ShouldCompact(msgs) {
+		t.Fatal("expected under budget initially")
+	}
+	msgs = append(msgs, llm.Message{Role: "user", Content: strings.Repeat("word ", 20000)})
+	if !m.ShouldCompact(msgs) {
+		t.Fatal("expected ShouldCompact to see growth after appending a large message")
+	}
+}
+
 func TestCompactPreservesHeadAndTail(t *testing.T) {
 	provider := &stubProvider{summary: "did auth work"}
 	m := NewManager(provider, Settings{KeepRecentMessages: 2})
@@ -135,7 +160,6 @@ func TestEnsureToolResultsCappedSticky(t *testing.T) {
 		t.Fatal("sticky capped content was lost")
 	}
 }
-
 
 func TestSnapshot(t *testing.T) {
 	m := NewManager(&stubProvider{}, Settings{

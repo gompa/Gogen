@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -34,9 +33,11 @@ type file struct {
 
 // Store persists sessions under .gogen/sessions/.
 type Store struct {
-	enabled    bool
-	maxCount   int
-	maxAgeDays int
+	enabled      bool
+	maxCount     int
+	maxAgeDays   int
+	createdCache map[string]time.Time // sessionID → Created timestamp (avoids re-read)
+	saveCount    int                  // counter for periodic pruning
 }
 
 // StoreOptions configures retention for persisted sessions.
@@ -60,7 +61,7 @@ func NewStoreWithOptions(enabled bool, opts StoreOptions) *Store {
 	if maxAge <= 0 {
 		maxAge = 30
 	}
-	return &Store{enabled: enabled, maxCount: maxCount, maxAgeDays: maxAge}
+	return &Store{enabled: enabled, maxCount: maxCount, maxAgeDays: maxAge, createdCache: make(map[string]time.Time)}
 }
 
 func (s *Store) dir(workingDir string) string {
@@ -87,19 +88,21 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 	if err := ensureUnderSessionsDir(snap.WorkingDir, path); err != nil {
 		return err
 	}
-	existing := file{Created: time.Now().UTC()}
-	if data, err := os.ReadFile(path); err == nil {
+	created := time.Now().UTC()
+	if cached, ok := s.createdCache[id]; ok {
+		created = cached
+	} else if data, err := os.ReadFile(path); err == nil {
+		// Cache miss (e.g. first save after process restart before Load):
+		// preserve Created from the existing file instead of resetting it.
 		var prev file
-		if err := json.Unmarshal(data, &prev); err != nil {
-			log.Printf("session save: ignoring corrupt session file %s: %v", path, err)
-		} else if !prev.Created.IsZero() {
-			existing.Created = prev.Created
+		if err := json.Unmarshal(data, &prev); err == nil && !prev.Created.IsZero() {
+			created = prev.Created
 		}
 	}
 	out := file{
 		Version:        version,
 		ID:             id,
-		Created:        existing.Created,
+		Created:        created,
 		Updated:        time.Now().UTC(),
 		WorkingDir:     snap.WorkingDir,
 		Model:          snap.Model,
@@ -109,14 +112,19 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 		Todos:          snap.Todos,
 		Messages:       snap.Messages,
 	}
-	data, err := json.MarshalIndent(out, "", "  ")
+	data, err := json.Marshal(out)
 	if err != nil {
 		return err
 	}
 	if err := writeFileAtomic(path, data, 0o600); err != nil {
 		return err
 	}
-	s.prune(snap.WorkingDir, id)
+	s.createdCache[id] = created
+	s.saveCount++
+	// Prune every 3 saves to avoid repeated directory scans on every write.
+	if s.saveCount%3 == 0 {
+		s.prune(snap.WorkingDir, id)
+	}
 	return nil
 }
 
@@ -139,6 +147,9 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 	var f file
 	if err := json.Unmarshal(data, &f); err != nil {
 		return agent.SessionSnapshot{}, err
+	}
+	if s != nil && !f.Created.IsZero() {
+		s.createdCache[id] = f.Created
 	}
 	return agent.SessionSnapshot{
 		WorkingDir:     f.WorkingDir,
@@ -244,6 +255,7 @@ func (s *Store) Delete(workingDir, id string) error {
 		}
 		return err
 	}
+	delete(s.createdCache, id)
 	return nil
 }
 
@@ -279,9 +291,9 @@ func ensureUnderSessionsDir(workingDir, path string) error {
 	return nil
 }
 
-// writeFileAtomic is a convenience wrapper around ioutil.WriteFileAtomic.
+// writeFileAtomic is a convenience wrapper around ioutil.WriteFileAtomicNoSync.
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
-	return ioutil.WriteFileAtomic(path, data, perm)
+	return ioutil.WriteFileAtomicNoSync(path, data, perm)
 }
 
 func sessionLabel(messages []llm.Message, label string) string {

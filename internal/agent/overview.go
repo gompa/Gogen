@@ -20,35 +20,50 @@ func (e *Executor) RepoOverview() (string, error) {
 		return "", err
 	}
 
-	entries, err := os.ReadDir(searchRoot)
+	// Single walk: count files per top-level directory in one pass instead
+	// of calling countRepoFiles (which does its own WalkDir) per directory.
+	dirCounts := make(map[string]int) // top-level dir name → file count
+	var rootFiles []string
+	total := 0
+
+	err = filepath.WalkDir(searchRoot, func(walkPath string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if walkPath == searchRoot {
+			return nil
+		}
+		name := d.Name()
+		if d.IsDir() {
+			if shouldSkipSearchEntry(name, true) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if shouldSkipSearchEntry(name, false) {
+			return nil
+		}
+		rel, err := filepath.Rel(searchRoot, walkPath)
+		if err != nil {
+			return nil
+		}
+		top := firstPathSegment(rel)
+		if top == "" {
+			// Root-level file
+			rootFiles = append(rootFiles, name)
+		} else {
+			dirCounts[top]++
+		}
+		total++
+		return nil
+	})
 	if err != nil {
 		return "", err
 	}
 
 	var dirs []dirCount
-	var rootFiles []string
-	total := 0
-
-	for _, entry := range entries {
-		name := entry.Name()
-		path := filepath.Join(searchRoot, name)
-		if entry.IsDir() {
-			if shouldSkipSearchEntry(name, true) {
-				continue
-			}
-			n, err := countRepoFiles(path)
-			if err != nil {
-				return "", fmt.Errorf("%s: %w", name, err)
-			}
-			if n == 0 {
-				continue
-			}
-			dirs = append(dirs, dirCount{name: name + "/", files: n})
-			total += n
-			continue
-		}
-		rootFiles = append(rootFiles, name)
-		total++
+	for name, count := range dirCounts {
+		dirs = append(dirs, dirCount{name: name + "/", files: count})
 	}
 
 	sort.Slice(dirs, func(i, j int) bool {
@@ -93,6 +108,15 @@ func (e *Executor) RepoOverview() (string, error) {
 	}
 
 	return strings.TrimRight(b.String(), "\n"), nil
+}
+
+// firstPathSegment returns the first component of a slash-separated path.
+func firstPathSegment(rel string) string {
+	if i := strings.IndexByte(rel, '/'); i >= 0 {
+		return rel[:i]
+	}
+	// No slash = root-level entry (already handled by caller).
+	return ""
 }
 
 func countRepoFiles(root string) (int, error) {

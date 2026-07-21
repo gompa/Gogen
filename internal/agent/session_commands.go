@@ -115,12 +115,12 @@ func (a *Agent) startNewSession(newID string) (string, error) {
 	}
 	oldID := a.SessionID
 	if a.SessionStore != nil {
-		a.persistSession()
+		a.FlushSession()
 	}
 	a.SessionID = newID
 	a.resetSessionState()
 	if a.SessionStore != nil {
-		a.persistSession()
+		a.FlushSession()
 		if oldID != "" {
 			return fmt.Sprintf("New session %s. Previous session %s saved — use `resume %s` to restore.",
 				newID, oldID, oldID), nil
@@ -196,7 +196,7 @@ func (a *Agent) deleteSessionByID(ctx context.Context, id, newSessionID string) 
 		}
 		a.SessionID = newSessionID
 		a.resetSessionState()
-		a.persistSession()
+		a.FlushSession()
 		out := fmt.Sprintf("Deleted session %s (was current — started new session %s).", id, newSessionID)
 		return AppendContextBrief(ctx, a, out), SessionActionClearChat, nil
 	}

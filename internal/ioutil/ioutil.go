@@ -12,9 +12,23 @@ import (
 // WriteFileAtomic writes content to a file atomically using a temp file + rename.
 // It creates parent directories as needed, preserves existing file permissions
 // when overwriting, and handles unsupported chmod gracefully on some filesystems.
+// The temp file is fsynced before rename for crash safety.
 func WriteFileAtomic(path string, content []byte, perm os.FileMode) error {
+	return writeFileSync(path, content, perm, false)
+}
+
+// WriteFileAtomicNoSync is like WriteFileAtomic but skips fsync to reduce
+// SSD wear.  Use only for session files where durability is less critical
+// and writes are frequent.
+func WriteFileAtomicNoSync(path string, content []byte, perm os.FileMode) error {
+	return writeFileSync(path, content, perm, true)
+}
+
+// writeFileSync is the shared implementation. When skipFSync is true the
+// temp file is not fsynced before rename (trades durability for less SSD wear).
+func writeFileSync(path string, content []byte, perm os.FileMode, skipFSync bool) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 	// Preserve the existing file mode when overwriting, so execute bits
@@ -53,9 +67,11 @@ func WriteFileAtomic(path string, content []byte, perm os.FileMode) error {
 		_ = tmp.Close()
 		return err
 	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
+	if !skipFSync {
+		if err := tmp.Sync(); err != nil {
+			_ = tmp.Close()
+			return err
+		}
 	}
 	if err := tmp.Close(); err != nil {
 		return err

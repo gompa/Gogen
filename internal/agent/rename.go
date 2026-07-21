@@ -90,6 +90,7 @@ func (e *Executor) renameWithAST(ctx context.Context, searchRoot, relPrefix, glo
 		}
 
 		// Apply renames
+		re := regexp.MustCompile(`\b` + regexp.QuoteMeta(oldName) + `\b`)
 		newContent := string(content)
 		var linesChanged []int
 
@@ -98,8 +99,7 @@ func (e *Executor) renameWithAST(ctx context.Context, searchRoot, relPrefix, glo
 			lines := strings.Split(newContent, "\n")
 			if ref.Line-1 < len(lines) {
 				oldLine := lines[ref.Line-1]
-				// Use word-boundary replacement to avoid partial matches
-				re := regexp.MustCompile(`\b` + regexp.QuoteMeta(oldName) + `\b`)
+				// Use word-boundary replacement (re compiled above)
 				lines[ref.Line-1] = re.ReplaceAllString(oldLine, newName)
 				newContent = strings.Join(lines, "\n")
 				linesChanged = append(linesChanged, ref.Line)

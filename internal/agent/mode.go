@@ -85,7 +85,7 @@ func (m Mode) AllowsTool(name string) bool {
 
 func (a *Agent) SetMode(m Mode) {
 	a.Mode = m
-	a.persistSession()
+	a.FlushSession()
 }
 
 func (a *Agent) checkPlanMode(toolName string) error {

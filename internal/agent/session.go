@@ -119,6 +119,6 @@ func sameWorkingDir(snapDir, currentDir string) bool {
 // RenameSession sets a user-visible label for the current session and persists it.
 func (a *Agent) RenameSession(label string) (string, error) {
 	a.SessionLabel = label
-	a.persistSession()
+	a.FlushSession()
 	return "Session label set to " + label, nil
 }

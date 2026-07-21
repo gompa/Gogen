@@ -120,3 +120,55 @@ func TestMergeToolCallDeltaArgsContinuationMissingIndex(t *testing.T) {
 		t.Fatalf("first tool polluted: %q", accums[0].ArgsStr)
 	}
 }
+
+func TestMergeToolArgsDeltaCumulativeAndReplay(t *testing.T) {
+	t.Parallel()
+
+	// Cumulative snapshots (not deltas): each chunk re-sends from the start.
+	got := mergeToolArgsDelta(`{"path"`, `{"path":"x.go"}`)
+	if got != `{"path":"x.go"}` {
+		t.Fatalf("cumulative: got %q", got)
+	}
+
+	// Full-object replay after complete JSON → "invalid character '{' after top-level value"
+	got = mergeToolArgsDelta(`{"pattern":"foo"}`, `{"pattern":"foo"}`)
+	if got != `{"pattern":"foo"}` {
+		t.Fatalf("replay: got %q", got)
+	}
+
+	// True delta still concatenates.
+	got = mergeToolArgsDelta(`{"path":"`, `x.go"}`)
+	if got != `{"path":"x.go"}` {
+		t.Fatalf("delta: got %q", got)
+	}
+}
+
+func TestMergeToolCallDeltaNewIDReusesIndex(t *testing.T) {
+	t.Parallel()
+	m := make(map[int]int)
+	var accums []tcAccum
+
+	accums, _ = mergeToolCallDelta(deltaTool(0, "a", "search_code", `{"pattern":"foo"}`), accums, m)
+	accums, _ = mergeToolCallDelta(deltaTool(0, "b", "read_file", `{"path":"x.go"}`), accums, m)
+
+	if len(accums) != 2 {
+		t.Fatalf("got %d accums, want 2", len(accums))
+	}
+	if accums[0].ArgsStr != `{"pattern":"foo"}` {
+		t.Fatalf("first polluted: %q", accums[0].ArgsStr)
+	}
+	if accums[1].Name != "read_file" || accums[1].ArgsStr != `{"path":"x.go"}` {
+		t.Fatalf("second = %#v", accums[1])
+	}
+}
+
+func TestParseToolCallArgsRecoversDuplicatedJSON(t *testing.T) {
+	t.Parallel()
+	args, err := parseToolCallArgs(`{"path":"x.go"}{"path":"x.go"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if args["path"] != "x.go" {
+		t.Fatalf("got %#v", args)
+	}
+}

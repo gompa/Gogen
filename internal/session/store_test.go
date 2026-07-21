@@ -1,6 +1,7 @@
 package session
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -66,5 +67,51 @@ func TestLatestIDUsesUpdatedNotMtime(t *testing.T) {
 	}
 	if got != "newer" {
 		t.Fatalf("LatestID=%q want %q (should use Updated, not mtime)", got, "newer")
+	}
+}
+
+func TestSavePreservesCreatedOnCacheMiss(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(true)
+	id := "created-preserve"
+	if err := store.Save(id, agent.SessionSnapshot{
+		WorkingDir: dir,
+		Messages:   []llm.Message{{Role: "user", Content: "hi"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, ".gogen", "sessions", id+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var first file
+	if err := json.Unmarshal(data, &first); err != nil {
+		t.Fatal(err)
+	}
+	if first.Created.IsZero() {
+		t.Fatal("expected Created to be set")
+	}
+
+	// New store instance = empty createdCache (simulates process restart
+	// without Load). Save must still keep the original Created.
+	time.Sleep(5 * time.Millisecond)
+	store2 := NewStore(true)
+	if err := store2.Save(id, agent.SessionSnapshot{
+		WorkingDir: dir,
+		Messages:   []llm.Message{{Role: "user", Content: "hi again"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var second file
+	if err := json.Unmarshal(data, &second); err != nil {
+		t.Fatal(err)
+	}
+	if !second.Created.Equal(first.Created) {
+		t.Fatalf("Created reset on cache miss: first=%v second=%v", first.Created, second.Created)
 	}
 }

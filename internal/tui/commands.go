@@ -25,7 +25,7 @@ func (m *Model) dispatchCommand(input string) (bool, bool, tea.Cmd) {
 
 	// exit
 	if trimmed == "exit" || trimmed == "/exit" || trimmed == "quit" || trimmed == "/quit" {
-		// Session saving happens automatically via the agent
+		m.flushAndQuit()
 		return true, true, tea.Quit
 	}
 

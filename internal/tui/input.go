@@ -36,7 +36,7 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.appendChatLine(SystemStyle.Render("Cancelled."))
 			return m, m.refocusInput()
 		}
-		m.quitting = true
+		m.flushAndQuit()
 		return m, tea.Quit
 	}
 
@@ -168,7 +168,7 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.streamCancel()
 			}
 			m.dismissApproval(false)
-			m.quitting = true
+			m.flushAndQuit()
 			return m, tea.Quit
 		}
 	}
@@ -209,7 +209,7 @@ func (m *Model) handleViewportKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// Stay on viewport focus; blink restarts when returning to input.
 			return m, nil
 		}
-		m.quitting = true
+		m.flushAndQuit()
 		return m, tea.Quit
 	}
 

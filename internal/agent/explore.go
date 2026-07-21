@@ -53,24 +53,24 @@ func gitPath() (string, bool) {
 
 // globRegexCache caches compiled regexes for glob patterns containing **,
 // avoiding recompilation for every file during WalkDir. The cache lives for
-// the lifetime of the process and is bounded: when it exceeds
-// globRegexCacheMax entries the whole map is dropped under the cache mutex.
-// The map is never reassigned (unlike a previous sync.Map-based design that
-// swapped the variable itself, which raced with concurrent readers/writers
-// and could discard their stores).
+// the lifetime of the process. When the cache exceeds globRegexCacheMax
+// entries, the oldest entry (by insertion order) is evicted rather than
+// dropping the entire map. This avoids cache thrashing under burst queries.
 const globRegexCacheMax = 100
 
-// globRegexCache is a package-level, mutex-guarded map. It must only be
-// touched via globRegexCacheGet/Store (which take globRegexMu).
+// globRegexCache is a package-level, mutex-guarded map of compiled regexes.
 var (
 	globRegexMu    sync.Mutex
 	globRegexCache = make(map[string]*regexp.Regexp)
+	// globRegexOrder tracks insertion order for FIFO eviction.
+	globRegexOrder []string
 )
 
-// resetGlobRegexCacheLocked clears the glob regex cache. Caller must hold
-// globRegexMu.
+// resetGlobRegexCacheLocked clears the glob regex cache and insertion-order
+// slice. Caller must hold globRegexMu. Exposed for tests only.
 func resetGlobRegexCacheLocked() {
 	globRegexCache = make(map[string]*regexp.Regexp)
+	globRegexOrder = globRegexOrder[:0]
 }
 
 // ListFiles lists directory entries. When recursive is true, walks the tree (max 500 paths).
@@ -317,14 +317,19 @@ func matchGlobRegex(pattern, path string) bool {
 	reParts = append(reParts, "$")
 	reStr := strings.Join(reParts, "")
 	re = regexp.MustCompile(reStr)
-	// Insert under the lock. If this insert pushes us over the cap, clear the
-	// whole cache (under the same lock, so no concurrent stores are lost and
-	// the cap bound holds) and re-insert the current entry into the fresh map.
+	// Insert under the lock. If this insert pushes us over the cap, evict
+	// the oldest entry (by insertion order) rather than clearing the entire
+	// map. This avoids cache thrashing when many distinct patterns are used
+	// in quick succession.
 	globRegexMu.Lock()
-	globRegexCache[pattern] = re
-	if len(globRegexCache) > globRegexCacheMax {
-		resetGlobRegexCacheLocked()
+	if _, ok := globRegexCache[pattern]; !ok {
+		if len(globRegexCache) >= globRegexCacheMax && len(globRegexOrder) > 0 {
+			victim := globRegexOrder[0]
+			globRegexOrder = globRegexOrder[1:]
+			delete(globRegexCache, victim)
+		}
 		globRegexCache[pattern] = re
+		globRegexOrder = append(globRegexOrder, pattern)
 	}
 	globRegexMu.Unlock()
 	return re.MatchString(path)
