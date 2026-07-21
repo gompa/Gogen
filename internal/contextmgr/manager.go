@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"gogen/internal/llm"
 )
@@ -35,6 +36,7 @@ func DefaultSettings() Settings {
 type Manager struct {
 	Settings           Settings
 	Provider           llm.LLMProvider
+	mu                 sync.RWMutex
 	limitResolved      bool
 	manualContextLimit int
 }
@@ -65,6 +67,8 @@ func NewManager(provider llm.LLMProvider, settings Settings) *Manager {
 
 // RefreshAfterModelChange updates the context limit for the newly selected model.
 func (m *Manager) RefreshAfterModelChange(ctx context.Context) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.manualContextLimit > 0 {
 		m.Settings.ContextLimit = m.manualContextLimit
 		m.limitResolved = true
@@ -72,13 +76,19 @@ func (m *Manager) RefreshAfterModelChange(ctx context.Context) {
 	}
 	m.Settings.ContextLimit = 0
 	m.limitResolved = false
-	m.EnsureContextLimit(ctx)
+	m.ensureContextLimitLocked(ctx)
 }
 
 // EnsureContextLimit resolves ContextLimit from the provider when not set explicitly.
 // A positive Settings.ContextLimit from GOGEN_CONTEXT_LIMIT is a manual override and
 // skips provider lookup; RefreshAfterModelChange preserves that override.
 func (m *Manager) EnsureContextLimit(ctx context.Context) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureContextLimitLocked(ctx)
+}
+
+func (m *Manager) ensureContextLimitLocked(ctx context.Context) {
 	if m.Settings.ContextLimit > 0 && m.limitResolved {
 		return
 	}
@@ -95,11 +105,20 @@ func (m *Manager) EnsureContextLimit(ctx context.Context) {
 	m.limitResolved = true
 }
 
+// ContextLimit returns the resolved context window size.
+func (m *Manager) ContextLimit() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.Settings.ContextLimit
+}
+
 const toolResultTruncationMarker = "\n… truncated ("
 
 // TruncateToolResult caps tool output stored in canonical history / LLM views.
 func (m *Manager) TruncateToolResult(content string) string {
+	m.mu.RLock()
 	max := m.Settings.MaxToolResultBytes
+	m.mu.RUnlock()
 	if max <= 0 || len(content) <= max {
 		return content
 	}
@@ -123,13 +142,15 @@ type ContextSnapshot struct {
 
 // Snapshot estimates token usage for canonical history and the LLM view.
 func (m *Manager) Snapshot(canonical, llmView []llm.Message) ContextSnapshot {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	limit := m.Settings.ContextLimit
 	if limit <= 0 {
 		limit = 128000
 	}
 	used := m.EstimateTokens(llmView)
 	stored := m.EstimateTokens(canonical)
-	compactAt := m.compactBudget()
+	compactAt := m.compactBudgetLocked()
 	snap := ContextSnapshot{
 		Limit:         limit,
 		Used:          used,
@@ -155,6 +176,12 @@ func hasTruncatedToolResults(messages []llm.Message) bool {
 }
 
 func (m *Manager) compactBudget() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.compactBudgetLocked()
+}
+
+func (m *Manager) compactBudgetLocked() int {
 	limit := m.Settings.ContextLimit
 	if limit <= 0 {
 		limit = 128000

@@ -30,7 +30,7 @@ func (a *Agent) ContextLimit() int {
 	if a.Context == nil {
 		return 0
 	}
-	return a.Context.Settings.ContextLimit
+	return a.Context.ContextLimit()
 }
 
 func (a *Agent) ListModels(ctx context.Context) ([]llm.ModelInfo, error) {

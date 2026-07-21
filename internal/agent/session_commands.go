@@ -150,7 +150,6 @@ func (a *Agent) resumeSessionByID(ctx context.Context, id string) (string, error
 	// Persist immediately so the resumed session gets a fresh UpdatedAt
 	// timestamp and appears at the top of the session sidebar list.
 	a.FlushSession()
-	go a.ValidateRestoredModel(context.Background(), model)
 	label := llm.SessionLabel(snap.Messages, llm.DefaultSessionLabelMaxLen)
 	var out string
 	if label != "" {
@@ -158,7 +157,11 @@ func (a *Agent) resumeSessionByID(ctx context.Context, id string) (string, error
 	} else {
 		out = fmt.Sprintf("Resumed session %s (%d messages).", id, len(snap.Messages))
 	}
-	return AppendContextBrief(ctx, a, out), nil
+	// Build the context brief before background model validation so we don't
+	// race Snapshot against RefreshAfterModelChange.
+	out = AppendContextBrief(ctx, a, out)
+	go a.ValidateRestoredModel(context.Background(), model)
+	return out, nil
 }
 
 func (a *Agent) resumeLatestSession(ctx context.Context) (string, error) {
