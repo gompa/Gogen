@@ -112,7 +112,15 @@
             margin: 14px 0;
         }
         #chat-container { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg); }
-        #messages { flex: 1; overflow-y: auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 10px; }
+        #messages {
+            flex: 1;
+            overflow-y: auto;
+            overflow-anchor: none; /* we manage stickiness; browser anchoring fights user scroll-away */
+            padding: 16px 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
         #messages > * { flex-shrink: 0; }
         #input-area {
             padding: 12px 16px;
@@ -1248,7 +1256,7 @@
             </div>
             <div id="chat-container">
                 <button type="button" id="sidebar-toggle" title="Toggle sidebar">☰</button>
-                <div id="messages"></div>
+                <div id="messages" tabindex="-1"></div>
                 <button type="button" id="scroll-bottom-btn">↓ New messages</button>
                 <div id="input-area">
                     <div id="input-wrap">
@@ -1693,6 +1701,7 @@
         function clearChat() {
             disposeChatEditors();
             messagesDiv.innerHTML = '';
+            stickToBottom = true;
             if (streamRenderTimer) {
                 clearTimeout(streamRenderTimer);
                 streamRenderTimer = null;
@@ -1708,6 +1717,10 @@
         let pendingSessionResponse = false;
         let ws;
         let reconnectTimer;
+        // Sticky auto-scroll. Cleared immediately on user scroll-up; re-enabled
+        // only when the user returns near the bottom (or clicks the jump button).
+        let stickToBottom = true;
+        let ignoreScrollEvent = false;
         let currentStreamDiv = null;
         let currentStreamRaw = '';
         let streamRenderTimer = null;
@@ -1941,7 +1954,7 @@
                 messageRawStore.set(msgDiv, text);
             }
             messagesDiv.appendChild(msgDiv);
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            smartScroll();
             return msgDiv;
         }
 
@@ -1954,6 +1967,8 @@
             const keepCursor = currentStreamDiv.classList.contains('cursor');
             setMessageMarkdown(currentStreamDiv, currentStreamRaw);
             if (keepCursor) currentStreamDiv.classList.add('cursor');
+            // Scroll after DOM height actually changes (tokens arrive before paint).
+            smartScroll();
         }
 
         function scheduleStreamRender() {
@@ -1972,7 +1987,7 @@
             const msgDiv = document.createElement('div');
             msgDiv.className = 'message assistant cursor md';
             messagesDiv.appendChild(msgDiv);
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            smartScroll();
             currentStreamDiv = msgDiv;
             currentStreamRaw = '';
         }
@@ -1982,7 +1997,7 @@
             currentStreamRaw += token;
             bumpContextEstimate(token);
             scheduleStreamRender();
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            smartScroll();
         }
 
         function showThinking() {
@@ -1998,7 +2013,7 @@
             div.appendChild(span);
             div.appendChild(close);
             messagesDiv.appendChild(div);
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            smartScroll();
             currentThinkingDiv = div;
             currentThinkingSpan = span;
         }
@@ -2012,7 +2027,7 @@
             }
             currentThinkingSpan.textContent += token;
             bumpContextEstimate(token);
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            smartScroll();
         }
 
         function removeThinkingStatus() {
@@ -2193,7 +2208,7 @@
             }
 
             messagesDiv.appendChild(card);
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            smartScroll();
 
             header.addEventListener('click', () => {
                 const collapsed = toggle.classList.toggle('collapsed');
@@ -2311,7 +2326,7 @@
                 // Compact non-diff keys in the header once JSON is parseable.
                 const compact = formatArgsCompact(cardInfo.rawArgs);
                 if (compact) cardInfo.toolArgs.textContent = compact;
-                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                smartScroll();
                 return;
             }
 
@@ -2327,7 +2342,7 @@
                 // Keep a short placeholder instead of dumping raw JSON.
                 cardInfo.argsStream.textContent = '…';
             }
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            smartScroll();
         }
 
         function finalizeStreamingToolCard(index, id, name, args) {
@@ -2409,10 +2424,12 @@
                 card.appendChild(body);
             }
 
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            smartScroll();
         }
 
         async function replayHistory(history) {
+            // Session/history loads should always land at the bottom.
+            stickToBottom = true;
             historyToolCallArgs = {};
             for (const h of history) {
                 if (h.role === 'user') {
@@ -2428,7 +2445,7 @@
                         close.textContent = '</thinking>';
                         div.append(open, document.createTextNode(h.reasoning), close);
                         messagesDiv.appendChild(div);
-                        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                        smartScroll();
                     }
                     if (h.content) appendMessage('assistant', h.content);
                     if (Array.isArray(h.toolCalls)) {
@@ -2463,6 +2480,7 @@
                     await updateToolCardWithResult(cardInfo, h.content || '', success, false, cardInfo.toolName);
                 }
             }
+            pinToBottom();
         }
 
         function connect() {
@@ -2496,7 +2514,7 @@
                     div.className = 'message assistant thinking';
                     div.textContent = 'thinking...';
                     messagesDiv.appendChild(div);
-                    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                    smartScroll();
                 } else if (data.type === 'waiting') {
                     setTurnActive(true);
                     removeThinkingStatus();
@@ -2508,7 +2526,7 @@
                         messagesDiv.appendChild(el);
                     }
                     el.textContent = 'waiting for model...';
-                    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                    smartScroll();
                 } else if (data.type === 'thinking_token') {
                     setTurnActive(true);
                     const w = document.getElementById('status-waiting');
@@ -2675,6 +2693,7 @@
                 abortInFlightUI(null);
             }
             hideSlashSuggest();
+            stickToBottom = true;
             appendMessage('user', text);
             streamingToolCards = {};
             pendingToolCards = {};
@@ -3025,20 +3044,76 @@
 
         // === Task 3: Scroll-to-bottom button ===
         const scrollBottomBtn = document.getElementById('scroll-bottom-btn');
+        const NEAR_BOTTOM_PX = 32;
+
+        function distanceFromBottom() {
+            return messagesDiv.scrollHeight - messagesDiv.scrollTop - messagesDiv.clientHeight;
+        }
+
+        function updateScrollBottomBtn() {
+            scrollBottomBtn.classList.toggle('visible', !stickToBottom || distanceFromBottom() > NEAR_BOTTOM_PX);
+        }
+
+        function unpinFromBottom() {
+            if (!stickToBottom) return;
+            stickToBottom = false;
+            updateScrollBottomBtn();
+        }
+
+        function pinToBottom() {
+            stickToBottom = true;
+            ignoreScrollEvent = true;
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            requestAnimationFrame(() => { ignoreScrollEvent = false; });
+            scrollBottomBtn.classList.remove('visible');
+        }
+
+        // Unpin as soon as the user scrolls up — don't wait for >120px distance,
+        // or streaming smartScroll will yank them back before they escape.
+        messagesDiv.addEventListener('wheel', (e) => {
+            if (e.deltaY < 0) unpinFromBottom();
+        }, { passive: true });
+        messagesDiv.addEventListener('touchstart', () => {
+            // Touch scroll direction is known on touchmove; mark intent on any
+            // touch interaction away from bottom after move.
+            messagesDiv._touchY = null;
+        }, { passive: true });
+        messagesDiv.addEventListener('touchmove', (e) => {
+            const y = e.touches[0]?.clientY;
+            if (y == null) return;
+            if (messagesDiv._touchY != null && y > messagesDiv._touchY + 2) {
+                // Finger moved down → content scrolls up
+                unpinFromBottom();
+            }
+            messagesDiv._touchY = y;
+        }, { passive: true });
+        messagesDiv.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowUp' || e.key === 'PageUp' || e.key === 'Home') unpinFromBottom();
+        });
+
         messagesDiv.addEventListener('scroll', () => {
-            const threshold = 120;
-            const atBottom = messagesDiv.scrollHeight - messagesDiv.scrollTop - messagesDiv.clientHeight < threshold;
-            scrollBottomBtn.classList.toggle('visible', !atBottom);
+            if (ignoreScrollEvent) return;
+            const d = distanceFromBottom();
+            if (d > NEAR_BOTTOM_PX) {
+                // Clearly away from bottom (scrollbar drag, etc.)
+                stickToBottom = false;
+            } else if (d <= 8) {
+                // Truly back at the bottom — re-enable follow
+                stickToBottom = true;
+            }
+            // 8 < d <= NEAR_BOTTOM_PX: leave stickToBottom alone so a small
+            // upward scroll after wheel-unpin is not immediately re-pinned.
+            scrollBottomBtn.classList.toggle('visible', !stickToBottom);
         });
         scrollBottomBtn.addEventListener('click', () => {
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;
-            scrollBottomBtn.classList.remove('visible');
+            pinToBottom();
         });
-        // Auto-scroll helper that respects user scroll position
+        // Auto-scroll only while stickToBottom is set (user hasn't scrolled away).
         function smartScroll() {
-            const threshold = 120;
-            const atBottom = messagesDiv.scrollHeight - messagesDiv.scrollTop - messagesDiv.clientHeight < threshold;
-            if (atBottom) messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            if (!stickToBottom) return;
+            ignoreScrollEvent = true;
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            requestAnimationFrame(() => { ignoreScrollEvent = false; });
         }
 
         // === Task 4: Collapsible sidebar toggle ===

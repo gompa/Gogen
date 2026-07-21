@@ -770,6 +770,10 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 						})
 					},
 					OnToolCallArgsDelta: func(index int, id, name, argsDelta string) {
+						// Flush pending thinking/content tokens before
+						// tool call args reach the client, so the web UI
+						// renders the thinking block before the tool card.
+						tokens.flush()
 						write(WSMessage{
 							Type:       "tool_call_delta",
 							Tool:       name,

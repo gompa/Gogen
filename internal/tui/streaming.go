@@ -113,7 +113,6 @@ func (b *tokenBatcher) flush() {
 }
 
 func (b *tokenBatcher) flushLocked() {
-	b.closed = false // timer-fired flush: batch is empty, safe to reopen
 	for _, seg := range b.segs {
 		if seg.text == "" {
 			continue
@@ -208,6 +207,11 @@ func (s *StreamAdapter) Handlers() *llm.StreamHandlers {
 			s.program.Send(streamRoundEndMsg{})
 		},
 		OnToolCallStart: func(index int, id, name string) {
+			// Flush any pending thinking/content tokens before tool calls
+			// reach the TUI.  Without this, batched thinking tokens can
+			// arrive after the tool call message and get silently dropped
+			// by handleStreamThinking's post-tool-call guard.
+			batch.flush()
 			s.program.Send(streamToolCallMsg{index: index, id: id, name: name})
 		},
 		OnToolCallArgsDelta: func(index int, id, name, argsDelta string) {
