@@ -129,7 +129,7 @@ func TestHandleSessionCommandResumeLatest(t *testing.T) {
 		"older":   {Messages: []llm.Message{{Role: "user", Content: "older task"}}},
 	}}
 	store.order = []string{"older", "current"}
-	a := &Agent{WorkingDir: "/tmp", SessionStore: store, SessionID: "current", Messages: []llm.Message{{Role: "user", Content: "current"}}}
+	a := &Agent{Provider: &statsStubProvider{}, WorkingDir: "/tmp", SessionStore: store, SessionID: "current", Messages: []llm.Message{{Role: "user", Content: "current"}}}
 
 	result, handled, err := a.HandleSessionCommand(context.Background(), "resume latest", "")
 	if err != nil || !handled {
@@ -148,7 +148,7 @@ func TestHandleSessionCommandResumeByID(t *testing.T) {
 		"abc": {Messages: []llm.Message{{Role: "user", Content: "restore me"}}, Mode: "plan"},
 	}}
 	store.order = []string{"abc"}
-	a := &Agent{WorkingDir: "/tmp", SessionStore: store, SessionID: "other"}
+	a := &Agent{Provider: &statsStubProvider{}, WorkingDir: "/tmp", SessionStore: store, SessionID: "other"}
 
 	_, handled, err := a.HandleSessionCommand(context.Background(), "resume abc", "")
 	if err != nil || !handled {

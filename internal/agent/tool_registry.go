@@ -132,7 +132,8 @@ func handleReadFile(_ context.Context, a *Agent, args map[string]interface{}) (s
 		return "", err
 	}
 	search, _ := stringArgOptional(args, "search")
-	return a.Executor.ReadFileRange(path, offset, limit, search)
+	lineNumbers, _ := boolArgOptional(args, "line_numbers")
+	return a.Executor.ReadFileRange(path, offset, limit, search, lineNumbers)
 }
 
 func handleReadFiles(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {

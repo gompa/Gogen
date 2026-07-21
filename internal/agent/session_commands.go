@@ -147,6 +147,9 @@ func (a *Agent) resumeSessionByID(ctx context.Context, id string) (string, error
 	model := snap.Model
 	a.RestoreSessionLocal(snap)
 	a.SessionID = id
+	// Persist immediately so the resumed session gets a fresh UpdatedAt
+	// timestamp and appears at the top of the session sidebar list.
+	a.FlushSession()
 	go a.ValidateRestoredModel(context.Background(), model)
 	label := llm.SessionLabel(snap.Messages, llm.DefaultSessionLabelMaxLen)
 	var out string

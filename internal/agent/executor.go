@@ -64,7 +64,7 @@ func (e *Executor) ReadFileRawBytes(path string) ([]byte, error) {
 // When search is non-empty, semantics change: the function jumps to the first
 // regex match, offset is treated as context lines around that match (default 10,
 // not a starting line number), and limit caps the total lines returned.
-func (e *Executor) ReadFileRange(path string, offset, limit int, search string) (string, error) {
+func (e *Executor) ReadFileRange(path string, offset, limit int, search string, lineNumbers bool) (string, error) {
 	secure, err := e.SecurePath(path)
 	if err != nil {
 		return "", err
@@ -159,9 +159,13 @@ func (e *Executor) ReadFileRange(path string, offset, limit int, search string) 
 			end = len(allLines)
 		}
 		selected := allLines[start-1 : end]
+		body := strings.Join(selected, "\n")
+		if lineNumbers {
+			body = formatWithLineNumbers(selected, start)
+		}
 		out := fmt.Sprintf("Lines %d-%d of %d (matched %q at line %d)\n%s",
 			start, end, len(allLines), search, matchLine,
-			strings.Join(selected, "\n"))
+			body)
 		if header.Len() > 0 {
 			out = header.String() + out
 		}
@@ -224,6 +228,9 @@ func (e *Executor) ReadFileRange(path string, offset, limit int, search string) 
 	}
 
 	body := strings.Join(selected, "\n")
+	if lineNumbers && len(selected) > 0 {
+		body = formatWithLineNumbers(selected, start)
+	}
 	if len(selected) > 0 && (end < totalLines || start > 1) {
 		header.WriteString(fmt.Sprintf("Lines %d-%d of %d\n", start, end, totalLines))
 	}
@@ -231,6 +238,20 @@ func (e *Executor) ReadFileRange(path string, offset, limit int, search string) 
 		return header.String() + body, nil
 	}
 	return body, nil
+}
+
+// formatWithLineNumbers formats lines with right-aligned line numbers.
+// startLine is the 1-based line number of the first line in the slice.
+func formatWithLineNumbers(lines []string, startLine int) string {
+	if len(lines) == 0 {
+		return ""
+	}
+	width := len(fmt.Sprintf("%d", startLine+len(lines)-1))
+	var b strings.Builder
+	for i, line := range lines {
+		fmt.Fprintf(&b, "%*d: %s\n", width, startLine+i, line)
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 func (e *Executor) WriteFile(path string, content string) error {

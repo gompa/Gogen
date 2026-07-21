@@ -190,7 +190,7 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 		}
 		entry := agent.SessionInfo{
 			ID:           id,
-			UpdatedAt:    f.Updated.UTC().Format(time.RFC3339),
+			UpdatedAt:    f.Updated.UTC().Format(time.RFC3339Nano),
 			MessageCount: len(f.Messages),
 			Label:        sessionLabel(f.Messages, f.Label),
 		}

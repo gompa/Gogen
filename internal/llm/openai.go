@@ -606,6 +606,15 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 		})
 	}
 
+	// Fallback: if no tool calls were extracted from the stream deltas,
+	// try to find embedded tool call patterns in the reasoning/content text.
+	if len(toolCalls) == 0 && (fullReasoning != "" || fullContent != "") {
+		extractedCalls := extractToolCallsFromText(fullReasoning + fullContent)
+		if len(extractedCalls) > 0 {
+			toolCalls = extractedCalls
+		}
+	}
+
 	content := fullContent
 	if content == "" && fullRefusal != "" {
 		content = fullRefusal

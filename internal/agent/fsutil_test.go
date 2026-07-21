@@ -83,7 +83,7 @@ func TestSecurePathBlocksSymlinkEscape(t *testing.T) {
 	}
 
 	exec := NewExecutor(root)
-	_, err := exec.ReadFileRange(filepath.Join("escape", "secret.txt"), 0, 0, "")
+	_, err := exec.ReadFileRange(filepath.Join("escape", "secret.txt"), 0, 0, "", false)
 	if err == nil {
 		t.Fatal("expected symlink escape to be blocked")
 	}

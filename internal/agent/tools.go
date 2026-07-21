@@ -71,11 +71,12 @@ func BuiltinTools() []llm.Tool {
 			}, "pattern")),
 		toolDef("read_file", "Read file content. With search, offset=context lines, limit=max returned lines.",
 			toolSchema(map[string]interface{}{
-				"file_path": toolProp("string", "Path to file (required unless path is provided)"),
-				"path":      toolProp("string", "Alternative path to file (fallback if file_path is empty)"),
-				"offset":    toolProp("integer", "Without search: 1-based starting line (default 1). With search: lines of context before/after the match (default 10) — not a starting line."),
-				"limit":     toolProp("integer", "Without search: max lines to read (default all, capped at 10000). With search: max lines returned around the match."),
-				"search":    toolProp("string", "Optional regex; jump to first matching line. When set, offset means context lines (not start line) and limit caps the window size."),
+				"file_path":   toolProp("string", "Path to file (required unless path is provided)"),
+				"path":        toolProp("string", "Alternative path to file (fallback if file_path is empty)"),
+				"offset":      toolProp("integer", "Without search: 1-based starting line (default 1). With search: lines of context before/after the match (default 10) — not a starting line."),
+				"limit":       toolProp("integer", "Without search: max lines to read (default all, capped at 10000). With search: max lines returned around the match."),
+				"search":      toolProp("string", "Optional regex; jump to first matching line. When set, offset means context lines (not start line) and limit caps the window size."),
+				"line_numbers": toolProp("boolean", "If true, prefix each line with its line number (e.g. '42: content'). Numbers are right-aligned for readability."),
 			})),
 		toolDef("read_files", "Read multiple files in one call. Output uses === path === headers (max 20 files, 512KB total).",
 			toolSchema(map[string]interface{}{

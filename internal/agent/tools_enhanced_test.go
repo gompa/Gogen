@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,7 +19,7 @@ func TestReadFileRangeOffsetLimit(t *testing.T) {
 	}
 
 	exec := NewExecutor(dir)
-	out, err := exec.ReadFileRange("lines.txt", 2, 2, "")
+	out, err := exec.ReadFileRange("lines.txt", 2, 2, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -27,6 +28,73 @@ func TestReadFileRangeOffsetLimit(t *testing.T) {
 	}
 	if !strings.Contains(out, "two\nthree") {
 		t.Fatalf("expected selected lines, got %q", out)
+	}
+}
+
+func TestReadFileRangeLineNumbers(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lines.txt")
+	content := "one\ntwo\nthree\nfour\nfive\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := NewExecutor(dir)
+	out, err := exec.ReadFileRange("lines.txt", 2, 2, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Line numbers should start at 2 (offset), not 1
+	if !strings.Contains(out, "2: two") || !strings.Contains(out, "3: three") {
+		t.Fatalf("expected line numbers, got %q", out)
+	}
+	// Should not contain lines 1 or 4
+	if strings.Contains(out, "1: one") || strings.Contains(out, "4: four") {
+		t.Fatalf("should not contain lines outside range, got %q", out)
+	}
+}
+
+func TestReadFileRangeLineNumbersAlignment(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lines.txt")
+	// Create a file with enough lines to test alignment
+	var lines []string
+	for i := 1; i <= 100; i++ {
+		lines = append(lines, fmt.Sprintf("line %d", i))
+	}
+	content := strings.Join(lines, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := NewExecutor(dir)
+	out, err := exec.ReadFileRange("lines.txt", 95, 6, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Numbers should be right-aligned (3 digits for 100)
+	if !strings.Contains(out, " 95: line 95") || !strings.Contains(out, "100: line 100") {
+		t.Fatalf("expected right-aligned line numbers, got %q", out)
+	}
+}
+
+func TestReadFileRangeLineNumbersWithSearch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lines.txt")
+	content := "apple\nbanana\ncherry\ndate\nelderberry\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := NewExecutor(dir)
+	// Search for "cherry", with 1 line context
+	out, err := exec.ReadFileRange("lines.txt", 1, 3, "cherry", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Line numbers should reflect actual file positions (2-4)
+	if !strings.Contains(out, "2: banana") || !strings.Contains(out, "3: cherry") || !strings.Contains(out, "4: date") {
+		t.Fatalf("expected actual line numbers with search, got %q", out)
 	}
 }
 
@@ -39,7 +107,7 @@ func TestReadFileRangeSizeWarning(t *testing.T) {
 	}
 
 	exec := NewExecutor(dir)
-	out, err := exec.ReadFileRange("big.txt", 0, 0, "")
+	out, err := exec.ReadFileRange("big.txt", 0, 0, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}

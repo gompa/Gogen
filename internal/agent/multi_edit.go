@@ -43,7 +43,7 @@ func (e *Executor) MultiEdit(ctx context.Context, pattern, search, replace strin
 		}
 
 		// Read file content
-		content, err := e.ReadFileRange(file, 0, 0, "")
+		content, err := e.ReadFileRange(file, 0, 0, "", false)
 		if err != nil {
 			continue // Skip files that can't be read
 		}
