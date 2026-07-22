@@ -175,12 +175,6 @@ func hasTruncatedToolResults(messages []llm.Message) bool {
 	return false
 }
 
-func (m *Manager) compactBudget() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.compactBudgetLocked()
-}
-
 func (m *Manager) compactBudgetLocked() int {
 	limit := m.Settings.ContextLimit
 	if limit <= 0 {
@@ -198,16 +192,22 @@ func (m *Manager) compactBudgetLocked() int {
 // Relies on EstimateTokens' per-message fingerprint cache; do not stash a
 // sticky total here — it goes stale when messages are appended across turns.
 func (m *Manager) ShouldCompact(messages []llm.Message) bool {
-	if len(messages) <= m.Settings.KeepRecentMessages+1 {
+	m.mu.RLock()
+	keep := m.Settings.KeepRecentMessages
+	budget := m.compactBudgetLocked()
+	m.mu.RUnlock()
+	if len(messages) <= keep+1 {
 		return false
 	}
-	return m.EstimateTokens(messages) >= m.compactBudget()
+	return m.EstimateTokens(messages) >= budget
 }
 
 // EnsureToolResultsCapped mutates messages so every tool body fits MaxToolResultBytes.
 // Safe to call every turn; only rewrites oversized bodies (one-time sticky rewrite).
 func (m *Manager) EnsureToolResultsCapped(messages []llm.Message) bool {
+	m.mu.RLock()
 	max := m.Settings.MaxToolResultBytes
+	m.mu.RUnlock()
 	if max <= 0 {
 		return false
 	}
@@ -241,12 +241,15 @@ func (m *Manager) Compact(ctx context.Context, messages []llm.Message) ([]llm.Me
 // CompactPinned is like Compact but keeps pinned message indices in the preserved
 // tail and returns remapped pin indices for the compacted history.
 func (m *Manager) CompactPinned(ctx context.Context, messages []llm.Message, pinned map[int]struct{}) ([]llm.Message, map[int]struct{}, error) {
-	if len(messages) <= m.Settings.KeepRecentMessages+1 {
+	m.mu.RLock()
+	keep := m.Settings.KeepRecentMessages
+	m.mu.RUnlock()
+	if len(messages) <= keep+1 {
 		return messages, copyIntSet(pinned), nil
 	}
 
 	headIdx := firstUserIndex(messages)
-	tailStart := adjustCompactTailStart(messages, len(messages)-m.Settings.KeepRecentMessages)
+	tailStart := adjustCompactTailStart(messages, len(messages)-keep)
 	tailStart = extendTailForPins(messages, headIdx, tailStart, pinned)
 	if tailStart <= headIdx+1 {
 		return messages, copyIntSet(pinned), nil
@@ -274,11 +277,10 @@ func (m *Manager) CompactPinned(ctx context.Context, messages []llm.Message, pin
 	compact = append(compact, tail...)
 
 	newPinned := remapPinsAfterCompact(pinned, headIdx, oldTailStart, len(compact)-len(tail))
-	// CompactPinned owns token-cache invalidation: the compacted slice is
-	// newly allocated, so every surviving message gets a new address and the
-	// old pointer-keyed cache entries are unreachable. Callers that reassign
-	// a.Messages from this return value must NOT invalidate again.
-	InvalidateTokenCache()
+	// The token cache is keyed by content fingerprint (not pointer), so
+	// the newly allocated copies of preserved messages still hit the same
+	// cache entries. Old entries for summarised-away middle messages are
+	// harmless (bounded by session size and valid for their key).
 	return compact, newPinned, nil
 }
 
@@ -349,19 +351,27 @@ func (m *Manager) summarizeMiddle(ctx context.Context, middle []llm.Message) (st
 
 func (m *Manager) summarizeMessagesDepth(ctx context.Context, messages []llm.Message, depth int) (string, error) {
 	if depth >= maxSummarizeDepth {
-		text := renderMessagesForSummary(messages, m.Settings.MaxToolResultBytes)
-		return truncateForSummary(text, m.maxSummaryInputTokens()), nil
+		m.mu.RLock()
+		maxTool := m.Settings.MaxToolResultBytes
+		maxIn := m.maxSummaryInputTokensLocked()
+		m.mu.RUnlock()
+		text := renderMessagesForSummary(messages, maxTool)
+		return truncateForSummary(text, maxIn), nil
 	}
 	return m.summarizeMessages(ctx, messages, depth)
 }
 
 func (m *Manager) summarizeMessages(ctx context.Context, messages []llm.Message, depth int) (string, error) {
-	text := renderMessagesForSummary(messages, m.Settings.MaxToolResultBytes)
-	if m.EstimateTokens([]llm.Message{{Content: text}}) <= m.maxSummaryInputTokens() {
+	m.mu.RLock()
+	maxTool := m.Settings.MaxToolResultBytes
+	maxIn := m.maxSummaryInputTokensLocked()
+	m.mu.RUnlock()
+	text := renderMessagesForSummary(messages, maxTool)
+	if m.EstimateTokens([]llm.Message{{Content: text}}) <= maxIn {
 		return m.summarizeText(ctx, text)
 	}
 	if len(messages) == 1 {
-		return m.summarizeText(ctx, truncateForSummary(text, m.maxSummaryInputTokens()))
+		return m.summarizeText(ctx, truncateForSummary(text, maxIn))
 	}
 
 	mid := len(messages) / 2
@@ -374,13 +384,19 @@ func (m *Manager) summarizeMessages(ctx context.Context, messages []llm.Message,
 		return "", err
 	}
 	merged := "Earlier segment summary:\n" + left + "\n\nLater segment summary:\n" + right
-	if m.EstimateTokens([]llm.Message{{Content: merged}}) <= m.maxSummaryInputTokens() {
+	if m.EstimateTokens([]llm.Message{{Content: merged}}) <= maxIn {
 		return m.summarizeText(ctx, merged)
 	}
 	return merged, nil
 }
 
 func (m *Manager) maxSummaryInputTokens() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.maxSummaryInputTokensLocked()
+}
+
+func (m *Manager) maxSummaryInputTokensLocked() int {
 	limit := m.Settings.ContextLimit
 	if limit <= 0 {
 		limit = 128000

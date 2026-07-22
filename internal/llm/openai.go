@@ -32,9 +32,9 @@ func isOpencodeURL(baseURL string) bool {
 }
 
 type OpenAIProvider struct {
-	client      openai.Client             // primary (user-configured; fallback for non-OpenCode)
-	zenClient   *openai.Client            // OpenCode Zen endpoint
-	goClient    *openai.Client            // OpenCode Go endpoint
+	client      openai.Client  // primary (user-configured; fallback for non-OpenCode)
+	zenClient   *openai.Client // OpenCode Zen endpoint
+	goClient    *openai.Client // OpenCode Go endpoint
 	model       string
 	modelClient map[string]*openai.Client // model ID → client routing
 	// promptCacheKey scopes provider-side prompt caching (defaults to none).
@@ -53,6 +53,12 @@ type modelsFetch struct {
 }
 
 func (p *OpenAIProvider) ModelName() string {
+	return p.currentModel()
+}
+
+func (p *OpenAIProvider) currentModel() string {
+	p.modelsMu.Lock()
+	defer p.modelsMu.Unlock()
 	return p.model
 }
 
@@ -208,7 +214,10 @@ func NewOpenAIProvider(apiKey string, model string, baseURL string) *OpenAIProvi
 // Use a value derived from the working directory to keep cache hits
 // scoped per-project while avoiding cross-user leakage.
 func (p *OpenAIProvider) SetPromptCacheKey(key string) {
-	if key == "" { p.promptCacheKey = param.Opt[string]{}; return }
+	if key == "" {
+		p.promptCacheKey = param.Opt[string]{}
+		return
+	}
 	p.promptCacheKey = param.NewOpt(key)
 }
 
@@ -356,10 +365,11 @@ func toolCallArgumentsJSON(tc ToolCall) string {
 
 func (p *OpenAIProvider) GenerateResponse(ctx context.Context, messages []Message, allowedTools map[string]struct{}, tools []Tool) (Response, error) {
 	chatMessages := p.messagesToChat(messages)
+	model := p.currentModel()
 	params := openai.ChatCompletionNewParams{
 		Messages: chatMessages,
 		Tools:    toolsToOpenAI(tools, allowedTools),
-		Model:    p.model,
+		Model:    model,
 	}
 	if p.promptCacheKey.Valid() {
 		params.PromptCacheKey = p.promptCacheKey
@@ -399,7 +409,7 @@ func (p *OpenAIProvider) GenerateResponse(ctx context.Context, messages []Messag
 	if msg.Refusal != "" && display == "" {
 		display = msg.Refusal
 	}
-	logNonStreamResponse(p.model, "non-stream", content, msg.Refusal, display, extras, toolCalls, usageFromOpenAI(resp.Usage))
+	logNonStreamResponse(model, "non-stream", content, msg.Refusal, display, extras, toolCalls, usageFromOpenAI(resp.Usage))
 	return Response{
 		Content:   display,
 		Reasoning: reasoning,
@@ -422,10 +432,11 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 	}
 
 	chatMessages := p.messagesToChat(messages)
+	model := p.currentModel()
 	params := openai.ChatCompletionNewParams{
 		Messages: chatMessages,
 		Tools:    toolsToOpenAI(tools, allowedTools),
-		Model:    p.model,
+		Model:    model,
 		StreamOptions: openai.ChatCompletionStreamOptionsParam{
 			IncludeUsage: openai.Bool(true),
 		},
@@ -646,18 +657,23 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 func (p *OpenAIProvider) ModelContextLimit(ctx context.Context) (int, error) {
 	models, _ := p.listModels(ctx)
 
+	p.modelsMu.Lock()
 	if len(models) == 1 {
 		sole := models[0]
 		if sole.ID != "" {
 			p.model = sole.ID
 		}
+		p.modelsMu.Unlock()
 		if limit := parseContextLimitFromJSON(sole.RawJSON()); limit > 0 {
 			return limit, nil
 		}
+	} else {
+		p.modelsMu.Unlock()
 	}
 
+	modelName := p.currentModel()
 	for _, model := range models {
-		if model.ID != p.model {
+		if model.ID != modelName {
 			continue
 		}
 		if limit := parseContextLimitFromJSON(model.RawJSON()); limit > 0 {
@@ -679,7 +695,7 @@ func (p *OpenAIProvider) ModelContextLimit(ctx context.Context) (int, error) {
 		}
 	}
 	for _, c := range clients {
-		model, err := c.Models.Get(ctx, p.model)
+		model, err := c.Models.Get(ctx, modelName)
 		if err != nil {
 			continue
 		}
@@ -688,11 +704,11 @@ func (p *OpenAIProvider) ModelContextLimit(ctx context.Context) (int, error) {
 		}
 	}
 
-	if limit := inferContextLimitFromModelName(p.model); limit > 0 {
+	if limit := inferContextLimitFromModelName(modelName); limit > 0 {
 		return limit, nil
 	}
 
-	return resolveContextLimit("", p.model), nil
+	return resolveContextLimit("", modelName), nil
 }
 
 func (p *OpenAIProvider) ListModels(ctx context.Context) ([]ModelInfo, error) {
@@ -701,7 +717,7 @@ func (p *OpenAIProvider) ListModels(ctx context.Context) ([]ModelInfo, error) {
 		return nil, err
 	}
 	out := make([]ModelInfo, 0, len(models))
-	current := p.model
+	current := p.currentModel()
 	for _, m := range models {
 		if m.ID == "" {
 			continue
@@ -716,7 +732,9 @@ func (p *OpenAIProvider) ListModels(ctx context.Context) ([]ModelInfo, error) {
 }
 
 func (p *OpenAIProvider) SetModel(id string) error {
+	p.modelsMu.Lock()
 	p.model = id
+	p.modelsMu.Unlock()
 	return nil
 }
 

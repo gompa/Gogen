@@ -70,6 +70,7 @@ func extractToolCallsFromText(text string) []ToolCall {
 	// If no tool calls found yet, try to find JSON tool call objects by looking for {"name": ...
 	if len(toolCalls) == 0 {
 		matches := toolCallJSONNameRegex.FindAllStringIndex(text, -1)
+		seenEnd := make(map[int]struct{})
 		for _, match := range matches {
 			// match[0] is the start of the match, which is '{' in {"name": ...
 			startIdx := match[0]
@@ -90,7 +91,10 @@ func extractToolCallsFromText(text string) []ToolCall {
 				// Extract JSON object
 				jsonStr, endIdx := extractJSONObject(text, objStart)
 				if jsonStr != "" && endIdx > objStart {
-					// Try to parse as tool call
+					if _, ok := seenEnd[endIdx]; ok {
+						continue
+					}
+					seenEnd[endIdx] = struct{}{}
 					calls := parseToolCallFromJSONString(jsonStr)
 					if len(calls) > 0 {
 						toolCalls = append(toolCalls, calls...)
@@ -106,37 +110,42 @@ func extractToolCallsFromText(text string) []ToolCall {
 // extractToolCallsFromBlock extracts tool calls from a <tool_call> ... </tool_call> block content
 func extractToolCallsFromBlock(blockContent string) []ToolCall {
 	var toolCalls []ToolCall
-	
+
 	// Strategy 1: Try to find JSON tool call objects inside the block
 	// (e.g. <tool_call>{"name": "...", "arguments": {...}}</tool_call>)
-	jsonMatches := toolCallJSONNameRegex.FindAllStringSubmatch(blockContent, -1)
+	// FindAllStringIndex so each match can locate its own object; scanning from
+	// byte 0 on every match would re-parse the first object repeatedly.
+	jsonMatches := toolCallJSONNameRegex.FindAllStringIndex(blockContent, -1)
 	if len(jsonMatches) > 0 {
-		for _, match := range jsonMatches {
-			if len(match) >= 2 {
-				toolName := match[1]
-				// Find the JSON object
-				objStart := -1
-				for i := 0; i < len(blockContent); i++ {
-					if blockContent[i] == '{' {
-						objStart = i
-						break
-					}
-				}
-				if objStart >= 0 {
-					jsonStr, _ := extractJSONObject(blockContent, objStart)
-					if jsonStr != "" {
-						calls := parseToolCallFromJSONString(jsonStr)
-						for i := range calls {
-							if calls[i].Name == "" {
-								calls[i].Name = sanitizeToolCallName(toolName)
-							}
-							calls[i].Index = len(toolCalls)
-							calls[i].ID = "tc_extracted_" + strconv.Itoa(len(toolCalls))
-						}
-						toolCalls = append(toolCalls, calls...)
-					}
+		seenEnd := make(map[int]struct{})
+		for _, loc := range jsonMatches {
+			startIdx := loc[0]
+			objStart := -1
+			for i := startIdx; i >= 0; i-- {
+				if blockContent[i] == '{' {
+					objStart = i
+					break
+				} else if blockContent[i] == '"' {
+					break
 				}
 			}
+			if objStart < 0 {
+				continue
+			}
+			jsonStr, endIdx := extractJSONObject(blockContent, objStart)
+			if jsonStr == "" || endIdx <= objStart {
+				continue
+			}
+			if _, ok := seenEnd[endIdx]; ok {
+				continue
+			}
+			seenEnd[endIdx] = struct{}{}
+			calls := parseToolCallFromJSONString(jsonStr)
+			for i := range calls {
+				calls[i].Index = len(toolCalls)
+				calls[i].ID = "tc_extracted_" + strconv.Itoa(len(toolCalls))
+			}
+			toolCalls = append(toolCalls, calls...)
 		}
 		if len(toolCalls) > 0 {
 			return toolCalls

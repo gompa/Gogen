@@ -65,6 +65,34 @@ func (s *Server) handleFSReadMessage(ws *wsConn, ctx context.Context, msg WSMess
 			resp.Modified = modified
 		}
 		_ = ws.writeJSON(resp)
+	}
+}
+
+func (s *Server) handleFSWriteMessage(ws *wsConn, ctx context.Context, msg WSMessage) {
+	reqID := msg.RequestID
+	path := msg.Path
+	if !s.tryAcquireTurn(wsTurnAcquireWait) {
+		resp := WSMessage{Type: msg.Type + "_result", Path: path, RequestID: reqID, Pattern: msg.Pattern}
+		if msg.Type == "fs_write" {
+			resp.Type = "fs_write_result"
+		} else if msg.Type == "fs_replace" {
+			resp.Type = "fs_replace_result"
+		}
+		resp.Error = "agent is busy with another client"
+		_ = ws.writeJSON(resp)
+		return
+	}
+	defer s.turnMu.Unlock()
+
+	switch msg.Type {
+	case "fs_write":
+		resp := WSMessage{Type: "fs_write_result", Path: path, RequestID: reqID}
+		if err := s.fsWrite(path, msg.Content); err != nil {
+			resp.Error = err.Error()
+		} else {
+			resp.Success = true
+		}
+		_ = ws.writeJSON(resp)
 	case "fs_replace":
 		replaced, fileCount, err := s.fsReplace(ctx, msg.Pattern, msg.Replacement, msg.Path, msg.Glob)
 		resp := WSMessage{Type: "fs_replace_result", Path: path, RequestID: reqID, Pattern: msg.Pattern}
@@ -77,23 +105,4 @@ func (s *Server) handleFSReadMessage(ws *wsConn, ctx context.Context, msg WSMess
 		}
 		_ = ws.writeJSON(resp)
 	}
-}
-
-func (s *Server) handleFSWriteMessage(ws *wsConn, msg WSMessage) {
-	reqID := msg.RequestID
-	path := msg.Path
-	resp := WSMessage{Type: "fs_write_result", Path: path, RequestID: reqID}
-	if !s.tryAcquireTurn(wsTurnAcquireWait) {
-		resp.Error = "agent is busy with another client"
-		_ = ws.writeJSON(resp)
-		return
-	}
-	err := s.fsWrite(path, msg.Content)
-	s.turnMu.Unlock()
-	if err != nil {
-		resp.Error = err.Error()
-	} else {
-		resp.Success = true
-	}
-	_ = ws.writeJSON(resp)
 }

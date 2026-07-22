@@ -4,7 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>GoGen AI Agent</title>
-    <link rel="stylesheet" href="/monaco/editor.main.css">
+    <!-- editor.main.css is loaded lazily with Monaco from initMonaco() to
+         avoid pulling 128KB on the Chat-only first paint. -->
     <style>
         :root {
             --bg: #1e1e1e;
@@ -115,11 +116,16 @@
         #messages {
             flex: 1;
             overflow-y: auto;
-            overflow-anchor: none; /* we manage stickiness; browser anchoring fights user scroll-away */
+            overflow-anchor: auto; /* default: let browser anchor when user scrolls away */
             padding: 16px 20px;
             display: flex;
             flex-direction: column;
             gap: 10px;
+        }
+        /* Disable anchoring while auto-following the stream so the browser
+           doesn't fight smartScroll trying to keep the growing message stable. */
+        #messages.no-anchor {
+            overflow-anchor: none;
         }
         #messages > * { flex-shrink: 0; }
         #input-area {
@@ -329,6 +335,14 @@
             margin-bottom: 12px;
             font-family: var(--mono);
             font-size: 0.85em;
+        }
+        #model-info.clickable {
+            cursor: pointer;
+            text-decoration: underline dotted;
+            text-underline-offset: 2px;
+        }
+        #model-info.clickable:hover {
+            color: var(--accent);
         }
         button {
             cursor: pointer;
@@ -1595,6 +1609,7 @@
         function updateModelInfo(model) {
             if (availableModels.length > 1) {
                 modelInfoDiv.hidden = true;
+                modelInfoDiv.classList.remove('clickable');
                 modelSelect.hidden = false;
                 if (model && [...modelSelect.options].some((o) => o.value === model)) {
                     modelSelect.value = model;
@@ -1603,9 +1618,17 @@
                 }
                 return;
             }
+            // Catalog not loaded yet (or only one model): show the label.
+            // Keep it clickable so users can trigger a catalog fetch — the
+            // <select> stays hidden until we have options, so focus/pointer
+            // listeners on modelSelect alone never fire.
             modelSelect.hidden = true;
             modelInfoDiv.hidden = false;
             modelInfoDiv.textContent = model || '—';
+            modelInfoDiv.classList.add('clickable');
+            modelInfoDiv.title = availableModels.length === 0
+                ? 'Click to load available models'
+                : 'Only one model available';
         }
 
         function updateModelSelect(models, current) {
@@ -1642,6 +1665,27 @@
             if (!id) return;
             ws.send(JSON.stringify({ type: 'set_model', model: id }));
         };
+
+        // Fetch the model catalog lazily so it never blocks initial connect.
+        // The select is hidden until the catalog arrives, so also allow a click
+        // on the model label and a post-paint idle fetch.
+        let modelsRequested = false;
+        function ensureModelsLoaded(opts) {
+            if (modelsRequested) return;
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            modelsRequested = true;
+            if (opts && opts.showLoading && availableModels.length <= 1 && !modelInfoDiv.hidden) {
+                modelInfoDiv.textContent = 'Loading models…';
+            }
+            ws.send(JSON.stringify({ type: 'list_models' }));
+        }
+        modelSelect.addEventListener('focus', () => ensureModelsLoaded(), { once: true });
+        modelSelect.addEventListener('pointerdown', () => ensureModelsLoaded(), { once: true });
+        modelInfoDiv.addEventListener('click', () => {
+            if (availableModels.length > 1) return;
+            modelsRequested = false;
+            ensureModelsLoaded({ showLoading: true });
+        });
 
         function updateContextInfo(data) {
             lastContextData = data || lastContextData;
@@ -1721,6 +1765,8 @@
         // only when the user returns near the bottom (or clicks the jump button).
         let stickToBottom = true;
         let ignoreScrollEvent = false;
+        // Start with anchoring disabled while following the stream.
+        messagesDiv.classList.add('no-anchor');
         let currentStreamDiv = null;
         let currentStreamRaw = '';
         let streamRenderTimer = null;
@@ -2493,8 +2539,19 @@
                 reconnectTimer = null;
                 setConnState('connected');
                 appendMessage('system', 'Connected to GoGen server');
-                ws.send(JSON.stringify({ type: 'list_models' }));
+                // Reset the lazy model-catalog guard so a fresh connection can
+                // fetch on next interaction; re-arm the one-shot listeners.
+                modelsRequested = false;
+                modelSelect.addEventListener('focus', () => ensureModelsLoaded(), { once: true });
+                modelSelect.addEventListener('pointerdown', () => ensureModelsLoaded(), { once: true });
+                // Only request the cheap, local session list eagerly. The
+                // model catalog is a remote /v1/models call that can dominate
+                // startup latency, so fetch it after first paint (idle) and
+                // also on click of the model label / select.
                 ws.send(JSON.stringify({ type: 'list_sessions' }));
+                const scheduleModels = window.requestIdleCallback
+                    || ((fn) => setTimeout(fn, 200));
+                scheduleModels(() => ensureModelsLoaded());
             };
 
             ws.onmessage = (event) => {
@@ -2925,7 +2982,10 @@
                 if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'message', content: '/context' }));
             }},
             { id: 'list-models', label: 'List / switch models', hint: '', run: () => {
-                if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'list_models' }));
+                if (ws?.readyState === WebSocket.OPEN) {
+                    modelsRequested = false; // palette is an explicit request; allow a refetch
+                    ensureModelsLoaded();
+                }
             }},
             { id: 'open-settings', label: 'Open settings', hint: '', run: () => settingsBtn.click() },
         ];
@@ -3058,10 +3118,16 @@
             if (!stickToBottom) return;
             stickToBottom = false;
             updateScrollBottomBtn();
+            // Re-enable browser scroll anchoring now that the user is reading
+            // (prevents content from jumping when the streaming div changes height).
+            messagesDiv.classList.remove('no-anchor');
         }
 
         function pinToBottom() {
             stickToBottom = true;
+            // Disable browser scroll anchoring while we're auto-following
+            // (prevents anchoring from fighting smartScroll's scroll-to-bottom).
+            messagesDiv.classList.add('no-anchor');
             ignoreScrollEvent = true;
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
             requestAnimationFrame(() => { ignoreScrollEvent = false; });
@@ -3097,9 +3163,11 @@
             if (d > NEAR_BOTTOM_PX) {
                 // Clearly away from bottom (scrollbar drag, etc.)
                 stickToBottom = false;
+                messagesDiv.classList.remove('no-anchor');
             } else if (d <= 8) {
                 // Truly back at the bottom — re-enable follow
                 stickToBottom = true;
+                messagesDiv.classList.add('no-anchor');
             }
             // 8 < d <= NEAR_BOTTOM_PX: leave stickToBottom alone so a small
             // upward scroll after wheel-unpin is not immediately re-pinned.
@@ -3108,12 +3176,28 @@
         scrollBottomBtn.addEventListener('click', () => {
             pinToBottom();
         });
+
+        // Async code colorization changes DOM height after we've already scrolled.
+        // Re-adjust if we're still pinned to the bottom.
+        window.addEventListener('gogen-colorized', () => {
+            if (stickToBottom) {
+                smartScroll();
+            }
+        });
+
         // Auto-scroll only while stickToBottom is set (user hasn't scrolled away).
         function smartScroll() {
             if (!stickToBottom) return;
             ignoreScrollEvent = true;
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
-            requestAnimationFrame(() => { ignoreScrollEvent = false; });
+            // Double-check after layout settles (handles async DOM changes like
+            // code colorization that may affect height after the initial scroll).
+            requestAnimationFrame(() => {
+                if (stickToBottom && messagesDiv.isConnected) {
+                    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                }
+                ignoreScrollEvent = false;
+            });
         }
 
         // === Task 4: Collapsible sidebar toggle ===

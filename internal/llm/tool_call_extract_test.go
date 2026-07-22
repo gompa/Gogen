@@ -158,3 +158,24 @@ func TestExtractToolCallsFromText_MultipleCalls(t *testing.T) {
 		t.Fatalf("call 1 = %q", calls[1].Name)
 	}
 }
+
+func TestExtractToolCallsFromText_MultipleJSONInOneBlock(t *testing.T) {
+	input := `<tool_call>
+{"name": "read_file", "arguments": {"file_path": "/a.go"}}
+{"name": "search_code", "arguments": {"pattern": "foo"}}
+</tool_call>`
+
+	calls := extractToolCallsFromText(input)
+	if len(calls) != 2 {
+		t.Fatalf("got %d calls, want 2; calls=%+v", len(calls), calls)
+	}
+	if calls[0].Name != "read_file" {
+		t.Fatalf("call 0 = %q, want read_file", calls[0].Name)
+	}
+	if calls[1].Name != "search_code" {
+		t.Fatalf("call 1 = %q, want search_code", calls[1].Name)
+	}
+	if calls[0].ID == calls[1].ID {
+		t.Fatal("expected distinct tool call IDs")
+	}
+}

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"compress/gzip"
 	"context"
 	"embed"
 	"errors"
@@ -561,11 +562,11 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			// Already handled in the reader; keep for safety if ever enqueued.
 			session.completeApproval(msg.ApprovalID, msg.Approved)
 			continue
-		case "fs_list", "fs_read", "fs_search", "git_status", "git_file_diff", "fs_replace":
+		case "fs_list", "fs_read", "fs_search", "git_status", "git_file_diff":
 			s.handleFSReadMessage(ws, r.Context(), msg)
 			continue
-		case "fs_write":
-			s.handleFSWriteMessage(ws, msg)
+		case "fs_write", "fs_replace":
+			s.handleFSWriteMessage(ws, r.Context(), msg)
 			continue
 		case "list_sessions":
 			_, sessions, err := s.agent.FormatSessionListForUI()
@@ -966,6 +967,16 @@ func (s *Server) HandleStatic(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")
+		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Header().Add("Vary", "Accept-Encoding")
+			gz := gzip.NewWriter(w)
+			defer gz.Close()
+			if _, err := gz.Write(content); err != nil {
+				return
+			}
+			return
+		}
 		_, _ = w.Write(content)
 		return
 	}
@@ -982,9 +993,32 @@ func (s *Server) HandleStatic(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	w.Header().Set("Content-Type", contentTypeForExt(filepath.Ext(name)))
+	ct := contentTypeForExt(filepath.Ext(name))
+	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Cache-Control", "public, max-age=86400")
+	if staticGzipMime(ct) && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") && len(content) > 512 {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Add("Vary", "Accept-Encoding")
+		gz := gzip.NewWriter(w)
+		defer gz.Close()
+		if _, err := gz.Write(content); err != nil {
+			return
+		}
+		return
+	}
 	_, _ = w.Write(content)
+}
+
+// staticGzipMime reports whether content of the given type is worth gzip-ing
+// on the fly. Binary/already-compressed assets (fonts, images) are excluded.
+func staticGzipMime(ct string) bool {
+	switch ct {
+	case "text/html; charset=utf-8", "text/css; charset=utf-8",
+		"text/javascript; charset=utf-8", "application/javascript",
+		"application/json; charset=utf-8", "image/svg+xml":
+		return true
+	}
+	return false
 }
 
 func contentTypeForExt(ext string) string {

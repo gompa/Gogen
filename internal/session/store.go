@@ -174,7 +174,15 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 		}
 		return nil, err
 	}
-	var out []agent.SessionInfo
+	// Collect entries with their parsed Updated time so we can sort
+	// correctly.  Sorting by the RFC3339Nano string is unreliable because
+	// trailing zeros in the fractional seconds are dropped (e.g.
+	// "T10:30:00.5Z" vs "T10:30:00Z" — ".5" is later but '.' < 'Z').
+	type item struct {
+		info    agent.SessionInfo
+		updated time.Time
+	}
+	var items []item
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
 			continue
@@ -188,15 +196,21 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 		if err := json.Unmarshal(data, &f); err != nil {
 			continue
 		}
-		entry := agent.SessionInfo{
-			ID:           id,
-			UpdatedAt:    f.Updated.UTC().Format(time.RFC3339Nano),
-			MessageCount: len(f.Messages),
-			Label:        sessionLabel(f.Messages, f.Label),
-		}
-		out = append(out, entry)
+		items = append(items, item{
+			info: agent.SessionInfo{
+				ID:           id,
+				UpdatedAt:    f.Updated.UTC().Format(time.RFC3339Nano),
+				MessageCount: len(f.Messages),
+				Label:        sessionLabel(f.Messages, f.Label),
+			},
+			updated: f.Updated,
+		})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].UpdatedAt > out[j].UpdatedAt })
+	sort.Slice(items, func(i, j int) bool { return items[i].updated.After(items[j].updated) })
+	out := make([]agent.SessionInfo, len(items))
+	for i, it := range items {
+		out[i] = it.info
+	}
 	return out, nil
 }
 

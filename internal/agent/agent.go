@@ -287,10 +287,7 @@ func (a *Agent) prepareMessages(ctx context.Context) []llm.Message {
 					if a.PinManager != nil {
 						a.PinManager.ReplacePins(newPins)
 					}
-					// Compaction produced a shorter history; the last API
-					// usage counters are no longer representative, so clear
-					// them to keep /context honest. (CompactPinned already
-					// invalidated the token count cache.)
+					// lastTurnUsage is no longer representative after compaction.
 					a.lastTurnUsage = nil
 				}
 			}
@@ -318,9 +315,7 @@ func (a *Agent) CompactHistory(ctx context.Context) error {
 	if a.PinManager != nil {
 		a.PinManager.ReplacePins(newPins)
 	}
-	// CompactPinned already invalidated the token cache (it owns invalidation
-	// on reassignment). lastTurnUsage reflects the pre-compaction request and
-	// is no longer accurate, so drop it to avoid a stale /context display.
+	// lastTurnUsage is no longer representative after compaction.
 	a.lastTurnUsage = nil
 	return nil
 }

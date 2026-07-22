@@ -62,6 +62,8 @@ jobs:
       - name: Build windows/amd64
         run: GOOS=windows GOARCH=amd64 CGO_ENABLED=1 go build -o gogen-windows-amd64.exe -ldflags="-s -w" .
       - name: Test
+        env:
+          CGO_ENABLED: "1"
         run: go test -v -race ./...
       - name: Vet
         run: go vet ./...

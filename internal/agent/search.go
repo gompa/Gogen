@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -139,6 +140,22 @@ func (e *Executor) SearchCode(ctx context.Context, pattern, subpath, glob string
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
+	// If subpath points to a file, scope the search to that file.
+	if strings.TrimSpace(subpath) != "" {
+		secure, err := e.SecurePath(subpath)
+		if err == nil {
+			info, err := os.Stat(secure)
+			if err == nil && !info.IsDir() {
+				// Use the file's directory as the search root and the
+				// filename as an implicit glob (unless one is already set).
+				if glob == "" {
+					glob = filepath.Base(secure)
+				}
+				subpath = filepath.Dir(secure)
+			}
+		}
+	}
+
 	searchRoot, relPrefix, err := e.searchRoot(subpath)
 	if err != nil {
 		return "", err
@@ -156,6 +173,139 @@ func (e *Executor) SearchCode(ctx context.Context, pattern, subpath, glob string
 		return "", goErr
 	}
 	return out, nil
+}
+
+// ReplaceInTree replaces every regex match of pattern with replacement under
+// subpath (same pattern semantics as SearchCode). Unlike search, it is not
+// capped by searchMaxMatches — every matching text file is updated.
+func (e *Executor) ReplaceInTree(ctx context.Context, pattern, replacement, subpath, glob string) (replaced, fileCount int, err error) {
+	if pattern == "" {
+		return 0, 0, fmt.Errorf("search pattern is required")
+	}
+	if err := rejectLeadingDashArg("pattern", pattern); err != nil {
+		return 0, 0, err
+	}
+	if glob != "" {
+		if err := rejectLeadingDashArg("glob", glob); err != nil {
+			return 0, 0, err
+		}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	re, err := compileSearchPattern(pattern)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// Single-file scope: replace only in that file.
+	if strings.TrimSpace(subpath) != "" {
+		secure, secErr := e.SecurePath(subpath)
+		if secErr == nil {
+			info, statErr := os.Stat(secure)
+			if statErr == nil && !info.IsDir() {
+				absWD, absErr := filepath.Abs(e.WorkingDir)
+				if absErr != nil {
+					return 0, 0, absErr
+				}
+				rel, relErr := filepath.Rel(absWD, secure)
+				if relErr != nil {
+					rel = subpath
+				}
+				rel = filepath.ToSlash(rel)
+				n, writeErr := e.replaceInFilePath(secure, rel, re, replacement)
+				if writeErr != nil {
+					return 0, 0, writeErr
+				}
+				if n > 0 {
+					return n, 1, nil
+				}
+				return 0, 0, nil
+			}
+		}
+	}
+
+	searchRoot, relPrefix, err := e.searchRoot(subpath)
+	if err != nil {
+		return 0, 0, err
+	}
+	glob = strings.TrimSpace(glob)
+
+	err = filepath.WalkDir(searchRoot, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		name := d.Name()
+		if d.IsDir() {
+			if shouldSkipSearchEntry(name, true) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if shouldSkipSearchEntry(name, false) {
+			return nil
+		}
+		info, infoErr := d.Info()
+		if infoErr != nil || info.Size() > searchMaxFileBytes {
+			return nil
+		}
+		if isBinaryFile(path) {
+			return nil
+		}
+
+		rel, relErr := filepath.Rel(searchRoot, path)
+		if relErr != nil {
+			return nil
+		}
+		if relPrefix != "" {
+			rel = filepath.ToSlash(filepath.Join(relPrefix, rel))
+		} else {
+			rel = filepath.ToSlash(rel)
+		}
+		if glob != "" && !matchGlobPattern(glob, rel) {
+			return nil
+		}
+
+		n, writeErr := e.replaceInFilePath(path, rel, re, replacement)
+		if writeErr != nil {
+			return writeErr
+		}
+		if n > 0 {
+			replaced += n
+			fileCount++
+		}
+		return nil
+	})
+	return replaced, fileCount, err
+}
+
+func (e *Executor) replaceInFilePath(absPath, relPath string, re *regexp.Regexp, replacement string) (int, error) {
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read %s: %w", relPath, err)
+	}
+	if bytes.IndexByte(data, 0) >= 0 {
+		return 0, nil
+	}
+	content := string(data)
+	locs := re.FindAllStringIndex(content, -1)
+	if len(locs) == 0 {
+		return 0, nil
+	}
+	newContent := re.ReplaceAllString(content, replacement)
+	if newContent == content {
+		return 0, nil
+	}
+	if err := writeFileAtomic(absPath, []byte(newContent), 0o644); err != nil {
+		return 0, fmt.Errorf("failed to write %s: %w", relPath, err)
+	}
+	return len(locs), nil
 }
 
 func (e *Executor) searchRoot(subpath string) (absRoot, relPrefix string, err error) {

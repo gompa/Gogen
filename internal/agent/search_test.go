@@ -251,3 +251,51 @@ func TestSearchCodeContextLinesRipgrep(t *testing.T) {
 		t.Fatalf("expected rg context output, got %q", out)
 	}
 }
+
+func TestReplaceInTreeRegexSemantics(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("fooBar and fooX\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exec := NewExecutor(dir)
+	replaced, files, err := exec.ReplaceInTree(context.Background(), `foo\w+`, "XX", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replaced != 2 || files != 1 {
+		t.Fatalf("replaced=%d files=%d, want 2/1", replaced, files)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(data); got != "XX and XX\n" {
+		t.Fatalf("content = %q, want %q", got, "XX and XX\n")
+	}
+}
+
+func TestReplaceInTreeSingleFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "keep.txt"), []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "edit.txt"), []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exec := NewExecutor(dir)
+	replaced, files, err := exec.ReplaceInTree(context.Background(), "old", "new", "edit.txt", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replaced != 1 || files != 1 {
+		t.Fatalf("replaced=%d files=%d, want 1/1", replaced, files)
+	}
+	keep, _ := os.ReadFile(filepath.Join(dir, "keep.txt"))
+	edit, _ := os.ReadFile(filepath.Join(dir, "edit.txt"))
+	if string(keep) != "old\n" {
+		t.Fatalf("keep.txt should be unchanged, got %q", keep)
+	}
+	if string(edit) != "new\n" {
+		t.Fatalf("edit.txt = %q, want new", edit)
+	}
+}

@@ -169,67 +169,14 @@ func (s *Server) fsWrite(path, content string) error {
 	return s.agent.Executor.OverwriteFile(path, content)
 }
 
-// fsReplace performs a search-and-replace across files matching the given pattern.
-// It returns the total number of replacements made and the number of files modified.
+// fsReplace performs a regex search-and-replace across files matching the given
+// pattern (same semantics as fs_search / SearchCode). It walks the tree rather
+// than relying on the capped search result set, so replace-all is complete.
 func (s *Server) fsReplace(ctx context.Context, search, replacement, subpath, glob string) (replaced int, fileCount int, err error) {
 	if s.agent == nil || s.agent.Executor == nil {
 		return 0, 0, fmt.Errorf("executor unavailable")
 	}
-	if search == "" {
-		return 0, 0, fmt.Errorf("search pattern is required")
-	}
-
-	// First, search for all matches to know which files to modify
-	matches, _, searchErr := s.fsSearch(ctx, search, subpath, glob)
-	if searchErr != nil {
-		return 0, 0, fmt.Errorf("search failed: %w", searchErr)
-	}
-	if len(matches) == 0 {
-		return 0, 0, nil
-	}
-
-	// Group matches by file path
-	filesToModify := make(map[string]bool)
-	for _, m := range matches {
-		filesToModify[m.Path] = true
-	}
-
-	// Process each file
-	for filePath := range filesToModify {
-		if ctx.Err() != nil {
-			return 0, 0, ctx.Err()
-		}
-
-		// Read the file content
-		data, err := s.agent.Executor.ReadFileRawBytes(filePath)
-		if err != nil {
-			return 0, 0, fmt.Errorf("failed to read %s: %w", filePath, err)
-		}
-
-		// Check if it's a binary file
-		if bytes.IndexByte(data, 0) >= 0 {
-			continue // Skip binary files
-		}
-
-		content := string(data)
-		// Replace all occurrences of the search pattern
-		newContent := strings.ReplaceAll(content, search, replacement)
-		if newContent == content {
-			continue // No changes made
-		}
-
-		// Count replacements in this file
-		fileReplacements := strings.Count(content, search)
-		replaced += fileReplacements
-		fileCount++
-
-		// Write the modified content back
-		if err := s.agent.Executor.OverwriteFile(filePath, newContent); err != nil {
-			return 0, 0, fmt.Errorf("failed to write %s: %w", filePath, err)
-		}
-	}
-
-	return replaced, fileCount, nil
+	return s.agent.Executor.ReplaceInTree(ctx, search, replacement, subpath, glob)
 }
 
 func (s *Server) gitStatusEntries(ctx context.Context) ([]GitStatusEntry, error) {

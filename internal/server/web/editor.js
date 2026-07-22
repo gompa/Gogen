@@ -86,7 +86,28 @@ export async function initMonaco() {
 
   // Dynamic import: avoids blocking the WebSocket connection on a 3.8 MB download.
   monacoInitPromise = (async () => {
-    const mod = await import('/monaco/editor.bundle.js');
+    // Load the editor stylesheet alongside the JS bundle so the Chat-only
+    // first paint never pays for 128KB of Monaco CSS. Once-only guard.
+    // Must wait for the CSS to finish loading before creating any editor,
+    // otherwise the diff viewer renders with wrong sizing and scrollbars.
+    let cssPromise = Promise.resolve();
+    if (!document.getElementById('monaco-editor-css')) {
+      const link = document.createElement('link');
+      link.id = 'monaco-editor-css';
+      link.rel = 'stylesheet';
+      link.href = '/monaco/editor.main.css';
+      cssPromise = new Promise((resolve) => {
+        link.onload = () => resolve();
+        link.onerror = () => resolve(); // proceed anyway on error
+        // Safety timeout: never block more than 5s waiting for CSS.
+        setTimeout(() => resolve(), 5000);
+      });
+      document.head.appendChild(link);
+    }
+    // Start the JS download in parallel but don't proceed until CSS is ready.
+    const jsPromise = import('/monaco/editor.bundle.js');
+    await cssPromise;
+    const mod = await jsPromise;
     monaco = mod.default;
     // Monaco 0.52+ no longer ships a built-in unified-diff highlighter.
     if (!monaco.languages.getLanguages().some((l) => l.id === 'diff')) {
@@ -295,6 +316,8 @@ export async function colorizeElement(el, langHint) {
     el.innerHTML = html;
     el.dataset.monacoColorized = '1';
     el.classList.add('monaco-colorized');
+    // Notify scroll system that DOM height may have changed.
+    window.dispatchEvent(new CustomEvent('gogen-colorized', { bubbles: false }));
   } catch (_) {
     // Unknown / unloaded language — leave plain text.
   }
@@ -341,6 +364,8 @@ export async function colorizeCodeBlocks(root) {
       // Unknown / unloaded language — leave plain text.
     }
   }
+  // Notify scroll system that DOM height may have changed.
+  window.dispatchEvent(new CustomEvent('gogen-colorized', { bubbles: false }));
 }
 
 /** Colorize unified-diff lines via decorations (works even if language tokens are missing). */
@@ -1028,21 +1053,29 @@ export function setupEditorUI() {
   }
 
   /**
-   * Highlight `search` inside `text`.
-   * If `replacement` is provided, show the replaced version instead.
+   * Highlight `search` inside `text` using the same regex semantics as backend search.
+   * If `replacement` is provided, show the replaced line instead.
    */
   function highlightMatch(text, search, replacement) {
-    // Split on search term (case-sensitive literal)
-    const parts = text.split(search);
-    const display = replacement !== undefined ? replacement : search;
-    const cls = replacement !== undefined ? 'rp-highlight' : 'rp-highlight';
-    return parts.map((p, i) => {
-      let out = escHTML(p);
-      if (i < parts.length - 1) {
-        out += `<span class="${cls}">${escHTML(display)}</span>`;
-      }
-      return out;
-    }).join('');
+    let re;
+    try {
+      re = new RegExp(search, 'g');
+    } catch {
+      const lit = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      re = new RegExp(lit, 'g');
+    }
+    if (replacement !== undefined) {
+      return escHTML(text.replace(re, replacement));
+    }
+    let out = '';
+    let last = 0;
+    for (const m of text.matchAll(re)) {
+      out += escHTML(text.slice(last, m.index));
+      out += `<span class="rp-highlight">${escHTML(m[0])}</span>`;
+      last = m.index + m[0].length;
+    }
+    out += escHTML(text.slice(last));
+    return out;
   }
 
   /**
