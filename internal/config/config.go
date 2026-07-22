@@ -37,6 +37,9 @@ type Config struct {
 	MCP             string
 	MCPServers      []MCPServerConfig
 
+	// DebugCompareMessages enables view-fingerprint comparison across turns (GOGEN_DEBUG_COMPARE_MESSAGES).
+	DebugCompareMessages bool
+
 	// ProjectGuidelines is loaded from the markdown body of the project file.
 	ProjectGuidelines string
 	ProjectFilePath   string
@@ -84,6 +87,7 @@ func Defaults() Config {
 		DebugLog:             "",
 		DebugSession:         "",
 		MCP:                  "off",
+		DebugCompareMessages: false,
 		WebBind:              "127.0.0.1:8081",
 		WebAllowedOrigins:    "",
 		WebTLSCertFile:       "",

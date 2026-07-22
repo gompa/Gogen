@@ -303,12 +303,12 @@ func (p *OpenAIProvider) messagesToChat(messages []Message) []openai.ChatComplet
 				if m.Content != "" {
 					asst.Content.OfString = param.NewOpt(m.Content)
 				}
-				for _, tc := range m.ToolCalls {
+				for i := range m.ToolCalls {
 					asst.ToolCalls = append(asst.ToolCalls, openai.ChatCompletionMessageToolCallParam{
-						ID: tc.ID,
+						ID: m.ToolCalls[i].ID,
 						Function: openai.ChatCompletionMessageToolCallFunctionParam{
-							Name:      tc.Name,
-							Arguments: toolCallArgumentsJSON(tc),
+							Name:      m.ToolCalls[i].Name,
+							Arguments: toolCallArgumentsJSON(&m.ToolCalls[i]),
 						},
 					})
 				}
@@ -328,17 +328,25 @@ func (p *OpenAIProvider) messagesToChat(messages []Message) []openai.ChatComplet
 }
 
 // toolCallArgumentsJSON returns provider-stable tool argument JSON.
-// Prefer the raw ArgsStr from the model so re-sends match the prior completion bytes.
-func toolCallArgumentsJSON(tc ToolCall) string {
+// Prefer the raw ArgsStr from the model so re-sends match the bytes that
+// established the prompt-cache prefix. Accepts a pointer so the exact wire
+// bytes can be pinned in tc.ArgsStr for all future turns.
+//
+// encoding/json already sorts map keys, so a remarsal fallback is
+// deterministic — but it still usually differs from the provider's original
+// ArgsStr (spacing/key order), which is why pinning matters.
+func toolCallArgumentsJSON(tc *ToolCall) string {
 	if s := strings.TrimSpace(tc.ArgsStr); s != "" && json.Valid([]byte(s)) {
+		// Pin the exact bytes we send so history stays aligned with the wire.
+		if tc.ArgsStr != s {
+			tc.ArgsStr = s
+		}
 		return tc.ArgsStr
 	}
 
-	// Falling back to re-marshaling breaks byte-level prompt-cache prefix
-	// stability. Log this so cache misses can be traced to a root cause.
+	// Falling back to re-marshaling can diverge from provider ArgsStr bytes.
+	// Log this so cache misses can be traced to a root cause.
 	if tc.ArgsStr != "" {
-		// ArgsStr was set but invalid JSON — indicates a provider bug or
-		// a message that was hand-constructed without preserving ArgsStr.
 		debuglog.Write("llm/tool_args", "toolCallArgumentsJSON: ArgsStr invalid, re-marshaling",
 			"", map[string]interface{}{
 				"name":    tc.Name,
@@ -346,6 +354,8 @@ func toolCallArgumentsJSON(tc ToolCall) string {
 				"argsStr": tc.ArgsStr,
 			})
 	} else if len(tc.Args) > 0 {
+		// ArgsStr was empty despite having parsed args — this happens
+		// when ToolCalls are constructed manually. Marshal once and pin.
 		debuglog.Write("llm/tool_args", "toolCallArgumentsJSON: ArgsStr empty, re-marshaling from map",
 			"", map[string]interface{}{
 				"name": tc.Name,
@@ -354,13 +364,23 @@ func toolCallArgumentsJSON(tc ToolCall) string {
 	}
 
 	if tc.Args == nil {
-		return "{}"
+		tc.ArgsStr = "{}"
+		return tc.ArgsStr
 	}
 	argsJSON, err := json.Marshal(tc.Args)
 	if err != nil {
-		return "{}"
+		tc.ArgsStr = "{}"
+		return tc.ArgsStr
 	}
-	return string(argsJSON)
+	tc.ArgsStr = string(argsJSON)
+	return tc.ArgsStr
+}
+
+// StabilizeToolCallArgs pins ArgsStr to the bytes that will be sent on the
+// wire. Call when appending tool calls to history so token estimates and
+// later re-sends share one stable prefix.
+func StabilizeToolCallArgs(tc *ToolCall) {
+	_ = toolCallArgumentsJSON(tc)
 }
 
 func (p *OpenAIProvider) GenerateResponse(ctx context.Context, messages []Message, allowedTools map[string]struct{}, tools []Tool) (Response, error) {

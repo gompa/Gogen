@@ -133,6 +133,7 @@ func main() {
 	a.SetProjectContext(cfg.ProjectFilePath, cfg.ProjectGuidelines, cfg.TestCommand, cfg.LintCommand)
 	a.TodoManager = agent.NewTodoManager(cfg.WorkingDir)
 	a.PinManager = agent.NewPinManager()
+	a.DebugCompareMessages = cfg.DebugCompareMessages
 
 	sessionEnabled := os.Getenv("GOGEN_SESSION_PERSIST") != "off"
 	store := session.NewStoreWithOptions(sessionEnabled, session.StoreOptions{

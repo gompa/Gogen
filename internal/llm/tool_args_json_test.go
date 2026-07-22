@@ -9,7 +9,7 @@ func TestToolCallArgumentsJSONPrefersArgsStr(t *testing.T) {
 		Args:    map[string]interface{}{"offset": 1.0, "path": "a.go"},
 		ArgsStr: raw,
 	}
-	if got := toolCallArgumentsJSON(tc); got != raw {
+	if got := toolCallArgumentsJSON(&tc); got != raw {
 		t.Fatalf("got %q, want exact ArgsStr", got)
 	}
 }
@@ -19,9 +19,12 @@ func TestToolCallArgumentsJSONFallsBackToMarshal(t *testing.T) {
 		Name: "read_file",
 		Args: map[string]interface{}{"path": "a.go"},
 	}
-	got := toolCallArgumentsJSON(tc)
+	got := toolCallArgumentsJSON(&tc)
 	if got != `{"path":"a.go"}` {
 		t.Fatalf("got %q", got)
+	}
+	if tc.ArgsStr != got {
+		t.Fatalf("ArgsStr not pinned: %q", tc.ArgsStr)
 	}
 }
 
@@ -31,7 +34,50 @@ func TestToolCallArgumentsJSONFallsBackOnInvalidArgsStr(t *testing.T) {
 		Args:    map[string]interface{}{"path": "a.go"},
 		ArgsStr: `{"path":`,
 	}
-	if got := toolCallArgumentsJSON(tc); got != `{"path":"a.go"}` {
+	if got := toolCallArgumentsJSON(&tc); got != `{"path":"a.go"}` {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestToolCallArgumentsJSONNormalizesWhitespace(t *testing.T) {
+	tc := ToolCall{
+		Name:    "read_file",
+		ArgsStr: "  {\"path\":\"a.go\"}  \n",
+	}
+	got := toolCallArgumentsJSON(&tc)
+	if got != `{"path":"a.go"}` {
+		t.Fatalf("got %q", got)
+	}
+	if tc.ArgsStr != got {
+		t.Fatalf("ArgsStr not normalized in place: %q", tc.ArgsStr)
+	}
+	// Second call must be identical (prompt-cache prefix stability).
+	if got2 := toolCallArgumentsJSON(&tc); got2 != got {
+		t.Fatalf("second call %q != first %q", got2, got)
+	}
+}
+
+func TestToolCallArgumentsJSONPinsEmptyObject(t *testing.T) {
+	tc := ToolCall{Name: "noop"}
+	if got := toolCallArgumentsJSON(&tc); got != "{}" {
+		t.Fatalf("got %q", got)
+	}
+	if tc.ArgsStr != "{}" {
+		t.Fatalf("nil Args should pin ArgsStr to {}, got %q", tc.ArgsStr)
+	}
+}
+
+func TestToolCallArgumentsJSONStableAcrossCalls(t *testing.T) {
+	tc := ToolCall{
+		Name: "read_file",
+		Args: map[string]interface{}{"z": 1.0, "a": 2.0, "m": 3.0},
+	}
+	first := toolCallArgumentsJSON(&tc)
+	second := toolCallArgumentsJSON(&tc)
+	if first != second {
+		t.Fatalf("unstable args json: %q vs %q", first, second)
+	}
+	if first != `{"a":2,"m":3,"z":1}` {
+		t.Fatalf("got %q, want sorted-key marshal", first)
 	}
 }

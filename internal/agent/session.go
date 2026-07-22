@@ -63,6 +63,7 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot) {
 	}
 	a.lastTurnUsage = nil
 	a.UsageAccum = UsageAccumulator{}
+	a.lastViewMessages = nil
 	a.SessionLabel = snap.Label
 	if m, ok := ParseMode(snap.Mode); ok {
 		a.Mode = m

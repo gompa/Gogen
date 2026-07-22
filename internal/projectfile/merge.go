@@ -36,6 +36,7 @@ func Merge(pf *ProjectFile, flags FlagOverrides) *config.Config {
 		DebugLog:             mergeString("GOGEN_DEBUG_LOG", file, "debug_log", file.DebugLog, def.DebugLog),
 		DebugSession:         mergeString("GOGEN_DEBUG_SESSION", file, "debug_session", file.DebugSession, def.DebugSession),
 		MCP:                  mergeString("GOGEN_MCP", file, "mcp", file.MCP, def.MCP),
+		DebugCompareMessages: mergeBool("GOGEN_DEBUG_COMPARE_MESSAGES", file, "debug_compare_messages", file.DebugCompareMessages, def.DebugCompareMessages),
 		MCPServers:           mergeMCPServers(file),
 		TestCommand:          mergeString("", file, "test_command", file.TestCommand, ""),
 		LintCommand:          mergeString("", file, "lint_command", file.LintCommand, ""),

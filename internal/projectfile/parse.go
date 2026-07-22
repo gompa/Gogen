@@ -237,6 +237,13 @@ func parseYAMLFrontMatter(yamlText string) (FileConfig, error) {
 	if v, ok := raw["mcp"]; ok {
 		cfg.MCP = asOnOffString(v)
 	}
+	if v, ok := raw["debug_compare_messages"]; ok {
+		b, err := asBool(v)
+		if err != nil {
+			return FileConfig{}, fmt.Errorf("debug_compare_messages: %w", err)
+		}
+		cfg.DebugCompareMessages = b
+	}
 	if v, ok := raw["mcp_servers"]; ok {
 		servers, err := parseMCPServers(v)
 		if err != nil {

@@ -30,6 +30,7 @@ type FileConfig struct {
 	DebugLog             string
 	DebugSession         string
 	MCP                  string
+	DebugCompareMessages bool
 	MCPServers           []MCPServerEntry
 	TestCommand          string
 	LintCommand          string

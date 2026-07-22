@@ -70,6 +70,7 @@ func (a *Agent) resetSessionState() {
 	contextmgr.InvalidateTokenCache()
 	a.lastTurnUsage = nil
 	a.UsageAccum = UsageAccumulator{}
+	a.lastViewMessages = nil
 	a.SessionLabel = ""
 	if a.PinManager != nil {
 		a.PinManager.ClearPins()
