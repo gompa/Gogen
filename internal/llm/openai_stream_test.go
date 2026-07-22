@@ -68,6 +68,70 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 	}
 }
 
+func TestGenerateResponseStreamKeepsRefusalSeparate(t *testing.T) {
+	t.Parallel()
+	const sse = `data: {"choices":[{"delta":{"refusal":"I cannot help with that."}}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(sse))
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(srv)
+	result, err := p.GenerateResponseStream(
+		t.Context(),
+		[]Message{{Role: "user", Content: "hi"}},
+		nil,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Content != "" {
+		t.Fatalf("Content should stay empty, got %q", result.Content)
+	}
+	if result.Refusal != "I cannot help with that." {
+		t.Fatalf("Refusal = %q", result.Refusal)
+	}
+}
+
+func TestGenerateResponseStreamKeepsReasoningOutOfContent(t *testing.T) {
+	t.Parallel()
+	const sse = `data: {"choices":[{"delta":{"reasoning_content":"only thinking"}}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(sse))
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(srv)
+	result, err := p.GenerateResponseStream(
+		t.Context(),
+		[]Message{{Role: "user", Content: "hi"}},
+		nil,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Content != "" {
+		t.Fatalf("Content should stay empty, got %q", result.Content)
+	}
+	if result.Reasoning != "only thinking" {
+		t.Fatalf("Reasoning = %q", result.Reasoning)
+	}
+}
+
 func TestGenerateResponseStreamIgnoresSpuriousStopDuringReasoning(t *testing.T) {
 	t.Parallel()
 	const sse = `data: {"choices":[{"delta":{"reasoning_content":"step one"}}]}

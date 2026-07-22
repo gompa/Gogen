@@ -56,11 +56,13 @@ func renderMessages(messages []llm.Message, workingDir string, modelName string,
 			if msg.Reasoning != "" {
 				lines = append(lines, ThinkingTagStyle.Render("<thinking>"+msg.Reasoning+"</thinking>"))
 			}
-			// Skip the assistant content line when it duplicates the reasoning
-			// (happens when the model only emitted reasoning with no content).
-			if msg.Content != "" && msg.Content != msg.Reasoning {
+			switch {
+			case msg.Content != "":
 				label := AssistantStyle.Render(assistantLabel)
 				lines = append(lines, label+" "+msg.Content)
+			case msg.Refusal != "":
+				label := AssistantStyle.Render(assistantLabel)
+				lines = append(lines, label+" "+msg.Refusal)
 			}
 			for _, tc := range msg.ToolCalls {
 				prefix := ToolCallStyle.Render("  →")
@@ -115,9 +117,7 @@ func renderToolResult(msg llm.Message, tcMap map[string]llm.ToolCall) []string {
 	if toolName == "show_diff" && isDiffContent(msg.Content) {
 		if rendered := renderDiff(msg.Content); rendered != "" {
 			lines = append(lines, DiffMetaStyle.Render("  ╭─ diff ─"))
-			for _, line := range strings.Split(rendered, "\n") {
-				lines = append(lines, line)
-			}
+			lines = append(lines, strings.Split(rendered, "\n")...)
 			lines = append(lines, DiffMetaStyle.Render("  ╰───────"))
 		}
 		return lines
@@ -129,9 +129,7 @@ func renderToolResult(msg llm.Message, tcMap map[string]llm.ToolCall) []string {
 		if diff, ok := tc.Args["diff"].(string); ok && diff != "" {
 			if rendered := renderDiff(diff); rendered != "" {
 				lines = append(lines, DiffMetaStyle.Render("  ╭─ diff ─"))
-				for _, line := range strings.Split(rendered, "\n") {
-					lines = append(lines, line)
-				}
+				lines = append(lines, strings.Split(rendered, "\n")...)
 				lines = append(lines, DiffMetaStyle.Render("  ╰───────"))
 			}
 			return lines

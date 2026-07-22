@@ -23,6 +23,10 @@ const (
 	// modelsCacheTTL avoids repeated full catalog fetches during startup
 	// (ValidateRestoredModel → ListModels + ModelContextLimit) and /models flows.
 	modelsCacheTTL = 60 * time.Second
+	// modelsCatalogTimeout bounds /v1/models and related catalog lookups.
+	// Separate from the long SSE stream idle timeout so a hung catalog
+	// endpoint cannot pin startup or the web WS loop for minutes.
+	modelsCatalogTimeout = 8 * time.Second
 )
 
 // isOpencodeURL reports whether baseURL points to an OpenCode endpoint that
@@ -40,7 +44,7 @@ type OpenAIProvider struct {
 	// promptCacheKey scopes provider-side prompt caching (defaults to none).
 	promptCacheKey param.Opt[string]
 
-	modelsMu       sync.Mutex
+	modelsMu       sync.RWMutex
 	modelsCache    []openai.Model
 	modelsCachedAt time.Time // zero means no successful cache entry
 	modelsFetch    *modelsFetch
@@ -57,8 +61,8 @@ func (p *OpenAIProvider) ModelName() string {
 }
 
 func (p *OpenAIProvider) currentModel() string {
-	p.modelsMu.Lock()
-	defer p.modelsMu.Unlock()
+	p.modelsMu.RLock()
+	defer p.modelsMu.RUnlock()
 	return p.model
 }
 
@@ -70,6 +74,21 @@ func (p *OpenAIProvider) cachedModelsLocked() ([]openai.Model, bool) {
 }
 
 func (p *OpenAIProvider) listModels(ctx context.Context) ([]openai.Model, error) {
+	ctx, cancel := context.WithTimeout(ctx, modelsCatalogTimeout)
+	defer cancel()
+
+	p.modelsMu.RLock()
+	if models, ok := p.cachedModelsLocked(); ok {
+		out := append([]openai.Model(nil), models...)
+		p.modelsMu.RUnlock()
+		return out, nil
+	}
+	if f := p.modelsFetch; f != nil {
+		p.modelsMu.RUnlock()
+		return waitModelsFetch(ctx, f)
+	}
+	p.modelsMu.RUnlock()
+
 	p.modelsMu.Lock()
 	if models, ok := p.cachedModelsLocked(); ok {
 		out := append([]openai.Model(nil), models...)
@@ -78,15 +97,7 @@ func (p *OpenAIProvider) listModels(ctx context.Context) ([]openai.Model, error)
 	}
 	if f := p.modelsFetch; f != nil {
 		p.modelsMu.Unlock()
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-f.done:
-			if f.err != nil {
-				return nil, f.err
-			}
-			return append([]openai.Model(nil), f.models...), nil
-		}
+		return waitModelsFetch(ctx, f)
 	}
 	f := &modelsFetch{done: make(chan struct{})}
 	p.modelsFetch = f
@@ -110,6 +121,18 @@ func (p *OpenAIProvider) listModels(ctx context.Context) ([]openai.Model, error)
 		return nil, err
 	}
 	return append([]openai.Model(nil), models...), nil
+}
+
+func waitModelsFetch(ctx context.Context, f *modelsFetch) ([]openai.Model, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-f.done:
+		if f.err != nil {
+			return nil, f.err
+		}
+		return append([]openai.Model(nil), f.models...), nil
+	}
 }
 
 // fetchModels loads the model catalog from the provider. OpenCode zen and go
@@ -226,16 +249,15 @@ func (p *OpenAIProvider) SetPromptCacheKey(key string) {
 // the lookup is cheap; otherwise it does a one-time discovery probe against
 // both endpoints to populate the cache.
 func (p *OpenAIProvider) clientForModel() *openai.Client {
-	p.modelsMu.Lock()
-	if p.modelClient == nil {
-		p.modelClient = make(map[string]*openai.Client)
-	}
-	if c, ok := p.modelClient[p.model]; ok {
-		p.modelsMu.Unlock()
-		return c
+	p.modelsMu.RLock()
+	if p.modelClient != nil {
+		if c, ok := p.modelClient[p.model]; ok {
+			p.modelsMu.RUnlock()
+			return c
+		}
 	}
 	model := p.model
-	p.modelsMu.Unlock()
+	p.modelsMu.RUnlock()
 
 	// Discovery: probe Zen first, then Go (deterministic order).
 	// Do not hold modelsMu across network I/O.
@@ -298,24 +320,32 @@ func (p *OpenAIProvider) messagesToChat(messages []Message) []openai.ChatComplet
 		case "user":
 			chatMessages = append(chatMessages, openai.UserMessage(m.Content))
 		case "assistant":
-			if len(m.ToolCalls) > 0 {
-				asst := openai.ChatCompletionAssistantMessageParam{}
-				if m.Content != "" {
-					asst.Content.OfString = param.NewOpt(m.Content)
-				}
-				for i := range m.ToolCalls {
-					asst.ToolCalls = append(asst.ToolCalls, openai.ChatCompletionMessageToolCallParam{
-						ID: m.ToolCalls[i].ID,
-						Function: openai.ChatCompletionMessageToolCallFunctionParam{
-							Name:      m.ToolCalls[i].Name,
-							Arguments: toolCallArgumentsJSON(&m.ToolCalls[i]),
-						},
-					})
-				}
-				chatMessages = append(chatMessages, openai.ChatCompletionMessageParamUnion{OfAssistant: &asst})
-			} else {
-				chatMessages = append(chatMessages, openai.AssistantMessage(m.Content))
+			// Always build an explicit assistant param so reasoning_content /
+			// refusal round-trip on the wire. Folding them into Content would
+			// diverge from the original completion bytes and bust prompt-cache
+			// prefixes on providers that emit those fields.
+			asst := openai.ChatCompletionAssistantMessageParam{}
+			if m.Content != "" {
+				asst.Content.OfString = param.NewOpt(m.Content)
 			}
+			if m.Refusal != "" {
+				asst.Refusal = param.NewOpt(m.Refusal)
+			}
+			if m.Reasoning != "" {
+				asst.SetExtraFields(map[string]any{
+					"reasoning_content": m.Reasoning,
+				})
+			}
+			for i := range m.ToolCalls {
+				asst.ToolCalls = append(asst.ToolCalls, openai.ChatCompletionMessageToolCallParam{
+					ID: m.ToolCalls[i].ID,
+					Function: openai.ChatCompletionMessageToolCallFunctionParam{
+						Name:      m.ToolCalls[i].Name,
+						Arguments: toolCallArgumentsJSON(&m.ToolCalls[i]),
+					},
+				})
+			}
+			chatMessages = append(chatMessages, openai.ChatCompletionMessageParamUnion{OfAssistant: &asst})
 		case "tool":
 			toolCallID := m.ToolCallID
 			if toolCallID == "" {
@@ -422,6 +452,9 @@ func (p *OpenAIProvider) GenerateResponse(ctx context.Context, messages []Messag
 	msg := resp.Choices[0].Message
 	extras := extraFieldsFromMessage(msg)
 	reasoning := primaryDisplayFromExtrasMap(extras)
+	// Keep content/reasoning/refusal separate. Providers that emit
+	// reasoning_content or refusal expect those fields echoed back; stuffing
+	// them into Content changes the wire bytes and busts prompt-cache prefixes.
 	display := content
 	if display == "" {
 		display = reasoning
@@ -431,8 +464,9 @@ func (p *OpenAIProvider) GenerateResponse(ctx context.Context, messages []Messag
 	}
 	logNonStreamResponse(model, "non-stream", content, msg.Refusal, display, extras, toolCalls, usageFromOpenAI(resp.Usage))
 	return Response{
-		Content:   display,
+		Content:   content,
 		Reasoning: reasoning,
+		Refusal:   msg.Refusal,
 		ToolCalls: toolCalls,
 		Usage:     usageFromOpenAI(resp.Usage),
 	}, nil
@@ -594,15 +628,18 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 		if resp.Reasoning != "" {
 			onThinking(resp.Reasoning)
 		}
-		if resp.Content != "" && (resp.Reasoning == "" || resp.Content != resp.Reasoning) {
+		if resp.Content != "" {
 			onToken(resp.Content)
+		} else if resp.Refusal != "" {
+			onToken(resp.Refusal)
 		}
 		return &StreamResult{
 			Content:       resp.Content,
 			Reasoning:     resp.Reasoning,
+			Refusal:       resp.Refusal,
 			ToolCalls:     resp.ToolCalls,
 			Usage:         resp.Usage,
-			PartialStream: len(tcAccums) > 0 || fullContent != "" || extras.textLen() > 0,
+			PartialStream: len(tcAccums) > 0 || fullContent != "" || fullRefusal != "" || extras.textLen() > 0,
 		}, nil
 	}
 
@@ -646,15 +683,11 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 		}
 	}
 
+	// Keep content/reasoning/refusal separate so re-sends match the original
+	// completion shape (required for provider prompt-cache prefix hits).
 	content := fullContent
-	if content == "" && fullRefusal != "" {
-		content = fullRefusal
-	}
-	if content == "" {
-		content = extras.primaryDisplayText()
-	}
 
-	if lastFinishReason == "" && (content != "" || len(tcAccums) > 0) {
+	if lastFinishReason == "" && (content != "" || fullRefusal != "" || fullReasoning != "" || len(tcAccums) > 0) {
 		if len(tcAccums) > 0 {
 			lastFinishReason = "tool_calls"
 		} else {
@@ -662,19 +695,23 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 		}
 	}
 
-	if lastFinishReason == "" && content == "" && len(toolCalls) == 0 {
+	if lastFinishReason == "" && content == "" && fullRefusal == "" && fullReasoning == "" && len(toolCalls) == 0 {
 		return nil, fmt.Errorf("stream ended without finish_reason")
 	}
 
 	return &StreamResult{
 		Content:   content,
 		Reasoning: fullReasoning,
+		Refusal:   fullRefusal,
 		ToolCalls: toolCalls,
 		Usage:     streamUsage,
 	}, nil
 }
 
 func (p *OpenAIProvider) ModelContextLimit(ctx context.Context) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, modelsCatalogTimeout)
+	defer cancel()
+
 	models, _ := p.listModels(ctx)
 
 	p.modelsMu.Lock()

@@ -6,12 +6,6 @@ import (
 	"strings"
 )
 
-// gitCmdResult holds the output from a git command execution.
-type gitCmdResult struct {
-	text string
-	err  error
-}
-
 // runGitCommand executes a git command with common error handling.
 // It returns the trimmed text output. On error, it wraps the error with
 // the git subcommand name. If ctx is cancelled, it returns the context error.

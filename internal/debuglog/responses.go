@@ -15,26 +15,26 @@ var (
 
 // LLMResponseRecord is a full snapshot of one model turn for offline review.
 type LLMResponseRecord struct {
-	Timestamp    int64                  `json:"timestamp"`
-	SessionID    string                 `json:"sessionId,omitempty"`
-	Model        string                 `json:"model"`
-	Source       string                 `json:"source"` // stream, stream-fallback, non-stream
-	Attempt      int                    `json:"attempt,omitempty"`
-	FinishReason string                 `json:"finishReason,omitempty"`
-	Error        string                 `json:"error,omitempty"`
-	Content      string                 `json:"content"`
-	Refusal      string                 `json:"refusal,omitempty"`
-	Reasoning    string                 `json:"reasoning,omitempty"`
-	ExtraFields     map[string]string      `json:"extraFields,omitempty"`
-	DeltaSamples    []string               `json:"deltaSamples,omitempty"`
-	ChunkDeltas     []string               `json:"chunkDeltas,omitempty"`
-	DisplayContent  string                 `json:"displayContent,omitempty"`
-	ToolCalls    []LLMToolCallRecord    `json:"toolCalls,omitempty"`
-	DroppedTools []LLMDroppedToolRecord `json:"droppedTools,omitempty"`
-	PartialTools []LLMDroppedToolRecord `json:"partialTools,omitempty"`
-	ChunkCount   int                    `json:"chunkCount,omitempty"`
-	UsedFallback bool                   `json:"usedFallback,omitempty"`
-	Usage        map[string]int         `json:"usage,omitempty"`
+	Timestamp      int64                  `json:"timestamp"`
+	SessionID      string                 `json:"sessionId,omitempty"`
+	Model          string                 `json:"model"`
+	Source         string                 `json:"source"` // stream, stream-fallback, non-stream
+	Attempt        int                    `json:"attempt,omitempty"`
+	FinishReason   string                 `json:"finishReason,omitempty"`
+	Error          string                 `json:"error,omitempty"`
+	Content        string                 `json:"content"`
+	Refusal        string                 `json:"refusal,omitempty"`
+	Reasoning      string                 `json:"reasoning,omitempty"`
+	ExtraFields    map[string]string      `json:"extraFields,omitempty"`
+	DeltaSamples   []string               `json:"deltaSamples,omitempty"`
+	ChunkDeltas    []string               `json:"chunkDeltas,omitempty"`
+	DisplayContent string                 `json:"displayContent,omitempty"`
+	ToolCalls      []LLMToolCallRecord    `json:"toolCalls,omitempty"`
+	DroppedTools   []LLMDroppedToolRecord `json:"droppedTools,omitempty"`
+	PartialTools   []LLMDroppedToolRecord `json:"partialTools,omitempty"`
+	ChunkCount     int                    `json:"chunkCount,omitempty"`
+	UsedFallback   bool                   `json:"usedFallback,omitempty"`
+	Usage          map[string]int         `json:"usage,omitempty"`
 }
 
 type LLMToolCallRecord struct {

@@ -25,6 +25,7 @@ type Usage struct {
 type Response struct {
 	Content   string
 	Reasoning string
+	Refusal   string // model refusal text when content is empty (kept separate for cache stability)
 	ToolCalls []ToolCall
 	Usage     *Usage
 }
@@ -48,26 +49,27 @@ type StreamCallback func(token string)
 
 // StreamHandlers provides optional callbacks for streaming and progress events.
 type StreamHandlers struct {
-	OnStart             func()                                      // called once when processing begins
-	OnRoundStart        func()                                      // called at the start of each LLM round after the first
-	OnStreamOpened      func()                                      // called when the SSE connection is established
-	OnStreamStall       func()                                      // called when no SSE chunk arrives for several seconds
-	OnStreamActivity    func()                                      // called on the first visible content/refusal token
-	OnThinkingToken     StreamCallback                              // called for each reasoning/thinking token (display separately)
-	OnToken             StreamCallback                              // called for each content token
-	OnStreamEnd         func()                                      // called when a streamed LLM turn completes with pending tool calls
-	OnToolCallStart     func(index int, id, name string)            // called when a tool call name first appears in the stream
-	OnToolCallArgsDelta func(index int, id, name, argsDelta string) // called for each streamed args fragment
-	OnToolCall          func(tc ToolCall)                           // called before a tool executes (args fully parsed)
-	OnRecoverPartialStream func()                                   // reset UI after stream error mid-tool-call
-	OnToolExecute       func(name string)                           // called immediately before a tool runs (may block)
-	OnToolResult        func(id, name, result string, success bool) // called after a tool executes
+	OnStart                func()                                      // called once when processing begins
+	OnRoundStart           func()                                      // called at the start of each LLM round after the first
+	OnStreamOpened         func()                                      // called when the SSE connection is established
+	OnStreamStall          func()                                      // called when no SSE chunk arrives for several seconds
+	OnStreamActivity       func()                                      // called on the first visible content/refusal token
+	OnThinkingToken        StreamCallback                              // called for each reasoning/thinking token (display separately)
+	OnToken                StreamCallback                              // called for each content token
+	OnStreamEnd            func()                                      // called when a streamed LLM turn completes with pending tool calls
+	OnToolCallStart        func(index int, id, name string)            // called when a tool call name first appears in the stream
+	OnToolCallArgsDelta    func(index int, id, name, argsDelta string) // called for each streamed args fragment
+	OnToolCall             func(tc ToolCall)                           // called before a tool executes (args fully parsed)
+	OnRecoverPartialStream func()                                      // reset UI after stream error mid-tool-call
+	OnToolExecute          func(name string)                           // called immediately before a tool runs (may block)
+	OnToolResult           func(id, name, result string, success bool) // called after a tool executes
 }
 
 // StreamResult holds the final accumulated response from a streamed call.
 type StreamResult struct {
 	Content       string
 	Reasoning     string // reasoning/thinking content accumulated during streaming
+	Refusal       string // refusal text accumulated during streaming (kept separate from Content)
 	ToolCalls     []ToolCall
 	Usage         *Usage
 	PartialStream bool // true when streaming failed after partial output before fallback
@@ -94,7 +96,8 @@ type LLMProvider interface {
 type Message struct {
 	Role       string
 	Content    string
-	Reasoning  string     // reasoning/thinking content from the model
+	Reasoning  string     // reasoning/thinking content from the model (sent as reasoning_content)
+	Refusal    string     // refusal text from the model (sent as refusal; not folded into Content)
 	ToolCalls  []ToolCall // set on assistant messages that invoke tools
 	ToolCallID string     // set on tool result messages
 }

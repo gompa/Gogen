@@ -71,10 +71,10 @@ type Model struct {
 	progressLabel string
 
 	// Chat content buffer (lines to render)
-	chatLines       []string
-	wrappedPrefix   string   // pre-wrapped content of chatLines[:len-1], ends with "\n" if non-empty
-	wrappedContent  string   // pre-computed wrapped content for viewport
-	maxWrappedWidth int      // cached max line width (incremental, avoids O(N) scan)
+	chatLines        []string
+	wrappedPrefix    string   // pre-wrapped content of chatLines[:len-1], ends with "\n" if non-empty
+	wrappedContent   string   // pre-computed wrapped content for viewport
+	maxWrappedWidth  int      // cached max line width (incremental, avoids O(N) scan)
 	styledLines      []string // wrappedContent split by "\n" (cached for selection render)
 	styledLinesDirty bool     // true when styledLines needs recomputation
 
@@ -120,15 +120,15 @@ type Model struct {
 	completionLine string // the full line at time of tab press
 
 	// Approval state
-	approvalResult chan bool
-	approvalUI     *approvalUIState
+	approvalResult   chan bool
+	approvalUI       *approvalUIState
 	approvalInFlight bool
 
 	// Modal data
 	sessionList   []agent.SessionInfo
 	modelList     []llm.ModelInfo
-	sessionCursor    int
-	modelCursor int
+	sessionCursor int
+	modelCursor   int
 
 	// Keymap
 	keys KeyMap
@@ -146,7 +146,6 @@ type Model struct {
 	dividerCacheWidth  int
 	dividerCacheFocus  FocusTarget
 	dividerCacheStream bool
-	statusBarDirty     bool
 	statusMsg          string // transient message (e.g. "Copied N chars")
 }
 
@@ -598,7 +597,6 @@ func (m *Model) View() string {
 		return ""
 	}
 
-
 	// Viewport content: use selection-aware render when selecting,
 	// otherwise use the stock viewport render.
 	var vpView string
@@ -881,7 +879,7 @@ func (m *Model) handleStreamToolArgs(index int, id string, delta string) {
 			diffStart := m.streamToolDiffStart[index]
 			// Update existing diff lines (content may have grown within a line)
 			for i := 0; i < prevCount && i < newCount; i++ {
-				m.chatLines[diffStart+i] = "  "+renderedLines[i]
+				m.chatLines[diffStart+i] = "  " + renderedLines[i]
 			}
 			// Append new diff lines
 			for i := prevCount; i < newCount; i++ {
@@ -1033,9 +1031,7 @@ func (m *Model) handleStreamToolResult(id string, name string, result string, su
 			rendered := renderDiff(diff)
 			if rendered != "" {
 				newLines = append(newLines, DiffMetaStyle.Render("  ╭─ diff ─"))
-				for _, line := range strings.Split(rendered, "\n") {
-					newLines = append(newLines, line)
-				}
+				newLines = append(newLines, strings.Split(rendered, "\n")...)
 				newLines = append(newLines, DiffMetaStyle.Render("  ╰───────"))
 			}
 		}
@@ -1043,9 +1039,7 @@ func (m *Model) handleStreamToolResult(id string, name string, result string, su
 		rendered := renderDiff(result)
 		if rendered != "" {
 			newLines = append(newLines, DiffMetaStyle.Render("  ╭─ diff ─"))
-			for _, line := range strings.Split(rendered, "\n") {
-				newLines = append(newLines, line)
-			}
+			newLines = append(newLines, strings.Split(rendered, "\n")...)
 			newLines = append(newLines, DiffMetaStyle.Render("  ╰───────"))
 		}
 	} else if m.verbose {
@@ -1254,24 +1248,6 @@ func (m *Model) checkPersistError() {
 		m.statusMsg = fmt.Sprintf("Warning: failed to save session: %v", err)
 	}
 }
-
-// requestContextStats refreshes the status-bar indicator asynchronously.
-// Prefer refreshContextStats from Update handlers when the stream is idle.
-func (m *Model) requestContextStats() tea.Cmd {
-	if m.agent == nil {
-		return nil
-	}
-	a := m.agent
-	ctx := m.ctx
-	return func() tea.Msg {
-		if ctx == nil {
-			ctx = context.Background()
-		}
-		return contextStatsMsg{stats: a.ContextStats(context.WithoutCancel(ctx))}
-	}
-}
-
-
 
 func (m *Model) handleStreamError(err error) {
 	wasStreaming := m.streaming

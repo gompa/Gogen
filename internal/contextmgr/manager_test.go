@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"gogen/internal/llm"
 )
@@ -34,6 +35,61 @@ func (s *stubProvider) SetModel(id string) error {
 
 func (s *stubProvider) ModelName() string {
 	return "test-model"
+}
+
+type blockingLimitProvider struct {
+	stubProvider
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (p *blockingLimitProvider) ModelContextLimit(_ context.Context) (int, error) {
+	close(p.entered)
+	<-p.release
+	return 64000, nil
+}
+
+func TestEnsureContextLimitDoesNotHoldLockDuringProviderIO(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	m := NewManager(&blockingLimitProvider{
+		entered: entered,
+		release: release,
+	}, Settings{})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.EnsureContextLimit(context.Background())
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("provider ModelContextLimit was not entered")
+	}
+
+	// Snapshot only needs RLock; it must not stall behind provider I/O.
+	snapDone := make(chan struct{})
+	go func() {
+		defer close(snapDone)
+		_ = m.Snapshot(nil, nil)
+	}()
+	select {
+	case <-snapDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Snapshot blocked while EnsureContextLimit waited on provider")
+	}
+
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("EnsureContextLimit did not finish")
+	}
+	if got := m.ContextLimit(); got != 64000 {
+		t.Fatalf("ContextLimit=%d, want 64000", got)
+	}
 }
 
 func TestTruncateToolResult(t *testing.T) {

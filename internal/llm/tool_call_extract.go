@@ -418,17 +418,3 @@ func parseToolCallFromJSONString(jsonStr string) []ToolCall {
 
 	return result
 }
-
-// sanitizeToolCallName removes any non-alphanumeric characters from tool call names
-func sanitizeToolCallName(name string) string {
-	var sb strings.Builder
-	for _, c := range name {
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
-			sb.WriteRune(c)
-		}
-	}
-	if sb.Len() == 0 {
-		return "unknown_tool"
-	}
-	return sb.String()
-}

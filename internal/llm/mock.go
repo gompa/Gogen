@@ -86,7 +86,7 @@ func (m *MockProvider) GenerateResponseStream(ctx context.Context, messages []Me
 		}
 		return result, nil
 	}
-	out := &StreamResult{Content: resp.Content, ToolCalls: resp.ToolCalls, Usage: resp.Usage}
+	out := &StreamResult{Content: resp.Content, Reasoning: resp.Reasoning, Refusal: resp.Refusal, ToolCalls: resp.ToolCalls, Usage: resp.Usage}
 	if h != nil {
 		emitStreamResult(h, out)
 	}
@@ -100,8 +100,13 @@ func emitStreamResult(h *StreamHandlers, result *StreamResult) {
 	if h.OnStreamOpened != nil {
 		h.OnStreamOpened()
 	}
+	if result.Reasoning != "" && h.OnThinkingToken != nil {
+		h.OnThinkingToken(result.Reasoning)
+	}
 	if result.Content != "" && h.OnToken != nil {
 		h.OnToken(result.Content)
+	} else if result.Refusal != "" && h.OnToken != nil {
+		h.OnToken(result.Refusal)
 	}
 	for _, tc := range result.ToolCalls {
 		if h.OnToolCallStart != nil {

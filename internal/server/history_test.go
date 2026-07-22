@@ -64,3 +64,20 @@ func TestHistoryEntriesIncludesReasoning(t *testing.T) {
 		t.Fatalf("content-only entry should have empty reasoning: %q", got[3].Reasoning)
 	}
 }
+
+func TestHistoryEntriesIncludesRefusal(t *testing.T) {
+	msgs := []llm.Message{
+		{Role: "user", Content: "bad request"},
+		{Role: "assistant", Refusal: "I cannot help with that."},
+	}
+	got := historyEntries(msgs)
+	if len(got) != 2 {
+		t.Fatalf("len=%d want 2: %#v", len(got), got)
+	}
+	if got[1].Refusal != "I cannot help with that." {
+		t.Fatalf("refusal = %q", got[1].Refusal)
+	}
+	if got[1].Content != "" {
+		t.Fatalf("content should stay empty: %q", got[1].Content)
+	}
+}

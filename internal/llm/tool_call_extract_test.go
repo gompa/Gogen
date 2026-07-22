@@ -80,7 +80,7 @@ true
 			wantN: 1,
 		},
 		{
-			name: "JSON without tool_call wrapper",
+			name:  "JSON without tool_call wrapper",
 			input: `I'll use {"name": "list_files", "arguments": {"path": "/tmp"}}`,
 			want:  "list_files",
 			wantN: 1,

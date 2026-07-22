@@ -70,7 +70,7 @@ func (a *Agent) resetSessionState() {
 	contextmgr.InvalidateTokenCache()
 	a.lastTurnUsage = nil
 	a.UsageAccum = UsageAccumulator{}
-	a.lastViewMessages = nil
+	a.clearViewDriftSnapshot()
 	a.SessionLabel = ""
 	if a.PinManager != nil {
 		a.PinManager.ClearPins()
@@ -101,13 +101,13 @@ func (a *Agent) handleResumeArg(ctx context.Context, args, newSessionID string) 
 		if err != nil {
 			return SessionCommandResult{}, true, err
 		}
-		return SessionCommandResult{Output: out, Action: SessionActionClearChat, History: a.Messages}, true, nil
+		return SessionCommandResult{Output: out, Action: SessionActionClearChat, History: append([]llm.Message(nil), a.Messages...)}, true, nil
 	}
 	out, err := a.resumeSessionByID(ctx, args)
 	if err != nil {
 		return SessionCommandResult{}, true, err
 	}
-	return SessionCommandResult{Output: out, Action: SessionActionClearChat, History: a.Messages}, true, nil
+	return SessionCommandResult{Output: out, Action: SessionActionClearChat, History: append([]llm.Message(nil), a.Messages...)}, true, nil
 }
 
 func (a *Agent) startNewSession(newID string) (string, error) {
@@ -146,7 +146,7 @@ func (a *Agent) resumeSessionByID(ctx context.Context, id string) (string, error
 	// validation / context-limit refresh runs in the background (same as
 	// process startup) and must not block the resume WS response.
 	model := snap.Model
-	a.RestoreSessionLocal(snap)
+	a.RestoreSessionLocal(snap, id)
 	a.SessionID = id
 	// Persist immediately so the resumed session gets a fresh UpdatedAt
 	// timestamp and appears at the top of the session sidebar list.

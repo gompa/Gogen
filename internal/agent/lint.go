@@ -10,7 +10,7 @@ import (
 
 // RunLint runs the project lint command with optional extra arguments.
 func (e *Executor) RunLint(ctx context.Context, extraArgs, lintCommandOverride string) (string, error) {
-	cmd := DetectLintCommand(e.WorkingDir, lintCommandOverride)
+	cmd := DetectLintCommand(e.GetWorkingDir(), lintCommandOverride)
 	if cmd == "" {
 		return "", fmt.Errorf("no lint command detected; set lint_command in GOGEN.md or use execute_command")
 	}

@@ -10,7 +10,6 @@ import (
 
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
-	"gogen/internal/debuglog"
 	"gogen/internal/llm"
 	"gogen/internal/projectfile"
 )
@@ -37,14 +36,17 @@ type Agent struct {
 	lastTurnUsage  *llm.Usage
 	lastPersistErr error
 	// sessionDirty tracks whether in-memory state differs from disk.
-	// All session persistence methods (persistSession, FlushSession, doPersist)
-	// are called exclusively from the agent's owner goroutine, so no mutex is needed.
-	sessionDirty     bool
-	lastPersistTime  time.Time // timestamp of last actual disk write
+	// TUI: single owner goroutine. Web server: Server.agentMu + turnMu serialize
+	// access across WebSocket clients (see internal/server).
+	sessionDirty    bool
+	lastPersistTime time.Time // timestamp of last actual disk write
 
-	// Debug: compare message views across turns (GOGEN_DEBUG_COMPARE_MESSAGES).
+	// DebugCompareMessages enables view-fingerprint comparison across turns
+	// and session restores (GOGEN_DEBUG_COMPARE_MESSAGES). Only effective in
+	// binaries built with `-tags debug`; production builds compile the
+	// detector out (see view_drift_release.go).
 	DebugCompareMessages bool
-	lastViewMessages     []llm.Message
+	lastViewMessages     []llm.Message // debug builds only; unused in release
 
 	// Runtime / project
 	WorkingDir        string
@@ -64,7 +66,7 @@ func NewAgent(provider llm.LLMProvider, executor *Executor, ctxMgr *contextmgr.M
 		Executor:     executor,
 		Context:      ctxMgr,
 		Messages:     []llm.Message{},
-		WorkingDir:   executor.WorkingDir,
+		WorkingDir:   executor.GetWorkingDir(),
 		Mode:         ModeAct,
 		toolHandlers: BuiltinToolHandlers(),
 	}
@@ -199,7 +201,7 @@ func (a *Agent) SetWorkingDir(dir string) {
 	a.WorkingDir = dir
 	a.projectProfile = ""
 	if a.Executor != nil {
-		a.Executor.WorkingDir = dir
+		a.Executor.SetWorkingDir(dir)
 	}
 	if a.TodoManager != nil {
 		a.TodoManager.SetWorkingDir(dir)
@@ -308,12 +310,7 @@ func (a *Agent) prepareMessages(ctx context.Context) []llm.Message {
 	// false-positive when messagesToChat would have written ArgsStr later).
 	stabilizeViewToolArgs(view)
 
-	if a.DebugCompareMessages && len(a.lastViewMessages) > 0 {
-		a.compareViewFingerprints(view)
-	}
-	if a.DebugCompareMessages {
-		a.lastViewMessages = cloneViewMessages(view)
-	}
+	a.recordViewForDrift(view)
 	return view
 }
 
@@ -323,85 +320,6 @@ func stabilizeViewToolArgs(view []llm.Message) {
 			llm.StabilizeToolCallArgs(&view[i].ToolCalls[j])
 		}
 	}
-}
-
-// compareViewFingerprints detects prefix drift that would bust provider
-// prompt-cache hits. Append-only growth is fine (shared prefix stays valid);
-// only overlapping-message mutations are reported.
-func (a *Agent) compareViewFingerprints(current []llm.Message) {
-	overlap := len(current)
-	if len(a.lastViewMessages) < overlap {
-		overlap = len(a.lastViewMessages)
-	}
-	mismatchIdx := -1
-	for i := 0; i < overlap; i++ {
-		if !messagesEqual(&current[i], &a.lastViewMessages[i]) {
-			mismatchIdx = i
-			break
-		}
-	}
-	if mismatchIdx < 0 {
-		return // Shared prefix unchanged — cache-safe (even if length grew/shrank at the end).
-	}
-	prevMsg := a.lastViewMessages[mismatchIdx]
-	newMsg := current[mismatchIdx]
-	debuglog.Write("agent/view-drift", "message view prefix changed between turns",
-		"view-mismatch", map[string]interface{}{
-			"turnNewCount":       len(current),
-			"turnPrevCount":      len(a.lastViewMessages),
-			"firstMismatchIndex": mismatchIdx,
-			"prevRole":           prevMsg.Role,
-			"newRole":            newMsg.Role,
-			"prevContentLen":     len(prevMsg.Content),
-			"newContentLen":      len(newMsg.Content),
-			"prevToolCalls":      len(prevMsg.ToolCalls),
-			"newToolCalls":       len(newMsg.ToolCalls),
-			"prevArgsStrLen":     toolCallsArgsStrLen(prevMsg.ToolCalls),
-			"newArgsStrLen":      toolCallsArgsStrLen(newMsg.ToolCalls),
-		})
-}
-
-func toolCallsArgsStrLen(tcs []llm.ToolCall) int {
-	n := 0
-	for i := range tcs {
-		n += len(tcs[i].ArgsStr)
-	}
-	return n
-}
-
-// cloneViewMessages deep-copies messages for drift detection. ToolCalls must
-// be cloned so later ArgsStr pinning on a.Messages cannot silently update the
-// previous-turn snapshot (shared slice backing).
-func cloneViewMessages(msgs []llm.Message) []llm.Message {
-	out := make([]llm.Message, len(msgs))
-	for i := range msgs {
-		out[i] = msgs[i]
-		if len(msgs[i].ToolCalls) == 0 {
-			continue
-		}
-		out[i].ToolCalls = make([]llm.ToolCall, len(msgs[i].ToolCalls))
-		copy(out[i].ToolCalls, msgs[i].ToolCalls)
-	}
-	return out
-}
-
-// messagesEqual compares fields that affect the serialized LLM request
-// (Reasoning is display-only and not sent by messagesToChat).
-func messagesEqual(a, b *llm.Message) bool {
-	if a.Role != b.Role || a.Content != b.Content || a.ToolCallID != b.ToolCallID {
-		return false
-	}
-	if len(a.ToolCalls) != len(b.ToolCalls) {
-		return false
-	}
-	for i := range a.ToolCalls {
-		if a.ToolCalls[i].ID != b.ToolCalls[i].ID ||
-			a.ToolCalls[i].Name != b.ToolCalls[i].Name ||
-			a.ToolCalls[i].ArgsStr != b.ToolCalls[i].ArgsStr {
-			return false
-		}
-	}
-	return true
 }
 
 // CompactHistory manually compacts conversation history at a task boundary.
@@ -490,18 +408,20 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 		a.recordTurnUsage(result.Usage)
 		a.UsageAccum.Add(result.Usage)
 
-		if len(result.ToolCalls) == 0 && result.Content != "" {
+		if len(result.ToolCalls) == 0 {
 			finishStreamUI(h)
-			a.Messages = append(a.Messages, llm.Message{Role: "assistant", Content: result.Content, Reasoning: result.Reasoning})
+			a.Messages = append(a.Messages, llm.Message{
+				Role:      "assistant",
+				Content:   result.Content,
+				Reasoning: result.Reasoning,
+				Refusal:   result.Refusal,
+			})
 			a.FlushSession()
-			return result.Content, nil
-		}
-
-		if len(result.ToolCalls) == 0 && result.Content == "" {
-			finishStreamUI(h)
-			a.Messages = append(a.Messages, llm.Message{Role: "assistant", Content: "", Reasoning: result.Reasoning})
-			a.FlushSession()
-			return "", nil
+			if result.Content != "" {
+				return result.Content, nil
+			}
+			// Refusal is user-visible when the model declined without content.
+			return result.Refusal, nil
 		}
 
 		if h.OnStreamEnd != nil {
@@ -521,6 +441,7 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 			Role:      "assistant",
 			Content:   result.Content,
 			Reasoning: result.Reasoning,
+			Refusal:   result.Refusal,
 			ToolCalls: result.ToolCalls,
 		})
 

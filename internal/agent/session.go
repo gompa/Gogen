@@ -38,7 +38,13 @@ type SessionInfo struct {
 // RestoreSessionLocal loads messages, mode, and model from a snapshot without
 // contacting the provider. Prefer this at process startup so the UI can come
 // up before model validation / context-limit lookup.
-func (a *Agent) RestoreSessionLocal(snap SessionSnapshot) {
+//
+// newSessionID is the id being resumed into (may be empty at process startup).
+// Debug builds with GOGEN_DEBUG_COMPARE_MESSAGES compare the previous session's
+// wire view against the restored view (compiled out of production binaries).
+func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
+	prevSessionID := a.SessionID
+
 	a.Messages = append([]llm.Message(nil), snap.Messages...)
 	// Token counts are keyed by content fingerprint, so entries from the
 	// previous session remain valid as long as the content hasn't changed.
@@ -63,7 +69,6 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot) {
 	}
 	a.lastTurnUsage = nil
 	a.UsageAccum = UsageAccumulator{}
-	a.lastViewMessages = nil
 	a.SessionLabel = snap.Label
 	if m, ok := ParseMode(snap.Mode); ok {
 		a.Mode = m
@@ -71,6 +76,8 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot) {
 	if snap.Model != "" {
 		_ = a.Provider.SetModel(snap.Model)
 	}
+
+	a.compareViewOnRestore(prevSessionID, newSessionID)
 }
 
 // ValidateRestoredModel checks that model still exists at the provider and
@@ -99,7 +106,7 @@ func (a *Agent) ValidateRestoredModel(ctx context.Context, model string) {
 // RestoreSession loads messages, mode, and model from a snapshot, then
 // validates the model against the provider (network).
 func (a *Agent) RestoreSession(ctx context.Context, snap SessionSnapshot) {
-	a.RestoreSessionLocal(snap)
+	a.RestoreSessionLocal(snap, a.SessionID)
 	a.ValidateRestoredModel(ctx, snap.Model)
 }
 

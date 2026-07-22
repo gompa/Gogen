@@ -113,7 +113,7 @@ func parseDDGHTMLResults(body []byte, maxResults int) []searchResult {
 
 	var (
 		inResult    bool
-		resultDepth int    // >0 inside result; emit when drops to 0
+		resultDepth int // >0 inside result; emit when drops to 0
 		inTitle     bool
 		inSnippet   bool
 		titleTag    string // tag name that opened result__title (e.g. "h2")

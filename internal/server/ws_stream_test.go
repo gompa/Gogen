@@ -1,6 +1,26 @@
 package server
 
-import "testing"
+import (
+	"sync/atomic"
+	"testing"
+)
+
+func TestWSTokenBatcherFlushReleasesLockBeforeSend(t *testing.T) {
+	var b *wsTokenBatcher
+	var sendSawUnlocked atomic.Bool
+	b = newWSTokenBatcher(func(WSMessage) {
+		// TryLock succeeds only if flush released b.mu before send.
+		if b.mu.TryLock() {
+			sendSawUnlocked.Store(true)
+			b.mu.Unlock()
+		}
+	})
+	b.streamToken("hi")
+	b.flush()
+	if !sendSawUnlocked.Load() {
+		t.Fatal("flush held b.mu across send")
+	}
+}
 
 func TestWSTokenBatcherPreservesThinkThenContentOrder(t *testing.T) {
 	var msgs []WSMessage

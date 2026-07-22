@@ -144,4 +144,3 @@ func TestCleanDDGLink(t *testing.T) {
 		}
 	}
 }
-

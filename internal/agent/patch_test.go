@@ -109,9 +109,9 @@ func TestParseUnifiedDiffGitStyleMultiFile(t *testing.T) {
 func TestNormalizePatchPathStripsTimestampsAndQuotes(t *testing.T) {
 	cases := map[string]string{
 		"a/foo.txt\t2024-01-01 12:00:00.000000000 +0000": "foo.txt",
-		"b/foo.txt 2024-01-01 12:00:00":                   "foo.txt",
-		`"b/foo bar.txt"`: "foo bar.txt",
-		"a/foo.txt":       "foo.txt",
+		"b/foo.txt 2024-01-01 12:00:00":                  "foo.txt",
+		`"b/foo bar.txt"`:                                "foo bar.txt",
+		"a/foo.txt":                                      "foo.txt",
 	}
 	for in, want := range cases {
 		got := normalizePatchPath(in)

@@ -70,7 +70,7 @@ func (m *Model) renderProgressInput() string {
 		if label == "" {
 			label = "running tool"
 		}
-		line = DimStyle.Render("  "+m.spinner.View()+" "+label)
+		line = DimStyle.Render("  " + m.spinner.View() + " " + label)
 	case progressActive:
 		line = progressStreamingLine
 	default:

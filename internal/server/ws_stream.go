@@ -1,11 +1,68 @@
 package server
 
 import (
+	"context"
 	"sync"
 	"time"
 )
 
 const wsTokenFlushInterval = 16 * time.Millisecond
+
+// wsConnStream owns the in-flight stream cancel handle for one WebSocket
+// connection. Allocated on the heap so the read loop and stream goroutine
+// share clear ownership (not ad-hoc locals).
+type wsConnStream struct {
+	mu     sync.Mutex
+	cancel context.CancelFunc
+	errCh  chan error
+}
+
+func (s *wsConnStream) cancelInFlight() {
+	s.mu.Lock()
+	if s.cancel == nil {
+		s.mu.Unlock()
+		return
+	}
+	s.cancel()
+	prevErr := s.errCh
+	s.cancel = nil
+	s.errCh = nil
+	s.mu.Unlock()
+	drainStreamErr(prevErr)
+}
+
+func (s *wsConnStream) close() {
+	s.mu.Lock()
+	if s.cancel == nil {
+		s.mu.Unlock()
+		return
+	}
+	s.cancel()
+	prevErr := s.errCh
+	s.cancel = nil
+	s.errCh = nil
+	s.mu.Unlock()
+	drainStreamErr(prevErr)
+}
+
+// begin registers a new stream cancel handle. Caller must already have
+// cancelled any prior stream. Returns the error channel the stream
+// goroutine should signal on exit.
+func (s *wsConnStream) begin(cancel context.CancelFunc) chan error {
+	s.mu.Lock()
+	s.cancel = cancel
+	s.errCh = make(chan error, 1)
+	errCh := s.errCh
+	s.mu.Unlock()
+	return errCh
+}
+
+func (s *wsConnStream) end() {
+	s.mu.Lock()
+	s.cancel = nil
+	s.errCh = nil
+	s.mu.Unlock()
+}
 
 type wsTokenSeg struct {
 	think bool
@@ -36,12 +93,15 @@ func (b *wsTokenBatcher) scheduleFlushLocked() {
 
 func (b *wsTokenBatcher) flush() {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if b.timer != nil {
 		b.timer.Stop()
 		b.timer = nil
 	}
-	for _, seg := range b.segs {
+	segs := b.segs
+	b.segs = nil
+	b.mu.Unlock()
+
+	for _, seg := range segs {
 		if seg.text == "" {
 			continue
 		}
@@ -51,7 +111,6 @@ func (b *wsTokenBatcher) flush() {
 			b.send(WSMessage{Type: "stream", Content: seg.text})
 		}
 	}
-	b.segs = b.segs[:0]
 }
 
 func (b *wsTokenBatcher) appendLocked(think bool, token string) {

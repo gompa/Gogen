@@ -121,6 +121,10 @@ func messageFingerprint(msg *llm.Message) uint64 {
 	_, _ = h.Write([]byte{0})
 	_, _ = h.Write([]byte(msg.Content))
 	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(msg.Reasoning))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(msg.Refusal))
+	_, _ = h.Write([]byte{0})
 	_, _ = h.Write([]byte(msg.ToolCallID))
 	for _, tc := range msg.ToolCalls {
 		_, _ = h.Write([]byte{0})
@@ -179,6 +183,16 @@ func countTokensExact(msg llm.Message) (int, bool) {
 		return 0, false
 	}
 	tokens += len(ids)
+	if msg.Reasoning != "" {
+		if ids, _, err := c.Encode(msg.Reasoning); err == nil {
+			tokens += len(ids)
+		}
+	}
+	if msg.Refusal != "" {
+		if ids, _, err := c.Encode(msg.Refusal); err == nil {
+			tokens += len(ids)
+		}
+	}
 	for _, tc := range msg.ToolCalls {
 		tokens += 4
 		if ids, _, err := c.Encode(tc.Name); err == nil {
@@ -214,6 +228,8 @@ func countTokensExact(msg llm.Message) (int, bool) {
 
 func estimateMessageTokensHeuristic(msg llm.Message) int {
 	tokens := (len(msg.Content) + 3) / 4
+	tokens += (len(msg.Reasoning) + 3) / 4
+	tokens += (len(msg.Refusal) + 3) / 4
 	tokens += 4 // role/overhead
 	for _, tc := range msg.ToolCalls {
 		tokens += (len(tc.Name)+len(tc.ID)+12)/4 + 4

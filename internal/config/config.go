@@ -38,6 +38,7 @@ type Config struct {
 	MCPServers      []MCPServerConfig
 
 	// DebugCompareMessages enables view-fingerprint comparison across turns (GOGEN_DEBUG_COMPARE_MESSAGES).
+	// Only effective in binaries built with `-tags debug`; ignored otherwise.
 	DebugCompareMessages bool
 
 	// ProjectGuidelines is loaded from the markdown body of the project file.

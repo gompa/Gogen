@@ -133,3 +133,46 @@ func TestFetchModelsQueriesOpenCodeEndpointsInParallel(t *testing.T) {
 		t.Fatalf("expected 2 models, got %d (%v)", len(models), models)
 	}
 }
+
+func TestListModelsHonorsCallerDeadline(t *testing.T) {
+	started := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			http.NotFound(w, r)
+			return
+		}
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	client := openai.NewClient(
+		option.WithBaseURL(srv.URL+"/"),
+		option.WithAPIKey("test"),
+		option.WithHTTPClient(srv.Client()),
+	)
+	p := &OpenAIProvider{
+		client:      client,
+		modelClient: make(map[string]*openai.Client),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := p.listModels(ctx)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected deadline error from hung /models")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("listModels ignored caller deadline: took %s", elapsed)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("server never saw /models request")
+	}
+}

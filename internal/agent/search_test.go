@@ -18,7 +18,7 @@ func TestSplitSearchLine(t *testing.T) {
 	if !ok || file != "file:with:colons.txt" || rest != "12:a:b:c" {
 		t.Fatalf("unexpected result: %q, %q, %v", file, rest, ok)
 	}
-	file, rest, ok = splitSearchLine("No matches found")
+	_, _, ok = splitSearchLine("No matches found")
 	if ok {
 		t.Fatal("should reject non-match lines")
 	}

@@ -46,7 +46,7 @@ go build -o gogen .
 Build without tree-sitter (smaller binary, no syntax checks or symbol extraction):
 
 ```bash
-CGO_ENABLED=0 go build -o gogen .
+CGO_ENABLED=0 go build -o gogen-nocgo .
 ```
 
 ### Run
@@ -143,7 +143,7 @@ Markdown files for agent instructions and rules:
 ```markdown
 # Project guidelines
 
-- Run `make test` before finishing Go changes.
+- Run `make test` before finishing Go changes. Use `make test-debug` (or `make check`) when touching debug-tagged packages (`internal/agent` view-drift, `internal/profiling`).
 - Never modify files in vendor/.
 ```
 

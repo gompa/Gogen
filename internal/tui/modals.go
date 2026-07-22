@@ -49,9 +49,9 @@ func (m *Model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // --- Approval Modal ---
 
 type approvalUIState struct {
-	paths   []string
-	reason  string
-	cursor  int // 0 = No, 1 = Yes
+	paths  []string
+	reason string
+	cursor int // 0 = No, 1 = Yes
 }
 
 func (m *Model) renderApprovalModal() string {
@@ -276,7 +276,6 @@ type styleLine struct {
 	text      string
 	highlight bool // if true, apply ansiHighlightOn; if false, ansiDimOn
 	preStyled bool // if true, text already contains ANSI; don't add prefix
-	prompt    bool // if true and preStyled, use ansiPromptOn instead of highlight/dim
 }
 
 // renderBorderedModal draws a plain border box around styled text lines.

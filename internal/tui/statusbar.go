@@ -12,7 +12,7 @@ func (m *Model) renderStatusBar() string {
 		return ""
 	}
 	if m.agent == nil {
-		return StatusBarStyle.Copy().Width(m.width).Render("")
+		return StatusBarStyle.Width(m.width).Render("")
 	}
 
 	var leftParts []string
@@ -24,7 +24,7 @@ func (m *Model) renderStatusBar() string {
 		msgWidth := lipgloss.Width(content)
 		padLeft := max(0, (m.width-msgWidth)/2)
 		result := strings.Repeat(" ", padLeft) + content
-		return StatusBarStyle.Copy().Width(m.width).Render(result)
+		return StatusBarStyle.Width(m.width).Render(result)
 	}
 
 	// Mode
@@ -92,5 +92,5 @@ func (m *Model) renderStatusBar() string {
 
 	content := left + strings.Repeat(" ", middleWidth) + right
 
-	return StatusBarStyle.Copy().Width(m.width).Render(content)
+	return StatusBarStyle.Width(m.width).Render(content)
 }

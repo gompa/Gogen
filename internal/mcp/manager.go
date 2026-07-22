@@ -45,12 +45,12 @@ type Client struct {
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
 
-	mu       sync.Mutex
-	writeMu  sync.Mutex
-	nextID   atomic.Int64
-	pending  map[int64]chan jsonRPCResponse
-	closed   chan struct{}
-	closeOnce sync.Once
+	mu         sync.Mutex
+	writeMu    sync.Mutex
+	nextID     atomic.Int64
+	pending    map[int64]chan jsonRPCResponse
+	closed     chan struct{}
+	closeOnce  sync.Once
 	readerDone chan struct{}
 }
 

@@ -8,7 +8,7 @@ import (
 
 // RunTests runs the project test command with optional target and extra arguments.
 func (e *Executor) RunTests(ctx context.Context, target, extraArgs, testCommandOverride string) (string, error) {
-	cmd := DetectTestCommand(e.WorkingDir, testCommandOverride)
+	cmd := DetectTestCommand(e.GetWorkingDir(), testCommandOverride)
 	if cmd == "" {
 		return "", fmt.Errorf("no test command detected; set test_command in GOGEN.md or use execute_command")
 	}

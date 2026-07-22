@@ -53,7 +53,7 @@ func (e *Executor) SecurePath(path string) (string, error) {
 	if path == "" {
 		return "", fmt.Errorf("path is required")
 	}
-	absWD, err := filepath.Abs(e.WorkingDir)
+	absWD, err := filepath.Abs(e.GetWorkingDir())
 	if err != nil {
 		return "", err
 	}

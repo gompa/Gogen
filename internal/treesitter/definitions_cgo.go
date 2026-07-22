@@ -15,9 +15,9 @@ import (
 var queryFS embed.FS
 
 var (
-	queryOnce  sync.Once
+	queryOnce   sync.Once
 	queryByLang map[string]string
-	queryCache sync.Map // lang -> *tree_sitter.Query
+	queryCache  sync.Map // lang -> *tree_sitter.Query
 )
 
 func initQueries() {

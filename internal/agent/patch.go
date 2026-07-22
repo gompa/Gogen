@@ -23,12 +23,11 @@ type patchHunk struct {
 }
 
 type patchPlan struct {
-	target   string
-	secure   string
-	original []byte
-	updated  string
-	delete   bool
-	create   bool
+	target  string
+	secure  string
+	updated string
+	delete  bool
+	create  bool
 }
 
 // PatchFile applies a unified diff to files under the working directory.

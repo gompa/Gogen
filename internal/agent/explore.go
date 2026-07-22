@@ -73,43 +73,37 @@ func resetGlobRegexCacheLocked() {
 	globRegexOrder = globRegexOrder[:0]
 }
 
-// ListFiles lists directory entries. When recursive is true, walks the tree (max 500 paths).
+// ListFiles lists directory entries as workspace-relative paths (same convention as
+// GlobFiles / search_code), so results can be passed straight to read_file.
+// When recursive is true, walks the tree (max 500 paths).
 // When trackedOnly is true, results are filtered to git-tracked files.
 func (e *Executor) ListFiles(path string, recursive, trackedOnly bool) (string, error) {
-	secure, err := e.SecurePath(path)
+	searchRoot, relPrefix, err := e.searchRoot(path)
 	if err != nil {
 		return "", err
-	}
-	info, err := os.Stat(secure)
-	if err != nil {
-		return "", err
-	}
-	if !info.IsDir() {
-		return "", fmt.Errorf("path is not a directory: %s", path)
 	}
 	if !recursive {
-		entries, err := os.ReadDir(secure)
+		entries, err := os.ReadDir(searchRoot)
 		if err != nil {
 			return "", err
 		}
-		var sb strings.Builder
+		var lines []string
 		for _, entry := range entries {
-			name := entry.Name()
-			if entry.IsDir() {
-				name += "/"
-			}
-			sb.WriteString(name)
-			sb.WriteByte('\n')
+			display := workspaceRelPath(relPrefix, entry.Name(), entry.IsDir())
+			lines = append(lines, display)
 		}
-		return sb.String(), nil
+		if len(lines) == 0 {
+			return "(empty)", nil
+		}
+		return strings.Join(lines, "\n"), nil
 	}
 
 	var lines []string
-	err = filepath.WalkDir(secure, func(walkPath string, d os.DirEntry, walkErr error) error {
+	err = filepath.WalkDir(searchRoot, func(walkPath string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return nil
 		}
-		if walkPath == secure {
+		if walkPath == searchRoot {
 			return nil
 		}
 		if shouldSkipSearchEntry(d.Name(), d.IsDir()) {
@@ -118,12 +112,15 @@ func (e *Executor) ListFiles(path string, recursive, trackedOnly bool) (string, 
 			}
 			return nil
 		}
-		rel, err := relDisplayPath(secure, walkPath, d.IsDir())
+		rel, err := relDisplayPath(searchRoot, walkPath, d.IsDir())
 		if err != nil {
 			return nil
 		}
 		if rel == "" {
 			return nil
+		}
+		if relPrefix != "" {
+			rel = workspaceRelPath(relPrefix, strings.TrimSuffix(rel, "/"), d.IsDir())
 		}
 		lines = append(lines, rel)
 		if len(lines) >= exploreMaxEntries {
@@ -136,7 +133,7 @@ func (e *Executor) ListFiles(path string, recursive, trackedOnly bool) (string, 
 	}
 	sort.Strings(lines)
 	if trackedOnly {
-		lines = filterTracked(e.WorkingDir, lines)
+		lines = filterTracked(e.GetWorkingDir(), lines)
 	}
 	out := strings.Join(lines, "\n")
 	if err == errExploreTruncated {
@@ -146,6 +143,19 @@ func (e *Executor) ListFiles(path string, recursive, trackedOnly bool) (string, 
 		return "(empty)", nil
 	}
 	return out, nil
+}
+
+// workspaceRelPath joins a workspace-relative prefix with a path segment.
+// Directories keep a trailing slash for list_files output.
+func workspaceRelPath(relPrefix, name string, isDir bool) string {
+	display := name
+	if relPrefix != "" {
+		display = filepath.ToSlash(filepath.Join(relPrefix, name))
+	}
+	if isDir {
+		display += "/"
+	}
+	return display
 }
 
 func filterTracked(workingDir string, paths []string) []string {
@@ -233,7 +243,7 @@ func (e *Executor) GlobFiles(pattern, subpath string, trackedOnly bool) (string,
 	}
 	sort.Strings(matches)
 	if trackedOnly {
-		matches = filterTracked(e.WorkingDir, matches)
+		matches = filterTracked(e.GetWorkingDir(), matches)
 	}
 	out := strings.Join(matches, "\n")
 	if err == errExploreTruncated {

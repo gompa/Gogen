@@ -108,12 +108,19 @@ func (b *tokenBatcher) scheduleFlushLocked() {
 
 func (b *tokenBatcher) flush() {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.flushLocked()
-}
+	if b.closed {
+		b.mu.Unlock()
+		return
+	}
+	segs := b.segs
+	b.segs = nil
+	if b.timer != nil {
+		b.timer.Stop()
+		b.timer = nil
+	}
+	b.mu.Unlock()
 
-func (b *tokenBatcher) flushLocked() {
-	for _, seg := range b.segs {
+	for _, seg := range segs {
 		if seg.text == "" {
 			continue
 		}
@@ -123,17 +130,13 @@ func (b *tokenBatcher) flushLocked() {
 			b.send(streamTokenMsg{token: seg.text})
 		}
 	}
-	b.segs = b.segs[:0]
-	if b.timer != nil {
-		b.timer.Stop()
-		b.timer = nil
-	}
 }
 
-// Close drains all pending segments, stops the timer, and sets the closed
+// Close discards pending segments, stops the timer, and sets the closed
 // flag so that any late-arriving timer goroutine flush is a no-op. Called
 // at stream round end (OnStreamEnd / OnToolCallStart) to prevent stale
 // thinking tokens from creating duplicate <thinking> blocks in the TUI.
+// Callers that need delivery must flush() before Close().
 func (b *tokenBatcher) Close() {
 	b.mu.Lock()
 	defer b.mu.Unlock()

@@ -20,10 +20,28 @@ jobs:
           sudo apt-get install -y -qq ripgrep gcc-aarch64-linux-gnu
       - name: Build linux/amd64
         run: GOOS=linux GOARCH=amd64 go build -o gogen-linux-amd64 -ldflags="-s -w" .
+      - name: Format
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: Tidy
+        run: go mod tidy -diff
       - name: Test
         run: go test -v -race ./...
+      - name: Test debug tags
+        run: go test -v -race -tags debug ./internal/agent/ ./internal/profiling/
       - name: Vet
         run: go vet ./...
+      - name: Staticcheck
+        run: go tool staticcheck ./...
+      - name: Vulncheck
+        run: go tool govulncheck ./...
+      - name: Build without CGO
+        run: CGO_ENABLED=0 go build -o gogen-nocgo .
       - name: Build linux/arm64
         run: CC=aarch64-linux-gnu-gcc GOOS=linux GOARCH=arm64 go build -o gogen-linux-arm64 -ldflags="-s -w" .
 

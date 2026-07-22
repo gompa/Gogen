@@ -5,21 +5,21 @@ import "github.com/charmbracelet/bubbles/key"
 // KeyMap defines all keybindings for the TUI.
 type KeyMap struct {
 	// Input
-	Submit       key.Binding
-	CancelTurn   key.Binding
-	ForceQuit    key.Binding
-	BackwardWord key.Binding
-	ForwardWord  key.Binding
-	KillToEnd    key.Binding
-	KillToStart  key.Binding
-	KillWord     key.Binding
+	Submit        key.Binding
+	CancelTurn    key.Binding
+	ForceQuit     key.Binding
+	BackwardWord  key.Binding
+	ForwardWord   key.Binding
+	KillToEnd     key.Binding
+	KillToStart   key.Binding
+	KillWord      key.Binding
 	DeleteForward key.Binding
-	DeleteBack   key.Binding
-	LineStart    key.Binding
-	LineEnd      key.Binding
-	HistoryUp    key.Binding
-	HistoryDown  key.Binding
-	Completion   key.Binding
+	DeleteBack    key.Binding
+	LineStart     key.Binding
+	LineEnd       key.Binding
+	HistoryUp     key.Binding
+	HistoryDown   key.Binding
+	Completion    key.Binding
 
 	// Viewport
 	ViewportUp       key.Binding
@@ -31,7 +31,7 @@ type KeyMap struct {
 	ViewportHalfUp   key.Binding
 	ViewportHalfDown key.Binding
 	FocusViewport    key.Binding
-	FocusInput      key.Binding
+	FocusInput       key.Binding
 
 	// Global
 	Help          key.Binding
@@ -66,7 +66,7 @@ var DefaultKeyMap = KeyMap{
 	ViewportHalfUp:   key.NewBinding(key.WithKeys("ctrl+u"), key.WithHelp("ctrl+u", "half page up")),
 	ViewportHalfDown: key.NewBinding(key.WithKeys("ctrl+d"), key.WithHelp("ctrl+d", "half page down")),
 	FocusViewport:    key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "focus viewport")),
-	FocusInput:      key.NewBinding(key.WithKeys("i", "enter"), key.WithHelp("i/enter", "focus input")),
+	FocusInput:       key.NewBinding(key.WithKeys("i", "enter"), key.WithHelp("i/enter", "focus input")),
 
 	Help:          key.NewBinding(key.WithKeys("f1"), key.WithHelp("f1 / ?", "help")),
 	Quit:          key.NewBinding(key.WithKeys("ctrl+c"), key.WithHelp("ctrl+c", "quit")),

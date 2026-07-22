@@ -66,7 +66,51 @@ func NewManager(provider llm.LLMProvider, settings Settings) *Manager {
 }
 
 // RefreshAfterModelChange updates the context limit for the newly selected model.
+// Provider I/O runs without holding m.mu so Snapshot/ContextStats are not stalled
+// behind a slow /v1/models call.
 func (m *Manager) RefreshAfterModelChange(ctx context.Context) {
+	m.mu.Lock()
+	if m.manualContextLimit > 0 {
+		m.Settings.ContextLimit = m.manualContextLimit
+		m.limitResolved = true
+		m.mu.Unlock()
+		return
+	}
+	m.Settings.ContextLimit = 0
+	m.limitResolved = false
+	m.mu.Unlock()
+	m.resolveContextLimit(ctx)
+}
+
+// EnsureContextLimit resolves ContextLimit from the provider when not set explicitly.
+// A positive Settings.ContextLimit from GOGEN_CONTEXT_LIMIT is a manual override and
+// skips provider lookup; RefreshAfterModelChange preserves that override.
+// Provider I/O runs without holding m.mu.
+func (m *Manager) EnsureContextLimit(ctx context.Context) {
+	m.mu.Lock()
+	if m.Settings.ContextLimit > 0 && m.limitResolved {
+		m.mu.Unlock()
+		return
+	}
+	if m.Settings.ContextLimit > 0 {
+		m.limitResolved = true
+		m.mu.Unlock()
+		return
+	}
+	m.mu.Unlock()
+	m.resolveContextLimit(ctx)
+}
+
+// resolveContextLimit fetches the provider limit without holding m.mu, then
+// stores the result. Concurrent resolvers are safe: the first successful store
+// wins unless a manual override lands mid-flight.
+func (m *Manager) resolveContextLimit(ctx context.Context) {
+	limit := 128000
+	if m.Provider != nil {
+		if n, err := m.Provider.ModelContextLimit(ctx); err == nil && n > 0 {
+			limit = n
+		}
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.manualContextLimit > 0 {
@@ -74,34 +118,10 @@ func (m *Manager) RefreshAfterModelChange(ctx context.Context) {
 		m.limitResolved = true
 		return
 	}
-	m.Settings.ContextLimit = 0
-	m.limitResolved = false
-	m.ensureContextLimitLocked(ctx)
-}
-
-// EnsureContextLimit resolves ContextLimit from the provider when not set explicitly.
-// A positive Settings.ContextLimit from GOGEN_CONTEXT_LIMIT is a manual override and
-// skips provider lookup; RefreshAfterModelChange preserves that override.
-func (m *Manager) EnsureContextLimit(ctx context.Context) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.ensureContextLimitLocked(ctx)
-}
-
-func (m *Manager) ensureContextLimitLocked(ctx context.Context) {
-	if m.Settings.ContextLimit > 0 && m.limitResolved {
+	if m.limitResolved && m.Settings.ContextLimit > 0 {
 		return
 	}
-	if m.Settings.ContextLimit > 0 {
-		m.limitResolved = true
-		return
-	}
-	if limit, err := m.Provider.ModelContextLimit(ctx); err == nil && limit > 0 {
-		m.Settings.ContextLimit = limit
-		m.limitResolved = true
-		return
-	}
-	m.Settings.ContextLimit = 128000
+	m.Settings.ContextLimit = limit
 	m.limitResolved = true
 }
 
@@ -119,6 +139,10 @@ func (m *Manager) TruncateToolResult(content string) string {
 	m.mu.RLock()
 	max := m.Settings.MaxToolResultBytes
 	m.mu.RUnlock()
+	return truncateToolResult(content, max)
+}
+
+func truncateToolResult(content string, max int) string {
 	if max <= 0 || len(content) <= max {
 		return content
 	}
@@ -143,14 +167,15 @@ type ContextSnapshot struct {
 // Snapshot estimates token usage for canonical history and the LLM view.
 func (m *Manager) Snapshot(canonical, llmView []llm.Message) ContextSnapshot {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
 	limit := m.Settings.ContextLimit
 	if limit <= 0 {
 		limit = 128000
 	}
+	compactAt := m.compactBudgetLocked()
+	m.mu.RUnlock()
+
 	used := m.EstimateTokens(llmView)
 	stored := m.EstimateTokens(canonical)
-	compactAt := m.compactBudgetLocked()
 	snap := ContextSnapshot{
 		Limit:         limit,
 		Used:          used,
@@ -222,7 +247,7 @@ func (m *Manager) EnsureToolResultsCapped(messages []llm.Message) bool {
 		if len(messages[i].Content) <= max {
 			continue
 		}
-		messages[i].Content = m.TruncateToolResult(messages[i].Content)
+		messages[i].Content = truncateToolResult(messages[i].Content, max)
 		changed = true
 	}
 	if changed {
@@ -390,12 +415,6 @@ func (m *Manager) summarizeMessages(ctx context.Context, messages []llm.Message,
 	return merged, nil
 }
 
-func (m *Manager) maxSummaryInputTokens() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.maxSummaryInputTokensLocked()
-}
-
 func (m *Manager) maxSummaryInputTokensLocked() int {
 	limit := m.Settings.ContextLimit
 	if limit <= 0 {
@@ -467,10 +486,18 @@ Conversation segment:
 	if err != nil {
 		return "", fmt.Errorf("context summarization failed: %w", err)
 	}
-	if resp.Content == "" {
+	summary := resp.Content
+	if summary == "" {
+		summary = resp.Refusal
+	}
+	if summary == "" {
+		// Some local models only emit reasoning for short completions.
+		summary = resp.Reasoning
+	}
+	if summary == "" {
 		return "", fmt.Errorf("context summarization returned empty summary")
 	}
-	return resp.Content, nil
+	return summary, nil
 }
 
 func writeMessageForSummary(b *strings.Builder, msg llm.Message, maxToolBytes int, toolNames map[string]string) {
@@ -480,6 +507,8 @@ func writeMessageForSummary(b *strings.Builder, msg llm.Message, maxToolBytes in
 	case "assistant":
 		if msg.Content != "" {
 			fmt.Fprintf(b, "ASSISTANT: %s\n", msg.Content)
+		} else if msg.Refusal != "" {
+			fmt.Fprintf(b, "ASSISTANT REFUSAL: %s\n", msg.Refusal)
 		}
 		for _, tc := range msg.ToolCalls {
 			fmt.Fprintf(b, "TOOL CALL: %s(%v)\n", tc.Name, tc.Args)
@@ -502,6 +531,7 @@ func cloneMessage(msg llm.Message) llm.Message {
 		Role:       msg.Role,
 		Content:    msg.Content,
 		Reasoning:  msg.Reasoning,
+		Refusal:    msg.Refusal,
 		ToolCallID: msg.ToolCallID,
 	}
 	if len(msg.ToolCalls) > 0 {

@@ -30,6 +30,43 @@ func TestListFilesRecursive(t *testing.T) {
 	}
 }
 
+func TestListFilesSubdirWorkspaceRelative(t *testing.T) {
+	dir := t.TempDir()
+	web := filepath.Join(dir, "internal", "server", "web")
+	if err := os.MkdirAll(web, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(web, "index.html"), []byte("<html>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := NewExecutor(dir)
+
+	out, err := exec.ListFiles("internal", true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "internal/server/web/index.html") {
+		t.Fatalf("expected workspace-relative path, got: %q", out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if line == "server/" || line == "server/web/" || line == "server/web/index.html" {
+			t.Fatalf("subdir-relative path leaked into listing: %q\nfull:\n%s", line, out)
+		}
+	}
+
+	out, err = exec.ListFiles("internal", false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "internal/server/") {
+		t.Fatalf("expected workspace-relative dir entry, got: %q", out)
+	}
+	if strings.Contains(out, "\nserver/") || out == "server/" || strings.HasPrefix(out, "server/") {
+		t.Fatalf("subdir-relative dir entry leaked: %q", out)
+	}
+}
+
 func TestGlobFiles(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("x"), 0o644); err != nil {

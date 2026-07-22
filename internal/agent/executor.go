@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -18,7 +19,8 @@ const (
 )
 
 type Executor struct {
-	WorkingDir            string
+	wdMu                  sync.RWMutex
+	WorkingDir            string // read via GetWorkingDir; write via SetWorkingDir
 	Commands              *CommandGuard
 	RequireDeleteApproval bool
 	CommandTimeout        time.Duration // 0 = default 2 minutes
@@ -46,6 +48,21 @@ func NewExecutorWithGuard(wd string, guard *CommandGuard) *Executor {
 		CommandTimeout:        2 * time.Minute,
 		Sandbox:               "off",
 	}
+}
+
+// GetWorkingDir returns the current working directory.
+// Safe for concurrent use with SetWorkingDir (e.g. FS browser vs config change).
+func (e *Executor) GetWorkingDir() string {
+	e.wdMu.RLock()
+	defer e.wdMu.RUnlock()
+	return e.WorkingDir
+}
+
+// SetWorkingDir updates the working directory.
+func (e *Executor) SetWorkingDir(dir string) {
+	e.wdMu.Lock()
+	e.WorkingDir = dir
+	e.wdMu.Unlock()
 }
 
 // readFileRaw reads the full raw bytes of a file without the headers or
@@ -288,7 +305,7 @@ func (e *Executor) newGitCmd(ctx context.Context, args ...string) (*exec.Cmd, er
 		return nil, fmt.Errorf("git is not available on PATH")
 	}
 	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = e.WorkingDir
+	cmd.Dir = e.GetWorkingDir()
 	return cmd, nil
 }
 
@@ -326,7 +343,7 @@ func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, 
 	if err != nil {
 		return "", err
 	}
-	cmd.Dir = e.WorkingDir
+	cmd.Dir = e.GetWorkingDir()
 	out, err := cmd.CombinedOutput()
 	outStr := string(out)
 	if err != nil {
@@ -351,7 +368,7 @@ func (e *Executor) buildShellCommand(ctx context.Context, command string) (*exec
 		if err != nil {
 			return nil, fmt.Errorf("command_sandbox=bwrap but bwrap not found on PATH: %w", err)
 		}
-		wd := e.WorkingDir
+		wd := e.GetWorkingDir()
 		if wd == "" {
 			wd = "."
 		}

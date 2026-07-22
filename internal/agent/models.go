@@ -97,15 +97,25 @@ func (a *Agent) SelectModel(ctx context.Context, selector string) error {
 	return nil
 }
 
+// ParseModelsCommand reports whether input is a /models command.
+// If selectArg is non-empty, the user is selecting a model; otherwise it is list-only.
+func ParseModelsCommand(input string) (selectArg string, ok bool) {
+	trimmed := strings.TrimSpace(input)
+	if trimmed != "/models" && trimmed != "models" && !strings.HasPrefix(trimmed, "/models ") && !strings.HasPrefix(trimmed, "models ") {
+		return "", false
+	}
+	arg := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(trimmed, "/models"), "models"))
+	return arg, true
+}
+
 // HandleModelsCommand processes /models and /models <selector>.
 // Returns output text and whether the command was handled.
 func (a *Agent) HandleModelsCommand(ctx context.Context, input string) (string, bool, error) {
-	trimmed := strings.TrimSpace(input)
-	if trimmed != "/models" && trimmed != "models" && !strings.HasPrefix(trimmed, "/models ") && !strings.HasPrefix(trimmed, "models ") {
+	arg, ok := ParseModelsCommand(input)
+	if !ok {
 		return "", false, nil
 	}
 
-	arg := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(trimmed, "/models"), "models"))
 	if arg != "" {
 		if err := a.SelectModel(ctx, arg); err != nil {
 			return "", true, err

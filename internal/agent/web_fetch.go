@@ -29,11 +29,11 @@ var webCfg webCfgState
 
 type webCfgState struct {
 	mu            sync.RWMutex
-	fetchOn       *bool   // nil until configured
-	searchOn      *bool   // nil until configured
-	fetchMode     string  // "https" or "all"
+	fetchOn       *bool    // nil until configured
+	searchOn      *bool    // nil until configured
+	fetchMode     string   // "https" or "all"
 	fetchDomains  []string // domain allowlist for fetch
-	searchBackend string  // "brave" or ""
+	searchBackend string   // "brave" or ""
 	searchAPIKey  string
 }
 

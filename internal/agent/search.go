@@ -207,7 +207,7 @@ func (e *Executor) ReplaceInTree(ctx context.Context, pattern, replacement, subp
 		if secErr == nil {
 			info, statErr := os.Stat(secure)
 			if statErr == nil && !info.IsDir() {
-				absWD, absErr := filepath.Abs(e.WorkingDir)
+				absWD, absErr := filepath.Abs(e.GetWorkingDir())
 				if absErr != nil {
 					return 0, 0, absErr
 				}
@@ -310,7 +310,7 @@ func (e *Executor) replaceInFilePath(absPath, relPath string, re *regexp.Regexp,
 
 func (e *Executor) searchRoot(subpath string) (absRoot, relPrefix string, err error) {
 	if strings.TrimSpace(subpath) == "" {
-		abs, err := filepath.Abs(e.WorkingDir)
+		abs, err := filepath.Abs(e.GetWorkingDir())
 		return abs, "", err
 	}
 	secure, err := e.SecurePath(subpath)
@@ -324,7 +324,7 @@ func (e *Executor) searchRoot(subpath string) (absRoot, relPrefix string, err er
 	if !info.IsDir() {
 		return "", "", fmt.Errorf("search path must be a directory: %s", subpath)
 	}
-	absWD, err := filepath.Abs(e.WorkingDir)
+	absWD, err := filepath.Abs(e.GetWorkingDir())
 	if err != nil {
 		return "", "", err
 	}

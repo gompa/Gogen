@@ -97,4 +97,3 @@ func TestTokenCacheSurvivesMessageAppend(t *testing.T) {
 		t.Fatalf("expected 3 cached entries after append, got %d", got)
 	}
 }
-

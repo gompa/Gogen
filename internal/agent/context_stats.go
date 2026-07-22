@@ -27,15 +27,14 @@ func (a *Agent) recordTurnUsage(u *llm.Usage) {
 
 // ContextStats is a read-only probe of current context usage.
 // It must not mutate Messages, compact history, or call the provider.
+// Web callers must hold Server.agentMu (see internal/server/agent_sync.go).
 func (a *Agent) ContextStats(ctx context.Context) TurnContext {
 	_ = ctx // reserved for future cancellation of pure-local work
 	msgs := a.Messages
 	view := msgs
 	if a.Context != nil {
-		// Shallow-copy the slice header's elements so Snapshot iteration is
-		// stable even if another goroutine appends (append may reallocate).
-		// Callers must still avoid overlapping Content mutations; truncation
-		// is applied in prepareMessages, not here.
+		// Copy so Snapshot iteration is stable if the caller releases agentMu
+		// and another turn appends (append may reallocate).
 		if n := len(msgs); n > 0 {
 			cp := make([]llm.Message, n)
 			copy(cp, msgs)

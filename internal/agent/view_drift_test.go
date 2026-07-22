@@ -1,3 +1,5 @@
+//go:build debug
+
 package agent
 
 import (
@@ -6,11 +8,19 @@ import (
 	"gogen/internal/llm"
 )
 
-func TestMessagesEqualIgnoresReasoning(t *testing.T) {
+func TestMessagesEqualDetectsReasoningDrift(t *testing.T) {
 	a := &llm.Message{Role: "assistant", Content: "hi", Reasoning: "think A"}
 	b := &llm.Message{Role: "assistant", Content: "hi", Reasoning: "think B"}
-	if !messagesEqual(a, b) {
-		t.Fatal("Reasoning should not affect wire-view equality")
+	if messagesEqual(a, b) {
+		t.Fatal("Reasoning should affect wire-view equality (sent as reasoning_content)")
+	}
+}
+
+func TestMessagesEqualDetectsRefusalDrift(t *testing.T) {
+	a := &llm.Message{Role: "assistant", Refusal: "nope"}
+	b := &llm.Message{Role: "assistant", Refusal: "different"}
+	if messagesEqual(a, b) {
+		t.Fatal("Refusal should affect wire-view equality")
 	}
 }
 
@@ -56,18 +66,120 @@ func TestCompareViewFingerprintsIgnoresAppendOnlyGrowth(t *testing.T) {
 	a.compareViewFingerprints(current) // must not panic
 }
 
-func TestStabilizeViewToolArgsPinsSharedBacking(t *testing.T) {
-	msgs := []llm.Message{{
-		Role: "assistant",
-		ToolCalls: []llm.ToolCall{{
-			ID:   "1",
-			Name: "read_file",
-			Args: map[string]interface{}{"path": "a.go"},
-		}},
-	}}
-	view := append([]llm.Message(nil), msgs...)
-	stabilizeViewToolArgs(view)
-	if msgs[0].ToolCalls[0].ArgsStr != `{"path":"a.go"}` {
-		t.Fatalf("expected pin into shared ToolCalls, got %q", msgs[0].ToolCalls[0].ArgsStr)
+func TestMessageWireHashIsStableAcrossReallocs(t *testing.T) {
+	m := llm.Message{Role: "system", Content: "sys"}
+	h1 := messageWireHash(&m)
+	cp := m
+	h2 := messageWireHash(&cp)
+	if h1 == "" {
+		t.Fatal("empty hash")
+	}
+	if h1 != h2 {
+		t.Fatalf("hash not content-keyed: %q != %q", h1, h2)
+	}
+	m.Content = "other"
+	if messageWireHash(&m) == h1 {
+		t.Fatal("hash should change when content changes")
+	}
+}
+
+func TestCompareViewFingerprintsSystemMessageDriftDetected(t *testing.T) {
+	a := &Agent{
+		DebugCompareMessages: true,
+		lastViewMessages: cloneViewMessages([]llm.Message{
+			{Role: "system", Content: "sys A"},
+			{Role: "user", Content: "hi"},
+		}),
+	}
+	current := []llm.Message{
+		{Role: "system", Content: "sys B"}, // index 0 mutation → bust whole prefix
+		{Role: "user", Content: "hi"},
+	}
+	// Must not panic; compareViewFingerprints now also emits system/message hashes.
+	a.compareViewFingerprints(current)
+}
+
+func TestRestoreSessionLocalComparesPreviousView(t *testing.T) {
+	a := &Agent{
+		DebugCompareMessages: true,
+		SessionID:            "sess-old",
+		WorkingDir:           "/tmp/project",
+		Mode:                 ModeAct,
+		projectProfile:       "profile-sticky",
+		lastViewMessages: cloneViewMessages([]llm.Message{
+			{Role: "system", Content: "sys from previous session"},
+			{Role: "user", Content: "old question"},
+			{Role: "assistant", Content: "old answer"},
+		}),
+		Messages: []llm.Message{
+			{Role: "user", Content: "old question"},
+			{Role: "assistant", Content: "old answer"},
+		},
+	}
+
+	a.RestoreSessionLocal(SessionSnapshot{
+		WorkingDir:     "/tmp/project",
+		ProjectProfile: "profile-sticky",
+		Mode:           "act",
+		Messages: []llm.Message{
+			{Role: "user", Content: "new session question"},
+			{Role: "assistant", Content: "new session answer"},
+		},
+	}, "sess-new")
+
+	if len(a.lastViewMessages) == 0 {
+		t.Fatal("expected restored wire view to be snapshotted for later turn drift")
+	}
+	// Restored snapshot should reflect the NEW session, not the old one.
+	foundNew := false
+	for _, m := range a.lastViewMessages {
+		if m.Role == "user" && m.Content == "new session question" {
+			foundNew = true
+		}
+		if m.Role == "user" && m.Content == "old question" {
+			t.Fatal("lastViewMessages still holds previous session user message")
+		}
+	}
+	if !foundNew {
+		t.Fatalf("restored snapshot missing new session content: %#v", a.lastViewMessages)
+	}
+}
+
+func TestRestoreSessionLocalSnapshotsWithoutPreviousView(t *testing.T) {
+	a := &Agent{
+		DebugCompareMessages: true,
+		WorkingDir:           "/tmp/project",
+		Mode:                 ModeAct,
+	}
+	a.RestoreSessionLocal(SessionSnapshot{
+		WorkingDir: "/tmp/project",
+		Mode:       "act",
+		Messages:   []llm.Message{{Role: "user", Content: "only"}},
+	}, "sess-a")
+	if len(a.lastViewMessages) == 0 {
+		t.Fatal("expected snapshot even with no previous view")
+	}
+}
+
+func TestReportViewDriftSessionRestoreAlwaysLogs(t *testing.T) {
+	a := &Agent{
+		DebugCompareMessages: true,
+		lastViewMessages: cloneViewMessages([]llm.Message{
+			{Role: "system", Content: "sys"},
+			{Role: "user", Content: "shared"},
+		}),
+	}
+	// Identical overlapping prefix — turn drift would stay silent; session
+	// restore must still accept the call (log is gated by GOGEN_DEBUG_LOG).
+	current := []llm.Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "shared"},
+	}
+	a.reportViewDrift(current, viewDriftSessionRestore, "old", "new")
+}
+
+func TestViewDriftCompiledInDebug(t *testing.T) {
+	if !ViewDriftCompiledIn() {
+		t.Fatal("expected ViewDriftCompiledIn in debug builds")
 	}
 }

@@ -8,10 +8,10 @@ import (
 )
 
 var (
-	cfgMu     sync.RWMutex
-	cfgLog    string
-	cfgLogSet bool
-	cfgSess   string
+	cfgMu      sync.RWMutex
+	cfgLog     string
+	cfgLogSet  bool
+	cfgSess    string
 	cfgSessSet bool
 
 	writeMu       sync.Mutex
@@ -22,12 +22,13 @@ var (
 // Configure applies runtime debug log settings from merged config.
 func Configure(logPath, sessionID string) {
 	cfgMu.Lock()
-	defer cfgMu.Unlock()
 	cfgLog = logPath
 	cfgLogSet = true
 	cfgSess = sessionID
 	cfgSessSet = true
+	cfgMu.Unlock()
 
+	// Close open files without holding cfgMu (lock order: never nest writeMu under cfgMu).
 	writeMu.Lock()
 	defer writeMu.Unlock()
 	if logFile != nil {

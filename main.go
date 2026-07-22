@@ -134,6 +134,10 @@ func main() {
 	a.TodoManager = agent.NewTodoManager(cfg.WorkingDir)
 	a.PinManager = agent.NewPinManager()
 	a.DebugCompareMessages = cfg.DebugCompareMessages
+	if cfg.DebugCompareMessages && !agent.ViewDriftCompiledIn() {
+		fmt.Fprintf(os.Stderr, "GOGEN_DEBUG_COMPARE_MESSAGES requires a debug build (-tags debug); ignoring\n")
+		a.DebugCompareMessages = false
+	}
 
 	sessionEnabled := os.Getenv("GOGEN_SESSION_PERSIST") != "off"
 	store := session.NewStoreWithOptions(sessionEnabled, session.StoreOptions{
@@ -147,7 +151,7 @@ func main() {
 	if sessionEnabled {
 		if latest, err := store.LatestID(cfg.WorkingDir); err == nil && latest != "" {
 			if snap, err := store.LoadInWorkingDir(cfg.WorkingDir, latest); err == nil {
-				a.RestoreSessionLocal(snap)
+				a.RestoreSessionLocal(snap, latest)
 				a.SessionID = latest
 				restoredModel = snap.Model
 				fmt.Fprintf(os.Stderr, "Session %s (%d msgs)\n", latest, len(a.Messages))

@@ -150,10 +150,10 @@ var (
 			Foreground(lipglossColor("#888888"))
 
 	ModalHighlightStyle = lipgloss.NewStyle().
-				// Uses foreground+bold instead of background to avoid
-				// color bleeding into the border padding of modal boxes.
-				Foreground(lipglossColor("#00AAAA")).
-				Bold(true)
+		// Uses foreground+bold instead of background to avoid
+		// color bleeding into the border padding of modal boxes.
+		Foreground(lipglossColor("#00AAAA")).
+		Bold(true)
 
 	ModalPromptStyle = lipgloss.NewStyle().
 				Foreground(lipglossColor("#CCAA00"))

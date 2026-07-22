@@ -20,8 +20,7 @@ func (e *Executor) RepoOverview() (string, error) {
 		return "", err
 	}
 
-	// Single walk: count files per top-level directory in one pass instead
-	// of calling countRepoFiles (which does its own WalkDir) per directory.
+	// Single walk: count files per top-level directory in one pass.
 	dirCounts := make(map[string]int) // top-level dir name → file count
 	var rootFiles []string
 	total := 0
@@ -75,7 +74,7 @@ func (e *Executor) RepoOverview() (string, error) {
 	sort.Strings(rootFiles)
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "Repository overview (%s)\n", filepath.ToSlash(e.WorkingDir))
+	fmt.Fprintf(&b, "Repository overview (%s)\n", filepath.ToSlash(e.GetWorkingDir()))
 	fmt.Fprintf(&b, "%d files under working directory (skips .git, node_modules, vendor, etc.)\n\n", total)
 
 	if len(dirs) > 0 {
@@ -117,22 +116,4 @@ func firstPathSegment(rel string) string {
 	}
 	// No slash = root-level entry (already handled by caller).
 	return ""
-}
-
-func countRepoFiles(root string) (int, error) {
-	count := 0
-	err := filepath.WalkDir(root, func(walkPath string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return nil
-		}
-		if d.IsDir() {
-			if walkPath != root && shouldSkipSearchEntry(d.Name(), true) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		count++
-		return nil
-	})
-	return count, err
 }
