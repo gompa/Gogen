@@ -3,6 +3,7 @@ package ioutil
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -133,23 +134,42 @@ func TestWriteFileAtomicLargeContent(t *testing.T) {
 }
 
 func TestWriteFileAtomicCleansUpOnWriteFailure(t *testing.T) {
-	// Write to a read-only directory — should fail but not leave temp files.
+	// Directory write bits are not enforced the same way on Windows, and root
+	// can bypass DAC on Linux — skip when the probe write still succeeds.
+	if os.PathSeparator == '\\' {
+		t.Skip("directory write bits not enforced on Windows")
+	}
 	dir := t.TempDir()
 	roDir := filepath.Join(dir, "readonly")
 	if err := os.MkdirAll(roDir, 0555); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = os.Chmod(roDir, 0755) })
 	path := filepath.Join(roDir, "test.txt")
 
 	err := WriteFileAtomic(path, []byte("fail"), 0644)
 	if err == nil {
-		t.Fatal("expected error writing to read-only dir")
+		t.Skip("read-only directory still writable (e.g. running as root)")
+	}
+	entries, readErr := os.ReadDir(roDir)
+	if readErr != nil {
+		t.Fatalf("ReadDir: %v", readErr)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".gogen-write-") {
+			t.Fatalf("temp file left behind: %s", e.Name())
+		}
 	}
 }
 
 func TestWriteFileAtomicInvalidDir(t *testing.T) {
-	// Use a path that can't exist.
-	path := "/proc/nonexistent/gogen-write-test.txt"
+	// Parent path is a regular file, so MkdirAll must fail on every OS.
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "notadir")
+	if err := os.WriteFile(blocker, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(blocker, "child.txt")
 	err := WriteFileAtomic(path, []byte("fail"), 0644)
 	if err == nil {
 		t.Fatal("expected error for invalid dir")
