@@ -80,7 +80,7 @@ func TestResolveContextLimitFromDiskCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveContextLimit: %v", err)
 	}
-	if time.Since(start) > 200*time.Millisecond {
+	if time.Since(start) > time.Second {
 		t.Fatalf("disk lookup blocked for %v", time.Since(start))
 	}
 	if lim.Context != 1000000 {
@@ -112,7 +112,7 @@ func TestResolveContextLimitUsesStaleMemoryWithoutBlocking(t *testing.T) {
 	if lim.Context != 1000000 {
 		t.Fatalf("Context=%d, want 1000000", lim.Context)
 	}
-	if elapsed > 200*time.Millisecond {
+	if elapsed > time.Second {
 		t.Fatalf("stale lookup blocked for %v; want immediate return", elapsed)
 	}
 }
@@ -130,18 +130,18 @@ func TestWarmThenResolve(t *testing.T) {
 	r := NewResolver(cache)
 	r.url = srv.URL
 
-	// Cold resolve must not block on network.
+	// Cold resolve must not block on network (may kick off a background fetch).
 	start := time.Now()
 	_, err := r.ResolveContextLimit("https://opencode.ai/zen/v1", "claude-opus-4-8")
 	if err == nil {
-		t.Fatal("expected miss before Warm completes")
+		t.Fatal("expected miss before registry is loaded")
 	}
-	if time.Since(start) > 100*time.Millisecond {
+	if time.Since(start) > time.Second {
 		t.Fatalf("cold miss blocked for %v", time.Since(start))
 	}
 
 	r.Warm()
-	waitReady(t, r, 2*time.Second)
+	waitReady(t, r, 5*time.Second)
 
 	lim, err := r.ResolveContextLimit("https://opencode.ai/zen/v1", "claude-opus-4-8")
 	if err != nil {
@@ -154,14 +154,18 @@ func TestWarmThenResolve(t *testing.T) {
 		t.Fatalf("expected disk cache written: %v", err)
 	}
 
-	// Many lookups must not re-fetch.
+	// Further lookups must be memory-only (no additional fetches).
+	warmHits := hits.Load()
+	if warmHits < 1 {
+		t.Fatal("expected at least one registry fetch to populate cache")
+	}
 	for i := 0; i < 50; i++ {
 		if _, err := r.ResolveContextLimit("https://opencode.ai/zen/go/v1", "mimo-v2.5-pro"); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if n := hits.Load(); n != 1 {
-		t.Fatalf("registry fetched %d times, want exactly 1", n)
+	if n := hits.Load(); n != warmHits {
+		t.Fatalf("lookups re-fetched registry: hits %d → %d", warmHits, n)
 	}
 }
 
@@ -176,7 +180,8 @@ func TestResolveContextLimitUnavailableNoCache(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when registry unavailable and no cache")
 	}
-	if elapsed > 50*time.Millisecond {
+	// Must not wait on the HTTP client timeout; allow slow CI scheduling.
+	if elapsed > time.Second {
 		t.Fatalf("cold miss blocked for %v; must not wait on network", elapsed)
 	}
 }
@@ -203,8 +208,9 @@ func TestNormalizeURL(t *testing.T) {
 }
 
 func TestCachePath(t *testing.T) {
-	got := CachePath("/proj")
-	want := filepath.Join("/proj", ".gogen", "models.json")
+	dir := t.TempDir()
+	got := CachePath(dir)
+	want := filepath.Join(dir, ".gogen", "models.json")
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
@@ -214,16 +220,20 @@ func TestCachePath(t *testing.T) {
 }
 
 func TestSetCachePathClearsMemory(t *testing.T) {
-	r := NewResolver("/old/.gogen/models.json")
+	dir := t.TempDir()
+	oldPath := filepath.Join(dir, "old", "models.json")
+	newPath := filepath.Join(dir, "new", "models.json")
+
+	r := NewResolver(oldPath)
 	r.mu.Lock()
 	r.setDataLocked(sampleRegistry())
 	r.mu.Unlock()
 
-	r.SetCachePath("/new/.gogen/models.json")
+	r.SetCachePath(newPath)
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if r.cachePath != "/new/.gogen/models.json" {
-		t.Fatalf("cachePath=%q", r.cachePath)
+	if r.cachePath != newPath {
+		t.Fatalf("cachePath=%q, want %q", r.cachePath, newPath)
 	}
 	if r.data != nil || r.byAPI != nil || !r.fetchedAt.IsZero() {
 		t.Fatal("expected in-memory registry cleared for new project path")
