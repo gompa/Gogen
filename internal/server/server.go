@@ -334,24 +334,9 @@ func applyContextStats(msg *WSMessage, stats agent.TurnContext) {
 	}
 }
 
-func (s *Server) agentConfigMsg(ctx context.Context) WSMessage {
-	// Caller must hold agentMu (R or W).
-	msg := WSMessage{
-		Type:       "config",
-		WorkingDir: s.agent.Executor.GetWorkingDir(),
-		Model:      s.agent.CurrentModel(),
-		Mode:       s.agent.Mode.String(),
-		SessionID:  s.agent.SessionID,
-	}
-	applyContextStats(&msg, s.agent.ContextStats(ctx))
-	return msg
-}
-
-// agentConfigMsgBasic returns a config message without the expensive
-// context-stats computation.  Use this on initial WS connect so the
-// client receives config + history immediately; context stats follow
-// via a separate "context" message.
-// Caller must hold agentMu (R or W).
+// agentConfigMsgBasic returns config fields that are cheap to read.
+// Caller must hold agentMu (R or W). Do not call ContextStats while holding
+// agentMu — tokenize after unlocking via applyContextStats.
 func (s *Server) agentConfigMsgBasic() WSMessage {
 	return WSMessage{
 		Type:       "config",
@@ -360,6 +345,17 @@ func (s *Server) agentConfigMsgBasic() WSMessage {
 		Mode:       s.agent.Mode.String(),
 		SessionID:  s.agent.SessionID,
 	}
+}
+
+// agentConfigMsg is a locked basic snapshot plus ContextStats applied outside
+// agentMu. Prefer this when the caller does not already hold agentMu.
+func (s *Server) agentConfigMsg(ctx context.Context) WSMessage {
+	var msg WSMessage
+	s.lockAgentRead(func() {
+		msg = s.agentConfigMsgBasic()
+	})
+	applyContextStats(&msg, s.agent.ContextStats(ctx))
+	return msg
 }
 
 func sessionEntries(list []agent.SessionInfo, currentID string) []SessionEntry {
@@ -427,15 +423,20 @@ func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, resu
 		}
 	}
 
-	var cfg, ctxMsg WSMessage
+	var cfg WSMessage
 	s.lockAgentRead(func() {
 		if err == nil && len(result.Sessions) > 0 {
 			resp.Type = "sessions"
 			resp.Sessions = sessionEntries(result.Sessions, s.agent.SessionID)
 		}
-		cfg = s.agentConfigMsg(ctx)
-		ctxMsg = s.contextMsg(ctx)
+		cfg = s.agentConfigMsgBasic()
 	})
+	// Tokenize once outside agentMu; reuse for config + context.
+	stats := s.agent.ContextStats(ctx)
+	applyContextStats(&cfg, stats)
+	ctxMsg := WSMessage{Type: "context"}
+	applyContextStats(&ctxMsg, stats)
+
 	resp.SessionID = cfg.SessionID
 	resp.Mode = cfg.Mode
 	// Send history before context so the client can start painting immediately.
@@ -447,7 +448,8 @@ func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, resu
 	_ = ws.writeJSON(cfg)
 }
 
-// contextMsg builds a context stats message. Caller must hold agentMu (R or W).
+// contextMsg builds a context stats message. Must not be called while holding
+// agentMu — ContextStats tokenizes the full history view.
 func (s *Server) contextMsg(ctx context.Context) WSMessage {
 	msg := WSMessage{Type: "context"}
 	applyContextStats(&msg, s.agent.ContextStats(ctx))
@@ -523,14 +525,9 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Compute context stats asynchronously so the client can start
-	// painting history immediately.  The context message arrives
-	// shortly after; the client already handles late context updates.
+	// painting history immediately.  Tokenization runs without agentMu.
 	go func() {
-		var ctxMsg WSMessage
-		s.lockAgentRead(func() {
-			ctxMsg = s.contextMsg(r.Context())
-		})
-		_ = ws.writeJSON(ctxMsg)
+		_ = ws.writeJSON(s.contextMsg(r.Context()))
 	}()
 
 	incoming := make(chan WSMessage, 8)
@@ -568,13 +565,13 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			s.handleFSWriteMessage(ws, r.Context(), msg)
 			continue
 		case "list_sessions":
-			var sessions []agent.SessionInfo
+			// SessionStore.List is disk I/O (~tens of ms with many sessions) —
+			// do not hold agentMu across it.
 			var sessionID string
-			var listErr error
 			s.lockAgentRead(func() {
-				_, sessions, listErr = s.agent.FormatSessionListForUI()
 				sessionID = s.agent.SessionID
 			})
+			_, sessions, listErr := s.agent.FormatSessionListForUI()
 			if listErr != nil {
 				_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", listErr)})
 				continue
@@ -593,9 +590,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			}
 			var result agent.SessionCommandResult
 			var err error
-			s.lockAgentWrite(func() {
-				result, _, err = s.agent.HandleSessionCommand(r.Context(), "/new", sesspkg.NewID())
-			})
+			result, _, err = s.agent.HandleSessionCommand(r.Context(), "/new", sesspkg.NewID())
 			s.turnMu.Unlock()
 			s.writeSessionCommandResult(ws, r.Context(), result, err)
 			continue
@@ -613,9 +608,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			}
 			var result agent.SessionCommandResult
 			var err error
-			s.lockAgentWrite(func() {
-				result, _, err = s.agent.HandleSessionCommand(r.Context(), "resume "+id, sesspkg.NewID())
-			})
+			result, _, err = s.agent.HandleSessionCommand(r.Context(), "resume "+id, sesspkg.NewID())
 			s.turnMu.Unlock()
 			s.writeSessionCommandResult(ws, r.Context(), result, err)
 			continue
@@ -644,14 +637,12 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 						resp.Type = "models"
 						resp.Models = s.modelEntries(models)
 					}
-					s.lockAgentRead(func() {
-						cfg := s.agentConfigMsg(r.Context())
-						resp.Model = cfg.Model
-						resp.ContextLimit = cfg.ContextLimit
-						resp.UsedTokens = cfg.UsedTokens
-						resp.UsedSource = cfg.UsedSource
-						resp.UsedPercent = cfg.UsedPercent
-					})
+					cfg := s.agentConfigMsg(r.Context())
+					resp.Model = cfg.Model
+					resp.ContextLimit = cfg.ContextLimit
+					resp.UsedTokens = cfg.UsedTokens
+					resp.UsedSource = cfg.UsedSource
+					resp.UsedPercent = cfg.UsedPercent
 					_ = ws.writeJSON(resp)
 				}(msg.Content)
 				continue
@@ -668,11 +659,12 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			s.lockAgentWrite(func() {
 				modeOut, modeHandled = s.agent.HandleModeCommand(msg.Content)
 				if modeHandled {
-					modeCfg = s.agentConfigMsg(r.Context())
+					modeCfg = s.agentConfigMsgBasic()
 				}
 			})
 			if modeHandled {
 				s.turnMu.Unlock()
+				applyContextStats(&modeCfg, s.agent.ContextStats(r.Context()))
 				_ = ws.writeJSON(modeCfg)
 				_ = ws.writeJSON(WSMessage{Type: "response", Content: modeOut})
 				continue
@@ -680,15 +672,10 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 
 			var ctxOut string
 			var ctxHandled bool
-			var ctxMsg WSMessage
-			s.lockAgentWrite(func() {
-				ctxOut, ctxHandled = s.agent.HandleContextCommand(r.Context(), msg.Content)
-				if ctxHandled {
-					ctxMsg = s.contextMsg(r.Context())
-				}
-			})
+			ctxOut, ctxHandled = s.agent.HandleContextCommand(r.Context(), msg.Content)
 			if ctxHandled {
 				s.turnMu.Unlock()
+				ctxMsg := s.contextMsg(r.Context())
 				_ = ws.writeJSON(ctxMsg)
 				_ = ws.writeJSON(WSMessage{Type: "response", Content: ctxOut})
 				continue
@@ -697,9 +684,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			var sessResult agent.SessionCommandResult
 			var sessHandled bool
 			var sessErr error
-			s.lockAgentWrite(func() {
-				sessResult, sessHandled, sessErr = s.agent.HandleSessionCommand(r.Context(), msg.Content, sesspkg.NewID())
-			})
+			sessResult, sessHandled, sessErr = s.agent.HandleSessionCommand(r.Context(), msg.Content, sesspkg.NewID())
 			if sessHandled {
 				s.turnMu.Unlock()
 				s.writeSessionCommandResult(ws, r.Context(), sessResult, sessErr)
@@ -707,13 +692,10 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if sel, isModels := agent.ParseModelsCommand(msg.Content); isModels && sel != "" {
-				var out string
-				var modelErr error
-				var cfg WSMessage
-				s.lockAgentWrite(func() {
-					out, _, modelErr = s.agent.HandleModelsCommand(r.Context(), msg.Content)
-					cfg = s.agentConfigMsg(r.Context())
-				})
+				// Model catalog / context-limit refresh are network calls — do
+				// not hold agentMu across them (would stall WS connect readers).
+				out, _, modelErr := s.agent.HandleModelsCommand(r.Context(), msg.Content)
+				cfg := s.agentConfigMsg(r.Context())
 				s.turnMu.Unlock()
 				resp := WSMessage{Type: "response", Content: out}
 				if modelErr != nil {
@@ -832,16 +814,20 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 					},
 				}
 
-				s.agentMu.Lock()
+				// turnMu (held by this goroutine) serializes mutating turns.
+				// Do not hold agentMu across StreamProcessInput: it includes
+				// catalog lookup, LLM streaming, and tool I/O — locking would
+				// stall WS connect/history/list_sessions for the whole turn
+				// (the prior slow-startup regression).
 				_, err := s.agent.StreamProcessInput(ctx, content, handlers)
 				var persistErr error
 				var ctxMsg WSMessage
 				if err == nil {
-					persistErr = s.agent.ConsumePersistError()
+					s.lockAgentWrite(func() {
+						persistErr = s.agent.ConsumePersistError()
+					})
 					ctxMsg = s.contextMsg(r.Context())
 				}
-				s.agentMu.Unlock()
-
 				if err != nil {
 					if ctx.Err() != nil {
 						tokens.flush()
@@ -892,12 +878,10 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
 				continue
 			}
-			var err error
-			var cfg WSMessage
-			s.lockAgentWrite(func() {
-				err = s.agent.SelectModel(r.Context(), msg.Model)
-				cfg = s.agentConfigMsg(r.Context())
-			})
+			// SelectModel hits /v1/models — keep agentMu free so connect/history
+			// readers are not pinned behind the catalog fetch.
+			err := s.agent.SelectModel(r.Context(), msg.Model)
+			cfg := s.agentConfigMsg(r.Context())
 			s.turnMu.Unlock()
 			if err != nil {
 				_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", err)})
@@ -917,11 +901,12 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 				if m, ok := agent.ParseMode(msg.Mode); ok {
 					s.agent.SetMode(m)
 					modeSet = true
-					cfg = s.agentConfigMsg(r.Context())
+					cfg = s.agentConfigMsgBasic()
 				}
 			})
 			s.turnMu.Unlock()
 			if modeSet {
+				applyContextStats(&cfg, s.agent.ContextStats(r.Context()))
 				_ = ws.writeJSON(cfg)
 			}
 			continue
@@ -945,9 +930,10 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			s.lockAgentWrite(func() {
 				s.agent.SetWorkingDir(absDir)
 				s.config.WorkingDir = absDir
-				cfg = s.agentConfigMsg(r.Context())
+				cfg = s.agentConfigMsgBasic()
 			})
 			s.turnMu.Unlock()
+			applyContextStats(&cfg, s.agent.ContextStats(r.Context()))
 			_ = ws.writeJSON(WSMessage{Type: "config", WorkingDir: absDir, Model: cfg.Model, ContextLimit: cfg.ContextLimit, UsedTokens: cfg.UsedTokens, UsedSource: cfg.UsedSource, UsedPercent: cfg.UsedPercent, CompactAt: cfg.CompactAt, MessageCount: cfg.MessageCount, NearCompact: cfg.NearCompact, ToolTruncated: cfg.ToolTruncated, Mode: cfg.Mode})
 		}
 	}

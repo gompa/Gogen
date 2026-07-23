@@ -3,18 +3,17 @@ package server
 // Agent locking on the web Server:
 //
 //   turnMu  — exclusive "turn" ownership across WebSocket clients (one mutator).
-//   agentMu — protects Agent memory against concurrent readers (list_sessions,
-//             connect history, context stats) while a turn is mutating state.
+//   agentMu — brief snapshots of Agent memory for concurrent readers
+//             (list_sessions, connect history, context stats, config).
 //
 // Lock order: always acquire turnMu before agentMu. Never take turnMu while
 // holding agentMu. Readers that do not mutate may take agentMu.RLock alone.
 //
-// Stream turns hold agentMu for the full StreamProcessInput call. That is
-// intentional: Messages/session state mutate continuously during the LLM
-// turn, and releasing early would race with RLock readers under -race.
-// turnMu already serializes mutators; agentMu additionally excludes readers
-// for the turn duration (list_sessions / connect stats wait until the turn
-// ends). Do not "narrow" this lock without an alternate snapshot protocol.
+// Never hold agentMu across provider, tool, or disk I/O (ListModels,
+// SelectModel, StreamProcessInput, SessionStore.List, ContextStats
+// tokenization). That pinned WS connect/history behind /v1/models, session
+// listing, and the full LLM turn — the slow --web startup/population bug.
+// turnMu already serializes mutators for the duration of a turn.
 //
 // FS browser paths use Executor.GetWorkingDir (its own mutex) so they do not
 // need agentMu and can proceed during an active turn.

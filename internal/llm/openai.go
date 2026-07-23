@@ -260,16 +260,19 @@ func (p *OpenAIProvider) clientForModel() *openai.Client {
 	p.modelsMu.RUnlock()
 
 	// Discovery: probe Zen first, then Go (deterministic order).
-	// Do not hold modelsMu across network I/O.
+	// Do not hold modelsMu across network I/O. Bound probes so a hung
+	// OpenCode endpoint cannot stall the first chat request indefinitely.
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), modelsCatalogTimeout)
+	defer probeCancel()
 	var chosen *openai.Client
 	if p.zenClient != nil {
-		_, err := p.zenClient.Models.Get(context.Background(), model)
+		_, err := p.zenClient.Models.Get(probeCtx, model)
 		if err == nil {
 			chosen = p.zenClient
 		}
 	}
 	if chosen == nil && p.goClient != nil {
-		_, err := p.goClient.Models.Get(context.Background(), model)
+		_, err := p.goClient.Models.Get(probeCtx, model)
 		if err == nil {
 			chosen = p.goClient
 		}

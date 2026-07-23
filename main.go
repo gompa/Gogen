@@ -212,16 +212,18 @@ func main() {
 			fmt.Printf("Auth token required (GOGEN_WEB_TOKEN / web_auth_token)\n")
 		}
 		// Listen first so the UI can connect immediately. Provider model
-		// validation and context-limit lookup continue in the background.
+		// validation and context-limit lookup continue in the background —
+		// start them before MCP init so a slow MCP server cannot delay the
+		// catalog warm-up that list_models joins.
 		errCh := make(chan error, 1)
 		go func() {
 			errCh <- s.Start(ctx, addr)
 		}()
-		initMCP()
 		go func() {
 			a.ValidateRestoredModel(context.Background(), restoredModel)
 			cfg.OpenAIModel = provider.ModelName()
 		}()
+		initMCP()
 		if err := <-errCh; err != nil {
 			log.Printf("web server error: %v", err)
 		}
