@@ -206,6 +206,9 @@ func (a *Agent) SetWorkingDir(dir string) {
 	if a.TodoManager != nil {
 		a.TodoManager.SetWorkingDir(dir)
 	}
+	if p, ok := a.Provider.(*llm.OpenAIProvider); ok {
+		p.SetModelInfoCacheDir(dir)
+	}
 	a.FlushSession()
 }
 

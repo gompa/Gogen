@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"path/filepath"
+	"time"
 
 	"gogen/internal/llm"
 )
@@ -82,7 +83,12 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 
 // ValidateRestoredModel checks that model still exists at the provider and
 // refreshes the context limit. Safe to run in the background after startup.
+// Bounded so a hung provider cannot run ListModels + ModelContextLimit
+// back-to-back for an unbounded wall time.
 func (a *Agent) ValidateRestoredModel(ctx context.Context, model string) {
+	ctx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+
 	if model != "" {
 		models, err := a.Provider.ListModels(ctx)
 		if err == nil {

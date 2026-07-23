@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"sync"
+	"testing"
 	"time"
 )
 
@@ -51,6 +52,11 @@ func logPath() string {
 		return p
 	}
 	cfgMu.RUnlock()
+	// Unit tests often inherit a developer's GOGEN_DEBUG_LOG and would
+	// otherwise pollute the real session log with fixture entries.
+	if testing.Testing() {
+		return ""
+	}
 	return os.Getenv("GOGEN_DEBUG_LOG")
 }
 
@@ -62,6 +68,9 @@ func sessionID() string {
 		return s
 	}
 	cfgMu.RUnlock()
+	if testing.Testing() {
+		return ""
+	}
 	return os.Getenv("GOGEN_DEBUG_SESSION")
 }
 

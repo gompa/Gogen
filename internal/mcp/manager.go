@@ -21,7 +21,11 @@ import (
 )
 
 const (
-	mcpCallTimeout         = 30 * time.Second
+	mcpCallTimeout = 30 * time.Second
+	// mcpInitTimeout bounds initialize + tools/list during NewManager so a
+	// hung MCP stdio server cannot stall process startup for a full
+	// mcpCallTimeout per server.
+	mcpInitTimeout         = 5 * time.Second
 	mcpMaxSkippedResponses = 100
 )
 
@@ -79,20 +83,44 @@ type Manager struct {
 	reg     *Registry
 }
 
+// ValidServers returns entries that have both a name and a command.
+// Incomplete stubs (mcp: on with placeholder objects) are dropped so
+// NewManager is never asked to spawn empty exec.Command values.
+func ValidServers(servers []config.MCPServerConfig) []config.MCPServerConfig {
+	if len(servers) == 0 {
+		return nil
+	}
+	out := make([]config.MCPServerConfig, 0, len(servers))
+	for _, s := range servers {
+		if strings.TrimSpace(s.Name) == "" || strings.TrimSpace(s.Command) == "" {
+			continue
+		}
+		out = append(out, s)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // NewManager starts configured MCP servers and builds a tool registry.
 func NewManager(servers []config.MCPServerConfig) (*Manager, error) {
 	reg := &Registry{tools: make(map[string]toolEntry)}
 	m := &Manager{reg: reg}
-	for _, s := range servers {
+	for _, s := range ValidServers(servers) {
 		c, err := startClient(s)
 		if err != nil {
 			continue
 		}
-		if err := c.initialize(context.Background()); err != nil {
+		initCtx, cancel := context.WithTimeout(context.Background(), mcpInitTimeout)
+		err = c.initialize(initCtx)
+		if err != nil {
+			cancel()
 			_ = c.Close()
 			continue
 		}
-		tools, err := c.listTools(context.Background())
+		tools, err := c.listTools(initCtx)
+		cancel()
 		if err != nil {
 			_ = c.Close()
 			continue

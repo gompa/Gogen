@@ -3,6 +3,7 @@
 package agent
 
 import (
+	"strings"
 	"testing"
 
 	"gogen/internal/llm"
@@ -176,6 +177,25 @@ func TestReportViewDriftSessionRestoreAlwaysLogs(t *testing.T) {
 		{Role: "user", Content: "shared"},
 	}
 	a.reportViewDrift(current, viewDriftSessionRestore, "old", "new")
+}
+
+func TestDriftPreviewTruncatesAndEscapes(t *testing.T) {
+	got := driftPreview("line1\nline2\t" + strings.Repeat("x", 300))
+	if strings.Contains(got, "\n") || strings.Contains(got, "\t") {
+		t.Fatalf("raw control chars leaked: %q", got)
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Fatalf("expected truncation marker: %q", got)
+	}
+}
+
+func TestMessageChangedFieldsDetectsToolArgs(t *testing.T) {
+	prev := &llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "1", Name: "read_file", ArgsStr: `{"path":"a"}`}}}
+	cur := &llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "1", Name: "read_file", ArgsStr: `{"path":"b"}`}}}
+	got := messageChangedFields(prev, cur)
+	if len(got) != 1 || got[0] != "toolCalls" {
+		t.Fatalf("changedFields = %v", got)
+	}
 }
 
 func TestViewDriftCompiledInDebug(t *testing.T) {

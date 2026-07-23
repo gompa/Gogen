@@ -86,7 +86,7 @@ func BuiltinTools() []llm.Tool {
 			toolSchema(map[string]interface{}{
 				"path": toolProp("string", "Source file path"),
 			}, "path")),
-		toolDef("write_file", "Write content to a file (creates parent dirs).",
+		toolDef("write_file", "Create a NEW file only (parent dirs ok). Refuses existing paths — use patch_file/replace_in_file to edit; never delete+recreate.",
 			toolSchema(map[string]interface{}{
 				"path":    toolProp("string", "File path"),
 				"content": toolProp("string", "Content"),
@@ -113,7 +113,7 @@ func BuiltinTools() []llm.Tool {
 			}, "path", "search", "replace")),
 		{
 			Name:        "delete_file",
-			Description: "Delete a file (requires approval).",
+			Description: "Delete a file (requires approval). Do not use to replace content — edit in place with patch_file/replace_in_file.",
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -127,7 +127,7 @@ func BuiltinTools() []llm.Tool {
 				"source":      toolProp("string", "Source path"),
 				"destination": toolProp("string", "Destination path"),
 			}, "source", "destination")),
-		toolDef("patch_file", "Apply unified diff(s). dry_run=preview, fuzzy=default (tolerant).",
+		toolDef("patch_file", "Apply surgical unified diff(s). Prefer over rewrites. dry_run=preview, fuzzy=default (tolerant). Do not remove+re-add whole files.",
 			toolSchema(map[string]interface{}{
 				"diff": toolProp("string", "Unified diff: '--- a/path'/'+++ b/path' headers (a/b optional), '@@ -oldStart,oldCount +newStart,newCount @@' hunks.\n"+
 					"Context=space, removed=minus, added=plus. Multi-file: stack sections (diff --git OK).\n\n"+

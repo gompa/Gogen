@@ -46,7 +46,11 @@ func (c *idleTimeoutConn) Read(b []byte) (int, error) {
 // delivers tokens in bursts instead of incrementally.
 func newSSEHTTPClient() *http.Client {
 	idle := streamReadIdleTimeout()
-	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	// Keep dial short: catalog lookups use modelsCatalogTimeout (~8s), and a
+	// 30s TCP timeout was a common "startup felt frozen" failure mode when the
+	// provider host was unreachable (blackhole / wrong LAN IP). Caller contexts
+	// still win when they are shorter.
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	return &http.Client{
 		Transport: &http.Transport{
 			DisableCompression: true,

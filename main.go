@@ -108,7 +108,7 @@ func main() {
 
 	applyRuntimeConfig(cfg)
 
-	provider := llm.NewOpenAIProvider(cfg.OpenAIKey, cfg.OpenAIModel, cfg.OpenAIURL)
+	provider := llm.NewOpenAIProvider(cfg.OpenAIKey, cfg.OpenAIModel, cfg.OpenAIURL, cfg.WorkingDir)
 
 	// Derive a stable prompt-cache key from the working directory so
 	// provider-side prefix caches survive sequential requests.
@@ -170,21 +170,34 @@ func main() {
 	}
 
 	var mcpMgr *mcp.Manager
+	mcpDone := make(chan struct{})
 	initMCP := func() {
-		if cfg.MCPEnabled() && len(cfg.MCPServers) > 0 {
-			var mcpErr error
-			mcpMgr, mcpErr = mcp.NewManager(cfg.MCPServers)
-			if mcpErr != nil {
-				fmt.Fprintf(os.Stderr, "MCP init error: %v\n", mcpErr)
-			} else if reg := mcpMgr.Registry(); reg != nil {
-				a.SetMCPRegistry(reg)
-				fmt.Fprintf(os.Stderr, "MCP tools: %d\n", len(reg.ToolNames()))
+		defer close(mcpDone)
+		servers := mcp.ValidServers(cfg.MCPServers)
+		if !cfg.MCPEnabled() {
+			if len(cfg.MCPServers) > 0 {
+				fmt.Fprintf(os.Stderr, "MCP servers configured but mcp is off; set mcp: on or GOGEN_MCP=on to enable\n")
 			}
-		} else if !cfg.MCPEnabled() && len(cfg.MCPServers) > 0 {
-			fmt.Fprintf(os.Stderr, "MCP servers configured but mcp is off; set mcp: on or GOGEN_MCP=on to enable\n")
+			return
+		}
+		if len(servers) == 0 {
+			// mcp: on with no usable servers — do not start a manager.
+			if len(cfg.MCPServers) > 0 {
+				fmt.Fprintf(os.Stderr, "MCP enabled but no valid mcp_servers entries (need name + command)\n")
+			}
+			return
+		}
+		var mcpErr error
+		mcpMgr, mcpErr = mcp.NewManager(servers)
+		if mcpErr != nil {
+			fmt.Fprintf(os.Stderr, "MCP init error: %v\n", mcpErr)
+		} else if reg := mcpMgr.Registry(); reg != nil {
+			a.SetMCPRegistry(reg)
+			fmt.Fprintf(os.Stderr, "MCP tools: %d\n", len(reg.ToolNames()))
 		}
 	}
 	defer func() {
+		<-mcpDone
 		if mcpMgr != nil {
 			_ = mcpMgr.Close()
 		}
@@ -212,9 +225,8 @@ func main() {
 			fmt.Printf("Auth token required (GOGEN_WEB_TOKEN / web_auth_token)\n")
 		}
 		// Listen first so the UI can connect immediately. Provider model
-		// validation and context-limit lookup continue in the background —
-		// start them before MCP init so a slow MCP server cannot delay the
-		// catalog warm-up that list_models joins.
+		// validation and context-limit lookup continue in the background.
+		// MCP only starts when there is at least one valid server configured.
 		errCh := make(chan error, 1)
 		go func() {
 			errCh <- s.Start(ctx, addr)
@@ -223,16 +235,16 @@ func main() {
 			a.ValidateRestoredModel(context.Background(), restoredModel)
 			cfg.OpenAIModel = provider.ModelName()
 		}()
-		initMCP()
+		go initMCP()
 		if err := <-errCh; err != nil {
 			log.Printf("web server error: %v", err)
 		}
 		return
 	}
 
-	initMCP()
-	// Provider model validation and context-limit lookup continue in the
-	// background so the TUI can open immediately (same as web mode).
+	// MCP (if configured) + model validation in the background so the TUI
+	// can open immediately.
+	go initMCP()
 	go a.ValidateRestoredModel(context.Background(), restoredModel)
 	// Default: TUI mode.
 	c := tui.New(a, cfg)

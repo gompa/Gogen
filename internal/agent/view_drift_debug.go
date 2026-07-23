@@ -5,7 +5,10 @@ package agent
 import (
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"hash/fnv"
+	"strings"
+	"unicode/utf8"
 
 	"gogen/internal/debuglog"
 	"gogen/internal/llm"
@@ -128,6 +131,31 @@ func (a *Agent) reportViewDrift(current []llm.Message, kind viewDriftKind, prevS
 		fields["newArgsStrLen"] = toolCallsArgsStrLen(newMsg.ToolCalls)
 		fields["prevToolCallID"] = prevMsg.ToolCallID
 		fields["newToolCallID"] = newMsg.ToolCallID
+		// Previews + field-level diff so a mid-prefix llama.cpp break can be
+		// mapped back to the exact message/bytes that changed.
+		fields["changedFields"] = messageChangedFields(&prevMsg, &newMsg)
+		fields["prevContentPreview"] = driftPreview(prevMsg.Content)
+		fields["newContentPreview"] = driftPreview(newMsg.Content)
+		if prevMsg.Reasoning != "" || newMsg.Reasoning != "" {
+			fields["prevReasoningPreview"] = driftPreview(prevMsg.Reasoning)
+			fields["newReasoningPreview"] = driftPreview(newMsg.Reasoning)
+		}
+		if prevMsg.Refusal != "" || newMsg.Refusal != "" {
+			fields["prevRefusalPreview"] = driftPreview(prevMsg.Refusal)
+			fields["newRefusalPreview"] = driftPreview(newMsg.Refusal)
+		}
+		if len(prevMsg.ToolCalls) > 0 || len(newMsg.ToolCalls) > 0 {
+			fields["prevToolCallsPreview"] = toolCallsDriftPreview(prevMsg.ToolCalls)
+			fields["newToolCallsPreview"] = toolCallsDriftPreview(newMsg.ToolCalls)
+		}
+		if mismatchIdx > 0 {
+			fields["beforeHashPrev"] = messageWireHash(&a.lastViewMessages[mismatchIdx-1])
+			fields["beforeHashNew"] = messageWireHash(&current[mismatchIdx-1])
+		}
+		if mismatchIdx+1 < len(a.lastViewMessages) && mismatchIdx+1 < len(current) {
+			fields["afterHashPrev"] = messageWireHash(&a.lastViewMessages[mismatchIdx+1])
+			fields["afterHashNew"] = messageWireHash(&current[mismatchIdx+1])
+		}
 	}
 
 	msg := "message view prefix changed between turns"
@@ -153,6 +181,72 @@ func toolCallsArgsStrLen(tcs []llm.ToolCall) int {
 		n += len(tcs[i].ArgsStr)
 	}
 	return n
+}
+
+const driftPreviewMaxRunes = 160
+
+func driftPreview(s string) string {
+	s = strings.ReplaceAll(s, "\n", "\\n")
+	s = strings.ReplaceAll(s, "\t", "\\t")
+	if utf8.RuneCountInString(s) <= driftPreviewMaxRunes {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:driftPreviewMaxRunes]) + "…"
+}
+
+func messageChangedFields(prev, cur *llm.Message) []string {
+	var out []string
+	if prev.Role != cur.Role {
+		out = append(out, "role")
+	}
+	if prev.Content != cur.Content {
+		out = append(out, "content")
+	}
+	if prev.Reasoning != cur.Reasoning {
+		out = append(out, "reasoning")
+	}
+	if prev.Refusal != cur.Refusal {
+		out = append(out, "refusal")
+	}
+	if prev.ToolCallID != cur.ToolCallID {
+		out = append(out, "toolCallID")
+	}
+	if !toolCallsWireEqual(prev.ToolCalls, cur.ToolCalls) {
+		out = append(out, "toolCalls")
+	}
+	return out
+}
+
+func toolCallsWireEqual(a, b []llm.ToolCall) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].ID != b[i].ID || a[i].Name != b[i].Name || a[i].ArgsStr != b[i].ArgsStr {
+			return false
+		}
+	}
+	return true
+}
+
+func toolCallsDriftPreview(tcs []llm.ToolCall) []map[string]interface{} {
+	out := make([]map[string]interface{}, 0, len(tcs))
+	for i := range tcs {
+		out = append(out, map[string]interface{}{
+			"id":             tcs[i].ID,
+			"name":           tcs[i].Name,
+			"argsStrLen":     len(tcs[i].ArgsStr),
+			"argsStrValid":   jsonValid(tcs[i].ArgsStr),
+			"argsStrPreview": driftPreview(tcs[i].ArgsStr),
+		})
+	}
+	return out
+}
+
+func jsonValid(s string) bool {
+	s = strings.TrimSpace(s)
+	return s != "" && json.Valid([]byte(s))
 }
 
 // messageWireHash returns a short, stable hex digest of the fields that affect

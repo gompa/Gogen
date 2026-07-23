@@ -1,6 +1,9 @@
 package llm
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestToolCallArgumentsJSONPrefersArgsStr(t *testing.T) {
 	raw := `{"path": "a.go", "offset":1}`
@@ -29,12 +32,31 @@ func TestToolCallArgumentsJSONFallsBackToMarshal(t *testing.T) {
 }
 
 func TestToolCallArgumentsJSONFallsBackOnInvalidArgsStr(t *testing.T) {
+	orig := `{"path":`
 	tc := ToolCall{
 		Name:    "read_file",
 		Args:    map[string]interface{}{"path": "a.go"},
-		ArgsStr: `{"path":`,
+		ArgsStr: orig,
 	}
 	if got := toolCallArgumentsJSON(&tc); got != `{"path":"a.go"}` {
+		t.Fatalf("got %q", got)
+	}
+	// Invalid provider fragment must stay in history — remarsal is wire-only.
+	if tc.ArgsStr != orig {
+		t.Fatalf("ArgsStr overwritten: %q", tc.ArgsStr)
+	}
+}
+
+func TestToolCallArgumentsJSONDoesNotHTMLEscape(t *testing.T) {
+	tc := ToolCall{
+		Name: "read_file",
+		Args: map[string]interface{}{"path": "a<b>.go"},
+	}
+	got := toolCallArgumentsJSON(&tc)
+	if strings.Contains(got, `\u003c`) {
+		t.Fatalf("HTML-escaped remarsal breaks cache stability: %q", got)
+	}
+	if got != `{"path":"a<b>.go"}` {
 		t.Fatalf("got %q", got)
 	}
 }

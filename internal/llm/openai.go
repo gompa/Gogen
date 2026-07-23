@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"gogen/internal/debuglog"
+	"gogen/internal/modelinfo"
 
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
@@ -40,9 +41,12 @@ type OpenAIProvider struct {
 	zenClient   *openai.Client // OpenCode Zen endpoint
 	goClient    *openai.Client // OpenCode Go endpoint
 	model       string
+	baseURL     string
 	modelClient map[string]*openai.Client // model ID → client routing
 	// promptCacheKey scopes provider-side prompt caching (defaults to none).
 	promptCacheKey param.Opt[string]
+	// modelInfo resolves context limits from models.dev (optional enrichment).
+	modelInfo *modelinfo.Resolver
 
 	modelsMu       sync.RWMutex
 	modelsCache    []openai.Model
@@ -199,7 +203,7 @@ func (p *OpenAIProvider) fetchModels(ctx context.Context) ([]openai.Model, map[s
 	return res.models, res.routing, nil
 }
 
-func NewOpenAIProvider(apiKey string, model string, baseURL string) *OpenAIProvider {
+func NewOpenAIProvider(apiKey string, model string, baseURL string, workingDir string) *OpenAIProvider {
 	opts := []option.RequestOption{
 		option.WithHTTPClient(newSSEHTTPClient()),
 	}
@@ -212,8 +216,11 @@ func NewOpenAIProvider(apiKey string, model string, baseURL string) *OpenAIProvi
 	p := &OpenAIProvider{
 		client:      openai.NewClient(opts...),
 		model:       model,
+		baseURL:     baseURL,
 		modelClient: make(map[string]*openai.Client),
+		modelInfo:   modelinfo.NewResolver(modelinfo.CachePath(workingDir)),
 	}
+	p.modelInfo.Warm() // non-blocking; populate cache before first limit lookup
 	if isOpencodeURL(baseURL) {
 		newClient := func(url string) *openai.Client {
 			nopts := []option.RequestOption{
@@ -230,6 +237,16 @@ func NewOpenAIProvider(apiKey string, model string, baseURL string) *OpenAIProvi
 		p.goClient = newClient(openCodeGoBaseURL)
 	}
 	return p
+}
+
+// SetModelInfoCacheDir points the models.dev disk cache at
+// <dir>/.gogen/models.json. Used when the agent switches projects.
+func (p *OpenAIProvider) SetModelInfoCacheDir(dir string) {
+	if p == nil || p.modelInfo == nil {
+		return
+	}
+	p.modelInfo.SetCachePath(modelinfo.CachePath(dir))
+	p.modelInfo.Warm()
 }
 
 // SetPromptCacheKey sets a stable key for provider-side prompt caching
@@ -377,18 +394,19 @@ func toolCallArgumentsJSON(tc *ToolCall) string {
 		return tc.ArgsStr
 	}
 
-	// Falling back to re-marshaling can diverge from provider ArgsStr bytes.
-	// Log this so cache misses can be traced to a root cause.
-	if tc.ArgsStr != "" {
-		debuglog.Write("llm/tool_args", "toolCallArgumentsJSON: ArgsStr invalid, re-marshaling",
+	// Remarsal for the wire only. Never overwrite a non-empty ArgsStr — even
+	// when invalid/truncated — so later turns keep the original history bytes
+	// and the drift detector can still see the provider fragment.
+	hadArgsStr := tc.ArgsStr != ""
+	if hadArgsStr {
+		debuglog.Write("llm/tool_args", "toolCallArgumentsJSON: ArgsStr invalid, remarsaling without overwrite",
 			"", map[string]interface{}{
-				"name":    tc.Name,
-				"id":      tc.ID,
-				"argsStr": tc.ArgsStr,
+				"name":       tc.Name,
+				"id":         tc.ID,
+				"argsStr":    tc.ArgsStr,
+				"argsStrLen": len(tc.ArgsStr),
 			})
 	} else if len(tc.Args) > 0 {
-		// ArgsStr was empty despite having parsed args — this happens
-		// when ToolCalls are constructed manually. Marshal once and pin.
 		debuglog.Write("llm/tool_args", "toolCallArgumentsJSON: ArgsStr empty, re-marshaling from map",
 			"", map[string]interface{}{
 				"name": tc.Name,
@@ -396,22 +414,32 @@ func toolCallArgumentsJSON(tc *ToolCall) string {
 			})
 	}
 
-	if tc.Args == nil {
-		tc.ArgsStr = "{}"
-		return tc.ArgsStr
+	marshaled := marshalToolArgsJSON(tc.Args)
+	if !hadArgsStr {
+		tc.ArgsStr = marshaled
 	}
-	argsJSON, err := json.Marshal(tc.Args)
-	if err != nil {
-		tc.ArgsStr = "{}"
-		return tc.ArgsStr
+	return marshaled
+}
+
+// marshalToolArgsJSON encodes tool args without HTML escaping so remarsaled
+// bytes stay closer to typical provider JSON (`<` not `\u003c`).
+func marshalToolArgsJSON(args map[string]interface{}) string {
+	if args == nil {
+		return "{}"
 	}
-	tc.ArgsStr = string(argsJSON)
-	return tc.ArgsStr
+	var buf strings.Builder
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(args); err != nil {
+		return "{}"
+	}
+	// Encoder always appends a trailing newline; strip it for stable ArgsStr.
+	return strings.TrimSuffix(buf.String(), "\n")
 }
 
 // StabilizeToolCallArgs pins ArgsStr to the bytes that will be sent on the
-// wire. Call when appending tool calls to history so token estimates and
-// later re-sends share one stable prefix.
+// wire when ArgsStr is empty. Non-empty ArgsStr (valid or not) is left alone
+// so provider/history bytes are not rewritten mid-session.
 func StabilizeToolCallArgs(tc *ToolCall) {
 	_ = toolCallArgumentsJSON(tc)
 }
@@ -764,11 +792,15 @@ func (p *OpenAIProvider) ModelContextLimit(ctx context.Context) (int, error) {
 		}
 	}
 
-	if limit := inferContextLimitFromModelName(modelName); limit > 0 {
+	// Provider JSON missed — try models.dev (in-memory/disk only; never blocks).
+	if limit := p.lookupModelsDevLimit(modelName); limit > 0 {
 		return limit, nil
 	}
 
-	return resolveContextLimit("", modelName), nil
+	if limit := inferContextLimitFromModelName(modelName); limit > 0 {
+		return limit, nil
+	}
+	return 128000, nil
 }
 
 func (p *OpenAIProvider) ListModels(ctx context.Context) ([]ModelInfo, error) {
@@ -784,7 +816,7 @@ func (p *OpenAIProvider) ListModels(ctx context.Context) ([]ModelInfo, error) {
 		}
 		out = append(out, ModelInfo{
 			ID:           m.ID,
-			ContextLimit: resolveContextLimit(m.RawJSON(), m.ID),
+			ContextLimit: p.resolveContextLimit(m.RawJSON(), m.ID),
 			Current:      m.ID == current,
 		})
 	}
@@ -798,13 +830,50 @@ func (p *OpenAIProvider) SetModel(id string) error {
 	return nil
 }
 
-// resolveContextLimit tries JSON fields first, then falls back to model-name inference.
-func resolveContextLimit(rawJSON, modelID string) int {
+// resolveContextLimit tries provider JSON fields, then models.dev, then
+// model-name inference. models.dev is consulted only after provider JSON
+// misses and never blocks on the network (see modelinfo.Resolver).
+func (p *OpenAIProvider) resolveContextLimit(rawJSON, modelID string) int {
 	if limit := parseContextLimitFromJSON(rawJSON); limit > 0 {
+		return limit
+	}
+	if limit := p.lookupModelsDevLimit(modelID); limit > 0 {
 		return limit
 	}
 	if limit := inferContextLimitFromModelName(modelID); limit > 0 {
 		return limit
 	}
 	return 128000
+}
+
+// lookupModelsDevLimit queries the models.dev registry by base URL + model ID.
+// OpenCode dual endpoints are both tried so zen and go models resolve.
+func (p *OpenAIProvider) lookupModelsDevLimit(modelID string) int {
+	if p == nil || p.modelInfo == nil || modelID == "" {
+		return 0
+	}
+	urls := make([]string, 0, 3)
+	seen := make(map[string]struct{}, 3)
+	add := func(u string) {
+		if u == "" {
+			return
+		}
+		if _, ok := seen[u]; ok {
+			return
+		}
+		seen[u] = struct{}{}
+		urls = append(urls, u)
+	}
+	add(p.baseURL)
+	if isOpencodeURL(p.baseURL) {
+		add(openCodeZenBaseURL)
+		add(openCodeGoBaseURL)
+	}
+	for _, u := range urls {
+		lim, err := p.modelInfo.ResolveContextLimit(u, modelID)
+		if err == nil && lim.Context > 0 {
+			return lim.Context
+		}
+	}
+	return 0
 }

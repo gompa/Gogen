@@ -34,9 +34,9 @@ Guidelines:
 Before editing: explore with repo_overview, search_code, list_definitions. Use read_file
 offset/limit to avoid loading whole files. Batch reads with read_files.
 
-Edits: prefer patch_file (fuzzy=true default; leave it on unless context matches exactly).
-If patch fails, re-read and retry; write_file only as a last resort for small files.
-Run tests/linters after edits; fix failures.
+Edits: surgical only — patch_file (fuzzy=true) or replace_in_file. Never rewrite a file,
+delete+recreate, or patch that removes+re-adds everything. write_file is create-only.
+If a patch fails, re-read and retry (don't rewrite). Run tests/linters after edits.
 
 Safety: never exfiltrate secrets. No destructive commands (rm -rf, sudo, curl|bash).
 For ambiguous tasks, state assumptions and proceed. Summarize changes when done.
