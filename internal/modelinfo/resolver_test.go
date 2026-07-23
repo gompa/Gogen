@@ -56,7 +56,7 @@ func waitReady(t *testing.T, r *Resolver, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		r.mu.RLock()
-		ready := r.data != nil
+		ready := r.data != nil && !r.refreshing
 		r.mu.RUnlock()
 		if ready {
 			return
@@ -64,6 +64,18 @@ func waitReady(t *testing.T, r *Resolver, timeout time.Duration) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("timed out waiting for registry to load")
+}
+
+func waitFile(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if st, err := os.Stat(path); err == nil && st.Size() > 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for cache file %s", path)
 }
 
 func TestResolveContextLimitFromDiskCache(t *testing.T) {
@@ -130,7 +142,7 @@ func TestWarmThenResolve(t *testing.T) {
 	r := NewResolver(cache)
 	r.url = srv.URL
 
-	// Cold resolve must not block on network (may kick off a background fetch).
+	// Cold resolve must not block on network.
 	start := time.Now()
 	_, err := r.ResolveContextLimit("https://opencode.ai/zen/v1", "claude-opus-4-8")
 	if err == nil {
@@ -142,6 +154,7 @@ func TestWarmThenResolve(t *testing.T) {
 
 	r.Warm()
 	waitReady(t, r, 5*time.Second)
+	waitFile(t, cache, 5*time.Second)
 
 	lim, err := r.ResolveContextLimit("https://opencode.ai/zen/v1", "claude-opus-4-8")
 	if err != nil {
@@ -149,9 +162,6 @@ func TestWarmThenResolve(t *testing.T) {
 	}
 	if lim.Context != 1000000 || lim.Output != 128000 {
 		t.Fatalf("got %+v", lim)
-	}
-	if _, err := os.Stat(cache); err != nil {
-		t.Fatalf("expected disk cache written: %v", err)
 	}
 
 	// Further lookups must be memory-only (no additional fetches).

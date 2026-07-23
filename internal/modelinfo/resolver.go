@@ -253,7 +253,7 @@ func (r *Resolver) writeDiskCache(data registry) {
 	if err != nil {
 		return
 	}
-	_ = ioutil.WriteFileAtomic(r.cachePath, b, 0o644)
+	_ = ioutil.WriteFileAtomicNoSync(r.cachePath, b, 0o644)
 }
 
 // normalizeURL strips a trailing slash so "https://x/v1" and "https://x/v1/"
