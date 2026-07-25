@@ -322,7 +322,6 @@ func applyContextStats(msg *WSMessage, stats agent.TurnContext) {
 	if snap.Used > 0 {
 		msg.UsedTokens = snap.Used
 	}
-	msg.UsedSource = "estimated"
 	msg.PromptTokens = stats.PromptTokens
 	msg.CompletionTokens = stats.CompletionTokens
 	msg.CachedTokens = stats.CachedTokens
@@ -330,6 +329,13 @@ func applyContextStats(msg *WSMessage, stats agent.TurnContext) {
 	msg.MessageCount = snap.MessageCount
 	msg.NearCompact = snap.NearCompact
 	msg.ToolTruncated = snap.ToolTruncated
+	// When the API returned exact usage, the Snapshot.Used incorporates that
+	// authoritative baseline (plus estimates for any messages added after the
+	// last request). Otherwise it's purely a local estimate.
+	msg.UsedSource = "estimated"
+	if stats.LastUsage != nil && stats.LastUsage.PromptTokens > 0 {
+		msg.UsedSource = "api"
+	}
 	if snap.Limit > 0 {
 		msg.UsedPercent = snap.Percent
 	}

@@ -71,6 +71,10 @@ func (s *stubSessionStore) Delete(workingDir, id string) error {
 	return nil
 }
 
+func (s *stubSessionStore) TouchSession(workingDir, id string) error {
+	return nil // no-op for tests
+}
+
 type errString string
 
 func (e errString) Error() string { return string(e) }

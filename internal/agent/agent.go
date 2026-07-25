@@ -29,12 +29,16 @@ type Agent struct {
 	TodoManager *TodoManager
 
 	// Session persistence
-	SessionStore   SessionPersister
-	SessionID      string
-	SessionLabel   string
-	UsageAccum     UsageAccumulator
-	lastTurnUsage  *llm.Usage
-	lastPersistErr error
+	SessionStore  SessionPersister
+	SessionID     string
+	SessionLabel  string
+	UsageAccum    UsageAccumulator
+	lastTurnUsage *llm.Usage
+	// apiBaselinePromptTokens and apiBaselineMsgCount let ContextStats use the
+	// API's exact prompt_tokens as the authoritative baseline for Snapshot.Used,
+	// only estimating messages added after the last API round.
+	apiBaselinePromptTokens, apiBaselineMsgCount int
+	lastPersistErr                               error
 	// sessionDirty tracks whether in-memory state differs from disk.
 	// TUI: single owner goroutine. Web server: Server.agentMu + turnMu serialize
 	// access across WebSocket clients (see internal/server).
@@ -171,7 +175,7 @@ func (a *Agent) doPersist() {
 	profile := a.ensureProjectProfile()
 	// Only copy messages now that we know we'll write.
 	msgs := append([]llm.Message(nil), a.Messages...)
-	if err := a.SessionStore.Save(a.SessionID, SessionSnapshot{
+	snap := SessionSnapshot{
 		WorkingDir:     a.WorkingDir,
 		Model:          a.CurrentModel(),
 		Mode:           a.Mode.String(),
@@ -179,7 +183,13 @@ func (a *Agent) doPersist() {
 		ProjectProfile: profile,
 		Todos:          todoSnapshot(a.TodoManager),
 		Messages:       msgs,
-	}); err != nil {
+	}
+	// Compute token counts so they can be persisted alongside messages and
+	// pre-warmed into the cache on the next load.
+	if a.Context != nil {
+		snap.TokenCounts = a.Context.TokenCounts(msgs)
+	}
+	if err := a.SessionStore.Save(a.SessionID, snap); err != nil {
 		log.Printf("session save failed (id=%s): %v", a.SessionID, err)
 		a.lastPersistErr = err
 		return
@@ -306,7 +316,7 @@ func (a *Agent) prepareMessages(ctx context.Context) []llm.Message {
 						a.PinManager.ReplacePins(newPins)
 					}
 					// lastTurnUsage is no longer representative after compaction.
-					a.lastTurnUsage = nil
+					a.clearTurnUsage()
 				}
 			}
 		}
@@ -350,7 +360,7 @@ func (a *Agent) CompactHistory(ctx context.Context) error {
 		a.PinManager.ReplacePins(newPins)
 	}
 	// lastTurnUsage is no longer representative after compaction.
-	a.lastTurnUsage = nil
+	a.clearTurnUsage()
 	return nil
 }
 

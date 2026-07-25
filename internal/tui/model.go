@@ -17,7 +17,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/muesli/reflow/wordwrap"
 	"github.com/muesli/reflow/wrap"
 )
 
@@ -279,15 +278,12 @@ func (m *Model) wrapWidth() int {
 // wrapLine wraps a single chat line ready for display.  It handles SGR
 // propagation so that ANSI styles are re‑emitted on every continuation line.
 //
-// wordwrap alone leaves overlong tokens (URLs, paths, etc.) wider than the
-// limit. A follow-up hard wrap breaks those so every line fits wrapWidth.
-// Without that, the normal viewport truncates with ansi.Cut while the
-// selection renderer re-wraps via lipgloss MaxWidth — causing lines to jump
-// when selecting text.
+// wrap.String handles both word-wrapping and hard-wrapping of overlong tokens
+// (URLs, paths, etc.) in a single pass, avoiding the cost of double-wrapping
+// on every streaming update (~32ms batches).
 func (m *Model) wrapLine(line string) []string {
 	w := m.wrapWidth()
-	wrapped := wordwrap.String(line, w)
-	wrapped = wrap.String(wrapped, w)
+	wrapped := wrap.String(line, w)
 	parts := strings.Split(wrapped, "\n")
 	// Strip trailing empty elements caused by a trailing newline.
 	// Without this, a trailing \n creates a blank visual line that

@@ -37,7 +37,10 @@ func (s *statsStubProvider) ListModels(_ context.Context) ([]llm.ModelInfo, erro
 func (s *statsStubProvider) SetModel(string) error { return nil }
 func (s *statsStubProvider) ModelName() string     { return "test-model" }
 
-func TestContextStatsUsesEstimatedHistory(t *testing.T) {
+// TestContextStatsUsesAPIBaseline verifies that when the API returned usage,
+// ContextStats uses it as the authoritative PromptTokens baseline for
+// Snapshot.Used rather than a full local estimate.
+func TestContextStatsUsesAPIBaseline(t *testing.T) {
 	provider := &statsStubProvider{limit: 1000}
 	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{ContextLimit: 1000})
 	a := NewAgent(provider, &Executor{WorkingDir: "."}, ctxMgr)
@@ -45,15 +48,45 @@ func TestContextStatsUsesEstimatedHistory(t *testing.T) {
 	a.recordTurnUsage(&llm.Usage{PromptTokens: 900, CompletionTokens: 50, TotalTokens: 950, CachedTokens: 400})
 
 	stats := a.ContextStats(context.Background())
-	if stats.Snapshot.Used == 900 {
-		t.Fatal("Used should track estimated history, not frozen API prompt tokens")
-	}
-	if stats.Snapshot.Used <= 0 {
-		t.Fatalf("expected estimated used > 0, got %d", stats.Snapshot.Used)
+	if stats.Snapshot.Used != 900 {
+		t.Fatalf("Used should use API baseline (900) when messages haven't changed, got %d", stats.Snapshot.Used)
 	}
 	if stats.PromptTokens != 900 || stats.CompletionTokens != 50 || stats.CachedTokens != 400 {
 		t.Fatalf("unexpected last turn usage: %+v", stats)
 	}
+}
+
+// TestContextStatsAPIBaselineWithExtraMessages verifies that when messages
+// are appended after the API baseline was recorded, Snapshot.Used equals
+// the API's PromptTokens plus a local estimate for the new messages.
+func TestContextStatsAPIBaselineWithExtraMessages(t *testing.T) {
+	provider := &statsStubProvider{limit: 10000}
+	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{ContextLimit: 10000})
+	a := NewAgent(provider, &Executor{WorkingDir: "."}, ctxMgr)
+	a.Messages = []llm.Message{
+		{Role: "user", Content: "hello"},
+	}
+	// Simulate: API call happened with 1 message, returned 10 prompt tokens.
+	a.recordTurnUsage(&llm.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15})
+
+	// Assistant response was appended after the API call (messages now = 2).
+	a.Messages = append(a.Messages, llm.Message{Role: "assistant", Content: "world"})
+
+	stats := a.ContextStats(context.Background())
+	if stats.Snapshot.Used <= 10 {
+		t.Fatalf("Used should be API baseline (10) + estimate for new message, got %d", stats.Snapshot.Used)
+	}
+	// The estimate for "world" should be > 0.
+	if stats.PromptTokens != 10 || stats.CompletionTokens != 5 {
+		t.Fatalf("unexpected last turn usage: prompt=%d completion=%d", stats.PromptTokens, stats.CompletionTokens)
+	}
+
+	// Verify /context detail view still works (it shows the API counters).
+	out, handled := a.HandleContextCommand(context.Background(), "/context")
+	if !handled {
+		t.Fatal("expected handled")
+	}
+	t.Logf("/context output: %s", out)
 }
 
 func TestContextStatsDoesNotMutateMessages(t *testing.T) {

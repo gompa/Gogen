@@ -18,16 +18,40 @@ type TurnContext struct {
 	CachedTokens     int
 }
 
+// recordTurnUsage stores the API usage and records a baseline so ContextStats
+// can use the API's exact prompt_tokens for the context indicator.
 func (a *Agent) recordTurnUsage(u *llm.Usage) {
 	if u == nil {
 		return
 	}
 	a.lastTurnUsage = u
+	// Record baseline for accurate context stats: the API's PromptTokens
+	// is the exact token count for the view (system prompt + canonical msgs)
+	// at this point. Subsequent ContextStats calls will use this as the
+	// authoritative baseline and only estimate messages added afterward.
+	if u.PromptTokens > 0 {
+		a.apiBaselinePromptTokens = u.PromptTokens
+		a.apiBaselineMsgCount = len(a.Messages)
+	}
+}
+
+// clearTurnUsage clears last-turn API counters and the baseline used by
+// ContextStats. Call when messages are compacted, the model is switched, or
+// the session is reset — any time the stored usage no longer represents the
+// current conversation state.
+func (a *Agent) clearTurnUsage() {
+	a.lastTurnUsage = nil
+	a.apiBaselinePromptTokens = 0
+	a.apiBaselineMsgCount = 0
 }
 
 // ContextStats is a read-only probe of current context usage.
 // It must not mutate Messages, compact history, or call the provider.
 // Web callers must hold Server.agentMu (see internal/server/agent_sync.go).
+//
+// When an API baseline is available, Snapshot.Used reflects the API's exact
+// prompt_tokens for the messages that were in the last request, plus local
+// estimates for any messages appended since then.
 func (a *Agent) ContextStats(ctx context.Context) TurnContext {
 	_ = ctx // reserved for future cancellation of pure-local work
 	msgs := a.Messages
@@ -54,14 +78,27 @@ func (a *Agent) ContextStats(ctx context.Context) TurnContext {
 		}
 	}
 
+	// If we have an API baseline, use it as the authoritative count for
+	// messages that were in the last request, then add local estimates
+	// for any messages appended since then.
+	if a.lastTurnUsage != nil && a.apiBaselinePromptTokens > 0 && a.apiBaselineMsgCount > 0 && a.Context != nil {
+		baseline := a.apiBaselinePromptTokens
+		if n := len(msgs); n > a.apiBaselineMsgCount {
+			extra := msgs[a.apiBaselineMsgCount:]
+			baseline += a.Context.EstimateTokens(extra)
+		}
+		snap.Used = baseline
+		if snap.Limit > 0 {
+			snap.Percent = float64(baseline) / float64(snap.Limit)
+		}
+	}
+
 	stats := TurnContext{
 		Snapshot:  snap,
 		LastUsage: a.lastTurnUsage,
 	}
 
-	// Attach last-request API counters for detail views. Snapshot.Used stays
-	// as the estimated current history size so the indicator moves as the
-	// session grows (API prompt tokens are frozen at request start).
+	// Attach last-request API counters for detail views.
 	if a.lastTurnUsage != nil && a.lastTurnUsage.PromptTokens > 0 {
 		stats.PromptTokens = a.lastTurnUsage.PromptTokens
 		stats.CompletionTokens = a.lastTurnUsage.CompletionTokens

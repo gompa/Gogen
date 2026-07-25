@@ -4,10 +4,12 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"gogen/internal/agent"
@@ -29,9 +31,28 @@ type file struct {
 	ProjectProfile string          `json:"projectProfile,omitempty"`
 	Todos          *agent.TodoList `json:"todos,omitempty"`
 	Messages       []llm.Message   `json:"messages"`
+	TokenCounts    []int           `json:"tokenCounts,omitempty"`
+}
+
+// sessionIndexEntry is a lightweight entry in the session index file.
+type sessionIndexEntry struct {
+	ID           string    `json:"id"`
+	Updated      time.Time `json:"updated"`
+	MessageCount int       `json:"messageCount"`
+	Label        string    `json:"label,omitempty"`
+}
+
+// sessionIndex is the on-disk index of session metadata for fast listing.
+type sessionIndex struct {
+	Entries []sessionIndexEntry `json:"entries"`
 }
 
 // Store persists sessions under .gogen/sessions/.
+//
+// Save/Load/Delete operations are externally serialized by the caller (turnMu
+// in the web server). List may be called concurrently from the WS read loop,
+// so the in-memory list cache is protected by a mutex. The metadata index
+// file is protected by the same mutex to avoid concurrent reads/writes.
 type Store struct {
 	enabled      bool
 	maxCount     int
@@ -39,6 +60,17 @@ type Store struct {
 	createdCache map[string]time.Time // sessionID → Created timestamp (avoids re-read)
 	saveCount    int                  // counter for periodic pruning
 }
+
+// listCacheEntry holds a cached session list for one working directory.
+type listCacheEntry struct {
+	info []agent.SessionInfo
+	time time.Time
+}
+
+var (
+	listCache   = make(map[string]listCacheEntry) // workingDir → cache
+	listCacheMu sync.RWMutex
+)
 
 // StoreOptions configures retention for persisted sessions.
 type StoreOptions struct {
@@ -111,6 +143,7 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 		ProjectProfile: snap.ProjectProfile,
 		Todos:          snap.Todos,
 		Messages:       snap.Messages,
+		TokenCounts:    snap.TokenCounts,
 	}
 	data, err := json.Marshal(out)
 	if err != nil {
@@ -125,7 +158,30 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 	if s.saveCount%3 == 0 {
 		s.prune(snap.WorkingDir, id)
 	}
+	// Update index and invalidate in-memory cache.
+	label := sessionLabel(snap.Messages, snap.Label)
+	s.updateIndex(snap.WorkingDir, id, out.Updated, len(snap.Messages), label)
 	return nil
+}
+
+// TouchSession updates only the session's timestamp metadata without
+// rewriting the full message payload. Uses file mtime plus the index file.
+func (s *Store) TouchSession(workingDir, id string) error {
+	if s == nil || !s.enabled || id == "" {
+		return nil
+	}
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
+	path := s.path(workingDir, id)
+	if err := ensureUnderSessionsDir(workingDir, path); err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	if err := os.Chtimes(path, now, now); err != nil {
+		return err
+	}
+	return s.touchIndex(workingDir, id, now)
 }
 
 // LoadInWorkingDir loads a session from a working directory.
@@ -159,14 +215,52 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 		ProjectProfile: f.ProjectProfile,
 		Todos:          f.Todos,
 		Messages:       f.Messages,
+		TokenCounts:    f.TokenCounts,
 	}, nil
 }
 
-// List returns session ids for a working directory.
+// List returns session info for a working directory, ordered by most recently
+// updated first. Uses the metadata index when available, falling back to a
+// full-file scan for legacy directories. Results are cached briefly in memory
+// to avoid repeated disk I/O on reconnects.
 func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 	if s == nil || !s.enabled {
 		return nil, nil
 	}
+
+	// Check in-memory cache first (1-second TTL).
+	listCacheMu.RLock()
+	if ce, ok := listCache[workingDir]; ok && time.Since(ce.time) < time.Second {
+		out := make([]agent.SessionInfo, len(ce.info))
+		copy(out, ce.info)
+		listCacheMu.RUnlock()
+		return out, nil
+	}
+	listCacheMu.RUnlock()
+
+	// Try the metadata index file.
+	idx := s.readIndex(workingDir)
+	if idx != nil && len(idx.Entries) > 0 {
+		sort.Slice(idx.Entries, func(i, j int) bool {
+			return idx.Entries[i].Updated.After(idx.Entries[j].Updated)
+		})
+		out := make([]agent.SessionInfo, len(idx.Entries))
+		for i, e := range idx.Entries {
+			out[i] = agent.SessionInfo{
+				ID:           e.ID,
+				UpdatedAt:    e.Updated.UTC().Format(time.RFC3339Nano),
+				MessageCount: e.MessageCount,
+				Label:        e.Label,
+			}
+		}
+		listCacheMu.Lock()
+		listCache[workingDir] = listCacheEntry{info: out, time: time.Now()}
+		listCacheMu.Unlock()
+		return out, nil
+	}
+
+	// Fallback: legacy full-file scan (no index file).
+	idx = &sessionIndex{} // collect entries to build the index
 	entries, err := os.ReadDir(s.dir(workingDir))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -174,10 +268,6 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 		}
 		return nil, err
 	}
-	// Collect entries with their parsed Updated time so we can sort
-	// correctly.  Sorting by the RFC3339Nano string is unreliable because
-	// trailing zeros in the fractional seconds are dropped (e.g.
-	// "T10:30:00.5Z" vs "T10:30:00Z" — ".5" is later but '.' < 'Z').
 	type item struct {
 		info    agent.SessionInfo
 		updated time.Time
@@ -185,6 +275,10 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 	var items []item
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		// Skip the index file if somehow named .json
+		if e.Name() == "index.json" {
 			continue
 		}
 		id := strings.TrimSuffix(e.Name(), ".json")
@@ -196,21 +290,36 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 		if err := json.Unmarshal(data, &f); err != nil {
 			continue
 		}
+		lbl := sessionLabel(f.Messages, f.Label)
 		items = append(items, item{
 			info: agent.SessionInfo{
 				ID:           id,
 				UpdatedAt:    f.Updated.UTC().Format(time.RFC3339Nano),
 				MessageCount: len(f.Messages),
-				Label:        sessionLabel(f.Messages, f.Label),
+				Label:        lbl,
 			},
 			updated: f.Updated,
 		})
+		idx.Entries = append(idx.Entries, sessionIndexEntry{
+			ID: id, Updated: f.Updated, MessageCount: len(f.Messages), Label: lbl,
+		})
+	}
+	// Persist the index for next time (best-effort).
+	if len(idx.Entries) > 0 {
+		sort.Slice(idx.Entries, func(i, j int) bool { return idx.Entries[i].Updated.After(idx.Entries[j].Updated) })
+		_ = s.writeIndex(workingDir, idx)
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].updated.After(items[j].updated) })
 	out := make([]agent.SessionInfo, len(items))
 	for i, it := range items {
 		out[i] = it.info
 	}
+
+	// Populate in-memory cache.
+	listCacheMu.Lock()
+	listCache[workingDir] = listCacheEntry{info: out, time: time.Now()}
+	listCacheMu.Unlock()
+
 	return out, nil
 }
 
@@ -270,6 +379,9 @@ func (s *Store) Delete(workingDir, id string) error {
 		return err
 	}
 	delete(s.createdCache, id)
+	// Remove from index and invalidate in-memory cache.
+	s.removeFromIndex(workingDir, id)
+	s.invalidateListCache(workingDir)
 	return nil
 }
 
@@ -308,6 +420,131 @@ func ensureUnderSessionsDir(workingDir, path string) error {
 // writeFileAtomic is a convenience wrapper around ioutil.WriteFileAtomicNoSync.
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	return ioutil.WriteFileAtomicNoSync(path, data, perm)
+}
+
+// indexFile returns the path to the metadata index for a working directory.
+func (s *Store) indexFile(workingDir string) string {
+	return filepath.Join(s.dir(workingDir), "index.json")
+}
+
+// readIndex loads the session metadata index from disk. Returns nil if the
+// file does not exist or is corrupt.
+func (s *Store) readIndex(workingDir string) *sessionIndex {
+	data, err := os.ReadFile(s.indexFile(workingDir))
+	if err != nil {
+		return nil
+	}
+	var idx sessionIndex
+	if err := json.Unmarshal(data, &idx); err != nil {
+		log.Printf("warning: corrupt session index, rebuilding: %v", err)
+		return nil
+	}
+	return &idx
+}
+
+// writeIndex writes the session metadata index atomically.
+func (s *Store) writeIndex(workingDir string, idx *sessionIndex) error {
+	if idx == nil {
+		return nil
+	}
+	data, err := json.Marshal(idx)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(s.dir(workingDir), 0o700); err != nil {
+		return err
+	}
+	indexPath := s.indexFile(workingDir)
+	if err := ensureUnderSessionsDir(workingDir, indexPath); err != nil {
+		return err
+	}
+	return writeFileAtomic(indexPath, data, 0o600)
+}
+
+// updateIndex adds or updates an entry in the session metadata index.
+func (s *Store) updateIndex(workingDir, id string, updated time.Time, msgCount int, label string) {
+	if s == nil || !s.enabled {
+		return
+	}
+	idx := s.readIndex(workingDir)
+	if idx == nil {
+		idx = &sessionIndex{}
+	}
+	found := false
+	for i, e := range idx.Entries {
+		if e.ID == id {
+			idx.Entries[i].Updated = updated
+			idx.Entries[i].MessageCount = msgCount
+			idx.Entries[i].Label = label
+			found = true
+			break
+		}
+	}
+	if !found {
+		idx.Entries = append(idx.Entries, sessionIndexEntry{
+			ID: id, Updated: updated, MessageCount: msgCount, Label: label,
+		})
+	}
+	_ = s.writeIndex(workingDir, idx)
+	s.invalidateListCache(workingDir)
+}
+
+// touchIndex updates only the timestamp for a session in the index.
+func (s *Store) touchIndex(workingDir, id string, updated time.Time) error {
+	if s == nil || !s.enabled {
+		return nil
+	}
+	idx := s.readIndex(workingDir)
+	if idx == nil {
+		// No index yet; nothing to touch.
+		return nil
+	}
+	found := false
+	for i, e := range idx.Entries {
+		if e.ID == id {
+			idx.Entries[i].Updated = updated
+			found = true
+			break
+		}
+	}
+	if !found {
+		// Entry not in index; skip. The list fallback will re-scan on next miss.
+		return nil
+	}
+	if err := s.writeIndex(workingDir, idx); err != nil {
+		return err
+	}
+	s.invalidateListCache(workingDir)
+	return nil
+}
+
+// removeFromIndex deletes an entry from the session metadata index.
+func (s *Store) removeFromIndex(workingDir, id string) {
+	if s == nil || !s.enabled {
+		return
+	}
+	idx := s.readIndex(workingDir)
+	if idx == nil {
+		return
+	}
+	filtered := idx.Entries[:0]
+	for _, e := range idx.Entries {
+		if e.ID != id {
+			filtered = append(filtered, e)
+		}
+	}
+	if len(filtered) == len(idx.Entries) {
+		return // nothing removed
+	}
+	idx.Entries = filtered
+	_ = s.writeIndex(workingDir, idx)
+}
+
+// invalidateListCache clears the in-memory list cache for a working directory.
+func (s *Store) invalidateListCache(workingDir string) {
+	listCacheMu.Lock()
+	delete(listCache, workingDir)
+	listCacheMu.Unlock()
 }
 
 func sessionLabel(messages []llm.Message, label string) string {

@@ -493,8 +493,8 @@ func compileSearchPattern(pattern string) (*regexp.Regexp, error) {
 }
 
 // scanFileSinglePass reads the file once, finds matches, and emits results
-// with context lines. Replaces the prior two-pass approach (findMatchLineNums
-// + fetchMatchedLines) to halve file I/O.
+// with context lines. Uses a single streaming pass when contextLines == 0
+// to avoid storing all lines in memory.
 func scanFileSinglePass(path, relPath string, re *regexp.Regexp, contextLines, matchLimit int) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -504,6 +504,30 @@ func scanFileSinglePass(path, relPath string, re *regexp.Regexp, contextLines, m
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), searchMaxFileBytes)
+
+	// Fast path: no context needed — emit matches as we scan, no line storage.
+	if contextLines <= 0 {
+		var out []string
+		lineNum := 0
+		for scanner.Scan() {
+			lineNum++
+			if re.MatchString(scanner.Text()) {
+				out = append(out, fmt.Sprintf("%s:%d:%s", relPath, lineNum, scanner.Text()))
+				if len(out) >= matchLimit {
+					break
+				}
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			return nil, err
+		}
+		if len(out) == 0 {
+			return nil, nil
+		}
+		return out, nil
+	}
+
+	// Context-lines path: store lines to support before/after context.
 	var lines []string
 	lineNum := 0
 	for scanner.Scan() {
@@ -513,8 +537,11 @@ func scanFileSinglePass(path, relPath string, re *regexp.Regexp, contextLines, m
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
+	if len(lines) == 0 {
+		return nil, nil
+	}
 
-	// Find matching line numbers.
+	// Find matching line numbers in a single pass over stored lines.
 	matchNums := make([]int, 0, matchLimit)
 	for i, line := range lines {
 		if re.MatchString(line) {
@@ -528,32 +555,31 @@ func scanFileSinglePass(path, relPath string, re *regexp.Regexp, contextLines, m
 		return nil, nil
 	}
 
-	// Build output set: which lines to emit and with what separator.
-	want := make(map[int]byte, len(matchNums)*(contextLines*2+1))
+	// Use a byte slice (1-indexed) instead of a map for the emit-mask.
+	// 0 = skip, ':' = match line, '-' = context line.
+	want := make([]byte, len(lines)+1)
 	for _, n := range matchNums {
-		if contextLines <= 0 {
-			want[n] = ':'
-			continue
-		}
 		start := n - contextLines
 		if start < 1 {
 			start = 1
 		}
-		for i := start; i <= n+contextLines; i++ {
-			sep := byte('-')
-			if i == n {
-				sep = ':'
-			}
-			if _, ok := want[i]; !ok || sep == ':' {
-				want[i] = sep
+		end := n + contextLines
+		if end > len(lines) {
+			end = len(lines)
+		}
+		for i := start; i <= end; i++ {
+			if i == n || want[i] == 0 {
+				want[i] = ':'
+			} else if want[i] != ':' {
+				want[i] = '-'
 			}
 		}
 	}
 
 	var out []string
 	for lineNum = 1; lineNum <= len(lines); lineNum++ {
-		sep, ok := want[lineNum]
-		if !ok {
+		sep := want[lineNum]
+		if sep == 0 {
 			continue
 		}
 		out = append(out, fmt.Sprintf("%s%c%d%c%s", relPath, sep, lineNum, sep, lines[lineNum-1]))

@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/binary"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"flag"
 	"fmt"

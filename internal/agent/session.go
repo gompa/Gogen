@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
 )
 
@@ -17,6 +18,7 @@ type SessionSnapshot struct {
 	ProjectProfile string
 	Todos          *TodoList
 	Messages       []llm.Message
+	TokenCounts    []int // pre-computed token counts per message (nil if unavailable)
 }
 
 // SessionPersister stores and loads agent sessions.
@@ -26,6 +28,8 @@ type SessionPersister interface {
 	List(workingDir string) ([]SessionInfo, error)
 	LatestID(workingDir string) (string, error)
 	Delete(workingDir, id string) error
+	// TouchSession updates only the timestamp metadata without rewriting messages.
+	TouchSession(workingDir, id string) error
 }
 
 // SessionInfo describes a saved session entry.
@@ -46,7 +50,8 @@ type SessionInfo struct {
 func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 	prevSessionID := a.SessionID
 
-	a.Messages = append([]llm.Message(nil), snap.Messages...)
+	// Take ownership of the snapshot's message slice — no defensive copy.
+	a.Messages = snap.Messages
 	// Token counts are keyed by content fingerprint, so entries from the
 	// previous session remain valid as long as the content hasn't changed.
 	// Keep the sticky project profile when resuming in the same working
@@ -68,7 +73,7 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 	if a.TodoManager != nil {
 		a.TodoManager.Replace(snap.Todos)
 	}
-	a.lastTurnUsage = nil
+	a.clearTurnUsage()
 	a.UsageAccum = UsageAccumulator{}
 	a.SessionLabel = snap.Label
 	if m, ok := ParseMode(snap.Mode); ok {
@@ -76,6 +81,11 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 	}
 	if snap.Model != "" {
 		_ = a.Provider.SetModel(snap.Model)
+	}
+
+	// Pre-warm the token cache with pre-computed counts from the snapshot.
+	if len(snap.TokenCounts) == len(a.Messages) {
+		contextmgr.WarmTokenCache(a.Messages, snap.TokenCounts)
 	}
 
 	a.compareViewOnRestore(prevSessionID, newSessionID)

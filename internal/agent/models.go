@@ -93,7 +93,7 @@ func (a *Agent) SelectModel(ctx context.Context, selector string) error {
 	}
 	// A new model may report usage on a different scale (and context limit),
 	// so the previous request's API counters are misleading for /context.
-	a.lastTurnUsage = nil
+	a.clearTurnUsage()
 	return nil
 }
 

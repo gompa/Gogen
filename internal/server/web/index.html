@@ -354,7 +354,6 @@
         .cursor::after { content: '|'; animation: blink 1s infinite; color: var(--accent); }
         @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
         .thinking { color: var(--fg-muted); font-style: italic; }
-        .thinking-block { color: var(--fg-muted); font-style: italic; white-space: pre-wrap; }
 
         .tool-card {
             align-self: flex-start;
@@ -2100,19 +2099,36 @@
         function showThinking() {
             finalizeThinking();
             const div = document.createElement('div');
-            div.className = 'message assistant thinking-block';
-            const open = document.createElement('span');
-            open.textContent = '<thinking>';
-            const span = document.createElement('span');
-            const close = document.createElement('span');
-            close.textContent = '</thinking>';
-            div.appendChild(open);
-            div.appendChild(span);
-            div.appendChild(close);
+            div.className = 'thought-card';
+
+            const header = document.createElement('div');
+            header.style.cssText = 'display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;font-size:0.85em;color:var(--fg-muted);padding:2px 0;';
+            const label = document.createElement('span');
+            label.style.fontStyle = 'italic';
+            label.textContent = 'Thinking';
+            const toggle = document.createElement('span');
+            toggle.textContent = '▾';
+            toggle.style.fontSize = '0.8em';
+            header.appendChild(label);
+            header.appendChild(toggle);
+
+            const body = document.createElement('div');
+            body.style.cssText = 'font-size:0.85em;color:var(--fg-muted);font-style:italic;white-space:pre-wrap;padding:4px 0 0 0;';
+
+            div.appendChild(header);
+            div.appendChild(body);
             messagesDiv.appendChild(div);
+
+            // Collapse toggle active from the start
+            header.addEventListener('click', () => {
+                const collapsed = body.style.display === 'none';
+                body.style.display = collapsed ? '' : 'none';
+                toggle.textContent = collapsed ? '▾' : '▸';
+            });
+
             smartScroll();
             currentThinkingDiv = div;
-            currentThinkingSpan = span;
+            currentThinkingSpan = body;
         }
 
         function appendThinkingToken(token) {
@@ -2136,39 +2152,16 @@
             removeThinkingStatus();
             if (!currentThinkingDiv) return;
             const div = currentThinkingDiv;
-            const content = (currentThinkingSpan ? currentThinkingSpan.textContent : '').trim();
+            const body = currentThinkingSpan;
+            const content = (body ? body.textContent : '').trim();
             currentThinkingDiv = null;
             currentThinkingSpan = null;
             if (!content) {
                 div.remove();
                 return;
             }
-
-            const header = document.createElement('div');
-            header.style.cssText = 'display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;font-size:0.85em;color:var(--fg-muted);padding:2px 0;';
-            const label = document.createElement('span');
-            label.style.fontStyle = 'italic';
-            label.textContent = 'Thinking';
-            const toggle = document.createElement('span');
-            toggle.textContent = '▾';
-            toggle.style.fontSize = '0.8em';
-            header.appendChild(label);
-            header.appendChild(toggle);
-
-            const body = document.createElement('div');
-            body.style.cssText = 'font-size:0.85em;color:var(--fg-muted);font-style:italic;white-space:pre-wrap;padding:4px 0 0 0;';
-            body.textContent = content;
-
-            div.innerHTML = '';
-            div.className = 'thought-card';
-            div.appendChild(header);
-            div.appendChild(body);
-
-            header.addEventListener('click', () => {
-                const collapsed = body.style.display === 'none';
-                body.style.display = collapsed ? '' : 'none';
-                toggle.textContent = collapsed ? '▾' : '▸';
-            });
+            // Card is already fully structured from showThinking() —
+            // the collapsible toggle is already active, no rebuild needed.
         }
 
         function endStream() {
@@ -2561,10 +2554,31 @@
                     // Skip when reasoning was promoted into content (same text).
                     if (h.reasoning && h.reasoning !== h.content) {
                         const div = document.createElement('div');
-                        div.className = 'message assistant thinking-block';
-                        div.textContent = `Thinking: ${h.reasoning}`;
-                        div.title = formatExactTime(msgDate(h.createdAt));
-                        if (h.createdAt) div.dataset.createdAt = h.createdAt;
+                        div.className = 'thought-card';
+                        const header = document.createElement('div');
+                        header.style.cssText = 'display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;font-size:0.85em;color:var(--fg-muted);padding:2px 0;';
+                        const label = document.createElement('span');
+                        label.style.fontStyle = 'italic';
+                        label.textContent = 'Thinking';
+                        const toggle = document.createElement('span');
+                        toggle.textContent = '▾';
+                        toggle.style.fontSize = '0.8em';
+                        header.appendChild(label);
+                        header.appendChild(toggle);
+                        const body = document.createElement('div');
+                        body.style.cssText = 'font-size:0.85em;color:var(--fg-muted);font-style:italic;white-space:pre-wrap;padding:4px 0 0 0;';
+                        body.textContent = h.reasoning;
+                        div.appendChild(header);
+                        div.appendChild(body);
+                        header.addEventListener('click', () => {
+                            const collapsed = body.style.display === 'none';
+                            body.style.display = collapsed ? '' : 'none';
+                            toggle.textContent = collapsed ? '▾' : '▸';
+                        });
+                        if (h.createdAt) {
+                            div.title = formatExactTime(msgDate(h.createdAt));
+                            div.dataset.createdAt = h.createdAt;
+                        }
                         messagesDiv.appendChild(div);
                         smartScroll();
                     }

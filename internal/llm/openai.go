@@ -537,8 +537,8 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 	stream := p.clientForModel().Chat.Completions.NewStreaming(ctx, params)
 	defer stream.Close()
 
-	var fullContent string
-	var fullRefusal string
+	var fullContent strings.Builder
+	var fullRefusal strings.Builder
 	var fullReasoning string
 	var lastFinishReason string
 	var streamUsage *Usage
@@ -592,11 +592,11 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 		extras.addFromDelta(delta, onThinking, &fullReasoning)
 
 		if delta.Content != "" {
-			fullContent += delta.Content
+			fullContent.WriteString(delta.Content)
 			onToken(delta.Content)
 		}
 		if delta.Refusal != "" {
-			fullRefusal += delta.Refusal
+			fullRefusal.WriteString(delta.Refusal)
 		}
 		if len(delta.ToolCalls) > 0 {
 			for _, tc := range delta.ToolCalls {
@@ -624,7 +624,7 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 				// content/refusal/tool-calls have arrived. A reasoning-carrying
 				// delta is NOT sufficient — the spurious stop often rides on the
 				// same chunk as a reasoning token.
-				if fullContent != "" || fullRefusal != "" || len(tcAccums) > 0 {
+				if fullContent.Len() > 0 || fullRefusal.Len() > 0 || len(tcAccums) > 0 {
 					lastFinishReason = choice.FinishReason
 					streamDone = true
 				}
@@ -675,7 +675,7 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 			Refusal:       resp.Refusal,
 			ToolCalls:     resp.ToolCalls,
 			Usage:         resp.Usage,
-			PartialStream: len(tcAccums) > 0 || fullContent != "" || fullRefusal != "" || extras.textLen() > 0,
+			PartialStream: len(tcAccums) > 0 || fullContent.Len() > 0 || fullRefusal.Len() > 0 || extras.textLen() > 0,
 		}, nil
 	}
 
@@ -712,8 +712,8 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 
 	// Fallback: if no tool calls were extracted from the stream deltas,
 	// try to find embedded tool call patterns in the reasoning/content text.
-	if len(toolCalls) == 0 && (fullReasoning != "" || fullContent != "") {
-		extractedCalls := extractToolCallsFromText(fullReasoning + fullContent)
+	if len(toolCalls) == 0 && (fullReasoning != "" || fullContent.Len() > 0) {
+		extractedCalls := extractToolCallsFromText(fullReasoning + fullContent.String())
 		if len(extractedCalls) > 0 {
 			toolCalls = extractedCalls
 		}
@@ -721,9 +721,9 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 
 	// Keep content/reasoning/refusal separate so re-sends match the original
 	// completion shape (required for provider prompt-cache prefix hits).
-	content := fullContent
+	content := fullContent.String()
 
-	if lastFinishReason == "" && (content != "" || fullRefusal != "" || fullReasoning != "" || len(tcAccums) > 0) {
+	if lastFinishReason == "" && (content != "" || fullRefusal.Len() > 0 || fullReasoning != "" || len(tcAccums) > 0) {
 		if len(tcAccums) > 0 {
 			lastFinishReason = "tool_calls"
 		} else {
@@ -731,14 +731,14 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 		}
 	}
 
-	if lastFinishReason == "" && content == "" && fullRefusal == "" && fullReasoning == "" && len(toolCalls) == 0 {
+	if lastFinishReason == "" && content == "" && fullRefusal.Len() == 0 && fullReasoning == "" && len(toolCalls) == 0 {
 		return nil, fmt.Errorf("stream ended without finish_reason")
 	}
 
 	return &StreamResult{
 		Content:   content,
 		Reasoning: fullReasoning,
-		Refusal:   fullRefusal,
+		Refusal:   fullRefusal.String(),
 		ToolCalls: toolCalls,
 		Usage:     streamUsage,
 	}, nil

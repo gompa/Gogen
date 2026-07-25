@@ -95,6 +95,41 @@ func InvalidateTokenCache() {
 	tokenCache.Unlock()
 }
 
+// TokenCounts returns per-message token counts for the given messages,
+// computing and caching any that are not already in the cache.
+func (m *Manager) TokenCounts(messages []llm.Message) []int {
+	if len(messages) == 0 {
+		return nil
+	}
+	counts := make([]int, len(messages))
+	for i := range messages {
+		if n, ok := cachedTokenCount(&messages[i]); ok {
+			counts[i] = n
+		} else {
+			n := computeMessageTokens(messages[i])
+			storeTokenCount(&messages[i], n)
+			counts[i] = n
+		}
+	}
+	return counts
+}
+
+// ComputeMessageTokens returns the estimated token count for a single message
+// using the cl100k_base tokenizer when available, falling back to a bytes/4
+// heuristic. The result is NOT cached — callers that want caching should use
+// Manager.EstimateTokens instead.
+func ComputeMessageTokens(msg llm.Message) int {
+	return computeMessageTokens(msg)
+}
+
+// WarmTokenCache pre-populates the token count cache for a slice of messages.
+// The counts slice must have the same length as msgs. Panics on mismatch.
+func WarmTokenCache(msgs []llm.Message, counts []int) {
+	for i := range msgs {
+		storeTokenCount(&msgs[i], counts[i])
+	}
+}
+
 // TokenCacheSize reports the number of cached token-count entries.
 // Intended for tests; production callers should not depend on cache size.
 func TokenCacheSize() int {

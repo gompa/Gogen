@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 
 	"gogen/internal/contextmgr"
@@ -68,7 +69,7 @@ func (a *Agent) resetSessionState() {
 	// Wipe token-count cache entries — old content is gone and new
 	// conversations start from empty.
 	contextmgr.InvalidateTokenCache()
-	a.lastTurnUsage = nil
+	a.clearTurnUsage()
 	a.UsageAccum = UsageAccumulator{}
 	a.clearViewDriftSnapshot()
 	a.SessionLabel = ""
@@ -150,7 +151,9 @@ func (a *Agent) resumeSessionByID(ctx context.Context, id string) (string, error
 	a.SessionID = id
 	// Persist immediately so the resumed session gets a fresh UpdatedAt
 	// timestamp and appears at the top of the session sidebar list.
-	a.FlushSession()
+	if err := a.SessionStore.TouchSession(a.WorkingDir, a.SessionID); err != nil {
+		log.Printf("session touch failed on resume (id=%s): %v", a.SessionID, err)
+	}
 	label := llm.SessionLabel(snap.Messages, llm.DefaultSessionLabelMaxLen)
 	var out string
 	if label != "" {
