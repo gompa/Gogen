@@ -167,7 +167,9 @@ func (m *Model) saveConfig(includeSecrets bool) error {
 		return err
 	}
 	m.appendChatLine(SystemStyle.Render(fmt.Sprintf("Wrote config to %s", cfgPath)))
-	m.appendChatLine(SystemStyle.Render(fmt.Sprintf("Wrote guidelines to %s", guidelinesPath)))
+	if guidelinesPath != "" {
+		m.appendChatLine(SystemStyle.Render(fmt.Sprintf("Wrote guidelines to %s", guidelinesPath)))
+	}
 	m.appendChatLine(SystemStyle.Render("Note: environment variables still override file values at runtime."))
 	return nil
 }

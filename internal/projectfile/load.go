@@ -2,6 +2,7 @@ package projectfile
 
 import (
 	"os"
+	"strings"
 	"path/filepath"
 
 	"gogen/internal/config"
@@ -41,7 +42,17 @@ func LoadGlobalConfig() *ProjectFile {
 	if err != nil {
 		return nil
 	}
-	return &ProjectFile{Path: path, HasConfig: true, Config: cfg}
+	pf := &ProjectFile{Path: path, HasConfig: true, Config: cfg}
+
+	// Load global guidelines from ~/.config/gogen/gogen.md (optional).
+	gPath := GlobalGuidelinesPath()
+	if gData, gErr := os.ReadFile(gPath); gErr == nil {
+		body := strings.TrimSpace(string(gData))
+		if body != "" {
+			pf.Guidelines = body
+		}
+	}
+	return pf
 }
 
 // GuidelinesHeader formats project guidelines for the system prompt.

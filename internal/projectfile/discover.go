@@ -128,6 +128,11 @@ func GlobalConfigPath() string {
 	return filepath.Join(GlobalConfigDir(), "config.yaml")
 }
 
+// GlobalGuidelinesPath returns the path to the global guidelines markdown file.
+func GlobalGuidelinesPath() string {
+	return filepath.Join(GlobalConfigDir(), "gogen.md")
+}
+
 // GlobalSessionDir returns the directory for session snapshots in global mode.
 func GlobalSessionDir() string {
 	return filepath.Join(GlobalDataDir(), "sessions")

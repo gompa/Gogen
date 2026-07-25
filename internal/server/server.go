@@ -203,6 +203,7 @@ type SessionEntry struct {
 	UpdatedAt    string `json:"updatedAt,omitempty"`
 	MessageCount int    `json:"messageCount,omitempty"`
 	Label        string `json:"label,omitempty"`
+	Oneshot      bool   `json:"oneshot,omitempty"`
 	Current      bool   `json:"current,omitempty"`
 }
 
@@ -373,6 +374,7 @@ func sessionEntries(list []agent.SessionInfo, currentID string) []SessionEntry {
 			UpdatedAt:    s.UpdatedAt,
 			MessageCount: s.MessageCount,
 			Label:        s.Label,
+			Oneshot:      s.Oneshot,
 			Current:      s.ID == currentID,
 		}
 	}
