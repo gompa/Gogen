@@ -53,16 +53,29 @@ func (e *Executor) SecurePath(path string) (string, error) {
 	if path == "" {
 		return "", fmt.Errorf("path is required")
 	}
-	absWD, err := filepath.Abs(e.GetWorkingDir())
+
+	// Determine the boundary root: PathBoundary (e.g. $HOME in global mode)
+	// or WorkingDir (project mode).
+	root := e.PathBoundary
+	if root == "" {
+		root = e.GetWorkingDir()
+	}
+	rootAbs, err := filepath.Abs(root)
 	if err != nil {
 		return "", err
 	}
-	resolvedWD, err := evalPath(absWD)
+	resolvedRoot, err := evalPath(rootAbs)
 	if err != nil {
-		return "", fmt.Errorf("working directory: %w", err)
+		return "", fmt.Errorf("path boundary: %w", err)
 	}
 
-	absPath, err := resolveExecutorPath(absWD, path)
+	// Resolve the requested path relative to the working directory (not the
+	// boundary), so relative paths work as expected.
+	wdAbs, err := filepath.Abs(e.GetWorkingDir())
+	if err != nil {
+		return "", err
+	}
+	absPath, err := resolveExecutorPath(wdAbs, path)
 	if err != nil {
 		return "", err
 	}
@@ -70,8 +83,8 @@ func (e *Executor) SecurePath(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if !isWithinRoot(resolvedPath, resolvedWD) {
-		return "", fmt.Errorf("path %s is outside of working directory %s", path, absWD)
+	if !isWithinRoot(resolvedPath, resolvedRoot) {
+		return "", fmt.Errorf("path %s is outside of allowed boundary %s", path, rootAbs)
 	}
 	return resolvedPath, nil
 }

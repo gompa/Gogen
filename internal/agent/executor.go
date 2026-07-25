@@ -25,6 +25,7 @@ type Executor struct {
 	RequireDeleteApproval bool
 	CommandTimeout        time.Duration // 0 = default 2 minutes
 	Sandbox               string        // off, bwrap
+	PathBoundary          string        // if non-empty, overrides WorkingDir for SecurePath checks
 }
 
 func NewExecutor(wd string) *Executor {
@@ -47,6 +48,7 @@ func NewExecutorWithGuard(wd string, guard *CommandGuard) *Executor {
 		RequireDeleteApproval: true,
 		CommandTimeout:        2 * time.Minute,
 		Sandbox:               "off",
+		PathBoundary:          "",
 	}
 }
 

@@ -128,6 +128,10 @@ var (
 				Foreground(lipglossColor("#00AA00")).
 				Background(lipglossColor("#333333"))
 
+	StatusBarGlobalStyle = lipgloss.NewStyle().
+				Foreground(lipglossColor("#00AAAA")).
+				Background(lipglossColor("#333333"))
+
 	// Modals
 	ModalOverlayStyle = lipgloss.NewStyle().
 				Background(lipglossColor("#000000")).

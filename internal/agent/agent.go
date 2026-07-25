@@ -29,11 +29,12 @@ type Agent struct {
 	TodoManager *TodoManager
 
 	// Session persistence
-	SessionStore  SessionPersister
-	SessionID     string
-	SessionLabel  string
-	UsageAccum    UsageAccumulator
-	lastTurnUsage *llm.Usage
+	SessionStore   SessionPersister
+	SessionID      string
+	SessionLabel   string
+	SessionOneshot bool // true if this session was created by a single-prompt (-p) invocation
+	UsageAccum     UsageAccumulator
+	lastTurnUsage  *llm.Usage
 	// apiBaselinePromptTokens and apiBaselineMsgCount let ContextStats use the
 	// API's exact prompt_tokens as the authoritative baseline for Snapshot.Used,
 	// only estimating messages added after the last API round.
@@ -55,6 +56,7 @@ type Agent struct {
 	// Runtime / project
 	WorkingDir        string
 	Mode              Mode
+	GlobalMode        bool
 	ProjectGuidelines string
 	ProjectFilePath   string
 	TestCommand       string
@@ -72,6 +74,7 @@ func NewAgent(provider llm.LLMProvider, executor *Executor, ctxMgr *contextmgr.M
 		Messages:     []llm.Message{},
 		WorkingDir:   executor.GetWorkingDir(),
 		Mode:         ModeAct,
+		GlobalMode:   false,
 		toolHandlers: BuiltinToolHandlers(),
 	}
 }
@@ -96,9 +99,18 @@ func (a *Agent) SaveConfig(cfg *config.Config, includeSecrets bool) (cfgPath, gu
 	}
 	effective := *cfg
 	effective.OpenAIModel = a.CurrentModel()
-	cfgPath = projectfile.DefaultSavePath(a.WorkingDir)
-	guidelinesPath = projectfile.DefaultGuidelinesSavePath(a.WorkingDir)
-	err = projectfile.SaveConfig(cfgPath, guidelinesPath, &effective, a.ProjectGuidelines, projectfile.WriteOptions{IncludeSecrets: includeSecrets})
+	if a.GlobalMode {
+		cfgPath = projectfile.GlobalConfigPath()
+		guidelinesPath = "" // no guidelines file in global mode
+		err = projectfile.SaveGlobalConfig(&effective, projectfile.WriteOptions{IncludeSecrets: includeSecrets})
+		if err != nil {
+			cfgPath = ""
+		}
+	} else {
+		cfgPath = projectfile.DefaultSavePath(a.WorkingDir)
+		guidelinesPath = projectfile.DefaultGuidelinesSavePath(a.WorkingDir)
+		err = projectfile.SaveConfig(cfgPath, guidelinesPath, &effective, a.ProjectGuidelines, projectfile.WriteOptions{IncludeSecrets: includeSecrets})
+	}
 	return
 }
 
@@ -179,6 +191,7 @@ func (a *Agent) doPersist() {
 		WorkingDir:     a.WorkingDir,
 		Model:          a.CurrentModel(),
 		Mode:           a.Mode.String(),
+		Oneshot:        a.SessionOneshot,
 		Label:          a.SessionLabel,
 		ProjectProfile: profile,
 		Todos:          todoSnapshot(a.TodoManager),
@@ -224,8 +237,12 @@ func (a *Agent) SetWorkingDir(dir string) {
 // cache for the new project dir. Must not run under server agentMu — both
 // steps do disk (and possibly background network) I/O.
 func (a *Agent) AfterWorkingDirChange() {
+	cacheDir := a.WorkingDir
+	if a.GlobalMode {
+		cacheDir = projectfile.GlobalDataDir()
+	}
 	if p, ok := a.Provider.(*llm.OpenAIProvider); ok {
-		p.SetModelInfoCacheDir(a.WorkingDir)
+		p.SetModelInfoCacheDir(cacheDir)
 	}
 	a.FlushSession()
 }

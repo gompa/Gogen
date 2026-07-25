@@ -36,8 +36,10 @@ func main() {
 	verboseFlag := flag.Bool("verbose", false, "Show full tool output in CLI mode")
 	dirFlag := flag.String("dir", "", "Specify the working directory")
 	urlFlag := flag.String("url", "", "OpenAI API base URL (e.g. https://api.openai.com/v1)")
+	globalFlag := flag.Bool("global", false, "Run in global mode (ignore project config, use ~/.config/gogen/)")
 	saveConfigFlag := flag.Bool("save-config", false, "Write effective config to .gogen/gogen.md and exit")
 	saveConfigSecretsFlag := flag.Bool("save-config-secrets", false, "Include openai_api_key when using --save-config")
+	promptFlag := flag.String("p", "", "Run a single prompt and exit (non-interactive)")
 	saveConfigPathFlag := flag.String("save-config-path", "", "Output path for --save-config (default .gogen/gogen.md)")
 
 	flag.Parse()
@@ -51,7 +53,12 @@ func main() {
 	} else if args := flag.Args(); len(args) > 0 {
 		workingDir = args[0]
 		if len(args) > 1 {
-			log.Fatal("Only one positional argument (working directory) is accepted")
+			if *promptFlag == "" {
+				*promptFlag = args[1]
+			}
+			if len(args) > 2 {
+				log.Fatal("Usage: gogen [flags] [dir] [prompt]")
+			}
 		}
 	}
 	absWD, err := filepath.Abs(workingDir)
@@ -60,15 +67,30 @@ func main() {
 	}
 	workingDir = absWD
 
+	// Determine mode: --global flag or GOGEN_MODE=global env var.
+	isGlobalMode := *globalFlag || projectfile.IsGlobalModeEnv()
+
 	var verboseOverride *bool
 	if *verboseFlag {
 		v := true
 		verboseOverride = &v
 	}
 
-	pf, err := projectfile.LoadFromWorkingDir(workingDir)
-	if err != nil {
-		log.Fatalf("project file: %v", err)
+	// Load config: project-local or global.
+	var pf *projectfile.ProjectFile
+	if isGlobalMode {
+		pf = projectfile.LoadGlobalConfig()
+		if pf != nil {
+			fmt.Fprintf(os.Stderr, "Using global config from %s\n", pf.Path)
+		} else {
+			fmt.Fprintf(os.Stderr, "Global mode: no global config found at %s, using defaults\n", projectfile.GlobalConfigPath())
+		}
+	} else {
+		var loadErr error
+		pf, loadErr = projectfile.LoadFromWorkingDir(workingDir)
+		if loadErr != nil {
+			log.Fatalf("project file: %v", loadErr)
+		}
 	}
 
 	cfg := projectfile.Merge(pf, projectfile.FlagOverrides{
@@ -83,6 +105,16 @@ func main() {
 	}
 
 	if *saveConfigFlag {
+		if isGlobalMode {
+			// Save to global config path (no guidelines file).
+			if err := projectfile.SaveGlobalConfig(cfg, projectfile.WriteOptions{IncludeSecrets: *saveConfigSecretsFlag}); err != nil {
+				log.Fatal(err)
+			}
+			fmt.Printf("Wrote global config to %s\n", projectfile.GlobalConfigPath())
+			fmt.Println("Note: environment variables still override file values at runtime.")
+			return
+		}
+		// Project mode: save to project-local path.
 		outPath := *saveConfigPathFlag
 		if outPath == "" {
 			outPath = projectfile.DefaultSavePath(workingDir)
@@ -130,7 +162,12 @@ func main() {
 	if cfg.CommandTimeoutSecs > 0 {
 		exec.CommandTimeout = time.Duration(cfg.CommandTimeoutSecs) * time.Second
 	}
+	if isGlobalMode {
+		// In global mode, relax the path boundary to the user's home directory.
+		exec.PathBoundary = projectfile.GlobalPathBoundary()
+	}
 	a := agent.NewAgent(provider, exec, ctxMgr)
+	a.GlobalMode = isGlobalMode
 	a.SetProjectContext(cfg.ProjectFilePath, cfg.ProjectGuidelines, cfg.TestCommand, cfg.LintCommand)
 	a.TodoManager = agent.NewTodoManager(cfg.WorkingDir)
 	a.PinManager = agent.NewPinManager()
@@ -141,10 +178,16 @@ func main() {
 	}
 
 	sessionEnabled := os.Getenv("GOGEN_SESSION_PERSIST") != "off"
-	store := session.NewStoreWithOptions(sessionEnabled, session.StoreOptions{
+	sessionOpts := session.StoreOptions{
 		MaxCount:   cfg.SessionMaxCount,
 		MaxAgeDays: cfg.SessionMaxAgeDays,
-	})
+	}
+	store := session.NewStoreWithOptions(sessionEnabled, sessionOpts)
+	_ = sessionOpts // suppress unused if globalMode not used below
+	if isGlobalMode {
+		// Use global session dir ~/.local/share/gogen/sessions/
+		store.SetGlobalDir(projectfile.GlobalSessionDir())
+	}
 	a.SessionStore = store
 	a.SessionID = session.NewID()
 	// Local-only restore: avoid blocking startup on provider ListModels.
@@ -213,6 +256,13 @@ func main() {
 	defer stop()
 	defer a.FlushSession()
 
+	if *promptFlag != "" {
+		go initMCP()
+		go a.ValidateRestoredModel(context.Background(), restoredModel)
+		runSinglePrompt(ctx, a, *promptFlag, cfg)
+		return
+	}
+
 	if *webFlag {
 		// Determine the listen address first so we can check for loopback
 		// and auto-generate a token before creating the server.
@@ -275,6 +325,48 @@ func main() {
 	// Default: TUI mode.
 	c := tui.New(a, cfg)
 	c.Run(ctx)
+}
+
+// runSinglePrompt processes one user prompt and exits.
+// It uses the already-initialized agent and config but skips the TUI/web.
+func runSinglePrompt(ctx context.Context, a *agent.Agent, prompt string, cfg *config.Config) {
+	// In single-prompt mode, skip delete approvals (no interactive modal).
+	a.Executor.RequireDeleteApproval = false
+
+	// Start a fresh session: clear any restored conversation state.
+	a.ResetSessionState()
+	a.SessionID = session.NewID()
+	a.SessionOneshot = true
+	a.FlushSession()
+
+	var final strings.Builder
+	handlers := &llm.StreamHandlers{
+		OnStart: func() {
+			if cfg.CLIVerbose {
+				fmt.Fprintln(os.Stderr, "─── prompt ───")
+			}
+		},
+		OnToken: func(token string) {
+			final.WriteString(token)
+			if cfg.CLIVerbose {
+				fmt.Print(token)
+			}
+		},
+		OnStreamEnd: func() {
+			if cfg.CLIVerbose {
+				fmt.Fprintln(os.Stderr, "")
+			}
+		},
+	}
+
+	_, err := a.StreamProcessInput(ctx, prompt, handlers)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\nError: %v\n", err)
+		os.Exit(1)
+	}
+	if !cfg.CLIVerbose {
+		fmt.Println(final.String())
+	}
 }
 
 // generateToken returns a cryptographically random 32-byte hex string.

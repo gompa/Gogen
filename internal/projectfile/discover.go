@@ -102,3 +102,62 @@ func DefaultSavePath(workingDir string) string {
 func DefaultGuidelinesSavePath(workingDir string) string {
 	return filepath.Join(workingDir, ".gogen", "gogen.md")
 }
+
+// GlobalConfigDir returns the platform-appropriate global config directory
+// (e.g. ~/.config/gogen/ on Linux, ~/Library/Application Support/gogen/ on macOS).
+func GlobalConfigDir() string {
+	if d := os.Getenv("XDG_CONFIG_HOME"); d != "" {
+		return filepath.Join(d, "gogen")
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "gogen")
+}
+
+// GlobalDataDir returns the platform-appropriate global data directory
+// (e.g. ~/.local/share/gogen/ on Linux, ~/Library/Application Support/gogen/ on macOS).
+func GlobalDataDir() string {
+	if d := os.Getenv("XDG_DATA_HOME"); d != "" {
+		return filepath.Join(d, "gogen")
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".local", "share", "gogen")
+}
+
+// GlobalConfigPath returns the path to the global config YAML file.
+func GlobalConfigPath() string {
+	return filepath.Join(GlobalConfigDir(), "config.yaml")
+}
+
+// GlobalSessionDir returns the directory for session snapshots in global mode.
+func GlobalSessionDir() string {
+	return filepath.Join(GlobalDataDir(), "sessions")
+}
+
+// GlobalModelsCachePath returns the path for the models.dev registry cache in global mode.
+func GlobalModelsCachePath() string {
+	return filepath.Join(GlobalDataDir(), "models.json")
+}
+
+// HomeDir returns the user's home directory. Returns "." if it cannot be determined.
+func HomeDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "."
+	}
+	return home
+}
+
+// GlobalPathBoundary returns the default path boundary for global mode
+// (the user's home directory), or "." as a fallback.
+func GlobalPathBoundary() string {
+	return HomeDir()
+}
+
+// IsGlobalModeEnv checks whether GOGEN_MODE environment variable requests global mode.
+func IsGlobalModeEnv() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GOGEN_MODE"))) {
+	case "global", "1", "true":
+		return true
+	}
+	return false
+}

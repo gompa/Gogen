@@ -40,8 +40,10 @@ func (m *Model) renderStatusBar() string {
 		leftParts = append(leftParts, StatusBarDimStyle.Render(model))
 	}
 
-	// Working directory
-	if wd := m.agent.WorkingDir; wd != "" {
+	// Working directory / global indicator
+	if m.agent.GlobalMode {
+		leftParts = append(leftParts, StatusBarGlobalStyle.Render("🌐 global"))
+	} else if wd := m.agent.WorkingDir; wd != "" {
 		leftParts = append(leftParts, StatusBarDimStyle.Render(wd))
 	}
 

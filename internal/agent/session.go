@@ -12,6 +12,7 @@ import (
 // SessionSnapshot is persisted conversation state.
 type SessionSnapshot struct {
 	WorkingDir     string
+	Oneshot        bool
 	Model          string
 	Mode           string
 	Label          string
@@ -35,6 +36,7 @@ type SessionPersister interface {
 // SessionInfo describes a saved session entry.
 type SessionInfo struct {
 	ID           string
+	Oneshot      bool
 	UpdatedAt    string
 	MessageCount int
 	Label        string
@@ -76,6 +78,7 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 	a.clearTurnUsage()
 	a.UsageAccum = UsageAccumulator{}
 	a.SessionLabel = snap.Label
+	a.SessionOneshot = snap.Oneshot
 	if m, ok := ParseMode(snap.Mode); ok {
 		a.Mode = m
 	}

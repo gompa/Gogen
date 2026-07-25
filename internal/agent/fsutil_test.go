@@ -87,7 +87,7 @@ func TestSecurePathBlocksSymlinkEscape(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected symlink escape to be blocked")
 	}
-	if !strings.Contains(err.Error(), "outside of working directory") {
+	if !strings.Contains(err.Error(), "outside of allowed boundary") && !strings.Contains(err.Error(), "outside of working directory") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

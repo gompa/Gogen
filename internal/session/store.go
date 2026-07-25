@@ -31,6 +31,7 @@ type file struct {
 	ProjectProfile string          `json:"projectProfile,omitempty"`
 	Todos          *agent.TodoList `json:"todos,omitempty"`
 	Messages       []llm.Message   `json:"messages"`
+	Oneshot        bool            `json:"oneshot,omitempty"`
 	TokenCounts    []int           `json:"tokenCounts,omitempty"`
 }
 
@@ -38,6 +39,7 @@ type file struct {
 type sessionIndexEntry struct {
 	ID           string    `json:"id"`
 	Updated      time.Time `json:"updated"`
+	Oneshot      bool      `json:"oneshot,omitempty"`
 	MessageCount int       `json:"messageCount"`
 	Label        string    `json:"label,omitempty"`
 }
@@ -59,6 +61,7 @@ type Store struct {
 	maxAgeDays   int
 	createdCache map[string]time.Time // sessionID → Created timestamp (avoids re-read)
 	saveCount    int                  // counter for periodic pruning
+	globalDir    string               // non-empty: override per-project .gogen/sessions/ dir
 }
 
 // listCacheEntry holds a cached session list for one working directory.
@@ -83,6 +86,14 @@ func NewStore(enabled bool) *Store {
 	return NewStoreWithOptions(enabled, StoreOptions{})
 }
 
+// SetGlobalDir configures the store to use a fixed directory for session
+// storage instead of the per-project .gogen/sessions/. Used in global mode.
+func (s *Store) SetGlobalDir(dir string) {
+	if s != nil {
+		s.globalDir = dir
+	}
+}
+
 // NewStoreWithOptions creates a session store with custom retention.
 func NewStoreWithOptions(enabled bool, opts StoreOptions) *Store {
 	maxCount := opts.MaxCount
@@ -97,10 +108,17 @@ func NewStoreWithOptions(enabled bool, opts StoreOptions) *Store {
 }
 
 func (s *Store) dir(workingDir string) string {
+	if s != nil && s.globalDir != "" {
+		return s.globalDir
+	}
 	return filepath.Join(workingDir, ".gogen", "sessions")
 }
 
 func (s *Store) path(workingDir, id string) string {
+	if s != nil && s.globalDir != "" {
+		// In global mode, sessions are stored flat in the global dir.
+		return filepath.Join(s.globalDir, id+".json")
+	}
 	return filepath.Join(s.dir(workingDir), id+".json")
 }
 
@@ -117,7 +135,7 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 		return err
 	}
 	path := s.path(snap.WorkingDir, id)
-	if err := ensureUnderSessionsDir(snap.WorkingDir, path); err != nil {
+	if err := ensureUnderSessionsDir(snap.WorkingDir, path, s.globalDir); err != nil {
 		return err
 	}
 	created := time.Now().UTC()
@@ -143,6 +161,7 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 		ProjectProfile: snap.ProjectProfile,
 		Todos:          snap.Todos,
 		Messages:       snap.Messages,
+		Oneshot:        snap.Oneshot,
 		TokenCounts:    snap.TokenCounts,
 	}
 	data, err := json.Marshal(out)
@@ -160,7 +179,7 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 	}
 	// Update index and invalidate in-memory cache.
 	label := sessionLabel(snap.Messages, snap.Label)
-	s.updateIndex(snap.WorkingDir, id, out.Updated, len(snap.Messages), label)
+	s.updateIndex(snap.WorkingDir, id, out.Updated, len(snap.Messages), label, snap.Oneshot)
 	return nil
 }
 
@@ -174,7 +193,7 @@ func (s *Store) TouchSession(workingDir, id string) error {
 		return err
 	}
 	path := s.path(workingDir, id)
-	if err := ensureUnderSessionsDir(workingDir, path); err != nil {
+	if err := ensureUnderSessionsDir(workingDir, path, s.globalDir); err != nil {
 		return err
 	}
 	now := time.Now().UTC()
@@ -193,7 +212,7 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 		return agent.SessionSnapshot{}, err
 	}
 	path := s.path(workingDir, id)
-	if err := ensureUnderSessionsDir(workingDir, path); err != nil {
+	if err := ensureUnderSessionsDir(workingDir, path, s.globalDir); err != nil {
 		return agent.SessionSnapshot{}, err
 	}
 	data, err := os.ReadFile(path)
@@ -211,6 +230,7 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 		WorkingDir:     f.WorkingDir,
 		Model:          f.Model,
 		Mode:           f.Mode,
+		Oneshot:        f.Oneshot,
 		Label:          f.Label,
 		ProjectProfile: f.ProjectProfile,
 		Todos:          f.Todos,
@@ -248,6 +268,7 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 		for i, e := range idx.Entries {
 			out[i] = agent.SessionInfo{
 				ID:           e.ID,
+				Oneshot:      e.Oneshot,
 				UpdatedAt:    e.Updated.UTC().Format(time.RFC3339Nano),
 				MessageCount: e.MessageCount,
 				Label:        e.Label,
@@ -294,6 +315,7 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 		items = append(items, item{
 			info: agent.SessionInfo{
 				ID:           id,
+				Oneshot:      f.Oneshot,
 				UpdatedAt:    f.Updated.UTC().Format(time.RFC3339Nano),
 				MessageCount: len(f.Messages),
 				Label:        lbl,
@@ -301,7 +323,7 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 			updated: f.Updated,
 		})
 		idx.Entries = append(idx.Entries, sessionIndexEntry{
-			ID: id, Updated: f.Updated, MessageCount: len(f.Messages), Label: lbl,
+			ID: id, Updated: f.Updated, Oneshot: f.Oneshot, MessageCount: len(f.Messages), Label: lbl,
 		})
 	}
 	// Persist the index for next time (best-effort).
@@ -369,7 +391,7 @@ func (s *Store) Delete(workingDir, id string) error {
 		return err
 	}
 	path := s.path(workingDir, id)
-	if err := ensureUnderSessionsDir(workingDir, path); err != nil {
+	if err := ensureUnderSessionsDir(workingDir, path, s.globalDir); err != nil {
 		return err
 	}
 	if err := os.Remove(path); err != nil {
@@ -398,12 +420,30 @@ func validateSessionID(id string) error {
 	return nil
 }
 
-func ensureUnderSessionsDir(workingDir, path string) error {
-	sessionsDir, err := filepath.Abs(filepath.Join(workingDir, ".gogen", "sessions"))
+func ensureUnderSessionsDir(workingDir, path string, globalDirs ...string) error {
+	absPath, err := filepath.Abs(path)
 	if err != nil {
 		return err
 	}
-	absPath, err := filepath.Abs(path)
+	// Check against global dir first if provided.
+	for _, gd := range globalDirs {
+		if gd == "" {
+			continue
+		}
+		gdAbs, err := filepath.Abs(gd)
+		if err != nil {
+			continue
+		}
+		rel, err := filepath.Rel(gdAbs, absPath)
+		if err != nil {
+			continue
+		}
+		if rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return nil
+		}
+	}
+	// Fall back to project-local sessions dir.
+	sessionsDir, err := filepath.Abs(filepath.Join(workingDir, ".gogen", "sessions"))
 	if err != nil {
 		return err
 	}
@@ -455,14 +495,14 @@ func (s *Store) writeIndex(workingDir string, idx *sessionIndex) error {
 		return err
 	}
 	indexPath := s.indexFile(workingDir)
-	if err := ensureUnderSessionsDir(workingDir, indexPath); err != nil {
+	if err := ensureUnderSessionsDir(workingDir, indexPath, s.globalDir); err != nil {
 		return err
 	}
 	return writeFileAtomic(indexPath, data, 0o600)
 }
 
 // updateIndex adds or updates an entry in the session metadata index.
-func (s *Store) updateIndex(workingDir, id string, updated time.Time, msgCount int, label string) {
+func (s *Store) updateIndex(workingDir, id string, updated time.Time, msgCount int, label string, oneshot bool) {
 	if s == nil || !s.enabled {
 		return
 	}
@@ -474,6 +514,7 @@ func (s *Store) updateIndex(workingDir, id string, updated time.Time, msgCount i
 	for i, e := range idx.Entries {
 		if e.ID == id {
 			idx.Entries[i].Updated = updated
+			idx.Entries[i].Oneshot = oneshot
 			idx.Entries[i].MessageCount = msgCount
 			idx.Entries[i].Label = label
 			found = true
@@ -482,7 +523,7 @@ func (s *Store) updateIndex(workingDir, id string, updated time.Time, msgCount i
 	}
 	if !found {
 		idx.Entries = append(idx.Entries, sessionIndexEntry{
-			ID: id, Updated: updated, MessageCount: msgCount, Label: label,
+			ID: id, Updated: updated, Oneshot: oneshot, MessageCount: msgCount, Label: label,
 		})
 	}
 	_ = s.writeIndex(workingDir, idx)

@@ -62,9 +62,9 @@ func parseSessionCommand(input string) (cmd, args string) {
 	return cmd, args
 }
 
-// resetSessionState clears all session-related state for starting fresh.
+// ResetSessionState clears all session-related state for starting fresh.
 // This is used when creating a new session or replacing a deleted current session.
-func (a *Agent) resetSessionState() {
+func (a *Agent) ResetSessionState() {
 	a.Messages = nil
 	// Wipe token-count cache entries — old content is gone and new
 	// conversations start from empty.
@@ -73,6 +73,7 @@ func (a *Agent) resetSessionState() {
 	a.UsageAccum = UsageAccumulator{}
 	a.clearViewDriftSnapshot()
 	a.SessionLabel = ""
+	a.SessionOneshot = false
 	if a.PinManager != nil {
 		a.PinManager.ClearPins()
 	}
@@ -120,7 +121,7 @@ func (a *Agent) startNewSession(newID string) (string, error) {
 		a.FlushSession()
 	}
 	a.SessionID = newID
-	a.resetSessionState()
+	a.ResetSessionState()
 	if a.SessionStore != nil {
 		a.FlushSession()
 		if oldID != "" {
@@ -208,7 +209,7 @@ func (a *Agent) deleteSessionByID(ctx context.Context, id, newSessionID string) 
 			return "", SessionActionNone, fmt.Errorf("session id is required")
 		}
 		a.SessionID = newSessionID
-		a.resetSessionState()
+		a.ResetSessionState()
 		a.FlushSession()
 		out := fmt.Sprintf("Deleted session %s (was current — started new session %s).", id, newSessionID)
 		return AppendContextBrief(ctx, a, out), SessionActionClearChat, nil

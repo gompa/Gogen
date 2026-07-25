@@ -1,6 +1,7 @@
 package projectfile
 
 import (
+	"os"
 	"path/filepath"
 
 	"gogen/internal/config"
@@ -25,6 +26,22 @@ func LoadEffective(workingDir string, flags FlagOverrides) (*config.Config, erro
 		cfg.WorkingDir = abs
 	}
 	return cfg, nil
+}
+
+// LoadGlobalConfig loads the global config file (~/.config/gogen/config.yaml).
+// Returns nil if the file does not exist or cannot be parsed (non-fatal).
+func LoadGlobalConfig() *ProjectFile {
+	path := GlobalConfigPath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	// Global config is pure YAML (same format as .gogen/gogen.conf).
+	cfg, err := parseYAMLConfig(string(data))
+	if err != nil {
+		return nil
+	}
+	return &ProjectFile{Path: path, HasConfig: true, Config: cfg}
 }
 
 // GuidelinesHeader formats project guidelines for the system prompt.

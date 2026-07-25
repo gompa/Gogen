@@ -200,7 +200,11 @@ func (m *Model) renderSessionsModal() string {
 	// Session entries
 	for i := start; i < end; i++ {
 		s := m.sessionList[i]
-		line := fmt.Sprintf("  %s  (%d msgs)", s.ID, s.MessageCount)
+		marker := "  "
+		if s.Oneshot {
+			marker = "⚡ "
+		}
+		line := fmt.Sprintf("%s%s  (%d msgs)", marker, s.ID, s.MessageCount)
 		if s.Label != "" {
 			line += fmt.Sprintf("  %q", s.Label)
 		}
