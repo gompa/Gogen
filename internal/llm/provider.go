@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"time"
 )
 
 // Tool represents a tool the AI agent can call.
@@ -100,4 +101,5 @@ type Message struct {
 	Refusal    string     // refusal text from the model (sent as refusal; not folded into Content)
 	ToolCalls  []ToolCall // set on assistant messages that invoke tools
 	ToolCallID string     // set on tool result messages
+	CreatedAt  time.Time  `json:"createdAt,omitempty"` // when the message was created (UTC), zero when not set
 }

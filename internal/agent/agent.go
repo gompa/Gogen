@@ -196,7 +196,9 @@ func (a *Agent) ConsumePersistError() error {
 	return err
 }
 
-// SetWorkingDir updates the agent and executor working directory together.
+// SetWorkingDir updates in-memory working directory fields (agent, executor,
+// todos). It does not touch disk or the models.dev cache — call
+// AfterWorkingDirChange for that, and never while holding server agentMu.
 func (a *Agent) SetWorkingDir(dir string) {
 	a.WorkingDir = dir
 	a.projectProfile = ""
@@ -206,8 +208,14 @@ func (a *Agent) SetWorkingDir(dir string) {
 	if a.TodoManager != nil {
 		a.TodoManager.SetWorkingDir(dir)
 	}
+}
+
+// AfterWorkingDirChange persists the session and retargets the models.dev
+// cache for the new project dir. Must not run under server agentMu — both
+// steps do disk (and possibly background network) I/O.
+func (a *Agent) AfterWorkingDirChange() {
 	if p, ok := a.Provider.(*llm.OpenAIProvider); ok {
-		p.SetModelInfoCacheDir(dir)
+		p.SetModelInfoCacheDir(a.WorkingDir)
 	}
 	a.FlushSession()
 }
@@ -368,13 +376,14 @@ func (a *Agent) appendToolResult(tc llm.ToolCall, result string) {
 		Role:       "tool",
 		Content:    result,
 		ToolCallID: tc.ID,
+		CreatedAt:  time.Now(),
 	})
 }
 
 // StreamProcessInput streams tokens to the handlers as they arrive.
 // It returns the final accumulated response or an error.
 func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.StreamHandlers) (string, error) {
-	a.Messages = append(a.Messages, llm.Message{Role: "user", Content: input})
+	a.Messages = append(a.Messages, llm.Message{Role: "user", Content: input, CreatedAt: time.Now()})
 	// Persist immediately so a failed/cancelled turn does not drop the user message.
 	a.FlushSession()
 
@@ -418,6 +427,7 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 				Content:   result.Content,
 				Reasoning: result.Reasoning,
 				Refusal:   result.Refusal,
+				CreatedAt: time.Now(),
 			})
 			a.FlushSession()
 			if result.Content != "" {
@@ -446,12 +456,13 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 			Reasoning: result.Reasoning,
 			Refusal:   result.Refusal,
 			ToolCalls: result.ToolCalls,
+			CreatedAt: time.Now(),
 		})
 
 		for i, tc := range result.ToolCalls {
 			if ctx.Err() != nil {
 				// Preserve a valid tool-call/result protocol for the next turn.
-				a.appendCanceledToolResults(result.ToolCalls[i:], ctx.Err())
+				a.appendCanceledToolResults(result.ToolCalls[i:])
 				finishStreamUI(h)
 				a.FlushSession()
 				return "", ctx.Err()
@@ -466,14 +477,17 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 			res, errTool := a.executeTool(ctx, tc)
 			if ctx.Err() != nil {
 				if errTool == nil {
-					errTool = ctx.Err()
+					res = "The operation was cancelled by the user."
+				} else if errTool == context.Canceled {
+					res = "The operation was cancelled by the user."
+				} else {
+					res = formatToolError(res, errTool)
 				}
-				res = formatToolError(res, errTool)
 				if h.OnToolResult != nil {
 					h.OnToolResult(tc.ID, tc.Name, res, false)
 				}
 				a.appendToolResult(tc, res)
-				a.appendCanceledToolResults(result.ToolCalls[i+1:], ctx.Err())
+				a.appendCanceledToolResults(result.ToolCalls[i+1:])
 				finishStreamUI(h)
 				a.FlushSession()
 				return "", ctx.Err()
@@ -493,8 +507,8 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 	}
 }
 
-func (a *Agent) appendCanceledToolResults(toolCalls []llm.ToolCall, err error) {
-	msg := formatToolError("", err)
+func (a *Agent) appendCanceledToolResults(toolCalls []llm.ToolCall) {
+	const msg = "Tool execution was skipped because the user cancelled the operation."
 	for _, tc := range toolCalls {
 		a.appendToolResult(tc, msg)
 	}

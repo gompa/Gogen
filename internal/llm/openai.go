@@ -24,10 +24,15 @@ const (
 	// modelsCacheTTL avoids repeated full catalog fetches during startup
 	// (ValidateRestoredModel → ListModels + ModelContextLimit) and /models flows.
 	modelsCacheTTL = 60 * time.Second
-	// modelsCatalogTimeout bounds /v1/models and related catalog lookups.
+	// modelsCatalogTimeout bounds /v1/models for ListModels / UI catalog.
 	// Separate from the long SSE stream idle timeout so a hung catalog
 	// endpoint cannot pin startup or the web WS loop for minutes.
 	modelsCatalogTimeout = 8 * time.Second
+	// modelsLimitLookupTimeout bounds the /v1/models attempt inside
+	// ModelContextLimit. Local llama.cpp answers in milliseconds; a hung
+	// remote catalog must fail fast so models.dev / heuristics can run.
+	// ListModels keeps modelsCatalogTimeout.
+	modelsLimitLookupTimeout = 1500 * time.Millisecond
 )
 
 // isOpencodeURL reports whether baseURL points to an OpenCode endpoint that
@@ -740,67 +745,66 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 }
 
 func (p *OpenAIProvider) ModelContextLimit(ctx context.Context) (int, error) {
-	ctx, cancel := context.WithTimeout(ctx, modelsCatalogTimeout)
+	// Resolution order (unchanged): provider /v1/models JSON → models.dev →
+	// name heuristics → 128000. Network catalog for this path uses a short
+	// timeout so a hung remote host cannot stall restore/context refresh;
+	// local servers still win when they answer quickly with n_ctx etc.
+	ctx, cancel := context.WithTimeout(ctx, modelsLimitLookupTimeout)
 	defer cancel()
 
-	models, _ := p.listModels(ctx)
+	// Warm cache: parse provider JSON with no I/O.
+	p.modelsMu.RLock()
+	cached, cacheOK := p.cachedModelsLocked()
+	if cacheOK {
+		cached = append([]openai.Model(nil), cached...)
+	}
+	p.modelsMu.RUnlock()
+	if cacheOK {
+		if lim, ok := p.contextLimitFromModels(cached); ok {
+			return lim, nil
+		}
+	}
 
-	p.modelsMu.Lock()
+	// Cold cache: brief /v1/models probe (local LLMs typically << timeout).
+	models, _ := p.listModels(ctx)
+	if lim, ok := p.contextLimitFromModels(models); ok {
+		return lim, nil
+	}
+
+	modelName := p.currentModel()
+	if limit := p.lookupModelsDevLimit(modelName); limit > 0 {
+		return limit, nil
+	}
+	if limit := inferContextLimitFromModelName(modelName); limit > 0 {
+		return limit, nil
+	}
+	return 128000, nil
+}
+
+// contextLimitFromModels applies sole-model auto-select and provider JSON
+// context fields. ok is false when no positive limit was found.
+func (p *OpenAIProvider) contextLimitFromModels(models []openai.Model) (int, bool) {
 	if len(models) == 1 {
 		sole := models[0]
+		p.modelsMu.Lock()
 		if sole.ID != "" {
 			p.model = sole.ID
 		}
 		p.modelsMu.Unlock()
 		if limit := parseContextLimitFromJSON(sole.RawJSON()); limit > 0 {
-			return limit, nil
+			return limit, true
 		}
-	} else {
-		p.modelsMu.Unlock()
 	}
-
 	modelName := p.currentModel()
 	for _, model := range models {
 		if model.ID != modelName {
 			continue
 		}
 		if limit := parseContextLimitFromJSON(model.RawJSON()); limit > 0 {
-			return limit, nil
+			return limit, true
 		}
 	}
-
-	// Try the model's known client first, then the other endpoint as a
-	// fallback (important when one endpoint is temporarily unreachable).
-	clients := []*openai.Client{p.clientForModel()}
-	if p.zenClient != nil && p.goClient != nil {
-		known := p.clientForModel()
-		if known == p.zenClient {
-			clients = append(clients, p.goClient)
-		} else if known == p.goClient {
-			clients = append(clients, p.zenClient)
-		} else {
-			clients = append(clients, p.zenClient, p.goClient)
-		}
-	}
-	for _, c := range clients {
-		model, err := c.Models.Get(ctx, modelName)
-		if err != nil {
-			continue
-		}
-		if limit := parseContextLimitFromJSON(model.RawJSON()); limit > 0 {
-			return limit, nil
-		}
-	}
-
-	// Provider JSON missed — try models.dev (in-memory/disk only; never blocks).
-	if limit := p.lookupModelsDevLimit(modelName); limit > 0 {
-		return limit, nil
-	}
-
-	if limit := inferContextLimitFromModelName(modelName); limit > 0 {
-		return limit, nil
-	}
-	return 128000, nil
+	return 0, false
 }
 
 func (p *OpenAIProvider) ListModels(ctx context.Context) ([]ModelInfo, error) {

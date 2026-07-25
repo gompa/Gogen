@@ -89,23 +89,27 @@ func (a *Agent) ValidateRestoredModel(ctx context.Context, model string) {
 	ctx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
 
-	if model != "" {
-		models, err := a.Provider.ListModels(ctx)
-		if err == nil {
-			found := false
-			for _, m := range models {
-				if m.ID == model {
-					found = true
-					break
-				}
-			}
-			if !found && a.Provider.ModelName() == model {
-				_ = a.Provider.SetModel("")
-			}
-		}
-	}
+	// Context limit first: ModelContextLimit tries /v1/models briefly (local
+	// n_ctx), then models.dev — without stacking a full catalog wait + Get.
 	if a.Context != nil {
 		a.Context.RefreshAfterModelChange(ctx)
+	}
+	if model == "" {
+		return
+	}
+	models, err := a.Provider.ListModels(ctx)
+	if err != nil {
+		return
+	}
+	found := false
+	for _, m := range models {
+		if m.ID == model {
+			found = true
+			break
+		}
+	}
+	if !found && a.Provider.ModelName() == model {
+		_ = a.Provider.SetModel("")
 	}
 }
 

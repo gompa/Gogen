@@ -151,9 +151,9 @@ func (m *Model) dispatchCommand(input string) (bool, bool, tea.Cmd) {
 			m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Error: directory does not exist: %s", newDir)))
 		} else {
 			m.agent.SetWorkingDir(absDir)
+			m.agent.AfterWorkingDirChange()
 			m.appendChatLine(SystemStyle.Render(fmt.Sprintf("Changed working directory to: %s", absDir)))
 		}
-		// SetWorkingDir persists the session.
 		m.checkPersistError()
 		return true, false, nil
 	}

@@ -176,6 +176,9 @@ func (a *Agent) resumeLatestSession(ctx context.Context) (string, error) {
 	if len(list) == 0 {
 		return "", fmt.Errorf("no saved sessions")
 	}
+	if len(list) == 1 && list[0].ID == a.SessionID {
+		return "", fmt.Errorf("no other saved sessions to resume")
+	}
 	target := list[0].ID
 	for _, s := range list {
 		if s.ID != a.SessionID {

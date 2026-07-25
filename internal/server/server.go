@@ -219,6 +219,7 @@ type HistoryEntry struct {
 	Refusal    string            `json:"refusal,omitempty"`
 	ToolCalls  []HistoryToolCall `json:"toolCalls,omitempty"`
 	ToolCallID string            `json:"toolCallId,omitempty"`
+	CreatedAt  string            `json:"createdAt,omitempty"` // RFC3339Nano UTC when the message was created
 }
 
 type WSMessage struct {
@@ -375,17 +376,28 @@ func sessionEntries(list []agent.SessionInfo, currentID string) []SessionEntry {
 func historyEntries(msgs []llm.Message) []HistoryEntry {
 	out := make([]HistoryEntry, 0, len(msgs))
 	for _, m := range msgs {
+		createdAt := ""
+		if !m.CreatedAt.IsZero() {
+			createdAt = m.CreatedAt.UTC().Format(time.RFC3339Nano)
+		}
+
 		switch m.Role {
 		case "user":
 			if m.Content == "" {
 				continue
 			}
-			out = append(out, HistoryEntry{Role: m.Role, Content: m.Content})
+			out = append(out, HistoryEntry{Role: m.Role, Content: m.Content, CreatedAt: createdAt})
 		case "assistant":
 			if m.Content == "" && len(m.ToolCalls) == 0 && m.Reasoning == "" && m.Refusal == "" {
 				continue
 			}
-			entry := HistoryEntry{Role: m.Role, Content: m.Content, Reasoning: m.Reasoning, Refusal: m.Refusal}
+			entry := HistoryEntry{
+				Role:      m.Role,
+				Content:   m.Content,
+				Reasoning: m.Reasoning,
+				Refusal:   m.Refusal,
+				CreatedAt: createdAt,
+			}
 			if len(m.ToolCalls) > 0 {
 				entry.ToolCalls = make([]HistoryToolCall, len(m.ToolCalls))
 				for i, tc := range m.ToolCalls {
@@ -397,6 +409,7 @@ func historyEntries(msgs []llm.Message) []HistoryEntry {
 				}
 			}
 			out = append(out, entry)
+
 		case "tool":
 			if m.Content == "" && m.ToolCallID == "" {
 				continue
@@ -405,6 +418,7 @@ func historyEntries(msgs []llm.Message) []HistoryEntry {
 				Role:       m.Role,
 				Content:    m.Content,
 				ToolCallID: m.ToolCallID,
+				CreatedAt:  createdAt,
 			})
 		}
 	}
@@ -424,26 +438,29 @@ func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, resu
 	}
 
 	var cfg WSMessage
+	var history []llm.Message
 	s.lockAgentRead(func() {
 		if err == nil && len(result.Sessions) > 0 {
 			resp.Type = "sessions"
 			resp.Sessions = sessionEntries(result.Sessions, s.agent.SessionID)
 		}
 		cfg = s.agentConfigMsgBasic()
+		if len(result.History) > 0 {
+			history = append([]llm.Message(nil), result.History...)
+		}
 	})
-	// Tokenize once outside agentMu; reuse for config + context.
+	resp.SessionID = cfg.SessionID
+	resp.Mode = cfg.Mode
+	// Paint sessions/history before ContextStats tokenization (can be slow on
+	// large restored sessions / cold tiktoken init).
+	_ = ws.writeJSON(resp)
+	if len(history) > 0 {
+		_ = ws.writeJSON(WSMessage{Type: "history", History: historyEntries(history)})
+	}
 	stats := s.agent.ContextStats(ctx)
 	applyContextStats(&cfg, stats)
 	ctxMsg := WSMessage{Type: "context"}
 	applyContextStats(&ctxMsg, stats)
-
-	resp.SessionID = cfg.SessionID
-	resp.Mode = cfg.Mode
-	// Send history before context so the client can start painting immediately.
-	_ = ws.writeJSON(resp)
-	if len(result.History) > 0 {
-		_ = ws.writeJSON(WSMessage{Type: "history", History: historyEntries(result.History)})
-	}
 	_ = ws.writeJSON(ctxMsg)
 	_ = ws.writeJSON(cfg)
 }
@@ -932,6 +949,9 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 				s.config.WorkingDir = absDir
 				cfg = s.agentConfigMsgBasic()
 			})
+			// FlushSession + models.dev cache retarget are disk/network — keep
+			// them off agentMu so WS connect/history readers are not stalled.
+			s.agent.AfterWorkingDirChange()
 			s.turnMu.Unlock()
 			applyContextStats(&cfg, s.agent.ContextStats(r.Context()))
 			_ = ws.writeJSON(WSMessage{Type: "config", WorkingDir: absDir, Model: cfg.Model, ContextLimit: cfg.ContextLimit, UsedTokens: cfg.UsedTokens, UsedSource: cfg.UsedSource, UsedPercent: cfg.UsedPercent, CompactAt: cfg.CompactAt, MessageCount: cfg.MessageCount, NearCompact: cfg.NearCompact, ToolTruncated: cfg.ToolTruncated, Mode: cfg.Mode})
@@ -1074,14 +1094,18 @@ func (s *Server) checkAuth(r *http.Request) bool {
 // On cancel it gracefully shuts down the HTTP server so callers can flush
 // session state (e.g. Ctrl+C / SIGTERM in --web mode).
 func (s *Server) Start(ctx context.Context, addr string) error {
-	if !isLoopbackBind(addr) {
+	if !IsLoopbackBind(addr) {
 		if s.authToken == "" {
-			return fmt.Errorf("non-loopback bind %q requires GOGEN_WEB_TOKEN (or web_auth_token) for authentication", addr)
+			return fmt.Errorf("non-loopback bind %q requires an auth token; set GOGEN_WEB_TOKEN or web_auth_token", addr)
 		}
 		if s.tlsCertFile == "" || s.tlsKeyFile == "" {
-			return fmt.Errorf("non-loopback bind %q requires TLS: set GOGEN_WEB_TLS_CERT and GOGEN_WEB_TLS_KEY (or web_tls_cert_file / web_tls_key_file)", addr)
+			log.Printf("WARNING: non-loopback bind %q without TLS — auth token is sent in plain text. Set GOGEN_WEB_TLS_CERT and GOGEN_WEB_TLS_KEY (or web_tls_cert_file / web_tls_key_file) for encryption.", addr)
 		}
-		log.Printf("listening on non-loopback %s with token auth and TLS", addr)
+		log.Printf("listening on non-loopback %s with token auth", addr)
+	}
+	if s.authToken != "" {
+		// Log the token on startup so users can construct the login URL.
+		log.Printf("auth token: %s", s.authToken)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", s.HandleWS)
@@ -1117,7 +1141,7 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 	}
 }
 
-func isLoopbackBind(addr string) bool {
+func IsLoopbackBind(addr string) bool {
 	host := addr
 	if h, _, err := net.SplitHostPort(addr); err == nil {
 		host = h

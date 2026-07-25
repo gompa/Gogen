@@ -69,6 +69,10 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error
 	if err := a.checkPlanMode(tc.Name); err != nil {
 		return "", err
 	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	ctx = a.toolContext(ctx)
 	if a.MCPRegistry != nil {
 		if names := a.MCPRegistry.ToolNames(); names != nil {
 			if _, ok := names[tc.Name]; ok {
@@ -76,7 +80,6 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error
 			}
 		}
 	}
-	ctx = a.toolContext(ctx)
 	handlers := a.toolHandlers
 	if handlers == nil {
 		handlers = BuiltinToolHandlers()

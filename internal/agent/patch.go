@@ -461,7 +461,7 @@ func applyPatchHunks(original []string, hunks []patchHunk, fuzzy bool) ([]string
 		} else if hint < len(out) {
 			actual = out[hint:]
 		}
-		matched := findHunkMatch(out, h.oldLines, hint, n, fuzzy)
+		matched := findHunkMatch(out, h.oldLines, hint, fuzzy)
 		if matched < 0 {
 			return nil, formatHunkMismatch(hi+1, len(hunks), hint+1, actual, h.oldLines, fuzzy)
 		}
@@ -477,7 +477,8 @@ func applyPatchHunks(original []string, hunks []patchHunk, fuzzy bool) ([]string
 // findHunkMatch locates oldLines within lines. Returns the start index, or -1
 // if no match is found. When fuzzy is true, relocation and whitespace-tolerant
 // matching are attempted before giving up.
-func findHunkMatch(lines, oldLines []string, hint, n int, fuzzy bool) int {
+func findHunkMatch(lines, oldLines []string, hint int, fuzzy bool) int {
+	n := len(oldLines)
 	end := hint + n
 	if end <= len(lines) && linesEqual(lines[hint:end], oldLines) {
 		return hint

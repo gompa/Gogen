@@ -36,16 +36,16 @@ func TestCheckWSOrigin(t *testing.T) {
 }
 
 func TestIsLoopbackBind(t *testing.T) {
-	if !isLoopbackBind("127.0.0.1:8080") {
+	if !IsLoopbackBind("127.0.0.1:8080") {
 		t.Fatal("expected loopback")
 	}
-	if !isLoopbackBind("localhost:8080") {
+	if !IsLoopbackBind("localhost:8080") {
 		t.Fatal("expected localhost loopback")
 	}
-	if isLoopbackBind("0.0.0.0:8080") {
+	if IsLoopbackBind("0.0.0.0:8080") {
 		t.Fatal("0.0.0.0 should not be loopback")
 	}
-	if isLoopbackBind(":8080") {
+	if IsLoopbackBind(":8080") {
 		t.Fatal(":8080 should not be loopback")
 	}
 }

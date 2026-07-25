@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"crypto/rand"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -213,16 +214,41 @@ func main() {
 	defer a.FlushSession()
 
 	if *webFlag {
-		s := server.NewServer(a, cfg)
+		// Determine the listen address first so we can check for loopback
+		// and auto-generate a token before creating the server.
 		addr := cfg.WebBind
+		var isLoopback bool
 		if addr == "" {
 			addr = "127.0.0.1:8081"
+			isLoopback = true
 		} else if !strings.Contains(addr, ":") {
 			addr += ":8081"
+			isLoopback = server.IsLoopbackBind(addr)
+		} else {
+			isLoopback = server.IsLoopbackBind(addr)
 		}
-		fmt.Printf("Starting web server on %s\n", addr)
+
+		// For non-loopback binds, auto-generate a token if none is provided.
+		if !isLoopback && cfg.WebAuthToken == "" {
+			token, err := generateToken()
+			if err != nil {
+				log.Fatalf("failed to generate auth token: %v", err)
+			}
+			cfg.WebAuthToken = token
+		}
+
+		s := server.NewServer(a, cfg)
+
+		// Build a user-friendly URL for the startup message.
+		// Replace 0.0.0.0 with 127.0.0.1 so the link works when clicked.
+		displayAddr := addr
+		if strings.HasPrefix(displayAddr, "0.0.0.0:") {
+			displayAddr = "127.0.0.1:" + displayAddr[len("0.0.0.0:"):]
+		}
 		if cfg.WebAuthToken != "" {
-			fmt.Printf("Auth token required (GOGEN_WEB_TOKEN / web_auth_token)\n")
+			fmt.Printf("Open http://%s?token=%s\n", displayAddr, cfg.WebAuthToken)
+		} else {
+			fmt.Printf("Open http://%s\n", displayAddr)
 		}
 		// Listen first so the UI can connect immediately. Provider model
 		// validation and context-limit lookup continue in the background.
@@ -249,6 +275,15 @@ func main() {
 	// Default: TUI mode.
 	c := tui.New(a, cfg)
 	c.Run(ctx)
+}
+
+// generateToken returns a cryptographically random 32-byte hex string.
+func generateToken() (string, error) {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 func applyRuntimeConfig(cfg *config.Config) {
