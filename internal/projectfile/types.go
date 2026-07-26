@@ -47,6 +47,7 @@ type FileConfig struct {
 	SessionMaxAgeDays    int
 	CommandSandbox       string
 	CommandTimeoutSecs   int
+	PreserveReasoning    string
 }
 
 // ProjectFile is a loaded combined config + guidelines file.

@@ -65,6 +65,10 @@ type Config struct {
 
 	CommandSandbox     string // off, bwrap (bubblewrap when available)
 	CommandTimeoutSecs int    // execute_command timeout; 0 = default 120s
+
+	// PreserveReasoning controls chat_template_kwargs.preserve_reasoning for
+	// self-hosted OpenAI-compatible servers: auto (probe /props), on, off.
+	PreserveReasoning string
 }
 
 // Defaults returns built-in default configuration values.
@@ -103,6 +107,7 @@ func Defaults() Config {
 		WebFetchMode:         "https",
 		CommandSandbox:       "off",
 		CommandTimeoutSecs:   120,
+		PreserveReasoning:    "auto",
 	}
 }
 

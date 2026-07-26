@@ -2,9 +2,15 @@ package llm
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"io"
+	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -33,7 +39,13 @@ const (
 	// remote catalog must fail fast so models.dev / heuristics can run.
 	// ListModels keeps modelsCatalogTimeout.
 	modelsLimitLookupTimeout = 1500 * time.Millisecond
+	// propsProbeTimeout bounds GET /props for chat_template_caps discovery.
+	propsProbeTimeout = 1500 * time.Millisecond
 )
+
+// propsHTTPClient is a plain short-timeout client for capability probes.
+// Intentionally not the SSE client (idle read deadlines are stream-oriented).
+var propsHTTPClient = &http.Client{Timeout: propsProbeTimeout}
 
 // isOpencodeURL reports whether baseURL points to an OpenCode endpoint that
 // should also expose the Go model family at openCodeGoBaseURL.
@@ -47,6 +59,7 @@ type OpenAIProvider struct {
 	goClient    *openai.Client // OpenCode Go endpoint
 	model       string
 	baseURL     string
+	apiKey      string
 	modelClient map[string]*openai.Client // model ID → client routing
 	// promptCacheKey scopes provider-side prompt caching (defaults to none).
 	promptCacheKey param.Opt[string]
@@ -57,6 +70,15 @@ type OpenAIProvider struct {
 	modelsCache    []openai.Model
 	modelsCachedAt time.Time // zero means no successful cache entry
 	modelsFetch    *modelsFetch
+
+	// propsCaps caches llama.cpp GET /props chat_template_caps. Invalidated
+	// on SetModel because router/multi-model hosts may change the template.
+	propsMu                sync.Mutex
+	propsChecked           bool
+	propsPreserveReasoning bool
+
+	// preserveReasoningMode: auto (default, probe /props), on, off.
+	preserveReasoningMode string
 }
 
 type modelsFetch struct {
@@ -222,6 +244,7 @@ func NewOpenAIProvider(apiKey string, model string, baseURL string, workingDir s
 		client:      openai.NewClient(opts...),
 		model:       model,
 		baseURL:     baseURL,
+		apiKey:      apiKey,
 		modelClient: make(map[string]*openai.Client),
 		modelInfo:   modelinfo.NewResolver(modelinfo.CachePath(workingDir)),
 	}
@@ -264,6 +287,161 @@ func (p *OpenAIProvider) SetPromptCacheKey(key string) {
 		return
 	}
 	p.promptCacheKey = param.NewOpt(key)
+}
+
+// SetPreserveReasoningMode controls whether chat_template_kwargs.preserve_reasoning
+// is sent for self-hosted endpoints: auto (probe /props), on, or off.
+func (p *OpenAIProvider) SetPreserveReasoningMode(mode string) {
+	if p == nil {
+		return
+	}
+	p.preserveReasoningMode = normalizePreserveReasoningMode(mode)
+}
+
+func normalizePreserveReasoningMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "on", "1", "true", "yes":
+		return "on"
+	case "off", "0", "false", "no":
+		return "off"
+	default:
+		return "auto"
+	}
+}
+
+// ProjectPromptCacheKey returns a stable, short hash of the working directory
+// for use as an OpenAI prompt_cache_key. This keeps provider-side cache hits
+// scoped per-project without leaking paths.
+func ProjectPromptCacheKey(workingDir string) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(workingDir))
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], h.Sum64())
+	return hex.EncodeToString(b[:])
+}
+
+// applyChatCompletionExtras sets llama.cpp-style kwargs that keep prompt-cache
+// prefixes stable across multi-turn agent loops.
+//
+//   - mode "off": never send
+//   - mode "on": send when a custom base URL is set (skip /props probe)
+//   - mode "auto" (default): send only if GET /props reports
+//     chat_template_caps.supports_preserve_reasoning
+//
+// Empty base URL is the default OpenAI API and never gets kwargs.
+func (p *OpenAIProvider) applyChatCompletionExtras(ctx context.Context, params *openai.ChatCompletionNewParams) {
+	if p == nil || params == nil {
+		return
+	}
+	switch normalizePreserveReasoningMode(p.preserveReasoningMode) {
+	case "off":
+		return
+	case "on":
+		if strings.TrimSpace(p.baseURL) == "" {
+			return
+		}
+	default: // auto
+		if !p.templateSupportsPreserveReasoning(ctx) {
+			return
+		}
+	}
+	params.SetExtraFields(map[string]any{
+		"chat_template_kwargs": map[string]any{
+			"preserve_reasoning": true,
+		},
+	})
+}
+
+// templateSupportsPreserveReasoning probes llama.cpp GET /props once and caches
+// chat_template_caps.supports_preserve_reasoning. Failures / missing caps → false.
+func (p *OpenAIProvider) templateSupportsPreserveReasoning(ctx context.Context) bool {
+	p.propsMu.Lock()
+	if p.propsChecked {
+		v := p.propsPreserveReasoning
+		p.propsMu.Unlock()
+		return v
+	}
+	p.propsMu.Unlock()
+
+	supported := p.probePreserveReasoning(ctx)
+
+	p.propsMu.Lock()
+	// Another goroutine may have filled the cache while we probed.
+	if !p.propsChecked {
+		p.propsChecked = true
+		p.propsPreserveReasoning = supported
+	}
+	v := p.propsPreserveReasoning
+	p.propsMu.Unlock()
+	return v
+}
+
+func (p *OpenAIProvider) invalidatePropsCaps() {
+	p.propsMu.Lock()
+	p.propsChecked = false
+	p.propsPreserveReasoning = false
+	p.propsMu.Unlock()
+}
+
+// probePreserveReasoning GETs /props and reads supports_preserve_reasoning.
+// Returns false on any error, non-200, or missing capability key.
+func (p *OpenAIProvider) probePreserveReasoning(ctx context.Context) bool {
+	propsURL := llamaPropsURL(p.baseURL)
+	if propsURL == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, propsProbeTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, propsURL, nil)
+	if err != nil {
+		return false
+	}
+	if p.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+p.apiKey)
+	}
+
+	resp, err := propsHTTPClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return false
+	}
+	return parsePreserveReasoningCap(body)
+}
+
+func parsePreserveReasoningCap(body []byte) bool {
+	var props struct {
+		ChatTemplateCaps map[string]bool `json:"chat_template_caps"`
+	}
+	if err := json.Unmarshal(body, &props); err != nil {
+		return false
+	}
+	return props.ChatTemplateCaps["supports_preserve_reasoning"]
+}
+
+// llamaPropsURL maps an OpenAI-compatible base URL (.../v1) to llama.cpp GET /props.
+func llamaPropsURL(baseURL string) string {
+	baseURL = strings.TrimSpace(baseURL)
+	if baseURL == "" {
+		return ""
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	path := strings.TrimSuffix(u.Path, "/")
+	path = strings.TrimSuffix(path, "/v1")
+	u.Path = path + "/props"
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
 }
 
 // clientForModel returns the openai.Client that should serve the currently
@@ -460,6 +638,7 @@ func (p *OpenAIProvider) GenerateResponse(ctx context.Context, messages []Messag
 	if p.promptCacheKey.Valid() {
 		params.PromptCacheKey = p.promptCacheKey
 	}
+	p.applyChatCompletionExtras(ctx, &params)
 	resp, err := p.clientForModel().Chat.Completions.New(ctx, params)
 
 	if err != nil {
@@ -534,6 +713,7 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 	if p.promptCacheKey.Valid() {
 		params.PromptCacheKey = p.promptCacheKey
 	}
+	p.applyChatCompletionExtras(ctx, &params)
 	stream := p.clientForModel().Chat.Completions.NewStreaming(ctx, params)
 	defer stream.Close()
 
@@ -831,6 +1011,8 @@ func (p *OpenAIProvider) SetModel(id string) error {
 	p.modelsMu.Lock()
 	p.model = id
 	p.modelsMu.Unlock()
+	// Template caps can change with the model on multi-model / router hosts.
+	p.invalidatePropsCaps()
 	return nil
 }
 

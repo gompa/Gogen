@@ -102,6 +102,7 @@ func buildGlobalFrontMatter(cfg *config.Config, opts WriteOptions) string {
 		writeYAMLString(&b, "debug_session", cfg.DebugSession)
 	}
 	writeYAMLString(&b, "mcp", cfg.MCP)
+	writePreserveReasoning(&b, cfg.PreserveReasoning)
 	if len(cfg.MCPServers) > 0 {
 		b.WriteString("mcp_servers:\n")
 		for _, s := range cfg.MCPServers {
@@ -167,6 +168,7 @@ func buildFrontMatter(cfg *config.Config, opts WriteOptions) string {
 		writeYAMLString(&b, "debug_session", cfg.DebugSession)
 	}
 	writeYAMLString(&b, "mcp", cfg.MCP)
+	writePreserveReasoning(&b, cfg.PreserveReasoning)
 	if len(cfg.MCPServers) > 0 {
 		b.WriteString("mcp_servers:\n")
 		for _, s := range cfg.MCPServers {
@@ -191,6 +193,16 @@ func buildFrontMatter(cfg *config.Config, opts WriteOptions) string {
 		}
 	}
 	return b.String()
+}
+
+// writePreserveReasoning emits the key only when it differs from the default
+// ("auto"), so generated configs stay quiet unless the user overrode it.
+func writePreserveReasoning(b *strings.Builder, mode string) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" || mode == "auto" {
+		return
+	}
+	writeYAMLString(b, "preserve_reasoning", mode)
 }
 
 func writeYAMLString(b *strings.Builder, key, val string) {

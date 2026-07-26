@@ -80,6 +80,30 @@ func TestMergeEmptyEnvClearsBaseURL(t *testing.T) {
 	}
 }
 
+func TestMergePreserveReasoning(t *testing.T) {
+	os.Unsetenv("GOGEN_PRESERVE_REASONING")
+	pf, err := ParseContent("GOGEN.md", "---\npreserve_reasoning: on\n---\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Merge(pf, FlagOverrides{})
+	if cfg.PreserveReasoning != "on" {
+		t.Fatalf("file value: got %q", cfg.PreserveReasoning)
+	}
+
+	t.Setenv("GOGEN_PRESERVE_REASONING", "off")
+	cfg = Merge(pf, FlagOverrides{})
+	if cfg.PreserveReasoning != "off" {
+		t.Fatalf("env override: got %q", cfg.PreserveReasoning)
+	}
+
+	os.Unsetenv("GOGEN_PRESERVE_REASONING")
+	cfg = Merge(nil, FlagOverrides{})
+	if cfg.PreserveReasoning != "auto" {
+		t.Fatalf("default: got %q", cfg.PreserveReasoning)
+	}
+}
+
 func TestSaveConfigRedactsSecrets(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, ".gogen", "gogen.conf")
@@ -111,6 +135,37 @@ func TestSaveConfigWithoutAPIKey(t *testing.T) {
 	cfg := Merge(nil, FlagOverrides{})
 	if err := SaveConfig(cfgPath, mdPath, cfg, "", WriteOptions{}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSaveConfigPreserveReasoning(t *testing.T) {
+	dir := t.TempDir()
+
+	cfg := Merge(nil, FlagOverrides{})
+	cfgPath := filepath.Join(dir, "auto.conf")
+	if err := SaveConfig(cfgPath, "", cfg, "", WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "preserve_reasoning") {
+		t.Fatalf("default auto should be omitted: %s", data)
+	}
+
+	cfg.PreserveReasoning = "on"
+	cfgPath = filepath.Join(dir, "on.conf")
+	if err := SaveConfig(cfgPath, "", cfg, "", WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "preserve_reasoning: on") &&
+		!strings.Contains(string(data), `preserve_reasoning: "on"`) {
+		t.Fatalf("expected on override: %s", data)
 	}
 }
 

@@ -305,6 +305,9 @@ func parseYAMLFrontMatter(yamlText string) (FileConfig, error) {
 	if v, ok := raw["web_fetch_mode"]; ok {
 		cfg.WebFetchMode = asString(v)
 	}
+	if v, ok := raw["preserve_reasoning"]; ok {
+		cfg.PreserveReasoning = asOnOffString(v)
+	}
 
 	return cfg, nil
 }

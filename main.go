@@ -3,11 +3,9 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"encoding/binary"
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"hash/fnv"
 	"log"
 	"os"
 	"os/signal"
@@ -145,8 +143,8 @@ func main() {
 
 	// Derive a stable prompt-cache key from the working directory so
 	// provider-side prefix caches survive sequential requests.
-	promptKey := projectPromptCacheKey(cfg.WorkingDir)
-	provider.SetPromptCacheKey(promptKey)
+	provider.SetPromptCacheKey(llm.ProjectPromptCacheKey(cfg.WorkingDir))
+	provider.SetPreserveReasoningMode(cfg.PreserveReasoning)
 
 	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{
 		ContextLimit:         cfg.ContextLimit,
@@ -386,15 +384,4 @@ func applyRuntimeConfig(cfg *config.Config) {
 	if cfg.DebugLog != "" || cfg.DebugSession != "" {
 		debuglog.Configure(cfg.DebugLog, cfg.DebugSession)
 	}
-}
-
-// projectPromptCacheKey returns a stable, short hash of the working directory
-// for use as an OpenAI prompt_cache_key. This keeps provider-side cache hits
-// scoped per-project without leaking paths.
-func projectPromptCacheKey(workingDir string) string {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(workingDir))
-	var b [8]byte
-	binary.BigEndian.PutUint64(b[:], h.Sum64())
-	return hex.EncodeToString(b[:])
 }

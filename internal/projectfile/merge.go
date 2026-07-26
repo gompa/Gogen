@@ -55,6 +55,7 @@ func Merge(pf *ProjectFile, flags FlagOverrides) *config.Config {
 		WebFetchMode:         mergeString("GOGEN_WEB_FETCH_MODE", file, "web_fetch_mode", file.WebFetchMode, def.WebFetchMode),
 		CommandSandbox:       mergeString("GOGEN_COMMAND_SANDBOX", file, "command_sandbox", file.CommandSandbox, def.CommandSandbox),
 		CommandTimeoutSecs:   mergeInt("GOGEN_COMMAND_TIMEOUT_SECS", file, "command_timeout_secs", file.CommandTimeoutSecs, def.CommandTimeoutSecs),
+		PreserveReasoning:    mergeString("GOGEN_PRESERVE_REASONING", file, "preserve_reasoning", file.PreserveReasoning, def.PreserveReasoning),
 	}
 
 	if flags.WorkingDir != "" {
