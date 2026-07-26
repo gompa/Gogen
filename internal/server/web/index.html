@@ -1412,6 +1412,7 @@
             editorRedo,
             saveAll,
             saveActive,
+            openFileAtLine,
         } from '/editor.js';
         import { marked } from '/vendor/marked.esm.js';
         import DOMPurify from '/vendor/dompurify.esm.js';
@@ -1767,6 +1768,7 @@
             historyToolCallArgs = {};
             toolsStartedThisTurn = false;
             setTurnActive(false);
+            scrollBottomBtn.classList.remove('visible');
         }
 
         let pendingSessionResponse = false;
@@ -2627,7 +2629,11 @@
                 clearTimeout(reconnectTimer);
                 reconnectTimer = null;
                 setConnState('connected');
-                appendMessage('system', 'Connected to GoGen server');
+                // Replace (don't append) on every connect: the server may omit
+                // history when the session is empty, and reconnect must not
+                // keep a stale transcript. Connection status lives in the
+                // indicator, not as chat system messages.
+                clearChat();
                 // Reset the lazy model-catalog guard so a fresh connection can
                 // fetch on next interaction; re-arm the one-shot listeners.
                 modelsRequested = false;
@@ -2790,7 +2796,10 @@
                         updateContextInfo(data);
                     }
                 } else if (data.type === 'history') {
-                    if (data.history) {
+                    // Full snapshot — replace the pane so reconnect / session
+                    // restore never stacks duplicate transcripts.
+                    clearChat();
+                    if (data.history && data.history.length) {
                         replayHistory(data.history).catch((err) => {
                             console.warn('history replay failed', err);
                             for (const h of data.history) {
@@ -2811,7 +2820,6 @@
 
             ws.onclose = () => {
                 setConnState('disconnected');
-                appendMessage('system', 'Disconnected from server');
                 endStream();
                 streamingToolCards = {};
                 pendingToolCards = {};
@@ -3246,21 +3254,28 @@
             if (e.key === 'ArrowUp' || e.key === 'PageUp' || e.key === 'Home') unpinFromBottom();
         });
 
+        // Throttle scroll handler to rAF to avoid layout thrashing during streaming.
+        let _scrollPending = false;
         messagesDiv.addEventListener('scroll', () => {
-            if (ignoreScrollEvent) return;
-            const d = distanceFromBottom();
-            if (d > NEAR_BOTTOM_PX) {
-                // Clearly away from bottom (scrollbar drag, etc.)
-                stickToBottom = false;
-                messagesDiv.classList.remove('no-anchor');
-            } else if (d <= 8) {
-                // Truly back at the bottom — re-enable follow
-                stickToBottom = true;
-                messagesDiv.classList.add('no-anchor');
-            }
-            // 8 < d <= NEAR_BOTTOM_PX: leave stickToBottom alone so a small
-            // upward scroll after wheel-unpin is not immediately re-pinned.
-            scrollBottomBtn.classList.toggle('visible', !stickToBottom);
+            if (_scrollPending) return;
+            _scrollPending = true;
+            requestAnimationFrame(() => {
+                _scrollPending = false;
+                if (ignoreScrollEvent) return;
+                const d = distanceFromBottom();
+                if (d > NEAR_BOTTOM_PX) {
+                    // Clearly away from bottom (scrollbar drag, etc.)
+                    stickToBottom = false;
+                    messagesDiv.classList.remove('no-anchor');
+                } else if (d <= 8) {
+                    // Truly back at the bottom — re-enable follow
+                    stickToBottom = true;
+                    messagesDiv.classList.add('no-anchor');
+                }
+                // 8 < d <= NEAR_BOTTOM_PX: leave stickToBottom alone so a small
+                // upward scroll after wheel-unpin is not immediately re-pinned.
+                scrollBottomBtn.classList.toggle('visible', !stickToBottom);
+            });
         });
         scrollBottomBtn.addEventListener('click', () => {
             pinToBottom();
@@ -3275,18 +3290,15 @@
         });
 
         // Auto-scroll only while stickToBottom is set (user hasn't scrolled away).
+        // The immediate scrollTop gives low-latency follow during streaming
+        // (each token triggers smartScroll).  The gogen-colorized event
+        // re-invokes smartScroll after Monaco finishes coloring, so we do
+        // NOT need a duplicate rAF double-check here.
         function smartScroll() {
             if (!stickToBottom) return;
             ignoreScrollEvent = true;
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
-            // Double-check after layout settles (handles async DOM changes like
-            // code colorization that may affect height after the initial scroll).
-            requestAnimationFrame(() => {
-                if (stickToBottom && messagesDiv.isConnected) {
-                    messagesDiv.scrollTop = messagesDiv.scrollHeight;
-                }
-                ignoreScrollEvent = false;
-            });
+            ignoreScrollEvent = false;
         }
 
         // === Task 4: Collapsible sidebar toggle ===

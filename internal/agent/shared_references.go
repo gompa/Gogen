@@ -127,10 +127,10 @@ func (e *Executor) walkSymbolReferences(ctx context.Context, searchRoot, relPref
 
 // walkSymbolReferencesText is a shared helper for text-based symbol search.
 // It walks the filesystem and finds symbol references using regex patterns.
-func (e *Executor) walkSymbolReferencesText(ctx context.Context, searchRoot, relPrefix, glob, symbol string,
+// The pattern parameter should be a pre-compiled regex pattern (callers use regexp.QuoteMeta).
+func (e *Executor) walkSymbolReferencesText(ctx context.Context, searchRoot, relPrefix, glob, pattern string,
 	visitor func(filePath string, lineNum int, line string) error) error {
 
-	pattern := fmt.Sprintf(`\b%s\b`, symbol)
 	re, err := compileSearchPattern(pattern)
 	if err != nil {
 		return err

@@ -142,7 +142,6 @@ func TestShouldCompactWhenOverBudget(t *testing.T) {
 // Regression: a prior ShouldCompact call must not freeze the decision when
 // the message list later grows past the compaction budget.
 func TestShouldCompactSeesGrowthAcrossCalls(t *testing.T) {
-	InvalidateTokenCache()
 	m := NewManager(&stubProvider{}, Settings{
 		ContextLimit:         8000,
 		CompactThreshold:     0.5,

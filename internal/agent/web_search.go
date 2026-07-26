@@ -121,6 +121,9 @@ func parseDDGHTMLResults(body []byte, maxResults int) []searchResult {
 		href        string
 		titleBuf    strings.Builder
 		snipBuf     strings.Builder
+		// cachedClasses avoids re-parsing the class attribute on every
+		// tokenHasClass call for the same HTML token.
+		cachedClasses []string
 	)
 
 	for {
@@ -132,11 +135,12 @@ func parseDDGHTMLResults(body []byte, maxResults int) []searchResult {
 			break
 		}
 		tok := z.Token()
+		cachedClasses = nil // reset per token
 
 		switch tt {
 		case html.StartTagToken, html.SelfClosingTagToken:
 			// <div class="result results_links ...">  → enter result
-			if tok.Data == "div" && tokenHasClass(tok, "result") && tokenHasClass(tok, "results_links") {
+			if tok.Data == "div" && tokenHasClassCached(tok, "result", &cachedClasses) && tokenHasClassCached(tok, "results_links", &cachedClasses) {
 				inResult = true
 				resultDepth = 0
 				href = ""
@@ -147,7 +151,7 @@ func parseDDGHTMLResults(body []byte, maxResults int) []searchResult {
 			}
 			if inResult {
 				// <a class="result__a" href="...">  → capture link (inside title h2)
-				if tok.Data == "a" && tokenHasClass(tok, "result__a") {
+				if tok.Data == "a" && tokenHasClassCached(tok, "result__a", &cachedClasses) {
 					for _, a := range tok.Attr {
 						if a.Key == "href" {
 							href = a.Val
@@ -156,12 +160,12 @@ func parseDDGHTMLResults(body []byte, maxResults int) []searchResult {
 					}
 				}
 				// Any element with class="result__title"  → start collecting title text
-				if tokenHasClass(tok, "result__title") {
+				if tokenHasClassCached(tok, "result__title", &cachedClasses) {
 					inTitle = true
 					titleTag = tok.Data
 				}
 				// Any element with class="result__snippet"  → start collecting snippet text
-				if tokenHasClass(tok, "result__snippet") {
+				if tokenHasClassCached(tok, "result__snippet", &cachedClasses) {
 					inSnippet = true
 					snippetTag = tok.Data
 				}
@@ -204,9 +208,31 @@ func parseDDGHTMLResults(body []byte, maxResults int) []searchResult {
 	return results
 }
 
-// tokenHasClass reports whether an HTML token's class attribute contains
-// the given CSS class as a whitespace-separated token.
-func tokenHasClass(tok html.Token, class string) bool {
+// tokenHasClassCached is like tokenHasClass but uses a cached slice of class
+// values to avoid re-parsing the class attribute on subsequent calls for the
+// same token. Pass &cachedClasses from the outer loop (nil to bypass cache).
+func tokenHasClassCached(tok html.Token, class string, cache *[]string) bool {
+	if cache != nil && *cache == nil {
+		for _, a := range tok.Attr {
+			if a.Key == "class" {
+				classes := strings.Fields(a.Val)
+				*cache = classes
+				break
+			}
+		}
+		if *cache == nil {
+			*cache = []string{} // non-nil sentinel: class attr absent
+		}
+	}
+	if cache != nil {
+		for _, c := range *cache {
+			if strings.EqualFold(c, class) {
+				return true
+			}
+		}
+		return false
+	}
+	// Fallback: uncached scan (for callers that don't have a cache).
 	for _, a := range tok.Attr {
 		if a.Key == "class" {
 			for _, c := range strings.Fields(a.Val) {

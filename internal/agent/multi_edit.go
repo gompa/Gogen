@@ -26,7 +26,7 @@ func (e *Executor) MultiEdit(ctx context.Context, pattern, search, replace strin
 		return "", err
 	}
 
-	if files == "No files found" {
+	if files == "No matches found" {
 		return "No files matched the pattern", nil
 	}
 
@@ -35,6 +35,7 @@ func (e *Executor) MultiEdit(ctx context.Context, pattern, search, replace strin
 
 	var changes []FileChange
 	var totalChanges int
+	var errs []string
 
 	for _, file := range fileList {
 		file = strings.TrimSpace(file)
@@ -42,11 +43,13 @@ func (e *Executor) MultiEdit(ctx context.Context, pattern, search, replace strin
 			continue
 		}
 
-		// Read file content
-		content, err := e.ReadFileRange(file, 0, 0, "", false)
+		// Read raw file content (no headers/truncation)
+		raw, err := e.ReadFileRawBytes(file)
 		if err != nil {
-			continue // Skip files that can't be read
+			errs = append(errs, fmt.Sprintf("%s: read failed: %v", file, err))
+			continue
 		}
+		content := string(raw)
 
 		// Count occurrences
 		oldCount := strings.Count(content, search)
@@ -58,8 +61,9 @@ func (e *Executor) MultiEdit(ctx context.Context, pattern, search, replace strin
 		newContent := strings.ReplaceAll(content, search, replace)
 
 		if !dryRun {
-			// Apply the replacement
-			if err := e.WriteFile(file, newContent); err != nil {
+			// Apply the replacement (create or overwrite)
+			if err := e.OverwriteFile(file, newContent); err != nil {
+				errs = append(errs, fmt.Sprintf("%s: write failed: %v", file, err))
 				continue
 			}
 		}
@@ -73,10 +77,10 @@ func (e *Executor) MultiEdit(ctx context.Context, pattern, search, replace strin
 		totalChanges += oldCount
 	}
 
-	return formatMultiEditResult(search, replace, changes, totalChanges, dryRun), nil
+	return formatMultiEditResult(search, replace, changes, totalChanges, dryRun, errs), nil
 }
 
-func formatMultiEditResult(search, replace string, changes []FileChange, totalChanges int, dryRun bool) string {
+func formatMultiEditResult(search, replace string, changes []FileChange, totalChanges int, dryRun bool, errs []string) string {
 	var b strings.Builder
 
 	action := "Replaced"
@@ -89,6 +93,13 @@ func formatMultiEditResult(search, replace string, changes []FileChange, totalCh
 
 	for _, c := range changes {
 		fmt.Fprintf(&b, "  %s (%d occurrence(s))\n", c.Path, c.OldCount)
+	}
+
+	if len(errs) > 0 {
+		fmt.Fprintf(&b, "\nErrors (%d file(s)):\n", len(errs))
+		for _, e := range errs {
+			fmt.Fprintf(&b, "  %s\n", e)
+		}
 	}
 
 	return b.String()

@@ -13,6 +13,11 @@ type tcAccum struct {
 	Name    string
 	ArgsStr string
 	Started bool
+	// argsFinalized is cached once ArgsStr is verified to be a complete JSON
+	// object via toolArgsFullyReceived. Reset to false whenever ArgsStr grows.
+	// The cheap brace-depth pre-check avoids re-validating an incomplete
+	// buffer on every streamed argument fragment.
+	argsFinalized bool
 }
 
 func toolCallDeltaArgsOnly(tc openai.ChatCompletionChunkChoiceDeltaToolCall) bool {
@@ -80,9 +85,54 @@ func applyToolCallDelta(tcAccums []tcAccum, idx int, tc openai.ChatCompletionChu
 		acc.Name = tc.Function.Name
 	}
 	if tc.Function.Arguments != "" {
-		acc.ArgsStr = mergeToolArgsDelta(acc.ArgsStr, tc.Function.Arguments)
+		merged := mergeToolArgsDelta(acc.ArgsStr, tc.Function.Arguments)
+		if merged != acc.ArgsStr {
+			// Buffer grew/replaced: invalidate the finalized cache so it is
+			// re-evaluated lazily by maybeFinalizeArgs.
+			acc.argsFinalized = false
+			acc.ArgsStr = merged
+		}
+		acc.maybeFinalizeArgs()
 	}
 	return tcAccums, idx
+}
+
+// maybeFinalizeArgs runs the expensive json.Unmarshal validity check exactly
+// once per accumulator and only when the (trimmed) buffer structurally looks
+// like a complete single JSON object. While braces are still open — the
+// common streaming case — the cheap O(n) brace-depth scan returns early and
+// no JSON validation runs. This preserves toolArgsFullyReceived semantics
+// while avoiding O(n^2) re-validation of an incomplete growing buffer.
+func (a *tcAccum) maybeFinalizeArgs() {
+	if a.argsFinalized {
+		return
+	}
+	s := strings.TrimSpace(a.ArgsStr)
+	if s == "" || s[0] != '{' || s[len(s)-1] != '}' {
+		return
+	}
+	if braceDepth(s) == 0 {
+		a.argsFinalized = toolArgsFullyReceived(a.ArgsStr)
+	}
+}
+
+// braceDepth returns the net brace nesting depth of s. Depth goes negative
+// when a closing brace appears before any opening one. Returns -1 in that
+// case so the caller treats it as unbalanced (and skips validation).
+func braceDepth(s string) int {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth < 0 {
+				return -1
+			}
+		}
+	}
+	return depth
 }
 
 // mergeToolArgsDelta combines streamed argument fragments.
@@ -156,10 +206,20 @@ func toolAccumsStreamComplete(accums []tcAccum) bool {
 	if len(accums) == 0 {
 		return false
 	}
-	for _, acc := range accums {
-		if acc.Name == "" || !toolArgsFullyReceived(acc.ArgsStr) {
+	for i := range accums {
+		acc := &accums[i]
+		if acc.Name == "" {
 			return false
 		}
+		// Use the cached finalized flag from streaming; fall back to a fresh
+		// check for accumulators built outside the streaming merge (tests).
+		if acc.argsFinalized {
+			continue
+		}
+		if !toolArgsFullyReceived(acc.ArgsStr) {
+			return false
+		}
+		acc.argsFinalized = true
 	}
 	return true
 }

@@ -343,8 +343,11 @@ export async function colorizeCodeBlocks(root) {
   }
   if (root._gogenHlGen !== gen || !root.isConnected) return;
 
+  // Collect all colorize tasks and run them concurrently so that large
+  // chat histories with many code blocks finish faster.
+  const tasks = [];
   for (const code of codes) {
-    if (root._gogenHlGen !== gen || !code.isConnected) return;
+    if (root._gogenHlGen !== gen || !code.isConnected) break;
     if (code.dataset.monacoColorized === '1') continue;
 
     const classMatch = /(?:^|\s)language-(\S+)/.exec(code.className || '');
@@ -354,15 +357,24 @@ export async function colorizeCodeBlocks(root) {
     const source = code.textContent || '';
     if (!source.trim()) continue;
 
-    try {
-      const html = await m.editor.colorize(source, lang, {});
-      if (root._gogenHlGen !== gen || !code.isConnected) return;
-      code.innerHTML = html;
-      code.dataset.monacoColorized = '1';
-      code.classList.add('monaco-colorized');
-    } catch (_) {
-      // Unknown / unloaded language — leave plain text.
-    }
+    // Capture snapshot for stale-result detection per block
+    const genSnapshot = root._gogenHlGen;
+    tasks.push(
+      (async () => {
+        try {
+          const html = await m.editor.colorize(source, lang, {});
+          if (root._gogenHlGen !== genSnapshot || !code.isConnected) return;
+          code.innerHTML = html;
+          code.dataset.monacoColorized = '1';
+          code.classList.add('monaco-colorized');
+        } catch (_) {
+          // Unknown / unloaded language — leave plain text.
+        }
+      })()
+    );
+  }
+  if (tasks.length > 0) {
+    await Promise.all(tasks);
   }
   // Notify scroll system that DOM height may have changed.
   window.dispatchEvent(new CustomEvent('gogen-colorized', { bubbles: false }));

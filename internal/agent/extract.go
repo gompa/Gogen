@@ -98,28 +98,42 @@ func (e *Executor) extractWithText(file string, codeBlock []string, startLine, e
 }
 
 func detectInputs(codeBlock []string) []string {
-	// Simplified input detection
-	// In production, use AST analysis
+	// Two-pass heuristic:
+	//   1. Collect assigned variables (left side of = or :=).
+	//   2. Collect all referenced identifiers.
+	// Inputs = referenced identifiers minus locally-assigned ones.
+	// This prevents local variable declarations from being treated as inputs.
 
-	inputs := make(map[string]bool)
+	assignRE := regexp.MustCompile(`(\w+)\s*(=|:=)`)
+	useRE := regexp.MustCompile(`\b([a-zA-Z_]\w*)\b`)
 
-	// Look for variable assignments
-	assignPattern := regexp.MustCompile(`(\w+)\s*=`)
+	assigned := make(map[string]bool)
+	referenced := make(map[string]bool)
 
-	// Look for variable usage before assignment
 	for _, line := range codeBlock {
-		matches := assignPattern.FindAllStringSubmatch(line, -1)
-		for _, match := range matches {
-			if len(match) > 1 {
-				inputs[match[1]] = true
+		// Collect left side of assignments
+		for _, m := range assignRE.FindAllStringSubmatch(line, -1) {
+			if len(m) > 1 {
+				assigned[m[1]] = true
+			}
+		}
+		// Collect all identifier uses
+		for _, m := range useRE.FindAllStringSubmatch(line, -1) {
+			if len(m) > 1 {
+				name := m[1]
+				if !isBuiltinOrKeyword(name) {
+					referenced[name] = true
+				}
 			}
 		}
 	}
 
-	// Convert to slice
+	// Inputs = referenced but not assigned within the block
 	var result []string
-	for input := range inputs {
-		result = append(result, input)
+	for name := range referenced {
+		if !assigned[name] {
+			result = append(result, name)
+		}
 	}
 
 	return result

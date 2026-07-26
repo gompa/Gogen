@@ -2,10 +2,10 @@ package agent
 
 import (
 	"context"
-	"crypto/rand"
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"gogen/internal/config"
@@ -45,6 +45,11 @@ type Agent struct {
 	// access across WebSocket clients (see internal/server).
 	sessionDirty    bool
 	lastPersistTime time.Time // timestamp of last actual disk write
+	// lastSavedMsgCount tracks how many messages were included in the last
+	// full snapshot save. Used by doPersist to decide between full and
+	// incremental delta saves, avoiding full JSON serialization every 5s.
+	lastSavedMsgCount int
+	lastFullSaveTime  time.Time // when the last full snapshot was written
 
 	// DebugCompareMessages enables view-fingerprint comparison across turns
 	// and session restores (GOGEN_DEBUG_COMPARE_MESSAGES). Only effective in
@@ -52,6 +57,12 @@ type Agent struct {
 	// detector out (see view_drift_release.go).
 	DebugCompareMessages bool
 	lastViewMessages     []llm.Message // debug builds only; unused in release
+
+	// restoredTokenCounts holds pre-computed token counts from a restored
+	// session snapshot. When non-nil and len matches a.Messages, ContextStats
+	// uses these counts instead of re-tokenizing every message, which is
+	// expensive for large sessions. Cleared when messages are modified.
+	restoredTokenCounts []int
 
 	// Runtime / project
 	WorkingDir        string
@@ -179,37 +190,91 @@ func (a *Agent) FlushSession() {
 // doPersist is the actual write — called by persistSession/flushSession.
 // Callers (persistSession, FlushSession) already validate SessionStore/SessionID;
 // this method only checks the dirty flag.
+//
+// It uses incremental delta saves when only a few messages have been added
+// since the last full snapshot, avoiding full JSON serialization of the
+// entire conversation history on every 5-second debounce tick.
 func (a *Agent) doPersist() {
-	// Skip if nothing changed since the last save.
 	if !a.sessionDirty {
 		return
 	}
-	profile := a.ensureProjectProfile()
-	// Only copy messages now that we know we'll write.
-	msgs := append([]llm.Message(nil), a.Messages...)
-	snap := SessionSnapshot{
-		WorkingDir:     a.WorkingDir,
-		Model:          a.CurrentModel(),
-		Mode:           a.Mode.String(),
-		Oneshot:        a.SessionOneshot,
-		Label:          a.SessionLabel,
-		ProjectProfile: profile,
-		Todos:          todoSnapshot(a.TodoManager),
-		Messages:       msgs,
-	}
-	// Compute token counts so they can be persisted alongside messages and
-	// pre-warmed into the cache on the next load.
-	if a.Context != nil {
-		snap.TokenCounts = a.Context.TokenCounts(msgs)
-	}
-	if err := a.SessionStore.Save(a.SessionID, snap); err != nil {
-		log.Printf("session save failed (id=%s): %v", a.SessionID, err)
-		a.lastPersistErr = err
+	if a.SessionStore == nil || a.SessionID == "" {
 		return
 	}
+
+	count := len(a.Messages)
+	profile := a.ensureProjectProfile()
+
+	// Safety: if the message list was truncated since last save (e.g.
+	// compaction, error rollback), force a full snapshot.
+	if a.lastSavedMsgCount > count {
+		a.lastSavedMsgCount = 0
+	}
+
+	// Decide: full snapshot or incremental delta?
+	// Full snapshot on first save, when more than 5 new messages have
+	// arrived, or when it's been >30s since the last full snapshot.
+	needsFullSave := a.lastSavedMsgCount == 0 ||
+		count-a.lastSavedMsgCount > 5 ||
+		time.Since(a.lastFullSaveTime) > 30*time.Second
+
+	if needsFullSave {
+		msgs := append([]llm.Message(nil), a.Messages...)
+		snap := SessionSnapshot{
+			WorkingDir:     a.WorkingDir,
+			Model:          a.CurrentModel(),
+			Mode:           a.Mode.String(),
+			Oneshot:        a.SessionOneshot,
+			Label:          a.SessionLabel,
+			ProjectProfile: profile,
+			Todos:          todoSnapshot(a.TodoManager),
+			Messages:       msgs,
+		}
+		if a.Context != nil {
+			snap.TokenCounts = a.Context.TokenCounts(msgs)
+		}
+		if err := a.SessionStore.Save(a.SessionID, snap); err != nil {
+			log.Printf("session save failed (id=%s): %v", a.SessionID, err)
+			a.lastPersistErr = err
+			return
+		}
+		a.lastSavedMsgCount = count
+		a.lastFullSaveTime = time.Now()
+	} else {
+		// Incremental: only serialise new messages since the last full save.
+		newMsgs := a.Messages[a.lastSavedMsgCount:]
+		var newCounts []int
+		if a.Context != nil {
+			newCounts = make([]int, len(newMsgs))
+			for i := range newMsgs {
+				newCounts[i] = contextmgr.ComputeMessageTokens(newMsgs[i])
+			}
+		}
+		deltaSnap := SessionSnapshot{
+			WorkingDir:  a.WorkingDir,
+			Oneshot:     a.SessionOneshot,
+			Label:       a.SessionLabel,
+			Messages:    newMsgs,
+			TokenCounts: newCounts,
+		}
+		if err := a.SessionStore.AppendMessages(a.SessionID, deltaSnap); err != nil {
+			log.Printf("session delta save failed (id=%s): %v", a.SessionID, err)
+			a.lastPersistErr = err
+			return
+		}
+	}
+
 	a.lastPersistErr = nil
 	a.lastPersistTime = time.Now()
 	a.sessionDirty = false
+}
+
+// resetSaveTracking resets the incremental-save counters so the next
+// doPersist writes a full snapshot. Call after any operation that
+// truncates or replaces a.Messages (compaction, session restore, etc.).
+func (a *Agent) resetSaveTracking() {
+	a.lastSavedMsgCount = 0
+	a.lastFullSaveTime = time.Time{}
 }
 
 // ConsumePersistError returns and clears the last session save failure, if any.
@@ -300,14 +365,18 @@ func ensureToolCallIDs(toolCalls []llm.ToolCall) {
 	}
 }
 
+var (
+	toolCallIDMu   sync.Mutex
+	toolCallIDSeq  uint64
+	toolCallIDSeed = uint64(time.Now().UnixNano())
+)
+
 func newToolCallID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return fmt.Sprintf("call_%d", time.Now().UnixNano())
-	}
-	b[6] = (b[6] & 0x0f) | 0x40
-	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+	toolCallIDMu.Lock()
+	toolCallIDSeq++
+	seq := toolCallIDSeq
+	toolCallIDMu.Unlock()
+	return fmt.Sprintf("call_%x_%x", toolCallIDSeed, seq)
 }
 
 func (a *Agent) prepareMessages(ctx context.Context) []llm.Message {
@@ -329,34 +398,43 @@ func (a *Agent) prepareMessages(ctx context.Context) []llm.Message {
 				compacted, newPins, err := a.Context.CompactPinned(ctx, a.Messages, pinned)
 				if err == nil {
 					a.Messages = compacted
+					// Messages replaced — cached token counts invalid.
+					a.restoredTokenCounts = nil
 					if a.PinManager != nil {
 						a.PinManager.ReplacePins(newPins)
 					}
 					// lastTurnUsage is no longer representative after compaction.
 					a.clearTurnUsage()
+					a.resetSaveTracking()
 				}
 			}
 		}
 		a.Context.EnsureToolResultsCapped(a.Messages)
 		view = a.Messages
 	}
+	// Stabilize tool args on a.Messages (not view, which may be a copy) so
+	// ArgsStabilized is persisted and we skip already-stable messages.
+	stabilizeToolArgs(a.Messages)
+
 	view = withSystemPrompt(view, a.WorkingDir)
 	view = enrichSystemPrompt(view, a.WorkingDir, a.ProjectFilePath, a.ProjectGuidelines, a.ensureProjectProfile(), a.Mode)
-
-	// Pin wire-stable tool args before compare/snapshot/send so the view,
-	// history, and HTTP body share one ArgsStr (and the detector does not
-	// false-positive when messagesToChat would have written ArgsStr later).
-	stabilizeViewToolArgs(view)
 
 	a.recordViewForDrift(view)
 	return view
 }
 
-func stabilizeViewToolArgs(view []llm.Message) {
-	for i := range view {
-		for j := range view[i].ToolCalls {
-			llm.StabilizeToolCallArgs(&view[i].ToolCalls[j])
+// stabilizeToolArgs ensures every unstabilized tool call has its ArgsStr set.
+// Skipped messages with ArgsStabilized=true — this turns an O(total_tool_calls)
+// scan into O(new_tool_calls) per turn.
+func stabilizeToolArgs(msgs []llm.Message) {
+	for i := range msgs {
+		if msgs[i].ArgsStabilized {
+			continue
 		}
+		for j := range msgs[i].ToolCalls {
+			llm.StabilizeToolCallArgs(&msgs[i].ToolCalls[j])
+		}
+		msgs[i].ArgsStabilized = true
 	}
 }
 
@@ -376,8 +454,11 @@ func (a *Agent) CompactHistory(ctx context.Context) error {
 	if a.PinManager != nil {
 		a.PinManager.ReplacePins(newPins)
 	}
+	// Compacted messages have different content — cached token counts invalid.
+	a.restoredTokenCounts = nil
 	// lastTurnUsage is no longer representative after compaction.
 	a.clearTurnUsage()
+	a.resetSaveTracking()
 	return nil
 }
 
@@ -416,6 +497,7 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 
 	if err := a.requireModelSelected(ctx); err != nil {
 		a.Messages = a.Messages[:len(a.Messages)-1]
+		a.resetSaveTracking()
 		a.FlushSession()
 		return "", err
 	}
@@ -614,6 +696,21 @@ func intArgOptional(args map[string]interface{}, key string) (int, error) {
 	default:
 		return 0, fmt.Errorf("argument %q must be an integer", key)
 	}
+}
+
+// intArg returns the integer value for key, or an error if the key is missing
+// or the value is not an integer. Unlike intArgOptional, this requires the key
+// to be present in the map.
+func intArg(args map[string]interface{}, key string) (int, error) {
+	_, ok := args[key]
+	if !ok {
+		return 0, fmt.Errorf("missing required argument %q", key)
+	}
+	v, err := intArgOptional(args, key)
+	if err != nil {
+		return 0, err
+	}
+	return v, nil
 }
 
 func stringSliceArg(args map[string]interface{}, key string) ([]string, error) {

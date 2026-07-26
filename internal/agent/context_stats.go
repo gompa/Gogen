@@ -71,7 +71,14 @@ func (a *Agent) ContextStats(ctx context.Context) TurnContext {
 
 	var snap contextmgr.ContextSnapshot
 	if a.Context != nil {
-		snap = a.Context.Snapshot(msgs, view)
+		// Use pre-computed token counts from a restored session snapshot to
+		// avoid re-tokenizing every message (expensive for large sessions).
+		// The counts are valid only when they match the current message count.
+		if len(a.restoredTokenCounts) == len(msgs) {
+			snap = a.Context.SnapshotWithCounts(msgs, view, a.restoredTokenCounts)
+		} else {
+			snap = a.Context.Snapshot(msgs, view)
+		}
 	} else {
 		snap = contextmgr.ContextSnapshot{
 			MessageCount: len(msgs),

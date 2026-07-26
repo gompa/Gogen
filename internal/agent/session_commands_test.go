@@ -15,6 +15,21 @@ type stubSessionStore struct {
 	saveErr  error
 }
 
+func (s *stubSessionStore) AppendMessages(id string, snap SessionSnapshot) error {
+	if s.saveErr != nil {
+		return s.saveErr
+	}
+	// In tests, append to messages in the existing snapshot.
+	if s.sessions != nil {
+		if existing, ok := s.sessions[id]; ok {
+			existing.Messages = append(existing.Messages, snap.Messages...)
+			s.sessions[id] = existing
+			return nil
+		}
+	}
+	return s.Save(id, snap)
+}
+
 func (s *stubSessionStore) Save(id string, snap SessionSnapshot) error {
 	if s.saveErr != nil {
 		return s.saveErr

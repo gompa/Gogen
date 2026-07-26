@@ -53,14 +53,12 @@ func (a *Agent) clearViewDriftSnapshot() {
 // wireViewForDebug builds the LLM wire view from current agent state without
 // compaction or updating the drift snapshot.
 func (a *Agent) wireViewForDebug() []llm.Message {
-	view := a.Messages
 	if a.Context != nil {
 		a.Context.EnsureToolResultsCapped(a.Messages)
-		view = a.Messages
 	}
-	view = withSystemPrompt(view, a.WorkingDir)
+	stabilizeToolArgs(a.Messages)
+	view := withSystemPrompt(a.Messages, a.WorkingDir)
 	view = enrichSystemPrompt(view, a.WorkingDir, a.ProjectFilePath, a.ProjectGuidelines, a.ensureProjectProfile(), a.Mode)
-	stabilizeViewToolArgs(view)
 	return view
 }
 

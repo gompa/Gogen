@@ -172,3 +172,62 @@ func TestParseToolCallArgsRecoversDuplicatedJSON(t *testing.T) {
 		t.Fatalf("got %#v", args)
 	}
 }
+
+// TestMergeToolCallDeltaFinalizesOncePerAccumulator verifies that streaming
+// incremental argument fragments marks the accumulator finalized exactly once
+// the JSON closes, and that subsequent identical fragments do not re-run the
+// JSON validity check (the argsFinalized cache stays set).
+func TestMergeToolCallDeltaFinalizesOncePerAccumulator(t *testing.T) {
+	t.Parallel()
+	m := make(map[int]int)
+	var accums []tcAccum
+
+	// Open the tool call, then stream `{"path":"x.go"}` one fragment at a time.
+	accums, _ = mergeToolCallDelta(deltaTool(0, "a", "read_file", ""), accums, m)
+	for _, frag := range []string{`{"path`, `":"x.go`, `"}`} {
+		accums, _ = mergeToolCallDelta(deltaTool(0, "", "", frag), accums, m)
+	}
+	if len(accums) != 1 {
+		t.Fatalf("got %d accums", len(accums))
+	}
+	if accums[0].ArgsStr != `{"path":"x.go"}` {
+		t.Fatalf("args = %q", accums[0].ArgsStr)
+	}
+	if !accums[0].argsFinalized {
+		t.Fatal("expected argsFinalized=true after complete JSON streamed")
+	}
+
+	// A subsequent replay fragment must keep the flag set (no re-validation).
+	before := accums[0].argsFinalized
+	accums, _ = mergeToolCallDelta(deltaTool(0, "", "", `{"path":"x.go"}`), accums, m)
+	// Replay is ignored by mergeToolArgsDelta, so the buffer is unchanged and
+	// the flag remains.
+	if !accums[0].argsFinalized || accums[0].argsFinalized != before {
+		t.Fatalf("replay should keep finalized flag set; got %v", accums[0].argsFinalized)
+	}
+
+	// toolAccumsStreamComplete should report true via the cached flag.
+	if !toolAccumsStreamComplete(accums) {
+		t.Fatal("expected toolAccumsStreamComplete true for finalized accumulator")
+	}
+}
+
+// TestBraceDepth covers the cheap structural pre-check used to decide when
+// the expensive json.Unmarshal validity check is worth running.
+func TestBraceDepth(t *testing.T) {
+	t.Parallel()
+	cases := map[string]int{
+		"":        0,
+		`{`:       1,
+		`}`:       -1,
+		`{}`:      0,
+		`{"a":1}`: 0,
+		`{"a":`:   1,
+		`{}}`:     -1,
+	}
+	for s, want := range cases {
+		if got := braceDepth(s); got != want {
+			t.Fatalf("braceDepth(%q) = %d, want %d", s, got, want)
+		}
+	}
+}

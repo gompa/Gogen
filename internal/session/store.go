@@ -35,6 +35,12 @@ type file struct {
 	TokenCounts    []int           `json:"tokenCounts,omitempty"`
 }
 
+// deltaFile holds messages appended since the last full snapshot save.
+type deltaFile struct {
+	Messages    []llm.Message `json:"messages"`
+	TokenCounts []int         `json:"tokenCounts,omitempty"`
+}
+
 // sessionIndexEntry is a lightweight entry in the session index file.
 type sessionIndexEntry struct {
 	ID           string    `json:"id"`
@@ -122,6 +128,14 @@ func (s *Store) path(workingDir, id string) string {
 	return filepath.Join(s.dir(workingDir), id+".json")
 }
 
+// deltaPath returns the path to the delta file for a session.
+func (s *Store) deltaPath(workingDir, id string) string {
+	if s != nil && s.globalDir != "" {
+		return filepath.Join(s.globalDir, id+".delta")
+	}
+	return filepath.Join(s.dir(workingDir), id+".delta")
+}
+
 // Save writes a session snapshot.
 func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 	if s == nil || !s.enabled || id == "" {
@@ -164,6 +178,9 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 		Oneshot:        snap.Oneshot,
 		TokenCounts:    snap.TokenCounts,
 	}
+	// Remove stale delta — the full snapshot supersedes it.
+	_ = s.clearDeltaFile(snap.WorkingDir, id)
+
 	data, err := json.Marshal(out)
 	if err != nil {
 		return err
@@ -226,6 +243,18 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 	if s != nil && !f.Created.IsZero() {
 		s.createdCache[id] = f.Created
 	}
+
+	// Merge any delta file (messages appended since last full snapshot).
+	snap, deltaErr := s.loadDelta(workingDir, id)
+	if deltaErr == nil && snap.Messages != nil {
+		f.Messages = append(f.Messages, snap.Messages...)
+		if len(snap.TokenCounts) > 0 {
+			f.TokenCounts = append(f.TokenCounts, snap.TokenCounts...)
+		}
+		// Delta consumed — remove it so we don't double-merge on next load.
+		_ = s.clearDeltaFile(workingDir, id)
+	}
+
 	return agent.SessionSnapshot{
 		WorkingDir:     f.WorkingDir,
 		Model:          f.Model,
@@ -237,6 +266,68 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 		Messages:       f.Messages,
 		TokenCounts:    f.TokenCounts,
 	}, nil
+}
+
+// AppendMessages writes new messages to the delta file for incremental saves.
+// The delta file is a lightweight JSON file that holds messages appended since
+// the last full snapshot. On restore, the delta is merged into the full snapshot.
+// This avoids rewriting the entire (potentially large) message list on every save.
+func (s *Store) AppendMessages(id string, snap agent.SessionSnapshot) error {
+	if s == nil || !s.enabled || id == "" {
+		return nil
+	}
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
+	dir := s.dir(snap.WorkingDir)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	path := s.deltaPath(snap.WorkingDir, id)
+	if err := ensureUnderSessionsDir(snap.WorkingDir, path, s.globalDir); err != nil {
+		return err
+	}
+
+	df := deltaFile{
+		Messages:    snap.Messages,
+		TokenCounts: snap.TokenCounts,
+	}
+	data, err := json.Marshal(df)
+	if err != nil {
+		return err
+	}
+	if err := writeFileAtomic(path, data, 0o600); err != nil {
+		return err
+	}
+
+	// Update the main file's mtime so the session appears recent in listings.
+	mainPath := s.path(snap.WorkingDir, id)
+	_ = os.Chtimes(mainPath, time.Now(), time.Now())
+
+	// Update index timestamp so the session appears recent in listings.
+	// The message count from the last full snapshot remains correct until
+	// the next full save overwrites it.
+	s.touchIndex(snap.WorkingDir, id, time.Now().UTC())
+	return nil
+}
+
+// loadDelta reads and returns the delta file for a session, if it exists.
+func (s *Store) loadDelta(workingDir, id string) (deltaFile, error) {
+	path := s.deltaPath(workingDir, id)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return deltaFile{}, err
+	}
+	var df deltaFile
+	if err := json.Unmarshal(data, &df); err != nil {
+		return deltaFile{}, err
+	}
+	return df, nil
+}
+
+// clearDeltaFile removes the delta file for a session.
+func (s *Store) clearDeltaFile(workingDir, id string) error {
+	return os.Remove(s.deltaPath(workingDir, id))
 }
 
 // List returns session info for a working directory, ordered by most recently

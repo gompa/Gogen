@@ -6,7 +6,6 @@ import (
 	"log"
 	"strings"
 
-	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
 )
 
@@ -66,11 +65,10 @@ func parseSessionCommand(input string) (cmd, args string) {
 // This is used when creating a new session or replacing a deleted current session.
 func (a *Agent) ResetSessionState() {
 	a.Messages = nil
-	// Wipe token-count cache entries — old content is gone and new
-	// conversations start from empty.
-	contextmgr.InvalidateTokenCache()
 	a.clearTurnUsage()
+	a.restoredTokenCounts = nil
 	a.UsageAccum = UsageAccumulator{}
+	a.resetSaveTracking()
 	a.clearViewDriftSnapshot()
 	a.SessionLabel = ""
 	a.SessionOneshot = false

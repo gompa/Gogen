@@ -39,19 +39,33 @@ var (
 	// toolCallBlockRegex matches <tool_call> ... </tool_call> blocks - using non-greedy but safe pattern
 	toolCallBlockRegex = regexp.MustCompile(`(?s)<tool_call>\s*(.*?)\s*</tool_call>`)
 
-	// toolCallJSONArgsRegex finds {"arguments": {...}} or {"input": {...}} - using non-greedy but safe pattern
-	toolCallJSONArgsRegex = regexp.MustCompile(`(?i)"arguments"\s*:\s*(\{[^{}]*\})|"input"\s*:\s*(\{[^{}]*\})`)
-
 	// toolInvokeBlockRegex matches full <invoke ...> ... </invoke> blocks (Anthropic-style)
 	toolInvokeBlockRegex = regexp.MustCompile(`(?s)<invoke\s[^>]*>.*?</invoke>`)
 )
+
+// byteRange is a [start, end) byte offset pair used to track tag locations.
+type byteRange struct{ start, end int }
 
 // extractToolCallsFromText scans text for embedded tool call patterns and returns them as ToolCall objects.
 func extractToolCallsFromText(text string) []ToolCall {
 	var toolCalls []ToolCall
 
 	// First, try to find <tool_call> ... </tool_call> blocks
+	// FindAllStringSubmatch for content extraction.
 	blockMatches := toolCallBlockRegex.FindAllStringSubmatch(text, -1)
+	// FindAllStringIndex for byte-range tracking (to skip nested <invoke>).
+	blockLocs := toolCallBlockRegex.FindAllStringIndex(text, -1)
+
+	// Track <tool_call> block byte ranges so we can skip <invoke>
+	// blocks that are already nested inside them.
+	toolCallRanges := make([]byteRange, 0, len(blockLocs))
+	for _, loc := range blockLocs {
+		toolCallRanges = append(toolCallRanges, byteRange{
+			start: loc[0],
+			end:   loc[1],
+		})
+	}
+
 	for _, match := range blockMatches {
 		if len(match) >= 2 {
 			blockContent := match[1]
@@ -61,8 +75,12 @@ func extractToolCallsFromText(text string) []ToolCall {
 	}
 
 	// Also try <invoke> blocks (Anthropic-style, may appear outside <tool_call>)
-	invokeMatches := toolInvokeBlockRegex.FindAllString(text, -1)
-	for _, fullMatch := range invokeMatches {
+	invokeLocs := toolInvokeBlockRegex.FindAllStringIndex(text, -1)
+	for _, loc := range invokeLocs {
+		if isInsideAnyByteRange(loc[0], loc[1], toolCallRanges) {
+			continue // already extracted as part of a <tool_call> block
+		}
+		fullMatch := text[loc[0]:loc[1]]
 		calls := extractToolCallsFromBlock(fullMatch)
 		toolCalls = append(toolCalls, calls...)
 	}
@@ -72,23 +90,9 @@ func extractToolCallsFromText(text string) []ToolCall {
 		matches := toolCallJSONNameRegex.FindAllStringIndex(text, -1)
 		seenEnd := make(map[int]struct{})
 		for _, match := range matches {
-			// match[0] is the start of the match, which is '{' in {"name": ...
-			startIdx := match[0]
-
-			// Find the nearest '{' at or before startIdx
-			objStart := -1
-			for i := startIdx; i >= 0; i-- {
-				if text[i] == '{' {
-					objStart = i
-					break
-				} else if text[i] == '"' {
-					// We hit a string quote without finding '{', stop looking back
-					break
-				}
-			}
-
+			// Locate the outermost '{' of the JSON object
+			objStart := findJSONObjStart(text, match[0])
 			if objStart >= 0 {
-				// Extract JSON object
 				jsonStr, endIdx := extractJSONObject(text, objStart)
 				if jsonStr != "" && endIdx > objStart {
 					if _, ok := seenEnd[endIdx]; ok {
@@ -105,6 +109,34 @@ func extractToolCallsFromText(text string) []ToolCall {
 	}
 
 	return toolCalls
+}
+
+// isInsideAnyByteRange reports whether byte range [start, end) falls entirely
+// within any of the given ranges.
+func isInsideAnyByteRange(start, end int, ranges []byteRange) bool {
+	for _, r := range ranges {
+		if start >= r.start && end <= r.end {
+			return true
+		}
+	}
+	return false
+}
+
+// findJSONObjStart scans backwards from idx to find the outermost '{' that
+// begins a JSON object, respecting string boundaries. Returns -1 if no
+// suitable '{' is found before hitting an unrelated quote character.
+func findJSONObjStart(text string, idx int) int {
+	for i := idx; i >= 0; i-- {
+		switch text[i] {
+		case '{':
+			return i
+		case '"':
+			// We hit a string boundary without finding '{' — can't
+			// reliably determine the object start from here.
+			return -1
+		}
+	}
+	return -1
 }
 
 // extractToolCallsFromBlock extracts tool calls from a <tool_call> ... </tool_call> block content
@@ -225,14 +257,13 @@ func extractXMLToolCall(blockContent string) (string, map[string]interface{}, st
 				}
 
 				// Try JSON arguments in the block content
-				argsMatches := toolCallJSONArgsRegex.FindStringSubmatch(blockContent)
-				if len(argsMatches) >= 2 {
-					var argsJSON string
-					if argsMatches[1] != "" {
-						argsJSON = argsMatches[1]
-					} else if argsMatches[2] != "" {
-						argsJSON = argsMatches[2]
-					}
+				// Use brace-counting to handle nested JSON objects,
+				// unlike the flat regex which only matches \{[^{}]*\}.
+				argsJSON := extractJSONArgValue(blockContent, "arguments")
+				if argsJSON == "" {
+					argsJSON = extractJSONArgValue(blockContent, "input")
+				}
+				if argsJSON != "" {
 					var parsedArgs map[string]interface{}
 					if err := json.Unmarshal([]byte(argsJSON), &parsedArgs); err == nil {
 						return toolName, parsedArgs, argsJSON
@@ -248,6 +279,35 @@ func extractXMLToolCall(blockContent string) (string, map[string]interface{}, st
 	}
 
 	return "", nil, ""
+}
+
+// extractJSONArgValue finds a JSON object value for the given key in blockContent.
+// It scans for `"key":` then uses brace-counting (extractJSONObject) to pull out
+// the full JSON value, supporting nested objects. Returns empty string if not found.
+func extractJSONArgValue(blockContent, key string) string {
+	// Find the key in the content
+	search := `"` + key + `"`
+	idx := strings.Index(blockContent, search)
+	if idx < 0 {
+		return ""
+	}
+	// Advance past the key and colon
+	rest := blockContent[idx+len(search):]
+	colonIdx := strings.Index(rest, ":")
+	if colonIdx < 0 {
+		return ""
+	}
+	rest = rest[colonIdx+1:]
+	// Skip whitespace
+	rest = strings.TrimLeft(rest, " \t\r\n")
+	if len(rest) == 0 || rest[0] != '{' {
+		return ""
+	}
+	jsonStr, _ := extractJSONObject(rest, 0)
+	if jsonStr == "" {
+		return ""
+	}
+	return jsonStr
 }
 
 // parseParamContent parses the content of a <parameters> tag, trying JSON first.
@@ -407,13 +467,9 @@ func parseToolCallFromJSONString(jsonStr string) []ToolCall {
 	}
 
 	// Create ToolCall
-	toolCall := ToolCall{
-		Index:   len(result),
-		ID:      "tc_extracted_" + strconv.Itoa(len(result)),
-		Name:    name,
-		Args:    argsMap,
-		ArgsStr: argsStr,
-	}
+	// Note: Index and ID are assigned by the caller (extractToolCallsFromBlock)
+	// to ensure they are unique within the full result set.
+	toolCall := ToolCall{Name: name, Args: argsMap, ArgsStr: argsStr}
 	result = append(result, toolCall)
 
 	return result

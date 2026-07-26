@@ -51,6 +51,26 @@ func gitPath() (string, bool) {
 	return cachedGitPath.path, cachedGitPath.ok
 }
 
+// trackedFilesCacheEntry caches the output of `git ls-files` for a directory.
+type trackedFilesCacheEntry struct {
+	paths map[string]struct{}
+	time  time.Time
+}
+
+var (
+	trackedFilesCache   = make(map[string]trackedFilesCacheEntry)
+	trackedFilesCacheMu sync.RWMutex
+)
+
+func invalidateTrackedCache(workingDir string) {
+	trackedFilesCacheMu.Lock()
+	delete(trackedFilesCache, workingDir)
+	trackedFilesCacheMu.Unlock()
+}
+
+// trackedFilesCacheTTL is how long we cache git ls-files output before refreshing.
+const trackedFilesCacheTTL = 2 * time.Second
+
 // globRegexCache caches compiled regexes for glob patterns containing **,
 // avoiding recompilation for every file during WalkDir. The cache lives for
 // the lifetime of the process. When the cache exceeds globRegexCacheMax
@@ -163,6 +183,16 @@ func filterTracked(workingDir string, paths []string) []string {
 	if !ok || len(paths) == 0 {
 		return paths
 	}
+
+	// Check TTL cache first.
+	trackedFilesCacheMu.RLock()
+	if ce, ok := trackedFilesCache[workingDir]; ok && time.Since(ce.time) < trackedFilesCacheTTL {
+		tracked := ce.paths
+		trackedFilesCacheMu.RUnlock()
+		return filterByTrackedSet(paths, tracked)
+	}
+	trackedFilesCacheMu.RUnlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, git, "ls-files", "--cached", "--others", "--exclude-standard")
@@ -178,7 +208,18 @@ func filterTracked(workingDir string, paths []string) []string {
 			tracked[filepath.ToSlash(line)] = struct{}{}
 		}
 	}
-	if len(tracked) == 0 {
+
+	// Store in cache.
+	trackedFilesCacheMu.Lock()
+	trackedFilesCache[workingDir] = trackedFilesCacheEntry{paths: tracked, time: time.Now()}
+	trackedFilesCacheMu.Unlock()
+
+	return filterByTrackedSet(paths, tracked)
+}
+
+// filterByTrackedSet filters paths to only those present in the tracked set.
+func filterByTrackedSet(paths []string, tracked map[string]struct{}) []string {
+	if len(tracked) == 0 || len(paths) == 0 {
 		return paths
 	}
 	filtered := make([]string, 0, len(paths))

@@ -55,6 +55,7 @@ func (e *Executor) GitStage(ctx context.Context, paths []string) (string, error)
 	if err != nil {
 		return "", gitError("add", text, err)
 	}
+	invalidateTrackedCache(e.GetWorkingDir())
 	return "Staged successfully", nil
 }
 
@@ -73,6 +74,7 @@ func (e *Executor) GitCommit(ctx context.Context, message string) (string, error
 		}
 		return text, gitError("commit", text, err)
 	}
+	invalidateTrackedCache(e.GetWorkingDir())
 	return text, nil
 }
 
@@ -90,6 +92,7 @@ func (e *Executor) GitBranch(ctx context.Context, name string, create bool) (str
 		if _, err := e.runGitCommand(ctx, []string{"switch", "-c", name}); err != nil {
 			return "", err
 		}
+		invalidateTrackedCache(e.GetWorkingDir())
 		return fmt.Sprintf("Created and switched to branch %q", name), nil
 	}
 
@@ -124,6 +127,7 @@ func (e *Executor) GitStash(ctx context.Context, message string, pop bool) (stri
 			}
 			return text, gitError("stash pop", text, err)
 		}
+		invalidateTrackedCache(e.GetWorkingDir())
 		return text, nil
 	}
 
@@ -140,6 +144,7 @@ func (e *Executor) GitStash(ctx context.Context, message string, pop bool) (stri
 		}
 		return text, gitError("stash", text, err)
 	}
+	invalidateTrackedCache(e.GetWorkingDir())
 	return text, nil
 }
 

@@ -174,8 +174,61 @@ func (m *Manager) Snapshot(canonical, llmView []llm.Message) ContextSnapshot {
 	compactAt := m.compactBudgetLocked()
 	m.mu.RUnlock()
 
-	used := m.EstimateTokens(llmView)
-	stored := m.EstimateTokens(canonical)
+	// Compute used once then derive stored, to avoid re-tokenizing the
+	// entire canonical run twice (llmView already contains canonical plus
+	// the system-prompt prefix). The system prefix is typically one message
+	// and cheap to tokenize separately.
+	canonicalTokens := m.EstimateTokens(canonical)
+	sysTokens := 0
+	if n := len(llmView) - len(canonical); n > 0 {
+		sysTokens = m.EstimateTokens(llmView[:n])
+	}
+	used := canonicalTokens + sysTokens
+	stored := canonicalTokens
+	snap := ContextSnapshot{
+		Limit:         limit,
+		Used:          used,
+		Stored:        stored,
+		CompactAt:     compactAt,
+		MessageCount:  len(canonical),
+		ToolTruncated: hasTruncatedToolResults(canonical),
+		NearCompact:   used >= compactAt,
+	}
+	if limit > 0 {
+		snap.Percent = float64(used) / float64(limit)
+	}
+	return snap
+}
+
+// SnapshotWithCounts is like Snapshot but uses pre-computed token counts for
+// the canonical messages, avoiding re-tokenization. The counts slice must
+// correspond 1:1 to canonical messages (not including system prompt). This
+// is significantly faster for large restored sessions where the token counts
+// were persisted alongside the messages.
+func (m *Manager) SnapshotWithCounts(canonical, llmView []llm.Message, canonicalCounts []int) ContextSnapshot {
+	m.mu.RLock()
+	limit := m.Settings.ContextLimit
+	if limit <= 0 {
+		limit = 128000
+	}
+	compactAt := m.compactBudgetLocked()
+	m.mu.RUnlock()
+
+	// Sum pre-computed counts for canonical messages.
+	stored := 0
+	for _, c := range canonicalCounts {
+		stored += c
+	}
+
+	// Estimate tokens for system prompt / enrichment messages (the prefix
+	// in llmView that is not part of canonical). This is typically 1 message
+	// and very cheap to tokenize compared to the full history.
+	sysTokens := 0
+	if n := len(llmView) - len(canonical); n > 0 {
+		sysTokens = m.EstimateTokens(llmView[:n])
+	}
+	used := stored + sysTokens
+
 	snap := ContextSnapshot{
 		Limit:         limit,
 		Used:          used,
@@ -214,8 +267,7 @@ func (m *Manager) compactBudgetLocked() int {
 }
 
 // ShouldCompact reports whether messages exceed the compaction threshold.
-// Relies on EstimateTokens' per-message fingerprint cache; do not stash a
-// sticky total here — it goes stale when messages are appended across turns.
+// EstimateTokens computes fresh each call — safe to call every turn.
 func (m *Manager) ShouldCompact(messages []llm.Message) bool {
 	m.mu.RLock()
 	keep := m.Settings.KeepRecentMessages
@@ -249,9 +301,6 @@ func (m *Manager) EnsureToolResultsCapped(messages []llm.Message) bool {
 		}
 		messages[i].Content = truncateToolResult(messages[i].Content, max)
 		changed = true
-	}
-	if changed {
-		InvalidateTokenCache()
 	}
 	return changed
 }

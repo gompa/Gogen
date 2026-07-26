@@ -439,7 +439,13 @@ func applyPatchHunks(original []string, hunks []patchHunk, fuzzy bool) ([]string
 				if start > len(out) {
 					start = len(out)
 				}
-				out = append(out[:start], append(append([]string(nil), h.newLines...), out[start:]...)...)
+				// Pre-allocate to avoid repeated slice growth.
+				newCap := len(out) + len(h.newLines)
+				newOut := make([]string, 0, newCap)
+				newOut = append(newOut, out[:start]...)
+				newOut = append(newOut, h.newLines...)
+				newOut = append(newOut, out[start:]...)
+				out = newOut
 				lineDelta += len(h.newLines)
 			}
 			continue
@@ -467,8 +473,14 @@ func applyPatchHunks(original []string, hunks []patchHunk, fuzzy bool) ([]string
 		}
 		start = matched
 		end := start + n
-		replacement := append([]string(nil), h.newLines...)
-		out = append(out[:start], append(replacement, out[end:]...)...)
+		// Pre-allocate output for this hunk: old[:start] + newLines + old[end:].
+		replacement := h.newLines
+		newCap := len(out) + len(replacement) - n
+		newOut := make([]string, 0, newCap)
+		newOut = append(newOut, out[:start]...)
+		newOut = append(newOut, replacement...)
+		newOut = append(newOut, out[end:]...)
+		out = newOut
 		lineDelta += len(replacement) - n
 	}
 	return out, nil

@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
 )
 
@@ -25,6 +24,7 @@ type SessionSnapshot struct {
 // SessionPersister stores and loads agent sessions.
 type SessionPersister interface {
 	Save(id string, snap SessionSnapshot) error
+	AppendMessages(id string, snap SessionSnapshot) error
 	LoadInWorkingDir(workingDir, id string) (SessionSnapshot, error)
 	List(workingDir string) ([]SessionInfo, error)
 	LatestID(workingDir string) (string, error)
@@ -77,6 +77,9 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 	}
 	a.clearTurnUsage()
 	a.UsageAccum = UsageAccumulator{}
+	// Reset save tracking — next doPersist will write a full snapshot that
+	// merges any existing delta file from a previous process lifetime.
+	a.resetSaveTracking()
 	a.SessionLabel = snap.Label
 	a.SessionOneshot = snap.Oneshot
 	if m, ok := ParseMode(snap.Mode); ok {
@@ -86,9 +89,16 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 		_ = a.Provider.SetModel(snap.Model)
 	}
 
-	// Pre-warm the token cache with pre-computed counts from the snapshot.
-	if len(snap.TokenCounts) == len(a.Messages) {
-		contextmgr.WarmTokenCache(a.Messages, snap.TokenCounts)
+	// Pre-warm the token-count cache from the snapshot so subsequent
+	// ContextStats calls can avoid re-tokenizing every message (expensive
+	// for large sessions). Cleared when messages are modified (append,
+	// compaction, session reset).
+	a.restoredTokenCounts = snap.TokenCounts
+
+	// Snapshot messages were persisted with stable ArgsStr, so mark them
+	// as stabilized to avoid re-serializing on the next turn.
+	for i := range a.Messages {
+		a.Messages[i].ArgsStabilized = true
 	}
 
 	a.compareViewOnRestore(prevSessionID, newSessionID)

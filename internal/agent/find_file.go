@@ -68,9 +68,6 @@ func (e *Executor) FindFile(name string, subpath string, limit int) (string, err
 	}
 
 	sort.Strings(matches)
-	if len(matches) > limit {
-		matches = matches[:limit]
-	}
 
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("Files matching %q:\n", name))

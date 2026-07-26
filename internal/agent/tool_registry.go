@@ -560,13 +560,13 @@ func handleExtractFunction(ctx context.Context, a *Agent, args map[string]interf
 	if err != nil {
 		return "", err
 	}
-	startLine, err := intArgOptional(args, "start_line")
-	if err != nil || startLine == 0 {
-		return "", fmt.Errorf("missing required argument %q", "start_line")
+	startLine, err := intArg(args, "start_line")
+	if err != nil {
+		return "", err
 	}
-	endLine, err := intArgOptional(args, "end_line")
-	if err != nil || endLine == 0 {
-		return "", fmt.Errorf("missing required argument %q", "end_line")
+	endLine, err := intArg(args, "end_line")
+	if err != nil {
+		return "", err
 	}
 	funcName, err := stringArg(args, "func_name")
 	if err != nil {
@@ -581,8 +581,14 @@ func handleGenerateTest(ctx context.Context, a *Agent, args map[string]interface
 		return "", err
 	}
 	file, _ := stringArgOptional(args, "file")
-	styleStr, _ := stringArgOptional(args, "style")
-	style := TestStyle(styleStr)
+	style := TestStyleSubtests
+	if styleStr, err := stringArgOptional(args, "style"); err != nil {
+		return "", err
+	} else if styleStr != "" && TestStyle(styleStr) != TestStyleTableDriven && TestStyle(styleStr) != TestStyleSubtests {
+		return "", fmt.Errorf("invalid style %q: must be %q or %q", styleStr, TestStyleTableDriven, TestStyleSubtests)
+	} else if styleStr != "" {
+		style = TestStyle(styleStr)
+	}
 	if style == "" {
 		style = TestStyleSubtests
 	}

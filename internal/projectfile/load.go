@@ -2,8 +2,8 @@ package projectfile
 
 import (
 	"os"
-	"strings"
 	"path/filepath"
+	"strings"
 
 	"gogen/internal/config"
 )

@@ -2,7 +2,6 @@ package contextmgr
 
 import (
 	"fmt"
-	"hash/fnv"
 	"sort"
 	"sync"
 
@@ -24,121 +23,24 @@ func getCodec() (tokenizer.Codec, error) {
 	return codec, encErr
 }
 
-type tokenCacheEntry struct {
-	n int
-}
-
-// tokenCache caches token counts by content fingerprint to avoid
-// re-tokenizing the same messages across multiple calls to EstimateTokens.
-// Keying by fingerprint (instead of pointer) means copies of the same
-// message — e.g. from ContextStats' defensive copy — hit the cache.
-//
-// The fingerprint is a 64-bit FNV-1a hash. A collision (two distinct message
-// bodies hashing identically) would let a stale count be served silently.
-// With the ~birthday bound at 2^32 messages
-// (far beyond any real session) and the cache only gating an *estimate* used
-// to decide compaction timing — never correctness of tool output — this trade
-// is acceptable. If the cache ever gated a correctness-critical decision,
-// switch to a 128-bit hash (crypto/sha128 or hash/maphash with a per-process
-// seed) for defense-in-depth.
-//
-// Memory for entries of compacted/removed messages persists until
-// InvalidateTokenCache is called. That is intentional and fine: the map
-// is bounded by session size and entry counts are correct for their key.
-var tokenCache struct {
-	sync.RWMutex
-	m map[uint64]tokenCacheEntry
-}
-
-// initTokenCache lazily initializes the token cache map.
-func initTokenCache() {
-	tokenCache.Lock()
-	defer tokenCache.Unlock()
-	if tokenCache.m == nil {
-		tokenCache.m = make(map[uint64]tokenCacheEntry)
-	}
-}
-
-// cachedTokenCount returns the cached token count for a message when the
-// fingerprint still matches.
-func cachedTokenCount(msg *llm.Message) (int, bool) {
-	fp := messageFingerprint(msg)
-	tokenCache.RLock()
-	defer tokenCache.RUnlock()
-	if tokenCache.m == nil {
-		return 0, false
-	}
-	e, ok := tokenCache.m[fp]
-	if !ok {
-		return 0, false
-	}
-	return e.n, true
-}
-
-// storeTokenCount caches the token count for a message.
-func storeTokenCount(msg *llm.Message, n int) {
-	initTokenCache()
-	fp := messageFingerprint(msg)
-	tokenCache.Lock()
-	tokenCache.m[fp] = tokenCacheEntry{n: n}
-	tokenCache.Unlock()
-}
-
-// InvalidateTokenCache clears all cached entries. Call this when the message
-// list is compacted, restored, or otherwise reassigned. Per-message content
-// mutations are caught by the fingerprint check inside cachedTokenCount, so
-// appending a new message to the slice does NOT require invalidation: the
-// existing entries' fingerprints still match.
-func InvalidateTokenCache() {
-	tokenCache.Lock()
-	tokenCache.m = nil
-	tokenCache.Unlock()
-}
-
-// TokenCounts returns per-message token counts for the given messages,
-// computing and caching any that are not already in the cache.
+// TokenCounts returns per-message token counts for the given messages.
+// Token counts are computed fresh each time; the cl100k_base tokenizer
+// is fast enough that a global cache added more complexity than value.
 func (m *Manager) TokenCounts(messages []llm.Message) []int {
 	if len(messages) == 0 {
 		return nil
 	}
 	counts := make([]int, len(messages))
 	for i := range messages {
-		if n, ok := cachedTokenCount(&messages[i]); ok {
-			counts[i] = n
-		} else {
-			n := computeMessageTokens(messages[i])
-			storeTokenCount(&messages[i], n)
-			counts[i] = n
-		}
+		counts[i] = computeMessageTokens(messages[i])
 	}
 	return counts
 }
 
 // ComputeMessageTokens returns the estimated token count for a single message
-// using the cl100k_base tokenizer when available, falling back to a bytes/4
-// heuristic. The result is NOT cached — callers that want caching should use
-// Manager.EstimateTokens instead.
+// using the cl100k_base tokenizer when available, falling back to a bytes/4 heuristic.
 func ComputeMessageTokens(msg llm.Message) int {
 	return computeMessageTokens(msg)
-}
-
-// WarmTokenCache pre-populates the token count cache for a slice of messages.
-// The counts slice must have the same length as msgs. Panics on mismatch.
-func WarmTokenCache(msgs []llm.Message, counts []int) {
-	for i := range msgs {
-		storeTokenCount(&msgs[i], counts[i])
-	}
-}
-
-// TokenCacheSize reports the number of cached token-count entries.
-// Intended for tests; production callers should not depend on cache size.
-func TokenCacheSize() int {
-	tokenCache.RLock()
-	defer tokenCache.RUnlock()
-	if tokenCache.m == nil {
-		return 0
-	}
-	return len(tokenCache.m)
 }
 
 func sortedToolArgKeys(args map[string]interface{}) []string {
@@ -150,52 +52,13 @@ func sortedToolArgKeys(args map[string]interface{}) []string {
 	return keys
 }
 
-func messageFingerprint(msg *llm.Message) uint64 {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(msg.Role))
-	_, _ = h.Write([]byte{0})
-	_, _ = h.Write([]byte(msg.Content))
-	_, _ = h.Write([]byte{0})
-	_, _ = h.Write([]byte(msg.Reasoning))
-	_, _ = h.Write([]byte{0})
-	_, _ = h.Write([]byte(msg.Refusal))
-	_, _ = h.Write([]byte{0})
-	_, _ = h.Write([]byte(msg.ToolCallID))
-	for _, tc := range msg.ToolCalls {
-		_, _ = h.Write([]byte{0})
-		_, _ = h.Write([]byte(tc.ID))
-		_, _ = h.Write([]byte{0})
-		_, _ = h.Write([]byte(tc.Name))
-		_, _ = h.Write([]byte{0})
-		if tc.ArgsStr != "" {
-			_, _ = h.Write([]byte(tc.ArgsStr))
-		} else {
-			for _, k := range sortedToolArgKeys(tc.Args) {
-				v := tc.Args[k]
-				_, _ = h.Write([]byte(k))
-				_, _ = h.Write([]byte{0})
-				_, _ = h.Write([]byte(fmt.Sprint(v)))
-				_, _ = h.Write([]byte{0})
-			}
-		}
-	}
-	return h.Sum64()
-}
-
 // EstimateTokens approximates token count for a message list using cl100k_base
 // (GPT-family). Falls back to a bytes/4 heuristic if the tokenizer is unavailable.
-// Results are cached by message pointer (with fingerprint validation) to avoid
-// re-tokenizing within a turn.
+// No caching; the tokenizer is fast enough for on-demand use.
 func (m *Manager) EstimateTokens(messages []llm.Message) int {
 	total := 0
 	for i := range messages {
-		if n, ok := cachedTokenCount(&messages[i]); ok {
-			total += n
-		} else {
-			n := computeMessageTokens(messages[i])
-			storeTokenCount(&messages[i], n)
-			total += n
-		}
+		total += computeMessageTokens(messages[i])
 	}
 	return total
 }

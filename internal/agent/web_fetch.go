@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 const (
@@ -27,6 +29,16 @@ var fetchPrivateRE = regexp.MustCompile(`^127\.|^10\.|^172\.(1[6-9]|2[0-9]|3[01]
 // webCfg holds all runtime web fetch/search configuration behind a single mutex.
 var webCfg webCfgState
 
+// envDefaults caches env-var lookups once at first access to avoid per-call syscalls.
+var envDefaults struct {
+	fetchOn       bool
+	fetchOnOnce   sync.Once
+	searchOn      bool
+	searchOnOnce  sync.Once
+	fetchMode     string
+	fetchModeOnce sync.Once
+}
+
 type webCfgState struct {
 	mu            sync.RWMutex
 	fetchOn       *bool    // nil until configured
@@ -37,10 +49,34 @@ type webCfgState struct {
 	searchAPIKey  string
 }
 
-// checkEnvToggle checks if an environment variable is set to "on", "1", or "true".
-func checkEnvToggle(envVar string) bool {
-	raw := strings.TrimSpace(os.Getenv(envVar))
-	return strings.EqualFold(raw, "on") || strings.EqualFold(raw, "1") || strings.EqualFold(raw, "true")
+// envFetchOn returns whether GOGEN_WEB_FETCH is enabled. Cached after first read.
+func envFetchOn() bool {
+	envDefaults.fetchOnOnce.Do(func() {
+		raw := strings.TrimSpace(os.Getenv("GOGEN_WEB_FETCH"))
+		envDefaults.fetchOn = strings.EqualFold(raw, "on") || strings.EqualFold(raw, "1") || strings.EqualFold(raw, "true")
+	})
+	return envDefaults.fetchOn
+}
+
+// envSearchOn returns whether GOGEN_WEB_SEARCH is enabled. Cached after first read.
+func envSearchOn() bool {
+	envDefaults.searchOnOnce.Do(func() {
+		raw := strings.TrimSpace(os.Getenv("GOGEN_WEB_SEARCH"))
+		envDefaults.searchOn = strings.EqualFold(raw, "on") || strings.EqualFold(raw, "1") || strings.EqualFold(raw, "true")
+	})
+	return envDefaults.searchOn
+}
+
+// envFetchMode returns the web fetch mode from env. Cached after first read.
+func envFetchMode() string {
+	envDefaults.fetchModeOnce.Do(func() {
+		mode := strings.ToLower(strings.TrimSpace(os.Getenv("GOGEN_WEB_FETCH_MODE")))
+		if mode == "" {
+			mode = "https"
+		}
+		envDefaults.fetchMode = mode
+	})
+	return envDefaults.fetchMode
 }
 
 func (c *webCfgState) isFetchOn() bool {
@@ -51,7 +87,7 @@ func (c *webCfgState) isFetchOn() bool {
 		return v
 	}
 	c.mu.RUnlock()
-	return checkEnvToggle("GOGEN_WEB_FETCH")
+	return envFetchOn()
 }
 
 func (c *webCfgState) isSearchOn() bool {
@@ -62,7 +98,7 @@ func (c *webCfgState) isSearchOn() bool {
 		return v
 	}
 	c.mu.RUnlock()
-	return checkEnvToggle("GOGEN_WEB_SEARCH")
+	return envSearchOn()
 }
 
 func (c *webCfgState) mode() string {
@@ -73,11 +109,7 @@ func (c *webCfgState) mode() string {
 		return m
 	}
 	c.mu.RUnlock()
-	mode := strings.ToLower(strings.TrimSpace(os.Getenv("GOGEN_WEB_FETCH_MODE")))
-	if mode == "" {
-		mode = "https"
-	}
-	return mode
+	return envFetchMode()
 }
 
 func (c *webCfgState) allowedDomains() []string {
@@ -88,19 +120,30 @@ func (c *webCfgState) allowedDomains() []string {
 		return d
 	}
 	c.mu.RUnlock()
-	raw := strings.TrimSpace(os.Getenv("GOGEN_WEB_ALLOWED_DOMAINS"))
-	if raw == "" {
-		return nil
-	}
-	parts := strings.Split(raw, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(strings.ToLower(p))
-		if p != "" {
-			out = append(out, p)
+	return envAllowedDomains()
+}
+
+// envAllowedDomains parses and caches GOGEN_WEB_ALLOWED_DOMAINS from env.
+var envAllowedDomainsVal []string
+var envAllowedDomainsOnce sync.Once
+
+func envAllowedDomains() []string {
+	envAllowedDomainsOnce.Do(func() {
+		raw := strings.TrimSpace(os.Getenv("GOGEN_WEB_ALLOWED_DOMAINS"))
+		if raw == "" {
+			return
 		}
-	}
-	return out
+		parts := strings.Split(raw, ",")
+		out := make([]string, 0, len(parts))
+		for _, p := range parts {
+			p = strings.TrimSpace(strings.ToLower(p))
+			if p != "" {
+				out = append(out, p)
+			}
+		}
+		envAllowedDomainsVal = out
+	})
+	return envAllowedDomainsVal
 }
 
 func (c *webCfgState) searchBE() string {
@@ -159,11 +202,17 @@ func ConfigureWebSearch(backend, apiKey string) {
 // sharedFetchClient is reused across requests for connection pooling.
 // CheckRedirect enforces max redirects, loop detection, and private-host blocking.
 var sharedFetchClient = &http.Client{
-	Transport: &http.Transport{
-		MaxIdleConns:    10,
-		IdleConnTimeout: 90 * time.Second,
-		DialContext:     dialContextPublicOnly,
-	},
+	Transport: func() *http.Transport {
+		tr := &http.Transport{
+			MaxIdleConns:    10,
+			IdleConnTimeout: 90 * time.Second,
+			DialContext:     dialContextPublicOnly,
+		}
+		if err := http2.ConfigureTransport(tr); err != nil {
+			panic(fmt.Sprintf("http2: %v", err))
+		}
+		return tr
+	}(),
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if len(via) >= webFetchMaxRedirects {
 			return fmt.Errorf("too many redirects")

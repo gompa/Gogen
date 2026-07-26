@@ -102,4 +102,9 @@ type Message struct {
 	ToolCalls  []ToolCall // set on assistant messages that invoke tools
 	ToolCallID string     // set on tool result messages
 	CreatedAt  time.Time  `json:"createdAt,omitempty"` // when the message was created (UTC), zero when not set
+
+	// ArgsStabilized is true when ToolCalls[j].Args has been marshalled
+	// into ArgsStr. Used to avoid re-stabilizing every message on every
+	// turn. Not serialized — restored messages start as stabilized.
+	ArgsStabilized bool `json:"-"`
 }

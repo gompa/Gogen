@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -106,12 +107,15 @@ func (e *Executor) ReadFileRange(path string, offset, limit int, search string, 
 	}
 	if info.Mode().IsRegular() && info.Size() > 0 {
 		// Binary check: read up to 512 bytes, sniff for NUL, close.
-		// Use defer for safety against future edits; Close is idempotent.
 		if f, err := os.Open(secure); err == nil {
 			head := make([]byte, 512)
-			n, _ := f.Read(head)
-			_ = f.Close()
-			if n > 0 && isBinary(head[:n]) {
+			n, readErr := f.Read(head)
+			f.Close()
+			// If Read returned no data due to an error, skip the binary
+			// check; the subsequent ReadFile will surface the real error.
+			if readErr != nil && n == 0 {
+				// Fall through to file reading below.
+			} else if n > 0 && bytes.IndexByte(head[:n], 0) >= 0 {
 				return "", fmt.Errorf("this is a binary file (%s). Use read_file with offset/limit on text files only, or use execute_command to inspect binary content", formatByteSize(info.Size()))
 			}
 		}
@@ -122,42 +126,12 @@ func (e *Executor) ReadFileRange(path string, offset, limit int, search string, 
 		fmt.Fprintf(&header, "Warning: file is %s (%d bytes). Use offset/limit to read in chunks.\n", formatByteSize(info.Size()), info.Size())
 	}
 
-	// When search is set, read all lines, find the first match, and
-	// return a window around it.
+	// When search is set, scan incrementally with a ring buffer for
+	// context before the match. This avoids storing all lines in memory.
 	if search != "" {
-		f, err := os.Open(secure)
-		if err != nil {
-			return "", err
-		}
-		defer f.Close()
-		sc := bufio.NewScanner(f)
-		sc.Buffer(make([]byte, 64*1024), 10*1024*1024)
-		var allLines []string
-		for sc.Scan() {
-			allLines = append(allLines, sc.Text())
-			if len(allLines) >= readFileMaxLines {
-				break
-			}
-		}
-		if err := sc.Err(); err != nil {
-			return "", err
-		}
-		if len(allLines) == 0 {
-			return "File is empty", nil
-		}
 		re, err := regexp.Compile(search)
 		if err != nil {
 			return "", fmt.Errorf("invalid search pattern: %w", err)
-		}
-		matchLine := 0
-		for i, line := range allLines {
-			if re.MatchString(line) {
-				matchLine = i + 1
-				break
-			}
-		}
-		if matchLine == 0 {
-			return "", fmt.Errorf("pattern %q not found in file (%d lines)", search, len(allLines))
 		}
 		ctx := 10
 		if limit > 0 {
@@ -166,29 +140,90 @@ func (e *Executor) ReadFileRange(path string, offset, limit int, search string, 
 		if offset > 0 {
 			ctx = offset
 		}
-		start := matchLine - ctx
-		if start < 1 {
-			start = 1
+		if ctx < 1 {
+			ctx = 1
 		}
-		end := matchLine + ctx
-		if limit > 0 {
-			end = start + limit - 1
+
+		f, err := os.Open(secure)
+		if err != nil {
+			return "", err
 		}
-		if end > len(allLines) {
-			end = len(allLines)
+		defer f.Close()
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 64*1024), 10*1024*1024)
+
+		// Ring buffer for context lines before the match.
+		ring := make([]string, ctx)
+		ringPos := 0
+		ringFull := false
+		lineNum := 0
+		matchLine := 0
+
+		for sc.Scan() {
+			lineNum++
+			line := sc.Text()
+			if re.MatchString(line) {
+				matchLine = lineNum
+				// Collect context before the match from the ring buffer.
+				var before []string
+				if ringFull {
+					before = append(ring[ringPos:], ring[:ringPos]...)
+				} else if ringPos > 0 {
+					before = ring[:ringPos]
+				}
+				// Collect context after the match: the current line + up to ctx more.
+				after := []string{line}
+				for sc.Scan() {
+					lineNum++
+					after = append(after, sc.Text())
+					if len(after) >= ctx+1 {
+						break
+					}
+				}
+				// Count remaining lines in the file for accurate total.
+				for sc.Scan() {
+					lineNum++
+				}
+				if err := sc.Err(); err != nil {
+					return "", err
+				}
+				totalLines := lineNum
+
+				selected := append(before, after...)
+				startLine := matchLine - len(before)
+				if startLine < 1 {
+					startLine = 1
+				}
+				body := strings.Join(selected, "\n")
+				if lineNumbers {
+					body = formatWithLineNumbers(selected, startLine)
+				}
+
+				out := fmt.Sprintf("Lines %d-%d of %d (matched %q at line %d)\n%s",
+					startLine, startLine+len(selected)-1, totalLines, search, matchLine,
+					body)
+				if header.Len() > 0 {
+					out = header.String() + out
+				}
+				return out, nil
+			}
+			// Store line in ring buffer.
+			ring[ringPos] = line
+			ringPos = (ringPos + 1) % ctx
+			if ringPos == 0 {
+				ringFull = true
+			}
+			if lineNum >= readFileMaxLines {
+				break
+			}
 		}
-		selected := allLines[start-1 : end]
-		body := strings.Join(selected, "\n")
-		if lineNumbers {
-			body = formatWithLineNumbers(selected, start)
+		if err := sc.Err(); err != nil {
+			return "", err
 		}
-		out := fmt.Sprintf("Lines %d-%d of %d (matched %q at line %d)\n%s",
-			start, end, len(allLines), search, matchLine,
-			body)
-		if header.Len() > 0 {
-			out = header.String() + out
+		if lineNum == 0 {
+			return "File is empty", nil
 		}
-		return out, nil
+		return "", fmt.Errorf("pattern %q not found in file (%d lines)", search, lineNum)
 	}
 
 	start := 1
@@ -303,7 +338,7 @@ func (e *Executor) newGitCmd(ctx context.Context, args ...string) (*exec.Cmd, er
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if _, err := exec.LookPath("git"); err != nil {
+	if _, ok := gitPath(); !ok {
 		return nil, fmt.Errorf("git is not available on PATH")
 	}
 	cmd := exec.CommandContext(ctx, "git", args...)
@@ -438,13 +473,4 @@ func (e *Executor) ReplaceInFile(path string, search string, replace string, rep
 	}
 	msg := "File updated successfully (1 occurrence replaced)"
 	return e.AppendSyntaxCheck(msg, path), nil
-}
-
-func isBinary(data []byte) bool {
-	for _, b := range data {
-		if b == 0 {
-			return true
-		}
-	}
-	return false
 }

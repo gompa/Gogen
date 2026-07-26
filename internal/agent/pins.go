@@ -106,7 +106,7 @@ func (p *PinManager) ReplacePins(pins map[int]struct{}) {
 
 // MergePinsWithTail returns the set of indices that must be kept in the tail
 // during compaction (merged with the normal keep-recent range).
-func (p *PinManager) MergePinsWithTail(tailStart int, keepRecent int) int {
+func (p *PinManager) MergePinsWithTail(tailStart int) int {
 	if p == nil || len(p.pinned) == 0 {
 		return tailStart
 	}
@@ -115,6 +115,5 @@ func (p *PinManager) MergePinsWithTail(tailStart int, keepRecent int) int {
 			tailStart = idx
 		}
 	}
-	_ = keepRecent
 	return tailStart
 }

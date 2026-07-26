@@ -9,6 +9,9 @@ import (
 	"gogen/internal/treesitter"
 )
 
+// callSiteRE matches an identifier followed by optional whitespace and an opening parenthesis.
+var callSiteRE = regexp.MustCompile(`\b([a-zA-Z_]\w*)\s*\(`)
+
 type CallGraphResult struct {
 	Symbol  string
 	Callers []FunctionRef
@@ -172,7 +175,7 @@ func (e *Executor) callGraphWithText(ctx context.Context, searchRoot, relPrefix,
 
 	// Search for the function definition and extract callees from its body.
 	defPattern := `(?:func|def|function)\s+` + regexp.QuoteMeta(symbol) + `\s*\(`
-	_ = e.walkSymbolReferencesText(ctx, searchRoot, relPrefix, glob, defPattern,
+	if err := e.walkSymbolReferencesText(ctx, searchRoot, relPrefix, glob, defPattern,
 		func(filePath string, lineNum int, line string) error {
 			// Found the definition at lineNum. Extract callees from the definition line
 			// and surrounding context. We use a best-effort approach here since we
@@ -186,7 +189,9 @@ func (e *Executor) callGraphWithText(ctx context.Context, searchRoot, relPrefix,
 				})
 			}
 			return nil
-		})
+		}); err != nil {
+		return nil, err
+	}
 
 	// Deduplicate results
 	result.Callers = dedupeFunctionRefs(result.Callers)
@@ -246,7 +251,7 @@ func extractCallsFromLines(lines []string, start, end int, symbol string) []stri
 	seen := make(map[string]bool)
 	var callees []string
 
-	callRe := regexp.MustCompile(`\b([a-zA-Z_]\w*)\s*\(`)
+	callRe := callSiteRE
 	for i := start - 1; i < end && i < len(lines); i++ {
 		line := lines[i]
 		matches := callRe.FindAllStringSubmatch(line, -1)
@@ -273,7 +278,7 @@ func extractCalleesFromLine(line, symbol string) []string {
 	seen := make(map[string]bool)
 	var callees []string
 
-	callRe := regexp.MustCompile(`\b([a-zA-Z_]\w*)\s*\(`)
+	callRe := callSiteRE
 	matches := callRe.FindAllStringSubmatch(line, -1)
 	for _, m := range matches {
 		if len(m) < 2 {

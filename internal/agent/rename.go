@@ -91,23 +91,22 @@ func (e *Executor) renameWithAST(ctx context.Context, searchRoot, relPrefix, glo
 
 		// Apply renames
 		re := regexp.MustCompile(`\b` + regexp.QuoteMeta(oldName) + `\b`)
-		newContent := string(content)
+		lines := strings.Split(string(content), "\n")
 		var linesChanged []int
 
 		for _, ref := range refs {
 			// Replace the symbol at the exact line
-			lines := strings.Split(newContent, "\n")
 			if ref.Line-1 < len(lines) {
 				oldLine := lines[ref.Line-1]
 				// Use word-boundary replacement (re compiled above)
 				lines[ref.Line-1] = re.ReplaceAllString(oldLine, newName)
-				newContent = strings.Join(lines, "\n")
 				linesChanged = append(linesChanged, ref.Line)
 			}
 		}
 
+		newContent := strings.Join(lines, "\n")
 		if !dryRun {
-			if err := os.WriteFile(path, []byte(newContent), 0o644); err != nil {
+			if err := writeFileAtomic(path, []byte(newContent), 0o644); err != nil {
 				return err
 			}
 		}
@@ -165,7 +164,7 @@ func (e *Executor) renameWithText(ctx context.Context, searchRoot, relPrefix, gl
 		newContent := re.ReplaceAll(content, []byte(newName))
 
 		if !dryRun {
-			if err := os.WriteFile(path, newContent, 0o644); err != nil {
+			if err := writeFileAtomic(path, newContent, 0o644); err != nil {
 				return err
 			}
 		}

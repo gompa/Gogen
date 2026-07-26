@@ -84,7 +84,12 @@ func (l *ipLimiter) allow(ip string) bool {
 		l.limiters[ip] = lim
 		// Opportunistic prune to avoid unbounded growth.
 		if len(l.limiters) > 10_000 {
-			l.limiters = map[string]*rate.Limiter{ip: lim}
+			// Evict one random entry instead of clearing the whole map,
+			// so existing rate limit state for other IPs is preserved.
+			for oldIP := range l.limiters {
+				delete(l.limiters, oldIP)
+				break
+			}
 		}
 	}
 	return lim.Allow()
