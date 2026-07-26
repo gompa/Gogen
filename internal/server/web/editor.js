@@ -712,6 +712,10 @@ async function openFile(path, line) {
     editor.setPosition({ lineNumber: line, column: 1 });
     editor.focus();
   }
+  // Optional: switch to Editor pane when opening a file from chat
+  if (localStorage.getItem('gogen_file_click_behavior') === 'open-switch') {
+    switchToEditorPane();
+  }
 }
 
 export async function openFileAtLine(path, line) {

@@ -1382,6 +1382,15 @@
                     </select>
                 </div>
             </div>
+            <div class="setting-row">
+                <div>
+                    <label>Click file in chat</label>
+                    <select id="file-click-behavior" aria-label="File click behavior">
+                        <option value="open">Open (background)</option>
+                        <option value="open-switch">Open &amp; switch to editor</option>
+                    </select>
+                </div>
+            </div>
         </div>
     </div>
     <div id="command-palette-overlay" aria-hidden="true">
@@ -3407,6 +3416,21 @@
 
         themeSelect.addEventListener('change', () => {
             applyTheme(themeSelect.value);
+        });
+
+        // === File-click behavior: persist and apply ===
+        const fileClickSelect = document.getElementById('file-click-behavior');
+        const savedFileClick = localStorage.getItem('gogen_file_click_behavior') || 'open';
+        fileClickSelect.value = savedFileClick;
+        fileClickSelect.addEventListener('change', () => {
+            localStorage.setItem('gogen_file_click_behavior', fileClickSelect.value);
+        });
+        // Listen for storage changes from other tabs
+        window.addEventListener('storage', (e) => {
+            if (e.key === 'gogen_file_click_behavior') {
+                const val = e.newValue || 'open';
+                if (fileClickSelect.value !== val) fileClickSelect.value = val;
+            }
         });
 
         setTurnActive(false);
