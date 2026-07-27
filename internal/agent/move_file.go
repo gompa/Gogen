@@ -3,31 +3,12 @@ package agent
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 )
 
 // MoveFile renames or moves a file within the working directory.
 func (e *Executor) MoveFile(src, dst string) (string, error) {
-	srcSecure, err := e.SecurePath(src)
+	srcSecure, dstSecure, err := e.validateFileOp(src, dst)
 	if err != nil {
-		return "", err
-	}
-	dstSecure, err := e.SecurePath(dst)
-	if err != nil {
-		return "", err
-	}
-
-	info, err := os.Lstat(srcSecure)
-	if err != nil {
-		return "", err
-	}
-	if info.IsDir() {
-		return "", fmt.Errorf("source is a directory; move_file only moves files")
-	}
-
-	// Ensure destination directory exists.
-	dstDir := filepath.Dir(dstSecure)
-	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		return "", err
 	}
 

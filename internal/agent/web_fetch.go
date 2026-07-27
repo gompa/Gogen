@@ -32,13 +32,12 @@ var webCfg webCfgState
 // envDefaults caches env-var lookups once at first access to avoid per-call syscalls.
 var envDefaults struct {
 	fetchOn       bool
-	fetchOnOnce   sync.Once
 	searchOn      bool
-	searchOnOnce  sync.Once
 	fetchMode     string
 	fetchModeOnce sync.Once
 }
 
+// webCfgState holds all runtime web fetch/search configuration behind a single mutex.
 type webCfgState struct {
 	mu            sync.RWMutex
 	fetchOn       *bool    // nil until configured
@@ -49,23 +48,26 @@ type webCfgState struct {
 	searchAPIKey  string
 }
 
-// envFetchOn returns whether GOGEN_WEB_FETCH is enabled. Cached after first read.
-func envFetchOn() bool {
-	envDefaults.fetchOnOnce.Do(func() {
-		raw := strings.TrimSpace(os.Getenv("GOGEN_WEB_FETCH"))
-		envDefaults.fetchOn = strings.EqualFold(raw, "on") || strings.EqualFold(raw, "1") || strings.EqualFold(raw, "true")
-	})
-	return envDefaults.fetchOn
+// envToggle is a thread-safe one-shot boolean env-var reader.
+// Each variable gets its own instance so they cache independently.
+type envToggle struct {
+	once sync.Once
+	val  bool
 }
 
-// envSearchOn returns whether GOGEN_WEB_SEARCH is enabled. Cached after first read.
-func envSearchOn() bool {
-	envDefaults.searchOnOnce.Do(func() {
-		raw := strings.TrimSpace(os.Getenv("GOGEN_WEB_SEARCH"))
-		envDefaults.searchOn = strings.EqualFold(raw, "on") || strings.EqualFold(raw, "1") || strings.EqualFold(raw, "true")
+// get reads envVar on first call and caches the boolean result.
+func (t *envToggle) get(envVar string) bool {
+	t.once.Do(func() {
+		raw := strings.TrimSpace(os.Getenv(envVar))
+		t.val = strings.EqualFold(raw, "on") || strings.EqualFold(raw, "1") || strings.EqualFold(raw, "true")
 	})
-	return envDefaults.searchOn
+	return t.val
 }
+
+var fetchOnToggle, searchOnToggle envToggle
+
+func envFetchOn() bool  { return fetchOnToggle.get("GOGEN_WEB_FETCH") }
+func envSearchOn() bool { return searchOnToggle.get("GOGEN_WEB_SEARCH") }
 
 // envFetchMode returns the web fetch mode from env. Cached after first read.
 func envFetchMode() string {

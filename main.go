@@ -139,6 +139,10 @@ func main() {
 
 	applyRuntimeConfig(cfg)
 
+	// Pre-load the cl100k_base tokenizer so the first token-counting call
+	// does not block on the ~2.6 MB init overhead.
+	contextmgr.WarmTokenizer()
+
 	provider := llm.NewOpenAIProvider(cfg.OpenAIKey, cfg.OpenAIModel, cfg.OpenAIURL, cfg.WorkingDir)
 
 	// Derive a stable prompt-cache key from the working directory so
@@ -239,17 +243,28 @@ func main() {
 		}
 	}
 	defer func() {
-		<-mcpDone
-		if mcpMgr != nil {
+		select {
+		case <-mcpDone:
+		case <-time.After(3 * time.Second):
+			log.Printf("mcp shutdown: timed out waiting for init")
+		}
+		if mcpMgr == nil {
+			return
+		}
+		done := make(chan struct{})
+		go func() {
 			_ = mcpMgr.Close()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			log.Printf("mcp shutdown: timed out closing manager")
 		}
 	}()
 
-	// Catch SIGTERM and SIGINT for program-level shutdown. In TUI mode
-	// SIGINT is also handled per-turn (cancel vs quit); cancelling this
-	// context on a second Ctrl+C / quit path is harmless. In web mode,
-	// Start watches ctx so Ctrl+C shuts the HTTP server down cleanly and
-	// the deferred FlushSession runs.
+	// Inherited SIG_IGN sticks across Notify unless cleared first.
+	signal.Reset(syscall.SIGINT, syscall.SIGTERM)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	defer a.FlushSession()

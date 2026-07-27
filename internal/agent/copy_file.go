@@ -4,38 +4,19 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 )
 
 // CopyFile copies a file within the working directory.
 // When createDirs is true, destination directories are created as needed.
 func (e *Executor) CopyFile(src, dst string) (string, error) {
-	srcSecure, err := e.SecurePath(src)
+	srcSecure, dstSecure, err := e.validateFileOp(src, dst)
 	if err != nil {
-		return "", err
-	}
-	dstSecure, err := e.SecurePath(dst)
-	if err != nil {
-		return "", err
-	}
-
-	info, err := os.Lstat(srcSecure)
-	if err != nil {
-		return "", err
-	}
-	if info.IsDir() {
-		return "", fmt.Errorf("source is a directory; copy_file only copies files")
-	}
-
-	// Ensure destination directory exists.
-	dstDir := filepath.Dir(dstSecure)
-	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		return "", err
 	}
 
 	srcFile, err := os.Open(srcSecure)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("open source: %w", err)
 	}
 	defer srcFile.Close()
 
@@ -44,11 +25,15 @@ func (e *Executor) CopyFile(src, dst string) (string, error) {
 		return "", err
 	}
 	defer dstFile.Close()
+	srcInfo, err := srcFile.Stat()
+	if err != nil {
+		return "", fmt.Errorf("stat source: %w", err)
+	}
 
 	if _, err := io.Copy(dstFile, srcFile); err != nil {
 		return "", err
 	}
-	if err := dstFile.Chmod(info.Mode()); err != nil {
+	if err := dstFile.Chmod(srcInfo.Mode()); err != nil {
 		return "", err
 	}
 

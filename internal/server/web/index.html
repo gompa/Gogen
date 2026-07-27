@@ -64,6 +64,23 @@
             background: #d29922;
             animation: conn-pulse 1.2s ease-in-out infinite;
         }
+        #global-mode-badge {
+            display: none;
+            margin-left: 0;
+            margin-right: 8px;
+            padding: 2px 8px;
+            font-size: 0.7em;
+            font-weight: 600;
+            letter-spacing: 0.03em;
+            color: var(--accent);
+            border: 1px solid var(--accent);
+            border-radius: 3px;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+        #global-mode-badge.visible {
+            display: inline-block;
+        }
         @keyframes conn-pulse {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.35; }
@@ -179,6 +196,52 @@
             position: relative;
             display: flex;
             min-width: 0;
+        }
+        /* ===== Input-area progress indicator (replaces textarea during streaming) ===== */
+        #input-progress {
+            display: none;
+            flex: 1;
+            min-width: 0;
+            align-items: center;
+            gap: 10px;
+            padding: 9px 12px;
+            font-size: 0.92em;
+            color: var(--fg-muted);
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            background: var(--bg-input);
+            min-height: 38px;
+            box-sizing: border-box;
+        }
+        #input-progress.active { display: flex; }
+        #input-progress .progress-spinner {
+            width: 16px;
+            height: 16px;
+            border: 2px solid var(--border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            flex-shrink: 0;
+            animation: input-spin 0.8s linear infinite;
+        }
+        #input-progress .progress-spinner.thinking {
+            border-top-color: var(--fg-muted);
+            animation-duration: 1.2s;
+        }
+        #input-progress .progress-spinner.streaming {
+            border-top-color: var(--accent);
+            animation-duration: 0.6s;
+        }
+        #input-progress .progress-spinner.tool {
+            border-top-color: var(--success);
+            animation-duration: 1s;
+        }
+        @keyframes input-spin {
+            to { transform: rotate(360deg); }
+        }
+        #input-progress .progress-label {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
         #cancel-btn:disabled { opacity: 0.4; cursor: not-allowed; }
         #cancel-btn:not(:disabled) {
@@ -443,9 +506,9 @@
             font-family: var(--mono);
         }
         .monaco-tool-host {
-            height: 280px;
-            min-height: 280px;
-            max-height: 280px;
+            height: 100px;
+            min-height: 80px;
+            max-height: 400px;
             border-top: 1px solid var(--border-subtle);
             background: var(--bg);
             position: relative;
@@ -454,11 +517,13 @@
             overflow: hidden;
         }
         .monaco-tool-editor {
-            position: absolute;
-            inset: 0;
             width: 100%;
             height: 100%;
+            overflow: hidden;
         }
+        /* Override Monaco's default overflow:visible so the background
+           doesn't extend beyond the container. */
+        .monaco-tool-host .monaco-editor { overflow: hidden; }
         .diff-fallback {
             margin: 0;
             padding: 8px 12px;
@@ -584,6 +649,9 @@
             background: var(--bg);
         }
         .session-row {
+            display: flex;
+            align-items: flex-start;
+            gap: 6px;
             padding: 8px 10px;
             cursor: pointer;
             border-bottom: 1px solid var(--border-subtle);
@@ -594,6 +662,10 @@
         .session-row.current {
             background: var(--accent-soft);
             border-left: 3px solid var(--accent);
+        }
+        .session-row-content {
+            flex: 1;
+            min-width: 0;
         }
         .session-row-title {
             font-family: var(--mono);
@@ -606,6 +678,26 @@
             color: var(--fg-muted);
             font-size: 0.85em;
             margin-top: 2px;
+        }
+        .session-row-del {
+            flex-shrink: 0;
+            background: none;
+            border: none;
+            color: var(--fg-dim);
+            cursor: pointer;
+            font-size: 1.1em;
+            line-height: 1;
+            padding: 2px 4px;
+            border-radius: 3px;
+            opacity: 0;
+            transition: opacity 0.15s, color 0.15s, background 0.15s;
+        }
+        .session-row:hover .session-row-del {
+            opacity: 1;
+        }
+        .session-row-del:hover {
+            color: var(--error);
+            background: var(--error-bg);
         }
         .session-list-empty {
             padding: 10px;
@@ -979,6 +1071,7 @@
         .thought-card {
             padding: 6px 10px;
             border-left: 2px solid var(--border);
+            word-break: break-word;
             margin: 4px 0;
             width: 100%;
             max-width: 95%;
@@ -1250,6 +1343,7 @@
     <div id="top-tabs">
         <button type="button" class="main-tab active" data-pane="chat">Chat</button>
         <button type="button" class="main-tab" data-pane="editor">Editor</button>
+        <span id="global-mode-badge" title="Global mode active — agent is not scoped to working directory">🌐 Global</span>
         <span id="conn-indicator" class="disconnected" title="Disconnected" role="status" aria-live="polite" aria-label="Disconnected"></span>
         <button type="button" id="settings-btn" title="Settings">⚙</button>
     </div>
@@ -1265,7 +1359,7 @@
                 <div id="model-info" style="font-size:0.85em;margin-bottom:12px;font-family:monospace;">—</div>
                 <select id="model-select" aria-label="Select model" hidden></select>
                 <label>Context:</label>
-                <div id="context-info" tabindex="0">—<div id="context-tooltip"></div></div>
+                <div id="context-info" tabindex="0"><span id="context-text">—</span><div id="context-tooltip"></div></div>
                 <div id="context-bar-wrap"><div id="context-bar"></div></div>
                 <label>Mode:</label>
                 <div id="mode-btns">
@@ -1289,6 +1383,10 @@
                     <div id="input-wrap">
                         <div id="slash-suggest" role="listbox" aria-label="Slash command suggestions"></div>
                         <textarea id="message-input" placeholder="Ask the agent... (type / for commands, Enter to send, Shift+Enter for newline)" autofocus autocomplete="off" rows="1"></textarea>
+                        <div id="input-progress">
+                            <div class="progress-spinner"></div>
+                            <span class="progress-label"></span>
+                        </div>
                     </div>
                     <button id="send-btn">Send</button>
                     <button id="cancel-btn" disabled title="Cancel current turn">Cancel</button>
@@ -1391,6 +1489,16 @@
                     </select>
                 </div>
             </div>
+            <div class="setting-row">
+                <div>
+                    <label>Desktop notifications</label>
+                    <select id="notifications-select" aria-label="Desktop notifications">
+                        <option value="off">Off</option>
+                        <option value="background">When tab is hidden</option>
+                        <option value="always">Always</option>
+                    </select>
+                </div>
+            </div>
         </div>
     </div>
     <div id="command-palette-overlay" aria-hidden="true">
@@ -1439,12 +1547,15 @@
         const modelInfoDiv = document.getElementById('model-info');
         const modelSelect = document.getElementById('model-select');
         const contextInfoDiv = document.getElementById('context-info');
+        const contextText = document.getElementById('context-text');
         const contextBar = document.getElementById('context-bar');
         const sessionInfoDiv = document.getElementById('session-info');
         const sessionListDiv = document.getElementById('session-list');
         const modeActBtn = document.getElementById('mode-act-btn');
         const modePlanBtn = document.getElementById('mode-plan-btn');
         let currentMode = 'act';
+        const inputProgress = document.getElementById('input-progress');
+        const globalModeBadge = document.getElementById('global-mode-badge');
         const deleteOverlay = document.getElementById('delete-approval-overlay');
         const deleteReason = document.getElementById('delete-approval-reason');
         const deletePaths = document.getElementById('delete-approval-paths');
@@ -1605,6 +1716,10 @@
             modePlanBtn.classList.toggle('active', currentMode === 'plan');
         }
 
+        function updateGlobalMode(isGlobal) {
+            if (globalModeBadge) globalModeBadge.classList.toggle('visible', !!isGlobal);
+        }
+
         modeActBtn.onclick = () => {
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
             ws.send(JSON.stringify({ type: 'set_mode', mode: 'act' }));
@@ -1617,17 +1732,13 @@
         function formatTokenCount(n) {
             if (!n || n <= 0) return '—';
             if (n < 1000) return String(n);
-            if (n < 10000) {
-                const whole = Math.floor(n / 1000);
-                const frac = Math.floor((n % 1000) / 100);
-                return frac === 0 ? `${whole}k` : `${whole}.${frac}k`;
-            }
             const whole = Math.floor(n / 1000);
             const frac = Math.floor((n % 1000) / 100);
             return frac === 0 ? `${whole}k` : `${whole}.${frac}k`;
         }
 
         let availableModels = [];
+        let currentModelPricing = null; // { input, output, cached } or null
 
         function updateModelInfo(model) {
             if (availableModels.length > 1) {
@@ -1680,6 +1791,18 @@
                 }
             }
             updateModelInfo(current || availableModels.find((m) => m.current)?.id || '');
+            // Extract pricing for the active model
+            const active = current
+                ? availableModels.find((m) => m.id === current)
+                : availableModels.find((m) => m.current);
+            if (active && active.inputPricePer1M) {
+                currentModelPricing = {
+                    input: active.inputPricePer1M,
+                    output: active.outputPricePer1M || 0,
+                    cached: active.cachedPricePer1M || 0,
+                };
+            }
+            if (!active || !active.inputPricePer1M) { currentModelPricing = null; }
         }
 
         modelSelect.onchange = () => {
@@ -1719,10 +1842,10 @@
                 contextLimit = limit;
                 contextEstAdded = 0;
             }
-            const source = data.usedSource === 'api' ? 'last request' : (used > 0 ? 'estimated' : '');
+            const source = data.usedSource === 'api' ? '' : (used > 0 ? 'estimated' : '');
 
             if (used <= 0 && limit <= 0) {
-                contextInfoDiv.textContent = '—';
+                contextText.textContent = '—';
                 contextBar.style.width = '0%';
                 contextBar.className = '';
                 return;
@@ -1734,10 +1857,11 @@
                 text += ` (${pct}%)`;
             }
             if (source) text += ` · ${source}`;
-            if (data.messageCount > 0) text += `\n${data.messageCount} messages`;
-            if (data.nearCompact) text += '\nnear auto-compact';
-            if (data.toolTruncated) text += '\nTool results truncated';
-            contextInfoDiv.textContent = text;
+            if (data.messageCount > 0) text += ` · ${data.messageCount} msgs`;
+            // near-compact & tool-truncated indicators removed to avoid context stats height oscillation
+            // causing layout jumps (used to be: if (data.nearCompact) text += '\nnear auto-compact';)
+            // if (data.toolTruncated) text += '\nTool results truncated'; — removed for same reason
+            contextText.textContent = text;
 
             if (limit > 0 && used > 0) {
                 const pct = Math.min(100, (used / limit) * 100);
@@ -1752,10 +1876,32 @@
         }
 
         function applyServerConfig(data) {
+            console.log('[pricing] applyServerConfig', { model: data.model, inputPrice: data.inputPricePer1M, totalTurns: data.totalTurns });
             if (data.workingDir) dirInput.value = data.workingDir;
             updateModelInfo(data.model);
             updateModeInfo(data.mode);
+            updateGlobalMode(data.globalMode);
+            // Sync pricing from server-provided fields (always present on config from cached lookups)
+            if (data.inputPricePer1M) {
+                console.log('[pricing] SET from config message', data.inputPricePer1M);
+                currentModelPricing = {
+                    input: data.inputPricePer1M,
+                    output: data.outputPricePer1M || 0,
+                    cached: data.cachedPricePer1M || 0,
+                };
+            } else if (data.model && availableModels.length > 0) {
+                // Fallback: look up from locally cached model list
+                const active = availableModels.find((m) => m.id === data.model);
+                if (active && active.inputPricePer1M) {
+                    currentModelPricing = {
+                        input: active.inputPricePer1M,
+                        output: active.outputPricePer1M || 0,
+                        cached: active.cachedPricePer1M || 0,
+                    };
+                }
+            }
             updateContextInfo(data);
+
             if (data.sessionId) {
                 sessionInfoDiv.textContent = data.sessionId;
             }
@@ -1769,6 +1915,7 @@
             disposeChatEditors();
             messagesDiv.innerHTML = '';
             stickToBottom = true;
+
             streamRafPending = false;
             streamLastRender = 0;
             endStream();
@@ -1777,16 +1924,19 @@
             historyToolCallArgs = {};
             toolsStartedThisTurn = false;
             setTurnActive(false);
+            setInputProgress(null);
             scrollBottomBtn.classList.remove('visible');
         }
 
         let pendingSessionResponse = false;
         let ws;
         let reconnectTimer;
+        let wasDisconnected = false;
         // Sticky auto-scroll. Cleared immediately on user scroll-up; re-enabled
         // only when the user returns near the bottom (or clicks the jump button).
         let stickToBottom = true;
         let ignoreScrollEvent = false;
+        let lastSmartScrollTime = 0;
         // Start with anchoring disabled while following the stream.
         messagesDiv.classList.add('no-anchor');
         let currentStreamDiv = null;
@@ -1832,12 +1982,13 @@
                 contextLimit: contextLimit || (lastContextData && lastContextData.contextLimit) || 0,
                 usedSource: 'estimated',
                 usedPercent: contextLimit > 0 ? used / contextLimit : 0,
+                toolTruncated: false,
             });
             // Mark estimated in the text via updateContextInfo source label
             updateContextInfo(data);
             // Append est marker
-            if (contextInfoDiv.textContent && !contextInfoDiv.textContent.includes('(est.)')) {
-                contextInfoDiv.textContent += ' (est.)';
+            if (contextText.textContent && !contextText.textContent.includes('(est.)')) {
+                contextText.textContent += ' (est.)';
             }
         }
 
@@ -1948,6 +2099,7 @@
             finalizeThinking();
             endStream();
             removeThinkingStatus();
+            setInputProgress(null);
             // Remove waiting spinners on pending cards
             for (const id of Object.keys(pendingToolCards)) {
                 const cardInfo = pendingToolCards[id];
@@ -1970,6 +2122,12 @@
         function renderMarkdownHTML(text) {
             const raw = marked.parse(text || '', { async: false });
             return DOMPurify.sanitize(raw, { USE_PROFILES: { html: true } });
+        }
+
+        /** Escape HTML entities so tags are displayed as plain text. */
+        function escapeHtml(str) {
+            const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+            return (str || '').replace(/[&<>"']/g, (ch) => map[ch]);
         }
 
         function enhanceCodeBlocksWithCopy(root) {
@@ -2048,7 +2206,10 @@
             const msgDiv = document.createElement('div');
             msgDiv.className = `message ${role}`;
             if (role === 'assistant' || role === 'user') {
-                setMessageMarkdown(msgDiv, text);
+                // User messages go through markdown too, but HTML tags are escaped first
+                // to prevent pasted HTML from influencing the page layout.
+                const safe = role === 'user' ? escapeHtml(text) : text;
+                setMessageMarkdown(msgDiv, safe);
             } else {
                 const span = document.createElement('span');
                 span.textContent = text;
@@ -2152,6 +2313,37 @@
             currentThinkingSpan.textContent += token;
             bumpContextEstimate(token);
             smartScroll();
+        }
+
+        // --- Input-area progress indicator (replaces textarea during streaming) ---
+        let currentProgressPhase = null;
+
+        /**
+         * Show/update the progress indicator in the input area.
+         * Phase: 'thinking' | 'streaming' | 'tool' | null
+         * When phase is null, the indicator is hidden and the textarea is restored.
+         */
+        function setInputProgress(phase, label) {
+            if (!inputProgress) return;
+            if (phase == null) {
+                // Hide progress, restore textarea
+                inputProgress.classList.remove('active');
+                inputArea.style.display = '';
+                inputArea.focus();
+                currentProgressPhase = null;
+                return;
+            }
+            currentProgressPhase = phase;
+            inputArea.style.display = 'none';
+            inputProgress.classList.add('active');
+            const spinner = inputProgress.querySelector('.progress-spinner');
+            const labelEl = inputProgress.querySelector('.progress-label');
+            if (spinner) {
+                spinner.className = 'progress-spinner ' + phase;
+            }
+            if (labelEl) {
+                labelEl.textContent = label || phase;
+            }
         }
 
         function removeThinkingStatus() {
@@ -2626,7 +2818,17 @@
                     await updateToolCardWithResult(cardInfo, h.content || '', success, false, cardInfo.toolName);
                 }
             }
+            // Pin twice: once immediately, then again after a frame to catch
+            // late DOM mutations (Monaco colorization, image loads, etc.).
             pinToBottom();
+            requestAnimationFrame(() => {
+                pinToBottom();
+                // Dispatch event so the gogen-colorized handler re-scrolls if
+                // Monaco finishes coloring after this rAF.
+                window.dispatchEvent(
+                    new CustomEvent('gogen-colorized', { bubbles: false })
+                );
+            });
         }
 
         function connect() {
@@ -2656,10 +2858,22 @@
                 const scheduleModels = window.requestIdleCallback
                     || ((fn) => setTimeout(fn, 200));
                 scheduleModels(() => ensureModelsLoaded());
+
+                // Notify on reconnection after a disconnect
+                if (wasDisconnected) {
+                    wasDisconnected = false;
+                    sendNotification('GoGen', 'Reconnected to server.', 'gogen-reconnect');
+                }
             };
 
             ws.onmessage = (event) => {
-                const data = JSON.parse(event.data);
+                let data;
+                try {
+                    data = JSON.parse(event.data);
+                } catch (err) {
+                    console.error('Failed to parse server message:', err, 'raw:', event.data.slice(0, 200));
+                    return;
+                }
                 if (handleServerMessage(data)) return;
 
                 if (data.type === 'thinking') {
@@ -2670,34 +2884,17 @@
                     toolsStartedThisTurn = false;
                     streamingToolCards = {};
                     finalizeThinking();
-                    const div = document.createElement('div');
-                    div.id = 'status-thinking';
-                    div.className = 'message assistant thinking';
-                    div.textContent = 'thinking...';
-                    messagesDiv.appendChild(div);
-                    smartScroll();
+                    setInputProgress('thinking', 'Thinking\u2026');
                 } else if (data.type === 'waiting') {
                     setTurnActive(true);
-                    removeThinkingStatus();
-                    let el = document.getElementById('status-waiting');
-                    if (!el) {
-                        el = document.createElement('div');
-                        el.id = 'status-waiting';
-                        el.className = 'message assistant thinking';
-                        messagesDiv.appendChild(el);
-                    }
-                    el.textContent = 'waiting for model...';
-                    smartScroll();
+                    setInputProgress('thinking', 'Waiting for model\u2026');
                 } else if (data.type === 'thinking_token') {
                     setTurnActive(true);
-                    const w = document.getElementById('status-waiting');
-                    if (w) w.remove();
                     appendThinkingToken(data.content || '');
                 } else if (data.type === 'stream') {
                     setTurnActive(true);
                     updateTitle('streaming');
-                    const w = document.getElementById('status-waiting');
-                    if (w) w.remove();
+                    setInputProgress('streaming', 'Streaming\u2026');
                     finalizeThinking();
                     if (!currentStreamDiv) startStream();
                     appendStreamToken(data.content);
@@ -2706,8 +2903,7 @@
                     endStream();
                 } else if (data.type === 'tool_call_start') {
                     setTurnActive(true);
-                    const w = document.getElementById('status-waiting');
-                    if (w) w.remove();
+                    setInputProgress('tool', 'Running ' + (data.tool || 'tool') + '\u2026');
                     startStreamingToolCard(data.index, data.tool);
                 } else if (data.type === 'tool_call_delta') {
                     finalizeThinking();
@@ -2725,6 +2921,7 @@
                 } else if (data.type === 'tool_execute') {
                     // Update waiting text on the matching pending card if present
                     const name = data.tool || '';
+                    setInputProgress('tool', name ? ('Running ' + name + '\u2026') : 'Running tool\u2026');
                     for (const id of Object.keys(pendingToolCards)) {
                         const cardInfo = pendingToolCards[id];
                         if (cardInfo && cardInfo.waiting && (!name || cardInfo.toolName === name)) {
@@ -2752,12 +2949,11 @@
                 } else if (data.type === 'cancelled') {
                     abortInFlightUI(data.content || 'Cancelled.');
                     setTurnActive(false);
+                    setInputProgress(null);
                 } else if (data.type === 'turn_end') {
                     setTurnActive(false);
                     updateTitle('idle');
-                    removeThinkingStatus();
-                    const w = document.getElementById('status-waiting');
-                    if (w) w.remove();
+                    setInputProgress(null);
                 } else if (data.type === 'clear_chat') {
                     clearChat();
                     pendingSessionResponse = true;
@@ -2767,7 +2963,7 @@
                     // Structured list only — never dump slash help text into chat.
                     renderSessionList(data.sessions || []);
                     if (data.sessionId) sessionInfoDiv.textContent = data.sessionId;
-                    if (data.contextLimit || data.usedTokens) updateContextInfo(data);
+                    if (data.contextLimit || data.usedTokens) { updateContextInfo(data); }
                 } else if (data.type === 'response') {
                     finalizeThinking();
                     endStream();
@@ -2833,11 +3029,10 @@
                 streamingToolCards = {};
                 pendingToolCards = {};
                 setTurnActive(false);
-                removeThinkingStatus();
-                const w = document.getElementById('status-waiting');
-                if (w) w.remove();
+                setInputProgress(null);
                 clearTimeout(reconnectTimer);
                 setConnState('reconnecting');
+                wasDisconnected = true;
                 reconnectTimer = setTimeout(connect, 3000);
             };
         }
@@ -2977,7 +3172,9 @@
             for (const s of sessions) {
                 const row = document.createElement('div');
                 row.className = 'session-row' + (s.current ? ' current' : '');
-                row.title = s.id;
+                row.title = s.rawLabel || s.label || s.id;
+                const content = document.createElement('div');
+                content.className = 'session-row-content';
                 const title = document.createElement('div');
                 title.className = 'session-row-title';
                 title.textContent = s.label || (s.id ? s.id.slice(0, 8) + '…' : '(unknown)');
@@ -2989,15 +3186,26 @@
                 if (rel) parts.push(rel);
                 if (s.current) parts.push('current');
                 meta.textContent = parts.join(' · ');
-                row.appendChild(title);
-                row.appendChild(meta);
-                row.onclick = () => {
+                content.appendChild(title);
+                content.appendChild(meta);
+                content.onclick = () => {
                     if (s.current) {
                         showToast('Already on this session', 'info');
                         return;
                     }
                     resumeSession(s.id);
                 };
+                row.appendChild(content);
+                // Delete button (hidden by default, shown on row hover)
+                const delBtn = document.createElement('button');
+                delBtn.className = 'session-row-del';
+                delBtn.textContent = '✕';
+                delBtn.title = 'Delete this session';
+                delBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    deleteSession(s.id, s.label);
+                };
+                row.appendChild(delBtn);
                 sessionListDiv.appendChild(row);
             }
         }
@@ -3009,6 +3217,20 @@
             }
             pendingSessionResponse = true;
             ws.send(JSON.stringify({ type: 'session_new' }));
+        }
+
+        function deleteSession(id, label) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                showToast('Not connected', 'error');
+                return;
+            }
+            if (!id) return;
+            const displayName = label || id.slice(0, 8) + '…';
+            if (!confirm(`Are you sure you want to delete session "${displayName}"?\n\nThis action cannot be undone.`)) {
+                return;
+            }
+            pendingSessionResponse = true;
+            ws.send(JSON.stringify({ type: 'session_delete', sessionId: id }));
         }
 
         function resumeSession(id) {
@@ -3044,7 +3266,6 @@
                     continue;
                 }
                 if (el.classList.contains('tool-card') || el.classList.contains('thought-card')) continue;
-                if (el.id === 'status-thinking' || el.id === 'status-waiting') continue;
                 const role = el.classList.contains('user') ? 'user'
                     : el.classList.contains('assistant') ? 'assistant' : null;
                 if (!role) continue;
@@ -3094,6 +3315,14 @@
                 }
             }},
             { id: 'open-settings', label: 'Open settings', hint: '', run: () => settingsBtn.click() },
+            { id: 'toggle-notifications', label: 'Toggle notifications', hint: '', run: () => {
+                const cur = localStorage.getItem('gogen_notifications') || 'off';
+                const next = cur === 'off' ? 'background' : 'off';
+                localStorage.setItem('gogen_notifications', next);
+                notificationsSelect.value = next;
+                if (next !== 'off') requestNotificationPermission();
+                showToast(`Notifications: ${next === 'off' ? 'off' : 'on (' + next + ')'}`, 'info');
+            }},
         ];
         let paletteMatches = [];
         let paletteIndex = 0;
@@ -3271,6 +3500,10 @@
             requestAnimationFrame(() => {
                 _scrollPending = false;
                 if (ignoreScrollEvent) return;
+                // Skip if a programmatic smartScroll() happened recently —
+                // the DOM may have grown since the scroll, making the
+                // distance check unreliable (causes false unpin during streaming).
+                if (performance.now() - lastSmartScrollTime < 100) return;
                 const d = distanceFromBottom();
                 if (d > NEAR_BOTTOM_PX) {
                     // Clearly away from bottom (scrollbar drag, etc.)
@@ -3307,6 +3540,7 @@
             if (!stickToBottom) return;
             ignoreScrollEvent = true;
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            lastSmartScrollTime = performance.now();
             ignoreScrollEvent = false;
         }
 
@@ -3344,9 +3578,8 @@
         const origAppendMessage = appendMessage;
         // We use MutationObserver on messages div to detect streaming
         const titleObserver = new MutationObserver(() => {
-            const thinking = document.getElementById('status-thinking');
             const streaming = messagesDiv.querySelector('.message.assistant.cursor');
-            if (thinking) updateTitle('thinking');
+            if (currentProgressPhase === 'thinking') updateTitle('thinking');
             else if (streaming) updateTitle('streaming');
             else updateTitle('idle');
         });
@@ -3354,13 +3587,26 @@
 
         // === Task 11: Context tooltip ===
         const contextTooltip = document.getElementById('context-tooltip');
-        const origUpdateContextInfo = updateContextInfo;
-        // Wrap updateContextInfo to also update tooltip
-        // We can't easily override since it's a local function, so we'll use MutationObserver
+        const fmtTokK = (n) => {
+            if (!n || n <= 0) return '0';
+            if (n < 1000) return String(n);
+            if (n < 10000) {
+                const w = Math.floor(n / 1000);
+                const f = Math.floor((n % 1000) / 100);
+                return f === 0 ? `${w}k` : `${w}.${f}k`;
+            }
+            return `${Math.floor(n / 1000)}k`;
+        };
+        const fmtCost = (usd) => {
+            if (usd < 0.01) return `$${usd.toFixed(4)}`;
+            if (usd < 1) return `$${usd.toFixed(3)}`;
+            return `$${usd.toFixed(2)}`;
+        };
         contextInfoDiv.addEventListener('mouseenter', () => {
             const d = lastContextData || {};
             if (!d.contextLimit && !d.usedTokens) return;
             const lines = [];
+            lines.push(`── Context ──`);
             if (d.usedTokens) lines.push(`Used: ${formatTokenCount(d.usedTokens)}`);
             if (d.contextLimit) lines.push(`Limit: ${formatTokenCount(d.contextLimit)}`);
             if (d.promptTokens) lines.push(`Prompt: ${formatTokenCount(d.promptTokens)}`);
@@ -3368,6 +3614,30 @@
             if (d.cachedTokens) lines.push(`Cached: ${formatTokenCount(d.cachedTokens)}`);
             if (d.compactAt) lines.push(`Compact at: ${formatTokenCount(d.compactAt)}`);
             if (d.usedSource) lines.push(`Source: ${d.usedSource}`);
+            const prompt = d.totalPromptTokens || 0;
+            const completion = d.totalCompletionTokens || 0;
+            const cached = d.totalCachedTokens || 0;
+            const turns = d.totalTurns || 0;
+            if (turns > 0 || prompt > 0 || currentModelPricing) {
+                lines.push(`── Session ──`);
+                if (turns > 0 || prompt > 0) {
+                    lines.push(`Total: ${fmtTokK(prompt + completion)} · ${turns} turns`);
+                    lines.push(`Prompt: ${fmtTokK(prompt)}`);
+                    lines.push(`Completion: ${fmtTokK(completion)}`);
+                    lines.push(`Cached: ${fmtTokK(cached)}`);
+                }
+                if (currentModelPricing) {
+                    console.log('[pricing] tooltip cost', { turns, prompt, completion, cached, pricing: currentModelPricing });
+                    const billablePrompt = Math.max(0, prompt - cached);
+                    const cost = (billablePrompt / 1e6) * currentModelPricing.input
+                               + (cached / 1e6) * currentModelPricing.cached
+                               + (completion / 1e6) * currentModelPricing.output;
+                    lines.push(`Pricing: in $${currentModelPricing.input}/1M · out $${currentModelPricing.output}/1M`);
+                    if (turns > 0 || prompt > 0) {
+                        lines.push(`Est. cost: ${fmtCost(cost)}`);
+                    }
+                }
+            }
             contextTooltip.textContent = lines.join('\n');
             contextTooltip.style.display = 'block';
         });
@@ -3432,6 +3702,83 @@
                 if (fileClickSelect.value !== val) fileClickSelect.value = val;
             }
         });
+
+        // === Desktop notifications ===
+        const notificationsSelect = document.getElementById('notifications-select');
+        const savedNotifications = localStorage.getItem('gogen_notifications') || 'off';
+        notificationsSelect.value = savedNotifications;
+        notificationsSelect.addEventListener('change', () => {
+            localStorage.setItem('gogen_notifications', notificationsSelect.value);
+            if (notificationsSelect.value !== 'off') {
+                requestNotificationPermission();
+            }
+        });
+        window.addEventListener('storage', (e) => {
+            if (e.key === 'gogen_notifications') {
+                const val = e.newValue || 'off';
+                if (notificationsSelect.value !== val) notificationsSelect.value = val;
+            }
+        });
+
+        function getNotificationPref() {
+            return localStorage.getItem('gogen_notifications') || 'off';
+        }
+
+        function requestNotificationPermission() {
+            if (!('Notification' in window)) return;
+            if (Notification.permission === 'granted') return;
+            if (Notification.permission === 'denied') return;
+            Notification.requestPermission();
+        }
+
+        /**
+         * Send a desktop notification if the user has enabled them.
+         * @param {string} title
+         * @param {string} [body]
+         * @param {string} [tag] - dedup tag (prevents stacking)
+         */
+        function sendNotification(title, body, tag) {
+            const pref = getNotificationPref();
+            if (pref === 'off') return;
+            if (!('Notification' in window)) return;
+            if (Notification.permission !== 'granted') return;
+
+            // "background" mode: only notify when the tab is not focused
+            if (pref === 'background' && document.hasFocus()) return;
+
+            try {
+                const opts = { tag: tag || 'gogen-notification' };
+                if (body) opts.body = body;
+                new Notification(title, opts);
+            } catch (_) {
+                // Service worker or permission issue — silently ignore.
+            }
+        }
+
+        // Restore notification permission on load if preference is non-off
+        if (getNotificationPref() !== 'off') {
+            requestNotificationPermission();
+        }
+
+        // Detect turn_end by observing the cancel button's disabled attribute,
+        // which toggles whenever setTurnActive is called.
+        let _prevTurnActive = false;
+        const _turnObserver = new MutationObserver(() => {
+            const isActive = !cancelBtn.disabled;
+            if (_prevTurnActive && !isActive) {
+                sendNotification('GoGen', 'Agent finished responding.', 'gogen-turn-end');
+            }
+            _prevTurnActive = isActive;
+        });
+        _turnObserver.observe(cancelBtn, { attributes: true, attributeFilter: ['disabled'] });
+
+        // Delete approval: always notify since it requires user action
+        const _origShowDeleteApproval = showDeleteApproval;
+        showDeleteApproval = function _showDeleteApprovalNotify(data) {
+            _origShowDeleteApproval.call(null, data);
+            const paths = (data.paths || []).join(', ');
+            sendNotification('GoGen — Approval needed', `File delete requested: ${paths}`, 'gogen-delete-approval');
+        };
 
         setTurnActive(false);
         setConnState('disconnected');

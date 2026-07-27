@@ -81,6 +81,10 @@ type ModelInfo struct {
 	ID           string
 	ContextLimit int
 	Current      bool
+	// Pricing from models.dev (USD per 1M tokens). Zero means no pricing data.
+	InputPricePer1M  float64
+	OutputPricePer1M float64
+	CachedPricePer1M float64
 }
 
 // LLMProvider defines the interface for different LLM providers.

@@ -12,6 +12,14 @@ var (
 	ErrUnsupported = errors.New("no definition query for this file type")
 )
 
+// guardEnabled returns ErrDisabled when tree-sitter is disabled, nil otherwise.
+func guardEnabled() error {
+	if !Enabled() {
+		return ErrDisabled
+	}
+	return nil
+}
+
 // Definition is a named symbol outline entry.
 type Definition struct {
 	Line int
@@ -21,8 +29,8 @@ type Definition struct {
 
 // ListDefinitions returns structural definitions for a supported source file.
 func ListDefinitions(path string, content []byte) ([]Definition, error) {
-	if !Enabled() {
-		return nil, ErrDisabled
+	if err := guardEnabled(); err != nil {
+		return nil, err
 	}
 	return listDefinitions(path, content)
 }

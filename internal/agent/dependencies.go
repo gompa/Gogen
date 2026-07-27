@@ -128,13 +128,16 @@ func (e *Executor) findIndirectDependents(ctx context.Context, directDependents 
 		if err != nil {
 			continue
 		}
+		if strings.HasPrefix(results, "No matches") {
+			continue
+		}
 
 		// Parse results
 		lines := strings.Split(results, "\n")
 		for _, line := range lines {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) >= 1 && parts[0] != dep {
-				indirect[parts[0]] = true
+			file, _, ok := splitSearchLine(line)
+			if ok && file != dep {
+				indirect[file] = true
 			}
 		}
 	}

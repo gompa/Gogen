@@ -27,6 +27,23 @@ func SessionLabel(messages []Message, maxLen int) string {
 	return ""
 }
 
+// FirstUserMessage returns the content of the first user message, untruncated,
+// with whitespace normalized (newlines → spaces, runs collapsed).
+func FirstUserMessage(messages []Message) string {
+	for _, m := range messages {
+		if m.Role != "user" {
+			continue
+		}
+		s := strings.TrimSpace(m.Content)
+		if s == "" {
+			continue
+		}
+		s = strings.ReplaceAll(s, "\n", " ")
+		return strings.Join(strings.Fields(s), " ")
+	}
+	return ""
+}
+
 func truncateRunes(s string, maxLen int) string {
 	if utf8.RuneCountInString(s) <= maxLen {
 		return s

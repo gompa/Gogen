@@ -35,10 +35,18 @@ type Limit struct {
 	Output  int `json:"output"`
 }
 
+// Cost holds per-token pricing for a model (USD per 1M tokens).
+type Cost struct {
+	Input     float64 `json:"input"`
+	Output    float64 `json:"output"`
+	CacheRead float64 `json:"cache_read"`
+}
+
 type modelEntry struct {
 	ID    string `json:"id"`
 	Name  string `json:"name"`
 	Limit Limit  `json:"limit"`
+	Cost  Cost   `json:"cost"`
 }
 
 type providerEntry struct {
@@ -106,9 +114,6 @@ func (r *Resolver) Warm() {
 	if r == nil {
 		return
 	}
-	r.mu.Lock()
-	r.lastFail = time.Time{} // allow an immediate retry after prior failures
-	r.mu.Unlock()
 	r.refreshAsync()
 }
 
@@ -172,6 +177,7 @@ func (r *Resolver) load() error {
 // existing data untouched and apply failBackoff before the next attempt.
 func (r *Resolver) refreshAsync() {
 	r.mu.Lock()
+	r.lastFail = time.Time{} // allow immediate retry (reset is atomic with the check below)
 	if r.refreshing {
 		r.mu.Unlock()
 		return
@@ -285,6 +291,27 @@ func (r *Resolver) ResolveContextLimit(baseURL, modelID string) (Limit, error) {
 	return Limit{}, fmt.Errorf("provider %q found for %s, but no entry for model %q", provider.ID, baseURL, modelID)
 }
 
+// Resolve returns both context limit and pricing for a model in a single
+// registry lookup. Use this instead of separate ResolveContextLimit + ResolveCost
+// calls to avoid redundant map lookups.
+func (r *Resolver) Resolve(baseURL, modelID string) (Limit, *Cost, error) {
+	if err := r.load(); err != nil {
+		return Limit{}, nil, fmt.Errorf("loading model registry: %w", err)
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	provider, ok := r.byAPI[normalizeURL(baseURL)]
+	if !ok {
+		return Limit{}, nil, fmt.Errorf("no provider in models.dev registry matches base URL %q", baseURL)
+	}
+	if m, ok := provider.Models[modelID]; ok {
+		return m.Limit, &m.Cost, nil
+	}
+	return Limit{}, nil, fmt.Errorf("provider %q found, but no entry for model %q", provider.ID, modelID)
+}
+
 // ProviderID returns the models.dev provider ID matching a base URL, if any.
 // Useful for logging/debugging, not required for ResolveContextLimit.
 func (r *Resolver) ProviderID(baseURL string) (string, bool) {
@@ -299,4 +326,26 @@ func (r *Resolver) ProviderID(baseURL string) (string, bool) {
 		return "", false
 	}
 	return provider.ID, true
+}
+
+// ResolveCost returns per-token pricing for a model from the models.dev
+// registry. Returns a non-nil Cost with zero values when the model is found
+// but has no pricing data (e.g. local/self-hosted models). Returns nil Cost
+// and an error only when the registry isn't loaded or the model isn't found.
+func (r *Resolver) ResolveCost(baseURL, modelID string) (*Cost, error) {
+	if err := r.load(); err != nil {
+		return nil, fmt.Errorf("loading model registry: %w", err)
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	provider, ok := r.byAPI[normalizeURL(baseURL)]
+	if !ok {
+		return nil, fmt.Errorf("no provider in models.dev registry matches base URL %q", baseURL)
+	}
+	if m, ok := provider.Models[modelID]; ok {
+		return &m.Cost, nil
+	}
+	return nil, fmt.Errorf("provider %q found, but no entry for model %q", provider.ID, modelID)
 }

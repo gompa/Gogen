@@ -53,7 +53,14 @@ func (a *Agent) clearTurnUsage() {
 // prompt_tokens for the messages that were in the last request, plus local
 // estimates for any messages appended since then.
 func (a *Agent) ContextStats(ctx context.Context) TurnContext {
-	_ = ctx // reserved for future cancellation of pure-local work
+	// Abort before expensive tokenization when the caller already cancelled
+	// (web/TUI interrupt). Returning a minimal snapshot keeps cancel paths
+	// from stalling inside OnStart/OnRoundStart context probes.
+	if ctx != nil && ctx.Err() != nil {
+		return TurnContext{
+			Snapshot: contextmgr.ContextSnapshot{MessageCount: len(a.Messages)},
+		}
+	}
 	msgs := a.Messages
 	view := msgs
 	if a.Context != nil {

@@ -40,6 +40,9 @@ type SessionInfo struct {
 	UpdatedAt    string
 	MessageCount int
 	Label        string
+	// RawLabel holds the full first user message (untruncated) for tooltip
+	// display, while Label is the short preview shown in the sidebar.
+	RawLabel string
 }
 
 // RestoreSessionLocal loads messages, mode, and model from a snapshot without

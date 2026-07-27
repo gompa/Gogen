@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"fmt"
-	"log"
 	"strings"
 
 	"gogen/internal/llm"
@@ -135,6 +134,11 @@ func (a *Agent) resumeSessionByID(ctx context.Context, id string) (string, error
 	if a.SessionStore == nil {
 		return "", fmt.Errorf("session persistence disabled")
 	}
+	// Flush the current session only if it has unsaved changes, so we don't
+	// write a fresh timestamp on a session that was merely loaded.
+	if a.sessionDirty {
+		a.FlushSession()
+	}
 	if strings.TrimSpace(id) == "" {
 		return "", fmt.Errorf("session id is required")
 	}
@@ -148,11 +152,6 @@ func (a *Agent) resumeSessionByID(ctx context.Context, id string) (string, error
 	model := snap.Model
 	a.RestoreSessionLocal(snap, id)
 	a.SessionID = id
-	// Persist immediately so the resumed session gets a fresh UpdatedAt
-	// timestamp and appears at the top of the session sidebar list.
-	if err := a.SessionStore.TouchSession(a.WorkingDir, a.SessionID); err != nil {
-		log.Printf("session touch failed on resume (id=%s): %v", a.SessionID, err)
-	}
 	label := llm.SessionLabel(snap.Messages, llm.DefaultSessionLabelMaxLen)
 	var out string
 	if label != "" {

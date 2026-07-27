@@ -1112,8 +1112,13 @@ func (m *Model) handleStreamStart() {
 }
 
 func (m *Model) handleStreamRoundStart() {
-	// Keep toolDiffShown across rounds — each diff is shown once per turn.
 	m.resetStreamState(true)
+	// Recapture the context baseline after each round so the streaming
+	// estimate uses the updated API count from recordTurnUsage rather
+	// than the pre-turn value. Resetting contextStreamEstAdded keeps the
+	// (est.) indicator incrementally accurate across multi-round turns.
+	m.contextStreamBaseUsed = m.contextStats.Snapshot.Used
+	m.contextStreamEstAdded = 0
 }
 
 func (m *Model) handleStreamRoundEnd() {

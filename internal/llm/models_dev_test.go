@@ -49,7 +49,7 @@ func TestLookupModelsDevLimitFromDisk(t *testing.T) {
 	}
 
 	start := time.Now()
-	got := p.lookupModelsDevLimit("claude-opus-4-8")
+	got, _ := p.lookupModelsDevLimit("claude-opus-4-8")
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
 		t.Fatalf("lookup blocked for %v (disk cache should be instant)", elapsed)
 	}
@@ -57,7 +57,7 @@ func TestLookupModelsDevLimitFromDisk(t *testing.T) {
 		t.Fatalf("zen model: got %d, want 1000000", got)
 	}
 
-	got = p.lookupModelsDevLimit("mimo-v2.5-pro")
+	got, _ = p.lookupModelsDevLimit("mimo-v2.5-pro")
 	if got != 1048576 {
 		t.Fatalf("go model via dual URL: got %d, want 1048576", got)
 	}
@@ -65,11 +65,11 @@ func TestLookupModelsDevLimitFromDisk(t *testing.T) {
 
 func TestLookupModelsDevLimitNilSafe(t *testing.T) {
 	var p *OpenAIProvider
-	if got := p.lookupModelsDevLimit("x"); got != 0 {
+	if got, _ := p.lookupModelsDevLimit("x"); got != 0 {
 		t.Fatalf("got %d", got)
 	}
 	p = &OpenAIProvider{}
-	if got := p.lookupModelsDevLimit("x"); got != 0 {
+	if got, _ := p.lookupModelsDevLimit("x"); got != 0 {
 		t.Fatalf("got %d", got)
 	}
 }

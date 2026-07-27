@@ -67,3 +67,17 @@ func newSSEHTTPClient() *http.Client {
 		},
 	}
 }
+
+// newCatalogHTTPClient is for /v1/models and similar non-stream calls.
+// A hard client Timeout prevents startup/ListModels from sitting on the SSE
+// idle read deadline (default 10m) when a provider stalls after headers.
+func newCatalogHTTPClient() *http.Client {
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	return &http.Client{
+		Timeout: modelsCatalogTimeout,
+		Transport: &http.Transport{
+			DisableCompression: true,
+			DialContext:        dialer.DialContext,
+		},
+	}
+}

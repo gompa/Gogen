@@ -54,13 +54,16 @@ func isOpencodeURL(baseURL string) bool {
 }
 
 type OpenAIProvider struct {
-	client      openai.Client  // primary (user-configured; fallback for non-OpenCode)
-	zenClient   *openai.Client // OpenCode Zen endpoint
-	goClient    *openai.Client // OpenCode Go endpoint
-	model       string
-	baseURL     string
-	apiKey      string
-	modelClient map[string]*openai.Client // model ID → client routing
+	client           openai.Client  // primary streaming client
+	catalogClient    *openai.Client // non-stream /v1/models (non-OpenCode)
+	zenClient        *openai.Client // OpenCode Zen streaming
+	zenCatalogClient *openai.Client // OpenCode Zen catalog
+	goClient         *openai.Client // OpenCode Go streaming
+	goCatalogClient  *openai.Client // OpenCode Go catalog
+	model            string
+	baseURL          string
+	apiKey           string
+	modelClient      map[string]*openai.Client // model ID → streaming client routing
 	// promptCacheKey scopes provider-side prompt caching (defaults to none).
 	promptCacheKey param.Opt[string]
 	// modelInfo resolves context limits from models.dev (optional enrichment).
@@ -174,14 +177,22 @@ func (p *OpenAIProvider) fetchModels(ctx context.Context) ([]openai.Model, map[s
 		routing map[string]*openai.Client
 		err     error
 	}
-	query := func(c *openai.Client) result {
+	query := func(catalog, stream *openai.Client) result {
+		if catalog == nil {
+			catalog = stream
+		}
 		var models []openai.Model
 		routing := make(map[string]*openai.Client)
-		pager := c.Models.ListAutoPaging(ctx)
+		pager := catalog.Models.ListAutoPaging(ctx)
 		for pager.Next() {
+			if ctx.Err() != nil {
+				return result{models: models, routing: routing, err: ctx.Err()}
+			}
 			m := pager.Current()
 			models = append(models, m)
-			routing[m.ID] = c
+			if stream != nil {
+				routing[m.ID] = stream
+			}
 		}
 		return result{models: models, routing: routing, err: pager.Err()}
 	}
@@ -192,13 +203,22 @@ func (p *OpenAIProvider) fetchModels(ctx context.Context) ([]openai.Model, map[s
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			zenRes = query(p.zenClient)
+			zenRes = query(p.zenCatalogClient, p.zenClient)
 		}()
 		go func() {
 			defer wg.Done()
-			goRes = query(p.goClient)
+			goRes = query(p.goCatalogClient, p.goClient)
 		}()
-		wg.Wait()
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		case <-done:
+		}
 
 		routing := make(map[string]*openai.Client, len(zenRes.routing)+len(goRes.routing))
 		models := make([]openai.Model, 0, len(zenRes.models)+len(goRes.models))
@@ -223,7 +243,7 @@ func (p *OpenAIProvider) fetchModels(ctx context.Context) ([]openai.Model, map[s
 		return models, routing, nil
 	}
 
-	res := query(&p.client)
+	res := query(p.catalogClient, &p.client)
 	if len(res.models) == 0 && res.err != nil {
 		return nil, nil, res.err
 	}
@@ -231,17 +251,22 @@ func (p *OpenAIProvider) fetchModels(ctx context.Context) ([]openai.Model, map[s
 }
 
 func NewOpenAIProvider(apiKey string, model string, baseURL string, workingDir string) *OpenAIProvider {
-	opts := []option.RequestOption{
+	streamOpts := []option.RequestOption{
 		option.WithHTTPClient(newSSEHTTPClient()),
 	}
+	catalogOpts := []option.RequestOption{
+		option.WithHTTPClient(newCatalogHTTPClient()),
+	}
 	if apiKey != "" {
-		opts = append(opts, option.WithAPIKey(apiKey))
+		streamOpts = append(streamOpts, option.WithAPIKey(apiKey))
+		catalogOpts = append(catalogOpts, option.WithAPIKey(apiKey))
 	}
 	if baseURL != "" {
-		opts = append(opts, option.WithBaseURL(baseURL))
+		streamOpts = append(streamOpts, option.WithBaseURL(baseURL))
+		catalogOpts = append(catalogOpts, option.WithBaseURL(baseURL))
 	}
 	p := &OpenAIProvider{
-		client:      openai.NewClient(opts...),
+		client:      openai.NewClient(streamOpts...),
 		model:       model,
 		baseURL:     baseURL,
 		apiKey:      apiKey,
@@ -250,19 +275,28 @@ func NewOpenAIProvider(apiKey string, model string, baseURL string, workingDir s
 	}
 	p.modelInfo.Warm() // non-blocking; populate cache before first limit lookup
 	if isOpencodeURL(baseURL) {
-		newClient := func(url string) *openai.Client {
-			nopts := []option.RequestOption{
+		newClients := func(url string) (stream, catalog *openai.Client) {
+			sopts := []option.RequestOption{
 				option.WithHTTPClient(newSSEHTTPClient()),
 				option.WithBaseURL(url),
 			}
-			if apiKey != "" {
-				nopts = append(nopts, option.WithAPIKey(apiKey))
+			copts := []option.RequestOption{
+				option.WithHTTPClient(newCatalogHTTPClient()),
+				option.WithBaseURL(url),
 			}
-			c := openai.NewClient(nopts...)
-			return &c
+			if apiKey != "" {
+				sopts = append(sopts, option.WithAPIKey(apiKey))
+				copts = append(copts, option.WithAPIKey(apiKey))
+			}
+			s := openai.NewClient(sopts...)
+			c := openai.NewClient(copts...)
+			return &s, &c
 		}
-		p.zenClient = newClient(openCodeZenBaseURL)
-		p.goClient = newClient(openCodeGoBaseURL)
+		p.zenClient, p.zenCatalogClient = newClients(openCodeZenBaseURL)
+		p.goClient, p.goCatalogClient = newClients(openCodeGoBaseURL)
+	} else {
+		c := openai.NewClient(catalogOpts...)
+		p.catalogClient = &c
 	}
 	return p
 }
@@ -296,6 +330,17 @@ func (p *OpenAIProvider) SetPreserveReasoningMode(mode string) {
 		return
 	}
 	p.preserveReasoningMode = normalizePreserveReasoningMode(mode)
+}
+
+// WarmPreserveReasoning eagerly probes the /props endpoint (in auto mode)
+// during startup so the result is cached before the first chat-completion
+// request, avoiding a 1.5 s inline timeout on the critical path.
+// Only the default ("auto") mode probes; "on" and "off" skip the probe.
+func (p *OpenAIProvider) WarmPreserveReasoning() {
+	if p == nil || normalizePreserveReasoningMode(p.preserveReasoningMode) != "auto" {
+		return
+	}
+	go p.templateSupportsPreserveReasoning(context.Background())
 }
 
 func normalizePreserveReasoningMode(mode string) string {
@@ -466,13 +511,21 @@ func (p *OpenAIProvider) clientForModel() *openai.Client {
 	defer probeCancel()
 	var chosen *openai.Client
 	if p.zenClient != nil {
-		_, err := p.zenClient.Models.Get(probeCtx, model)
+		catalog := p.zenCatalogClient
+		if catalog == nil {
+			catalog = p.zenClient
+		}
+		_, err := catalog.Models.Get(probeCtx, model)
 		if err == nil {
 			chosen = p.zenClient
 		}
 	}
 	if chosen == nil && p.goClient != nil {
-		_, err := p.goClient.Models.Get(probeCtx, model)
+		catalog := p.goCatalogClient
+		if catalog == nil {
+			catalog = p.goClient
+		}
+		_, err := catalog.Models.Get(probeCtx, model)
 		if err == nil {
 			chosen = p.goClient
 		}
@@ -716,6 +769,18 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 	p.applyChatCompletionExtras(ctx, &params)
 	stream := p.clientForModel().Chat.Completions.NewStreaming(ctx, params)
 	defer stream.Close()
+	// stream.Next() can block on the response body even after ctx cancel if
+	// the transport is slow to abort. Closing the stream from a watcher
+	// unblocks Next promptly (important for --web Ctrl+C).
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = stream.Close()
+		case <-stopWatch:
+		}
+	}()
 
 	var fullContent strings.Builder
 	var fullRefusal strings.Builder
@@ -929,10 +994,15 @@ func (p *OpenAIProvider) ModelContextLimit(ctx context.Context) (int, error) {
 	// name heuristics → 128000. Network catalog for this path uses a short
 	// timeout so a hung remote host cannot stall restore/context refresh;
 	// local servers still win when they answer quickly with n_ctx etc.
+	//
+	// Updated order: warm in-memory cache → models.dev (disk-cached, no
+	// network) → brief /v1/models probe → name heuristics → 128k default.
+	// models.dev is preferred over a live /v1/models call because its
+	// registry is already on disk and resolves instantly.
 	ctx, cancel := context.WithTimeout(ctx, modelsLimitLookupTimeout)
 	defer cancel()
 
-	// Warm cache: parse provider JSON with no I/O.
+	// 1. Warm in-memory cache: parse provider JSON with no I/O.
 	p.modelsMu.RLock()
 	cached, cacheOK := p.cachedModelsLocked()
 	if cacheOK {
@@ -945,16 +1015,21 @@ func (p *OpenAIProvider) ModelContextLimit(ctx context.Context) (int, error) {
 		}
 	}
 
-	// Cold cache: brief /v1/models probe (local LLMs typically << timeout).
+	// 2. models.dev registry: disk-cached, resolves instantly with no network.
+	modelName := p.currentModel()
+	if limit, _ := p.lookupModelsDevLimit(modelName); limit > 0 {
+		return limit, nil
+	}
+
+	// 3. Brief /v1/models probe (fallback when models.dev has no entry).
+	//    Local LLMs typically answer in << 1s; a hung remote host is bounded
+	//    by the outer modelsLimitLookupTimeout context.
 	models, _ := p.listModels(ctx)
 	if lim, ok := p.contextLimitFromModels(models); ok {
 		return lim, nil
 	}
 
-	modelName := p.currentModel()
-	if limit := p.lookupModelsDevLimit(modelName); limit > 0 {
-		return limit, nil
-	}
+	// 4. Name-based heuristics.
 	if limit := inferContextLimitFromModelName(modelName); limit > 0 {
 		return limit, nil
 	}
@@ -998,45 +1073,28 @@ func (p *OpenAIProvider) ListModels(ctx context.Context) ([]ModelInfo, error) {
 		if m.ID == "" {
 			continue
 		}
-		out = append(out, ModelInfo{
+		limit, cost := p.resolveContextLimit(m.RawJSON(), m.ID)
+		info := ModelInfo{
 			ID:           m.ID,
-			ContextLimit: p.resolveContextLimit(m.RawJSON(), m.ID),
+			ContextLimit: limit,
 			Current:      m.ID == current,
-		})
+		}
+		if m.ID == current && cost != nil {
+			info.InputPricePer1M = cost.Input
+			info.OutputPricePer1M = cost.Output
+			info.CachedPricePer1M = cost.CacheRead
+		}
+		out = append(out, info)
 	}
 	return out, nil
 }
 
-func (p *OpenAIProvider) SetModel(id string) error {
-	p.modelsMu.Lock()
-	p.model = id
-	p.modelsMu.Unlock()
-	// Template caps can change with the model on multi-model / router hosts.
-	p.invalidatePropsCaps()
-	return nil
-}
-
-// resolveContextLimit tries provider JSON fields, then models.dev, then
-// model-name inference. models.dev is consulted only after provider JSON
-// misses and never blocks on the network (see modelinfo.Resolver).
-func (p *OpenAIProvider) resolveContextLimit(rawJSON, modelID string) int {
-	if limit := parseContextLimitFromJSON(rawJSON); limit > 0 {
-		return limit
-	}
-	if limit := p.lookupModelsDevLimit(modelID); limit > 0 {
-		return limit
-	}
-	if limit := inferContextLimitFromModelName(modelID); limit > 0 {
-		return limit
-	}
-	return 128000
-}
-
-// lookupModelsDevLimit queries the models.dev registry by base URL + model ID.
-// OpenCode dual endpoints are both tried so zen and go models resolve.
-func (p *OpenAIProvider) lookupModelsDevLimit(modelID string) int {
+// lookupModelsDevLimit queries the models.dev registry by base URL + model ID
+// for both context limit and pricing in a single pass. OpenCode dual endpoints
+// are both tried so zen and go models resolve.
+func (p *OpenAIProvider) lookupModelsDevLimit(modelID string) (int, *modelinfo.Cost) {
 	if p == nil || p.modelInfo == nil || modelID == "" {
-		return 0
+		return 0, nil
 	}
 	urls := make([]string, 0, 3)
 	seen := make(map[string]struct{}, 3)
@@ -1056,10 +1114,61 @@ func (p *OpenAIProvider) lookupModelsDevLimit(modelID string) int {
 		add(openCodeGoBaseURL)
 	}
 	for _, u := range urls {
-		lim, err := p.modelInfo.ResolveContextLimit(u, modelID)
-		if err == nil && lim.Context > 0 {
-			return lim.Context
+		lim, cost, err := p.modelInfo.Resolve(u, modelID)
+		if err == nil {
+			var c *modelinfo.Cost
+			if cost != nil && (cost.Input > 0 || cost.Output > 0) {
+				c = cost
+			}
+			if lim.Context > 0 {
+				return lim.Context, c
+			}
+			if c != nil {
+				return 0, c
+			}
 		}
 	}
-	return 0
+	return 0, nil
+}
+
+func (p *OpenAIProvider) SetModel(id string) error {
+	p.modelsMu.Lock()
+	p.model = id
+	p.modelsMu.Unlock()
+	// Template caps can change with the model on multi-model / router hosts.
+	p.invalidatePropsCaps()
+	return nil
+}
+
+// resolveContextLimit resolves context limit and pricing. Provider JSON is
+// tried first for the limit, but models.dev is always consulted for cost
+// data since provider JSON never includes pricing.
+func (p *OpenAIProvider) resolveContextLimit(rawJSON, modelID string) (int, *modelinfo.Cost) {
+	// Always look up models.dev for pricing (provider JSON never has it).
+	var cost *modelinfo.Cost
+	devLimit, devCost := p.lookupModelsDevLimit(modelID)
+	if devCost != nil {
+		cost = devCost
+	}
+	// Prefer provider JSON limit, then models.dev, then heuristic.
+	if limit := parseContextLimitFromJSON(rawJSON); limit > 0 {
+		return limit, cost
+	}
+	if devLimit > 0 {
+		return devLimit, cost
+	}
+	if limit := inferContextLimitFromModelName(modelID); limit > 0 {
+		return limit, cost
+	}
+	return 128000, cost
+}
+
+// ModelPricing returns per-token pricing (USD per 1M tokens) for the given
+// model from the models.dev registry. Only cached map lookup — never blocks.
+func (p *OpenAIProvider) ModelPricing(modelID string) (input, output, cached float64, ok bool) {
+	_, cost := p.lookupModelsDevLimit(modelID)
+	if cost != nil {
+		return cost.Input, cost.Output, cost.CacheRead, true
+	}
+	return 0, 0, 0, false
 }

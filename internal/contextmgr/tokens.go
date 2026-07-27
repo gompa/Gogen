@@ -23,6 +23,12 @@ func getCodec() (tokenizer.Codec, error) {
 	return codec, encErr
 }
 
+// WarmTokenizer eagerly loads the cl100k_base tokenizer vocabulary so the
+// first token-counting call does not pay the ~2.6 MB init cost inline.
+func WarmTokenizer() {
+	_, _ = getCodec()
+}
+
 // TokenCounts returns per-message token counts for the given messages.
 // Token counts are computed fresh each time; the cl100k_base tokenizer
 // is fast enough that a global cache added more complexity than value.

@@ -8,15 +8,23 @@ import (
 
 const wsTokenFlushInterval = 16 * time.Millisecond
 
-// wsConnStream owns the in-flight stream cancel handle for one WebSocket
+// wsConnStream owns the in-flight stream cancel handles for one WebSocket
 // connection. Allocated on the heap so the read loop and stream goroutine
 // share clear ownership (not ad-hoc locals).
+//
+// Two cancel functions allow close() to stop only the LLM call while keeping
+// the outer goroutine context alive so deferred cleanup (stream.end(),
+// turnMu.Unlock(), turn_end write) runs naturally.
 type wsConnStream struct {
-	mu     sync.Mutex
-	cancel context.CancelFunc
-	errCh  chan error
+	mu        sync.Mutex
+	cancel    context.CancelFunc // outer: cancels the stream goroutine (cancelInFlight)
+	llmCancel context.CancelFunc // inner: cancels only the LLM call (close)
+	errCh     chan error
 }
 
+// cancelInFlight stops the entire stream: cancels the outer context (which
+// propagates to the inner LLM context) and waits for the stream goroutine
+// to finish its deferred cleanup.
 func (s *wsConnStream) cancelInFlight() {
 	s.mu.Lock()
 	if s.cancel == nil {
@@ -24,33 +32,40 @@ func (s *wsConnStream) cancelInFlight() {
 		return
 	}
 	s.cancel()
+	s.llmCancel = nil
 	prevErr := s.errCh
 	s.cancel = nil
 	s.errCh = nil
 	s.mu.Unlock()
+	// Wait for cancel repair (appendCanceledToolResults + FlushSession).
 	drainStreamErr(prevErr)
 }
 
+// close cancels only the inner LLM context so StreamProcessInput returns
+// promptly. The outer goroutine context remains valid, so its deferred
+// cleanup (stream.end(), turnMu.Unlock(), turn_end notification) always
+// executes. Unlike cancelInFlight, it does not wait for the goroutine —
+// the deferred cleanup runs asynchronously.
 func (s *wsConnStream) close() {
 	s.mu.Lock()
-	if s.cancel == nil {
-		s.mu.Unlock()
-		return
+	// Cancel the inner (LLM) context only — the outer goroutine still needs
+	// its context alive to run deferred cleanup.
+	if s.llmCancel != nil {
+		s.llmCancel()
+		s.llmCancel = nil
 	}
-	s.cancel()
-	prevErr := s.errCh
-	s.cancel = nil
-	s.errCh = nil
+	// NEVER clear s.cancel or s.errCh here — the outer goroutine still
+	// references them for its deferred cleanup.
 	s.mu.Unlock()
-	drainStreamErr(prevErr)
 }
 
-// begin registers a new stream cancel handle. Caller must already have
-// cancelled any prior stream. Returns the error channel the stream
-// goroutine should signal on exit.
-func (s *wsConnStream) begin(cancel context.CancelFunc) chan error {
+// begin registers cancel handles for a new stream. Caller must already have
+// cancelled any prior stream. Returns the error channel the stream goroutine
+// should signal on exit.
+func (s *wsConnStream) begin(cancel, llmCancel context.CancelFunc) chan error {
 	s.mu.Lock()
 	s.cancel = cancel
+	s.llmCancel = llmCancel
 	s.errCh = make(chan error, 1)
 	errCh := s.errCh
 	s.mu.Unlock()
@@ -60,83 +75,7 @@ func (s *wsConnStream) begin(cancel context.CancelFunc) chan error {
 func (s *wsConnStream) end() {
 	s.mu.Lock()
 	s.cancel = nil
+	s.llmCancel = nil
 	s.errCh = nil
 	s.mu.Unlock()
-}
-
-type wsTokenSeg struct {
-	think bool
-	text  string
-}
-
-// wsTokenBatcher coalesces stream/thinking tokens so the LLM reader is not
-// blocked waiting on slow websocket clients.
-// Segments flush in arrival order so thinking is not emitted after content
-// when both were buffered in the same window.
-type wsTokenBatcher struct {
-	send  func(WSMessage)
-	mu    sync.Mutex
-	segs  []wsTokenSeg
-	timer *time.Timer
-}
-
-func newWSTokenBatcher(send func(WSMessage)) *wsTokenBatcher {
-	return &wsTokenBatcher{send: send}
-}
-
-func (b *wsTokenBatcher) scheduleFlushLocked() {
-	if b.timer != nil {
-		return
-	}
-	b.timer = time.AfterFunc(wsTokenFlushInterval, b.flush)
-}
-
-func (b *wsTokenBatcher) flush() {
-	b.mu.Lock()
-	if b.timer != nil {
-		b.timer.Stop()
-		b.timer = nil
-	}
-	segs := b.segs
-	b.segs = nil
-	b.mu.Unlock()
-
-	for _, seg := range segs {
-		if seg.text == "" {
-			continue
-		}
-		if seg.think {
-			b.send(WSMessage{Type: "thinking_token", Content: seg.text})
-		} else {
-			b.send(WSMessage{Type: "stream", Content: seg.text})
-		}
-	}
-}
-
-func (b *wsTokenBatcher) appendLocked(think bool, token string) {
-	n := len(b.segs)
-	if n > 0 && b.segs[n-1].think == think {
-		b.segs[n-1].text += token
-	} else {
-		b.segs = append(b.segs, wsTokenSeg{think: think, text: token})
-	}
-	b.scheduleFlushLocked()
-}
-
-func (b *wsTokenBatcher) streamToken(token string) {
-	if token == "" {
-		return
-	}
-	b.mu.Lock()
-	b.appendLocked(false, token)
-	b.mu.Unlock()
-}
-
-func (b *wsTokenBatcher) thinkToken(token string) {
-	if token == "" {
-		return
-	}
-	b.mu.Lock()
-	b.appendLocked(true, token)
-	b.mu.Unlock()
 }

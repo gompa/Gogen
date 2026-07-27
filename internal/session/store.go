@@ -48,6 +48,7 @@ type sessionIndexEntry struct {
 	Oneshot      bool      `json:"oneshot,omitempty"`
 	MessageCount int       `json:"messageCount"`
 	Label        string    `json:"label,omitempty"`
+	RawLabel     string    `json:"rawLabel,omitempty"`
 }
 
 // sessionIndex is the on-disk index of session metadata for fast listing.
@@ -87,6 +88,10 @@ type StoreOptions struct {
 	MaxAgeDays int // drop sessions older than this many days (0 = default 30)
 }
 
+// maxCreatedCacheEntries limits the in-memory created-timestamp cache so it
+// cannot grow unboundedly on long-running processes with many sessions.
+const maxCreatedCacheEntries = 200
+
 // NewStore creates a session store with default retention.
 func NewStore(enabled bool) *Store {
 	return NewStoreWithOptions(enabled, StoreOptions{})
@@ -111,6 +116,23 @@ func NewStoreWithOptions(enabled bool, opts StoreOptions) *Store {
 		maxAge = 30
 	}
 	return &Store{enabled: enabled, maxCount: maxCount, maxAgeDays: maxAge, createdCache: make(map[string]time.Time)}
+}
+
+// setCreatedCache adds an entry to the created-timestamp cache, evicting the
+// oldest entry if the cache exceeds maxCreatedCacheEntries to prevent
+// unbounded memory growth on long-running processes.
+func (s *Store) setCreatedCache(id string, created time.Time) {
+	if s == nil {
+		return
+	}
+	if len(s.createdCache) >= maxCreatedCacheEntries {
+		// Evict the first (oldest) entry.
+		for k := range s.createdCache {
+			delete(s.createdCache, k)
+			break
+		}
+	}
+	s.createdCache[id] = created
 }
 
 func (s *Store) dir(workingDir string) string {
@@ -188,7 +210,7 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 	if err := writeFileAtomic(path, data, 0o600); err != nil {
 		return err
 	}
-	s.createdCache[id] = created
+	s.setCreatedCache(id, created)
 	s.saveCount++
 	// Prune every 3 saves to avoid repeated directory scans on every write.
 	if s.saveCount%3 == 0 {
@@ -196,7 +218,8 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 	}
 	// Update index and invalidate in-memory cache.
 	label := sessionLabel(snap.Messages, snap.Label)
-	s.updateIndex(snap.WorkingDir, id, out.Updated, len(snap.Messages), label, snap.Oneshot)
+	rawLabel := llm.FirstUserMessage(snap.Messages)
+	s.updateIndex(snap.WorkingDir, id, out.Updated, len(snap.Messages), label, snap.Oneshot, rawLabel)
 	return nil
 }
 
@@ -241,7 +264,7 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 		return agent.SessionSnapshot{}, err
 	}
 	if s != nil && !f.Created.IsZero() {
-		s.createdCache[id] = f.Created
+		s.setCreatedCache(id, f.Created)
 	}
 
 	// Merge any delta file (messages appended since last full snapshot).
@@ -352,6 +375,20 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 	// Try the metadata index file.
 	idx := s.readIndex(workingDir)
 	if idx != nil && len(idx.Entries) > 0 {
+		// Migration: sessions saved before the RawLabel field existed won't have
+		// it in the index. For those, load the session file to compute it.
+		needsRewrite := false
+		for i, e := range idx.Entries {
+			if e.RawLabel == "" && e.Label != "" {
+				if raw := s.loadRawLabel(workingDir, e.ID); raw != "" {
+					idx.Entries[i].RawLabel = raw
+					needsRewrite = true
+				}
+			}
+		}
+		if needsRewrite {
+			_ = s.writeIndex(workingDir, idx)
+		}
 		sort.Slice(idx.Entries, func(i, j int) bool {
 			return idx.Entries[i].Updated.After(idx.Entries[j].Updated)
 		})
@@ -363,6 +400,7 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 				UpdatedAt:    e.Updated.UTC().Format(time.RFC3339Nano),
 				MessageCount: e.MessageCount,
 				Label:        e.Label,
+				RawLabel:     e.RawLabel,
 			}
 		}
 		listCacheMu.Lock()
@@ -403,6 +441,7 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 			continue
 		}
 		lbl := sessionLabel(f.Messages, f.Label)
+		rawLabel := llm.FirstUserMessage(f.Messages)
 		items = append(items, item{
 			info: agent.SessionInfo{
 				ID:           id,
@@ -410,11 +449,12 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 				UpdatedAt:    f.Updated.UTC().Format(time.RFC3339Nano),
 				MessageCount: len(f.Messages),
 				Label:        lbl,
+				RawLabel:     rawLabel,
 			},
 			updated: f.Updated,
 		})
 		idx.Entries = append(idx.Entries, sessionIndexEntry{
-			ID: id, Updated: f.Updated, Oneshot: f.Oneshot, MessageCount: len(f.Messages), Label: lbl,
+			ID: id, Updated: f.Updated, Oneshot: f.Oneshot, MessageCount: len(f.Messages), Label: lbl, RawLabel: rawLabel,
 		})
 	}
 	// Persist the index for next time (best-effort).
@@ -441,10 +481,28 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 // restored files cannot displace the true latest. Only the updated timestamp
 // is decoded — messages and other fields are skipped for a cheap scan.
 func (s *Store) LatestID(workingDir string) (string, error) {
+	// Fast path: use the metadata index file (avoids reading every session file).
+	idx := s.readIndex(workingDir)
+	if idx != nil && len(idx.Entries) > 0 {
+		var latestID string
+		var latestUpdated time.Time
+		for _, e := range idx.Entries {
+			if e.Updated.After(latestUpdated) {
+				latestUpdated = e.Updated
+				latestID = e.ID
+			}
+		}
+		if latestID != "" {
+			return latestID, nil
+		}
+	}
+
+	// Fallback: scan all session files (legacy directories without index).
 	dir := s.dir(workingDir)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
+			// Already tried index above; nothing more to do.
 			return "", nil
 		}
 		return "", err
@@ -573,6 +631,22 @@ func (s *Store) readIndex(workingDir string) *sessionIndex {
 	return &idx
 }
 
+// loadRawLabel loads a session file and returns the full first user message.
+func (s *Store) loadRawLabel(workingDir, id string) string {
+	data, err := os.ReadFile(s.path(workingDir, id))
+	if err != nil {
+		return ""
+	}
+	var f file
+	if err := json.Unmarshal(data, &f); err != nil {
+		return ""
+	}
+	if len(f.Messages) == 0 {
+		return ""
+	}
+	return llm.FirstUserMessage(f.Messages)
+}
+
 // writeIndex writes the session metadata index atomically.
 func (s *Store) writeIndex(workingDir string, idx *sessionIndex) error {
 	if idx == nil {
@@ -593,7 +667,7 @@ func (s *Store) writeIndex(workingDir string, idx *sessionIndex) error {
 }
 
 // updateIndex adds or updates an entry in the session metadata index.
-func (s *Store) updateIndex(workingDir, id string, updated time.Time, msgCount int, label string, oneshot bool) {
+func (s *Store) updateIndex(workingDir, id string, updated time.Time, msgCount int, label string, oneshot bool, rawLabel string) {
 	if s == nil || !s.enabled {
 		return
 	}
@@ -608,13 +682,14 @@ func (s *Store) updateIndex(workingDir, id string, updated time.Time, msgCount i
 			idx.Entries[i].Oneshot = oneshot
 			idx.Entries[i].MessageCount = msgCount
 			idx.Entries[i].Label = label
+			idx.Entries[i].RawLabel = rawLabel
 			found = true
 			break
 		}
 	}
 	if !found {
 		idx.Entries = append(idx.Entries, sessionIndexEntry{
-			ID: id, Updated: updated, Oneshot: oneshot, MessageCount: msgCount, Label: label,
+			ID: id, Updated: updated, Oneshot: oneshot, MessageCount: msgCount, Label: label, RawLabel: rawLabel,
 		})
 	}
 	_ = s.writeIndex(workingDir, idx)
@@ -672,6 +747,33 @@ func (s *Store) removeFromIndex(workingDir, id string) {
 	_ = s.writeIndex(workingDir, idx)
 }
 
+// removeFromIndexBatch removes multiple entries from the session metadata index
+// in a single pass, rewriting the index file only once.
+func (s *Store) removeFromIndexBatch(workingDir string, ids []string) {
+	if s == nil || !s.enabled || len(ids) == 0 {
+		return
+	}
+	idx := s.readIndex(workingDir)
+	if idx == nil {
+		return
+	}
+	del := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		del[id] = struct{}{}
+	}
+	filtered := make([]sessionIndexEntry, 0, len(idx.Entries))
+	for _, e := range idx.Entries {
+		if _, ok := del[e.ID]; !ok {
+			filtered = append(filtered, e)
+		}
+	}
+	if len(filtered) == len(idx.Entries) {
+		return
+	}
+	idx.Entries = filtered
+	_ = s.writeIndex(workingDir, idx)
+}
+
 // invalidateListCache clears the in-memory list cache for a working directory.
 func (s *Store) invalidateListCache(workingDir string) {
 	listCacheMu.Lock()
@@ -695,33 +797,50 @@ func NewID() string {
 	return fmt.Sprintf("%x", b)
 }
 
-// prune deletes expired and excess sessions, always retaining keepID.
-// Uses file mtimes so it does not need to open or parse any session files.
+// prune deletes expired and excess sessions, always retaining keepID
+// (the current session). Uses the Updated field from the session index or
+// session JSON, not file mtime, to be consistent with LatestID.
+// Deletions are batched so the index is rewritten only once.
 func (s *Store) prune(workingDir, keepID string) {
 	if s == nil || !s.enabled {
 		return
 	}
-	entries, err := os.ReadDir(s.dir(workingDir))
-	if err != nil {
-		return
-	}
+
 	type item struct {
 		id      string
 		updated time.Time
 	}
 	var items []item
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			continue
+
+	// Prefer the metadata index (fast, no per-file I/O).
+	idx := s.readIndex(workingDir)
+	if idx != nil && len(idx.Entries) > 0 {
+		for _, e := range idx.Entries {
+			items = append(items, item{id: e.ID, updated: e.Updated})
 		}
-		info, err := e.Info()
+	} else {
+		// Fallback: read updated from each session JSON file.
+		entries, err := os.ReadDir(s.dir(workingDir))
 		if err != nil {
-			continue
+			return
 		}
-		items = append(items, item{
-			id:      strings.TrimSuffix(e.Name(), ".json"),
-			updated: info.ModTime().UTC(),
-		})
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+				continue
+			}
+			id := strings.TrimSuffix(e.Name(), ".json")
+			data, err := os.ReadFile(s.path(workingDir, id))
+			if err != nil {
+				continue
+			}
+			var meta struct {
+				Updated time.Time `json:"updated"`
+			}
+			if err := json.Unmarshal(data, &meta); err != nil || meta.Updated.IsZero() {
+				continue
+			}
+			items = append(items, item{id: id, updated: meta.Updated.UTC()})
+		}
 	}
 	if len(items) == 0 {
 		return
@@ -736,6 +855,7 @@ func (s *Store) prune(workingDir, keepID string) {
 			otherBudget = 0
 		}
 	}
+	var toDelete []string
 	others := 0
 	for _, it := range items {
 		if it.id == keepID {
@@ -743,9 +863,21 @@ func (s *Store) prune(workingDir, keepID string) {
 		}
 		expired := it.updated.Before(cutoff)
 		if expired || others >= otherBudget {
-			_ = s.Delete(workingDir, it.id)
+			toDelete = append(toDelete, it.id)
 			continue
 		}
 		others++
+	}
+
+	// Batch-delete without rewriting the index per file.
+	for _, id := range toDelete {
+		path := s.path(workingDir, id)
+		_ = os.Remove(path)
+		delete(s.createdCache, id)
+		_ = s.clearDeltaFile(workingDir, id)
+	}
+	if len(toDelete) > 0 {
+		s.removeFromIndexBatch(workingDir, toDelete)
+		s.invalidateListCache(workingDir)
 	}
 }

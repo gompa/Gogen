@@ -8,7 +8,7 @@ import (
 
 // FormatCheck returns a non-empty note when path/content has tree-sitter syntax issues.
 func FormatCheck(path string, content []byte) string {
-	if !Enabled() {
+	if err := guardEnabled(); err != nil {
 		return ""
 	}
 	issues := Check(path, content)
@@ -33,7 +33,7 @@ type Issue struct {
 
 // Check parses content when path has a supported extension.
 func Check(path string, content []byte) []Issue {
-	if !Enabled() {
+	if err := guardEnabled(); err != nil {
 		return nil
 	}
 	return checkSupported(path, content)

@@ -14,8 +14,8 @@ type Reference struct {
 
 // FindSymbolReferences locates identifier occurrences matching symbol in a source file.
 func FindSymbolReferences(path string, content []byte, symbol string) ([]Reference, error) {
-	if !Enabled() {
-		return nil, ErrDisabled
+	if err := guardEnabled(); err != nil {
+		return nil, err
 	}
 	symbol = strings.TrimSpace(symbol)
 	if symbol == "" {

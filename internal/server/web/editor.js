@@ -597,6 +597,7 @@ async function enforceTabCap() {
   while (openOrder.length > GOGEN_UI.maxOpenTabs) {
     let victim = null;
     let oldest = Infinity;
+    // First pass: only consider clean (non-dirty) tabs
     for (const p of openOrder) {
       if (p === activePath) continue;
       if (isDirty(p)) continue;
@@ -605,6 +606,19 @@ async function enforceTabCap() {
       if (t < oldest) {
         oldest = t;
         victim = p;
+      }
+    }
+    // Second pass: if no clean tab can be evicted, fall back to oldest dirty tab
+    if (!victim) {
+      oldest = Infinity;
+      for (const p of openOrder) {
+        if (p === activePath) continue;
+        const b = buffers.get(p);
+        const t = b ? b.lastUsed : 0;
+        if (t < oldest) {
+          oldest = t;
+          victim = p;
+        }
       }
     }
     if (!victim) break;
@@ -1194,6 +1208,19 @@ export function extractDiffValue(rawJSON) {
   return { ok: out.length > 0, value: out };
 }
 
+const DIFF_MIN_HEIGHT = 80;
+const DIFF_MAX_HEIGHT = 400;
+
+/** Resize the container to fit Monaco content, clamped to min/max. */
+function resizeDiffContainer(container, ed) {
+  if (!container || !ed) return;
+  const w = container.clientWidth || 0;
+  if (w <= 0) return;
+  const h = Math.max(DIFF_MIN_HEIGHT, Math.min(DIFF_MAX_HEIGHT, Math.ceil(ed.getContentHeight())));
+  container.style.height = h + 'px';
+  ed.layout({ width: w, height: h });
+}
+
 export async function mountDiffEditor(container, value, opts = {}) {
   await initMonaco();
   // Keep a fallback <pre> so diffs remain visible if Monaco layout/workers fail.
@@ -1230,23 +1257,15 @@ export async function mountDiffEditor(container, value, opts = {}) {
     chatEditors.add(ed);
     applyUnifiedDiffDecorations(ed);
 
-    const layoutFixed = () => {
-      const w = container.clientWidth || host.clientWidth;
-      const h = container.clientHeight || 280;
-      if (w > 0 && h > 0) {
-        ed.layout({ width: w, height: h });
-      }
-    };
-
     // Layout after the tool card has a real width in the flex column.
     requestAnimationFrame(() => {
       try {
-        layoutFixed();
+        resizeDiffContainer(container, ed);
         // Prefer Monaco once it has painted; hide plain fallback.
         if (host.clientWidth > 0 && host.clientHeight > 0) {
           fallback.style.display = 'none';
           host.style.visibility = 'visible';
-          layoutFixed();
+          resizeDiffContainer(container, ed);
         }
       } catch (_) { /* keep fallback visible */ }
     });
@@ -1264,16 +1283,12 @@ export function updateDiffEditor(ed, value) {
   if (model.getValue() === value) return;
   model.setValue(value);
   applyUnifiedDiffDecorations(ed);
-  const line = model.getLineCount();
-  ed.revealLine(line);
+  ed.revealLine(model.getLineCount());
   requestAnimationFrame(() => {
     try {
       const dom = ed.getDomNode();
-      const parent = dom && dom.parentElement;
-      const host = parent && parent.parentElement;
-      const w = (host && host.clientWidth) || (dom && dom.clientWidth) || 0;
-      const h = (host && host.clientHeight) || 280;
-      if (w > 0) ed.layout({ width: w, height: h });
+      const container = dom && dom.parentElement && dom.parentElement.parentElement;
+      resizeDiffContainer(container, ed);
     } catch (_) { /* ignore */ }
   });
 }

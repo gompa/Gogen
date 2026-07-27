@@ -1,11 +1,11 @@
 package tui
 
 import (
-	"sync"
 	"time"
 
 	"gogen/internal/agent"
 	"gogen/internal/llm"
+	"gogen/internal/streamutil"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -68,114 +68,6 @@ type StreamAdapter struct {
 	program *tea.Program
 }
 
-// tokenSeg is one coalesced run of either content or thinking tokens.
-// Adjacent tokens of the same kind are merged; kind switches preserve order.
-type tokenSeg struct {
-	think bool
-	text  string
-}
-
-// tokenBatcher coalesces stream/thinking tokens so the Bubble Tea channel
-// is not flooded with one message per token. Flushes at 32ms intervals.
-// All fields are guarded by mu because AfterFunc runs flush off the stream goroutine.
-//
-// Segments are flushed in arrival order. Flushing all content before all
-// thinking (or the reverse) would reverse interleaved batches and make
-// <thinking> tags appear mid-sentence or as tiny one-word blocks.
-type tokenBatcher struct {
-	mu    sync.Mutex
-	send  func(tea.Msg)
-	segs  []tokenSeg
-	timer *time.Timer // created lazily; always stopped before reuse
-	// closed is set by Close() at stream round end to prevent the
-	// timer goroutine from delivering stale thinking/content tokens
-	// after the thinking block has already been finalized.
-	closed bool
-}
-
-func (b *tokenBatcher) scheduleFlushLocked() {
-	// Lazily create a one-shot timer. Only start a timer if one isn't
-	// already pending. We intentionally do NOT extend the deadline on
-	// subsequent tokens (the old Stop+Reset approach delayed flushes
-	// indefinitely for fast streams). The first token in each batch
-	// sets a fixed 32ms window, guaranteeing at most 32ms of batching
-	// and keeping the UI responsive even when tokens arrive faster
-	// than the flush interval.
-	if b.timer == nil {
-		b.timer = time.AfterFunc(32*time.Millisecond, b.flush)
-	}
-}
-
-func (b *tokenBatcher) flush() {
-	b.mu.Lock()
-	if b.closed {
-		b.mu.Unlock()
-		return
-	}
-	segs := b.segs
-	b.segs = nil
-	if b.timer != nil {
-		b.timer.Stop()
-		b.timer = nil
-	}
-	b.mu.Unlock()
-
-	for _, seg := range segs {
-		if seg.text == "" {
-			continue
-		}
-		if seg.think {
-			b.send(streamThinkingMsg{token: seg.text})
-		} else {
-			b.send(streamTokenMsg{token: seg.text})
-		}
-	}
-}
-
-// Close discards pending segments, stops the timer, and sets the closed
-// flag so that any late-arriving timer goroutine flush is a no-op. Called
-// at stream round end (OnStreamEnd / OnToolCallStart) to prevent stale
-// thinking tokens from creating duplicate <thinking> blocks in the TUI.
-// Callers that need delivery must flush() before Close().
-func (b *tokenBatcher) Close() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.segs = b.segs[:0]
-	b.closed = true
-	if b.timer != nil {
-		b.timer.Stop()
-		b.timer = nil
-	}
-}
-
-func (b *tokenBatcher) appendLocked(think bool, token string) {
-	if token == "" {
-		return
-	}
-	if b.closed {
-		return
-	}
-	n := len(b.segs)
-	if n > 0 && b.segs[n-1].think == think {
-		b.segs[n-1].text += token
-	} else {
-		b.segs = append(b.segs, tokenSeg{think: think, text: token})
-	}
-	b.scheduleFlushLocked()
-}
-
-func (b *tokenBatcher) streamToken(token string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.appendLocked(false, token)
-}
-
-func (b *tokenBatcher) thinkToken(token string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.appendLocked(true, token)
-}
-
 // NewStreamAdapter creates a new StreamAdapter.
 func NewStreamAdapter(p *tea.Program) *StreamAdapter {
 	return &StreamAdapter{program: p}
@@ -183,38 +75,37 @@ func NewStreamAdapter(p *tea.Program) *StreamAdapter {
 
 // Handlers returns a full set of stream handlers that emit tea.Msg values.
 func (s *StreamAdapter) Handlers() *llm.StreamHandlers {
-	batch := &tokenBatcher{send: s.program.Send}
+	tuiSend := func(think bool, text string) {
+		if think {
+			s.program.Send(streamThinkingMsg{token: text})
+		} else {
+			s.program.Send(streamTokenMsg{token: text})
+		}
+	}
+	batch := streamutil.NewTokenBatcher(tuiSend, 32*time.Millisecond)
 
 	return &llm.StreamHandlers{
 		OnStart: func() {
-			batch.mu.Lock()
-			batch.closed = false
-			batch.mu.Unlock()
+			batch.Reset()
 			s.program.Send(streamStartMsg{})
 		},
 		OnRoundStart: func() {
-			batch.mu.Lock()
-			batch.closed = false
-			batch.mu.Unlock()
+			batch.Reset()
 			s.program.Send(streamRoundStartMsg{})
 		},
 		OnThinkingToken: func(token string) {
-			batch.thinkToken(token)
+			batch.ThinkToken(token)
 		},
 		OnToken: func(token string) {
-			batch.streamToken(token)
+			batch.StreamToken(token)
 		},
 		OnStreamEnd: func() {
-			batch.flush()
+			batch.Flush()
 			batch.Close()
 			s.program.Send(streamRoundEndMsg{})
 		},
 		OnToolCallStart: func(index int, id, name string) {
-			// Flush any pending thinking/content tokens before tool calls
-			// reach the TUI.  Without this, batched thinking tokens can
-			// arrive after the tool call message and get silently dropped
-			// by handleStreamThinking's post-tool-call guard.
-			batch.flush()
+			batch.Flush()
 			s.program.Send(streamToolCallMsg{index: index, id: id, name: name})
 		},
 		OnToolCallArgsDelta: func(index int, id, name, argsDelta string) {

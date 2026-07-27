@@ -1,43 +1,34 @@
 package server
 
 import (
-	"sync/atomic"
 	"testing"
+	"time"
+
+	"gogen/internal/streamutil"
 )
 
-func TestWSTokenBatcherFlushReleasesLockBeforeSend(t *testing.T) {
-	var b *wsTokenBatcher
-	var sendSawUnlocked atomic.Bool
-	b = newWSTokenBatcher(func(WSMessage) {
-		// TryLock succeeds only if flush released b.mu before send.
-		if b.mu.TryLock() {
-			sendSawUnlocked.Store(true)
-			b.mu.Unlock()
-		}
-	})
-	b.streamToken("hi")
-	b.flush()
-	if !sendSawUnlocked.Load() {
-		t.Fatal("flush held b.mu across send")
-	}
-}
-
 func TestWSTokenBatcherPreservesThinkThenContentOrder(t *testing.T) {
-	var msgs []WSMessage
-	b := newWSTokenBatcher(func(msg WSMessage) { msgs = append(msgs, msg) })
+	var got []WSMessage
+	b := streamutil.NewTokenBatcher(func(think bool, text string) {
+		if think {
+			got = append(got, WSMessage{Type: "thinking_token", Content: text})
+		} else {
+			got = append(got, WSMessage{Type: "stream", Content: text})
+		}
+	}, 10*time.Millisecond)
 
-	b.thinkToken("Let me ")
-	b.thinkToken("think")
-	b.streamToken("Hello")
-	b.flush()
+	b.ThinkToken("Let me ")
+	b.ThinkToken("think")
+	b.StreamToken("Hello")
+	b.Flush()
 
-	if len(msgs) != 2 {
-		t.Fatalf("got %d msgs, want 2: %#v", len(msgs), msgs)
+	if len(got) != 2 {
+		t.Fatalf("got %d msgs, want 2: %#v", len(got), got)
 	}
-	if msgs[0].Type != "thinking_token" || msgs[0].Content != "Let me think" {
-		t.Fatalf("msg[0] = %#v", msgs[0])
+	if got[0].Type != "thinking_token" || got[0].Content != "Let me think" {
+		t.Fatalf("msg[0] = %#v", got[0])
 	}
-	if msgs[1].Type != "stream" || msgs[1].Content != "Hello" {
-		t.Fatalf("msg[1] = %#v", msgs[1])
+	if got[1].Type != "stream" || got[1].Content != "Hello" {
+		t.Fatalf("msg[1] = %#v", got[1])
 	}
 }

@@ -92,15 +92,15 @@ func (e *Executor) renameWithAST(ctx context.Context, searchRoot, relPrefix, glo
 		// Apply renames
 		re := regexp.MustCompile(`\b` + regexp.QuoteMeta(oldName) + `\b`)
 		lines := strings.Split(string(content), "\n")
-		var linesChanged []int
+		linesChangedSet := make(map[int]struct{})
 
+		// Deduplicate refs by line number so each line is replaced exactly once.
 		for _, ref := range refs {
-			// Replace the symbol at the exact line
 			if ref.Line-1 < len(lines) {
-				oldLine := lines[ref.Line-1]
-				// Use word-boundary replacement (re compiled above)
-				lines[ref.Line-1] = re.ReplaceAllString(oldLine, newName)
-				linesChanged = append(linesChanged, ref.Line)
+				if _, seen := linesChangedSet[ref.Line]; !seen {
+					linesChangedSet[ref.Line] = struct{}{}
+					lines[ref.Line-1] = re.ReplaceAllString(lines[ref.Line-1], newName)
+				}
 			}
 		}
 
@@ -112,6 +112,10 @@ func (e *Executor) renameWithAST(ctx context.Context, searchRoot, relPrefix, glo
 		}
 
 		rel, _ := filepath.Rel(searchRoot, path)
+		var linesChanged []int
+		for line := range linesChangedSet {
+			linesChanged = append(linesChanged, line)
+		}
 		changes = append(changes, FileChange{
 			Path:         filepath.ToSlash(filepath.Join(relPrefix, rel)),
 			LinesChanged: linesChanged,

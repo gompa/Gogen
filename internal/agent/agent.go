@@ -174,17 +174,19 @@ func (a *Agent) persistSession() {
 	if !a.lastPersistTime.IsZero() && time.Since(a.lastPersistTime) < persistMinInterval {
 		return
 	}
-	a.doPersist()
+	a.doPersist(false)
 }
 
 // FlushSession forces an immediate disk write regardless of debounce timing.
 // Use at final boundaries: turn complete, errors, context cancellation, and quit.
+// Skips full re-tokenization so Ctrl+C / --web shutdown stays snappy on large
+// sessions; restored counts are reused when still valid.
 func (a *Agent) FlushSession() {
 	a.sessionDirty = true
 	if a.SessionStore == nil || a.SessionID == "" {
 		return
 	}
-	a.doPersist()
+	a.doPersist(true)
 }
 
 // doPersist is the actual write — called by persistSession/flushSession.
@@ -194,12 +196,18 @@ func (a *Agent) FlushSession() {
 // It uses incremental delta saves when only a few messages have been added
 // since the last full snapshot, avoiding full JSON serialization of the
 // entire conversation history on every 5-second debounce tick.
-func (a *Agent) doPersist() {
+// When skipTokenCounts is true (FlushSession), avoid cl100k re-tokenization.
+func (a *Agent) doPersist(skipTokenCounts bool) {
 	if !a.sessionDirty {
 		return
 	}
 	if a.SessionStore == nil || a.SessionID == "" {
 		return
+	}
+	// Invalidate cached token counts if message count changed (append,
+	// compaction, etc.) — the length check below will force re-counting.
+	if a.restoredTokenCounts != nil && len(a.restoredTokenCounts) != len(a.Messages) {
+		a.restoredTokenCounts = nil
 	}
 
 	count := len(a.Messages)
@@ -230,7 +238,9 @@ func (a *Agent) doPersist() {
 			Todos:          todoSnapshot(a.TodoManager),
 			Messages:       msgs,
 		}
-		if a.Context != nil {
+		if len(a.restoredTokenCounts) == len(msgs) {
+			snap.TokenCounts = append([]int(nil), a.restoredTokenCounts...)
+		} else if a.Context != nil && !skipTokenCounts {
 			snap.TokenCounts = a.Context.TokenCounts(msgs)
 		}
 		if err := a.SessionStore.Save(a.SessionID, snap); err != nil {
@@ -244,7 +254,7 @@ func (a *Agent) doPersist() {
 		// Incremental: only serialise new messages since the last full save.
 		newMsgs := a.Messages[a.lastSavedMsgCount:]
 		var newCounts []int
-		if a.Context != nil {
+		if a.Context != nil && !skipTokenCounts {
 			newCounts = make([]int, len(newMsgs))
 			for i := range newMsgs {
 				newCounts[i] = contextmgr.ComputeMessageTokens(newMsgs[i])
@@ -262,6 +272,7 @@ func (a *Agent) doPersist() {
 			a.lastPersistErr = err
 			return
 		}
+		a.lastSavedMsgCount = count
 	}
 
 	a.lastPersistErr = nil
@@ -509,6 +520,7 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 	for first := true; ; first = false {
 		if ctx.Err() != nil {
 			finishStreamUI(h)
+			a.RepairOrphanToolCalls()
 			a.FlushSession()
 			return "", ctx.Err()
 		}
@@ -519,10 +531,19 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 		} else if !first && h.OnRoundStart != nil {
 			h.OnRoundStart()
 		}
+		if ctx.Err() != nil {
+			finishStreamUI(h)
+			a.RepairOrphanToolCalls()
+			a.FlushSession()
+			return "", ctx.Err()
+		}
 
 		result, err := a.Provider.GenerateResponseStream(ctx, view, a.AllowedToolNames(), a.llmTools(), h)
 		if err != nil {
 			finishStreamUI(h)
+			if ctx.Err() != nil {
+				a.RepairOrphanToolCalls()
+			}
 			a.FlushSession()
 			return "", err
 		}
@@ -621,6 +642,47 @@ func (a *Agent) appendCanceledToolResults(toolCalls []llm.ToolCall) {
 	for _, tc := range toolCalls {
 		a.appendToolResult(tc, msg)
 	}
+}
+
+// RepairOrphanToolCalls appends cancelled tool-result placeholders for any
+// trailing assistant tool_calls that lack matching tool messages. Call on
+// cancel/shutdown so the next turn keeps a valid tool-call/result protocol.
+// Returns true when messages were modified.
+func (a *Agent) RepairOrphanToolCalls() bool {
+	if a == nil || len(a.Messages) == 0 {
+		return false
+	}
+	modified := false
+	for i := len(a.Messages) - 1; i >= 0; i-- {
+		msg := a.Messages[i]
+		if msg.Role == "tool" {
+			continue
+		}
+		if msg.Role != "assistant" || len(msg.ToolCalls) == 0 {
+			continue
+		}
+		have := make(map[string]struct{})
+		for j := i + 1; j < len(a.Messages); j++ {
+			if a.Messages[j].Role != "tool" {
+				break
+			}
+			if id := a.Messages[j].ToolCallID; id != "" {
+				have[id] = struct{}{}
+			}
+		}
+		var missing []llm.ToolCall
+		for _, tc := range msg.ToolCalls {
+			if _, ok := have[tc.ID]; !ok {
+				missing = append(missing, tc)
+			}
+		}
+		if len(missing) == 0 {
+			continue
+		}
+		a.appendCanceledToolResults(missing)
+		modified = true
+	}
+	return modified
 }
 
 func stringArg(args map[string]interface{}, key string) (string, error) {

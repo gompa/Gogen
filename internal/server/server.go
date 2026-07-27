@@ -20,6 +20,7 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/llm"
 	sesspkg "gogen/internal/session"
+	"gogen/internal/streamutil"
 
 	"github.com/gorilla/websocket"
 )
@@ -45,7 +46,8 @@ const (
 	wsWriteTimeout    = 30 * time.Second
 	wsReadTimeout     = 60 * time.Second
 	wsTurnAcquireWait = 150 * time.Millisecond
-	wsStreamDrainWait = 45 * time.Second
+	// UI cancel: wait briefly for StreamProcessInput to finish cancel repair.
+	wsStreamDrainWait = 2 * time.Second
 )
 
 func drainStreamErr(ch chan error) {
@@ -188,14 +190,19 @@ type Server struct {
 	authToken      string
 	tlsCertFile    string
 	tlsKeyFile     string
+	wsConnsMu      sync.Mutex
+	wsConns        []*websocket.Conn
 	connLimiter    *rateLimitState
 	upgradeLimiter *ipLimiter
 }
 
 type ModelEntry struct {
-	ID           string `json:"id"`
-	ContextLimit int    `json:"contextLimit,omitempty"`
-	Current      bool   `json:"current,omitempty"`
+	ID               string  `json:"id"`
+	ContextLimit     int     `json:"contextLimit,omitempty"`
+	Current          bool    `json:"current,omitempty"`
+	InputPricePer1M  float64 `json:"inputPricePer1M,omitempty"`
+	OutputPricePer1M float64 `json:"outputPricePer1M,omitempty"`
+	CachedPricePer1M float64 `json:"cachedPricePer1M,omitempty"`
 }
 
 type SessionEntry struct {
@@ -205,6 +212,8 @@ type SessionEntry struct {
 	Label        string `json:"label,omitempty"`
 	Oneshot      bool   `json:"oneshot,omitempty"`
 	Current      bool   `json:"current,omitempty"`
+	// RawLabel is the full first user message (untruncated) for tooltip display.
+	RawLabel string `json:"rawLabel,omitempty"`
 }
 
 type HistoryToolCall struct {
@@ -224,39 +233,49 @@ type HistoryEntry struct {
 }
 
 type WSMessage struct {
-	Type             string                 `json:"type"`
-	Content          string                 `json:"content,omitempty"`
-	Tool             string                 `json:"tool,omitempty"`
-	ToolCallID       string                 `json:"toolCallId,omitempty"`
-	Index            int                    `json:"index,omitempty"`
-	ArgsDelta        string                 `json:"argsDelta,omitempty"`
-	Args             map[string]interface{} `json:"args,omitempty"`
-	Result           string                 `json:"result,omitempty"`
-	Success          bool                   `json:"success,omitempty"`
-	ResultTruncated  bool                   `json:"resultTruncated,omitempty"`
-	WorkingDir       string                 `json:"workingDir,omitempty"`
-	Model            string                 `json:"model,omitempty"`
-	ContextLimit     int                    `json:"contextLimit,omitempty"`
-	UsedTokens       int                    `json:"usedTokens,omitempty"`
-	UsedSource       string                 `json:"usedSource,omitempty"`
-	PromptTokens     int                    `json:"promptTokens,omitempty"`
-	CompletionTokens int                    `json:"completionTokens,omitempty"`
-	CachedTokens     int                    `json:"cachedTokens,omitempty"`
-	CompactAt        int                    `json:"compactAt,omitempty"`
-	MessageCount     int                    `json:"messageCount,omitempty"`
-	NearCompact      bool                   `json:"nearCompact,omitempty"`
-	UsedPercent      float64                `json:"usedPercent,omitempty"`
-	ToolTruncated    bool                   `json:"toolTruncated,omitempty"`
-	Models           []ModelEntry           `json:"models,omitempty"`
-	ApprovalID       string                 `json:"approvalId,omitempty"`
-	Approved         bool                   `json:"approved,omitempty"`
-	Paths            []string               `json:"paths,omitempty"`
-	Reason           string                 `json:"reason,omitempty"`
-	Mode             string                 `json:"mode,omitempty"`
-	SessionID        string                 `json:"sessionId,omitempty"`
-	SessionAction    string                 `json:"sessionAction,omitempty"`
-	Sessions         []SessionEntry         `json:"sessions,omitempty"`
-	History          []HistoryEntry         `json:"history,omitempty"`
+	Type            string                 `json:"type"`
+	Content         string                 `json:"content,omitempty"`
+	Tool            string                 `json:"tool,omitempty"`
+	ToolCallID      string                 `json:"toolCallId,omitempty"`
+	Index           int                    `json:"index,omitempty"`
+	ArgsDelta       string                 `json:"argsDelta,omitempty"`
+	Args            map[string]interface{} `json:"args,omitempty"`
+	Result          string                 `json:"result,omitempty"`
+	Success         bool                   `json:"success,omitempty"`
+	ResultTruncated bool                   `json:"resultTruncated,omitempty"`
+	WorkingDir      string                 `json:"workingDir,omitempty"`
+	Model           string                 `json:"model,omitempty"`
+	// Pricing for the current model (USD per 1M tokens), populated from models.dev cache.
+	InputPricePer1M  float64 `json:"inputPricePer1M,omitempty"`
+	OutputPricePer1M float64 `json:"outputPricePer1M,omitempty"`
+	CachedPricePer1M float64 `json:"cachedPricePer1M,omitempty"`
+	ContextLimit     int     `json:"contextLimit,omitempty"`
+	UsedTokens       int     `json:"usedTokens,omitempty"`
+	UsedSource       string  `json:"usedSource,omitempty"`
+	PromptTokens     int     `json:"promptTokens,omitempty"`
+	CompletionTokens int     `json:"completionTokens,omitempty"`
+	CachedTokens     int     `json:"cachedTokens,omitempty"`
+	CompactAt        int     `json:"compactAt,omitempty"`
+	MessageCount     int     `json:"messageCount,omitempty"`
+	NearCompact      bool    `json:"nearCompact,omitempty"`
+	UsedPercent      float64 `json:"usedPercent,omitempty"`
+	ToolTruncated    bool    `json:"toolTruncated,omitempty"`
+	// Accumulated session usage
+	TotalPromptTokens     int            `json:"totalPromptTokens,omitempty"`
+	TotalCompletionTokens int            `json:"totalCompletionTokens,omitempty"`
+	TotalCachedTokens     int            `json:"totalCachedTokens,omitempty"`
+	TotalTurns            int            `json:"totalTurns,omitempty"`
+	Models                []ModelEntry   `json:"models,omitempty"`
+	ApprovalID            string         `json:"approvalId,omitempty"`
+	Approved              bool           `json:"approved,omitempty"`
+	Paths                 []string       `json:"paths,omitempty"`
+	Reason                string         `json:"reason,omitempty"`
+	Mode                  string         `json:"mode,omitempty"`
+	GlobalMode            bool           `json:"globalMode,omitempty"`
+	SessionID             string         `json:"sessionId,omitempty"`
+	SessionAction         string         `json:"sessionAction,omitempty"`
+	Sessions              []SessionEntry `json:"sessions,omitempty"`
+	History               []HistoryEntry `json:"history,omitempty"`
 	// Filesystem / git editor APIs
 	Path        string              `json:"path,omitempty"`
 	Pattern     string              `json:"pattern,omitempty"`
@@ -315,7 +334,7 @@ func (s *Server) wsUpgrader() websocket.Upgrader {
 	}
 }
 
-func applyContextStats(msg *WSMessage, stats agent.TurnContext) {
+func applyContextStats(msg *WSMessage, stats agent.TurnContext, accum *agent.UsageAccumulator) {
 	snap := stats.Snapshot
 	if snap.Limit > 0 {
 		msg.ContextLimit = snap.Limit
@@ -340,6 +359,12 @@ func applyContextStats(msg *WSMessage, stats agent.TurnContext) {
 	if snap.Limit > 0 {
 		msg.UsedPercent = snap.Percent
 	}
+	if accum != nil {
+		msg.TotalPromptTokens = accum.TotalPromptTokens
+		msg.TotalCompletionTokens = accum.TotalCompletionTokens
+		msg.TotalCachedTokens = accum.TotalCachedTokens
+		msg.TotalTurns = accum.TotalTurns
+	}
 }
 
 // agentConfigMsgBasic returns config fields that are cheap to read.
@@ -351,6 +376,7 @@ func (s *Server) agentConfigMsgBasic() WSMessage {
 		WorkingDir: s.agent.Executor.GetWorkingDir(),
 		Model:      s.agent.CurrentModel(),
 		Mode:       s.agent.Mode.String(),
+		GlobalMode: s.agent.GlobalMode,
 		SessionID:  s.agent.SessionID,
 	}
 }
@@ -362,8 +388,22 @@ func (s *Server) agentConfigMsg(ctx context.Context) WSMessage {
 	s.lockAgentRead(func() {
 		msg = s.agentConfigMsgBasic()
 	})
-	applyContextStats(&msg, s.agent.ContextStats(ctx))
+	s.fillModelPricing(ctx, &msg)
+	accum := s.agent.UsageAccum
+	applyContextStats(&msg, s.agent.ContextStats(ctx), &accum)
 	return msg
+}
+
+// fillModelPricing looks up pricing for the current model from the models.dev
+// registry cache (never blocks — pure map lookup).
+func (s *Server) fillModelPricing(_ context.Context, msg *WSMessage) {
+	if p, ok := s.agent.Provider.(*llm.OpenAIProvider); ok && msg.Model != "" {
+		if in, out, cached, ok := p.ModelPricing(msg.Model); ok {
+			msg.InputPricePer1M = in
+			msg.OutputPricePer1M = out
+			msg.CachedPricePer1M = cached
+		}
+	}
 }
 
 func sessionEntries(list []agent.SessionInfo, currentID string) []SessionEntry {
@@ -375,6 +415,7 @@ func sessionEntries(list []agent.SessionInfo, currentID string) []SessionEntry {
 			MessageCount: s.MessageCount,
 			Label:        s.Label,
 			Oneshot:      s.Oneshot,
+			RawLabel:     s.RawLabel,
 			Current:      s.ID == currentID,
 		}
 	}
@@ -466,9 +507,11 @@ func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, resu
 		_ = ws.writeJSON(WSMessage{Type: "history", History: historyEntries(history)})
 	}
 	stats := s.agent.ContextStats(ctx)
-	applyContextStats(&cfg, stats)
+	accum := s.agent.UsageAccum
+	applyContextStats(&cfg, stats, &accum)
+	s.fillModelPricing(ctx, &cfg)
 	ctxMsg := WSMessage{Type: "context"}
-	applyContextStats(&ctxMsg, stats)
+	applyContextStats(&ctxMsg, stats, &accum)
 	_ = ws.writeJSON(ctxMsg)
 	_ = ws.writeJSON(cfg)
 }
@@ -477,7 +520,8 @@ func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, resu
 // agentMu — ContextStats tokenizes the full history view.
 func (s *Server) contextMsg(ctx context.Context) WSMessage {
 	msg := WSMessage{Type: "context"}
-	applyContextStats(&msg, s.agent.ContextStats(ctx))
+	accum := s.agent.UsageAccum
+	applyContextStats(&msg, s.agent.ContextStats(ctx), &accum)
 	return msg
 }
 
@@ -485,9 +529,12 @@ func (s *Server) modelEntries(models []llm.ModelInfo) []ModelEntry {
 	out := make([]ModelEntry, len(models))
 	for i, m := range models {
 		out[i] = ModelEntry{
-			ID:           m.ID,
-			ContextLimit: m.ContextLimit,
-			Current:      m.Current,
+			ID:               m.ID,
+			ContextLimit:     m.ContextLimit,
+			Current:          m.Current,
+			InputPricePer1M:  m.InputPricePer1M,
+			OutputPricePer1M: m.OutputPricePer1M,
+			CachedPricePer1M: m.CachedPricePer1M,
 		}
 	}
 	return out
@@ -517,6 +564,8 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
+	s.registerWSConn(conn)
+	defer s.unregisterWSConn(conn)
 	// Pong handler extends the read deadline whenever the browser replies to
 	// our pings. If the client stops responding (tab closed, network gone),
 	// the read deadline elapses, ReadJSON fails, and HandleWS tears down —
@@ -549,10 +598,10 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 		_ = ws.writeJSON(WSMessage{Type: "history", History: historyEntries(msgs)})
 	}
 
-	// Compute context stats asynchronously so the client can start
-	// painting history immediately.  Tokenization runs without agentMu.
+	// Send full config with context stats and pricing asynchronously so the
+	// client can start painting history immediately. Tokenization runs without agentMu.
 	go func() {
-		_ = ws.writeJSON(s.contextMsg(r.Context()))
+		_ = ws.writeJSON(s.agentConfigMsg(r.Context()))
 	}()
 
 	incoming := make(chan WSMessage, 8)
@@ -637,6 +686,24 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			s.turnMu.Unlock()
 			s.writeSessionCommandResult(ws, r.Context(), result, err)
 			continue
+		case "session_delete":
+			stream.cancelInFlight()
+			if !s.tryAcquireTurn(wsTurnAcquireWait) {
+				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+				continue
+			}
+			id := strings.TrimSpace(msg.SessionID)
+			if id == "" {
+				s.turnMu.Unlock()
+				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: sessionId is required"})
+				continue
+			}
+			var result agent.SessionCommandResult
+			var err error
+			result, _, err = s.agent.HandleSessionCommand(r.Context(), "resume del "+id, sesspkg.NewID())
+			s.turnMu.Unlock()
+			s.writeSessionCommandResult(ws, r.Context(), result, err)
+			continue
 		case "cancel":
 			stream.cancelInFlight()
 			continue
@@ -689,7 +756,8 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			})
 			if modeHandled {
 				s.turnMu.Unlock()
-				applyContextStats(&modeCfg, s.agent.ContextStats(r.Context()))
+				accum := s.agent.UsageAccum
+				applyContextStats(&modeCfg, s.agent.ContextStats(r.Context()), &accum)
 				_ = ws.writeJSON(modeCfg)
 				_ = ws.writeJSON(WSMessage{Type: "response", Content: modeOut})
 				continue
@@ -738,9 +806,13 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// Transfer turnMu ownership to the stream goroutine (do not Unlock here).
-			streamCtx, cancel := context.WithCancel(r.Context())
-			errCh := stream.begin(cancel)
-			go func(content string, ctx context.Context, cancel context.CancelFunc, done chan error) {
+			// Two contexts: streamCtx for the outer goroutine (cleanup/logging),
+			// llmCtx for the LLM call itself. close() cancels only llmCtx so the
+			// outer goroutine's deferred cleanup always runs.
+			streamCtx, streamCancel := context.WithCancel(r.Context())
+			llmCtx, llmCancel := context.WithCancel(streamCtx)
+			errCh := stream.begin(streamCancel, llmCancel)
+			go func(content string, llmCtx context.Context, done chan error) {
 				defer stream.end()
 				defer func() { done <- nil }()
 				defer s.turnMu.Unlock()
@@ -748,7 +820,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 					// Always notify the client the turn is over (success, error, or cancel).
 					_ = ws.writeJSON(WSMessage{Type: "turn_end"})
 				}()
-				ctx = agent.ContextWithDeleteApprover(ctx, session.deleteApprover())
+				ctx := agent.ContextWithDeleteApprover(llmCtx, session.deleteApprover())
 				var writeFailed atomic.Bool
 				failWrite := sync.Once{}
 				write := func(v WSMessage) {
@@ -760,33 +832,50 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 						// the LLM and tear down so the browser reconnects.
 						writeFailed.Store(true)
 						failWrite.Do(func() {
-							cancel()
+							llmCancel()
 							_ = ws.conn.Close()
 						})
 						return
 					}
 				}
-				tokens := newWSTokenBatcher(write)
+				tokens := streamutil.NewTokenBatcher(func(think bool, text string) {
+					if think {
+						write(WSMessage{Type: "thinking_token", Content: text})
+					} else {
+						write(WSMessage{Type: "stream", Content: text})
+					}
+				}, wsTokenFlushInterval)
 
 				handlers := &llm.StreamHandlers{
 					OnStart: func() {
+						// Thinking first so the UI arms immediately; skip the
+						// context probe when already cancelled so interrupt
+						// reaches appendCanceledToolResults promptly.
 						write(WSMessage{Type: "thinking"})
+						if ctx.Err() != nil {
+							return
+						}
+						write(s.contextMsg(ctx))
 					},
 					OnRoundStart: func() {
 						write(WSMessage{Type: "thinking"})
+						if ctx.Err() != nil {
+							return
+						}
+						write(s.contextMsg(ctx))
 					},
 					OnStreamOpened: func() {
 						write(WSMessage{Type: "waiting"})
 					},
 					OnStreamActivity: func() {},
-					OnThinkingToken:  tokens.thinkToken,
-					OnToken:          tokens.streamToken,
+					OnThinkingToken:  tokens.ThinkToken,
+					OnToken:          tokens.StreamToken,
 					OnStreamEnd: func() {
-						tokens.flush()
+						tokens.Flush()
 						write(WSMessage{Type: "stream_end"})
 					},
 					OnToolCallStart: func(index int, id, name string) {
-						tokens.flush()
+						tokens.Flush()
 						write(WSMessage{
 							Type:       "tool_call_start",
 							Tool:       name,
@@ -798,7 +887,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 						// Flush pending thinking/content tokens before
 						// tool call args reach the client, so the web UI
 						// renders the thinking block before the tool card.
-						tokens.flush()
+						tokens.Flush()
 						write(WSMessage{
 							Type:       "tool_call_delta",
 							Tool:       name,
@@ -808,7 +897,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 						})
 					},
 					OnToolCall: func(tc llm.ToolCall) {
-						tokens.flush()
+						tokens.Flush()
 						write(WSMessage{
 							Type:       "tool_call",
 							Tool:       tc.Name,
@@ -855,13 +944,13 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 				}
 				if err != nil {
 					if ctx.Err() != nil {
-						tokens.flush()
+						tokens.Flush()
 						if !writeFailed.Load() {
 							_ = ws.writeJSON(WSMessage{Type: "cancelled", Content: "Cancelled."})
 						}
 						return
 					}
-					tokens.flush()
+					tokens.Flush()
 					write(WSMessage{Type: "stream_end"})
 					write(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", err)})
 					log.Printf("stream error: %v", err)
@@ -870,10 +959,10 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 				if persistErr != nil {
 					write(WSMessage{Type: "response", Content: fmt.Sprintf("Warning: failed to save session: %v", persistErr)})
 				}
-				tokens.flush()
+				tokens.Flush()
 				write(WSMessage{Type: "stream_end"})
 				write(ctxMsg)
-			}(msg.Content, streamCtx, cancel, errCh)
+			}(msg.Content, llmCtx, errCh)
 			// Do not block here — keep reading so delete_approval_response can complete.
 			continue
 		case "list_models":
@@ -931,7 +1020,8 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			})
 			s.turnMu.Unlock()
 			if modeSet {
-				applyContextStats(&cfg, s.agent.ContextStats(r.Context()))
+				accum := s.agent.UsageAccum
+				applyContextStats(&cfg, s.agent.ContextStats(r.Context()), &accum)
 				_ = ws.writeJSON(cfg)
 			}
 			continue
@@ -961,7 +1051,8 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			// them off agentMu so WS connect/history readers are not stalled.
 			s.agent.AfterWorkingDirChange()
 			s.turnMu.Unlock()
-			applyContextStats(&cfg, s.agent.ContextStats(r.Context()))
+			accum := s.agent.UsageAccum
+			applyContextStats(&cfg, s.agent.ContextStats(r.Context()), &accum)
 			_ = ws.writeJSON(WSMessage{Type: "config", WorkingDir: absDir, Model: cfg.Model, ContextLimit: cfg.ContextLimit, UsedTokens: cfg.UsedTokens, UsedSource: cfg.UsedSource, UsedPercent: cfg.UsedPercent, CompactAt: cfg.CompactAt, MessageCount: cfg.MessageCount, NearCompact: cfg.NearCompact, ToolTruncated: cfg.ToolTruncated, Mode: cfg.Mode})
 		}
 	}
@@ -1099,8 +1190,9 @@ func (s *Server) checkAuth(r *http.Request) bool {
 }
 
 // Start serves the web UI until ctx is cancelled or the listener fails.
-// On cancel it gracefully shuts down the HTTP server so callers can flush
-// session state (e.g. Ctrl+C / SIGTERM in --web mode).
+// On cancel it force-closes WebSockets and the HTTP listener so shutdown
+// is not blocked by hijacked connections, then returns so the caller can
+// FlushSession (Ctrl+C / SIGTERM in --web mode).
 func (s *Server) Start(ctx context.Context, addr string) error {
 	if !IsLoopbackBind(addr) {
 		if s.authToken == "" {
@@ -1131,16 +1223,21 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 		errCh <- err
 	}()
 
+	s.trackHTTPServer(srv)
+	defer s.untrackHTTPServer()
+
 	select {
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
-		err := <-errCh
-		if err == nil || errors.Is(err, http.ErrServerClosed) {
+		s.ForceClose()
+		select {
+		case err := <-errCh:
+			if err == nil || errors.Is(err, http.ErrServerClosed) {
+				return nil
+			}
+			return err
+		case <-time.After(100 * time.Millisecond):
 			return nil
 		}
-		return err
 	case err := <-errCh:
 		if err == nil || errors.Is(err, http.ErrServerClosed) {
 			return nil
@@ -1167,5 +1264,47 @@ func IsLoopbackBind(addr string) bool {
 	default:
 		ip := net.ParseIP(strings.Trim(host, "[]"))
 		return ip != nil && ip.IsLoopback()
+	}
+}
+
+// registerWSConn adds conn to the tracked set so the server can close it
+// on graceful shutdown.
+func (s *Server) registerWSConn(conn *websocket.Conn) {
+	s.wsConnsMu.Lock()
+	s.wsConns = append(s.wsConns, conn)
+	s.wsConnsMu.Unlock()
+}
+
+// unregisterWSConn removes conn from the tracked set so shutdown does not
+// close a connection that has already been cleaned up.
+func (s *Server) unregisterWSConn(conn *websocket.Conn) {
+	s.wsConnsMu.Lock()
+	defer s.wsConnsMu.Unlock()
+	for i, c := range s.wsConns {
+		if c == conn {
+			s.wsConns = append(s.wsConns[:i], s.wsConns[i+1:]...)
+			return
+		}
+	}
+}
+
+// closeWSConns force-closes all tracked WebSocket connections. Safe to call
+// concurrently with register/unregister. Never blocks on a single conn.
+func (s *Server) closeWSConns() {
+	s.wsConnsMu.Lock()
+	conns := s.wsConns
+	s.wsConns = nil
+	s.wsConnsMu.Unlock()
+	now := time.Now()
+	for _, conn := range conns {
+		if conn == nil {
+			continue
+		}
+		c := conn
+		go func() {
+			_ = c.SetReadDeadline(now)
+			_ = c.SetWriteDeadline(now)
+			_ = c.Close()
+		}()
 	}
 }
