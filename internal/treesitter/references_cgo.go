@@ -53,13 +53,13 @@ var refsQueries = map[string]string{
 (variable_name) @ref`,
 	"ruby": `(identifier) @ref
 (constant) @ref`,
-	"bash": `(word) @ref`,
-	"lua":  `(identifier) @ref`,
-	"hcl":  `(identifier) @ref`,
+	"bash":   `(word) @ref`,
+	"lua":    `(identifier) @ref`,
+	"hcl":    `(identifier) @ref`,
 	"kotlin": `(identifier) @ref`,
-	"scala": `(identifier) @ref`,
-	"sql": `(object_reference) @ref`,
-	"zig": `(identifier) @ref`,
+	"scala":  `(identifier) @ref`,
+	"sql":    `(object_reference) @ref`,
+	"zig":    `(identifier) @ref`,
 }
 
 func refsQueryForLang(langName string) (*tree_sitter.Query, error) {

@@ -9,8 +9,9 @@ import (
 	"sync"
 	"unsafe"
 
-	tree_sitter_kotlin "github.com/tree-sitter-grammars/tree-sitter-kotlin/bindings/go"
+	tree_sitter_dockerfile "github.com/gortexhq/tree-sitter-dockerfile/bindings/go"
 	tree_sitter_hcl "github.com/tree-sitter-grammars/tree-sitter-hcl/bindings/go"
+	tree_sitter_kotlin "github.com/tree-sitter-grammars/tree-sitter-kotlin/bindings/go"
 	tree_sitter_lua "github.com/tree-sitter-grammars/tree-sitter-lua/bindings/go"
 	tree_sitter_make "github.com/tree-sitter-grammars/tree-sitter-make/bindings/go"
 	tree_sitter_toml "github.com/tree-sitter-grammars/tree-sitter-toml/bindings/go"
@@ -22,9 +23,7 @@ import (
 	tree_sitter_c "github.com/tree-sitter/tree-sitter-c/bindings/go"
 	tree_sitter_cpp "github.com/tree-sitter/tree-sitter-cpp/bindings/go"
 	tree_sitter_css "github.com/tree-sitter/tree-sitter-css/bindings/go"
-	tree_sitter_dockerfile "github.com/gortexhq/tree-sitter-dockerfile/bindings/go"
 	tree_sitter_go "github.com/tree-sitter/tree-sitter-go/bindings/go"
-	tree_sitter_sql "github.com/wippyai/tree-sitter-sql/bindings/go"
 	tree_sitter_html "github.com/tree-sitter/tree-sitter-html/bindings/go"
 	tree_sitter_java "github.com/tree-sitter/tree-sitter-java/bindings/go"
 	tree_sitter_javascript "github.com/tree-sitter/tree-sitter-javascript/bindings/go"
@@ -35,6 +34,7 @@ import (
 	tree_sitter_rust "github.com/tree-sitter/tree-sitter-rust/bindings/go"
 	tree_sitter_scala "github.com/tree-sitter/tree-sitter-scala/bindings/go"
 	tree_sitter_typescript "github.com/tree-sitter/tree-sitter-typescript/bindings/go"
+	tree_sitter_sql "github.com/wippyai/tree-sitter-sql/bindings/go"
 )
 
 type langSpec struct {
