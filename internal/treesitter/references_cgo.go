@@ -95,7 +95,9 @@ func findSymbolReferences(path string, content []byte, symbol string) ([]Referen
 	p := parserPool.Get().(*tree_sitter.Parser)
 	defer parserPool.Put(p)
 	parser := p
-	parser.SetLanguage(lang)
+	if err := parser.SetLanguage(lang); err != nil {
+		return nil, fmt.Errorf("set language %s: %w", langName, err)
+	}
 
 	tree := parser.Parse(content, nil)
 	if tree == nil {

@@ -1857,7 +1857,7 @@
                 text += ` (${pct}%)`;
             }
             if (source) text += ` · ${source}`;
-            if (data.messageCount > 0) text += ` · ${data.messageCount} msgs`;
+            if (data.messageCount > 0) text += `\n${data.messageCount} msgs`;
             // near-compact & tool-truncated indicators removed to avoid context stats height oscillation
             // causing layout jumps (used to be: if (data.nearCompact) text += '\nnear auto-compact';)
             // if (data.toolTruncated) text += '\nTool results truncated'; — removed for same reason
@@ -1904,6 +1904,7 @@
 
             if (data.sessionId) {
                 sessionInfoDiv.textContent = data.sessionId;
+                updateCurrentSessionLabel(data.sessionLabel);
             }
             // Refresh explorer when working dir changes
             if (document.getElementById('editor-pane').classList.contains('active')) {
@@ -3018,6 +3019,7 @@
                     applyServerConfig(data);
                 } else if (data.type === 'context') {
                     updateContextInfo(data);
+                    updateCurrentSessionLabel(data.sessionLabel);
                 } else if (data.type === 'delete_approval') {
                     showDeleteApproval(data);
                 }
@@ -3208,6 +3210,22 @@
                 row.appendChild(delBtn);
                 sessionListDiv.appendChild(row);
             }
+        }
+
+        /**
+         * Update the current session row's title in the sidebar without
+         * re-rendering the entire list.
+         */
+        function updateCurrentSessionLabel(label) {
+            if (!label || !sessionListDiv) return;
+            const currentRow = sessionListDiv.querySelector('.session-row.current');
+            if (!currentRow) return;
+            const titleEl = currentRow.querySelector('.session-row-title');
+            if (!titleEl) return;
+            if (titleEl.textContent === label) return; // already up-to-date
+            titleEl.textContent = label;
+            // Also update the row's tooltip with the label.
+            currentRow.title = label;
         }
 
         function newSession() {

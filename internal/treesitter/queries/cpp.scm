@@ -1,3 +1,7 @@
 (function_definition declarator: (function_declarator declarator: (identifier) @name.function))
 (class_specifier name: (type_identifier) @name.class)
 (struct_specifier name: (type_identifier) @name.struct)
+(enum_specifier name: (type_identifier) @name.enum)
+(template_declaration (class_specifier name: (type_identifier) @name.class))
+(template_declaration (struct_specifier name: (type_identifier) @name.struct))
+(declaration (function_declarator declarator: (identifier) @name.function))

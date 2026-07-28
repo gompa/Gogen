@@ -89,7 +89,9 @@ func listDefinitions(path string, content []byte) ([]Definition, error) {
 	p := parserPool.Get().(*tree_sitter.Parser)
 	defer parserPool.Put(p)
 	parser := p
-	parser.SetLanguage(lang)
+	if err := parser.SetLanguage(lang); err != nil {
+		return nil, fmt.Errorf("set language %s: %w", langName, err)
+	}
 
 	tree := parser.Parse(content, nil)
 	if tree == nil {
@@ -120,6 +122,9 @@ func listDefinitions(path string, content []byte) ([]Definition, error) {
 			}
 			kind := strings.TrimPrefix(captureName, "name.")
 			name := strings.TrimSpace(cap.Node.Utf8Text(content))
+			if langName == "ruby" {
+				name = strings.TrimPrefix(name, ":")
+			}
 			if name == "" {
 				continue
 			}

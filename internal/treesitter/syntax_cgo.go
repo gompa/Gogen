@@ -3,6 +3,7 @@
 package treesitter
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -56,8 +57,8 @@ func bundledSpecs() []langSpec {
 		{name: "c", exts: []string{"c", "h"}, ptrFn: tree_sitter_c.Language},
 		{name: "cpp", exts: []string{"cpp", "cc", "cxx", "hpp", "hh", "hxx"}, ptrFn: tree_sitter_cpp.Language},
 		{name: "csharp", exts: []string{"cs"}, ptrFn: tree_sitter_c_sharp.Language},
-		{name: "php", exts: []string{"php"}, ptrFn: tree_sitter_php.LanguagePHP},
-		{name: "ruby", exts: []string{"rb"}, ptrFn: tree_sitter_ruby.Language},
+		{name: "php", exts: []string{"php", "phtml"}, ptrFn: tree_sitter_php.LanguagePHP},
+		{name: "ruby", exts: []string{"rb", "rake"}, ptrFn: tree_sitter_ruby.Language},
 		{name: "html", exts: []string{"html", "htm"}, ptrFn: tree_sitter_html.Language},
 		{name: "css", exts: []string{"css"}, ptrFn: tree_sitter_css.Language},
 		{name: "bash", exts: []string{"sh", "bash"}, ptrFn: tree_sitter_bash.Language},
@@ -139,7 +140,9 @@ func parseIssues(lang *tree_sitter.Language, content []byte) []Issue {
 	p := parserPool.Get().(*tree_sitter.Parser)
 	defer parserPool.Put(p)
 	parser := p
-	parser.SetLanguage(lang)
+	if err := parser.SetLanguage(lang); err != nil {
+		return []Issue{{Line: 1, Message: fmt.Sprintf("set language: %v", err)}}
+	}
 
 	tree := parser.Parse(content, nil)
 	if tree == nil {

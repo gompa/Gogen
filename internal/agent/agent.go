@@ -503,6 +503,10 @@ func (a *Agent) appendToolResult(tc llm.ToolCall, result string) {
 // It returns the final accumulated response or an error.
 func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.StreamHandlers) (string, error) {
 	a.Messages = append(a.Messages, llm.Message{Role: "user", Content: input, CreatedAt: time.Now()})
+	// If the session doesn't have a label yet, derive one from the first user message.
+	if a.SessionLabel == "" {
+		a.SessionLabel = llm.SessionLabel(a.Messages, llm.DefaultSessionLabelMaxLen)
+	}
 	// Persist immediately so a failed/cancelled turn does not drop the user message.
 	a.FlushSession()
 

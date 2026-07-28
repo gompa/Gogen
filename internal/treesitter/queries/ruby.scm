@@ -2,3 +2,5 @@
 (singleton_method name: (identifier) @name.method)
 (class name: (constant) @name.class)
 (module name: (constant) @name.module)
+(call method: (identifier) @_method (#match? @_method "^attr_")
+  (argument_list (simple_symbol) @name.attribute))

@@ -274,6 +274,7 @@ type WSMessage struct {
 	GlobalMode            bool           `json:"globalMode,omitempty"`
 	SessionID             string         `json:"sessionId,omitempty"`
 	SessionAction         string         `json:"sessionAction,omitempty"`
+	SessionLabel          string         `json:"sessionLabel,omitempty"`
 	Sessions              []SessionEntry `json:"sessions,omitempty"`
 	History               []HistoryEntry `json:"history,omitempty"`
 	// Filesystem / git editor APIs
@@ -372,12 +373,13 @@ func applyContextStats(msg *WSMessage, stats agent.TurnContext, accum *agent.Usa
 // agentMu — tokenize after unlocking via applyContextStats.
 func (s *Server) agentConfigMsgBasic() WSMessage {
 	return WSMessage{
-		Type:       "config",
-		WorkingDir: s.agent.Executor.GetWorkingDir(),
-		Model:      s.agent.CurrentModel(),
-		Mode:       s.agent.Mode.String(),
-		GlobalMode: s.agent.GlobalMode,
-		SessionID:  s.agent.SessionID,
+		Type:         "config",
+		WorkingDir:   s.agent.Executor.GetWorkingDir(),
+		Model:        s.agent.CurrentModel(),
+		Mode:         s.agent.Mode.String(),
+		GlobalMode:   s.agent.GlobalMode,
+		SessionID:    s.agent.SessionID,
+		SessionLabel: s.agent.SessionLabel,
 	}
 }
 
@@ -522,6 +524,7 @@ func (s *Server) contextMsg(ctx context.Context) WSMessage {
 	msg := WSMessage{Type: "context"}
 	accum := s.agent.UsageAccum
 	applyContextStats(&msg, s.agent.ContextStats(ctx), &accum)
+	msg.SessionLabel = s.agent.SessionLabel
 	return msg
 }
 
