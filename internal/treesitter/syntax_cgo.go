@@ -9,17 +9,22 @@ import (
 	"sync"
 	"unsafe"
 
+	tree_sitter_kotlin "github.com/tree-sitter-grammars/tree-sitter-kotlin/bindings/go"
 	tree_sitter_hcl "github.com/tree-sitter-grammars/tree-sitter-hcl/bindings/go"
 	tree_sitter_lua "github.com/tree-sitter-grammars/tree-sitter-lua/bindings/go"
+	tree_sitter_make "github.com/tree-sitter-grammars/tree-sitter-make/bindings/go"
 	tree_sitter_toml "github.com/tree-sitter-grammars/tree-sitter-toml/bindings/go"
 	tree_sitter_yaml "github.com/tree-sitter-grammars/tree-sitter-yaml/bindings/go"
+	tree_sitter_zig "github.com/tree-sitter-grammars/tree-sitter-zig/bindings/go"
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
 	tree_sitter_bash "github.com/tree-sitter/tree-sitter-bash/bindings/go"
 	tree_sitter_c_sharp "github.com/tree-sitter/tree-sitter-c-sharp/bindings/go"
 	tree_sitter_c "github.com/tree-sitter/tree-sitter-c/bindings/go"
 	tree_sitter_cpp "github.com/tree-sitter/tree-sitter-cpp/bindings/go"
 	tree_sitter_css "github.com/tree-sitter/tree-sitter-css/bindings/go"
+	tree_sitter_dockerfile "github.com/gortexhq/tree-sitter-dockerfile/bindings/go"
 	tree_sitter_go "github.com/tree-sitter/tree-sitter-go/bindings/go"
+	tree_sitter_sql "github.com/wippyai/tree-sitter-sql/bindings/go"
 	tree_sitter_html "github.com/tree-sitter/tree-sitter-html/bindings/go"
 	tree_sitter_java "github.com/tree-sitter/tree-sitter-java/bindings/go"
 	tree_sitter_javascript "github.com/tree-sitter/tree-sitter-javascript/bindings/go"
@@ -28,6 +33,7 @@ import (
 	tree_sitter_python "github.com/tree-sitter/tree-sitter-python/bindings/go"
 	tree_sitter_ruby "github.com/tree-sitter/tree-sitter-ruby/bindings/go"
 	tree_sitter_rust "github.com/tree-sitter/tree-sitter-rust/bindings/go"
+	tree_sitter_scala "github.com/tree-sitter/tree-sitter-scala/bindings/go"
 	tree_sitter_typescript "github.com/tree-sitter/tree-sitter-typescript/bindings/go"
 )
 
@@ -54,17 +60,23 @@ func bundledSpecs() []langSpec {
 		{name: "json", exts: []string{"json"}, ptrFn: tree_sitter_json.Language},
 		{name: "rust", exts: []string{"rs"}, ptrFn: tree_sitter_rust.Language},
 		{name: "java", exts: []string{"java"}, ptrFn: tree_sitter_java.Language},
+		{name: "kotlin", exts: []string{"kt", "kts"}, ptrFn: tree_sitter_kotlin.Language},
 		{name: "c", exts: []string{"c", "h"}, ptrFn: tree_sitter_c.Language},
 		{name: "cpp", exts: []string{"cpp", "cc", "cxx", "hpp", "hh", "hxx"}, ptrFn: tree_sitter_cpp.Language},
 		{name: "csharp", exts: []string{"cs"}, ptrFn: tree_sitter_c_sharp.Language},
 		{name: "php", exts: []string{"php", "phtml"}, ptrFn: tree_sitter_php.LanguagePHP},
 		{name: "ruby", exts: []string{"rb", "rake"}, ptrFn: tree_sitter_ruby.Language},
+		{name: "scala", exts: []string{"scala"}, ptrFn: tree_sitter_scala.Language},
+		{name: "sql", exts: []string{"sql"}, ptrFn: tree_sitter_sql.Language},
 		{name: "html", exts: []string{"html", "htm"}, ptrFn: tree_sitter_html.Language},
 		{name: "css", exts: []string{"css"}, ptrFn: tree_sitter_css.Language},
 		{name: "bash", exts: []string{"sh", "bash"}, ptrFn: tree_sitter_bash.Language},
+		{name: "dockerfile", exts: nil, ptrFn: tree_sitter_dockerfile.Language},
 		{name: "yaml", exts: []string{"yaml", "yml"}, ptrFn: tree_sitter_yaml.Language},
 		{name: "toml", exts: []string{"toml"}, ptrFn: tree_sitter_toml.Language},
+		{name: "zig", exts: []string{"zig"}, ptrFn: tree_sitter_zig.Language},
 		{name: "lua", exts: []string{"lua"}, ptrFn: tree_sitter_lua.Language},
+		{name: "make", exts: []string{"mk"}, ptrFn: tree_sitter_make.Language},
 		{name: "hcl", exts: []string{"hcl", "tf"}, ptrFn: tree_sitter_hcl.Language},
 	}
 }
@@ -75,7 +87,9 @@ func initRegistry() {
 	for _, spec := range bundledSpecs() {
 		langSpecs[spec.name] = spec
 		for _, ext := range spec.exts {
-			extToLang[ext] = spec.name
+			if ext != "" {
+				extToLang[ext] = spec.name
+			}
 		}
 	}
 }
@@ -109,6 +123,20 @@ func langNameForPath(path string) (string, bool) {
 	registryOnce.Do(initRegistry)
 	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(path), "."))
 	if ext == "" {
+		// Special case: filenames without extension (e.g. Dockerfile, Makefile)
+		base := strings.ToLower(filepath.Base(path))
+		switch base {
+		case "dockerfile":
+			if !langAllowed("dockerfile", allowedLangs()) {
+				return "", false
+			}
+			return "dockerfile", true
+		case "makefile", "gnumakefile":
+			if !langAllowed("make", allowedLangs()) {
+				return "", false
+			}
+			return "make", true
+		}
 		return "", false
 	}
 	name, ok := extToLang[ext]

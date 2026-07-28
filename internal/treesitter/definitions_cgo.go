@@ -37,6 +37,10 @@ func initQueries() {
 		"bash":       "queries/bash.scm",
 		"lua":        "queries/lua.scm",
 		"hcl":        "queries/hcl.scm",
+		"kotlin":     "queries/kotlin.scm",
+		"scala":      "queries/scala.scm",
+		"sql":        "queries/sql.scm",
+		"zig":        "queries/zig.scm",
 	}
 }
 

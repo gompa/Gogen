@@ -1,0 +1,6 @@
+(function_declaration name: (identifier) @name.function)
+(class_definition name: (identifier) @name.class)
+(object_definition name: (identifier) @name.object)
+(trait_definition name: (identifier) @name.trait)
+(val_declaration name: (identifier) @name.value)
+(var_declaration name: (identifier) @name.variable)

@@ -1,6 +1,6 @@
 module gogen
 
-go 1.26.4
+go 1.26.5
 
 require (
 	github.com/atotto/clipboard v0.1.4
@@ -10,13 +10,17 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/charmbracelet/x/ansi v0.11.7
 	github.com/gorilla/websocket v1.5.3
+	github.com/gortexhq/tree-sitter-dockerfile v0.1.0
 	github.com/muesli/reflow v0.3.0
 	github.com/openai/openai-go v1.12.0
 	github.com/tiktoken-go/tokenizer v0.8.1
 	github.com/tree-sitter-grammars/tree-sitter-hcl v1.2.0
+	github.com/tree-sitter-grammars/tree-sitter-kotlin v1.1.0
 	github.com/tree-sitter-grammars/tree-sitter-lua v0.5.0
+	github.com/tree-sitter-grammars/tree-sitter-make v1.1.1
 	github.com/tree-sitter-grammars/tree-sitter-toml v0.7.0
 	github.com/tree-sitter-grammars/tree-sitter-yaml v0.7.2
+	github.com/tree-sitter-grammars/tree-sitter-zig v1.1.2
 	github.com/tree-sitter/go-tree-sitter v0.25.0
 	github.com/tree-sitter/tree-sitter-bash v0.25.1
 	github.com/tree-sitter/tree-sitter-c v0.24.2
@@ -32,7 +36,9 @@ require (
 	github.com/tree-sitter/tree-sitter-python v0.25.0
 	github.com/tree-sitter/tree-sitter-ruby v0.23.1
 	github.com/tree-sitter/tree-sitter-rust v0.24.2
+	github.com/tree-sitter/tree-sitter-scala v0.26.0
 	github.com/tree-sitter/tree-sitter-typescript v0.23.2
+	github.com/wippyai/tree-sitter-sql v0.0.4
 	golang.org/x/net v0.57.0
 	golang.org/x/time v0.15.0
 	gopkg.in/yaml.v3 v3.0.1
