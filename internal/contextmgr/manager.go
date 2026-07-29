@@ -132,6 +132,16 @@ func (m *Manager) ContextLimit() int {
 	return m.Settings.ContextLimit
 }
 
+// SetContextLimit sets the context window size directly, bypassing provider
+// resolution. Used when restoring a session snapshot so the limit is available
+// synchronously before the async provider refresh completes.
+func (m *Manager) SetContextLimit(limit int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.Settings.ContextLimit = limit
+	m.limitResolved = true
+}
+
 const toolResultTruncationMarker = "\n… truncated ("
 
 // TruncateToolResult caps tool output stored in canonical history / LLM views.

@@ -514,6 +514,7 @@ func (m *Model) renderHelpModal() string {
 			{"/help", "Show this help"},
 			{"/plan / /act", "Toggle plan/act mode"},
 			{"/mode", "Show current mode"},
+			{"/think", "Set thinking level"},
 			{"/models", "List/switch models"},
 			{"/context", "Context usage details"},
 			{"/new", "Start new session"},

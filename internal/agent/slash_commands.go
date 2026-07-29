@@ -22,8 +22,10 @@ var SlashCommands = []SlashCommand{
 	{Name: "/context", Description: "Context usage details", Web: true, TUI: true},
 	{Name: "/new", Description: "Start a new session", Web: true, TUI: true},
 	{Name: "/resume", Description: "List, restore, or delete sessions", Web: true, TUI: true},
+	{Name: "/fork", Description: "Fork a new session from the last assistant message (or fork <N> from message N)", Web: true, TUI: true},
 	{Name: "/compact", Description: "Compact conversation history", Web: false, TUI: true},
 	{Name: "/verbose", Description: "Toggle verbose tool output", Web: false, TUI: true},
+	{Name: "/think", Description: "Set thinking/reasoning level (off/low/medium/high/max) or show current level", Web: true, TUI: true},
 	{Name: "/save-config", Description: "Write config to .gogen/", Web: false, TUI: true},
 	{Name: "/exit", Description: "Quit GoGen", Web: false, TUI: true},
 }

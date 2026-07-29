@@ -27,6 +27,8 @@ func (s *statsStubProvider) ModelContextLimit(_ context.Context) (int, error) {
 	return s.limit, nil
 }
 
+func (s *statsStubProvider) SetThinkingLevel(string) {}
+
 func (s *statsStubProvider) ListModels(_ context.Context) ([]llm.ModelInfo, error) {
 	if s.models != nil {
 		return s.models, nil

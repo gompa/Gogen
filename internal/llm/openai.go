@@ -82,6 +82,9 @@ type OpenAIProvider struct {
 
 	// preserveReasoningMode: auto (default, probe /props), on, off.
 	preserveReasoningMode string
+
+	// thinkingLevel controls reasoning_effort. Empty means omit (no thinking).
+	thinkingLevel string
 }
 
 type modelsFetch struct {
@@ -397,6 +400,31 @@ func (p *OpenAIProvider) applyChatCompletionExtras(ctx context.Context, params *
 	})
 }
 
+// applyThinkingLevel sets the reasoning_effort field on chat completion params
+// when a non-empty thinking level is configured. Empty level means omit the
+// parameter entirely (no thinking/reasoning requested from the API).
+func (p *OpenAIProvider) applyThinkingLevel(_ context.Context, params *openai.ChatCompletionNewParams) {
+	if p == nil || params == nil {
+		return
+	}
+	p.modelsMu.RLock()
+	level := p.thinkingLevel
+	p.modelsMu.RUnlock()
+	if level == "" || level == "off" {
+		return
+	}
+	// Map Gogen thinking levels to OpenAI reasoning_effort.
+	// OpenAI supports: low, medium, high.
+	switch level {
+	case "low", "minimal":
+		params.ReasoningEffort = shared.ReasoningEffortLow
+	case "medium":
+		params.ReasoningEffort = shared.ReasoningEffortMedium
+	case "high", "xhigh", "max":
+		params.ReasoningEffort = shared.ReasoningEffortHigh
+	}
+}
+
 // templateSupportsPreserveReasoning probes llama.cpp GET /props once and caches
 // chat_template_caps.supports_preserve_reasoning. Failures / missing caps → false.
 func (p *OpenAIProvider) templateSupportsPreserveReasoning(ctx context.Context) bool {
@@ -692,6 +720,7 @@ func (p *OpenAIProvider) GenerateResponse(ctx context.Context, messages []Messag
 		params.PromptCacheKey = p.promptCacheKey
 	}
 	p.applyChatCompletionExtras(ctx, &params)
+	p.applyThinkingLevel(ctx, &params)
 	resp, err := p.clientForModel().Chat.Completions.New(ctx, params)
 
 	if err != nil {
@@ -767,6 +796,7 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 		params.PromptCacheKey = p.promptCacheKey
 	}
 	p.applyChatCompletionExtras(ctx, &params)
+	p.applyThinkingLevel(ctx, &params)
 	stream := p.clientForModel().Chat.Completions.NewStreaming(ctx, params)
 	defer stream.Close()
 	// stream.Next() can block on the response body even after ctx cancel if
@@ -990,15 +1020,11 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 }
 
 func (p *OpenAIProvider) ModelContextLimit(ctx context.Context) (int, error) {
-	// Resolution order (unchanged): provider /v1/models JSON → models.dev →
-	// name heuristics → 128000. Network catalog for this path uses a short
-	// timeout so a hung remote host cannot stall restore/context refresh;
-	// local servers still win when they answer quickly with n_ctx etc.
-	//
-	// Updated order: warm in-memory cache → models.dev (disk-cached, no
-	// network) → brief /v1/models probe → name heuristics → 128k default.
-	// models.dev is preferred over a live /v1/models call because its
-	// registry is already on disk and resolves instantly.
+	// Resolution order: warm in-memory cache → models.dev (disk-cached, no
+	// network) → brief /v1/models probe → 128k default. Network catalog
+	// uses a short timeout so a hung remote host cannot stall restore or
+	// context refresh; local servers still win when they answer quickly
+	// with n_ctx etc.
 	ctx, cancel := context.WithTimeout(ctx, modelsLimitLookupTimeout)
 	defer cancel()
 
@@ -1028,11 +1054,7 @@ func (p *OpenAIProvider) ModelContextLimit(ctx context.Context) (int, error) {
 	if lim, ok := p.contextLimitFromModels(models); ok {
 		return lim, nil
 	}
-
-	// 4. Name-based heuristics.
-	if limit := inferContextLimitFromModelName(modelName); limit > 0 {
-		return limit, nil
-	}
+	// 4. Fallback — return the default.
 	return 128000, nil
 }
 
@@ -1140,6 +1162,14 @@ func (p *OpenAIProvider) SetModel(id string) error {
 	return nil
 }
 
+// SetThinkingLevel sets the reasoning_effort level. Empty string means omit
+// the parameter (the model will not use reasoning/thinking).
+func (p *OpenAIProvider) SetThinkingLevel(level string) {
+	p.modelsMu.Lock()
+	p.thinkingLevel = level
+	p.modelsMu.Unlock()
+}
+
 // resolveContextLimit resolves context limit and pricing. Provider JSON is
 // tried first for the limit, but models.dev is always consulted for cost
 // data since provider JSON never includes pricing.
@@ -1150,15 +1180,12 @@ func (p *OpenAIProvider) resolveContextLimit(rawJSON, modelID string) (int, *mod
 	if devCost != nil {
 		cost = devCost
 	}
-	// Prefer provider JSON limit, then models.dev, then heuristic.
+	// Prefer provider JSON limit, then models.dev, then default.
 	if limit := parseContextLimitFromJSON(rawJSON); limit > 0 {
 		return limit, cost
 	}
 	if devLimit > 0 {
 		return devLimit, cost
-	}
-	if limit := inferContextLimitFromModelName(modelID); limit > 0 {
-		return limit, cost
 	}
 	return 128000, cost
 }

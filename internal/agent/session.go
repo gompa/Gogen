@@ -14,11 +14,13 @@ type SessionSnapshot struct {
 	Oneshot        bool
 	Model          string
 	Mode           string
+	ThinkingLevel  string // persisted thinking level; empty/absent means "off"
 	Label          string
 	ProjectProfile string
 	Todos          *TodoList
 	Messages       []llm.Message
 	TokenCounts    []int // pre-computed token counts per message (nil if unavailable)
+	ContextLimit   int   // resolved context window size (0 = unknown)
 }
 
 // SessionPersister stores and loads agent sessions.
@@ -88,6 +90,11 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 	if m, ok := ParseMode(snap.Mode); ok {
 		a.Mode = m
 	}
+	if snap.ThinkingLevel != "" {
+		if l, ok := ParseThinkingLevel(snap.ThinkingLevel); ok {
+			a.ThinkingLevel = l
+		}
+	}
 	if snap.Model != "" {
 		_ = a.Provider.SetModel(snap.Model)
 	}
@@ -97,6 +104,13 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 	// for large sessions). Cleared when messages are modified (append,
 	// compaction, session reset).
 	a.restoredTokenCounts = snap.TokenCounts
+
+	// Pre-warm the context limit from the snapshot so the first ContextStats
+	// call after restore sees the correct max context size immediately,
+	// without waiting for the async ValidateRestoredModel refresh.
+	if a.Context != nil && snap.ContextLimit > 0 {
+		a.Context.SetContextLimit(snap.ContextLimit)
+	}
 
 	// Snapshot messages were persisted with stable ArgsStr, so mark them
 	// as stabilized to avoid re-serializing on the next turn.
@@ -117,7 +131,7 @@ func (a *Agent) ValidateRestoredModel(ctx context.Context, model string) {
 
 	// Context limit first: ModelContextLimit tries /v1/models briefly (local
 	// n_ctx), then models.dev — without stacking a full catalog wait + Get.
-	if a.Context != nil {
+	if a.Context != nil && a.ContextLimit() <= 0 {
 		a.Context.RefreshAfterModelChange(ctx)
 	}
 	if model == "" {

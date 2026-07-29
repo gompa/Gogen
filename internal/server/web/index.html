@@ -249,6 +249,162 @@
             border-color: #7a3030;
             color: #ff7b72;
         }
+        /* Swap Send/Cancel: only one shown at a time. */
+        #input-area.turn-active #send-btn {
+            display: none;
+        }
+        #input-area:not(.turn-active) #cancel-btn {
+            display: none;
+        }
+        #cancel-btn {
+            display: inline-flex;
+            align-items: center;
+        }
+
+        /* ===== Composer toolbar (above input area) ===== */
+        #composer-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 16px 0;
+            background: var(--bg-elevated);
+            border-top: 1px solid var(--border);
+            flex-shrink: 0;
+            min-height: 28px;
+            flex-wrap: wrap;
+        }
+        .tb-btn {
+            font-family: var(--sans);
+            font-size: 0.78em;
+            padding: 2px 8px;
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            background: var(--bg-input);
+            color: var(--fg);
+            cursor: pointer;
+            white-space: nowrap;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .tb-btn:hover { background: var(--bg-hover); }
+        .tb-btn .tb-arrow { color: var(--fg-muted); font-size: 0.75em; }
+
+        /* Model picker popover */
+        .tb-group { position: relative; }
+        #tb-context-group { margin-left: auto; }
+        .tb-popover {
+            display: none;
+        }
+        .tb-popover {
+            display: none;
+            position: absolute;
+            bottom: 100%;
+            left: 0;
+            margin-bottom: 4px;
+            min-width: 220px;
+            max-height: 360px;
+            overflow-y: auto;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border);
+            border-radius: 5px;
+            box-shadow: 0 -4px 16px rgba(0,0,0,0.35);
+            z-index: 30;
+            padding: 8px;
+        }
+        .tb-popover.open { display: block; }
+        .tb-popover-section + .tb-popover-section {
+            border-top: 1px solid var(--border);
+            margin-top: 6px;
+            padding-top: 6px;
+        }
+        .tb-popover-heading {
+            font-size: 0.65em;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--fg-muted);
+            margin: 0 0 4px 4px;
+        }
+        .tb-model-list { display: grid; gap: 2px; }
+        .tb-model-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 5px 8px;
+            border: 1px solid transparent;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 0.82em;
+            color: var(--fg);
+            background: transparent;
+            text-align: left;
+            width: 100%;
+        }
+        .tb-model-row:hover { background: var(--bg-hover); }
+        .tb-model-row.active {
+            background: var(--accent-soft);
+            border-color: var(--accent);
+        }
+        .tb-model-row .tb-model-limit {
+            margin-left: auto;
+            color: var(--fg-muted);
+            font-size: 0.85em;
+            font-family: var(--mono);
+        }
+        .tb-model-row .tb-check { color: var(--accent); margin-left: 4px; }
+
+        /* Thinking level chips */
+        .tb-thinking-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+        }
+        .tb-thinking-chip {
+            font-size: 0.75em;
+            padding: 2px 8px;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            background: var(--bg-input);
+            color: var(--fg);
+            cursor: pointer;
+        }
+        .tb-thinking-chip:hover { background: var(--bg-hover); }
+        .tb-thinking-chip.active {
+            background: var(--accent-soft);
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
+        /* Context usage badge (circular progress ring) */
+        .tb-context-badge {
+            font-family: var(--mono);
+            font-size: 0.75em;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            color: var(--fg-muted);
+            cursor: default;
+        }
+        .tb-context-badge .ctx-ring {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: conic-gradient(var(--ctx-color, var(--fg-muted)) var(--ctx-pct, 0%), var(--border) 0);
+            flex-shrink: 0;
+        }
+        .tb-context-badge[data-tone="warning"] { color: #d29922; }
+        .tb-context-badge[data-tone="warning"] .ctx-ring { --ctx-color: #d29922; }
+        .tb-context-badge[data-tone="danger"] { color: var(--error); }
+        .tb-context-badge[data-tone="danger"] .ctx-ring { --ctx-color: var(--error); }
+
+        /* Command mode indicator */
+        #input-area.command-mode #input-wrap textarea {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 1px rgba(86,156,214,0.3);
+        }
+
         .message {
             padding: 10px 12px;
             border-radius: 4px;
@@ -1197,10 +1353,13 @@
         #close-tab-actions button.discard { background: var(--error-bg); border-color: #7a3030; color: #ff7b72; }
         #close-tab-actions button.keep { background: var(--success-bg); border-color: #2d6a4f; color: var(--success); }
 
-        /* ===== Task 11: Context tooltip ===== */
+        /* ===== Context tooltip (inside toolbar) ===== */
         #context-tooltip {
             display: none;
             position: absolute;
+            bottom: 100%;
+            right: 0;
+            margin-bottom: 4px;
             background: var(--bg-elevated);
             border: 1px solid var(--border);
             border-radius: 4px;
@@ -1211,9 +1370,9 @@
             box-shadow: 0 4px 16px rgba(0,0,0,0.35);
             z-index: 50;
             white-space: pre-wrap;
-            max-width: 300px;
+            max-width: 420px;
+            width: max-content;
         }
-        #context-info { position: relative; cursor: help; }
 
         /* ===== Settings modal ===== */
         #settings-btn {
@@ -1336,6 +1495,35 @@
             color: var(--fg-muted);
         }
 
+        /* ===== Fork button on assistant messages ===== */
+        .message.assistant {
+            position: relative;
+        }
+        .fork-btn {
+            display: none;
+            position: absolute;
+            bottom: -14px;
+            right: 8px;
+            font-size: 0.85em;
+            cursor: pointer;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border);
+            color: var(--fg-dim);
+            padding: 1px 6px;
+            border-radius: 3px;
+            line-height: 1.3;
+            user-select: none;
+            z-index: 5;
+        }
+        .fork-btn:hover {
+            color: var(--accent);
+            border-color: var(--accent);
+            background: var(--accent-soft);
+        }
+        .message.assistant:hover .fork-btn {
+            display: inline-block;
+        }
+
     </style>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤖</text></svg>">
 </head>
@@ -1355,22 +1543,21 @@
                 <input type="text" id="working-dir-input" placeholder="/path/to/dir">
                 <button id="set-dir-btn">Set Working Directory</button>
                 <hr>
-                <label>Model:</label>
-                <div id="model-info" style="font-size:0.85em;margin-bottom:12px;font-family:monospace;">—</div>
-                <select id="model-select" aria-label="Select model" hidden></select>
-                <label>Context:</label>
-                <div id="context-info" tabindex="0"><span id="context-text">—</span><div id="context-tooltip"></div></div>
-                <div id="context-bar-wrap"><div id="context-bar"></div></div>
-                <label>Mode:</label>
-                <div id="mode-btns">
-                    <button type="button" id="mode-act-btn" class="active">Act</button>
-                    <button type="button" id="mode-plan-btn">Plan</button>
+                <!-- Hidden references for toolbar JS — do not remove -->
+                <div style="display:none">
+                    <div id="model-info"></div>
+                    <select id="model-select"></select>
+                    <div id="thinking-info"></div>
+                    <div id="context-info"><span id="context-text"></span></div>
+                    <div id="context-bar-wrap"><div id="context-bar"></div></div>
+                    <div id="mode-btns">
+                        <button type="button" id="mode-act-btn"></button>
+                        <button type="button" id="mode-plan-btn"></button>
+                    </div>
+                    <div id="session-info" style="display:none"></div>
                 </div>
-                <label>Session:</label>
-                <div id="session-info" style="font-size:0.85em;margin-bottom:8px;font-family:monospace;">—</div>
                 <div id="session-actions">
                     <button type="button" id="session-new-btn" title="Start a new session">New</button>
-                    <button type="button" id="session-refresh-btn" title="Refresh session list">Refresh</button>
                     <button type="button" id="export-chat-btn" title="Export chat as markdown">Export</button>
                 </div>
                 <div id="session-list" aria-label="Saved sessions"></div>
@@ -1379,6 +1566,37 @@
                 <button type="button" id="sidebar-toggle" title="Toggle sidebar">☰</button>
                 <div id="messages" tabindex="-1"></div>
                 <button type="button" id="scroll-bottom-btn">↓ New messages</button>
+                <div id="composer-toolbar">
+                    <div id="tb-model-picker" class="tb-group">
+                        <button type="button" id="tb-model-btn" class="tb-btn" title="Select model">— <span class="tb-arrow">▾</span></button>
+                        <div id="tb-model-popover" class="tb-popover">
+                            <div class="tb-popover-section">
+                                <div class="tb-popover-heading">Model</div>
+                                <div id="tb-model-list" class="tb-model-list"></div>
+                            </div>
+                            <div class="tb-popover-section">
+                                <div class="tb-popover-heading">Thinking level</div>
+                                <div id="tb-thinking-grid" class="tb-thinking-grid"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <div id="tb-mode-picker" class="tb-group">
+                        <button type="button" id="tb-mode-btn" class="tb-btn">📝 Coding <span class="tb-arrow">▾</span></button>
+                        <div id="tb-mode-popover" class="tb-popover">
+                            <div class="tb-popover-section">
+                                <div class="tb-popover-heading">Mode</div>
+                                <div id="tb-mode-list" class="tb-model-list">
+                                    <button type="button" class="tb-model-row" data-mode="act">Act</button>
+                                    <button type="button" class="tb-model-row" data-mode="plan">Plan</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div id="tb-context-group" class="tb-group">
+                        <span id="tb-context-badge" class="tb-context-badge" role="status">—</span>
+                        <div id="context-tooltip"></div>
+                    </div>
+                </div>
                 <div id="input-area">
                     <div id="input-wrap">
                         <div id="slash-suggest" role="listbox" aria-label="Slash command suggestions"></div>
@@ -1565,6 +1783,15 @@
         const paletteInput = document.getElementById('command-palette-input');
         const paletteList = document.getElementById('command-palette-list');
         const toastHost = document.getElementById('toast-host');
+        // Toolbar elements
+        const tbModelBtn = document.getElementById('tb-model-btn');
+        const tbModelPopover = document.getElementById('tb-model-popover');
+        const tbModelList = document.getElementById('tb-model-list');
+        const tbThinkingGrid = document.getElementById('tb-thinking-grid');
+        const tbModeBtn = document.getElementById('tb-mode-btn');
+        const tbContextBadge = document.getElementById('tb-context-badge');
+        const composerToolbar = document.getElementById('composer-toolbar');
+
         let pendingDeleteApprovalId = null;
         let messageRawStore = new WeakMap();
 
@@ -1598,6 +1825,7 @@
             { name: '/plan', description: 'Switch to plan (read-only) mode' },
             { name: '/act', description: 'Switch to act mode' },
             { name: '/mode', description: 'Show current mode' },
+            { name: '/think', description: 'Set thinking/reasoning level (off/low/medium/high/max)' },
             { name: '/models', description: 'List or switch models' },
             { name: '/context', description: 'Context usage details' },
             { name: '/new', description: 'Start a new session' },
@@ -1710,10 +1938,229 @@
             sendBtn.disabled = true;
         }
 
+        // ── Toolbar: model picker popover ──
+        let tbModelPopoverOpen = false;
+
+        function toggleModelPopover() {
+            tbModelPopoverOpen = !tbModelPopoverOpen;
+            tbModelPopover.classList.toggle('open', tbModelPopoverOpen);
+        }
+
+        function closeModelPopover() {
+            tbModelPopoverOpen = false;
+            tbModelPopover.classList.remove('open');
+        }
+
+        // Click outside popover to close
+        document.addEventListener('click', (e) => {
+            if (tbModelPopoverOpen && !tbModelBtn.contains(e.target) && !tbModelPopover.contains(e.target)) {
+                closeModelPopover();
+            }
+        });
+
+        tbModelBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (availableModels.length <= 1) {
+                // Fetch models if we don't have a list yet
+                modelsRequested = false;
+                ensureModelsLoaded({ showLoading: true });
+            }
+            toggleModelPopover();
+        });
+
+        function renderToolbarModelList(models, current) {
+            if (!tbModelList) return;
+            tbModelList.innerHTML = '';
+            if (!models || models.length === 0) {
+                const empty = document.createElement('div');
+                empty.className = 'tb-model-row';
+                empty.textContent = 'No models loaded';
+                empty.style.color = 'var(--fg-muted)';
+                empty.style.fontSize = '0.82em';
+                empty.style.cursor = 'default';
+                tbModelList.appendChild(empty);
+                return;
+            }
+            for (const m of models) {
+                const active = m.id === current || m.current;
+                const row = document.createElement('button');
+                row.className = 'tb-model-row' + (active ? ' active' : '');
+                row.type = 'button';
+                const label = document.createElement('span');
+                label.textContent = m.id;
+                row.appendChild(label);
+                if (m.contextLimit) {
+                    const limit = document.createElement('span');
+                    limit.className = 'tb-model-limit';
+                    limit.textContent = formatTokenCount(m.contextLimit);
+                    row.appendChild(limit);
+                }
+                if (active) {
+                    const check = document.createElement('span');
+                    check.className = 'tb-check';
+                    check.textContent = '✓';
+                    row.appendChild(check);
+                }
+                row.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    if (m.id === current) { closeModelPopover(); return; }
+                    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+                    ws.send(JSON.stringify({ type: 'set_model', model: m.id }));
+                    closeModelPopover();
+                });
+                tbModelList.appendChild(row);
+            }
+        }
+
+        // ── Toolbar: thinking level chips ──
+        const THINKING_LABELS = { off: 'Off', minimal: 'Mi', low: 'L', medium: 'M', high: 'H', xhigh: 'XH', max: 'Max' };
+
+        function renderThinkingChips(level) {
+            if (!tbThinkingGrid) return;
+            tbThinkingGrid.innerHTML = '';
+            for (const [key, label] of Object.entries(THINKING_LABELS)) {
+                const chip = document.createElement('button');
+                chip.className = 'tb-thinking-chip' + (key === level ? ' active' : '');
+                chip.type = 'button';
+                chip.textContent = label;
+                chip.title = key;
+                chip.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    if (key === level) return;
+                    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+                    ws.send(JSON.stringify({ type: 'set_thinking_level', thinkingLevel: key }));
+                });
+                tbThinkingGrid.appendChild(chip);
+            }
+        }
+
+        // ── Toolbar: mode selector popover ──
+        const tbModePopover = document.getElementById('tb-mode-popover');
+        const tbModePicker = document.getElementById('tb-mode-picker');
+        let tbModePopoverOpen = false;
+
+        function toggleModePopover() {
+            tbModePopoverOpen = !tbModePopoverOpen;
+            tbModePopover.classList.toggle('open', tbModePopoverOpen);
+        }
+
+        function closeModePopover() {
+            tbModePopoverOpen = false;
+            tbModePopover.classList.remove('open');
+        }
+
+        document.addEventListener('click', (e) => {
+            if (tbModePopoverOpen && !tbModePicker.contains(e.target)) {
+                closeModePopover();
+            }
+        });
+
+        tbModeBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            toggleModePopover();
+        });
+
+        document.querySelectorAll('#tb-mode-list .tb-model-row').forEach((row) => {
+            row.addEventListener('click', () => {
+                const mode = row.dataset.mode;
+                if (mode === currentMode) { closeModePopover(); return; }
+                if (!ws || ws.readyState !== WebSocket.OPEN) return;
+                ws.send(JSON.stringify({ type: 'set_mode', mode }));
+                closeModePopover();
+            });
+        });
+
+        function updateToolbarMode(mode) {
+            if (!tbModeBtn) return;
+            const label = mode === 'plan' ? 'Plan' : 'Act';
+            tbModeBtn.innerHTML = `${label} <span class="tb-arrow">▾</span>`;
+            // Highlight active option in popover
+            document.querySelectorAll('#tb-mode-list .tb-model-row').forEach((r) => {
+                r.classList.toggle('active', r.dataset.mode === mode);
+            });
+        }
+
+        // ── Toolbar: context badge ──
+        function updateToolbarContext(data) {
+            if (!tbContextBadge) return;
+            const used = (data && data.usedTokens) || 0;
+            const limit = (data && data.contextLimit) || 0;
+            if (used <= 0 || limit <= 0) {
+                tbContextBadge.innerHTML = '<span class="ctx-ring"></span> —';
+                tbContextBadge.removeAttribute('data-tone');
+                tbContextBadge.title = 'Context usage unknown';
+                return;
+            }
+            const pct = Math.min(100, Math.round((used / limit) * 100));
+            const ring = document.createElement('span');
+            ring.className = 'ctx-ring';
+            ring.style.setProperty('--ctx-pct', pct + '%');
+            const label = `${pct}% ${formatTokenCount(used)}/${formatTokenCount(limit)}`;
+            tbContextBadge.innerHTML = '';
+            tbContextBadge.appendChild(ring);
+            tbContextBadge.appendChild(document.createTextNode(' ' + label));
+            tbContextBadge.title = `Context: ${used.toLocaleString()} / ${limit.toLocaleString()} tokens`;
+            const tone = pct >= 90 ? 'danger' : pct >= 75 ? 'warning' : '';
+            if (tone) tbContextBadge.setAttribute('data-tone', tone);
+            else tbContextBadge.removeAttribute('data-tone');
+        }
+
+        // ── Context tooltip on toolbar badge (reuses sidebar tooltip element) ──
+        tbContextBadge.addEventListener('mouseenter', () => {
+            const d = lastContextData || {};
+            if (!d.contextLimit && !d.usedTokens) return;
+            const lines = [];
+            lines.push('── Context ──');
+            if (d.usedTokens) lines.push(`Used: ${formatTokenCount(d.usedTokens)}`);
+            if (d.contextLimit) lines.push(`Limit: ${formatTokenCount(d.contextLimit)}`);
+            if (d.promptTokens) lines.push(`Prompt: ${formatTokenCount(d.promptTokens)}`);
+            if (d.completionTokens) lines.push(`Completion: ${formatTokenCount(d.completionTokens)}`);
+            if (d.cachedTokens) lines.push(`Cached: ${formatTokenCount(d.cachedTokens)}`);
+            if (d.compactAt) lines.push(`Compact at: ${formatTokenCount(d.compactAt)}`);
+            if (d.messageCount > 0) lines.push(`Messages: ${d.messageCount}`);
+            if (d.usedSource) lines.push(`Source: ${d.usedSource}`);
+            const prompt = d.totalPromptTokens || 0;
+            const completion = d.totalCompletionTokens || 0;
+            const cached = d.totalCachedTokens || 0;
+            const turns = d.totalTurns || 0;
+            if (turns > 0 || prompt > 0 || currentModelPricing) {
+                lines.push('── Session ──');
+                if (turns > 0 || prompt > 0) {
+                    lines.push(`Total: ${fmtTokK(prompt + completion)} · ${turns} turns`);
+                    lines.push(`Prompt: ${fmtTokK(prompt)}`);
+                    lines.push(`Completion: ${fmtTokK(completion)}`);
+                    lines.push(`Cached: ${fmtTokK(cached)}`);
+                }
+                if (currentModelPricing) {
+                    const billablePrompt = Math.max(0, prompt - cached);
+                    const cost = (billablePrompt / 1e6) * currentModelPricing.input
+                               + (cached / 1e6) * currentModelPricing.cached
+                               + (completion / 1e6) * currentModelPricing.output;
+                    lines.push(`Pricing: in $${currentModelPricing.input}/1M · out $${currentModelPricing.output}/1M`);
+                    if (turns > 0 || prompt > 0) {
+                        lines.push(`Est. cost: ${fmtCost(cost)}`);
+                    }
+                }
+            }
+            contextTooltip.textContent = lines.join('\n');
+            contextTooltip.style.display = 'block';
+        });
+        tbContextBadge.addEventListener('mouseleave', () => {
+            contextTooltip.style.display = 'none';
+        });
+
+        // ── Command mode indicator ──
+        const inputAreaWrap = document.getElementById('input-area');
+        inputArea.addEventListener('input', () => {
+            const val = inputArea.value;
+            inputAreaWrap.classList.toggle('command-mode', val.startsWith('/') && val.length > 0);
+        });
+
         function updateModeInfo(mode) {
             currentMode = (mode || 'act').toLowerCase();
             modeActBtn.classList.toggle('active', currentMode === 'act');
             modePlanBtn.classList.toggle('active', currentMode === 'plan');
+            updateToolbarMode(currentMode);
         }
 
         function updateGlobalMode(isGlobal) {
@@ -1750,19 +2197,34 @@
                 } else if (!model) {
                     modelSelect.value = '';
                 }
-                return;
+            } else {
+                // Catalog not loaded yet (or only one model): show the label.
+                // Keep it clickable so users can trigger a catalog fetch — the
+                // <select> stays hidden until we have options, so focus/pointer
+                // listeners on modelSelect alone never fire.
+                modelSelect.hidden = true;
+                modelInfoDiv.hidden = false;
+                modelInfoDiv.textContent = model || '—';
+                modelInfoDiv.classList.add('clickable');
+                modelInfoDiv.title = availableModels.length === 0
+                    ? 'Click to load available models'
+                    : 'Only one model available';
             }
-            // Catalog not loaded yet (or only one model): show the label.
-            // Keep it clickable so users can trigger a catalog fetch — the
-            // <select> stays hidden until we have options, so focus/pointer
-            // listeners on modelSelect alone never fire.
-            modelSelect.hidden = true;
-            modelInfoDiv.hidden = false;
-            modelInfoDiv.textContent = model || '—';
-            modelInfoDiv.classList.add('clickable');
-            modelInfoDiv.title = availableModels.length === 0
-                ? 'Click to load available models'
-                : 'Only one model available';
+            // Update toolbar model button
+            if (tbModelBtn) {
+                const name = model || (availableModels.length > 0 ? availableModels.find(m => m.current)?.id : null) || '—';
+                tbModelBtn.innerHTML = name + ' <span class="tb-arrow">▾</span>';
+            }
+        }
+
+        const thinkingInfoEl = document.getElementById('thinking-info');
+
+        function updateThinkingInfo(level) {
+            if (!thinkingInfoEl) return;
+            const labels = { off: 'Off', minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Maximum' };
+            thinkingInfoEl.textContent = labels[level] || 'Off';
+            // Update toolbar thinking chips
+            renderThinkingChips(level);
         }
 
         function updateModelSelect(models, current) {
@@ -1790,10 +2252,13 @@
                     placeholder.selected = true;
                 }
             }
-            updateModelInfo(current || availableModels.find((m) => m.current)?.id || '');
+            const modelId = current || availableModels.find((m) => m.current)?.id || '';
+            updateModelInfo(modelId);
+            // Populate toolbar model list
+            renderToolbarModelList(availableModels, modelId);
             // Extract pricing for the active model
-            const active = current
-                ? availableModels.find((m) => m.id === current)
+            const active = modelId
+                ? availableModels.find((m) => m.id === modelId)
                 : availableModels.find((m) => m.current);
             if (active && active.inputPricePer1M) {
                 currentModelPricing = {
@@ -1848,6 +2313,7 @@
                 contextText.textContent = '—';
                 contextBar.style.width = '0%';
                 contextBar.className = '';
+                updateToolbarContext(null);
                 return;
             }
 
@@ -1873,12 +2339,15 @@
                 contextBar.style.width = '0%';
                 contextBar.className = '';
             }
+            // Update toolbar context badge
+            updateToolbarContext(data);
         }
 
         function applyServerConfig(data) {
             console.log('[pricing] applyServerConfig', { model: data.model, inputPrice: data.inputPricePer1M, totalTurns: data.totalTurns });
             if (data.workingDir) dirInput.value = data.workingDir;
             updateModelInfo(data.model);
+            updateThinkingInfo(data.thinkingLevel);
             updateModeInfo(data.mode);
             updateGlobalMode(data.globalMode);
             // Sync pricing from server-provided fields (always present on config from cached lookups)
@@ -1916,10 +2385,13 @@
             disposeChatEditors();
             messagesDiv.innerHTML = '';
             stickToBottom = true;
+            msgIdxCounter = 0;
 
             streamRafPending = false;
             streamLastRender = 0;
             endStream();
+            currentThinkingDiv = null;
+            currentThinkingSpan = null;
             streamingToolCards = {};
             pendingToolCards = {};
             historyToolCallArgs = {};
@@ -1958,11 +2430,15 @@
         let lastContextData = null;
         // Map toolCallId → args for history replay of patch_file diffs
         let historyToolCallArgs = {};
+        // Monotonic counter for message positions (used for forking)
+        let msgIdxCounter = 0;
 
         function setTurnActive(active) {
             turnActive = !!active;
             if (cancelBtn) cancelBtn.disabled = !turnActive;
             if (sendBtn) sendBtn.disabled = false; // send cancels+restarts; keep enabled
+            // Toggle class so Send/Cancel swap places
+            document.getElementById('input-area').classList.toggle('turn-active', turnActive);
             if (!active) {
                 toolsStartedThisTurn = false;
             }
@@ -2199,13 +2675,27 @@
         }
         // ==============================
 
+        /** Send a fork request.
+         *  For history-replayed messages the server-side message index is used.
+         *  For streaming messages (no histIdx) we pass -1 meaning "last assistant". */
+        function forkSession(msgIdx) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            ws.send(JSON.stringify({ type: 'session_fork', messageIndex: msgIdx }));
+            pendingSessionResponse = true;
+        }
+
         function appendMessage(role, text) {
             return appendMessageAtTime(role, text, new Date());
         }
 
-        function appendMessageAtTime(role, text, date) {
+        function appendMessageAtTime(role, text, date, histIdx) {
             const msgDiv = document.createElement('div');
             msgDiv.className = `message ${role}`;
+            const idx = msgIdxCounter++;
+            msgDiv.dataset.msgIdx = idx;
+            if (histIdx !== undefined && histIdx >= 0) {
+                msgDiv.dataset.histIdx = histIdx;
+            }
             if (role === 'assistant' || role === 'user') {
                 // User messages go through markdown too, but HTML tags are escaped first
                 // to prevent pasted HTML from influencing the page layout.
@@ -2219,6 +2709,22 @@
             }
             msgDiv.dataset.createdAt = date.toISOString();
             addTimestampToMsg(msgDiv, date);
+            if (role === 'assistant') {
+                const forkBtn = document.createElement('button');
+                forkBtn.className = 'fork-btn';
+                forkBtn.textContent = '⑂';
+                forkBtn.title = 'Fork session from this message';
+                forkBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    // Use the server-side history index when available (history replay),
+                    // otherwise fall back to the display index (streaming messages).
+                    const targetIdx = msgDiv.dataset.histIdx !== undefined
+                        ? parseInt(msgDiv.dataset.histIdx)
+                        : parseInt(msgDiv.dataset.msgIdx);
+                    forkSession(targetIdx);
+                });
+                msgDiv.appendChild(forkBtn);
+            }
             messagesDiv.appendChild(msgDiv);
             smartScroll();
             return msgDiv;
@@ -2373,6 +2879,23 @@
                 flushStreamRender();
                 currentStreamDiv.classList.remove('cursor');
                 addTimestampToMsg(currentStreamDiv, new Date());
+                // Assign a message index and fork button.
+                // Streaming messages use the server-side "last" target because
+                // the client's clock may not match the server's CreatedAt (which
+                // would cause the wrong message to be matched, or no match at all).
+                const idx = msgIdxCounter++;
+                currentStreamDiv.dataset.msgIdx = idx;
+                const forkBtn = document.createElement('button');
+                forkBtn.className = 'fork-btn';
+                forkBtn.textContent = '⑂';
+                forkBtn.title = 'Fork session from this message';
+                forkBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    // Streaming messages don't have a known server-side index,
+                    // so send -1 which the server treats as "last assistant".
+                    forkSession(-1);
+                });
+                currentStreamDiv.appendChild(forkBtn);
             }
             currentStreamDiv = null;
             currentStreamRaw = '';
@@ -2656,8 +3179,8 @@
                     cardInfo.argsStream = null;
                 }
             } else if (cardInfo.argsStream) {
-                // Keep a short placeholder instead of dumping raw JSON.
-                cardInfo.argsStream.textContent = '…';
+                // Show accumulating raw args so the user sees live progress
+                cardInfo.argsStream.textContent = cardInfo.rawArgs;
             }
             smartScroll();
         }
@@ -2753,7 +3276,7 @@
             }
             for (const h of history) {
                 if (h.role === 'user') {
-                    appendMessageAtTime('user', h.content || '', msgDate(h.createdAt));
+                    appendMessageAtTime('user', h.content || '', msgDate(h.createdAt), h.index);
                 } else if (h.role === 'assistant') {
                     // Skip when reasoning was promoted into content (same text).
                     if (h.reasoning && h.reasoning !== h.content) {
@@ -2786,7 +3309,7 @@
                         messagesDiv.appendChild(div);
                         smartScroll();
                     }
-                    if (h.content) appendMessageAtTime('assistant', h.content, msgDate(h.createdAt));
+                    if (h.content) appendMessageAtTime('assistant', h.content, msgDate(h.createdAt), h.index);
                     if (Array.isArray(h.toolCalls)) {
                         for (const tc of h.toolCalls) {
                             historyToolCallArgs[tc.id] = tc.args || {};
@@ -3384,7 +3907,7 @@
         }
 
         document.getElementById('session-new-btn')?.addEventListener('click', () => newSession());
-        document.getElementById('session-refresh-btn')?.addEventListener('click', () => requestSessionList());
+        // Auto-refreshed on session mutations — no manual refresh button needed
         document.getElementById('export-chat-btn')?.addEventListener('click', () => exportChat());
 
         paletteInput.addEventListener('input', () => {

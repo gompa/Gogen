@@ -65,6 +65,13 @@ func (m *Model) dispatchCommand(input string) (bool, bool, tea.Cmd) {
 		return true, false, nil
 	}
 
+	// Thinking level command
+	if out, handled := m.agent.HandleThinkingCommand(input); handled {
+		m.appendChatLine(SystemStyle.Render(out))
+		m.checkPersistError()
+		return true, false, nil
+	}
+
 	// Context command
 	if out, handled := m.agent.HandleContextCommand(m.ctx, input); handled {
 		m.appendChatLine(SystemStyle.Render(out))

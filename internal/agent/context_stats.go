@@ -80,9 +80,21 @@ func (a *Agent) ContextStats(ctx context.Context) TurnContext {
 	if a.Context != nil {
 		// Use pre-computed token counts from a restored session snapshot to
 		// avoid re-tokenizing every message (expensive for large sessions).
-		// The counts are valid only when they match the current message count.
-		if len(a.restoredTokenCounts) == len(msgs) {
-			snap = a.Context.SnapshotWithCounts(msgs, view, a.restoredTokenCounts)
+		// When counts are available but shorter than msgs (messages appended
+		// since restore), compute counts for only the missing messages locally
+		// so we still get the fast SnapshotWithCounts path without mutating
+		// shared state (ContextStats runs without agentMu).
+		counts := a.restoredTokenCounts
+		if counts != nil && len(counts) < len(msgs) {
+			extended := make([]int, len(msgs))
+			copy(extended, counts)
+			for i := len(counts); i < len(msgs); i++ {
+				extended[i] = contextmgr.ComputeMessageTokens(msgs[i])
+			}
+			counts = extended
+		}
+		if len(counts) == len(msgs) {
+			snap = a.Context.SnapshotWithCounts(msgs, view, counts)
 		} else {
 			snap = a.Context.Snapshot(msgs, view)
 		}

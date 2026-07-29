@@ -64,6 +64,10 @@ type Agent struct {
 	// expensive for large sessions. Cleared when messages are modified.
 	restoredTokenCounts []int
 
+	// ThinkingLevel controls how much reasoning/thinking the model should use.
+	// When "off", no thinking parameter is sent to the API.
+	ThinkingLevel ThinkingLevel
+
 	// Runtime / project
 	WorkingDir        string
 	Mode              Mode
@@ -79,14 +83,15 @@ type Agent struct {
 
 func NewAgent(provider llm.LLMProvider, executor *Executor, ctxMgr *contextmgr.Manager) *Agent {
 	return &Agent{
-		Provider:     provider,
-		Executor:     executor,
-		Context:      ctxMgr,
-		Messages:     []llm.Message{},
-		WorkingDir:   executor.GetWorkingDir(),
-		Mode:         ModeAct,
-		GlobalMode:   false,
-		toolHandlers: BuiltinToolHandlers(),
+		Provider:      provider,
+		Executor:      executor,
+		Context:       ctxMgr,
+		Messages:      []llm.Message{},
+		WorkingDir:    executor.GetWorkingDir(),
+		Mode:          ModeAct,
+		GlobalMode:    false,
+		ThinkingLevel: ThinkingOff,
+		toolHandlers:  BuiltinToolHandlers(),
 	}
 }
 
@@ -194,8 +199,10 @@ func (a *Agent) FlushSession() {
 // this method only checks the dirty flag.
 //
 // It uses incremental delta saves when only a few messages have been added
-// since the last full snapshot, avoiding full JSON serialization of the
-// entire conversation history on every 5-second debounce tick.
+// since the last full snapshot, avoiding full JSON serialization on every
+// 5-second debounce tick.  Importantly, lastSavedMsgCount is NOT advanced on
+// incremental saves, so each delta always contains ALL messages since the last
+// full snapshot — making the delta file self-contained and crash-safe.
 // When skipTokenCounts is true (FlushSession), avoid cl100k re-tokenization.
 func (a *Agent) doPersist(skipTokenCounts bool) {
 	if !a.sessionDirty {
@@ -204,11 +211,9 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 	if a.SessionStore == nil || a.SessionID == "" {
 		return
 	}
-	// Invalidate cached token counts if message count changed (append,
-	// compaction, etc.) — the length check below will force re-counting.
-	if a.restoredTokenCounts != nil && len(a.restoredTokenCounts) != len(a.Messages) {
-		a.restoredTokenCounts = nil
-	}
+	// Extend cached token counts to cover any new messages so the full
+	// snapshot path can reuse them instead of re-tokenizing everything.
+	a.extendTokenCounts()
 
 	count := len(a.Messages)
 	profile := a.ensureProjectProfile()
@@ -232,11 +237,13 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 			WorkingDir:     a.WorkingDir,
 			Model:          a.CurrentModel(),
 			Mode:           a.Mode.String(),
+			ThinkingLevel:  string(a.ThinkingLevel),
 			Oneshot:        a.SessionOneshot,
 			Label:          a.SessionLabel,
 			ProjectProfile: profile,
 			Todos:          todoSnapshot(a.TodoManager),
 			Messages:       msgs,
+			ContextLimit:   a.ContextLimit(),
 		}
 		if len(a.restoredTokenCounts) == len(msgs) {
 			snap.TokenCounts = append([]int(nil), a.restoredTokenCounts...)
@@ -272,7 +279,15 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 			a.lastPersistErr = err
 			return
 		}
-		a.lastSavedMsgCount = count
+		// Do NOT advance lastSavedMsgCount here.  The delta file is
+		// overwritten on each incremental save and must always contain ALL
+		// messages since the last full snapshot.  Advancing lastSavedMsgCount
+		// would make the next delta save include only the newest messages,
+		// and a crash between increments would permanently lose the earlier
+		// batches.  The full-save thresholds (5 new messages or 30 s) will
+		// trigger a full snapshot soon enough, at which point lastSavedMsgCount
+		// is updated.
+		_ = count // referenced for clarity; not saved until next full snapshot
 	}
 
 	a.lastPersistErr = nil
@@ -286,6 +301,22 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 func (a *Agent) resetSaveTracking() {
 	a.lastSavedMsgCount = 0
 	a.lastFullSaveTime = time.Time{}
+}
+
+// extendTokenCounts extends restoredTokenCounts to cover any messages
+// appended since the last restore or extension. Call after appending to
+// a.Messages when restoredTokenCounts is non-nil. This preserves the
+// fast SnapshotWithCounts path in ContextStats and avoids re-tokenizing
+// the entire history on every call.
+func (a *Agent) extendTokenCounts() {
+	if a.restoredTokenCounts == nil {
+		return
+	}
+	for len(a.restoredTokenCounts) < len(a.Messages) {
+		idx := len(a.restoredTokenCounts)
+		a.restoredTokenCounts = append(a.restoredTokenCounts,
+			contextmgr.ComputeMessageTokens(a.Messages[idx]))
+	}
 }
 
 // ConsumePersistError returns and clears the last session save failure, if any.
@@ -495,14 +526,16 @@ func (a *Agent) appendToolResult(tc llm.ToolCall, result string) {
 		Role:       "tool",
 		Content:    result,
 		ToolCallID: tc.ID,
-		CreatedAt:  time.Now(),
+		CreatedAt:  time.Now().Truncate(time.Millisecond),
 	})
+	a.extendTokenCounts()
 }
 
 // StreamProcessInput streams tokens to the handlers as they arrive.
 // It returns the final accumulated response or an error.
 func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.StreamHandlers) (string, error) {
-	a.Messages = append(a.Messages, llm.Message{Role: "user", Content: input, CreatedAt: time.Now()})
+	a.Messages = append(a.Messages, llm.Message{Role: "user", Content: input, CreatedAt: time.Now().Truncate(time.Millisecond)})
+	a.extendTokenCounts()
 	// If the session doesn't have a label yet, derive one from the first user message.
 	if a.SessionLabel == "" {
 		a.SessionLabel = llm.SessionLabel(a.Messages, llm.DefaultSessionLabelMaxLen)
@@ -542,6 +575,7 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 			return "", ctx.Err()
 		}
 
+		a.Provider.SetThinkingLevel(string(a.ThinkingLevel))
 		result, err := a.Provider.GenerateResponseStream(ctx, view, a.AllowedToolNames(), a.llmTools(), h)
 		if err != nil {
 			finishStreamUI(h)
@@ -561,8 +595,9 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 				Content:   result.Content,
 				Reasoning: result.Reasoning,
 				Refusal:   result.Refusal,
-				CreatedAt: time.Now(),
+				CreatedAt: time.Now().Truncate(time.Millisecond),
 			})
+			a.extendTokenCounts()
 			a.FlushSession()
 			if result.Content != "" {
 				return result.Content, nil
@@ -590,8 +625,9 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 			Reasoning: result.Reasoning,
 			Refusal:   result.Refusal,
 			ToolCalls: result.ToolCalls,
-			CreatedAt: time.Now(),
+			CreatedAt: time.Now().Truncate(time.Millisecond),
 		})
+		a.extendTokenCounts()
 
 		for i, tc := range result.ToolCalls {
 			if ctx.Err() != nil {

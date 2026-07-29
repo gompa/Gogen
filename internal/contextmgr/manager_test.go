@@ -33,6 +33,8 @@ func (s *stubProvider) SetModel(id string) error {
 	return nil
 }
 
+func (s *stubProvider) SetThinkingLevel(string) {}
+
 func (s *stubProvider) ModelName() string {
 	return "test-model"
 }

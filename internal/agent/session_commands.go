@@ -3,7 +3,9 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	"gogen/internal/llm"
 )
@@ -44,6 +46,11 @@ func (a *Agent) HandleSessionCommand(ctx context.Context, input, newSessionID st
 			return SessionCommandResult{}, true, err
 		}
 		return SessionCommandResult{Output: out, Sessions: sessions}, true, nil
+	case "fork":
+		if err := a.ForkSession(ctx, args, newSessionID); err != nil {
+			return SessionCommandResult{}, true, err
+		}
+		return SessionCommandResult{Output: AppendContextBrief(ctx, a, fmt.Sprintf("Forked new session %s.", newSessionID)), Action: SessionActionClearChat, History: append([]llm.Message(nil), a.Messages...)}, true, nil
 	}
 	return SessionCommandResult{}, false, nil
 }
@@ -244,4 +251,122 @@ func (a *Agent) formatSessionList() (string, []SessionInfo, error) {
 // FormatSessionListForUI returns saved sessions without the slash-command help text.
 func (a *Agent) FormatSessionListForUI() (string, []SessionInfo, error) {
 	return a.formatSessionList()
+}
+
+// ForkSession starts a new session that is a copy of the current conversation
+// up to (and including) a specific message. args can be:
+//   - "" or "last": fork from the last assistant message
+//   - "<N>": fork from the Nth displayed message (0-indexed, counting only user+assistant)
+//   - "assistant <N>": fork from the Nth assistant message (0-indexed)
+//   - "created <RFC3339Nano>": fork from message with the given CreatedAt timestamp
+func (a *Agent) ForkSession(ctx context.Context, args, newSessionID string) error {
+	if strings.TrimSpace(newSessionID) == "" {
+		return fmt.Errorf("session id is required")
+	}
+	if len(a.Messages) == 0 {
+		return fmt.Errorf("no messages to fork from")
+	}
+
+	// Determine the fork index
+	idx := -1
+	args = strings.TrimSpace(args)
+	switch {
+	case args == "" || args == "last":
+		// Fork from the last assistant message
+		for i := len(a.Messages) - 1; i >= 0; i-- {
+			if a.Messages[i].Role == "assistant" {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return fmt.Errorf("no assistant message found to fork from")
+		}
+	case strings.HasPrefix(args, "created "):
+		ts := strings.TrimSpace(strings.TrimPrefix(args, "created "))
+		createdAt, err := time.Parse(time.RFC3339Nano, ts)
+		if err != nil {
+			return fmt.Errorf("invalid timestamp %q: %v", ts, err)
+		}
+		for i, m := range a.Messages {
+			diff := m.CreatedAt.Sub(createdAt)
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff <= time.Millisecond {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return fmt.Errorf("message with timestamp %q not found", ts)
+		}
+	case strings.HasPrefix(args, "assistant "):
+		n, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(args, "assistant ")))
+		if err != nil {
+			return fmt.Errorf("usage: fork [assistant <N>] — invalid number: %v", err)
+		}
+		count := 0
+		for i, m := range a.Messages {
+			if m.Role == "assistant" {
+				if count == n {
+					idx = i
+					break
+				}
+				count++
+			}
+		}
+		if idx < 0 {
+			return fmt.Errorf("assistant message %d not found (only %d assistant messages)", n, count)
+		}
+	default:
+		// Raw index into the Messages array (matches histIdx from the client).
+		n, err := strconv.Atoi(args)
+		if err != nil || n < 0 || n >= len(a.Messages) {
+			return fmt.Errorf("usage: fork [<N> | last | assistant <N> | created <timestamp>] — invalid index %q", args)
+		}
+		idx = n
+	}
+
+	// Save current session (the original branch)
+	if a.SessionStore != nil {
+		a.FlushSession()
+	}
+
+	oldSessionID := a.SessionID
+
+	// Copy messages up to and including the fork point.
+	forkedMsgs := append([]llm.Message(nil), a.Messages[:idx+1]...)
+
+	// If the fork point is an assistant message with tool calls, strip the
+	// tool calls from it so the forked session doesn't have orphaned
+	// tool calls with no corresponding results.
+	if forkedMsgs[idx].Role == "assistant" && len(forkedMsgs[idx].ToolCalls) > 0 {
+		forkedMsgs[idx].ToolCalls = nil
+	}
+
+	// Start new session with the truncated history
+	a.SessionID = newSessionID
+	a.Messages = forkedMsgs
+	a.clearTurnUsage()
+	a.restoredTokenCounts = nil
+	a.UsageAccum = UsageAccumulator{}
+	a.resetSaveTracking()
+	a.clearViewDriftSnapshot()
+	a.SessionLabel = ""
+	a.SessionOneshot = false
+	if a.PinManager != nil {
+		a.PinManager.ClearPins()
+	}
+	if a.TodoManager != nil {
+		a.TodoManager.Clear()
+	}
+
+	// Persist new session
+	if a.SessionStore != nil {
+		a.FlushSession()
+		_ = a.SessionStore.TouchSession(a.WorkingDir, oldSessionID)
+	}
+
+	return nil
 }

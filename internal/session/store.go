@@ -33,6 +33,7 @@ type file struct {
 	Messages       []llm.Message   `json:"messages"`
 	Oneshot        bool            `json:"oneshot,omitempty"`
 	TokenCounts    []int           `json:"tokenCounts,omitempty"`
+	ContextLimit   int             `json:"contextLimit,omitempty"`
 }
 
 // deltaFile holds messages appended since the last full snapshot save.
@@ -199,6 +200,7 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 		Messages:       snap.Messages,
 		Oneshot:        snap.Oneshot,
 		TokenCounts:    snap.TokenCounts,
+		ContextLimit:   snap.ContextLimit,
 	}
 	// Remove stale delta — the full snapshot supersedes it.
 	_ = s.clearDeltaFile(snap.WorkingDir, id)
@@ -288,6 +290,7 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 		Todos:          f.Todos,
 		Messages:       f.Messages,
 		TokenCounts:    f.TokenCounts,
+		ContextLimit:   f.ContextLimit,
 	}, nil
 }
 

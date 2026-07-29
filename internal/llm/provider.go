@@ -95,6 +95,9 @@ type LLMProvider interface {
 	ListModels(ctx context.Context) ([]ModelInfo, error)
 	SetModel(id string) error
 	ModelName() string
+	// SetThinkingLevel controls reasoning/thinking effort. Pass empty string to
+	// omit the parameter (equivalent to "off").
+	SetThinkingLevel(level string)
 }
 
 // Message represents a chat message.

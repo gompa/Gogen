@@ -40,6 +40,13 @@ func (m *Model) renderStatusBar() string {
 		leftParts = append(leftParts, StatusBarDimStyle.Render(model))
 	}
 
+	// Thinking level (show only when non-off)
+	if level := m.agent.ThinkingLevel; level != "" && level != "off" {
+		if short := level.ShortLabel(); short != "" {
+			leftParts = append(leftParts, StatusBarDimStyle.Render("("+short+")"))
+		}
+	}
+
 	// Working directory / global indicator
 	if m.agent.GlobalMode {
 		leftParts = append(leftParts, StatusBarGlobalStyle.Render("🌐 global"))

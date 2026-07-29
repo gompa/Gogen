@@ -229,6 +229,7 @@ type HistoryEntry struct {
 	Refusal    string            `json:"refusal,omitempty"`
 	ToolCalls  []HistoryToolCall `json:"toolCalls,omitempty"`
 	ToolCallID string            `json:"toolCallId,omitempty"`
+	Index      int               `json:"index,omitempty"`     // index in agent.Messages array (for fork/session commands)
 	CreatedAt  string            `json:"createdAt,omitempty"` // RFC3339Nano UTC when the message was created
 }
 
@@ -271,10 +272,12 @@ type WSMessage struct {
 	Paths                 []string       `json:"paths,omitempty"`
 	Reason                string         `json:"reason,omitempty"`
 	Mode                  string         `json:"mode,omitempty"`
+	ThinkingLevel         string         `json:"thinkingLevel,omitempty"`
 	GlobalMode            bool           `json:"globalMode,omitempty"`
 	SessionID             string         `json:"sessionId,omitempty"`
 	SessionAction         string         `json:"sessionAction,omitempty"`
 	SessionLabel          string         `json:"sessionLabel,omitempty"`
+	MessageIndex          int            `json:"messageIndex,omitempty"`
 	Sessions              []SessionEntry `json:"sessions,omitempty"`
 	History               []HistoryEntry `json:"history,omitempty"`
 	// Filesystem / git editor APIs
@@ -373,13 +376,14 @@ func applyContextStats(msg *WSMessage, stats agent.TurnContext, accum *agent.Usa
 // agentMu — tokenize after unlocking via applyContextStats.
 func (s *Server) agentConfigMsgBasic() WSMessage {
 	return WSMessage{
-		Type:         "config",
-		WorkingDir:   s.agent.Executor.GetWorkingDir(),
-		Model:        s.agent.CurrentModel(),
-		Mode:         s.agent.Mode.String(),
-		GlobalMode:   s.agent.GlobalMode,
-		SessionID:    s.agent.SessionID,
-		SessionLabel: s.agent.SessionLabel,
+		Type:          "config",
+		WorkingDir:    s.agent.Executor.GetWorkingDir(),
+		Model:         s.agent.CurrentModel(),
+		Mode:          s.agent.Mode.String(),
+		ThinkingLevel: string(s.agent.ThinkingLevel),
+		GlobalMode:    s.agent.GlobalMode,
+		SessionID:     s.agent.SessionID,
+		SessionLabel:  s.agent.SessionLabel,
 	}
 }
 
@@ -426,7 +430,7 @@ func sessionEntries(list []agent.SessionInfo, currentID string) []SessionEntry {
 
 func historyEntries(msgs []llm.Message) []HistoryEntry {
 	out := make([]HistoryEntry, 0, len(msgs))
-	for _, m := range msgs {
+	for idx, m := range msgs {
 		createdAt := ""
 		if !m.CreatedAt.IsZero() {
 			createdAt = m.CreatedAt.UTC().Format(time.RFC3339Nano)
@@ -437,7 +441,7 @@ func historyEntries(msgs []llm.Message) []HistoryEntry {
 			if m.Content == "" {
 				continue
 			}
-			out = append(out, HistoryEntry{Role: m.Role, Content: m.Content, CreatedAt: createdAt})
+			out = append(out, HistoryEntry{Role: m.Role, Content: m.Content, Index: idx, CreatedAt: createdAt})
 		case "assistant":
 			if m.Content == "" && len(m.ToolCalls) == 0 && m.Reasoning == "" && m.Refusal == "" {
 				continue
@@ -447,6 +451,7 @@ func historyEntries(msgs []llm.Message) []HistoryEntry {
 				Content:   m.Content,
 				Reasoning: m.Reasoning,
 				Refusal:   m.Refusal,
+				Index:     idx,
 				CreatedAt: createdAt,
 			}
 			if len(m.ToolCalls) > 0 {
@@ -469,6 +474,7 @@ func historyEntries(msgs []llm.Message) []HistoryEntry {
 				Role:       m.Role,
 				Content:    m.Content,
 				ToolCallID: m.ToolCallID,
+				Index:      idx,
 				CreatedAt:  createdAt,
 			})
 		}
@@ -707,6 +713,22 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			s.turnMu.Unlock()
 			s.writeSessionCommandResult(ws, r.Context(), result, err)
 			continue
+		case "session_fork":
+			stream.cancelInFlight()
+			if !s.tryAcquireTurn(wsTurnAcquireWait) {
+				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+				continue
+			}
+			forkArg := fmt.Sprintf("%d", msg.MessageIndex)
+			if msg.MessageIndex < 0 {
+				forkArg = "last"
+			}
+			var result agent.SessionCommandResult
+			var err error
+			result, _, err = s.agent.HandleSessionCommand(r.Context(), "fork "+forkArg, sesspkg.NewID())
+			s.turnMu.Unlock()
+			s.writeSessionCommandResult(ws, r.Context(), result, err)
+			continue
 		case "cancel":
 			stream.cancelInFlight()
 			continue
@@ -763,6 +785,20 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 				applyContextStats(&modeCfg, s.agent.ContextStats(r.Context()), &accum)
 				_ = ws.writeJSON(modeCfg)
 				_ = ws.writeJSON(WSMessage{Type: "response", Content: modeOut})
+				continue
+			}
+
+			var thinkOut string
+			var thinkHandled bool
+			s.lockAgentWrite(func() {
+				thinkOut, thinkHandled = s.agent.HandleThinkingCommand(msg.Content)
+			})
+			if thinkHandled {
+				s.turnMu.Unlock()
+				cfg := s.agentConfigMsg(r.Context())
+				cfg.ThinkingLevel = string(s.agent.ThinkingLevel)
+				_ = ws.writeJSON(cfg)
+				_ = ws.writeJSON(WSMessage{Type: "response", Content: thinkOut})
 				continue
 			}
 
@@ -1027,6 +1063,21 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 				applyContextStats(&cfg, s.agent.ContextStats(r.Context()), &accum)
 				_ = ws.writeJSON(cfg)
 			}
+			continue
+		case "set_thinking_level":
+			stream.cancelInFlight()
+			if !s.tryAcquireTurn(wsTurnAcquireWait) {
+				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+				continue
+			}
+			s.lockAgentWrite(func() {
+				if level, ok := agent.ParseThinkingLevel(msg.ThinkingLevel); ok {
+					s.agent.SetThinkingLevel(level)
+				}
+			})
+			cfg := s.agentConfigMsg(r.Context())
+			s.turnMu.Unlock()
+			_ = ws.writeJSON(cfg)
 			continue
 		case "config":
 			absDir, err := filepath.Abs(msg.WorkingDir)

@@ -158,5 +158,12 @@ func (m *MockProvider) ModelName() string {
 	return m.Model
 }
 
+func (m *MockProvider) SetThinkingLevel(level string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Mock: no-op, just record it if needed.
+	_ = level
+}
+
 // Ensure MockProvider implements LLMProvider.
 var _ LLMProvider = (*MockProvider)(nil)
