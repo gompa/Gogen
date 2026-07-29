@@ -23,11 +23,12 @@ type patchHunk struct {
 }
 
 type patchPlan struct {
-	target  string
-	secure  string
-	updated string
-	delete  bool
-	create  bool
+	target     string
+	secure     string
+	updated    string
+	delete     bool
+	create     bool
+	hunkShifts []string // non-nil when fuzzy mode relocated hunks
 }
 
 // PatchFile applies a unified diff to files under the working directory.
@@ -103,7 +104,7 @@ func (e *Executor) PatchFile(ctx context.Context, diff string, dryRun, fuzzy boo
 			snapshots[plan.secure] = data
 		}
 
-		if err := writeFileAtomic(plan.secure, []byte(plan.updated), 0o644); err != nil {
+		if err := writeFileAtomic(plan.secure, []byte(plan.updated), defaultFilePerm); err != nil {
 			rollbackPatches(snapshots, created)
 			return "", err
 		}
@@ -116,6 +117,7 @@ func (e *Executor) PatchFile(ctx context.Context, diff string, dryRun, fuzzy boo
 	}
 
 	msg := fmt.Sprintf("Applied patch to %d file(s): %s", len(applied), strings.Join(applied, ", "))
+	msg = appendShifts(msg, plans)
 	return e.AppendSyntaxCheck(msg, appliedPaths(applied)...), nil
 }
 
@@ -129,6 +131,25 @@ func appliedPaths(applied []string) []string {
 	return out
 }
 
+func appendShifts(msg string, plans []patchPlan) string {
+	var shifts []string
+	for _, p := range plans {
+		for _, s := range p.hunkShifts {
+			shifts = append(shifts, p.target+": "+s)
+		}
+	}
+	if len(shifts) == 0 {
+		return msg
+	}
+	var b strings.Builder
+	b.WriteString(msg)
+	b.WriteString("\n\nFuzzy-matching shifts (hunks relocated from original positions):\n")
+	for _, s := range shifts {
+		b.WriteString("  " + s + "\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
 func rollbackPatches(snapshots map[string][]byte, created []string) {
 	for _, path := range created {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
@@ -136,7 +157,7 @@ func rollbackPatches(snapshots map[string][]byte, created []string) {
 		}
 	}
 	for path, data := range snapshots {
-		if err := writeFileAtomic(path, data, 0o644); err != nil {
+		if err := writeFileAtomic(path, data, defaultFilePerm); err != nil {
 			log.Printf("patch rollback: restore %s: %v", path, err)
 		}
 	}
@@ -202,7 +223,7 @@ func (e *Executor) planPatch(pf patchFile, fuzzy bool) (patchPlan, string, error
 		original = splitLinesPreserveTrailing(string(data))
 	}
 
-	updated, err := applyPatchHunks(original, pf.hunks, fuzzy)
+	updated, shifts, err := applyPatchHunks(original, pf.hunks, fuzzy)
 	if err != nil {
 		return patchPlan{}, target, err
 	}
@@ -213,10 +234,11 @@ func (e *Executor) planPatch(pf patchFile, fuzzy bool) (patchPlan, string, error
 	}
 
 	return patchPlan{
-		target:  target,
-		secure:  secure,
-		updated: joinLinesPreserveTrailing(updated),
-		create:  isCreate,
+		target:     target,
+		secure:     secure,
+		updated:    joinLinesPreserveTrailing(updated),
+		create:     isCreate,
+		hunkShifts: shifts,
 	}, label, nil
 }
 
@@ -425,7 +447,7 @@ func parseDiffLineCount(part string) (int, error) {
 	return n, nil
 }
 
-func applyPatchHunks(original []string, hunks []patchHunk, fuzzy bool) ([]string, error) {
+func applyPatchHunks(original []string, hunks []patchHunk, fuzzy bool) (outLines []string, hunkShifts []string, err error) {
 	out := append([]string(nil), original...)
 	lineDelta := 0
 	for hi, h := range hunks {
@@ -453,9 +475,9 @@ func applyPatchHunks(original []string, hunks []patchHunk, fuzzy bool) ([]string
 		inBounds := start <= len(out) && start+n <= len(out)
 		if !inBounds && !fuzzy {
 			if start > len(out) {
-				return nil, fmt.Errorf("hunk %d/%d starts at line %d but file has %d lines", hi+1, len(hunks), h.oldStart, len(out)-lineDelta)
+				return nil, nil, fmt.Errorf("hunk %d/%d starts at line %d but file has %d lines", hi+1, len(hunks), h.oldStart, len(out)-lineDelta)
 			}
-			return nil, fmt.Errorf("hunk %d/%d extends past end of file (line %d)", hi+1, len(hunks), h.oldStart+n-1)
+			return nil, nil, fmt.Errorf("hunk %d/%d extends past end of file (line %d)", hi+1, len(hunks), h.oldStart+n-1)
 		}
 		hint := start
 		if hint > len(out) {
@@ -469,7 +491,14 @@ func applyPatchHunks(original []string, hunks []patchHunk, fuzzy bool) ([]string
 		}
 		matched := findHunkMatch(out, h.oldLines, hint, fuzzy)
 		if matched < 0 {
-			return nil, formatHunkMismatch(hi+1, len(hunks), hint+1, actual, h.oldLines, fuzzy)
+			return nil, nil, formatHunkMismatch(hi+1, len(hunks), hint+1, actual, h.oldLines, fuzzy)
+		}
+		// Track hunk relocation when fuzzy matching found the hunk at a
+		// different position than the diff headers indicated.
+		if shift := matched - hint; shift != 0 {
+			expectedLine := h.oldStart + lineDelta
+			hunkShifts = append(hunkShifts, fmt.Sprintf("hunk %d shifted by %+d lines (expected around line %d, found at line %d)",
+				hi+1, shift, expectedLine, expectedLine+shift))
 		}
 		start = matched
 		end := start + n
@@ -483,7 +512,7 @@ func applyPatchHunks(original []string, hunks []patchHunk, fuzzy bool) ([]string
 		out = newOut
 		lineDelta += len(replacement) - n
 	}
-	return out, nil
+	return out, hunkShifts, nil
 }
 
 // findHunkMatch locates oldLines within lines. Returns the start index, or -1

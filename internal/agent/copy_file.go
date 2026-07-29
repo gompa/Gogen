@@ -20,7 +20,7 @@ func (e *Executor) CopyFile(src, dst string) (string, error) {
 	}
 	defer srcFile.Close()
 
-	dstFile, err := os.OpenFile(dstSecure, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	dstFile, err := os.OpenFile(dstSecure, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, defaultFilePerm)
 	if err != nil {
 		return "", err
 	}

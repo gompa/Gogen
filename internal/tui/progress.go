@@ -21,8 +21,7 @@ const (
 // Pre-rendered static progress lines so DimStyle.Render is not called every
 // frame for content that never changes between renders.
 var (
-	progressStreamingLine  = DimStyle.Render("  streaming…")
-	progressProcessingLine = DimStyle.Render("  … processing …")
+	progressStreamingLine = DimStyle.Render("  streaming…")
 )
 
 func newProgressSpinner() spinner.Model {
@@ -74,7 +73,9 @@ func (m *Model) renderProgressInput() string {
 	case progressActive:
 		line = progressStreamingLine
 	default:
-		line = progressProcessingLine
+		// Fallback for progressHidden (renderProgressInput is only called
+		// when streaming is true, but handle defensively).
+		line = ""
 	}
 	return padInputBand(line, m.textarea.Height())
 }

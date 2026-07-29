@@ -8,6 +8,9 @@ import (
 	"gogen/internal/llm"
 )
 
+// validateModelTimeout bounds the model validation call after session restore.
+const validateModelTimeout = 12 * time.Second
+
 // SessionSnapshot is persisted conversation state.
 type SessionSnapshot struct {
 	WorkingDir     string
@@ -126,7 +129,7 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 // Bounded so a hung provider cannot run ListModels + ModelContextLimit
 // back-to-back for an unbounded wall time.
 func (a *Agent) ValidateRestoredModel(ctx context.Context, model string) {
-	ctx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, validateModelTimeout)
 	defer cancel()
 
 	// Context limit first: ModelContextLimit tries /v1/models briefly (local

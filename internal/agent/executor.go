@@ -19,6 +19,9 @@ const (
 	readFileMaxLines  = 10000
 )
 
+// defaultCommandTimeout is the default maximum duration for command execution.
+const defaultCommandTimeout = 2 * time.Minute
+
 type Executor struct {
 	wdMu                  sync.RWMutex
 	WorkingDir            string // read via GetWorkingDir; write via SetWorkingDir
@@ -34,7 +37,7 @@ func NewExecutor(wd string) *Executor {
 		WorkingDir:            wd,
 		Commands:              NewCommandGuard("blocklist", nil),
 		RequireDeleteApproval: true,
-		CommandTimeout:        2 * time.Minute,
+		CommandTimeout:        defaultCommandTimeout,
 		Sandbox:               "off",
 	}
 }
@@ -47,7 +50,7 @@ func NewExecutorWithGuard(wd string, guard *CommandGuard) *Executor {
 		WorkingDir:            wd,
 		Commands:              guard,
 		RequireDeleteApproval: true,
-		CommandTimeout:        2 * time.Minute,
+		CommandTimeout:        defaultCommandTimeout,
 		Sandbox:               "off",
 		PathBoundary:          "",
 	}
@@ -213,9 +216,9 @@ func (e *Executor) ReadFileRange(path string, offset, limit int, search string, 
 			if ringPos == 0 {
 				ringFull = true
 			}
-			if lineNum >= readFileMaxLines {
-				break
-			}
+			// Do not cap by readFileMaxLines when searching — the file-size
+			// warning above already informed the user, and the post-match
+			// line-counting scan below has no cap either.
 		}
 		if err := sc.Err(); err != nil {
 			return "", err
@@ -320,7 +323,7 @@ func (e *Executor) WriteFile(path string, content string) error {
 	if !os.IsNotExist(err) {
 		return err
 	}
-	return writeFileAtomic(secure, []byte(content), 0o644)
+	return writeFileAtomic(secure, []byte(content), defaultFilePerm)
 }
 
 // OverwriteFile creates or overwrites a file under the working directory.
@@ -329,7 +332,7 @@ func (e *Executor) OverwriteFile(path string, content string) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(secure, []byte(content), 0o644)
+	return writeFileAtomic(secure, []byte(content), defaultFilePerm)
 }
 
 // newGitCmd creates a *exec.Cmd for running git subcommands.
@@ -362,7 +365,7 @@ func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, 
 	}
 	timeout := e.CommandTimeout
 	if timeout <= 0 {
-		timeout = 2 * time.Minute
+		timeout = defaultCommandTimeout
 	}
 	if deadline, ok := ctx.Deadline(); ok {
 		remaining := time.Until(deadline)
@@ -456,7 +459,7 @@ func (e *Executor) ReplaceInFile(path string, search string, replace string, rep
 			return "", fmt.Errorf("search string not found in file")
 		}
 		newContent := strings.ReplaceAll(text, search, replace)
-		if err := writeFileAtomic(secure, []byte(newContent), 0o644); err != nil {
+		if err := writeFileAtomic(secure, []byte(newContent), defaultFilePerm); err != nil {
 			return "", err
 		}
 		msg := fmt.Sprintf("File updated successfully (%d occurrences replaced)", count)
@@ -468,7 +471,7 @@ func (e *Executor) ReplaceInFile(path string, search string, replace string, rep
 		return "", fmt.Errorf("search string not found in file")
 	}
 	newContent := text[:idx] + replace + text[idx+len(search):]
-	if err := writeFileAtomic(secure, []byte(newContent), 0o644); err != nil {
+	if err := writeFileAtomic(secure, []byte(newContent), defaultFilePerm); err != nil {
 		return "", err
 	}
 	msg := "File updated successfully (1 occurrence replaced)"

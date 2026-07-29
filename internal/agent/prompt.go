@@ -28,7 +28,7 @@ func systemPromptTemplate() string {
 You have tools for: exploring files, searching code, editing files (prefer patch_file),
 running tests/linters, git operations, web search, and task tracking.
 Also: find_definition, find_references, rename_symbol, multi_edit, call_graph,
-generate_test, context_pin_last, session_usage. See tool descriptions for details.
+context_pin_last, session_usage. See tool descriptions for details.
 
 Guidelines:
 Before editing: explore with repo_overview, search_code, list_definitions. Use read_file

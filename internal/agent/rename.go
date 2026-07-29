@@ -106,7 +106,7 @@ func (e *Executor) renameWithAST(ctx context.Context, searchRoot, relPrefix, glo
 
 		newContent := strings.Join(lines, "\n")
 		if !dryRun {
-			if err := writeFileAtomic(path, []byte(newContent), 0o644); err != nil {
+			if err := writeFileAtomic(path, []byte(newContent), defaultFilePerm); err != nil {
 				return err
 			}
 		}
@@ -168,7 +168,7 @@ func (e *Executor) renameWithText(ctx context.Context, searchRoot, relPrefix, gl
 		newContent := re.ReplaceAll(content, []byte(newName))
 
 		if !dryRun {
-			if err := writeFileAtomic(path, newContent, 0o644); err != nil {
+			if err := writeFileAtomic(path, newContent, defaultFilePerm); err != nil {
 				return err
 			}
 		}

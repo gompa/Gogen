@@ -2,8 +2,14 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+)
+
+var (
+	ErrDeleteDenied           = errors.New("delete denied by user")
+	ErrDeleteApprovalRequired = errors.New("delete blocked: approval is required")
 )
 
 // DeleteFile removes a file after user approval when required.

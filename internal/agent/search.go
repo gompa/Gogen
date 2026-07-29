@@ -31,6 +31,16 @@ const (
 	searchMaxContextLines = 20
 )
 
+// searchTimeout bounds a single SearchCode call.
+const searchTimeout = 30 * time.Second
+
+// replaceTreeTimeout bounds a ReplaceInTree call, which may scan many files
+// and is given a longer budget than a plain search.
+const replaceTreeTimeout = 60 * time.Second
+
+// gitLsFilesTimeout bounds the git ls-files call inside search scoping.
+const gitLsFilesTimeout = 15 * time.Second
+
 var searchSkipDirs = map[string]struct{}{
 	".git":         {},
 	"node_modules": {},
@@ -137,7 +147,7 @@ func (e *Executor) SearchCode(ctx context.Context, pattern, subpath, glob string
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, searchTimeout)
 	defer cancel()
 
 	// If subpath points to a file, scope the search to that file.
@@ -193,7 +203,7 @@ func (e *Executor) ReplaceInTree(ctx context.Context, pattern, replacement, subp
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, replaceTreeTimeout)
 	defer cancel()
 
 	re, err := compileSearchPattern(pattern)
@@ -302,7 +312,7 @@ func (e *Executor) replaceInFilePath(absPath, relPath string, re *regexp.Regexp,
 	if newContent == content {
 		return 0, nil
 	}
-	if err := writeFileAtomic(absPath, []byte(newContent), 0o644); err != nil {
+	if err := writeFileAtomic(absPath, []byte(newContent), defaultFilePerm); err != nil {
 		return 0, fmt.Errorf("failed to write %s: %w", relPath, err)
 	}
 	return len(locs), nil

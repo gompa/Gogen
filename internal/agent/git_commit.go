@@ -12,7 +12,7 @@ import (
 // Non-empty text is returned alongside the error when the command produces output
 // but still fails (e.g. git prints a message then exits non-zero).
 func (e *Executor) runGitCommand(ctx context.Context, args []string) (string, error) {
-	cmd, err := e.NewGitCmd(ctx, args...)
+	cmd, err := e.newGitCmd(ctx, args...)
 	if err != nil {
 		return "", err
 	}

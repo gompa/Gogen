@@ -55,7 +55,7 @@ func toolDef(name, desc string, params map[string]interface{}) llm.Tool {
 // BuiltinTools returns built-in tool definitions for the LLM.
 func BuiltinTools() []llm.Tool {
 	return []llm.Tool{
-		toolDef("list_files", "List directory contents as workspace-relative paths. Recursive=true walks tree. Directories suffixed with /.",
+		toolDef("list_files", "List directory contents as workspace-relative paths. Recursive=true walks tree (max 500 entries). Directories suffixed with /.",
 			toolSchema(map[string]interface{}{
 				"path":         toolProp("string", "Directory path"),
 				"recursive":    toolProp("boolean", "Walk tree recursively (max 500)"),
@@ -71,8 +71,8 @@ func BuiltinTools() []llm.Tool {
 			}, "pattern")),
 		toolDef("read_file", "Read file content. Use offset/limit for ranges. Search=regex jump.",
 			toolSchema(map[string]interface{}{
-				"file_path":    toolProp("string", "File path"),
-				"path":         toolProp("string", "Alternative path (fallback)"),
+				"path":         toolProp("string", "File path"),
+				"file_path":    toolProp("string", "Deprecated alias for path (prefer path)"),
 				"offset":       toolProp("integer", "Start line (no search) or context lines (with search, default 10)"),
 				"limit":        toolProp("integer", "Max lines (no search, default all/max 10000) or window size (with search)"),
 				"search":       toolProp("string", "Regex to jump to; offset/limit become context/window"),
@@ -82,7 +82,7 @@ func BuiltinTools() []llm.Tool {
 			toolSchema(map[string]interface{}{
 				"paths": toolPropArray("string", "File paths"),
 			}, "paths")),
-		toolDef("list_definitions", "List functions/types in a file with line numbers. Use before editing.",
+		toolDef("list_definitions", "List functions/types in a file with line numbers (requires tree-sitter; set GOGEN_TREESITTER=on). Use before editing.",
 			toolSchema(map[string]interface{}{
 				"path": toolProp("string", "Source file path"),
 			}, "path")),
@@ -253,11 +253,11 @@ func BuiltinTools() []llm.Tool {
 				"glob":     toolProp("string", "Optional glob filter"),
 				"dry_run":  toolProp("boolean", "Preview only"),
 			}, "old_name", "new_name")),
-		toolDef("multi_edit", "Same text replacement across multiple files.",
+		toolDef("multi_edit", "Same literal text replacement across multiple files (not regex).",
 			toolSchema(map[string]interface{}{
 				"pattern": toolProp("string", "Glob pattern (e.g. *.go)"),
-				"search":  toolProp("string", "String to find"),
-				"replace": toolProp("string", "Replacement"),
+				"search":  toolProp("string", "Literal string to find"),
+				"replace": toolProp("string", "Replacement text"),
 				"dry_run": toolProp("boolean", "Preview only"),
 			}, "pattern", "search", "replace")),
 		toolDef("call_graph", "Call relationships for a symbol.",
@@ -272,19 +272,6 @@ func BuiltinTools() []llm.Tool {
 				"symbol": toolProp("string", "Symbol"),
 				"path":   toolProp("string", "Optional subdirectory"),
 			}, "symbol")),
-		toolDef("extract_function", "Extract code block into a new function.",
-			toolSchema(map[string]interface{}{
-				"file":       toolProp("string", "File"),
-				"start_line": toolProp("integer", "Start line"),
-				"end_line":   toolProp("integer", "End line"),
-				"func_name":  toolProp("string", "Function name"),
-			}, "file", "start_line", "end_line", "func_name")),
-		toolDef("generate_test", "Generate tests (table-driven or subtests).",
-			toolSchema(map[string]interface{}{
-				"func_name": toolProp("string", "Function"),
-				"file":      toolProp("string", "Optional file (auto-detect)"),
-				"style":     toolProp("string", "table-driven or subtests"),
-			}, "func_name")),
 	}
 }
 

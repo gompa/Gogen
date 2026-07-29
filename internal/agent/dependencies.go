@@ -18,6 +18,22 @@ type DependencyResult struct {
 	Method             string
 }
 
+// computeImpact sets ImpactScore and Recommendation based on direct and indirect dependents.
+func (r *DependencyResult) computeImpact() {
+	if r == nil {
+		return
+	}
+	r.ImpactScore = len(r.DirectDependents) + len(r.IndirectDependents)*2
+	switch {
+	case r.ImpactScore > 20:
+		r.Recommendation = "⚠️  High impact change - consider breaking into smaller changes"
+	case r.ImpactScore > 10:
+		r.Recommendation = "⚡ Medium impact change"
+	default:
+		r.Recommendation = "✅ Low impact change"
+	}
+}
+
 // DependencyAnalysis analyzes the impact of changing a symbol.
 // Uses tree-sitter for supported languages, falls back to text search.
 func (e *Executor) DependencyAnalysis(ctx context.Context, symbol, subpath string) (string, error) {
@@ -66,17 +82,7 @@ func (e *Executor) dependencyAnalysisWithAST(ctx context.Context, searchRoot, re
 	// Find indirect dependents
 	result.IndirectDependents = e.findIndirectDependents(ctx, result.DirectDependents, "")
 
-	// Calculate impact score
-	result.ImpactScore = len(result.DirectDependents) + len(result.IndirectDependents)*2
-
-	// Generate recommendation
-	if result.ImpactScore > 20 {
-		result.Recommendation = "⚠️  High impact change - consider breaking into smaller changes"
-	} else if result.ImpactScore > 10 {
-		result.Recommendation = "⚡ Medium impact change"
-	} else {
-		result.Recommendation = "✅ Low impact change"
-	}
+	result.computeImpact()
 
 	return result, nil
 }
@@ -102,17 +108,7 @@ func (e *Executor) dependencyAnalysisWithText(ctx context.Context, searchRoot, r
 	// Find indirect dependents
 	result.IndirectDependents = e.findIndirectDependents(ctx, result.DirectDependents, "")
 
-	// Calculate impact score
-	result.ImpactScore = len(result.DirectDependents) + len(result.IndirectDependents)*2
-
-	// Generate recommendation
-	if result.ImpactScore > 20 {
-		result.Recommendation = "⚠️  High impact change - consider breaking into smaller changes"
-	} else if result.ImpactScore > 10 {
-		result.Recommendation = "⚡ Medium impact change"
-	} else {
-		result.Recommendation = "✅ Low impact change"
-	}
+	result.computeImpact()
 
 	return result, nil
 }

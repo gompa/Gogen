@@ -256,7 +256,7 @@ func cleanDDGLink(raw string) string {
 		parsed, err := url.Parse(raw)
 		if err == nil {
 			if dest := parsed.Query().Get("uddg"); dest != "" {
-				decoded, err := url.PathUnescape(dest)
+				decoded, err := url.QueryUnescape(dest)
 				if err == nil {
 					return decoded
 				}
@@ -271,7 +271,6 @@ func cleanDDGLink(raw string) string {
 func searchBrave(ctx context.Context, query string, maxResults int, apiKey string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, webSearchTimeout)
 	defer cancel()
-	client := &http.Client{}
 	reqURL := "https://api.search.brave.com/res/v1/web/search?" + url.Values{
 		"q":     {query},
 		"count": {strconv.Itoa(maxResults)},
@@ -285,7 +284,7 @@ func searchBrave(ctx context.Context, query string, maxResults int, apiKey strin
 	req.Header.Set("Accept-Encoding", "gzip")
 	req.Header.Set("X-Subscription-Token", apiKey)
 
-	resp, err := client.Do(req)
+	resp, err := sharedFetchClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("brave search: %w", err)
 	}

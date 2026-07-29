@@ -25,7 +25,7 @@ var ErrNoResults = errors.New("no results found in AST or text search")
 // ASTFallback is a generic helper that tries AST-based search first,
 // then falls back to text-based search if AST returns no results.
 // This eliminates code duplication across rename, call_graph, dependencies,
-// find_definition, extract, and test_generator.
+// and find_definition.
 type ASTFallback[T any] struct {
 	ASTFunc   func() (T, error) // AST-based search function
 	TextFunc  func() (T, error) // Text-based fallback function

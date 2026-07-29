@@ -193,7 +193,7 @@ func filterTracked(workingDir string, paths []string) []string {
 	}
 	trackedFilesCacheMu.RUnlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), gitLsFilesTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, git, "ls-files", "--cached", "--others", "--exclude-standard")
 	cmd.Dir = workingDir
@@ -220,7 +220,11 @@ func filterTracked(workingDir string, paths []string) []string {
 // filterByTrackedSet filters paths to only those present in the tracked set.
 func filterByTrackedSet(paths []string, tracked map[string]struct{}) []string {
 	if len(tracked) == 0 || len(paths) == 0 {
-		return paths
+		// No tracked files known — return empty instead of the original
+		// list so that trackedOnly=true does not silently show untracked
+		// files. Callers that fall back when git is unavailable already
+		// returned the unfiltered list before reaching this function.
+		return nil
 	}
 	filtered := make([]string, 0, len(paths))
 	for _, p := range paths {

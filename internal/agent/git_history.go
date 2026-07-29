@@ -84,7 +84,7 @@ func (e *Executor) GitBlame(ctx context.Context, path string, startLine, limit i
 		"--", path,
 	}
 
-	cmd, cmdErr := e.NewGitCmd(ctx, args...)
+	cmd, cmdErr := e.newGitCmd(ctx, args...)
 	if cmdErr != nil {
 		return "", cmdErr
 	}

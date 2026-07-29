@@ -9,6 +9,13 @@ import (
 	"gogen/internal/ioutil"
 )
 
+// defaultFilePerm is the default file permission used when creating or
+// overwriting files. Readable and writable by owner, readable by others.
+const defaultFilePerm os.FileMode = 0o644
+
+// defaultDirPerm is the default directory permission for created parent dirs.
+const defaultDirPerm os.FileMode = 0o755
+
 // validateFileOp validates source/destination paths for CopyFile/MoveFile,
 // checks the source is a regular file, and creates the destination parent
 // directory. Both operations share this exact preamble.
@@ -34,7 +41,7 @@ func (e *Executor) validateFileOp(src, dst string) (srcSecure, dstSecure string,
 	}
 	// Ensure destination parent directory exists.
 	dstDir := filepath.Dir(dstSecure)
-	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+	if err := os.MkdirAll(dstDir, defaultDirPerm); err != nil {
 		return "", "", err
 	}
 	return srcSecure, dstSecure, nil

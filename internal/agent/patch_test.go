@@ -128,16 +128,19 @@ func TestApplyPatchHunksFuzzyPastEOF(t *testing.T) {
 		oldLines: []string{"func main() {", "}"},
 		newLines: []string{"func main() {", "\t// hi", "}"},
 	}}
-	_, err := applyPatchHunks(original, hunks, false)
+	_, _, err := applyPatchHunks(original, hunks, false)
 	if err == nil {
 		t.Fatal("expected strict apply to fail with stale line numbers")
 	}
-	got, err := applyPatchHunks(original, hunks, true)
+	got, shifts, err := applyPatchHunks(original, hunks, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 5 || got[3] != "\t// hi" {
 		t.Fatalf("got %#v", got)
+	}
+	if len(shifts) != 1 {
+		t.Fatalf("expected 1 hunk shift, got %d: %v", len(shifts), shifts)
 	}
 }
 

@@ -57,32 +57,70 @@ func (e *Executor) CallGraph(ctx context.Context, symbol, subpath, glob string, 
 	return formatCallGraph(result, direction), nil
 }
 
+// definitionPattern describes how to detect a function/method definition for a
+// given symbol. The prefix is checked against the trimmed line first; when it
+// matches, verify reports whether the remainder indicates a definition of symbol.
+type definitionPattern struct {
+	prefix   string
+	verify   func(lineAfterPrefix, symbol string) bool
+	skipLen  int  // number of prefix bytes to strip; 0 = len(prefix)
+	skipRecv bool // true when Go receiver needs stripping
+	noPrefix bool // when true, prefix is not checked; all lines match
+}
+
 // isDefinitionLine checks whether a line is a definition of the symbol in any language.
 func isDefinitionLine(line, symbol string) bool {
+	patterns := []definitionPattern{
+		// Go: func Symbol( or func (receiver) Symbol(
+		{prefix: "func ", skipRecv: true, verify: func(rest, sym string) bool {
+			return strings.HasPrefix(rest, sym+"(") || strings.HasPrefix(rest, sym+" ")
+		}},
+		// Python: def Symbol(
+		{prefix: "def ", verify: func(rest, sym string) bool {
+			return strings.HasPrefix(rest, sym+"(")
+		}},
+		// JavaScript/TypeScript: function Symbol(
+		{prefix: "function ", verify: func(rest, sym string) bool {
+			return strings.HasPrefix(rest, sym+"(")
+		}},
+		// JavaScript/TypeScript: const/let/var Symbol = (
+		{noPrefix: true, verify: func(rest, sym string) bool {
+			for _, kw := range []string{"const ", "let ", "var "} {
+				if strings.HasPrefix(rest, kw+sym) {
+					after := rest[len(kw)+len(sym):]
+					after = strings.TrimSpace(after)
+					if strings.HasPrefix(after, "= (") || strings.HasPrefix(after, "=(") {
+						return true
+					}
+				}
+			}
+			return false
+		}},
+	}
+
 	trimmed := strings.TrimSpace(line)
-	// Go: func Symbol( or func (receiver) Symbol(
-	if strings.HasPrefix(trimmed, "func ") {
-		rest := trimmed[5:]
-		// Skip receiver: func (x *T) Symbol(
-		if strings.HasPrefix(rest, "(") {
+	if trimmed == "" {
+		return false
+	}
+
+	for _, p := range patterns {
+		if !p.noPrefix && !strings.HasPrefix(trimmed, p.prefix) {
+			continue
+		}
+		var rest string
+		if p.skipLen > 0 {
+			rest = trimmed[p.skipLen:]
+		} else if !p.noPrefix {
+			rest = trimmed[len(p.prefix):]
+		} else {
+			rest = trimmed
+		}
+		if p.skipRecv && strings.HasPrefix(rest, "(") {
 			if idx := strings.Index(rest, ")"); idx >= 0 {
 				rest = strings.TrimSpace(rest[idx+1:])
 			}
 		}
-		return strings.HasPrefix(rest, symbol+"(") || strings.HasPrefix(rest, symbol+" ")
-	}
-	// Python: def Symbol(
-	if strings.HasPrefix(trimmed, "def "+symbol+"(") {
-		return true
-	}
-	// JavaScript/TypeScript: function Symbol( or const Symbol = (
-	if strings.HasPrefix(trimmed, "function "+symbol+"(") {
-		return true
-	}
-	if strings.HasPrefix(trimmed, "const "+symbol) || strings.HasPrefix(trimmed, "let "+symbol) || strings.HasPrefix(trimmed, "var "+symbol) {
-		after := trimmed[len(symbol)+6:]
-		after = strings.TrimSpace(after)
-		if strings.HasPrefix(after, "= (") || strings.HasPrefix(after, "=(") {
+		if p.verify(rest, symbol) {
 			return true
 		}
 	}

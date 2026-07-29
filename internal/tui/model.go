@@ -24,20 +24,20 @@ import (
 type FocusTarget int
 
 const (
-	FocusInput    FocusTarget = iota
-	FocusViewport FocusTarget = iota
+	FocusInput FocusTarget = iota
+	FocusViewport
 )
 
 // ModalKind identifies the active modal overlay.
 type ModalKind int
 
 const (
-	ModalNone       ModalKind = iota
-	ModalApproval   ModalKind = iota
-	ModalSessions   ModalKind = iota
-	ModalModels     ModalKind = iota
-	ModalHelp       ModalKind = iota
-	ModalCompletion ModalKind = iota
+	ModalNone ModalKind = iota
+	ModalApproval
+	ModalSessions
+	ModalModels
+	ModalHelp
+	ModalCompletion
 )
 
 // Model is the top-level Bubble Tea model for the TUI.

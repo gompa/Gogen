@@ -7,6 +7,13 @@ import (
 	"gogen/internal/llm"
 )
 
+// MCPToolRegistry exposes MCP tools to the agent.
+type MCPToolRegistry interface {
+	Definitions() []llm.Tool
+	ToolNames() map[string]struct{}
+	CallTool(ctx context.Context, name string, args map[string]interface{}) (string, error)
+}
+
 // ToolHandler executes a builtin tool given parsed arguments.
 type ToolHandler func(ctx context.Context, a *Agent, args map[string]interface{}) (string, error)
 
@@ -57,8 +64,6 @@ func BuiltinToolHandlers() map[string]ToolHandler {
 		"multi_edit":          handleMultiEdit,
 		"call_graph":          handleCallGraph,
 		"dependency_analysis": handleDependencyAnalysis,
-		"extract_function":    handleExtractFunction,
-		"generate_test":       handleGenerateTest,
 	}
 }
 
@@ -116,15 +121,19 @@ func handleRepoOverview(_ context.Context, a *Agent, _ map[string]interface{}) (
 }
 
 func handleReadFile(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
-	path, err := stringArgOptional(args, "file_path")
+	// Prefer "path", fall back to deprecated "file_path".
+	path, err := stringArgOptional(args, "path")
 	if err != nil {
 		return "", err
 	}
 	if path == "" {
-		path, err = stringArg(args, "path")
+		path, err = stringArgOptional(args, "file_path")
 		if err != nil {
 			return "", err
 		}
+	}
+	if path == "" {
+		return "", fmt.Errorf("missing required argument %q", "path")
 	}
 	offset, err := intArgOptional(args, "offset")
 	if err != nil {
@@ -160,9 +169,8 @@ func handleWriteFile(_ context.Context, a *Agent, args map[string]interface{}) (
 		return "", err
 	}
 	result := a.Executor.AppendSyntaxCheck("File written successfully", path)
-	if diffOut, diffErr := runDiffQuick(a.WorkingDir, path); diffErr == nil && diffOut != "" {
-		result += "\n\n" + diffOut
-	}
+	// No diff shown: write_file only creates new files. Use show_diff
+	// after staging/committing or patch_file for modifications.
 	return result, nil
 }
 
@@ -553,44 +561,4 @@ func handleDependencyAnalysis(ctx context.Context, a *Agent, args map[string]int
 	}
 	subpath, _ := stringArgOptional(args, "path")
 	return a.Executor.DependencyAnalysis(ctx, symbol, subpath)
-}
-
-func handleExtractFunction(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
-	file, err := stringArg(args, "file")
-	if err != nil {
-		return "", err
-	}
-	startLine, err := intArg(args, "start_line")
-	if err != nil {
-		return "", err
-	}
-	endLine, err := intArg(args, "end_line")
-	if err != nil {
-		return "", err
-	}
-	funcName, err := stringArg(args, "func_name")
-	if err != nil {
-		return "", err
-	}
-	return a.Executor.ExtractFunction(ctx, file, startLine, endLine, funcName)
-}
-
-func handleGenerateTest(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
-	funcName, err := stringArg(args, "func_name")
-	if err != nil {
-		return "", err
-	}
-	file, _ := stringArgOptional(args, "file")
-	style := TestStyleSubtests
-	if styleStr, err := stringArgOptional(args, "style"); err != nil {
-		return "", err
-	} else if styleStr != "" && TestStyle(styleStr) != TestStyleTableDriven && TestStyle(styleStr) != TestStyleSubtests {
-		return "", fmt.Errorf("invalid style %q: must be %q or %q", styleStr, TestStyleTableDriven, TestStyleSubtests)
-	} else if styleStr != "" {
-		style = TestStyle(styleStr)
-	}
-	if style == "" {
-		style = TestStyleSubtests
-	}
-	return a.Executor.GenerateTest(ctx, funcName, file, style)
 }

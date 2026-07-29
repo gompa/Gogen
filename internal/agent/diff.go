@@ -9,6 +9,9 @@ import (
 	"time"
 )
 
+// diffQuickTimeout bounds the git diff call inside runDiffQuick.
+const diffQuickTimeout = 15 * time.Second
+
 // ShowDiff returns a unified diff for the working tree using git when available.
 func (e *Executor) ShowDiff(ctx context.Context, path string, staged bool) (string, error) {
 	args := []string{"diff", "--no-color", "--no-ext-diff"}
@@ -55,7 +58,7 @@ func runDiffQuick(workingDir, path string) (string, error) {
 	if _, err := exec.LookPath("git"); err != nil {
 		return "", err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), diffQuickTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", "diff", "--no-color", "--no-ext-diff", "--", path)
 	cmd.Dir = workingDir

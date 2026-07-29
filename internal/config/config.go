@@ -111,23 +111,33 @@ func Defaults() Config {
 	}
 }
 
-// MCPEnabled reports whether MCP integration is active.
-// Opt-in: servers in project config are not started unless mcp is explicitly enabled.
-func (c *Config) MCPEnabled() bool {
-	if c == nil {
-		return false
-	}
-	v := strings.ToLower(strings.TrimSpace(c.MCP))
+// configOn reports whether a config field is explicitly enabled.
+func configOn(v string) bool {
+	v = strings.ToLower(strings.TrimSpace(v))
 	return v == "on" || v == "1" || v == "true"
 }
 
+// configOff reports whether a config field is explicitly disabled
+// (set to "off", "0", or "false"). An empty string is not "off" —
+// absence of a value does not imply explicit disablement.
+func configOff(v string) bool {
+	v = strings.ToLower(strings.TrimSpace(v))
+	return v == "off" || v == "0" || v == "false"
+}
+
+// MCPEnabled reports whether MCP integration is active.
+// Opt-in: servers in project config are not started unless mcp is explicitly enabled.
+func (c *Config) MCPEnabled() bool {
+	return c != nil && configOn(c.MCP)
+}
+
 // TreeSitterEnabled reports whether tree-sitter checks are active.
+// Enabled by default (on unless explicitly set to "off", "0", or "false").
 func (c *Config) TreeSitterEnabled() bool {
 	if c == nil {
 		return true
 	}
-	v := strings.ToLower(strings.TrimSpace(c.TreeSitter))
-	return v != "off" && v != "0" && v != "false"
+	return !configOff(c.TreeSitter)
 }
 
 // WebFetchEnabled reports whether the web_fetch tool is active.
@@ -135,8 +145,7 @@ func (c *Config) WebFetchEnabled() bool {
 	if c == nil {
 		return false
 	}
-	v := strings.ToLower(strings.TrimSpace(c.WebFetch))
-	return v == "on" || v == "1" || v == "true"
+	return configOn(c.WebFetch)
 }
 
 // WebSearchEnabled reports whether the web_search tool is active.
@@ -144,8 +153,7 @@ func (c *Config) WebSearchEnabled() bool {
 	if c == nil {
 		return false
 	}
-	v := strings.ToLower(strings.TrimSpace(c.WebSearch))
-	return v == "on" || v == "1" || v == "true"
+	return configOn(c.WebSearch)
 }
 
 // WebToolsEnabled reports whether either web tool may use the network.
