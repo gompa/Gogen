@@ -19,6 +19,7 @@
             saveAll,
             saveActive,
             openFileAtLine,
+            setMonacoTheme,
         } from '/editor.js';
         import { marked } from '/vendor/marked.esm.js';
         import DOMPurify from '/vendor/dompurify.esm.js';
@@ -1975,12 +1976,12 @@
             for (const s of sessions) {
                 const row = document.createElement('div');
                 row.className = 'session-row' + (s.current ? ' current' : '');
-                row.title = s.rawLabel || s.label || s.id;
+                row.title = s.label || s.id;
                 const content = document.createElement('div');
                 content.className = 'session-row-content';
                 const title = document.createElement('div');
                 title.className = 'session-row-title';
-                title.textContent = s.label || (s.id ? s.id.slice(0, 8) + '…' : '(unknown)');
+                title.textContent = s.label || s.id || '(unknown)';
                 const meta = document.createElement('div');
                 meta.className = 'session-row-meta';
                 const parts = [];
@@ -2044,7 +2045,7 @@
                 return;
             }
             if (!id) return;
-            const displayName = label || id.slice(0, 8) + '…';
+            const displayName = label || id;
             if (!confirm(`Are you sure you want to delete session "${displayName}"?\n\nThis action cannot be undone.`)) {
                 return;
             }
@@ -2377,6 +2378,66 @@
             }
         });
 
+        // === Resizable sidebar via drag handle ===
+        function initSidebarResize() {
+            const handles = document.querySelectorAll('.sidebar-resize-handle');
+
+            handles.forEach(handle => {
+                const targetId = handle.dataset.target;
+                const sidebar = document.getElementById(targetId);
+                if (!sidebar) return;
+
+                // Restore saved width
+                const saved = localStorage.getItem(targetId + '-width');
+                if (saved) {
+                    sidebar.style.width = saved;
+                    sidebar.style.flexGrow = '0';
+                    sidebar.style.flexShrink = '0';
+                }
+
+                handle.addEventListener('mousedown', (e) => {
+                    e.preventDefault();
+                    const startX = e.clientX;
+                    const startWidth = sidebar.getBoundingClientRect().width;
+
+                    handle.classList.add('active');
+
+                    function onMouseMove(ev) {
+                        const delta = ev.clientX - startX;
+                        let newWidth = startWidth + delta;
+                        // Clamp to sensible range
+                        newWidth = Math.max(160, Math.min(600, newWidth));
+                        sidebar.style.width = newWidth + 'px';
+                        sidebar.style.flexGrow = '0';
+                        sidebar.style.flexShrink = '0';
+                    }
+
+                    function onMouseUp() {
+                        handle.classList.remove('active');
+                        document.removeEventListener('mousemove', onMouseMove);
+                        document.removeEventListener('mouseup', onMouseUp);
+                        // Persist the width
+                        localStorage.setItem(targetId + '-width', sidebar.style.width);
+                    }
+
+                    document.addEventListener('mousemove', onMouseMove);
+                    document.addEventListener('mouseup', onMouseUp);
+                });
+
+                // Touch support: forward touch events to mouse handlers
+                handle.addEventListener('touchstart', (e) => {
+                    const touch = e.touches[0];
+                    const mouseEvent = new MouseEvent('mousedown', {
+                        clientX: touch.clientX,
+                        clientY: touch.clientY,
+                    });
+                    handle.dispatchEvent(mouseEvent);
+                }, { passive: true });
+            });
+        }
+
+        initSidebarResize();
+
         // === Task 9: Favicon (handled via link tag) ===
 
         // === Task 10: Page title updates ===
@@ -2491,6 +2552,8 @@
             localStorage.setItem('gogen-theme', preference);
             // Keep select in sync
             if (themeSelect.value !== preference) themeSelect.value = preference;
+            // Switch Monaco theme to match
+            setMonacoTheme(resolved === 'light');
         }
 
         // Initialize
@@ -2537,6 +2600,60 @@
                 const val = e.newValue || 'off';
                 if (notificationsSelect.value !== val) notificationsSelect.value = val;
             }
+        });
+
+        // === Accent color: persist and apply ===
+        const accentInput = document.getElementById('accent-color-input');
+
+        function hexToRgba(hex, alpha) {
+            if (!/^#[0-9a-f]{6}$/i.test(hex)) return null;
+            const r = parseInt(hex.slice(1, 3), 16);
+            const g = parseInt(hex.slice(3, 5), 16);
+            const b = parseInt(hex.slice(5, 7), 16);
+            return 'rgba(' + r + ', ' + g + ', ' + b + ', ' + alpha + ')';
+        }
+
+        function applyAccentColor(hex) {
+            if (!hex) {
+                document.documentElement.style.removeProperty('--user-accent');
+                document.documentElement.style.removeProperty('--user-accent-soft');
+                return;
+            }
+            const soft = hexToRgba(hex, 0.18);
+            if (!soft) return;
+            document.documentElement.style.setProperty('--user-accent', hex);
+            document.documentElement.style.setProperty('--user-accent-soft', soft);
+        }
+
+        const savedAccent = localStorage.getItem('gogen-accent-color') || '';
+        if (savedAccent) {
+            accentInput.value = savedAccent;
+            applyAccentColor(savedAccent);
+        }
+
+        accentInput.addEventListener('input', function () {
+            const hex = accentInput.value;
+            applyAccentColor(hex);
+            localStorage.setItem('gogen-accent-color', hex);
+        });
+
+        window.addEventListener('storage', function (e) {
+            if (e.key === 'gogen-accent-color') {
+                const val = e.newValue || '';
+                if (accentInput.value !== val) accentInput.value = val;
+                applyAccentColor(val);
+            }
+        });
+
+        // === Accent color: reset to theme default ===
+        document.getElementById('accent-reset-btn').addEventListener('click', function () {
+            localStorage.removeItem('gogen-accent-color');
+            document.documentElement.style.removeProperty('--user-accent');
+            document.documentElement.style.removeProperty('--user-accent-soft');
+            // Reset picker to the current theme's default accent
+            const isLight = document.documentElement.classList.contains('light');
+            accentInput.value = isLight ? '#0066cc' : '#569cd6';
+            accentInput.blur();
         });
 
         function getNotificationPref() {

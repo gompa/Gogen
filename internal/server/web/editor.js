@@ -149,6 +149,27 @@ export async function initMonaco() {
         'editorGutter.modifiedBackground': '#d29922',
       },
     });
+    monaco.editor.defineTheme('gogen-light', {
+      base: 'vs',
+      inherit: true,
+      rules: [
+        { token: 'comment', foreground: '008000' },
+        { token: 'meta.diff', foreground: '0066CC' },
+        { token: 'meta.diff.header', foreground: '0066CC', fontStyle: 'bold' },
+        { token: 'meta.diff.hunk', foreground: 'A626A4' },
+        { token: 'markup.inserted', foreground: '1A7F37' },
+        { token: 'markup.deleted', foreground: 'CF222E' },
+      ],
+      colors: {
+        'diffEditor.insertedTextBackground': '#dafbe180',
+        'diffEditor.removedTextBackground': '#ffebe980',
+        'diffEditor.insertedLineBackground': '#dafbe140',
+        'diffEditor.removedLineBackground': '#ffebe940',
+        'editorGutter.addedBackground': '#1a7f37',
+        'editorGutter.deletedBackground': '#cf222e',
+        'editorGutter.modifiedBackground': '#9a6700',
+      },
+    });
     monaco.editor.setTheme('gogen-dark');
     monacoReady = true;
     return monaco;
@@ -160,6 +181,15 @@ export async function initMonaco() {
     monacoInitPromise = null;
     throw err;
   }
+}
+
+/**
+ * Switch the Monaco theme between dark and light.
+ * Safe to call before initMonaco has completed — the call is a no-op until monaco is ready.
+ */
+export function setMonacoTheme(useLight) {
+  if (!monaco) return;
+  monaco.editor.setTheme(useLight ? 'gogen-light' : 'gogen-dark');
 }
 
 // Common fence aliases → Monaco language ids.
@@ -419,7 +449,6 @@ function ensureEditors() {
   if (!editor) {
     editor = monaco.editor.create(host, {
       automaticLayout: true,
-      theme: 'gogen-dark',
       minimap: { enabled: false },
       fontSize: 13,
       wordWrap: 'on',
@@ -496,7 +525,6 @@ function showDiffPane() {
     diffEditor = monaco.editor.createDiffEditor(diffHost, {
       automaticLayout: true,
       readOnly: true,
-      theme: 'gogen-dark',
       renderSideBySide: GOGEN_UI.diffRenderSideBySide,
       minimap: { enabled: false },
       fontSize: 13,
@@ -1242,7 +1270,6 @@ export async function mountDiffEditor(container, value, opts = {}) {
       value: value || '',
       language: 'diff',
       readOnly: true,
-      theme: 'gogen-dark',
       // Fixed host size — avoid ResizeObserver fighting flex layout.
       automaticLayout: false,
       minimap: { enabled: false },

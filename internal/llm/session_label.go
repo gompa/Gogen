@@ -2,30 +2,17 @@ package llm
 
 import (
 	"strings"
-	"unicode/utf8"
 )
 
-const DefaultSessionLabelMaxLen = 50
+// DefaultSessionLabelMaxLen is kept for backward compatibility but no longer
+// enforced — the label is returned untruncated and CSS text-overflow: ellipsis
+// handles dynamic truncation on the client side.
+const DefaultSessionLabelMaxLen = 1 << 30 // effectively unlimited
 
-// SessionLabel returns a short preview of the first user message.
-func SessionLabel(messages []Message, maxLen int) string {
-	if maxLen <= 0 {
-		maxLen = DefaultSessionLabelMaxLen
-	}
-	for _, m := range messages {
-		if m.Role != "user" {
-			continue
-		}
-		s := strings.TrimSpace(m.Content)
-		if s == "" {
-			continue
-		}
-		s = strings.ReplaceAll(s, "\n", " ")
-		s = strings.Join(strings.Fields(s), " ")
-		return truncateRunes(s, maxLen)
-	}
-	return ""
-}
+// SessionLabel returns a normalized preview of the first user message.
+// Truncation is left to the client (CSS text-overflow: ellipsis) so the
+// full text is available when the sidebar is wide enough.
+func SessionLabel(messages []Message, maxLen int) string { return FirstUserMessage(messages) }
 
 // FirstUserMessage returns the content of the first user message, untruncated,
 // with whitespace normalized (newlines → spaces, runs collapsed).
@@ -42,15 +29,4 @@ func FirstUserMessage(messages []Message) string {
 		return strings.Join(strings.Fields(s), " ")
 	}
 	return ""
-}
-
-func truncateRunes(s string, maxLen int) string {
-	if utf8.RuneCountInString(s) <= maxLen {
-		return s
-	}
-	runes := []rune(s)
-	if maxLen <= 1 {
-		return string(runes[:maxLen])
-	}
-	return string(runes[:maxLen-1]) + "…"
 }

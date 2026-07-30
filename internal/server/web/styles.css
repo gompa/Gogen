@@ -9,8 +9,8 @@
             --fg: #d4d4d4;
             --fg-muted: #858585;
             --fg-dim: #6a6a6a;
-            --accent: #569cd6;
-            --accent-soft: rgba(86, 156, 214, 0.18);
+            --accent: var(--user-accent, #569cd6);
+            --accent-soft: var(--user-accent-soft, rgba(86, 156, 214, 0.18));
             --success: #4ec9b0;
             --success-bg: rgba(46, 160, 67, 0.18);
             --error: #f14c4c;
@@ -69,6 +69,26 @@
             white-space: nowrap;
             flex-shrink: 0;
         }
+
+        /* ===== Resizable sidebar drag handle ===== */
+        .sidebar-resize-handle {
+            width: 4px;
+            cursor: col-resize;
+            flex-shrink: 0;
+            position: relative;
+            z-index: 10;
+            background: transparent;
+            transition: background 0.15s ease;
+        }
+        .sidebar-resize-handle:hover,
+        .sidebar-resize-handle.active {
+            background: var(--accent);
+        }
+        @media (max-width: 768px) {
+            .sidebar-resize-handle {
+                display: none;
+            }
+        }
         #global-mode-badge.visible {
             display: inline-block;
         }
@@ -120,7 +140,7 @@
             border-top: 1px solid var(--border);
             margin: 14px 0;
         }
-        #chat-container { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg); }
+        #chat-container { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg); position: relative; }
         #messages {
             flex: 1;
             overflow-y: auto;
@@ -400,7 +420,7 @@
             padding: 10px 12px;
             border-radius: 4px;
             width: 100%;
-            max-width: 95%;
+            max-width: 100%;
             white-space: pre-wrap;
             word-break: break-word;
             flex-shrink: 0;
@@ -571,7 +591,7 @@
             border: 1px solid var(--border);
             border-radius: 4px;
             width: 100%;
-            max-width: 95%;
+            max-width: 100%;
             overflow: hidden;
             font-size: 0.9em;
             flex-shrink: 0;
@@ -684,17 +704,17 @@
             white-space: pre-wrap;
             word-break: break-word;
         }
-        .monaco-tool-host .gogen-diff-add { background: rgba(46, 160, 67, 0.22) !important; color: #3fb950 !important; }
-        .monaco-tool-host .gogen-diff-del { background: rgba(248, 81, 73, 0.22) !important; color: #ff7b72 !important; }
-        .monaco-tool-host .gogen-diff-hunk { background: rgba(86, 156, 214, 0.18) !important; color: #c586c0 !important; }
-        .monaco-tool-host .gogen-diff-meta { color: #858585 !important; }
-        .monaco-tool-host .diff-fallback .gogen-diff-add { background: rgba(46, 160, 67, 0.22); color: #3fb950; display: inline; }
-        .monaco-tool-host .diff-fallback .gogen-diff-del { background: rgba(248, 81, 73, 0.22); color: #ff7b72; display: inline; }
-        .monaco-tool-host .diff-fallback .gogen-diff-hunk { background: rgba(86, 156, 214, 0.18); color: #c586c0; display: inline; }
-        .monaco-tool-host .diff-fallback .gogen-diff-meta { color: #858585; display: inline; }
-        .monaco-tool-host .gogen-diff-add-margin { background: #2ea043 !important; width: 3px !important; margin-left: 3px; }
-        .monaco-tool-host .gogen-diff-del-margin { background: #f85149 !important; width: 3px !important; margin-left: 3px; }
-        .monaco-tool-host .gogen-diff-hunk-margin { background: #569cd6 !important; width: 3px !important; margin-left: 3px; }
+        .monaco-tool-host .gogen-diff-add { background: var(--success-bg) !important; color: var(--success) !important; }
+        .monaco-tool-host .gogen-diff-del { background: var(--error-bg) !important; color: var(--error) !important; }
+        .monaco-tool-host .gogen-diff-hunk { background: var(--accent-soft) !important; color: var(--accent) !important; }
+        .monaco-tool-host .gogen-diff-meta { color: var(--fg-muted) !important; }
+        .monaco-tool-host .diff-fallback .gogen-diff-add { background: var(--success-bg); color: var(--success); display: inline; }
+        .monaco-tool-host .diff-fallback .gogen-diff-del { background: var(--error-bg); color: var(--error); display: inline; }
+        .monaco-tool-host .diff-fallback .gogen-diff-hunk { background: var(--accent-soft); color: var(--accent); display: inline; }
+        .monaco-tool-host .diff-fallback .gogen-diff-meta { color: var(--fg-muted); display: inline; }
+        .monaco-tool-host .gogen-diff-add-margin { background: var(--success) !important; width: 3px !important; margin-left: 3px; }
+        .monaco-tool-host .gogen-diff-del-margin { background: var(--error) !important; width: 3px !important; margin-left: 3px; }
+        .monaco-tool-host .gogen-diff-hunk-margin { background: var(--accent) !important; width: 3px !important; margin-left: 3px; }
         .tool-waiting {
             padding: 6px 12px;
             font-size: 0.85em;
@@ -1221,7 +1241,7 @@
             word-break: break-word;
             margin: 4px 0;
             width: 100%;
-            max-width: 95%;
+            max-width: 100%;
             align-self: flex-start;
             color: var(--fg-muted);
             box-sizing: border-box;
@@ -1267,8 +1287,10 @@
         #scroll-bottom-btn {
             position: absolute;
             bottom: 80px;
-            left: 50%;
-            transform: translateX(-50%);
+            left: 0;
+            right: 0;
+            width: fit-content;
+            margin: 0 auto;
             z-index: 10;
             padding: 6px 16px;
             border-radius: 16px;
@@ -1314,7 +1336,6 @@
                 box-shadow: 4px 0 16px rgba(0,0,0,0.4);
             }
             #sidebar-toggle { display: block; }
-            #chat-container { position: relative; }
         }
 
         /* ===== Task 6: Custom close-tab modal ===== */
@@ -1420,6 +1441,21 @@
             font-size: 0.85em;
             min-width: 120px;
         }
+        #settings-dialog .settings-btn-secondary {
+            font-family: var(--sans);
+            font-size: 0.75em;
+            padding: 2px 8px;
+            margin-top: 4px;
+            background: transparent;
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            color: var(--fg-muted);
+            cursor: pointer;
+        }
+        #settings-dialog .settings-btn-secondary:hover {
+            color: var(--fg);
+            background: var(--bg-hover);
+        }
         :root.light {
             --bg: #ffffff;
             --bg-elevated: #f3f3f3;
@@ -1431,8 +1467,8 @@
             --fg: #1e1e1e;
             --fg-muted: #616161;
             --fg-dim: #999999;
-            --accent: #0066cc;
-            --accent-soft: rgba(0, 102, 204, 0.12);
+            --accent: var(--user-accent, #0066cc);
+            --accent-soft: var(--user-accent-soft, rgba(0, 102, 204, 0.12));
             --success: #1a7f37;
             --success-bg: rgba(26, 127, 55, 0.12);
             --error: #cf222e;

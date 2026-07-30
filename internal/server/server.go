@@ -212,8 +212,8 @@ type SessionEntry struct {
 	Label        string `json:"label,omitempty"`
 	Oneshot      bool   `json:"oneshot,omitempty"`
 	Current      bool   `json:"current,omitempty"`
-	// RawLabel is the full first user message (untruncated) for tooltip display.
-	RawLabel string `json:"rawLabel,omitempty"`
+	// Label is now the full first user message — CSS text-overflow: ellipsis
+	// handles dynamic truncation on the client side.
 }
 
 type HistoryToolCall struct {
@@ -421,7 +421,6 @@ func sessionEntries(list []agent.SessionInfo, currentID string) []SessionEntry {
 			MessageCount: s.MessageCount,
 			Label:        s.Label,
 			Oneshot:      s.Oneshot,
-			RawLabel:     s.RawLabel,
 			Current:      s.ID == currentID,
 		}
 	}

@@ -41,6 +41,7 @@
                 </div>
                 <div id="session-list" aria-label="Saved sessions"></div>
             </div>
+            <div class="sidebar-resize-handle" data-target="sidebar" title="Drag to resize sidebar"></div>
             <div id="chat-container">
                 <button type="button" id="sidebar-toggle" title="Toggle sidebar">☰</button>
                 <div id="messages" tabindex="-1"></div>
@@ -114,6 +115,7 @@
                     <div id="unstaged-list"></div>
                 </div>
             </div>
+            <div class="sidebar-resize-handle" data-target="editor-sidebar" title="Drag to resize sidebar"></div>
             <div id="editor-main">
                 <div id="editor-toolbar">
                     <span id="editor-path-label">No file open</span>
@@ -184,6 +186,13 @@
                         <option value="open">Open (background)</option>
                         <option value="open-switch">Open &amp; switch to editor</option>
                     </select>
+                </div>
+            </div>
+            <div class="setting-row" id="accent-setting-row">
+                <div>
+                    <label>Accent color</label>
+                    <input type="color" id="accent-color-input" value="#569cd6" aria-label="Accent color">
+                    <button type="button" id="accent-reset-btn" class="settings-btn-secondary">Default</button>
                 </div>
             </div>
             <div class="setting-row">

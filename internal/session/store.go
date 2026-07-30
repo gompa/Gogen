@@ -49,7 +49,6 @@ type sessionIndexEntry struct {
 	Oneshot      bool      `json:"oneshot,omitempty"`
 	MessageCount int       `json:"messageCount"`
 	Label        string    `json:"label,omitempty"`
-	RawLabel     string    `json:"rawLabel,omitempty"`
 }
 
 // sessionIndex is the on-disk index of session metadata for fast listing.
@@ -220,8 +219,7 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 	}
 	// Update index and invalidate in-memory cache.
 	label := sessionLabel(snap.Messages, snap.Label)
-	rawLabel := llm.FirstUserMessage(snap.Messages)
-	s.updateIndex(snap.WorkingDir, id, out.Updated, len(snap.Messages), label, snap.Oneshot, rawLabel)
+	s.updateIndex(snap.WorkingDir, id, out.Updated, len(snap.Messages), label, snap.Oneshot)
 	return nil
 }
 
@@ -378,13 +376,14 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 	// Try the metadata index file.
 	idx := s.readIndex(workingDir)
 	if idx != nil && len(idx.Entries) > 0 {
-		// Migration: sessions saved before the RawLabel field existed won't have
-		// it in the index. For those, load the session file to compute it.
+		// Migration: older sessions may still have a truncated Label (50-char
+		// limit from before CSS handled dynamic truncation). Load the session
+		// file and refresh with the full untruncated label.
 		needsRewrite := false
 		for i, e := range idx.Entries {
-			if e.RawLabel == "" && e.Label != "" {
-				if raw := s.loadRawLabel(workingDir, e.ID); raw != "" {
-					idx.Entries[i].RawLabel = raw
+			if e.Label != "" {
+				if raw := s.loadRawLabel(workingDir, e.ID); raw != "" && raw != e.Label {
+					idx.Entries[i].Label = raw
 					needsRewrite = true
 				}
 			}
@@ -403,7 +402,6 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 				UpdatedAt:    e.Updated.UTC().Format(time.RFC3339Nano),
 				MessageCount: e.MessageCount,
 				Label:        e.Label,
-				RawLabel:     e.RawLabel,
 			}
 		}
 		listCacheMu.Lock()
@@ -444,7 +442,6 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 			continue
 		}
 		lbl := sessionLabel(f.Messages, f.Label)
-		rawLabel := llm.FirstUserMessage(f.Messages)
 		items = append(items, item{
 			info: agent.SessionInfo{
 				ID:           id,
@@ -452,12 +449,11 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 				UpdatedAt:    f.Updated.UTC().Format(time.RFC3339Nano),
 				MessageCount: len(f.Messages),
 				Label:        lbl,
-				RawLabel:     rawLabel,
 			},
 			updated: f.Updated,
 		})
 		idx.Entries = append(idx.Entries, sessionIndexEntry{
-			ID: id, Updated: f.Updated, Oneshot: f.Oneshot, MessageCount: len(f.Messages), Label: lbl, RawLabel: rawLabel,
+			ID: id, Updated: f.Updated, Oneshot: f.Oneshot, MessageCount: len(f.Messages), Label: lbl,
 		})
 	}
 	// Persist the index for next time (best-effort).
@@ -670,7 +666,7 @@ func (s *Store) writeIndex(workingDir string, idx *sessionIndex) error {
 }
 
 // updateIndex adds or updates an entry in the session metadata index.
-func (s *Store) updateIndex(workingDir, id string, updated time.Time, msgCount int, label string, oneshot bool, rawLabel string) {
+func (s *Store) updateIndex(workingDir, id string, updated time.Time, msgCount int, label string, oneshot bool) {
 	if s == nil || !s.enabled {
 		return
 	}
@@ -685,14 +681,13 @@ func (s *Store) updateIndex(workingDir, id string, updated time.Time, msgCount i
 			idx.Entries[i].Oneshot = oneshot
 			idx.Entries[i].MessageCount = msgCount
 			idx.Entries[i].Label = label
-			idx.Entries[i].RawLabel = rawLabel
 			found = true
 			break
 		}
 	}
 	if !found {
 		idx.Entries = append(idx.Entries, sessionIndexEntry{
-			ID: id, Updated: updated, Oneshot: oneshot, MessageCount: msgCount, Label: label, RawLabel: rawLabel,
+			ID: id, Updated: updated, Oneshot: oneshot, MessageCount: msgCount, Label: label,
 		})
 	}
 	_ = s.writeIndex(workingDir, idx)
@@ -784,10 +779,10 @@ func (s *Store) invalidateListCache(workingDir string) {
 	listCacheMu.Unlock()
 }
 
-func sessionLabel(messages []llm.Message, label string) string {
-	if label != "" {
-		return label
-	}
+func sessionLabel(messages []llm.Message, _ string) string {
+	// Always regenerate the label from messages — CSS text-overflow: ellipsis
+	// handles dynamic truncation. The stored label (if any) was truncated at
+	// 50 chars by an older version and is no longer desirable.
 	return llm.SessionLabel(messages, llm.DefaultSessionLabelMaxLen)
 }
 
