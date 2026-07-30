@@ -1551,3 +1551,71 @@
             display: inline-block;
         }
 
+        /* ===== Resend and edit buttons on user messages ===== */
+        .message.user {
+            position: relative;
+        }
+        .resend-btn, .edit-btn {
+            display: none;
+            position: absolute;
+            bottom: -14px;
+            font-size: 0.85em;
+            cursor: pointer;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border);
+            color: var(--fg-dim);
+            padding: 1px 6px;
+            border-radius: 3px;
+            line-height: 1.3;
+            user-select: none;
+            z-index: 5;
+        }
+        .resend-btn:hover, .edit-btn:hover {
+            color: var(--accent);
+            border-color: var(--accent);
+            background: var(--accent-soft);
+        }
+        .resend-btn { right: 4px; }
+        .edit-btn { right: 34px; }
+        .message.user:hover .resend-btn,
+        .message.user:hover .edit-btn {
+            display: inline-block;
+        }
+        /* ===== Inline edit (plain text) for edit-resend ===== */
+        .msg-text.editing {
+            cursor: text;
+            caret-color: var(--fg);
+            outline: none;
+            min-height: 1.2em;
+            white-space: pre-wrap;
+            user-select: text;
+            -webkit-user-select: text;
+        }
+        .inline-edit-bar {
+            position: absolute;
+            bottom: -14px;
+            right: 4px;
+            display: flex;
+            gap: 4px;
+        }
+        .inline-edit-send, .inline-edit-cancel {
+            font-size: 0.85em;
+            padding: 2px 8px;
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            background: var(--bg-elevated);
+            color: var(--fg-dim);
+            cursor: pointer;
+            line-height: 1.3;
+            user-select: none;
+        }
+        .inline-edit-send:hover {
+            color: var(--accent);
+            border-color: var(--accent);
+            background: var(--accent-soft);
+        }
+        .inline-edit-cancel:hover {
+            color: #f44;
+            border-color: #f44;
+        }
+

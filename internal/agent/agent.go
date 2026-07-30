@@ -553,7 +553,6 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 	if h == nil {
 		h = &llm.StreamHandlers{}
 	}
-
 	for first := true; ; first = false {
 		if ctx.Err() != nil {
 			finishStreamUI(h)

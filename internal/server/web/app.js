@@ -681,6 +681,15 @@
         }
 
         let pendingSessionResponse = false;
+        // After session_new / session_fork for edit-resend, send this as a
+        // normal message once history has been replayed.
+        let pendingResendContent = null;
+        // True only while a beginResend is waiting for its history snapshot.
+        // Prevents unrelated history (reconnect/resume) from flushing a stale send.
+        let resendAwaitingHistory = false;
+        // Count of cancel→turn_end pairs to ignore so a cancelled turn's turn_end
+        // cannot clobber an in-flight resend/send (pendingSessionResponse / turnActive).
+        let suppressTurnEnds = 0;
         let ws;
         let reconnectTimer;
         let wasDisconnected = false;
@@ -920,10 +929,18 @@
         function setMessageMarkdown(el, text) {
             el.classList.add('md');
             el._gogenHlGen = (el._gogenHlGen || 0) + 1;
-            el.innerHTML = renderMarkdownHTML(text);
+            // Wrap rendered content in a child element so edit-resend can
+            // hide/show it without touching appended buttons.
+            let textWrap = el.querySelector('.msg-text');
+            if (!textWrap) {
+                textWrap = document.createElement('div');
+                textWrap.className = 'msg-text';
+                el.appendChild(textWrap);
+            }
+            textWrap.innerHTML = renderMarkdownHTML(text);
             messageRawStore.set(el, text);
-            enhanceCodeBlocksWithCopy(el);
-            colorizeCodeBlocks(el);
+            enhanceCodeBlocksWithCopy(textWrap);
+            colorizeCodeBlocks(textWrap);
         }
 
         // ===== Message timestamps =====
@@ -959,8 +976,167 @@
          *  For streaming messages (no histIdx) we pass -1 meaning "last assistant". */
         function forkSession(msgIdx) {
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            if (resendAwaitingHistory) {
+                showToast('Resend already in progress', 'info');
+                return;
+            }
             ws.send(JSON.stringify({ type: 'session_fork', messageIndex: msgIdx }));
             pendingSessionResponse = true;
+        }
+
+        function cancelActiveTurn() {
+            if (!turnActive || !ws || ws.readyState !== WebSocket.OPEN) return;
+            suppressTurnEnds++;
+            ws.send(JSON.stringify({ type: 'cancel' }));
+            setTurnActive(false);
+            abortInFlightUI(null);
+        }
+
+        function clearPendingResend() {
+            pendingResendContent = null;
+            resendAwaitingHistory = false;
+        }
+
+        /** Fork/new to before a user message, then send content as a normal turn. */
+        function beginResend(histIdx, content) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            if (histIdx === undefined || histIdx < 0 || !content) return;
+            if (resendAwaitingHistory || pendingResendContent !== null) {
+                showToast('Resend already in progress', 'info');
+                return;
+            }
+            cancelActiveTurn();
+            pendingResendContent = content;
+            resendAwaitingHistory = true;
+            pendingSessionResponse = true;
+            stickToBottom = true;
+            if (histIdx === 0) {
+                ws.send(JSON.stringify({ type: 'session_new' }));
+            } else {
+                ws.send(JSON.stringify({ type: 'session_fork', messageIndex: histIdx - 1 }));
+            }
+        }
+
+        function flushPendingResend() {
+            if (!resendAwaitingHistory) return;
+            const text = pendingResendContent;
+            clearPendingResend();
+            if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+            const el = appendMessage('user', text);
+            if (el) el.dataset.pendingAck = '1';
+            streamingToolCards = {};
+            pendingToolCards = {};
+            toolsStartedThisTurn = false;
+            contextEstAdded = 0;
+            ws.send(JSON.stringify({ type: 'message', content: text }));
+            setTurnActive(true);
+            stickToBottom = true;
+        }
+
+        /** Attach resend/edit controls once a user bubble has a server histIdx. */
+        function ensureUserResendActions(msgDiv) {
+            if (!msgDiv || msgDiv.querySelector('.resend-btn')) return;
+            if (msgDiv.dataset.histIdx === undefined) return;
+            const histIdx = parseInt(msgDiv.dataset.histIdx, 10);
+            if (Number.isNaN(histIdx) || histIdx < 0) return;
+
+            const resendBtn = document.createElement('button');
+            resendBtn.className = 'resend-btn';
+            resendBtn.type = 'button';
+            resendBtn.innerHTML = '↻';
+            resendBtn.title = 'Resend this message';
+            resendBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const idx = parseInt(msgDiv.dataset.histIdx, 10);
+                const content = msgDiv.dataset.rawContent || '';
+                if (!content || Number.isNaN(idx) || idx < 0) return;
+                beginResend(idx, content);
+            });
+            msgDiv.appendChild(resendBtn);
+
+            const editBtn = document.createElement('button');
+            editBtn.className = 'edit-btn';
+            editBtn.type = 'button';
+            editBtn.innerHTML = '✎';
+            editBtn.title = 'Edit and resend';
+            editBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (turnActive) return;
+                if (msgDiv.querySelector('.inline-edit-bar')) return;
+
+                const tw = msgDiv.querySelector('.msg-text');
+                if (!tw) return;
+                const raw = msgDiv.dataset.rawContent || '';
+
+                msgDiv.querySelectorAll('.resend-btn, .edit-btn').forEach(b => { b.style.display = 'none'; });
+
+                // Plain text — markdown DOM is not a reliable contenteditable surface.
+                tw.textContent = raw;
+                tw.contentEditable = 'true';
+                tw.classList.add('editing');
+                tw.focus();
+                const range = document.createRange();
+                range.selectNodeContents(tw);
+                range.collapse(false);
+                const sel = window.getSelection();
+                sel.removeAllRanges();
+                sel.addRange(range);
+
+                const bar = document.createElement('div');
+                bar.className = 'inline-edit-bar';
+                const sendBtn2 = document.createElement('button');
+                sendBtn2.className = 'inline-edit-send';
+                sendBtn2.type = 'button';
+                sendBtn2.innerHTML = '▶';
+                sendBtn2.title = 'Send (Enter)';
+                const cancelBtn2 = document.createElement('button');
+                cancelBtn2.className = 'inline-edit-cancel';
+                cancelBtn2.type = 'button';
+                cancelBtn2.innerHTML = '×';
+                cancelBtn2.title = 'Cancel (Esc)';
+                bar.appendChild(sendBtn2);
+                bar.appendChild(cancelBtn2);
+                msgDiv.appendChild(bar);
+
+                function onEditKeydown(ev) {
+                    if (ev.key === 'Escape') {
+                        ev.preventDefault();
+                        finishEdit(true);
+                    } else if (ev.key === 'Enter' && !ev.shiftKey) {
+                        ev.preventDefault();
+                        sendBtn2.click();
+                    }
+                }
+
+                function finishEdit(restore) {
+                    tw.removeEventListener('keydown', onEditKeydown);
+                    tw.contentEditable = 'false';
+                    tw.classList.remove('editing');
+                    if (restore) {
+                        setMessageMarkdown(msgDiv, escapeHtml(msgDiv.dataset.rawContent || ''));
+                    }
+                    bar.remove();
+                    msgDiv.querySelectorAll('.resend-btn, .edit-btn').forEach(b => { b.style.display = ''; });
+                }
+
+                cancelBtn2.addEventListener('click', (ev) => {
+                    ev.stopPropagation();
+                    finishEdit(true);
+                });
+
+                tw.addEventListener('keydown', onEditKeydown);
+
+                sendBtn2.addEventListener('click', (ev) => {
+                    ev.stopPropagation();
+                    const newContent = tw.innerText.replace(/\u00a0/g, ' ').trim();
+                    if (!newContent) return;
+                    finishEdit(false);
+                    const idx = parseInt(msgDiv.dataset.histIdx, 10);
+                    if (Number.isNaN(idx) || idx < 0) return;
+                    beginResend(idx, newContent);
+                });
+            });
+            msgDiv.appendChild(editBtn);
         }
 
         function appendMessage(role, text) {
@@ -1003,6 +1179,10 @@
                     forkSession(targetIdx);
                 });
                 msgDiv.appendChild(forkBtn);
+            }
+            if (role === 'user') {
+                msgDiv.dataset.rawContent = text;
+                ensureUserResendActions(msgDiv);
             }
             messagesDiv.appendChild(msgDiv);
             smartScroll();
@@ -1750,16 +1930,36 @@
                         appendMessage('system', `[${data.tool}] ${data.result}`);
                     }
                 } else if (data.type === 'cancelled') {
+                    // Stale cancel from a turn we replaced with resend/send — ignore.
+                    if (suppressTurnEnds > 0) return;
                     abortInFlightUI(data.content || 'Cancelled.');
                     setTurnActive(false);
                     setInputProgress(null);
                 } else if (data.type === 'turn_end') {
+                    // Ignore turn_end from a turn we cancelled to start a resend/send.
+                    // Otherwise it clears pendingSessionResponse / turnActive mid-flow.
+                    if (suppressTurnEnds > 0) {
+                        suppressTurnEnds--;
+                        return;
+                    }
                     setTurnActive(false);
                     updateTitle('idle');
                     setInputProgress(null);
+                    pendingSessionResponse = false;
                 } else if (data.type === 'clear_chat') {
                     clearChat();
                     pendingSessionResponse = true;
+                } else if (data.type === 'user_acked') {
+                    // Server assigned the Messages index for the user turn just started.
+                    // Index is in content so 0 is not dropped by JSON omitempty.
+                    const idx = parseInt(data.content, 10);
+                    const el = messagesDiv.querySelector('.message.user[data-pending-ack="1"]')
+                        || [...messagesDiv.querySelectorAll('.message.user:not([data-hist-idx])')].at(-1);
+                    if (el && Number.isFinite(idx) && idx >= 0) {
+                        delete el.dataset.pendingAck;
+                        el.dataset.histIdx = String(idx);
+                        ensureUserResendActions(el);
+                    }
                 } else if (data.type === 'sessions') {
                     finalizeThinking();
                     endStream();
@@ -1776,10 +1976,15 @@
                         updateContextInfo(data);
                         const msg = (data.content || '').split('\n')[0] || 'Session updated';
                         if (String(data.content || '').startsWith('Error:')) {
+                            clearPendingResend();
                             showToast(data.content, 'error');
                             appendMessage('system', data.content);
-                        } else {
+                        } else if (!resendAwaitingHistory) {
+                            // Normal session switch — toast. Resend follow-up
+                            // suppresses the toast; flush happens after history.
                             showToast(msg, 'success');
+                            requestSessionList();
+                        } else {
                             requestSessionList();
                         }
                     } else if (data.content && String(data.content).startsWith('Error:')) {
@@ -1807,15 +2012,28 @@
                     // Full snapshot — replace the pane so reconnect / session
                     // restore never stacks duplicate transcripts.
                     clearChat();
+                    const afterHistory = () => {
+                        if (resendAwaitingHistory) flushPendingResend();
+                    };
                     if (data.history && data.history.length) {
-                        replayHistory(data.history).catch((err) => {
+                        replayHistory(data.history).then(afterHistory).catch((err) => {
                             console.warn('history replay failed', err);
                             for (const h of data.history) {
                                 if (h.role === 'user' || h.role === 'assistant') {
-                                    if (h.content) appendMessage(h.role, h.content);
+                                    if (h.content) {
+                                        appendMessageAtTime(
+                                            h.role,
+                                            h.content,
+                                            h.createdAt ? new Date(h.createdAt) : new Date(),
+                                            h.index
+                                        );
+                                    }
                                 }
                             }
+                            afterHistory();
                         });
+                    } else {
+                        afterHistory();
                     }
                 } else if (data.type === 'config') {
                     applyServerConfig(data);
@@ -1832,6 +2050,9 @@
                 endStream();
                 streamingToolCards = {};
                 pendingToolCards = {};
+                clearPendingResend();
+                suppressTurnEnds = 0;
+                pendingSessionResponse = false;
                 setTurnActive(false);
                 setInputProgress(null);
                 clearTimeout(reconnectTimer);
@@ -1848,15 +2069,16 @@
                 appendMessage('system', 'Not connected — wait for reconnection.');
                 return;
             }
-            if (turnActive) {
-                // Sending while busy cancels the current turn (same as TUI interrupt + new prompt).
-                ws.send(JSON.stringify({ type: 'cancel' }));
-                setTurnActive(false);
-                abortInFlightUI(null);
+            if (resendAwaitingHistory) {
+                showToast('Resend already in progress', 'info');
+                return;
             }
+            // Sending while busy cancels the current turn (same as TUI interrupt + new prompt).
+            cancelActiveTurn();
             hideSlashSuggest();
             stickToBottom = true;
-            appendMessage('user', text);
+            const el = appendMessage('user', text);
+            if (el) el.dataset.pendingAck = '1';
             streamingToolCards = {};
             pendingToolCards = {};
             toolsStartedThisTurn = false;
@@ -2035,6 +2257,10 @@
                 showToast('Not connected', 'error');
                 return;
             }
+            if (resendAwaitingHistory) {
+                showToast('Resend already in progress', 'info');
+                return;
+            }
             pendingSessionResponse = true;
             ws.send(JSON.stringify({ type: 'session_new' }));
         }
@@ -2045,6 +2271,10 @@
                 return;
             }
             if (!id) return;
+            if (resendAwaitingHistory) {
+                showToast('Resend already in progress', 'info');
+                return;
+            }
             const displayName = label || id;
             if (!confirm(`Are you sure you want to delete session "${displayName}"?\n\nThis action cannot be undone.`)) {
                 return;
@@ -2059,6 +2289,10 @@
                 return;
             }
             if (!id) return;
+            if (resendAwaitingHistory) {
+                showToast('Resend already in progress', 'info');
+                return;
+            }
             pendingSessionResponse = true;
             ws.send(JSON.stringify({ type: 'session_resume', sessionId: id }));
         }
@@ -2405,8 +2639,12 @@
                     function onMouseMove(ev) {
                         const delta = ev.clientX - startX;
                         let newWidth = startWidth + delta;
-                        // Clamp to sensible range
-                        newWidth = Math.max(160, Math.min(600, newWidth));
+                        // Clamp percentage-of-viewport so it scales on 4K/8K screens
+                        const minPct = 0.12;  // at least 12% of viewport
+                        const maxPct = 0.50;  // at most 50% of viewport
+                        const minW = Math.max(120, window.innerWidth * minPct);
+                        const maxW = window.innerWidth * maxPct;
+                        newWidth = Math.max(minW, Math.min(maxW, newWidth));
                         sidebar.style.width = newWidth + 'px';
                         sidebar.style.flexGrow = '0';
                         sidebar.style.flexShrink = '0';

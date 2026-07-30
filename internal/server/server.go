@@ -229,7 +229,7 @@ type HistoryEntry struct {
 	Refusal    string            `json:"refusal,omitempty"`
 	ToolCalls  []HistoryToolCall `json:"toolCalls,omitempty"`
 	ToolCallID string            `json:"toolCallId,omitempty"`
-	Index      int               `json:"index,omitempty"`     // index in agent.Messages array (for fork/session commands)
+	Index      int               `json:"index"`               // index in agent.Messages (0 is valid; do not omitempty)
 	CreatedAt  string            `json:"createdAt,omitempty"` // RFC3339Nano UTC when the message was created
 }
 
@@ -483,12 +483,14 @@ func historyEntries(msgs []llm.Message) []HistoryEntry {
 
 func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, result agent.SessionCommandResult, err error) {
 	resp := WSMessage{Type: "response"}
+	clearChat := false
 	if err != nil {
 		resp.Content = fmt.Sprintf("Error: %v", err)
 	} else {
 		resp.Content = result.Output
 		if result.Action == agent.SessionActionClearChat {
 			resp.SessionAction = string(result.Action)
+			clearChat = true
 			_ = ws.writeJSON(WSMessage{Type: "clear_chat"})
 		}
 	}
@@ -503,6 +505,10 @@ func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, resu
 		cfg = s.agentConfigMsgBasic()
 		if len(result.History) > 0 {
 			history = append([]llm.Message(nil), result.History...)
+		} else if clearChat && err == nil {
+			// /new (and any clear with empty History) — still emit history so
+			// clients can reliably run post-session follow-ups (e.g. resend).
+			history = append([]llm.Message(nil), s.agent.Messages...)
 		}
 	})
 	resp.SessionID = cfg.SessionID
@@ -510,7 +516,9 @@ func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, resu
 	// Paint sessions/history before ContextStats tokenization (can be slow on
 	// large restored sessions / cold tiktoken init).
 	_ = ws.writeJSON(resp)
-	if len(history) > 0 {
+	if clearChat && err == nil {
+		_ = ws.writeJSON(WSMessage{Type: "history", History: historyEntries(history)})
+	} else if len(history) > 0 {
 		_ = ws.writeJSON(WSMessage{Type: "history", History: historyEntries(history)})
 	}
 	stats := s.agent.ContextStats(ctx)
@@ -972,6 +980,17 @@ func (s *Server) startAsyncStreamingTurn(ws *wsConn, r *http.Request, stream *ws
 
 		handlers := &llm.StreamHandlers{
 			OnStart: func() {
+				// Tell the client the server-side index of the user message
+				// that StreamProcessInput just appended (for edit/resend).
+				// Index goes in Content because WSMessage.Index has omitempty
+				// and the first message is index 0.
+				var userIdx int
+				s.lockAgentRead(func() {
+					userIdx = len(s.agent.Messages) - 1
+				})
+				if userIdx >= 0 {
+					write(WSMessage{Type: "user_acked", Content: fmt.Sprintf("%d", userIdx)})
+				}
 				write(WSMessage{Type: "thinking"})
 				if ctx.Err() != nil {
 					return
