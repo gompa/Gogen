@@ -799,9 +799,11 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 	p.applyThinkingLevel(ctx, &params)
 	stream := p.clientForModel().Chat.Completions.NewStreaming(ctx, params)
 	defer stream.Close()
+
 	// stream.Next() can block on the response body even after ctx cancel if
 	// the transport is slow to abort. Closing the stream from a watcher
 	// unblocks Next promptly (important for --web Ctrl+C).
+
 	stopWatch := make(chan struct{})
 	defer close(stopWatch)
 	go func() {
@@ -812,111 +814,13 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 		}
 	}()
 
-	var fullContent strings.Builder
-	var fullRefusal strings.Builder
-	var fullReasoning string
-	var lastFinishReason string
-	var streamUsage *Usage
-	var tcAccums []tcAccum
-	tcIndexMap := make(map[int]int)
-	extras := newExtraFieldAccums()
+	acc := newStreamAccumulator()
 
-	emitToolCallStart := func(tcIdx int, acc *tcAccum) {
-		if acc.Started || acc.Name == "" || h.OnToolCallStart == nil {
-			return
-		}
-		acc.Started = true
-		h.OnToolCallStart(tcIdx, acc.ID, acc.Name)
-	}
-
-	emitToolCallArgsDelta := func(tcIdx int, acc *tcAccum, argsDelta string) {
-		if argsDelta == "" || h.OnToolCallArgsDelta == nil {
-			return
-		}
-		h.OnToolCallArgsDelta(tcIdx, acc.ID, acc.Name, argsDelta)
-	}
-
-	streamDone := false
-	drainAfterDone := 0
 	for stream.Next() {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-
-		chunk := stream.Current()
-		// Always capture usage — with include_usage it often arrives in a
-		// trailing chunk after finish_reason (empty choices).
-		if u := usageFromOpenAI(chunk.Usage); u != nil {
-			streamUsage = u
-		}
-		if streamDone {
-			// Drain a few trailer chunks for usage, then stop (some local
-			// servers keep the HTTP stream open after finish_reason).
-			drainAfterDone++
-			if drainAfterDone >= 8 {
-				break
-			}
-			continue
-		}
-		if len(chunk.Choices) == 0 {
-			continue
-		}
-
-		choice := chunk.Choices[0]
-		delta := choice.Delta
-		extras.addFromDelta(delta, onThinking, &fullReasoning)
-
-		if delta.Content != "" {
-			fullContent.WriteString(delta.Content)
-			onToken(delta.Content)
-		}
-		if delta.Refusal != "" {
-			fullRefusal.WriteString(delta.Refusal)
-		}
-		if len(delta.ToolCalls) > 0 {
-			for _, tc := range delta.ToolCalls {
-				var idx int
-				tcAccums, idx = mergeToolCallDelta(tc, tcAccums, tcIndexMap)
-				acc := &tcAccums[idx]
-				if tc.Function.Name != "" {
-					emitToolCallStart(acc.Index, acc)
-				}
-				if tc.Function.Arguments != "" {
-					emitToolCallStart(acc.Index, acc)
-					emitToolCallArgsDelta(acc.Index, acc, tc.Function.Arguments)
-				}
-			}
-		}
-
-		if choice.FinishReason != "" {
-			switch choice.FinishReason {
-			case "tool_calls":
-				lastFinishReason = choice.FinishReason
-				streamDone = true
-			case "stop":
-				// llama.cpp emits spurious stop while reasoning is still in
-				// progress; only treat stop as terminal once real
-				// content/refusal/tool-calls have arrived. A reasoning-carrying
-				// delta is NOT sufficient — the spurious stop often rides on the
-				// same chunk as a reasoning token.
-				if fullContent.Len() > 0 || fullRefusal.Len() > 0 || len(tcAccums) > 0 {
-					lastFinishReason = choice.FinishReason
-					streamDone = true
-				}
-			case "length", "content_filter":
-				lastFinishReason = choice.FinishReason
-				streamDone = true
-			default:
-				lastFinishReason = choice.FinishReason
-				streamDone = true
-			}
-		} else if len(tcAccums) > 0 && toolAccumsStreamComplete(tcAccums) && deltaIsTerminalToolSignal(delta, true) {
-			// llama.cpp often sends an empty {} delta after tool args but keeps
-			// the HTTP connection open without [DONE] or finish_reason. Only
-			// treat it as terminal once the accumulated args are actually
-			// complete JSON, otherwise an empty keepalive between arg
-			// fragments would end the stream prematurely.
-			lastFinishReason = "tool_calls"
+		if stop := acc.processChunk(stream.Current(), onToken, onThinking, h); stop {
 			break
 		}
 	}
@@ -926,36 +830,141 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 	}
 
 	if err := stream.Err(); err != nil {
-		if h.OnStreamEnd != nil {
-			h.OnStreamEnd()
-		}
-		if h.OnRecoverPartialStream != nil {
-			h.OnRecoverPartialStream()
-		}
-		resp, fbErr := p.GenerateResponse(ctx, messages, allowedTools, tools)
-		if fbErr != nil {
-			return nil, fmt.Errorf("stream error: %w (non-streaming fallback also failed: %v)", err, fbErr)
-		}
-		if resp.Reasoning != "" {
-			onThinking(resp.Reasoning)
-		}
-		if resp.Content != "" {
-			onToken(resp.Content)
-		} else if resp.Refusal != "" {
-			onToken(resp.Refusal)
-		}
-		return &StreamResult{
-			Content:       resp.Content,
-			Reasoning:     resp.Reasoning,
-			Refusal:       resp.Refusal,
-			ToolCalls:     resp.ToolCalls,
-			Usage:         resp.Usage,
-			PartialStream: len(tcAccums) > 0 || fullContent.Len() > 0 || fullRefusal.Len() > 0 || extras.textLen() > 0,
-		}, nil
+		return p.handleStreamFallback(ctx, messages, allowedTools, tools, h, err, acc)
 	}
 
+	return acc.buildResult()
+}
+
+type streamAccumulator struct {
+	fullContent      strings.Builder
+	fullRefusal      strings.Builder
+	fullReasoning    string
+	lastFinishReason string
+	streamUsage      *Usage
+	tcAccums         []tcAccum
+	tcIndexMap       map[int]int
+	extras           extraFieldAccums
+	streamDone       bool
+	drainAfterDone   int
+}
+
+func newStreamAccumulator() *streamAccumulator {
+	return &streamAccumulator{
+		tcIndexMap: make(map[int]int),
+		extras:     newExtraFieldAccums(),
+	}
+}
+
+func (a *streamAccumulator) processChunk(chunk openai.ChatCompletionChunk, onToken, onThinking func(string), h *StreamHandlers) bool {
+	if u := usageFromOpenAI(chunk.Usage); u != nil {
+		a.streamUsage = u
+	}
+	if a.streamDone {
+		a.drainAfterDone++
+		return a.drainAfterDone >= 8
+	}
+	if len(chunk.Choices) == 0 {
+		return false
+	}
+
+	choice := chunk.Choices[0]
+	delta := choice.Delta
+	a.extras.addFromDelta(delta, onThinking, &a.fullReasoning)
+
+	if delta.Content != "" {
+		a.fullContent.WriteString(delta.Content)
+		onToken(delta.Content)
+	}
+	if delta.Refusal != "" {
+		a.fullRefusal.WriteString(delta.Refusal)
+	}
+	if len(delta.ToolCalls) > 0 {
+		for _, tc := range delta.ToolCalls {
+			var idx int
+			a.tcAccums, idx = mergeToolCallDelta(tc, a.tcAccums, a.tcIndexMap)
+			tacc := &a.tcAccums[idx]
+			if tc.Function.Name != "" {
+				emitToolCallStart(tacc.Index, tacc, h)
+			}
+			if tc.Function.Arguments != "" {
+				emitToolCallStart(tacc.Index, tacc, h)
+				emitToolCallArgsDelta(tacc.Index, tacc, tc.Function.Arguments, h)
+			}
+		}
+	}
+
+	if choice.FinishReason != "" {
+		switch choice.FinishReason {
+		case "tool_calls":
+			a.lastFinishReason = choice.FinishReason
+			a.streamDone = true
+		case "stop":
+			if a.fullContent.Len() > 0 || a.fullRefusal.Len() > 0 || len(a.tcAccums) > 0 {
+				a.lastFinishReason = choice.FinishReason
+				a.streamDone = true
+			}
+		case "length", "content_filter":
+			a.lastFinishReason = choice.FinishReason
+			a.streamDone = true
+		default:
+			a.lastFinishReason = choice.FinishReason
+			a.streamDone = true
+		}
+	} else if len(a.tcAccums) > 0 && toolAccumsStreamComplete(a.tcAccums) && deltaIsTerminalToolSignal(delta, true) {
+		a.lastFinishReason = "tool_calls"
+		return true
+	}
+	return false
+}
+
+func emitToolCallStart(tcIdx int, acc *tcAccum, h *StreamHandlers) {
+	if acc.Started || acc.Name == "" || h.OnToolCallStart == nil {
+		return
+	}
+	acc.Started = true
+	h.OnToolCallStart(tcIdx, acc.ID, acc.Name)
+}
+
+func emitToolCallArgsDelta(tcIdx int, acc *tcAccum, argsDelta string, h *StreamHandlers) {
+	if argsDelta == "" || h.OnToolCallArgsDelta == nil {
+		return
+	}
+	h.OnToolCallArgsDelta(tcIdx, acc.ID, acc.Name, argsDelta)
+}
+
+func (p *OpenAIProvider) handleStreamFallback(ctx context.Context, messages []Message, allowedTools map[string]struct{}, tools []Tool, h *StreamHandlers, streamErr error, acc *streamAccumulator) (*StreamResult, error) {
+	if h.OnStreamEnd != nil {
+		h.OnStreamEnd()
+	}
+	if h.OnRecoverPartialStream != nil {
+		h.OnRecoverPartialStream()
+	}
+	resp, fbErr := p.GenerateResponse(ctx, messages, allowedTools, tools)
+	if fbErr != nil {
+		return nil, fmt.Errorf("stream error: %w (non-streaming fallback also failed: %v)", streamErr, fbErr)
+	}
+	if resp.Reasoning != "" && h.OnThinkingToken != nil {
+		h.OnThinkingToken(resp.Reasoning)
+	}
+	if resp.Content != "" && h.OnToken != nil {
+		h.OnToken(resp.Content)
+	} else if resp.Refusal != "" && h.OnToken != nil {
+		h.OnToken(resp.Refusal)
+	}
+	return &StreamResult{
+		Content:       resp.Content,
+		Reasoning:     resp.Reasoning,
+		Refusal:       resp.Refusal,
+		ToolCalls:     resp.ToolCalls,
+		Usage:         resp.Usage,
+		PartialStream: len(acc.tcAccums) > 0 || acc.fullContent.Len() > 0 || acc.fullRefusal.Len() > 0 || acc.extras.textLen() > 0,
+	}, nil
+}
+
+func (a *streamAccumulator) buildResult() (*StreamResult, error) {
 	var toolCalls []ToolCall
-	for _, acc := range tcAccums {
+	for _, acc := range a.tcAccums {
 		if acc.Name == "" {
 			continue
 		}
@@ -985,37 +994,33 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 		})
 	}
 
-	// Fallback: if no tool calls were extracted from the stream deltas,
-	// try to find embedded tool call patterns in the reasoning/content text.
-	if len(toolCalls) == 0 && (fullReasoning != "" || fullContent.Len() > 0) {
-		extractedCalls := extractToolCallsFromText(fullReasoning + fullContent.String())
+	if len(toolCalls) == 0 && (a.fullReasoning != "" || a.fullContent.Len() > 0) {
+		extractedCalls := extractToolCallsFromText(a.fullReasoning + a.fullContent.String())
 		if len(extractedCalls) > 0 {
 			toolCalls = extractedCalls
 		}
 	}
 
-	// Keep content/reasoning/refusal separate so re-sends match the original
-	// completion shape (required for provider prompt-cache prefix hits).
-	content := fullContent.String()
+	content := a.fullContent.String()
 
-	if lastFinishReason == "" && (content != "" || fullRefusal.Len() > 0 || fullReasoning != "" || len(tcAccums) > 0) {
-		if len(tcAccums) > 0 {
-			lastFinishReason = "tool_calls"
+	if a.lastFinishReason == "" && (content != "" || a.fullRefusal.Len() > 0 || a.fullReasoning != "" || len(a.tcAccums) > 0) {
+		if len(a.tcAccums) > 0 {
+			a.lastFinishReason = "tool_calls"
 		} else {
-			lastFinishReason = "stop"
+			a.lastFinishReason = "stop"
 		}
 	}
 
-	if lastFinishReason == "" && content == "" && fullRefusal.Len() == 0 && fullReasoning == "" && len(toolCalls) == 0 {
+	if a.lastFinishReason == "" && content == "" && a.fullRefusal.Len() == 0 && a.fullReasoning == "" && len(toolCalls) == 0 {
 		return nil, fmt.Errorf("stream ended without finish_reason")
 	}
 
 	return &StreamResult{
 		Content:   content,
-		Reasoning: fullReasoning,
-		Refusal:   fullRefusal.String(),
+		Reasoning: a.fullReasoning,
+		Refusal:   a.fullRefusal.String(),
 		ToolCalls: toolCalls,
-		Usage:     streamUsage,
+		Usage:     a.streamUsage,
 	}, nil
 }
 

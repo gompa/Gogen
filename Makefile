@@ -1,4 +1,4 @@
-.PHONY: fmt tidy outdated update test test-debug vet staticcheck vuln build-nocgo check
+.PHONY: fmt tidy outdated update test test-debug vet staticcheck gocyclo vuln build-nocgo check
 
 fmt:
 	@unformatted=$$(gofmt -l .); \
@@ -49,6 +49,9 @@ staticcheck:
 
 vuln:
 	go tool govulncheck ./...
+
+gocyclo:
+	go tool gocyclo -over 15 .
 
 # Verifies the documented no-tree-sitter build path still compiles.
 build-nocgo:

@@ -638,478 +638,447 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	for msg := range incoming {
 		switch msg.Type {
 		case "delete_approval_response":
-			// Already handled in the reader; keep for safety if ever enqueued.
 			session.completeApproval(msg.ApprovalID, msg.Approved)
-			continue
 		case "fs_list", "fs_read", "fs_search", "git_status", "git_file_diff":
 			s.handleFSReadMessage(ws, r.Context(), msg)
-			continue
 		case "fs_write", "fs_replace":
 			s.handleFSWriteMessage(ws, r.Context(), msg)
-			continue
 		case "list_sessions":
-			// SessionStore.List is disk I/O (~tens of ms with many sessions) —
-			// do not hold agentMu across it.
-			var sessionID string
-			s.lockAgentRead(func() {
-				sessionID = s.agent.SessionID
-			})
-			_, sessions, listErr := s.agent.FormatSessionListForUI()
-			if listErr != nil {
-				_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", listErr)})
-				continue
-			}
-			_ = ws.writeJSON(WSMessage{
-				Type:      "sessions",
-				Sessions:  sessionEntries(sessions, sessionID),
-				SessionID: sessionID,
-			})
-			continue
-		case "session_new":
-			stream.cancelInFlight()
-			if !s.tryAcquireTurn(wsTurnAcquireWait) {
-				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
-				continue
-			}
-			var result agent.SessionCommandResult
-			var err error
-			result, _, err = s.agent.HandleSessionCommand(r.Context(), "/new", sesspkg.NewID())
-			s.turnMu.Unlock()
-			s.writeSessionCommandResult(ws, r.Context(), result, err)
-			continue
-		case "session_resume":
-			stream.cancelInFlight()
-			if !s.tryAcquireTurn(wsTurnAcquireWait) {
-				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
-				continue
-			}
-			id := strings.TrimSpace(msg.SessionID)
-			if id == "" {
-				s.turnMu.Unlock()
-				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: sessionId is required"})
-				continue
-			}
-			var result agent.SessionCommandResult
-			var err error
-			result, _, err = s.agent.HandleSessionCommand(r.Context(), "resume "+id, sesspkg.NewID())
-			s.turnMu.Unlock()
-			s.writeSessionCommandResult(ws, r.Context(), result, err)
-			continue
-		case "session_delete":
-			stream.cancelInFlight()
-			if !s.tryAcquireTurn(wsTurnAcquireWait) {
-				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
-				continue
-			}
-			id := strings.TrimSpace(msg.SessionID)
-			if id == "" {
-				s.turnMu.Unlock()
-				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: sessionId is required"})
-				continue
-			}
-			var result agent.SessionCommandResult
-			var err error
-			result, _, err = s.agent.HandleSessionCommand(r.Context(), "resume del "+id, sesspkg.NewID())
-			s.turnMu.Unlock()
-			s.writeSessionCommandResult(ws, r.Context(), result, err)
-			continue
-		case "session_fork":
-			stream.cancelInFlight()
-			if !s.tryAcquireTurn(wsTurnAcquireWait) {
-				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
-				continue
-			}
-			forkArg := fmt.Sprintf("%d", msg.MessageIndex)
-			if msg.MessageIndex < 0 {
-				forkArg = "last"
-			}
-			var result agent.SessionCommandResult
-			var err error
-			result, _, err = s.agent.HandleSessionCommand(r.Context(), "fork "+forkArg, sesspkg.NewID())
-			s.turnMu.Unlock()
-			s.writeSessionCommandResult(ws, r.Context(), result, err)
-			continue
+			s.handleWSListSessions(ws)
+		case "session_new", "session_resume", "session_delete", "session_fork":
+			s.handleWSSessionAction(ws, r.Context(), stream, msg)
+		case "list_models":
+			s.handleWSListModels(ws, r.Context())
+		case "set_model":
+			s.handleWSSetModel(ws, r.Context(), stream, msg)
+		case "set_mode":
+			s.handleWSSetMode(ws, r.Context(), stream, msg)
+		case "set_thinking_level":
+			s.handleWSSetThinkingLevel(ws, r.Context(), stream, msg)
+		case "config":
+			s.handleWSConfig(ws, r.Context(), stream, msg)
 		case "cancel":
 			stream.cancelInFlight()
-			continue
 		case "message":
-			stream.cancelInFlight()
-
-			if out, handled := agent.HandleHelpCommand(msg.Content, true, false); handled {
-				_ = ws.writeJSON(WSMessage{Type: "response", Content: out})
-				continue
-			}
-
-			// List-only /models is a remote catalog fetch — do not take turnMu.
-			if sel, isModels := agent.ParseModelsCommand(msg.Content); isModels && sel == "" {
-				go func(content string) {
-					out, _, err := s.agent.HandleModelsCommand(r.Context(), content)
-					resp := WSMessage{Type: "response", Content: out}
-					if err != nil {
-						resp.Content = fmt.Sprintf("Error: %v", err)
-						_ = ws.writeJSON(resp)
-						return
-					}
-					if models, listErr := s.agent.ListModels(r.Context()); listErr == nil && len(models) > 1 {
-						resp.Type = "models"
-						resp.Models = s.modelEntries(models)
-					}
-					cfg := s.agentConfigMsg(r.Context())
-					resp.Model = cfg.Model
-					resp.ContextLimit = cfg.ContextLimit
-					resp.UsedTokens = cfg.UsedTokens
-					resp.UsedSource = cfg.UsedSource
-					resp.UsedPercent = cfg.UsedPercent
-					_ = ws.writeJSON(resp)
-				}(msg.Content)
-				continue
-			}
-
-			if !s.tryAcquireTurn(wsTurnAcquireWait) {
-				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
-				continue
-			}
-
-			var modeOut string
-			var modeHandled bool
-			var modeCfg WSMessage
-			s.lockAgentWrite(func() {
-				modeOut, modeHandled = s.agent.HandleModeCommand(msg.Content)
-				if modeHandled {
-					modeCfg = s.agentConfigMsgBasic()
-				}
-			})
-			if modeHandled {
-				s.turnMu.Unlock()
-				accum := s.agent.UsageAccum
-				applyContextStats(&modeCfg, s.agent.ContextStats(r.Context()), &accum)
-				_ = ws.writeJSON(modeCfg)
-				_ = ws.writeJSON(WSMessage{Type: "response", Content: modeOut})
-				continue
-			}
-
-			var thinkOut string
-			var thinkHandled bool
-			s.lockAgentWrite(func() {
-				thinkOut, thinkHandled = s.agent.HandleThinkingCommand(msg.Content)
-			})
-			if thinkHandled {
-				s.turnMu.Unlock()
-				cfg := s.agentConfigMsg(r.Context())
-				cfg.ThinkingLevel = string(s.agent.ThinkingLevel)
-				_ = ws.writeJSON(cfg)
-				_ = ws.writeJSON(WSMessage{Type: "response", Content: thinkOut})
-				continue
-			}
-
-			var ctxOut string
-			var ctxHandled bool
-			ctxOut, ctxHandled = s.agent.HandleContextCommand(r.Context(), msg.Content)
-			if ctxHandled {
-				s.turnMu.Unlock()
-				ctxMsg := s.contextMsg(r.Context())
-				_ = ws.writeJSON(ctxMsg)
-				_ = ws.writeJSON(WSMessage{Type: "response", Content: ctxOut})
-				continue
-			}
-
-			var sessResult agent.SessionCommandResult
-			var sessHandled bool
-			var sessErr error
-			sessResult, sessHandled, sessErr = s.agent.HandleSessionCommand(r.Context(), msg.Content, sesspkg.NewID())
-			if sessHandled {
-				s.turnMu.Unlock()
-				s.writeSessionCommandResult(ws, r.Context(), sessResult, sessErr)
-				continue
-			}
-
-			if sel, isModels := agent.ParseModelsCommand(msg.Content); isModels && sel != "" {
-				// Model catalog / context-limit refresh are network calls — do
-				// not hold agentMu across them (would stall WS connect readers).
-				out, _, modelErr := s.agent.HandleModelsCommand(r.Context(), msg.Content)
-				cfg := s.agentConfigMsg(r.Context())
-				s.turnMu.Unlock()
-				resp := WSMessage{Type: "response", Content: out}
-				if modelErr != nil {
-					resp.Content = fmt.Sprintf("Error: %v", modelErr)
-				} else {
-					resp.Model = cfg.Model
-					resp.ContextLimit = cfg.ContextLimit
-					resp.UsedTokens = cfg.UsedTokens
-					resp.UsedSource = cfg.UsedSource
-					resp.UsedPercent = cfg.UsedPercent
-					_ = ws.writeJSON(cfg)
-				}
-				_ = ws.writeJSON(resp)
-				continue
-			}
-
-			// Transfer turnMu ownership to the stream goroutine (do not Unlock here).
-			// Two contexts: streamCtx for the outer goroutine (cleanup/logging),
-			// llmCtx for the LLM call itself. close() cancels only llmCtx so the
-			// outer goroutine's deferred cleanup always runs.
-			streamCtx, streamCancel := context.WithCancel(r.Context())
-			llmCtx, llmCancel := context.WithCancel(streamCtx)
-			errCh := stream.begin(streamCancel, llmCancel)
-			go func(content string, llmCtx context.Context, done chan error) {
-				defer stream.end()
-				defer func() { done <- nil }()
-				defer s.turnMu.Unlock()
-				defer func() {
-					// Always notify the client the turn is over (success, error, or cancel).
-					_ = ws.writeJSON(WSMessage{Type: "turn_end"})
-				}()
-				ctx := agent.ContextWithDeleteApprover(llmCtx, session.deleteApprover())
-				var writeFailed atomic.Bool
-				failWrite := sync.Once{}
-				write := func(v WSMessage) {
-					if ctx.Err() != nil {
-						return
-					}
-					if err := ws.writeJSON(v); err != nil {
-						// Do not keep streaming into a full/dead queue — cancel
-						// the LLM and tear down so the browser reconnects.
-						writeFailed.Store(true)
-						failWrite.Do(func() {
-							llmCancel()
-							_ = ws.conn.Close()
-						})
-						return
-					}
-				}
-				tokens := streamutil.NewTokenBatcher(func(think bool, text string) {
-					if think {
-						write(WSMessage{Type: "thinking_token", Content: text})
-					} else {
-						write(WSMessage{Type: "stream", Content: text})
-					}
-				}, wsTokenFlushInterval)
-
-				handlers := &llm.StreamHandlers{
-					OnStart: func() {
-						// Thinking first so the UI arms immediately; skip the
-						// context probe when already cancelled so interrupt
-						// reaches appendCanceledToolResults promptly.
-						write(WSMessage{Type: "thinking"})
-						if ctx.Err() != nil {
-							return
-						}
-						write(s.contextMsg(ctx))
-					},
-					OnRoundStart: func() {
-						write(WSMessage{Type: "thinking"})
-						if ctx.Err() != nil {
-							return
-						}
-						write(s.contextMsg(ctx))
-					},
-					OnStreamOpened: func() {
-						write(WSMessage{Type: "waiting"})
-					},
-					OnStreamActivity: func() {},
-					OnThinkingToken:  tokens.ThinkToken,
-					OnToken:          tokens.StreamToken,
-					OnStreamEnd: func() {
-						tokens.Flush()
-						write(WSMessage{Type: "stream_end"})
-					},
-					OnToolCallStart: func(index int, id, name string) {
-						tokens.Flush()
-						write(WSMessage{
-							Type:       "tool_call_start",
-							Tool:       name,
-							ToolCallID: id,
-							Index:      index,
-						})
-					},
-					OnToolCallArgsDelta: func(index int, id, name, argsDelta string) {
-						// Flush pending thinking/content tokens before
-						// tool call args reach the client, so the web UI
-						// renders the thinking block before the tool card.
-						tokens.Flush()
-						write(WSMessage{
-							Type:       "tool_call_delta",
-							Tool:       name,
-							ToolCallID: id,
-							Index:      index,
-							ArgsDelta:  argsDelta,
-						})
-					},
-					OnToolCall: func(tc llm.ToolCall) {
-						tokens.Flush()
-						write(WSMessage{
-							Type:       "tool_call",
-							Tool:       tc.Name,
-							ToolCallID: tc.ID,
-							Index:      tc.Index,
-							Args:       tc.Args,
-						})
-					},
-					OnToolExecute: func(name string) {
-						write(WSMessage{Type: "tool_execute", Tool: name})
-					},
-					OnToolResult: func(id, name, result string, success bool) {
-						truncated := false
-						const maxResult = 128 * 1024
-						origLen := len(result)
-						if origLen > maxResult {
-							result = result[:maxResult] + fmt.Sprintf("\n… truncated (%d bytes total)", origLen)
-							truncated = true
-						}
-						write(WSMessage{
-							Type:            "tool_result",
-							Tool:            name,
-							ToolCallID:      id,
-							Result:          result,
-							Success:         success,
-							ResultTruncated: truncated,
-						})
-					},
-				}
-
-				// turnMu (held by this goroutine) serializes mutating turns.
-				// Do not hold agentMu across StreamProcessInput: it includes
-				// catalog lookup, LLM streaming, and tool I/O — locking would
-				// stall WS connect/history/list_sessions for the whole turn
-				// (the prior slow-startup regression).
-				_, err := s.agent.StreamProcessInput(ctx, content, handlers)
-				var persistErr error
-				var ctxMsg WSMessage
-				if err == nil {
-					s.lockAgentWrite(func() {
-						persistErr = s.agent.ConsumePersistError()
-					})
-					ctxMsg = s.contextMsg(r.Context())
-				}
-				if err != nil {
-					if ctx.Err() != nil {
-						tokens.Flush()
-						if !writeFailed.Load() {
-							_ = ws.writeJSON(WSMessage{Type: "cancelled", Content: "Cancelled."})
-						}
-						return
-					}
-					tokens.Flush()
-					write(WSMessage{Type: "stream_end"})
-					write(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", err)})
-					log.Printf("stream error: %v", err)
-					return
-				}
-				if persistErr != nil {
-					write(WSMessage{Type: "response", Content: fmt.Sprintf("Warning: failed to save session: %v", persistErr)})
-				}
-				tokens.Flush()
-				write(WSMessage{Type: "stream_end"})
-				write(ctxMsg)
-			}(msg.Content, llmCtx, errCh)
-			// Do not block here — keep reading so delete_approval_response can complete.
-			continue
-		case "list_models":
-			// Catalog fetch is a remote /v1/models call and can be slow or hang.
-			// Do not block the WS read loop — history, sessions, cancel, and FS
-			// must keep flowing while models load in the background.
-			go func() {
-				models, err := s.agent.ListModels(r.Context())
-				if err != nil {
-					_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", err)})
-					return
-				}
-				var current string
-				s.lockAgentRead(func() {
-					current = s.agent.CurrentModel()
-				})
-				_ = ws.writeJSON(WSMessage{
-					Type:   "models",
-					Model:  current,
-					Models: s.modelEntries(models),
-				})
-			}()
-			continue
-		case "set_model":
-			stream.cancelInFlight()
-			if !s.tryAcquireTurn(wsTurnAcquireWait) {
-				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
-				continue
-			}
-			// SelectModel hits /v1/models — keep agentMu free so connect/history
-			// readers are not pinned behind the catalog fetch.
-			err := s.agent.SelectModel(r.Context(), msg.Model)
-			cfg := s.agentConfigMsg(r.Context())
-			s.turnMu.Unlock()
-			if err != nil {
-				_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", err)})
-				continue
-			}
-			_ = ws.writeJSON(cfg)
-			continue
-		case "set_mode":
-			stream.cancelInFlight()
-			if !s.tryAcquireTurn(wsTurnAcquireWait) {
-				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
-				continue
-			}
-			modeSet := false
-			var cfg WSMessage
-			s.lockAgentWrite(func() {
-				if m, ok := agent.ParseMode(msg.Mode); ok {
-					s.agent.SetMode(m)
-					modeSet = true
-					cfg = s.agentConfigMsgBasic()
-				}
-			})
-			s.turnMu.Unlock()
-			if modeSet {
-				accum := s.agent.UsageAccum
-				applyContextStats(&cfg, s.agent.ContextStats(r.Context()), &accum)
-				_ = ws.writeJSON(cfg)
-			}
-			continue
-		case "set_thinking_level":
-			stream.cancelInFlight()
-			if !s.tryAcquireTurn(wsTurnAcquireWait) {
-				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
-				continue
-			}
-			s.lockAgentWrite(func() {
-				if level, ok := agent.ParseThinkingLevel(msg.ThinkingLevel); ok {
-					s.agent.SetThinkingLevel(level)
-				}
-			})
-			cfg := s.agentConfigMsg(r.Context())
-			s.turnMu.Unlock()
-			_ = ws.writeJSON(cfg)
-			continue
-		case "config":
-			absDir, err := filepath.Abs(msg.WorkingDir)
-			if err != nil {
-				_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: invalid path: %v", err)})
-				continue
-			}
-			info, err := os.Stat(absDir)
-			if err != nil || !info.IsDir() {
-				_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: directory does not exist: %s", absDir)})
-				continue
-			}
-			stream.cancelInFlight()
-			if !s.tryAcquireTurn(wsTurnAcquireWait) {
-				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
-				continue
-			}
-			var cfg WSMessage
-			s.lockAgentWrite(func() {
-				s.agent.SetWorkingDir(absDir)
-				s.config.WorkingDir = absDir
-				cfg = s.agentConfigMsgBasic()
-			})
-			// FlushSession + models.dev cache retarget are disk/network — keep
-			// them off agentMu so WS connect/history readers are not stalled.
-			s.agent.AfterWorkingDirChange()
-			s.turnMu.Unlock()
-			accum := s.agent.UsageAccum
-			applyContextStats(&cfg, s.agent.ContextStats(r.Context()), &accum)
-			_ = ws.writeJSON(WSMessage{Type: "config", WorkingDir: absDir, Model: cfg.Model, ContextLimit: cfg.ContextLimit, UsedTokens: cfg.UsedTokens, UsedSource: cfg.UsedSource, UsedPercent: cfg.UsedPercent, CompactAt: cfg.CompactAt, MessageCount: cfg.MessageCount, NearCompact: cfg.NearCompact, ToolTruncated: cfg.ToolTruncated, Mode: cfg.Mode})
+			s.handleWSUserMessage(ws, r, stream, session, msg)
 		}
 	}
+}
+
+func (s *Server) handleWSListSessions(ws *wsConn) {
+	var sessionID string
+	s.lockAgentRead(func() {
+		sessionID = s.agent.SessionID
+	})
+	_, sessions, listErr := s.agent.FormatSessionListForUI()
+	if listErr != nil {
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", listErr)})
+		return
+	}
+	_ = ws.writeJSON(WSMessage{
+		Type:      "sessions",
+		Sessions:  sessionEntries(sessions, sessionID),
+		SessionID: sessionID,
+	})
+}
+
+func (s *Server) handleWSSessionAction(ws *wsConn, ctx context.Context, stream *wsConnStream, msg WSMessage) {
+	stream.cancelInFlight()
+	if !s.tryAcquireTurn(wsTurnAcquireWait) {
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+		return
+	}
+	var cmd string
+	switch msg.Type {
+	case "session_new":
+		cmd = "/new"
+	case "session_resume":
+		id := strings.TrimSpace(msg.SessionID)
+		if id == "" {
+			s.turnMu.Unlock()
+			_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: sessionId is required"})
+			return
+		}
+		cmd = "resume " + id
+	case "session_delete":
+		id := strings.TrimSpace(msg.SessionID)
+		if id == "" {
+			s.turnMu.Unlock()
+			_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: sessionId is required"})
+			return
+		}
+		cmd = "resume del " + id
+	case "session_fork":
+		forkArg := fmt.Sprintf("%d", msg.MessageIndex)
+		if msg.MessageIndex < 0 {
+			forkArg = "last"
+		}
+		cmd = "fork " + forkArg
+	}
+
+	result, _, err := s.agent.HandleSessionCommand(ctx, cmd, sesspkg.NewID())
+	s.turnMu.Unlock()
+	s.writeSessionCommandResult(ws, ctx, result, err)
+}
+
+func (s *Server) handleWSListModels(ws *wsConn, ctx context.Context) {
+	go func() {
+		models, err := s.agent.ListModels(ctx)
+		if err != nil {
+			_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", err)})
+			return
+		}
+		var current string
+		s.lockAgentRead(func() {
+			current = s.agent.CurrentModel()
+		})
+		_ = ws.writeJSON(WSMessage{
+			Type:   "models",
+			Model:  current,
+			Models: s.modelEntries(models),
+		})
+	}()
+}
+
+func (s *Server) handleWSSetModel(ws *wsConn, ctx context.Context, stream *wsConnStream, msg WSMessage) {
+	stream.cancelInFlight()
+	if !s.tryAcquireTurn(wsTurnAcquireWait) {
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+		return
+	}
+	err := s.agent.SelectModel(ctx, msg.Model)
+	cfg := s.agentConfigMsg(ctx)
+	s.turnMu.Unlock()
+	if err != nil {
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", err)})
+		return
+	}
+	_ = ws.writeJSON(cfg)
+}
+
+func (s *Server) handleWSSetMode(ws *wsConn, ctx context.Context, stream *wsConnStream, msg WSMessage) {
+	stream.cancelInFlight()
+	if !s.tryAcquireTurn(wsTurnAcquireWait) {
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+		return
+	}
+	modeSet := false
+	var cfg WSMessage
+	s.lockAgentWrite(func() {
+		if m, ok := agent.ParseMode(msg.Mode); ok {
+			s.agent.SetMode(m)
+			modeSet = true
+			cfg = s.agentConfigMsgBasic()
+		}
+	})
+	s.turnMu.Unlock()
+	if modeSet {
+		accum := s.agent.UsageAccum
+		applyContextStats(&cfg, s.agent.ContextStats(ctx), &accum)
+		_ = ws.writeJSON(cfg)
+	}
+}
+
+func (s *Server) handleWSSetThinkingLevel(ws *wsConn, ctx context.Context, stream *wsConnStream, msg WSMessage) {
+	stream.cancelInFlight()
+	if !s.tryAcquireTurn(wsTurnAcquireWait) {
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+		return
+	}
+	s.lockAgentWrite(func() {
+		if level, ok := agent.ParseThinkingLevel(msg.ThinkingLevel); ok {
+			s.agent.SetThinkingLevel(level)
+		}
+	})
+	cfg := s.agentConfigMsg(ctx)
+	s.turnMu.Unlock()
+	_ = ws.writeJSON(cfg)
+}
+
+func (s *Server) handleWSConfig(ws *wsConn, ctx context.Context, stream *wsConnStream, msg WSMessage) {
+	absDir, err := filepath.Abs(msg.WorkingDir)
+	if err != nil {
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: invalid path: %v", err)})
+		return
+	}
+	info, err := os.Stat(absDir)
+	if err != nil || !info.IsDir() {
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: directory does not exist: %s", absDir)})
+		return
+	}
+	stream.cancelInFlight()
+	if !s.tryAcquireTurn(wsTurnAcquireWait) {
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+		return
+	}
+	var cfg WSMessage
+	s.lockAgentWrite(func() {
+		s.agent.SetWorkingDir(absDir)
+		s.config.WorkingDir = absDir
+		cfg = s.agentConfigMsgBasic()
+	})
+	s.agent.AfterWorkingDirChange()
+	s.turnMu.Unlock()
+	accum := s.agent.UsageAccum
+	applyContextStats(&cfg, s.agent.ContextStats(ctx), &accum)
+	_ = ws.writeJSON(WSMessage{Type: "config", WorkingDir: absDir, Model: cfg.Model, ContextLimit: cfg.ContextLimit, UsedTokens: cfg.UsedTokens, UsedSource: cfg.UsedSource, UsedPercent: cfg.UsedPercent, CompactAt: cfg.CompactAt, MessageCount: cfg.MessageCount, NearCompact: cfg.NearCompact, ToolTruncated: cfg.ToolTruncated, Mode: cfg.Mode})
+}
+
+func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, stream *wsConnStream, session *wsSession, msg WSMessage) {
+	stream.cancelInFlight()
+
+	if out, handled := agent.HandleHelpCommand(msg.Content, true, false); handled {
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: out})
+		return
+	}
+
+	if sel, isModels := agent.ParseModelsCommand(msg.Content); isModels && sel == "" {
+		go func(content string) {
+			out, _, err := s.agent.HandleModelsCommand(r.Context(), content)
+			resp := WSMessage{Type: "response", Content: out}
+			if err != nil {
+				resp.Content = fmt.Sprintf("Error: %v", err)
+				_ = ws.writeJSON(resp)
+				return
+			}
+			if models, listErr := s.agent.ListModels(r.Context()); listErr == nil && len(models) > 1 {
+				resp.Type = "models"
+				resp.Models = s.modelEntries(models)
+			}
+			cfg := s.agentConfigMsg(r.Context())
+			resp.Model = cfg.Model
+			resp.ContextLimit = cfg.ContextLimit
+			resp.UsedTokens = cfg.UsedTokens
+			resp.UsedSource = cfg.UsedSource
+			resp.UsedPercent = cfg.UsedPercent
+			_ = ws.writeJSON(resp)
+		}(msg.Content)
+		return
+	}
+
+	if !s.tryAcquireTurn(wsTurnAcquireWait) {
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+		return
+	}
+
+	var modeOut string
+	var modeHandled bool
+	var modeCfg WSMessage
+	s.lockAgentWrite(func() {
+		modeOut, modeHandled = s.agent.HandleModeCommand(msg.Content)
+		if modeHandled {
+			modeCfg = s.agentConfigMsgBasic()
+		}
+	})
+	if modeHandled {
+		s.turnMu.Unlock()
+		accum := s.agent.UsageAccum
+		applyContextStats(&modeCfg, s.agent.ContextStats(r.Context()), &accum)
+		_ = ws.writeJSON(modeCfg)
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: modeOut})
+		return
+	}
+
+	var thinkOut string
+	var thinkHandled bool
+	s.lockAgentWrite(func() {
+		thinkOut, thinkHandled = s.agent.HandleThinkingCommand(msg.Content)
+	})
+	if thinkHandled {
+		s.turnMu.Unlock()
+		cfg := s.agentConfigMsg(r.Context())
+		cfg.ThinkingLevel = string(s.agent.ThinkingLevel)
+		_ = ws.writeJSON(cfg)
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: thinkOut})
+		return
+	}
+
+	var ctxOut string
+	var ctxHandled bool
+	ctxOut, ctxHandled = s.agent.HandleContextCommand(r.Context(), msg.Content)
+	if ctxHandled {
+		s.turnMu.Unlock()
+		ctxMsg := s.contextMsg(r.Context())
+		_ = ws.writeJSON(ctxMsg)
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: ctxOut})
+		return
+	}
+
+	var sessResult agent.SessionCommandResult
+	var sessHandled bool
+	var sessErr error
+	sessResult, sessHandled, sessErr = s.agent.HandleSessionCommand(r.Context(), msg.Content, sesspkg.NewID())
+	if sessHandled {
+		s.turnMu.Unlock()
+		s.writeSessionCommandResult(ws, r.Context(), sessResult, sessErr)
+		return
+	}
+
+	if sel, isModels := agent.ParseModelsCommand(msg.Content); isModels && sel != "" {
+		out, _, modelErr := s.agent.HandleModelsCommand(r.Context(), msg.Content)
+		cfg := s.agentConfigMsg(r.Context())
+		s.turnMu.Unlock()
+		resp := WSMessage{Type: "response", Content: out}
+		if modelErr != nil {
+			resp.Content = fmt.Sprintf("Error: %v", modelErr)
+		} else {
+			resp.Model = cfg.Model
+			resp.ContextLimit = cfg.ContextLimit
+			resp.UsedTokens = cfg.UsedTokens
+			resp.UsedSource = cfg.UsedSource
+			resp.UsedPercent = cfg.UsedPercent
+			_ = ws.writeJSON(cfg)
+		}
+		_ = ws.writeJSON(resp)
+		return
+	}
+
+	s.startAsyncStreamingTurn(ws, r, stream, session, msg.Content)
+}
+
+func (s *Server) startAsyncStreamingTurn(ws *wsConn, r *http.Request, stream *wsConnStream, session *wsSession, content string) {
+	streamCtx, streamCancel := context.WithCancel(r.Context())
+	llmCtx, llmCancel := context.WithCancel(streamCtx)
+	errCh := stream.begin(streamCancel, llmCancel)
+	go func(content string, llmCtx context.Context, done chan error) {
+		defer stream.end()
+		defer func() { done <- nil }()
+		defer s.turnMu.Unlock()
+		defer func() {
+			_ = ws.writeJSON(WSMessage{Type: "turn_end"})
+		}()
+		ctx := agent.ContextWithDeleteApprover(llmCtx, session.deleteApprover())
+		var writeFailed atomic.Bool
+		failWrite := sync.Once{}
+		write := func(v WSMessage) {
+			if ctx.Err() != nil {
+				return
+			}
+			if err := ws.writeJSON(v); err != nil {
+				writeFailed.Store(true)
+				failWrite.Do(func() {
+					llmCancel()
+					_ = ws.conn.Close()
+				})
+				return
+			}
+		}
+		tokens := streamutil.NewTokenBatcher(func(think bool, text string) {
+			if think {
+				write(WSMessage{Type: "thinking_token", Content: text})
+			} else {
+				write(WSMessage{Type: "stream", Content: text})
+			}
+		}, wsTokenFlushInterval)
+
+		handlers := &llm.StreamHandlers{
+			OnStart: func() {
+				write(WSMessage{Type: "thinking"})
+				if ctx.Err() != nil {
+					return
+				}
+				write(s.contextMsg(ctx))
+			},
+			OnRoundStart: func() {
+				write(WSMessage{Type: "thinking"})
+				if ctx.Err() != nil {
+					return
+				}
+				write(s.contextMsg(ctx))
+			},
+			OnStreamOpened: func() {
+				write(WSMessage{Type: "waiting"})
+			},
+			OnStreamActivity: func() {},
+			OnThinkingToken:  tokens.ThinkToken,
+			OnToken:          tokens.StreamToken,
+			OnStreamEnd: func() {
+				tokens.Flush()
+				write(WSMessage{Type: "stream_end"})
+			},
+			OnToolCallStart: func(index int, id, name string) {
+				tokens.Flush()
+				write(WSMessage{
+					Type:       "tool_call_start",
+					Tool:       name,
+					ToolCallID: id,
+					Index:      index,
+				})
+			},
+			OnToolCallArgsDelta: func(index int, id, name, argsDelta string) {
+				tokens.Flush()
+				write(WSMessage{
+					Type:       "tool_call_delta",
+					Tool:       name,
+					ToolCallID: id,
+					Index:      index,
+					ArgsDelta:  argsDelta,
+				})
+			},
+			OnToolCall: func(tc llm.ToolCall) {
+				tokens.Flush()
+				write(WSMessage{
+					Type:       "tool_call",
+					Tool:       tc.Name,
+					ToolCallID: tc.ID,
+					Index:      tc.Index,
+					Args:       tc.Args,
+				})
+			},
+			OnToolExecute: func(name string) {
+				write(WSMessage{Type: "tool_execute", Tool: name})
+			},
+			OnToolResult: func(id, name, result string, success bool) {
+				truncated := false
+				const maxResult = 128 * 1024
+				origLen := len(result)
+				if origLen > maxResult {
+					result = result[:maxResult] + fmt.Sprintf("\n… truncated (%d bytes total)", origLen)
+					truncated = true
+				}
+				write(WSMessage{
+					Type:            "tool_result",
+					Tool:            name,
+					ToolCallID:      id,
+					Result:          result,
+					Success:         success,
+					ResultTruncated: truncated,
+				})
+			},
+		}
+
+		_, err := s.agent.StreamProcessInput(ctx, content, handlers)
+		var persistErr error
+		var ctxMsg WSMessage
+		if err == nil {
+			s.lockAgentWrite(func() {
+				persistErr = s.agent.ConsumePersistError()
+			})
+			ctxMsg = s.contextMsg(r.Context())
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				tokens.Flush()
+				if !writeFailed.Load() {
+					_ = ws.writeJSON(WSMessage{Type: "cancelled", Content: "Cancelled."})
+				}
+				return
+			}
+			tokens.Flush()
+			write(WSMessage{Type: "stream_end"})
+			write(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", err)})
+			log.Printf("stream error: %v", err)
+			return
+		}
+		if persistErr != nil {
+			write(WSMessage{Type: "response", Content: fmt.Sprintf("Warning: failed to save session: %v", persistErr)})
+		}
+		tokens.Flush()
+		write(WSMessage{Type: "stream_end"})
+		if ctxMsg.Type != "" {
+			write(ctxMsg)
+		}
+	}(content, llmCtx, errCh)
 }
 
 func (s *Server) HandleStatic(w http.ResponseWriter, r *http.Request) {

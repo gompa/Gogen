@@ -618,6 +618,13 @@
             console.log('[pricing] applyServerConfig', { model: data.model, inputPrice: data.inputPricePer1M, totalTurns: data.totalTurns });
             if (data.workingDir) dirInput.value = data.workingDir;
             updateModelInfo(data.model);
+            // Keep the popover model list in sync with the active model after a switch
+            if (data.model && availableModels.length > 0) {
+                for (const m of availableModels) {
+                    m.current = (m.id === data.model);
+                }
+                renderToolbarModelList(availableModels, data.model);
+            }
             updateThinkingInfo(data.thinkingLevel);
             updateModeInfo(data.mode);
             updateGlobalMode(data.globalMode);

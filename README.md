@@ -74,6 +74,11 @@ Non-loopback binds (e.g. `--host 0.0.0.0`) require a token:
 GOGEN_WEB_TOKEN=secret ./gogen --web --host 0.0.0.0
 # then open http://host:8080/?token=secret
 ```
+Global mode (use `~/.config/gogen/` instead of project `.gogen/`):
+
+```bash
+GOGEN_MODE=global ./gogen
+```
 
 ### Flags
 
@@ -82,11 +87,13 @@ GOGEN_WEB_TOKEN=secret ./gogen --web --host 0.0.0.0
 | `--web` | Run in web mode (listens on `:8080`) |
 | `--host <host>` | Listen host for `--web` (e.g. `0.0.0.0`; default `127.0.0.1`; also `GOGEN_WEB_BIND` for host:port) |
 | `--dir <path>` | Set the working directory |
+| `--global` | Ignore project `.gogen/`, use `~/.config/gogen/` instead |
 | `--url <url>` | Override OpenAI API base URL (e.g., for local LLMs or proxies) |
 | `--verbose` | Show full tool output in CLI mode |
+| `-p <prompt>` | Run a single prompt and exit (non-interactive) |
 | `--save-config` | Write effective config to `.gogen/gogen.conf` and guidelines to `.gogen/gogen.md` |
 | `--save-config-secrets` | Include `openai_api_key` when using `--save-config` |
-| `--save-config-path <file>` | Output path for `--save-config` config file (default `.gogen/gogen.conf`) |
+| `--save-config-path <file>` | Output path for `--save-config` config file (default `.gogen/gogen.conf`; use with `--global` to set global config path) |
 
 The first positional argument is also treated as the working directory (overridden by `--dir`).
 
@@ -184,12 +191,35 @@ After each agent turn, GoGen shows context usage in the CLI (dim line) and web U
 | `GOGEN_COMMAND_ALLOWLIST` | *(empty)* | Comma-separated allowed command prefixes (allowlist mode) |
 | `GOGEN_DELETE_APPROVAL` | `required` | Set to `off` to skip delete confirmation |
 
+### Command execution
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GOGEN_COMMAND_SANDBOX` | `off` | Sandbox mode: `off` or `bwrap` (bubblewrap when available) |
+| `GOGEN_COMMAND_TIMEOUT_SECS` | `120` | Maximum duration for `execute_command` |
+
+### Global mode
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GOGEN_MODE` | *(empty)* | Set to `global` to use `~/.config/gogen/` instead of project `.gogen/` |
+
 ### Tree-sitter
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GOGEN_TREESITTER` | *(on)* | Set to `off` to disable syntax checks and symbol extraction |
 | `GOGEN_TREESITTER_LANGS` | *(all)* | Comma-separated subset, e.g. `go,python,rust` |
+| `GOGEN_DEBUG_COMPARE_MESSAGES` | off | (debug builds only) Enable view-fingerprint comparison across turns |
+
+### Project commands
+
+| Config key | Description |
+|------------|-------------|
+| `test_command` | Override the test command auto-detection (e.g. `"make test"`) |
+| `lint_command` | Override the lint command auto-detection (e.g. `"make vet"`) |
+
+These can be set in `.gogen/gogen.conf` or as CLI flags. They are loaded from the project file only (no environment variable equivalent).
 
 ### MCP
 
@@ -198,11 +228,19 @@ After each agent turn, GoGen shows context usage in the CLI (dim line) and web U
 | `GOGEN_MCP` | off | Set to `on` to enable MCP (also set `mcp: on` in project config) |
 | `GOGEN_MCP_SERVERS` | *(empty)* | JSON array of `{name, command, args, env}` (overrides file) |
 
-### Sessions and debug
+### Session persistence
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GOGEN_SESSION_PERSIST` | on | Set to `off` to disable session save/resume |
+| `GOGEN_SESSION_MAX_COUNT` | `50` | Max saved sessions per working directory |
+| `GOGEN_SESSION_MAX_AGE_DAYS` | `30` | Auto-delete sessions older than N days |
+| `GOGEN_SESSION_PERSIST` is listed above; the other two are config-only via `.gogen/gogen.conf` (`session_max_count`, `session_max_age_days`). |
+
+### Sessions and debug
+
+| Variable | Default | Description |
+|----------|---------|-------------|
 | `GOGEN_CLI_VERBOSE` | off | Verbose tool output in CLI |
 | `GOGEN_DEBUG_LOG` | *(empty)* | Path to JSON debug log |
 | `GOGEN_DEBUG_SESSION` | *(empty)* | Session id in debug logs |
@@ -211,11 +249,30 @@ After each agent turn, GoGen shows context usage in the CLI (dim line) and web U
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GOGEN_WEB_BIND` | `127.0.0.1:8080` | Listen address for `--web` (e.g. `0.0.0.0:8080` to accept remote connections) |
-| `GOGEN_WEB_ALLOWED_ORIGINS` | *(empty)* | Comma-separated host allowlist for WebSocket; empty uses localhost defaults |
+| `GOGEN_WEB_BIND` | `127.0.0.1:8081` | Listen address for `--web` (e.g. `0.0.0.0:8080` to accept remote connections) |
+| `GOGEN_WEB_TOKEN` | *(empty)* | Required for non-loopback binds; also set via `--web --host` or `GOGEN_WEB_TOKEN` |
+| `GOGEN_WEB_ALLOWED_ORIGINS` | *(empty)* | Comma-separated host allowlist for WebSocket CORS; empty uses localhost defaults |
+| `GOGEN_WEB_TLS_CERT` | *(empty)* | Path to PEM certificate file for TLS |
+| `GOGEN_WEB_TLS_KEY` | *(empty)* | Path to PEM key file for TLS |
+
+### Web tools (web_fetch / web_search)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GOGEN_WEB_FETCH` | on | Enable `web_fetch` tool (`on`/`off`) |
+| `GOGEN_WEB_SEARCH` | on | Enable `web_search` tool (`on`/`off`) |
+| `GOGEN_WEB_FETCH_MODE` | `https` | `https` (default) or `all` (allow HTTP) |
+| `GOGEN_WEB_SEARCH_BACKEND` | *(empty)* | `brave` for Brave Search API; empty uses DuckDuckGo |
+| `GOGEN_WEB_SEARCH_API_KEY` | *(empty)* | API key for Brave Web Search |
+| `GOGEN_WEB_ALLOWED_DOMAINS` | *(empty)* | Comma-separated domain suffix allowlist for fetch |
+
+### API compatibility
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GOGEN_PRESERVE_REASONING` | `auto` | Controls `preserve_reasoning` for llama.cpp endpoints: `auto`, `on`, or `off` |
 
 ### Example
-
 ```bash
 export OPENAI_API_KEY=sk-...
 export OPENAI_MODEL=gpt-4o
@@ -223,6 +280,11 @@ export OPENAI_BASE_URL=https://api.openai.com/v1
 export GOGEN_WORKING_DIR=/path/to/your/project
 export GOGEN_COMMAND_SAFETY=blocklist
 export GOGEN_DELETE_APPROVAL=required
+export GOGEN_WEB_TOKEN=my-secret-token
+export GOGEN_WEB_SEARCH_BACKEND=brave
+export GOGEN_WEB_SEARCH_API_KEY=BSA...
+export GOGEN_COMMAND_SANDBOX=bwrap
+export GOGEN_PRESERVE_REASONING=on
 
 ./gogen
 ```

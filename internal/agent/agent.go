@@ -800,21 +800,6 @@ func intArgOptional(args map[string]interface{}, key string) (int, error) {
 	}
 }
 
-// intArg returns the integer value for key, or an error if the key is missing
-// or the value is not an integer. Unlike intArgOptional, this requires the key
-// to be present in the map.
-func intArg(args map[string]interface{}, key string) (int, error) {
-	_, ok := args[key]
-	if !ok {
-		return 0, fmt.Errorf("missing required argument %q", key)
-	}
-	v, err := intArgOptional(args, key)
-	if err != nil {
-		return 0, err
-	}
-	return v, nil
-}
-
 func stringSliceArg(args map[string]interface{}, key string) ([]string, error) {
 	val, ok := args[key]
 	if !ok {

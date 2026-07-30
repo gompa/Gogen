@@ -28,31 +28,42 @@ import (
 	"gogen/internal/tui"
 )
 
-func main() {
-	webFlag := flag.Bool("web", false, "Run in Web mode")
-	hostFlag := flag.String("host", "", "Listen host for --web (e.g. 0.0.0.0, default 127.0.0.1)")
-	verboseFlag := flag.Bool("verbose", false, "Show full tool output in CLI mode")
-	dirFlag := flag.String("dir", "", "Specify the working directory")
-	urlFlag := flag.String("url", "", "OpenAI API base URL (e.g. https://api.openai.com/v1)")
-	globalFlag := flag.Bool("global", false, "Run in global mode (ignore project config, use ~/.config/gogen/)")
-	saveConfigFlag := flag.Bool("save-config", false, "Write effective config to .gogen/gogen.md and exit")
-	saveConfigSecretsFlag := flag.Bool("save-config-secrets", false, "Include openai_api_key when using --save-config")
-	promptFlag := flag.String("p", "", "Run a single prompt and exit (non-interactive)")
-	saveConfigPathFlag := flag.String("save-config-path", "", "Output path for --save-config (default .gogen/gogen.md)")
+type cliFlags struct {
+	web               bool
+	host              string
+	verbose           bool
+	dir               string
+	url               string
+	global            bool
+	saveConfig        bool
+	saveConfigSecrets bool
+	prompt            string
+	saveConfigPath    string
+}
+
+func parseCLIOptions() (cliFlags, string) {
+	opts := cliFlags{}
+	flag.BoolVar(&opts.web, "web", false, "Run in Web mode")
+	flag.StringVar(&opts.host, "host", "", "Listen host for --web (e.g. 0.0.0.0, default 127.0.0.1)")
+	flag.BoolVar(&opts.verbose, "verbose", false, "Show full tool output in CLI mode")
+	flag.StringVar(&opts.dir, "dir", "", "Specify the working directory")
+	flag.StringVar(&opts.url, "url", "", "OpenAI API base URL (e.g. https://api.openai.com/v1)")
+	flag.BoolVar(&opts.global, "global", false, "Run in global mode (ignore project config, use ~/.config/gogen/)")
+	flag.BoolVar(&opts.saveConfig, "save-config", false, "Write effective config to .gogen/gogen.md and exit")
+	flag.BoolVar(&opts.saveConfigSecrets, "save-config-secrets", false, "Include openai_api_key when using --save-config")
+	flag.StringVar(&opts.prompt, "p", "", "Run a single prompt and exit (non-interactive)")
+	flag.StringVar(&opts.saveConfigPath, "save-config-path", "", "Output path for --save-config (default .gogen/gogen.md)")
 
 	flag.Parse()
 
-	profiling.Start()
-	defer profiling.Stop()
-
 	workingDir := "."
-	if *dirFlag != "" {
-		workingDir = *dirFlag
+	if opts.dir != "" {
+		workingDir = opts.dir
 	} else if args := flag.Args(); len(args) > 0 {
 		workingDir = args[0]
 		if len(args) > 1 {
-			if *promptFlag == "" {
-				*promptFlag = args[1]
+			if opts.prompt == "" {
+				opts.prompt = args[1]
 			}
 			if len(args) > 2 {
 				log.Fatal("Usage: gogen [flags] [dir] [prompt]")
@@ -63,18 +74,55 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	workingDir = absWD
+	return opts, absWD
+}
 
-	// Determine mode: --global flag or GOGEN_MODE=global env var.
-	isGlobalMode := *globalFlag || projectfile.IsGlobalModeEnv()
+func handleSaveConfigFlag(opts cliFlags, isGlobalMode bool, workingDir string, cfg *config.Config, pf *projectfile.ProjectFile) bool {
+	if !opts.saveConfig {
+		return false
+	}
+	if isGlobalMode {
+		if err := projectfile.SaveGlobalConfig(cfg, projectfile.WriteOptions{IncludeSecrets: opts.saveConfigSecrets}); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("Wrote global config to %s\n", projectfile.GlobalConfigPath())
+		fmt.Println("Note: environment variables still override file values at runtime.")
+		return true
+	}
+	outPath := opts.saveConfigPath
+	if outPath == "" {
+		outPath = projectfile.DefaultSavePath(workingDir)
+	} else if !filepath.IsAbs(outPath) {
+		outPath = filepath.Join(workingDir, outPath)
+	}
+	guidelinesPath := projectfile.DefaultGuidelinesSavePath(workingDir)
+	guidelines := cfg.ProjectGuidelines
+	if pf != nil && guidelines == "" {
+		guidelines = pf.Guidelines
+	}
+	if err := projectfile.SaveConfig(outPath, guidelinesPath, cfg, guidelines, projectfile.WriteOptions{IncludeSecrets: opts.saveConfigSecrets}); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("Wrote config to %s\n", outPath)
+	fmt.Printf("Wrote guidelines to %s\n", guidelinesPath)
+	fmt.Println("Note: environment variables still override file values at runtime.")
+	return true
+}
+
+func main() {
+	opts, workingDir := parseCLIOptions()
+
+	profiling.Start()
+	defer profiling.Stop()
+
+	isGlobalMode := opts.global || projectfile.IsGlobalModeEnv()
 
 	var verboseOverride *bool
-	if *verboseFlag {
+	if opts.verbose {
 		v := true
 		verboseOverride = &v
 	}
 
-	// Load config: project-local or global.
 	var pf *projectfile.ProjectFile
 	if isGlobalMode {
 		pf = projectfile.LoadGlobalConfig()
@@ -93,43 +141,16 @@ func main() {
 
 	cfg := projectfile.Merge(pf, projectfile.FlagOverrides{
 		WorkingDir: workingDir,
-		OpenAIURL:  *urlFlag,
+		OpenAIURL:  opts.url,
 		CLIVerbose: verboseOverride,
-		WebBind:    *hostFlag,
+		WebBind:    opts.host,
 	})
 	if pf != nil {
 		cfg.ProjectGuidelines = pf.Guidelines
 		cfg.ProjectFilePath = pf.Path
 	}
 
-	if *saveConfigFlag {
-		if isGlobalMode {
-			// Save to global config path (no guidelines file).
-			if err := projectfile.SaveGlobalConfig(cfg, projectfile.WriteOptions{IncludeSecrets: *saveConfigSecretsFlag}); err != nil {
-				log.Fatal(err)
-			}
-			fmt.Printf("Wrote global config to %s\n", projectfile.GlobalConfigPath())
-			fmt.Println("Note: environment variables still override file values at runtime.")
-			return
-		}
-		// Project mode: save to project-local path.
-		outPath := *saveConfigPathFlag
-		if outPath == "" {
-			outPath = projectfile.DefaultSavePath(workingDir)
-		} else if !filepath.IsAbs(outPath) {
-			outPath = filepath.Join(workingDir, outPath)
-		}
-		guidelinesPath := projectfile.DefaultGuidelinesSavePath(workingDir)
-		guidelines := cfg.ProjectGuidelines
-		if pf != nil && guidelines == "" {
-			guidelines = pf.Guidelines
-		}
-		if err := projectfile.SaveConfig(outPath, guidelinesPath, cfg, guidelines, projectfile.WriteOptions{IncludeSecrets: *saveConfigSecretsFlag}); err != nil {
-			log.Fatal(err)
-		}
-		fmt.Printf("Wrote config to %s\n", outPath)
-		fmt.Printf("Wrote guidelines to %s\n", guidelinesPath)
-		fmt.Println("Note: environment variables still override file values at runtime.")
+	if handleSaveConfigFlag(opts, isGlobalMode, workingDir, cfg, pf) {
 		return
 	}
 
@@ -269,14 +290,14 @@ func main() {
 	defer stop()
 	defer a.FlushSession()
 
-	if *promptFlag != "" {
+	if opts.prompt != "" {
 		go initMCP()
 		go a.ValidateRestoredModel(context.Background(), restoredModel)
-		runSinglePrompt(ctx, a, *promptFlag, cfg)
+		runSinglePrompt(ctx, a, opts.prompt, cfg)
 		return
 	}
 
-	if *webFlag {
+	if opts.web {
 		// Determine the listen address first so we can check for loopback
 		// and auto-generate a token before creating the server.
 		addr := cfg.WebBind

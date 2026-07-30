@@ -88,38 +88,47 @@ func (e *Executor) ReadFileRawBytes(path string) ([]byte, error) {
 // regex match, offset is treated as context lines around that match (default 10,
 // not a starting line number), and limit caps the total lines returned.
 func (e *Executor) ReadFileRange(path string, offset, limit int, search string, lineNumbers bool) (string, error) {
-	secure, err := e.SecurePath(path)
+	secure, header, err := e.validateAndCheckFile(path)
 	if err != nil {
 		return "", err
 	}
 
+	if search != "" {
+		return e.readWithRegexSearch(secure, offset, limit, search, lineNumbers, header)
+	}
+	return e.readWithLineRange(secure, offset, limit, lineNumbers, header)
+}
+
+func (e *Executor) validateAndCheckFile(path string) (string, string, error) {
+	secure, err := e.SecurePath(path)
+	if err != nil {
+		return "", "", err
+	}
+
 	info, err := os.Stat(secure)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if info.IsDir() {
 		entries, err := os.ReadDir(secure)
 		if err != nil {
-			return "", fmt.Errorf("path is a directory, use list_files to explore contents")
+			return "", "", fmt.Errorf("path is a directory, use list_files to explore contents")
 		}
 		var names []string
 		for _, entry := range entries {
 			names = append(names, entry.Name())
 		}
-		return "", fmt.Errorf("path is a directory containing: %s. Use list_files or read_file with a specific file path", strings.Join(names, ", "))
+		return "", "", fmt.Errorf("path is a directory containing: %s. Use list_files or read_file with a specific file path", strings.Join(names, ", "))
 	}
 	if info.Mode().IsRegular() && info.Size() > 0 {
-		// Binary check: read up to 512 bytes, sniff for NUL, close.
 		if f, err := os.Open(secure); err == nil {
 			head := make([]byte, 512)
 			n, readErr := f.Read(head)
 			f.Close()
-			// If Read returned no data due to an error, skip the binary
-			// check; the subsequent ReadFile will surface the real error.
-			if readErr != nil && n == 0 {
-				// Fall through to file reading below.
-			} else if n > 0 && bytes.IndexByte(head[:n], 0) >= 0 {
-				return "", fmt.Errorf("this is a binary file (%s). Use read_file with offset/limit on text files only, or use execute_command to inspect binary content", formatByteSize(info.Size()))
+			if readErr == nil || n > 0 {
+				if n > 0 && bytes.IndexByte(head[:n], 0) >= 0 {
+					return "", "", fmt.Errorf("this is a binary file (%s). Use read_file with offset/limit on text files only, or use execute_command to inspect binary content", formatByteSize(info.Size()))
+				}
 			}
 		}
 	}
@@ -128,107 +137,100 @@ func (e *Executor) ReadFileRange(path string, offset, limit int, search string, 
 	if info.Size() > readFileWarnBytes {
 		fmt.Fprintf(&header, "Warning: file is %s (%d bytes). Use offset/limit to read in chunks.\n", formatByteSize(info.Size()), info.Size())
 	}
+	return secure, header.String(), nil
+}
 
-	// When search is set, scan incrementally with a ring buffer for
-	// context before the match. This avoids storing all lines in memory.
-	if search != "" {
-		re, err := regexp.Compile(search)
-		if err != nil {
-			return "", fmt.Errorf("invalid search pattern: %w", err)
-		}
-		ctx := 10
-		if limit > 0 {
-			ctx = limit / 2
-		}
-		if offset > 0 {
-			ctx = offset
-		}
-		if ctx < 1 {
-			ctx = 1
-		}
-
-		f, err := os.Open(secure)
-		if err != nil {
-			return "", err
-		}
-		defer f.Close()
-		sc := bufio.NewScanner(f)
-		sc.Buffer(make([]byte, 64*1024), 10*1024*1024)
-
-		// Ring buffer for context lines before the match.
-		ring := make([]string, ctx)
-		ringPos := 0
-		ringFull := false
-		lineNum := 0
-		matchLine := 0
-
-		for sc.Scan() {
-			lineNum++
-			line := sc.Text()
-			if re.MatchString(line) {
-				matchLine = lineNum
-				// Collect context before the match from the ring buffer.
-				var before []string
-				if ringFull {
-					before = append(ring[ringPos:], ring[:ringPos]...)
-				} else if ringPos > 0 {
-					before = ring[:ringPos]
-				}
-				// Collect context after the match: the current line + up to ctx more.
-				after := []string{line}
-				for sc.Scan() {
-					lineNum++
-					after = append(after, sc.Text())
-					if len(after) >= ctx+1 {
-						break
-					}
-				}
-				// Count remaining lines in the file for accurate total.
-				for sc.Scan() {
-					lineNum++
-				}
-				if err := sc.Err(); err != nil {
-					return "", err
-				}
-				totalLines := lineNum
-
-				selected := append(before, after...)
-				startLine := matchLine - len(before)
-				if startLine < 1 {
-					startLine = 1
-				}
-				body := strings.Join(selected, "\n")
-				if lineNumbers {
-					body = formatWithLineNumbers(selected, startLine)
-				}
-
-				out := fmt.Sprintf("Lines %d-%d of %d (matched %q at line %d)\n%s",
-					startLine, startLine+len(selected)-1, totalLines, search, matchLine,
-					body)
-				if header.Len() > 0 {
-					out = header.String() + out
-				}
-				return out, nil
-			}
-			// Store line in ring buffer.
-			ring[ringPos] = line
-			ringPos = (ringPos + 1) % ctx
-			if ringPos == 0 {
-				ringFull = true
-			}
-			// Do not cap by readFileMaxLines when searching — the file-size
-			// warning above already informed the user, and the post-match
-			// line-counting scan below has no cap either.
-		}
-		if err := sc.Err(); err != nil {
-			return "", err
-		}
-		if lineNum == 0 {
-			return "File is empty", nil
-		}
-		return "", fmt.Errorf("pattern %q not found in file (%d lines)", search, lineNum)
+func (e *Executor) readWithRegexSearch(secure string, offset, limit int, search string, lineNumbers bool, header string) (string, error) {
+	re, err := regexp.Compile(search)
+	if err != nil {
+		return "", fmt.Errorf("invalid search pattern: %w", err)
+	}
+	ctx := 10
+	if limit > 0 {
+		ctx = limit / 2
+	}
+	if offset > 0 {
+		ctx = offset
+	}
+	if ctx < 1 {
+		ctx = 1
 	}
 
+	f, err := os.Open(secure)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 10*1024*1024)
+
+	ring := make([]string, ctx)
+	ringPos := 0
+	ringFull := false
+	lineNum := 0
+	matchLine := 0
+
+	for sc.Scan() {
+		lineNum++
+		line := sc.Text()
+		if re.MatchString(line) {
+			matchLine = lineNum
+			var before []string
+			if ringFull {
+				before = append(ring[ringPos:], ring[:ringPos]...)
+			} else if ringPos > 0 {
+				before = ring[:ringPos]
+			}
+			after := []string{line}
+			for sc.Scan() {
+				lineNum++
+				after = append(after, sc.Text())
+				if len(after) >= ctx+1 {
+					break
+				}
+			}
+			for sc.Scan() {
+				lineNum++
+			}
+			if err := sc.Err(); err != nil {
+				return "", err
+			}
+			totalLines := lineNum
+
+			selected := append(before, after...)
+			startLine := matchLine - len(before)
+			if startLine < 1 {
+				startLine = 1
+			}
+			body := strings.Join(selected, "\n")
+			if lineNumbers {
+				body = formatWithLineNumbers(selected, startLine)
+			}
+
+			out := fmt.Sprintf("Lines %d-%d of %d (matched %q at line %d)\n%s",
+				startLine, startLine+len(selected)-1, totalLines, search, matchLine,
+				body)
+			if header != "" {
+				out = header + out
+			}
+			return out, nil
+		}
+		ring[ringPos] = line
+		ringPos = (ringPos + 1) % ctx
+		if ringPos == 0 {
+			ringFull = true
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return "", err
+	}
+	if lineNum == 0 {
+		return "File is empty", nil
+	}
+	return "", fmt.Errorf("pattern %q not found in file (%d lines)", search, lineNum)
+}
+
+func (e *Executor) readWithLineRange(secure string, offset, limit int, lineNumbers bool, header string) (string, error) {
 	start := 1
 	if offset > 0 {
 		start = offset
@@ -273,15 +275,19 @@ func (e *Executor) ReadFileRange(path string, offset, limit int, search string, 
 	totalLines := lineNum
 	if totalLines == 0 {
 		msg := fmt.Sprintf("File has %d lines; offset %d is past end.", totalLines, start)
-		if header.Len() > 0 {
-			return header.String() + msg, nil
+		if header != "" {
+			return header + msg, nil
 		}
 		return msg, nil
 	}
 
 	end := start + len(selected) - 1
+	var hdr strings.Builder
+	if header != "" {
+		hdr.WriteString(header)
+	}
 	if offset == 0 && limit == 0 && totalLines > readFileMaxLines {
-		header.WriteString(fmt.Sprintf("Warning: file has %d lines; showing first %d. Use offset/limit for more.\n", totalLines, readFileMaxLines))
+		hdr.WriteString(fmt.Sprintf("Warning: file has %d lines; showing first %d. Use offset/limit for more.\n", totalLines, readFileMaxLines))
 	}
 
 	body := strings.Join(selected, "\n")
@@ -289,10 +295,10 @@ func (e *Executor) ReadFileRange(path string, offset, limit int, search string, 
 		body = formatWithLineNumbers(selected, start)
 	}
 	if len(selected) > 0 && (end < totalLines || start > 1) {
-		header.WriteString(fmt.Sprintf("Lines %d-%d of %d\n", start, end, totalLines))
+		hdr.WriteString(fmt.Sprintf("Lines %d-%d of %d\n", start, end, totalLines))
 	}
-	if header.Len() > 0 {
-		return header.String() + body, nil
+	if hdr.Len() > 0 {
+		return hdr.String() + body, nil
 	}
 	return body, nil
 }

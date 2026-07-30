@@ -159,6 +159,20 @@ func parseYAMLFrontMatter(yamlText string) (FileConfig, error) {
 		cfg.Keys[k] = struct{}{}
 	}
 
+	if err := parseCoreConfigFields(raw, &cfg); err != nil {
+		return FileConfig{}, err
+	}
+	if err := parseRuntimeConfigFields(raw, &cfg); err != nil {
+		return FileConfig{}, err
+	}
+	if err := parseWebAndToolFields(raw, &cfg); err != nil {
+		return FileConfig{}, err
+	}
+
+	return cfg, nil
+}
+
+func parseCoreConfigFields(raw map[string]interface{}, cfg *FileConfig) error {
 	if v, ok := raw["openai_api_key"]; ok {
 		cfg.OpenAIAPIKey = asString(v)
 	}
@@ -174,38 +188,42 @@ func parseYAMLFrontMatter(yamlText string) (FileConfig, error) {
 	if v, ok := raw["context_limit"]; ok {
 		n, err := asInt(v)
 		if err != nil {
-			return FileConfig{}, fmt.Errorf("context_limit: %w", err)
+			return fmt.Errorf("context_limit: %w", err)
 		}
 		cfg.ContextLimit = n
 	}
 	if v, ok := raw["compact_threshold"]; ok {
 		f, err := asFloat(v)
 		if err != nil {
-			return FileConfig{}, fmt.Errorf("compact_threshold: %w", err)
+			return fmt.Errorf("compact_threshold: %w", err)
 		}
 		cfg.CompactThreshold = f
 	}
 	if v, ok := raw["keep_recent_messages"]; ok {
 		n, err := asInt(v)
 		if err != nil {
-			return FileConfig{}, fmt.Errorf("keep_recent_messages: %w", err)
+			return fmt.Errorf("keep_recent_messages: %w", err)
 		}
 		cfg.KeepRecentMessages = n
 	}
 	if v, ok := raw["max_tool_result_bytes"]; ok {
 		n, err := asInt(v)
 		if err != nil {
-			return FileConfig{}, fmt.Errorf("max_tool_result_bytes: %w", err)
+			return fmt.Errorf("max_tool_result_bytes: %w", err)
 		}
 		cfg.MaxToolResultBytes = n
 	}
 	if v, ok := raw["compact_reserve_tokens"]; ok {
 		n, err := asInt(v)
 		if err != nil {
-			return FileConfig{}, fmt.Errorf("compact_reserve_tokens: %w", err)
+			return fmt.Errorf("compact_reserve_tokens: %w", err)
 		}
 		cfg.CompactReserveTokens = n
 	}
+	return nil
+}
+
+func parseRuntimeConfigFields(raw map[string]interface{}, cfg *FileConfig) error {
 	if v, ok := raw["command_safety"]; ok {
 		cfg.CommandSafety = asString(v)
 	}
@@ -224,7 +242,7 @@ func parseYAMLFrontMatter(yamlText string) (FileConfig, error) {
 	if v, ok := raw["cli_verbose"]; ok {
 		b, err := asBool(v)
 		if err != nil {
-			return FileConfig{}, fmt.Errorf("cli_verbose: %w", err)
+			return fmt.Errorf("cli_verbose: %w", err)
 		}
 		cfg.CLIVerbose = b
 	}
@@ -240,14 +258,36 @@ func parseYAMLFrontMatter(yamlText string) (FileConfig, error) {
 	if v, ok := raw["debug_compare_messages"]; ok {
 		b, err := asBool(v)
 		if err != nil {
-			return FileConfig{}, fmt.Errorf("debug_compare_messages: %w", err)
+			return fmt.Errorf("debug_compare_messages: %w", err)
 		}
 		cfg.DebugCompareMessages = b
 	}
+	if v, ok := raw["session_max_count"]; ok {
+		if n, err := asInt(v); err == nil {
+			cfg.SessionMaxCount = n
+		}
+	}
+	if v, ok := raw["session_max_age_days"]; ok {
+		if n, err := asInt(v); err == nil {
+			cfg.SessionMaxAgeDays = n
+		}
+	}
+	if v, ok := raw["command_sandbox"]; ok {
+		cfg.CommandSandbox = asString(v)
+	}
+	if v, ok := raw["command_timeout_secs"]; ok {
+		if n, err := asInt(v); err == nil {
+			cfg.CommandTimeoutSecs = n
+		}
+	}
+	return nil
+}
+
+func parseWebAndToolFields(raw map[string]interface{}, cfg *FileConfig) error {
 	if v, ok := raw["mcp_servers"]; ok {
 		servers, err := parseMCPServers(v)
 		if err != nil {
-			return FileConfig{}, err
+			return err
 		}
 		cfg.MCPServers = servers
 	}
@@ -265,27 +305,6 @@ func parseYAMLFrontMatter(yamlText string) (FileConfig, error) {
 	}
 	if v, ok := raw["web_tls_key_file"]; ok {
 		cfg.WebTLSKeyFile = asString(v)
-	}
-	if v, ok := raw["session_max_count"]; ok {
-		n, err := asInt(v)
-		if err == nil {
-			cfg.SessionMaxCount = n
-		}
-	}
-	if v, ok := raw["session_max_age_days"]; ok {
-		n, err := asInt(v)
-		if err == nil {
-			cfg.SessionMaxAgeDays = n
-		}
-	}
-	if v, ok := raw["command_sandbox"]; ok {
-		cfg.CommandSandbox = asString(v)
-	}
-	if v, ok := raw["command_timeout_secs"]; ok {
-		n, err := asInt(v)
-		if err == nil {
-			cfg.CommandTimeoutSecs = n
-		}
 	}
 	if v, ok := raw["web_fetch"]; ok {
 		cfg.WebFetch = asOnOffString(v)
@@ -308,8 +327,7 @@ func parseYAMLFrontMatter(yamlText string) (FileConfig, error) {
 	if v, ok := raw["preserve_reasoning"]; ok {
 		cfg.PreserveReasoning = asOnOffString(v)
 	}
-
-	return cfg, nil
+	return nil
 }
 
 func parseMCPServers(v interface{}) ([]MCPServerEntry, error) {
