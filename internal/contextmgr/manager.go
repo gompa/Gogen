@@ -176,38 +176,8 @@ type ContextSnapshot struct {
 
 // Snapshot estimates token usage for canonical history and the LLM view.
 func (m *Manager) Snapshot(canonical, llmView []llm.Message) ContextSnapshot {
-	m.mu.RLock()
-	limit := m.Settings.ContextLimit
-	if limit <= 0 {
-		limit = 128000
-	}
-	compactAt := m.compactBudgetLocked()
-	m.mu.RUnlock()
-
-	// Compute used once then derive stored, to avoid re-tokenizing the
-	// entire canonical run twice (llmView already contains canonical plus
-	// the system-prompt prefix). The system prefix is typically one message
-	// and cheap to tokenize separately.
-	canonicalTokens := m.EstimateTokens(canonical)
-	sysTokens := 0
-	if n := len(llmView) - len(canonical); n > 0 {
-		sysTokens = m.EstimateTokens(llmView[:n])
-	}
-	used := canonicalTokens + sysTokens
-	stored := canonicalTokens
-	snap := ContextSnapshot{
-		Limit:         limit,
-		Used:          used,
-		Stored:        stored,
-		CompactAt:     compactAt,
-		MessageCount:  len(canonical),
-		ToolTruncated: hasTruncatedToolResults(canonical),
-		NearCompact:   used >= compactAt,
-	}
-	if limit > 0 {
-		snap.Percent = float64(used) / float64(limit)
-	}
-	return snap
+	stored := m.EstimateTokens(canonical)
+	return m.snapshot(canonical, llmView, stored)
 }
 
 // SnapshotWithCounts is like Snapshot but uses pre-computed token counts for
@@ -216,6 +186,16 @@ func (m *Manager) Snapshot(canonical, llmView []llm.Message) ContextSnapshot {
 // is significantly faster for large restored sessions where the token counts
 // were persisted alongside the messages.
 func (m *Manager) SnapshotWithCounts(canonical, llmView []llm.Message, canonicalCounts []int) ContextSnapshot {
+	stored := 0
+	for _, c := range canonicalCounts {
+		stored += c
+	}
+	return m.snapshot(canonical, llmView, stored)
+}
+
+// snapshot is the shared implementation for Snapshot and SnapshotWithCounts.
+// stored is the pre-computed token count for canonical messages.
+func (m *Manager) snapshot(canonical, llmView []llm.Message, stored int) ContextSnapshot {
 	m.mu.RLock()
 	limit := m.Settings.ContextLimit
 	if limit <= 0 {
@@ -223,12 +203,6 @@ func (m *Manager) SnapshotWithCounts(canonical, llmView []llm.Message, canonical
 	}
 	compactAt := m.compactBudgetLocked()
 	m.mu.RUnlock()
-
-	// Sum pre-computed counts for canonical messages.
-	stored := 0
-	for _, c := range canonicalCounts {
-		stored += c
-	}
 
 	// Estimate tokens for system prompt / enrichment messages (the prefix
 	// in llmView that is not part of canonical). This is typically 1 message
@@ -239,13 +213,18 @@ func (m *Manager) SnapshotWithCounts(canonical, llmView []llm.Message, canonical
 	}
 	used := stored + sysTokens
 
+	return m.buildSnapshot(limit, compactAt, stored, used, len(canonical), hasTruncatedToolResults(canonical))
+}
+
+// buildSnapshot creates a ContextSnapshot from computed values.
+func (m *Manager) buildSnapshot(limit, compactAt, stored, used, msgCount int, truncated bool) ContextSnapshot {
 	snap := ContextSnapshot{
 		Limit:         limit,
 		Used:          used,
 		Stored:        stored,
 		CompactAt:     compactAt,
-		MessageCount:  len(canonical),
-		ToolTruncated: hasTruncatedToolResults(canonical),
+		MessageCount:  msgCount,
+		ToolTruncated: truncated,
 		NearCompact:   used >= compactAt,
 	}
 	if limit > 0 {

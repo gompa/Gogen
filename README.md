@@ -62,7 +62,7 @@ With a workspace directory:
 OPENAI_API_KEY=sk-... ./gogen /path/to/project
 ```
 
-**Web mode** (browser UI on `:8080`):
+**Web mode** (browser UI on `:8081`):
 
 ```bash
 OPENAI_API_KEY=sk-... ./gogen --web
@@ -72,7 +72,7 @@ Non-loopback binds (e.g. `--host 0.0.0.0`) require a token:
 
 ```bash
 GOGEN_WEB_TOKEN=secret ./gogen --web --host 0.0.0.0
-# then open http://host:8080/?token=secret
+# then open http://host:8081/?token=secret
 ```
 Global mode (use `~/.config/gogen/` instead of project `.gogen/`):
 
@@ -84,7 +84,7 @@ GOGEN_MODE=global ./gogen
 
 | Flag | Description |
 |------|-------------|
-| `--web` | Run in web mode (listens on `:8080`) |
+| `--web` | Run in web mode (listens on `:8081`) |
 | `--host <host>` | Listen host for `--web` (e.g. `0.0.0.0`; default `127.0.0.1`; also `GOGEN_WEB_BIND` for host:port) |
 | `--dir <path>` | Set the working directory |
 | `--global` | Ignore project `.gogen/`, use `~/.config/gogen/` instead |

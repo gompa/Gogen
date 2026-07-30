@@ -19,105 +19,104 @@ const (
 	ThinkingMax     ThinkingLevel = "max"
 )
 
+// thinkingInfo holds display and parsing metadata for a thinking level.
+type thinkingInfo struct {
+	label      string
+	shortLabel string
+	details    string
+	aliases    []string // parse aliases (lowercase)
+}
+
+// thinkingLevels is the single source of truth for all level metadata.
+var thinkingLevels = map[ThinkingLevel]thinkingInfo{
+	ThinkingOff: {
+		label:      "Off",
+		shortLabel: "",
+		details:    "No reasoning",
+		aliases:    []string{"off", "0"},
+	},
+	ThinkingMinimal: {
+		label:      "Minimal",
+		shortLabel: "Mi",
+		details:    "Very brief reasoning",
+		aliases:    []string{"minimal", "min"},
+	},
+	ThinkingLow: {
+		label:      "Low",
+		shortLabel: "L",
+		details:    "Light reasoning",
+		aliases:    []string{"low"},
+	},
+	ThinkingMedium: {
+		label:      "Medium",
+		shortLabel: "M",
+		details:    "Moderate reasoning",
+		aliases:    []string{"medium", "med"},
+	},
+	ThinkingHigh: {
+		label:      "High",
+		shortLabel: "H",
+		details:    "Deep reasoning",
+		aliases:    []string{"high"},
+	},
+	ThinkingXHigh: {
+		label:      "Extra high",
+		shortLabel: "XH",
+		details:    "Extra-deep reasoning",
+		aliases:    []string{"xhigh", "x-high"},
+	},
+	ThinkingMax: {
+		label:      "Maximum",
+		shortLabel: "Max",
+		details:    "Maximum reasoning",
+		aliases:    []string{"max"},
+	},
+}
+
 // ValidThinkingLevels returns all supported thinking levels.
 func ValidThinkingLevels() []ThinkingLevel {
-	return []ThinkingLevel{
-		ThinkingOff,
-		ThinkingMinimal,
-		ThinkingLow,
-		ThinkingMedium,
-		ThinkingHigh,
-		ThinkingXHigh,
-		ThinkingMax,
+	all := make([]ThinkingLevel, 0, len(thinkingLevels))
+	for level := range thinkingLevels {
+		all = append(all, level)
 	}
+	return all
 }
 
 // ParseThinkingLevel parses a thinking level string. Returns false on unknown input.
 func ParseThinkingLevel(s string) (ThinkingLevel, bool) {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "off", "0":
-		return ThinkingOff, true
-	case "minimal", "min":
-		return ThinkingMinimal, true
-	case "low":
-		return ThinkingLow, true
-	case "medium", "med":
-		return ThinkingMedium, true
-	case "high":
-		return ThinkingHigh, true
-	case "xhigh", "x-high":
-		return ThinkingXHigh, true
-	case "max":
-		return ThinkingMax, true
-	default:
-		return ThinkingOff, false
+	normalized := strings.ToLower(strings.TrimSpace(s))
+	for level, info := range thinkingLevels {
+		for _, alias := range info.aliases {
+			if normalized == alias {
+				return level, true
+			}
+		}
 	}
+	return ThinkingOff, false
 }
 
 // ShortLabel returns a compact label for display in toolbars (empty for "off").
 func (l ThinkingLevel) ShortLabel() string {
-	switch l {
-	case ThinkingOff:
-		return ""
-	case ThinkingMinimal:
-		return "Mi"
-	case ThinkingLow:
-		return "L"
-	case ThinkingMedium:
-		return "M"
-	case ThinkingHigh:
-		return "H"
-	case ThinkingXHigh:
-		return "XH"
-	case ThinkingMax:
-		return "Max"
-	default:
-		return ""
+	if info, ok := thinkingLevels[l]; ok {
+		return info.shortLabel
 	}
+	return ""
 }
 
 // Label returns a user-friendly label.
 func (l ThinkingLevel) Label() string {
-	switch l {
-	case ThinkingOff:
-		return "Off"
-	case ThinkingMinimal:
-		return "Minimal"
-	case ThinkingLow:
-		return "Low"
-	case ThinkingMedium:
-		return "Medium"
-	case ThinkingHigh:
-		return "High"
-	case ThinkingXHigh:
-		return "Extra high"
-	case ThinkingMax:
-		return "Maximum"
-	default:
-		return "Off"
+	if info, ok := thinkingLevels[l]; ok {
+		return info.label
 	}
+	return "Off"
 }
 
 // Details returns a longer description of the thinking level.
 func (l ThinkingLevel) Details() string {
-	switch l {
-	case ThinkingOff:
-		return "No reasoning"
-	case ThinkingMinimal:
-		return "Very brief reasoning"
-	case ThinkingLow:
-		return "Light reasoning"
-	case ThinkingMedium:
-		return "Moderate reasoning"
-	case ThinkingHigh:
-		return "Deep reasoning"
-	case ThinkingXHigh:
-		return "Extra-deep reasoning"
-	case ThinkingMax:
-		return "Maximum reasoning"
-	default:
-		return ""
+	if info, ok := thinkingLevels[l]; ok {
+		return info.details
 	}
+	return ""
 }
 
 // SetThinkingLevel sets the agent's thinking level and persists the session.
