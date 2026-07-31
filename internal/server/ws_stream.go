@@ -25,20 +25,31 @@ type wsConnStream struct {
 // cancelInFlight stops the entire stream: cancels the outer context (which
 // propagates to the inner LLM context) and waits for the stream goroutine
 // to finish its deferred cleanup.
+//
+// If the stream does not exit within wsStreamDrainWait, errCh is kept so a
+// later cancel/message can keep waiting. Clearing it on timeout made the next
+// tryAcquireTurn fail with "agent is busy" while a stuck command still held
+// turnMu.
 func (s *wsConnStream) cancelInFlight() {
 	s.mu.Lock()
-	if s.cancel == nil {
-		s.mu.Unlock()
+	if s.cancel != nil {
+		s.cancel()
+		s.cancel = nil
+		s.llmCancel = nil
+	}
+	prevErr := s.errCh
+	s.mu.Unlock()
+	if prevErr == nil {
 		return
 	}
-	s.cancel()
-	s.llmCancel = nil
-	prevErr := s.errCh
-	s.cancel = nil
-	s.errCh = nil
-	s.mu.Unlock()
 	// Wait for cancel repair (appendCanceledToolResults + FlushSession).
-	drainStreamErr(prevErr)
+	if drainStreamErr(prevErr) {
+		s.mu.Lock()
+		if s.errCh == prevErr {
+			s.errCh = nil
+		}
+		s.mu.Unlock()
+	}
 }
 
 // close cancels only the inner LLM context so StreamProcessInput returns

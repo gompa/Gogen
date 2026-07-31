@@ -1,0 +1,38 @@
+# --- Binaries ---
+/gogen
+/gogen-nocgo
+/gogenold
+/gogen-debug
+/gogen-test
+/gogen_test
+
+# --- Profiling data ---
+*.prof
+
+# --- Scratch patch files ---
+*.patch
+
+# --- Snapshot files ---
+*.fxsnapshot
+
+# --- Diff scratch files ---
+.diff_output.txt
+
+# --- Temporary planning / review docs ---
+/PLAN.md
+/CODE_REVIEW*.md
+/CODE_DUPLICATION_PLAN.md
+/LOGIC_ISSUES_PLAN.md
+/STREAMING_JUMPING_ANALYSIS.md
+
+# --- Project configuration ---
+# .gogen/ directory: track guidelines (.md) and config template, ignore local artifacts
+/.gogen/gogen.conf
+/.gogen/models.json
+/.gogen/sessions/
+/.gogen/todos.json.migrated
+
+# --- Editor / IDE ---
+*.swp
+*.swo
+*~

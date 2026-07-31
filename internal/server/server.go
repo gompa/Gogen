@@ -50,14 +50,18 @@ const (
 	wsStreamDrainWait = 2 * time.Second
 )
 
-func drainStreamErr(ch chan error) {
+// drainStreamErr waits for the stream goroutine to signal exit.
+// Returns true if the signal arrived, false on timeout (caller should keep ch).
+func drainStreamErr(ch chan error) bool {
 	if ch == nil {
-		return
+		return true
 	}
 	select {
 	case <-ch:
+		return true
 	case <-time.After(wsStreamDrainWait):
 		log.Printf("warning: timed out waiting for stream goroutine to exit")
+		return false
 	}
 }
 
@@ -644,8 +648,6 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 
 	for msg := range incoming {
 		switch msg.Type {
-		case "delete_approval_response":
-			session.completeApproval(msg.ApprovalID, msg.Approved)
 		case "fs_list", "fs_read", "fs_search", "git_status", "git_file_diff":
 			s.handleFSReadMessage(ws, r.Context(), msg)
 		case "fs_write", "fs_replace":
@@ -864,8 +866,12 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, stream *wsConn
 	}
 
 	if !s.tryAcquireTurn(wsTurnAcquireWait) {
-		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
-		return
+		// Cancel may have timed out while a tool was still exiting; wait once more.
+		stream.cancelInFlight()
+		if !s.tryAcquireTurn(wsStreamDrainWait) {
+			_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+			return
+		}
 	}
 
 	var modeOut string

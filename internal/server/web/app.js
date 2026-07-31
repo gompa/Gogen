@@ -34,15 +34,8 @@
         const dirInput = document.getElementById('working-dir-input');
         const setDirBtn = document.getElementById('set-dir-btn');
         const connIndicator = document.getElementById('conn-indicator');
-        const modelInfoDiv = document.getElementById('model-info');
-        const modelSelect = document.getElementById('model-select');
-        const contextInfoDiv = document.getElementById('context-info');
-        const contextText = document.getElementById('context-text');
-        const contextBar = document.getElementById('context-bar');
         const sessionInfoDiv = document.getElementById('session-info');
         const sessionListDiv = document.getElementById('session-list');
-        const modeActBtn = document.getElementById('mode-act-btn');
-        const modePlanBtn = document.getElementById('mode-plan-btn');
         let currentMode = 'act';
         const inputProgress = document.getElementById('input-progress');
         const globalModeBadge = document.getElementById('global-mode-badge');
@@ -62,7 +55,6 @@
         const tbThinkingGrid = document.getElementById('tb-thinking-grid');
         const tbModeBtn = document.getElementById('tb-mode-btn');
         const tbContextBadge = document.getElementById('tb-context-badge');
-        const composerToolbar = document.getElementById('composer-toolbar');
 
         let pendingDeleteApprovalId = null;
         let messageRawStore = new WeakMap();
@@ -235,7 +227,7 @@
             if (availableModels.length <= 1) {
                 // Fetch models if we don't have a list yet
                 modelsRequested = false;
-                ensureModelsLoaded({ showLoading: true });
+                ensureModelsLoaded();
             }
             toggleModelPopover();
         });
@@ -353,28 +345,53 @@
         }
 
         // ── Toolbar: context badge ──
+        // The badge DOM is built once and mutated in place. Per-token context
+        // estimate updates (up to ~60/s while streaming) must not recreate
+        // nodes each time.
+        let tbBadgeRing = null;
+        let tbBadgeLabel = null;
+        let tbBadgeTitle = null;
+        let tbBadgeTone = null;
+        function ensureToolbarBadgeNodes() {
+            if (tbBadgeRing) return true;
+            if (!tbContextBadge) return false;
+            tbContextBadge.innerHTML = '';
+            tbBadgeRing = document.createElement('span');
+            tbBadgeRing.className = 'ctx-ring';
+            tbBadgeLabel = document.createTextNode('');
+            tbContextBadge.appendChild(tbBadgeRing);
+            tbContextBadge.appendChild(tbBadgeLabel);
+            return true;
+        }
         function updateToolbarContext(data) {
             if (!tbContextBadge) return;
+            if (!ensureToolbarBadgeNodes()) return;
             const used = (data && data.usedTokens) || 0;
             const limit = (data && data.contextLimit) || 0;
             if (used <= 0 || limit <= 0) {
-                tbContextBadge.innerHTML = '<span class="ctx-ring"></span> —';
-                tbContextBadge.removeAttribute('data-tone');
-                tbContextBadge.title = 'Context usage unknown';
+                tbBadgeRing.style.setProperty('--ctx-pct', '0%');
+                if (tbBadgeLabel.nodeValue !== ' —') tbBadgeLabel.nodeValue = ' —';
+                const title = 'Context usage unknown';
+                if (tbBadgeTitle !== title) { tbContextBadge.title = title; tbBadgeTitle = title; }
+                const tone = '';
+                if (tbBadgeTone !== tone) {
+                    tbContextBadge.removeAttribute('data-tone');
+                    tbBadgeTone = tone;
+                }
                 return;
             }
             const pct = Math.min(100, Math.round((used / limit) * 100));
-            const ring = document.createElement('span');
-            ring.className = 'ctx-ring';
-            ring.style.setProperty('--ctx-pct', pct + '%');
-            const label = `${pct}% ${formatTokenCount(used)}/${formatTokenCount(limit)}`;
-            tbContextBadge.innerHTML = '';
-            tbContextBadge.appendChild(ring);
-            tbContextBadge.appendChild(document.createTextNode(' ' + label));
-            tbContextBadge.title = `Context: ${used.toLocaleString()} / ${limit.toLocaleString()} tokens`;
+            tbBadgeRing.style.setProperty('--ctx-pct', pct + '%');
+            const label = ` ${pct}% ${formatTokenCount(used)}/${formatTokenCount(limit)}`;
+            if (tbBadgeLabel.nodeValue !== label) tbBadgeLabel.nodeValue = label;
+            const title = `Context: ${used.toLocaleString()} / ${limit.toLocaleString()} tokens`;
+            if (tbBadgeTitle !== title) { tbContextBadge.title = title; tbBadgeTitle = title; }
             const tone = pct >= 90 ? 'danger' : pct >= 75 ? 'warning' : '';
-            if (tone) tbContextBadge.setAttribute('data-tone', tone);
-            else tbContextBadge.removeAttribute('data-tone');
+            if (tbBadgeTone !== tone) {
+                if (tone) tbContextBadge.setAttribute('data-tone', tone);
+                else tbContextBadge.removeAttribute('data-tone');
+                tbBadgeTone = tone;
+            }
         }
 
         // ── Context tooltip on toolbar badge (reuses sidebar tooltip element) ──
@@ -430,23 +447,12 @@
 
         function updateModeInfo(mode) {
             currentMode = (mode || 'act').toLowerCase();
-            modeActBtn.classList.toggle('active', currentMode === 'act');
-            modePlanBtn.classList.toggle('active', currentMode === 'plan');
             updateToolbarMode(currentMode);
         }
 
         function updateGlobalMode(isGlobal) {
             if (globalModeBadge) globalModeBadge.classList.toggle('visible', !!isGlobal);
         }
-
-        modeActBtn.onclick = () => {
-            if (!ws || ws.readyState !== WebSocket.OPEN) return;
-            ws.send(JSON.stringify({ type: 'set_mode', mode: 'act' }));
-        };
-        modePlanBtn.onclick = () => {
-            if (!ws || ws.readyState !== WebSocket.OPEN) return;
-            ws.send(JSON.stringify({ type: 'set_mode', mode: 'plan' }));
-        };
 
         function formatTokenCount(n) {
             if (!n || n <= 0) return '—';
@@ -460,28 +466,6 @@
         let currentModelPricing = null; // { input, output, cached } or null
 
         function updateModelInfo(model) {
-            if (availableModels.length > 1) {
-                modelInfoDiv.hidden = true;
-                modelInfoDiv.classList.remove('clickable');
-                modelSelect.hidden = false;
-                if (model && [...modelSelect.options].some((o) => o.value === model)) {
-                    modelSelect.value = model;
-                } else if (!model) {
-                    modelSelect.value = '';
-                }
-            } else {
-                // Catalog not loaded yet (or only one model): show the label.
-                // Keep it clickable so users can trigger a catalog fetch — the
-                // <select> stays hidden until we have options, so focus/pointer
-                // listeners on modelSelect alone never fire.
-                modelSelect.hidden = true;
-                modelInfoDiv.hidden = false;
-                modelInfoDiv.textContent = model || '—';
-                modelInfoDiv.classList.add('clickable');
-                modelInfoDiv.title = availableModels.length === 0
-                    ? 'Click to load available models'
-                    : 'Only one model available';
-            }
             // Update toolbar model button
             if (tbModelBtn) {
                 const name = model || (availableModels.length > 0 ? availableModels.find(m => m.current)?.id : null) || '—';
@@ -489,41 +473,13 @@
             }
         }
 
-        const thinkingInfoEl = document.getElementById('thinking-info');
-
         function updateThinkingInfo(level) {
-            if (!thinkingInfoEl) return;
-            const labels = { off: 'Off', minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Maximum' };
-            thinkingInfoEl.textContent = labels[level] || 'Off';
             // Update toolbar thinking chips
             renderThinkingChips(level);
         }
 
         function updateModelSelect(models, current) {
             availableModels = Array.isArray(models) ? models : [];
-            modelSelect.innerHTML = '';
-            if (availableModels.length > 1) {
-                const placeholder = document.createElement('option');
-                placeholder.value = '';
-                placeholder.disabled = true;
-                placeholder.textContent = 'Select a model…';
-                modelSelect.appendChild(placeholder);
-                for (const m of availableModels) {
-                    const opt = document.createElement('option');
-                    opt.value = m.id;
-                    opt.textContent = m.contextLimit
-                        ? `${m.id} (${formatTokenCount(m.contextLimit)})`
-                        : m.id;
-                    modelSelect.appendChild(opt);
-                }
-                const selected = current || availableModels.find((m) => m.current)?.id || '';
-                if (selected && [...modelSelect.options].some((o) => o.value === selected)) {
-                    modelSelect.value = selected;
-                    placeholder.selected = false;
-                } else {
-                    placeholder.selected = true;
-                }
-            }
             const modelId = current || availableModels.find((m) => m.current)?.id || '';
             updateModelInfo(modelId);
             // Populate toolbar model list
@@ -542,33 +498,14 @@
             if (!active || !active.inputPricePer1M) { currentModelPricing = null; }
         }
 
-        modelSelect.onchange = () => {
-            if (!ws || ws.readyState !== WebSocket.OPEN) return;
-            const id = modelSelect.value;
-            if (!id) return;
-            ws.send(JSON.stringify({ type: 'set_model', model: id }));
-        };
-
         // Fetch the model catalog lazily so it never blocks initial connect.
-        // The select is hidden until the catalog arrives, so also allow a click
-        // on the model label and a post-paint idle fetch.
         let modelsRequested = false;
-        function ensureModelsLoaded(opts) {
+        function ensureModelsLoaded() {
             if (modelsRequested) return;
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
             modelsRequested = true;
-            if (opts && opts.showLoading && availableModels.length <= 1 && !modelInfoDiv.hidden) {
-                modelInfoDiv.textContent = 'Loading models…';
-            }
             ws.send(JSON.stringify({ type: 'list_models' }));
         }
-        modelSelect.addEventListener('focus', () => ensureModelsLoaded(), { once: true });
-        modelSelect.addEventListener('pointerdown', () => ensureModelsLoaded(), { once: true });
-        modelInfoDiv.addEventListener('click', () => {
-            if (availableModels.length > 1) return;
-            modelsRequested = false;
-            ensureModelsLoaded({ showLoading: true });
-        });
 
         function updateContextInfo(data) {
             lastContextData = data || lastContextData;
@@ -579,37 +516,10 @@
                 contextLimit = limit;
                 contextEstAdded = 0;
             }
-            const source = data.usedSource === 'api' ? '' : (used > 0 ? 'estimated' : '');
 
             if (used <= 0 && limit <= 0) {
-                contextText.textContent = '—';
-                contextBar.style.width = '0%';
-                contextBar.className = '';
                 updateToolbarContext(null);
                 return;
-            }
-
-            let text = `${formatTokenCount(used)} / ${formatTokenCount(limit)}`;
-            if (limit > 0 && data.usedPercent > 0) {
-                const pct = Math.min(100, Math.round(data.usedPercent * 100));
-                text += ` (${pct}%)`;
-            }
-            if (source) text += ` · ${source}`;
-            if (data.messageCount > 0) text += `\n${data.messageCount} msgs`;
-            // near-compact & tool-truncated indicators removed to avoid context stats height oscillation
-            // causing layout jumps (used to be: if (data.nearCompact) text += '\nnear auto-compact';)
-            // if (data.toolTruncated) text += '\nTool results truncated'; — removed for same reason
-            contextText.textContent = text;
-
-            if (limit > 0 && used > 0) {
-                const pct = Math.min(100, (used / limit) * 100);
-                contextBar.style.width = `${pct}%`;
-                contextBar.className = '';
-                if (data.nearCompact || pct >= 75) contextBar.classList.add('warn');
-                if (pct >= 90) contextBar.classList.add('danger');
-            } else {
-                contextBar.style.width = '0%';
-                contextBar.className = '';
             }
             // Update toolbar context badge
             updateToolbarContext(data);
@@ -671,6 +581,8 @@
             endStream();
             currentThinkingDiv = null;
             currentThinkingSpan = null;
+            currentThinkingRaw = '';
+            thinkingRafPending = false;
             streamingToolCards = {};
             pendingToolCards = {};
             historyToolCallArgs = {};
@@ -697,7 +609,6 @@
         // only when the user returns near the bottom (or clicks the jump button).
         let stickToBottom = true;
         let ignoreScrollEvent = false;
-        let lastSmartScrollTime = 0;
         // Start with anchoring disabled while following the stream.
         messagesDiv.classList.add('no-anchor');
         let currentStreamDiv = null;
@@ -707,6 +618,9 @@
         let streamLastRender = 0;
         let currentThinkingDiv = null;
         let currentThinkingSpan = null;
+        let currentThinkingRaw = '';
+        let thinkingRafPending = false;
+        let thinkingLastRender = 0;
         let pendingToolCards = {};
         let streamingToolCards = {};
         let toolCallCounter = 0;
@@ -718,6 +632,9 @@
         let lastContextData = null;
         // Map toolCallId → args for history replay of patch_file diffs
         let historyToolCallArgs = {};
+        // True while replayHistory() rebuilds the pane; suppresses per-message
+        // smartScroll so the rebuild doesn't force O(n) layout passes.
+        let replayInProgress = false;
         // Monotonic counter for message positions (used for forking)
         let msgIdxCounter = 0;
 
@@ -749,12 +666,7 @@
                 usedPercent: contextLimit > 0 ? used / contextLimit : 0,
                 toolTruncated: false,
             });
-            // Mark estimated in the text via updateContextInfo source label
             updateContextInfo(data);
-            // Append est marker
-            if (contextText.textContent && !contextText.textContent.includes('(est.)')) {
-                contextText.textContent += ' (est.)';
-            }
         }
 
         // Collapse only when output is genuinely large (DOM / scroll cost).
@@ -863,7 +775,6 @@
         function abortInFlightUI(message) {
             finalizeThinking();
             endStream();
-            removeThinkingStatus();
             setInputProgress(null);
             // Remove waiting spinners on pending cards
             for (const id of Object.keys(pendingToolCards)) {
@@ -1231,7 +1142,6 @@
             currentStreamRaw += token;
             bumpContextEstimate(token);
             scheduleStreamRender();
-            smartScroll();
         }
 
         function showThinking() {
@@ -1250,8 +1160,10 @@
             header.appendChild(label);
             header.appendChild(toggle);
 
+            // Markdown is rendered live into this body (like the assistant
+            // stream); base size stays compact, typography comes from CSS.
             const body = document.createElement('div');
-            body.style.cssText = 'font-size:0.85em;color:var(--fg-muted);font-style:italic;white-space:pre-wrap;padding:4px 0 0 0;';
+            body.style.cssText = 'font-size:0.85em;padding:4px 0 0 0;';
 
             div.appendChild(header);
             div.appendChild(body);
@@ -1265,6 +1177,7 @@
             });
 
             smartScroll();
+            currentThinkingRaw = '';
             currentThinkingDiv = div;
             currentThinkingSpan = body;
         }
@@ -1276,9 +1189,35 @@
             if (!currentThinkingSpan) {
                 showThinking();
             }
-            currentThinkingSpan.textContent += token;
+            currentThinkingRaw += token;
             bumpContextEstimate(token);
+            scheduleThinkingRender();
+        }
+
+        function flushThinkingRender() {
+            thinkingRafPending = false;
+            thinkingLastRender = performance.now();
+            if (!currentThinkingSpan) return;
+            // Live markdown render of the reasoning content, exactly like the
+            // assistant stream (same cadence, same per-flush colorize). The
+            // colorized and plain code states are height-identical, so the
+            // pinned scroll stays stable while colors apply mid-stream.
+            setMessageMarkdown(currentThinkingSpan, currentThinkingRaw);
             smartScroll();
+        }
+
+        function scheduleThinkingRender() {
+            // Coalesce thinking-token arrivals into a single paint-aligned
+            // render, exactly like the assistant stream (STREAM_RENDER_INTERVAL).
+            if (thinkingRafPending) return;
+            const elapsed = performance.now() - thinkingLastRender;
+            if (elapsed >= STREAM_RENDER_INTERVAL) {
+                thinkingRafPending = true;
+                requestAnimationFrame(() => {
+                    if (!thinkingRafPending) return;
+                    flushThinkingRender();
+                });
+            }
         }
 
         // --- Input-area progress indicator (replaces textarea during streaming) ---
@@ -1312,19 +1251,17 @@
             }
         }
 
-        function removeThinkingStatus() {
-            const el = document.getElementById('status-thinking');
-            if (el) el.remove();
-        }
-
         function finalizeThinking() {
-            removeThinkingStatus();
             if (!currentThinkingDiv) return;
+            // Render any tokens that arrived since the last live flush so the
+            // final card shows the complete reasoning text.
+            flushThinkingRender();
             const div = currentThinkingDiv;
-            const body = currentThinkingSpan;
-            const content = (body ? body.textContent : '').trim();
+            const content = (currentThinkingRaw || '').trim();
             currentThinkingDiv = null;
             currentThinkingSpan = null;
+            currentThinkingRaw = '';
+            thinkingRafPending = false;
             if (!content) {
                 div.remove();
                 return;
@@ -1366,6 +1303,10 @@
             if (!document.hidden && currentStreamDiv && streamRafPending) {
                 streamRafPending = false;
                 scheduleStreamRender();
+            }
+            if (!document.hidden && currentThinkingSpan && thinkingRafPending) {
+                thinkingRafPending = false;
+                scheduleThinkingRender();
             }
         });
 
@@ -1531,15 +1472,58 @@
                 args: args || {},
                 rawArgs: '',
                 pendingDiff: '',
+                diffComplete: false,
+                finalized: false,
                 rafScheduled: false,
-                scheduleDiffUpdate(text) {
-                    this.pendingDiff = text || '';
-                    updateDiffFallback(this.monacoHost, this.pendingDiff);
+                lastFallbackText: '',
+                scheduleFrameUpdate() {
+                    // Coalesce per-delta tool-arg updates into one pass per
+                    // frame: diff extraction, fallback/Monaco update, compact
+                    // header, and scroll all run at most once per frame.
                     if (this.rafScheduled) return;
                     this.rafScheduled = true;
                     requestAnimationFrame(() => {
                         this.rafScheduled = false;
-                        if (this.monacoEditor) updateDiffEditor(this.monacoEditor, this.pendingDiff);
+                        if (this.finalized || !this.card.isConnected) return;
+                        if (this.monacoHost) {
+                            let text;
+                            if (this.diffComplete) {
+                                // Diff value is final once its closing quote
+                                // was seen; don't re-extract it every frame.
+                                text = this.pendingDiff || '';
+                            } else {
+                                const extracted = extractDiffValue(this.rawArgs);
+                                if (extracted.complete) {
+                                    this.diffComplete = true;
+                                    this.pendingDiff = extracted.value;
+                                }
+                                text = extracted.ok ? extracted.value : (this.pendingDiff || '');
+                            }
+                            if (!this.monacoEditor) {
+                                // Fallback <pre> is visible only until Monaco
+                                // paints; create it on first sight and then
+                                // only touch it when the text actually changes.
+                                const pre = this.monacoHost.querySelector('.diff-fallback');
+                                if (!pre || this.lastFallbackText !== text) {
+                                    this.lastFallbackText = text;
+                                    updateDiffFallback(this.monacoHost, text);
+                                }
+                            } else {
+                                updateDiffEditor(this.monacoEditor, text);
+                            }
+                        } else if (this.argsStream) {
+                            this.argsStream.textContent = this.rawArgs;
+                        }
+                        // Compact the header once the JSON is parseable enough.
+                        const compact = formatArgsCompact(this.rawArgs);
+                        if (compact && this.toolArgs && this.toolArgs.textContent !== compact) {
+                            this.toolArgs.textContent = compact;
+                            if (this.argsStream) {
+                                this.argsStream.remove();
+                                this.argsStream = null;
+                            }
+                        }
+                        smartScroll();
                     });
                 },
                 setCollapsed: (c) => { toggle.classList.toggle('collapsed', c); },
@@ -1614,34 +1598,20 @@
             bumpContextEstimate(argsDelta);
 
             const tool = cardInfo.toolName;
-            const extracted = extractDiffValue(cardInfo.rawArgs);
-            if (tool === 'patch_file' || extracted.ok) {
+            if (cardInfo.monacoHost) {
+                // Patch viewer already exists (patch_file cards get one at
+                // start): all per-delta work is coalesced into one rAF pass.
                 cardInfo.toolName = 'patch_file';
-                if (extracted.ok) {
-                    ensurePatchViewer(cardInfo, extracted.value).catch(() => {});
-                } else {
-                    ensurePatchViewer(cardInfo, cardInfo.pendingDiff || '').catch(() => {});
+            } else {
+                // Not a patch viewer yet. Pre-upgrade args are short, so a
+                // precise "diff" key check per delta is cheap.
+                const extracted = extractDiffValue(cardInfo.rawArgs);
+                if (tool === 'patch_file' || extracted.ok) {
+                    cardInfo.toolName = 'patch_file';
+                    ensurePatchViewer(cardInfo, extracted.ok ? extracted.value : (cardInfo.pendingDiff || '')).catch(() => {});
                 }
-                // Compact non-diff keys in the header once JSON is parseable.
-                const compact = formatArgsCompact(cardInfo.rawArgs);
-                if (compact) cardInfo.toolArgs.textContent = compact;
-                smartScroll();
-                return;
             }
-
-            // Non-patch tools: show compact args only when JSON is complete enough.
-            const compact = formatArgsCompact(cardInfo.rawArgs);
-            if (compact) {
-                cardInfo.toolArgs.textContent = compact;
-                if (cardInfo.argsStream) {
-                    cardInfo.argsStream.remove();
-                    cardInfo.argsStream = null;
-                }
-            } else if (cardInfo.argsStream) {
-                // Show accumulating raw args so the user sees live progress
-                cardInfo.argsStream.textContent = cardInfo.rawArgs;
-            }
-            smartScroll();
+            cardInfo.scheduleFrameUpdate();
         }
 
         function finalizeStreamingToolCard(index, id, name, args) {
@@ -1667,6 +1637,7 @@
                 }
             }
 
+            cardInfo.finalized = true;
             cardInfo.toolName = name || cardInfo.toolName;
             cardInfo.args = args || cardInfo.args || {};
             if (id) {
@@ -1682,6 +1653,7 @@
 
         async function updateToolCardWithResult(cardInfo, result, success, truncated, toolName) {
             const { card, waiting } = cardInfo;
+            cardInfo.finalized = true;
             if (waiting) waiting.remove();
             cardInfo.waiting = null;
 
@@ -1730,6 +1702,17 @@
             // Session/history loads should always land at the bottom.
             stickToBottom = true;
             historyToolCallArgs = {};
+            // Self-contained: a history snapshot replaces the whole pane, so
+            // reset leftover tool-card state rather than relying on the caller
+            // having run clearChat() first.
+            streamingToolCards = {};
+            pendingToolCards = {};
+            toolsStartedThisTurn = false;
+            // Suppress per-message smartScroll while rebuilding; the final
+            // pinToBottom() below does a single scroll pass instead of O(n)
+            // forced layouts. The history handler's error fallback also resets
+            // this so a failed replay still scrolls while re-appending.
+            replayInProgress = true;
             function msgDate(createdAt) {
                 return createdAt ? new Date(createdAt) : new Date();
             }
@@ -1752,8 +1735,9 @@
                         header.appendChild(label);
                         header.appendChild(toggle);
                         const body = document.createElement('div');
-                        body.style.cssText = 'font-size:0.85em;color:var(--fg-muted);font-style:italic;white-space:pre-wrap;padding:4px 0 0 0;';
-                        body.textContent = h.reasoning;
+                        body.style.cssText = 'font-size:0.85em;padding:4px 0 0 0;';
+                        // Same live-style markdown render as streaming thinking.
+                        setMessageMarkdown(body, h.reasoning || '');
                         div.appendChild(header);
                         div.appendChild(body);
                         header.addEventListener('click', () => {
@@ -1768,7 +1752,10 @@
                         messagesDiv.appendChild(div);
                         smartScroll();
                     }
-                    if (h.content) appendMessageAtTime('assistant', h.content, msgDate(h.createdAt), h.index);
+                    // Render refusal text through the normal assistant bubble
+                    // when there is no content (OpenAI-style refusals).
+                    const assistantText = h.content || h.refusal;
+                    if (assistantText) appendMessageAtTime('assistant', assistantText, msgDate(h.createdAt), h.index);
                     if (Array.isArray(h.toolCalls)) {
                         for (const tc of h.toolCalls) {
                             historyToolCallArgs[tc.id] = tc.args || {};
@@ -1801,6 +1788,7 @@
                     await updateToolCardWithResult(cardInfo, h.content || '', success, false, cardInfo.toolName);
                 }
             }
+            replayInProgress = false;
             // Pin twice: once immediately, then again after a frame to catch
             // late DOM mutations (Monaco colorization, image loads, etc.).
             pinToBottom();
@@ -1828,15 +1816,11 @@
                 // keep a stale transcript. Connection status lives in the
                 // indicator, not as chat system messages.
                 clearChat();
-                // Reset the lazy model-catalog guard so a fresh connection can
-                // fetch on next interaction; re-arm the one-shot listeners.
+                // Reset the lazy model-catalog guard so a fresh connection can fetch again.
                 modelsRequested = false;
-                modelSelect.addEventListener('focus', () => ensureModelsLoaded(), { once: true });
-                modelSelect.addEventListener('pointerdown', () => ensureModelsLoaded(), { once: true });
                 // Only request the cheap, local session list eagerly. The
                 // model catalog is a remote /v1/models call that can dominate
-                // startup latency, so fetch it after first paint (idle) and
-                // also on click of the model label / select.
+                // startup latency, so fetch it after first paint (idle).
                 ws.send(JSON.stringify({ type: 'list_sessions' }));
                 const scheduleModels = window.requestIdleCallback
                     || ((fn) => setTimeout(fn, 200));
@@ -2018,6 +2002,9 @@
                     if (data.history && data.history.length) {
                         replayHistory(data.history).then(afterHistory).catch((err) => {
                             console.warn('history replay failed', err);
+                            // Ensure the replay scroll-suppression flag is off
+                            // so the fallback re-append below scrolls normally.
+                            replayInProgress = false;
                             for (const h of data.history) {
                                 if (h.role === 'user' || h.role === 'assistant') {
                                     if (h.content) {
@@ -2525,8 +2512,11 @@
 
         // Unpin as soon as the user scrolls up — don't wait for >120px distance,
         // or streaming smartScroll will yank them back before they escape.
+        // Only unpin when there is actually content to scroll: a non-scrollable
+        // pane can't fire a scroll event to re-pin, leaving the button stuck.
+        const messagesScrollable = () => messagesDiv.scrollHeight > messagesDiv.clientHeight;
         messagesDiv.addEventListener('wheel', (e) => {
-            if (e.deltaY < 0) unpinFromBottom();
+            if (e.deltaY < 0 && messagesScrollable()) unpinFromBottom();
         }, { passive: true });
         messagesDiv.addEventListener('touchstart', () => {
             // Touch scroll direction is known on touchmove; mark intent on any
@@ -2538,12 +2528,12 @@
             if (y == null) return;
             if (messagesDiv._touchY != null && y > messagesDiv._touchY + 2) {
                 // Finger moved down → content scrolls up
-                unpinFromBottom();
+                if (messagesScrollable()) unpinFromBottom();
             }
             messagesDiv._touchY = y;
         }, { passive: true });
         messagesDiv.addEventListener('keydown', (e) => {
-            if (e.key === 'ArrowUp' || e.key === 'PageUp' || e.key === 'Home') unpinFromBottom();
+            if ((e.key === 'ArrowUp' || e.key === 'PageUp' || e.key === 'Home') && messagesScrollable()) unpinFromBottom();
         });
 
         // Throttle scroll handler to rAF to avoid layout thrashing during streaming.
@@ -2553,11 +2543,11 @@
             _scrollPending = true;
             requestAnimationFrame(() => {
                 _scrollPending = false;
+                // Programmatic smartScroll()/pinToBottom() set ignoreScrollEvent
+                // and defer the reset by one frame, so their own scroll events
+                // are skipped here. User-initiated scrolls (wheel, trackpad,
+                // scrollbar drag) reach this point with the flag clear.
                 if (ignoreScrollEvent) return;
-                // Skip if a programmatic smartScroll() happened recently —
-                // the DOM may have grown since the scroll, making the
-                // distance check unreliable (causes false unpin during streaming).
-                if (performance.now() - lastSmartScrollTime < 100) return;
                 const d = distanceFromBottom();
                 if (d > NEAR_BOTTOM_PX) {
                     // Clearly away from bottom (scrollbar drag, etc.)
@@ -2570,32 +2560,71 @@
                 }
                 // 8 < d <= NEAR_BOTTOM_PX: leave stickToBottom alone so a small
                 // upward scroll after wheel-unpin is not immediately re-pinned.
-                scrollBottomBtn.classList.toggle('visible', !stickToBottom);
+                updateScrollBottomBtn();
             });
         });
         scrollBottomBtn.addEventListener('click', () => {
             pinToBottom();
         });
 
-        // Async code colorization changes DOM height after we've already scrolled.
-        // Re-adjust if we're still pinned to the bottom.
-        window.addEventListener('gogen-colorized', () => {
-            if (stickToBottom) {
-                smartScroll();
-            }
-        });
+        // Async code colorization, image/font loads, and layout resizes can grow
+        // the DOM after we've already scrolled. Re-adjust when pinned, coalesced
+        // to one rAF pass so bursts of events don't force repeated layouts.
+        let _repinRafPending = false;
+        function scheduleRepinIfPinned() {
+            if (!stickToBottom || _repinRafPending) return;
+            _repinRafPending = true;
+            requestAnimationFrame(() => {
+                _repinRafPending = false;
+                if (stickToBottom) smartScroll();
+            });
+        }
+        window.addEventListener('gogen-colorized', scheduleRepinIfPinned);
+
+        // <img> load doesn't bubble, so listen in the capture phase.
+        messagesDiv.addEventListener('load', (e) => {
+            if (e.target && e.target.tagName === 'IMG') scheduleRepinIfPinned();
+        }, true);
+        if (document.fonts && document.fonts.ready) {
+            document.fonts.ready.then(() => scheduleRepinIfPinned());
+        }
+        if (typeof ResizeObserver !== 'undefined') {
+            // Fires when #messages' visible box changes (window/sidebar/composer
+            // resize). scrollHeight growth is content, not the box, so the
+            // streaming / colorize / image / font paths above cover that case.
+            new ResizeObserver(() => {
+                if (stickToBottom) scheduleRepinIfPinned();
+                else updateScrollBottomBtn();
+            }).observe(messagesDiv);
+        }
 
         // Auto-scroll only while stickToBottom is set (user hasn't scrolled away).
         // The immediate scrollTop gives low-latency follow during streaming
         // (each token triggers smartScroll).  The gogen-colorized event
-        // re-invokes smartScroll after Monaco finishes coloring, so we do
-        // NOT need a duplicate rAF double-check here.
+        // re-invokes smartScroll after Monaco finishes coloring.
+        let _smartScrollRafPending = false;
         function smartScroll() {
-            if (!stickToBottom) return;
+            if (!stickToBottom || replayInProgress) return;
+            // Suppress the scroll event generated by this programmatic scroll.
+            // The flag must survive until that event fires, so reset it on the
+            // next frame (scroll events are dispatched as tasks before the next
+            // rendering update's rAF callbacks run).
             ignoreScrollEvent = true;
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
-            lastSmartScrollTime = performance.now();
-            ignoreScrollEvent = false;
+            requestAnimationFrame(() => { ignoreScrollEvent = false; });
+            // Late layout (async Monaco mounting, syntax highlighting, image
+            // or font loads, composer height changes) can grow the DOM after
+            // the synchronous scroll above. Re-check on the next frame so the
+            // bottom stays pinned even if no other event arrives afterwards.
+            if (_smartScrollRafPending) return;
+            _smartScrollRafPending = true;
+            requestAnimationFrame(() => {
+                _smartScrollRafPending = false;
+                if (!stickToBottom || replayInProgress) return;
+                ignoreScrollEvent = true;
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                requestAnimationFrame(() => { ignoreScrollEvent = false; });
+            });
         }
 
         // === Task 4: Collapsible sidebar toggle ===
@@ -2681,25 +2710,36 @@
         // === Task 10: Page title updates ===
         const baseTitle = 'GoGen AI Agent';
         function updateTitle(status) {
+            let title;
             if (status === 'thinking' || status === 'streaming') {
-                document.title = `⏳ ${baseTitle}`;
+                title = `⏳ ${baseTitle}`;
             } else if (status === 'disconnected') {
-                document.title = `🔴 ${baseTitle}`;
+                title = `🔴 ${baseTitle}`;
             } else {
-                document.title = baseTitle;
+                title = baseTitle;
             }
+            // Avoid rewriting the title bar on every mutation burst.
+            if (document.title !== title) document.title = title;
         }
         const origSetConnState = setConnState;
         // Patch setConnState to also update title
         const _origSetConnState = window.setConnState;
         // Override appendMessage to detect activity
         const origAppendMessage = appendMessage;
-        // We use MutationObserver on messages div to detect streaming
+        // We use MutationObserver on messages div to detect streaming.
+        // Coalesce mutation bursts (innerHTML swaps, colorize attribute
+        // writes) into one rAF pass and derive state from variables instead
+        // of a subtree querySelector per mutation record.
+        let titleUpdatePending = false;
         const titleObserver = new MutationObserver(() => {
-            const streaming = messagesDiv.querySelector('.message.assistant.cursor');
-            if (currentProgressPhase === 'thinking') updateTitle('thinking');
-            else if (streaming) updateTitle('streaming');
-            else updateTitle('idle');
+            if (titleUpdatePending) return;
+            titleUpdatePending = true;
+            requestAnimationFrame(() => {
+                titleUpdatePending = false;
+                if (currentProgressPhase === 'thinking') updateTitle('thinking');
+                else if (currentStreamDiv) updateTitle('streaming');
+                else updateTitle('idle');
+            });
         });
         titleObserver.observe(messagesDiv, { childList: true, subtree: true, attributes: true });
 
@@ -2720,48 +2760,6 @@
             if (usd < 1) return `$${usd.toFixed(3)}`;
             return `$${usd.toFixed(2)}`;
         };
-        contextInfoDiv.addEventListener('mouseenter', () => {
-            const d = lastContextData || {};
-            if (!d.contextLimit && !d.usedTokens) return;
-            const lines = [];
-            lines.push(`── Context ──`);
-            if (d.usedTokens) lines.push(`Used: ${formatTokenCount(d.usedTokens)}`);
-            if (d.contextLimit) lines.push(`Limit: ${formatTokenCount(d.contextLimit)}`);
-            if (d.promptTokens) lines.push(`Prompt: ${formatTokenCount(d.promptTokens)}`);
-            if (d.completionTokens) lines.push(`Completion: ${formatTokenCount(d.completionTokens)}`);
-            if (d.cachedTokens) lines.push(`Cached: ${formatTokenCount(d.cachedTokens)}`);
-            if (d.compactAt) lines.push(`Compact at: ${formatTokenCount(d.compactAt)}`);
-            if (d.usedSource) lines.push(`Source: ${d.usedSource}`);
-            const prompt = d.totalPromptTokens || 0;
-            const completion = d.totalCompletionTokens || 0;
-            const cached = d.totalCachedTokens || 0;
-            const turns = d.totalTurns || 0;
-            if (turns > 0 || prompt > 0 || currentModelPricing) {
-                lines.push(`── Session ──`);
-                if (turns > 0 || prompt > 0) {
-                    lines.push(`Total: ${fmtTokK(prompt + completion)} · ${turns} turns`);
-                    lines.push(`Prompt: ${fmtTokK(prompt)}`);
-                    lines.push(`Completion: ${fmtTokK(completion)}`);
-                    lines.push(`Cached: ${fmtTokK(cached)}`);
-                }
-                if (currentModelPricing) {
-                    console.log('[pricing] tooltip cost', { turns, prompt, completion, cached, pricing: currentModelPricing });
-                    const billablePrompt = Math.max(0, prompt - cached);
-                    const cost = (billablePrompt / 1e6) * currentModelPricing.input
-                               + (cached / 1e6) * currentModelPricing.cached
-                               + (completion / 1e6) * currentModelPricing.output;
-                    lines.push(`Pricing: in $${currentModelPricing.input}/1M · out $${currentModelPricing.output}/1M`);
-                    if (turns > 0 || prompt > 0) {
-                        lines.push(`Est. cost: ${fmtCost(cost)}`);
-                    }
-                }
-            }
-            contextTooltip.textContent = lines.join('\n');
-            contextTooltip.style.display = 'block';
-        });
-        contextInfoDiv.addEventListener('mouseleave', () => {
-            contextTooltip.style.display = 'none';
-        });
 
         // === Settings modal ===
         const settingsBtn = document.getElementById('settings-btn');

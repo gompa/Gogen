@@ -389,6 +389,7 @@ func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, 
 	if err != nil {
 		return "", err
 	}
+	configureCancelableCmd(cmd)
 	cmd.Dir = e.GetWorkingDir()
 	out, err := cmd.CombinedOutput()
 	outStr := string(out)

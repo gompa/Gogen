@@ -316,6 +316,17 @@ export function languageFromPath(path) {
 }
 
 /**
+ * Monaco's colorize appends a <br/> after every line, including the last, so
+ * its output is always one (empty) line taller than the plain <pre> render.
+ * Drop that trailing break so the colorized and plain states have identical
+ * line structure — otherwise swapping between them mid-stream changes the
+ * block's height and makes pinned auto-scroll bounce.
+ */
+function normalizeColorizeHTML(html) {
+  return html.replace(/<\s*br\s*\/?>\s*$/i, '');
+}
+
+/**
  * Colorize a single element's textContent with Monaco.
  * langHint may be a language id or a file path.
  */
@@ -341,7 +352,7 @@ export async function colorizeElement(el, langHint) {
   if (!source.trim()) return;
 
   try {
-    const html = await m.editor.colorize(source, lang, {});
+    const html = normalizeColorizeHTML(await m.editor.colorize(source, lang, {}));
     if (el._gogenHlGen !== gen || !el.isConnected) return;
     el.innerHTML = html;
     el.dataset.monacoColorized = '1';
@@ -392,7 +403,7 @@ export async function colorizeCodeBlocks(root) {
     tasks.push(
       (async () => {
         try {
-          const html = await m.editor.colorize(source, lang, {});
+          const html = normalizeColorizeHTML(await m.editor.colorize(source, lang, {}));
           if (root._gogenHlGen !== genSnapshot || !code.isConnected) return;
           code.innerHTML = html;
           code.dataset.monacoColorized = '1';
@@ -458,8 +469,7 @@ function ensureEditors() {
       saveActive();
     });
     editor.onDidChangeModelContent(() => {
-      updateDirtyIndicators();
-      updateUndoRedoButtons();
+      updateDirtyState();
     });
 
     // --- Context menu: add selection reference to chat input ---
@@ -552,18 +562,36 @@ function isDirty(path) {
   return b.model.getAlternativeVersionId() !== b.savedVersionId;
 }
 
-function updateDirtyIndicators() {
-  renderTabs();
+function updatePathLabel() {
   const label = $('editor-path-label');
-  if (label) {
-    if (mode === 'diff' && activePath) {
-      label.textContent = `${activePath} (unstaged diff)`;
-    } else if (activePath) {
-      label.textContent = isDirty(activePath) ? `${activePath} *` : activePath;
-    } else {
-      label.textContent = 'No file open';
+  if (!label) return;
+  if (mode === 'diff' && activePath) {
+    label.textContent = `${activePath} (unstaged diff)`;
+  } else if (activePath) {
+    label.textContent = isDirty(activePath) ? `${activePath} *` : activePath;
+  } else {
+    label.textContent = 'No file open';
+  }
+}
+
+// Cheap per-keystroke path: mutate only the active tab's dirty marker and
+// the path label instead of rebuilding the whole tab strip (renderTabs).
+function updateDirtyState() {
+  if (mode === 'edit' && activePath) {
+    const strip = $('editor-tabs');
+    const name = strip && strip.querySelector('.file-tab.active .file-tab-name');
+    if (name) {
+      const text = (isDirty(activePath) ? '* ' : '') + basename(activePath);
+      if (name.textContent !== text) name.textContent = text;
     }
   }
+  updatePathLabel();
+  updateUndoRedoButtons();
+}
+
+function updateDirtyIndicators() {
+  renderTabs();
+  updatePathLabel();
   updateUndoRedoButtons();
 }
 
@@ -1206,11 +1234,11 @@ export { saveAll, saveActive };
 
 export function extractDiffValue(rawJSON) {
   const idx = rawJSON.indexOf('"diff"');
-  if (idx < 0) return { ok: false, value: '' };
+  if (idx < 0) return { ok: false, value: '', complete: false };
   let rest = rawJSON.slice(idx + 6).replace(/^[ \t]+/, '');
-  if (!rest.startsWith(':')) return { ok: false, value: '' };
+  if (!rest.startsWith(':')) return { ok: false, value: '', complete: false };
   rest = rest.slice(1).replace(/^[ \t]+/, '');
-  if (!rest.startsWith('"')) return { ok: false, value: '' };
+  if (!rest.startsWith('"')) return { ok: false, value: '', complete: false };
   rest = rest.slice(1);
   let out = '';
   for (let i = 0; i < rest.length; i++) {
@@ -1228,12 +1256,12 @@ export function extractDiffValue(rawJSON) {
       }
       i++;
     } else if (ch === '"') {
-      return { ok: true, value: out };
+      return { ok: true, value: out, complete: true };
     } else {
       out += ch;
     }
   }
-  return { ok: out.length > 0, value: out };
+  return { ok: out.length > 0, value: out, complete: false };
 }
 
 const DIFF_MIN_HEIGHT = 80;
@@ -1247,6 +1275,14 @@ function resizeDiffContainer(container, ed) {
   const h = Math.max(DIFF_MIN_HEIGHT, Math.min(DIFF_MAX_HEIGHT, Math.ceil(ed.getContentHeight())));
   container.style.height = h + 'px';
   ed.layout({ width: w, height: h });
+  // The diff host grows asynchronously after the tool card is placed (Monaco
+  // mounts via a lazy import and lays out after paint), so the card's bottom
+  // can end up below the chat fold. Notify the scroll system that the DOM
+  // height may have changed; it re-pins the bottom if the user is still there.
+  if (h !== container._lastDiffH) {
+    container._lastDiffH = h;
+    window.dispatchEvent(new CustomEvent('gogen-colorized', { bubbles: false }));
+  }
 }
 
 export async function mountDiffEditor(container, value, opts = {}) {

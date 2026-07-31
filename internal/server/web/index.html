@@ -22,19 +22,8 @@
                 <input type="text" id="working-dir-input" placeholder="/path/to/dir">
                 <button id="set-dir-btn">Set Working Directory</button>
                 <hr>
-                <!-- Hidden references for toolbar JS — do not remove -->
-                <div style="display:none">
-                    <div id="model-info"></div>
-                    <select id="model-select"></select>
-                    <div id="thinking-info"></div>
-                    <div id="context-info"><span id="context-text"></span></div>
-                    <div id="context-bar-wrap"><div id="context-bar"></div></div>
-                    <div id="mode-btns">
-                        <button type="button" id="mode-act-btn"></button>
-                        <button type="button" id="mode-plan-btn"></button>
-                    </div>
-                    <div id="session-info" style="display:none"></div>
-                </div>
+                <!-- Current session id (kept hidden; read by chat export) -->
+                <div id="session-info" style="display:none"></div>
                 <div id="session-actions">
                     <button type="button" id="session-new-btn" title="Start a new session">New</button>
                     <button type="button" id="export-chat-btn" title="Export chat as markdown">Export</button>
