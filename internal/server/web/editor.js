@@ -1321,7 +1321,6 @@ function resizeDiffContainer(container, ed) {
 }
 
 export async function mountDiffEditor(container, value, opts = {}) {
-  await initMonaco();
   // Keep a fallback <pre> so diffs remain visible if Monaco layout/workers fail.
   container.innerHTML = '';
   container.classList.add('monaco-tool-host');
@@ -1332,11 +1331,21 @@ export async function mountDiffEditor(container, value, opts = {}) {
   updateDiffFallback(container, value || '');
 
   try {
+    // initMonaco is inside the try so a failed/never-loading Monaco never
+    // rejects the caller (which would skip the post-append scroll fixup);
+    // the fallback <pre> stays visible instead.
+    await initMonaco();
     const host = document.createElement('div');
     host.className = 'monaco-tool-editor';
     host.style.visibility = 'hidden';
     container.appendChild(host);
 
+    // File-line numbers for the diff, derived from the @@ hunks (old numbers
+    // for '-' lines, new numbers for '+'/context lines). Parsed once per text
+    // change and served from the cache.
+    let edRef = null;
+    let diffNumsCacheText = null;
+    let diffNumsCache = [];
     const ed = monaco.editor.create(host, {
       value: value || '',
       language: 'diff',
@@ -1347,15 +1356,37 @@ export async function mountDiffEditor(container, value, opts = {}) {
       cursorBlinking: 'hidden',
       // Fixed host size — avoid ResizeObserver fighting flex layout.
       automaticLayout: false,
+      // Let boundary wheel events chain to the chat. Both flags must be off:
+      // alwaysConsumeMouseWheel:true swallows wheels even at the edges, and
+      // consumeMouseWheelIfScrollbarIsNeeded:true (the editor default) re-
+      // swallows them whenever the diff has a scrollbar — which tall diffs
+      // always do. With both false, Monaco only consumes wheels it can
+      // actually scroll, and edge wheels chain to #messages natively.
+      alwaysConsumeMouseWheel: false,
+      consumeMouseWheelIfScrollbarIsNeeded: false,
       minimap: { enabled: false },
       fontSize: 12,
       wordWrap: 'on',
       scrollBeyondLastLine: false,
-      lineNumbers: 'on',
+      // Show the *file* line number per diff line (old numbers for '-'
+      // lines, new numbers for '+'/context), matching the @@ hunks — not the
+      // sequential index of the patch text.
+      lineNumbers: (line) => {
+        const model = edRef && edRef.getModel();
+        if (!model) return '';
+        const text = model.getValue();
+        if (text !== diffNumsCacheText) {
+          diffNumsCacheText = text;
+          diffNumsCache = diffLineNumbers(text);
+        }
+        const n = diffNumsCache[line - 1];
+        return n || '';
+      },
       folding: false,
       renderLineHighlight: 'none',
       ...opts,
     });
+    edRef = ed;
     chatEditors.add(ed);
     applyUnifiedDiffDecorations(ed);
 
@@ -1383,9 +1414,19 @@ export function updateDiffEditor(ed, value) {
   const model = ed.getModel();
   if (!model) return;
   if (model.getValue() === value) return;
+  // Preserve the user's reading position while the diff streams in:
+  // model.setValue resets the scroll to top, so re-reveal after every
+  // update — follow the new last line only if the user was at the bottom,
+  // otherwise keep the line that was at the top of the view in place.
+  const topLine = diffTopVisibleLine(ed);
+  const atBottom = diffAtBottom(ed);
   model.setValue(value);
   applyUnifiedDiffDecorations(ed);
-  ed.revealLine(model.getLineCount());
+  if (atBottom) {
+    ed.revealLine(model.getLineCount());
+  } else if (topLine > 1) {
+    ed.revealLine(topLine);
+  }
   requestAnimationFrame(() => {
     try {
       const dom = ed.getDomNode();
@@ -1393,6 +1434,16 @@ export function updateDiffEditor(ed, value) {
       resizeDiffContainer(container, ed);
     } catch (_) { /* ignore */ }
   });
+}
+
+function diffTopVisibleLine(ed) {
+  const ranges = ed.getVisibleRanges();
+  return ranges && ranges[0] ? ranges[0].startLineNumber : 1;
+}
+
+function diffAtBottom(ed) {
+  const h = ed.getLayoutInfo().height;
+  return ed.getScrollHeight() - ed.getScrollTop() - h < 16;
 }
 
 /** Update fallback <pre> inside a monaco-tool-host (always kept in sync). */
@@ -1404,23 +1455,107 @@ export function updateDiffFallback(container, value) {
     pre.className = 'diff-fallback';
     container.appendChild(pre);
   }
-  // Colorize plain-text fallback so diffs stay readable if Monaco fails.
+  // Rebuilding the <pre> resets its scroll position; preserve it by keeping
+  // the same distance from the bottom (streaming content grows append-only,
+  // so the visible lines stay put).
+  const distFromBottom = Math.max(0, pre.scrollHeight - pre.scrollTop - pre.clientHeight);
   const text = value || '';
   pre.textContent = '';
-  for (const line of text.split('\n')) {
-    const span = document.createElement('span');
-    span.textContent = line + '\n';
+  const nums = diffLineNumbers(text);
+  const lines = text.split('\n');
+  if (lines.length && lines[lines.length - 1] === '') lines.pop(); // trailing newline
+  // Colorize plain-text fallback so diffs stay readable if Monaco fails or
+  // in static (tokenizer) mode. Each line is a row with a file-line-number
+  // gutter, matching the Monaco viewer's numbering.
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const row = document.createElement('div');
+    row.className = 'diff-row';
+    const num = document.createElement('span');
+    num.className = 'diff-num';
+    num.textContent = nums[i] || '';
+    const code = document.createElement('span');
+    code.className = 'diff-code';
     if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('diff ') || line.startsWith('index ')) {
-      span.className = 'gogen-diff-meta';
+      code.classList.add('gogen-diff-meta');
     } else if (line.startsWith('@@')) {
-      span.className = 'gogen-diff-hunk';
+      code.classList.add('gogen-diff-hunk');
     } else if (line.startsWith('+')) {
-      span.className = 'gogen-diff-add';
+      code.classList.add('gogen-diff-add');
     } else if (line.startsWith('-')) {
-      span.className = 'gogen-diff-del';
+      code.classList.add('gogen-diff-del');
     }
-    pre.appendChild(span);
+    code.textContent = line;
+    row.appendChild(num);
+    row.appendChild(code);
+    pre.appendChild(row);
   }
+  // Restore the previous reading position (clamped to the new bounds).
+  const maxTop = pre.scrollHeight - pre.clientHeight;
+  pre.scrollTop = maxTop > 0 ? Math.min(Math.max(maxTop - distFromBottom, 0), maxTop) : 0;
+}
+
+// Map each line of a unified diff to a file line number for display. Header
+// and hunk-marker lines get '' (no number); '-' lines show the old-file line
+// number; '+' and context lines show the new-file line number — matching how
+// standard diff viewers number unified diffs.
+export function diffLineNumbers(text) {
+  const lines = String(text || '').split('\n');
+  const out = new Array(lines.length).fill('');
+  let oldN = 0;
+  let newN = 0;
+  let inHunk = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const h = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+    if (h) {
+      oldN = parseInt(h[1], 10);
+      newN = parseInt(h[2], 10);
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk) continue;
+    const c = line.charAt(0);
+    if (c === '-') {
+      out[i] = String(oldN++);
+    } else if (c === '+') {
+      out[i] = String(newN++);
+    } else if (c === ' ') {
+      out[i] = String(newN++);
+      oldN++;
+    }
+    // '\ No newline at end of file' and anything else: no number.
+  }
+  return out;
+}
+
+// Returns the chat diff editor whose DOM node contains the event target, or
+// null. Used by the wheel-edge takeover in app.js.
+function chatEditorAt(e) {
+  const t = e && e.target;
+  if (!t || typeof t.closest !== 'function' || !t.closest('.monaco-tool-host')) return null;
+  for (const ed of chatEditors) {
+    const dom = ed.getDomNode && ed.getDomNode();
+    if (dom && dom.contains(t)) return ed;
+  }
+  return null;
+}
+
+// Wheel-boundary state for a chat diff editor, via the editor API. Monaco's
+// internal scroll model is transform-based, so DOM scrollTop/scrollHeight on
+// .monaco-scrollable-element are unreliable (scrollTop always 0, scrollHeight
+// ≈ clientHeight) — the API values are the real ones.
+export function chatDiffWheelEdge(e) {
+  const ed = chatEditorAt(e);
+  if (!ed) return { over: false };
+  const st = ed.getScrollTop();
+  const sh = ed.getScrollHeight();
+  const h = ed.getLayoutInfo().height;
+  return {
+    over: true,
+    atTop: st <= 0,
+    atBottom: sh - st - h <= 0,
+  };
 }
 
 export function disposeChatEditors() {

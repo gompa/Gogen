@@ -7,6 +7,7 @@
             mountDiffEditor,
             updateDiffEditor,
             updateDiffFallback,
+            chatDiffWheelEdge,
             extractDiffValue,
             initMonaco,
             colorizeCodeBlocks,
@@ -573,7 +574,7 @@
         function clearChat() {
             disposeChatEditors();
             messagesDiv.innerHTML = '';
-            stickToBottom = true;
+            enableFollow();
             msgIdxCounter = 0;
 
             streamRafPending = false;
@@ -611,6 +612,14 @@
         let ignoreScrollEvent = false;
         // Start with anchoring disabled while following the stream.
         messagesDiv.classList.add('no-anchor');
+        // Re-enabling follow must always re-disable browser scroll anchoring:
+        // otherwise overflow-anchor fights smartScroll's scroll-to-bottom and
+        // the view stops following (drifts up) as content grows below — this
+        // surfaced when re-enabling follow after reading a diff/patch.
+        function enableFollow() {
+            stickToBottom = true;
+            messagesDiv.classList.add('no-anchor');
+        }
         let currentStreamDiv = null;
         let currentStreamRaw = '';
         const STREAM_RENDER_INTERVAL = 32; // ms between renders (~2 frames at 60fps)
@@ -1061,6 +1070,13 @@
                 showToast('Resend already in progress', 'info');
                 return;
             }
+            if (pendingSessionResponse) {
+                showToast('Session change already in progress', 'info');
+                return;
+            }
+            // Server cancels any in-flight turn to acquire the session lock;
+            // suppress its turn_end so it can't clear our pending flag early.
+            cancelActiveTurn();
             ws.send(JSON.stringify({ type: 'session_fork', messageIndex: msgIdx }));
             pendingSessionResponse = true;
         }
@@ -1090,7 +1106,7 @@
             pendingResendContent = content;
             resendAwaitingHistory = true;
             pendingSessionResponse = true;
-            stickToBottom = true;
+            enableFollow();
             if (histIdx === 0) {
                 ws.send(JSON.stringify({ type: 'session_new' }));
             } else {
@@ -1111,7 +1127,7 @@
             contextEstAdded = 0;
             ws.send(JSON.stringify({ type: 'message', content: text }));
             setTurnActive(true);
-            stickToBottom = true;
+            enableFollow();
         }
 
         /** Attach resend/edit controls once a user bubble has a server histIdx. */
@@ -1629,6 +1645,11 @@
                 if (body) body.classList.toggle('collapsed', collapsed);
                 if (argsStream) argsStream.classList.toggle('collapsed', collapsed);
                 if (monacoHost) monacoHost.style.display = collapsed ? 'none' : 'block';
+                // Toggling changes content height below the fold; keep the
+                // scroll system in sync (re-pin if following, refresh the
+                // jump-button if detached).
+                scheduleRepinIfPinned();
+                if (!stickToBottom) updateScrollBottomBtn();
             });
 
             const cardInfo = {
@@ -1704,6 +1725,21 @@
             return cardInfo;
         }
 
+        // The chat diff viewer is either a static line-numbered <pre>
+        // (default) or a full Monaco editor — a user setting
+        // (gogen_chat_diff_viewer). Reads localStorage directly so it works
+        // regardless of when the settings UI initializes.
+        function diffViewerMode() {
+            return localStorage.getItem('gogen_chat_diff_viewer') === 'monaco' ? 'monaco' : 'tokenizer';
+        }
+
+        function createDiffHost(cardInfo) {
+            const host = document.createElement('div');
+            host.className = 'monaco-tool-host' + (diffViewerMode() === 'tokenizer' ? ' diff-static' : '');
+            cardInfo.monacoHost = host;
+            return host;
+        }
+
         async function ensurePatchViewer(cardInfo, diffText) {
             if (!cardInfo) return;
             if (diffText != null && diffText !== '') {
@@ -1715,15 +1751,20 @@
                     cardInfo.argsStream.remove();
                     cardInfo.argsStream = null;
                 }
-                cardInfo.monacoHost = document.createElement('div');
-                cardInfo.monacoHost.className = 'monaco-tool-host';
+                const host = createDiffHost(cardInfo);
                 // Insert before waiting/status if present
                 const waiting = cardInfo.card.querySelector('.tool-waiting');
-                if (waiting) cardInfo.card.insertBefore(cardInfo.monacoHost, waiting);
-                else cardInfo.card.appendChild(cardInfo.monacoHost);
+                if (waiting) cardInfo.card.insertBefore(host, waiting);
+                else cardInfo.card.appendChild(host);
             }
             updateDiffFallback(cardInfo.monacoHost, cardInfo.pendingDiff || '');
 
+            if (diffViewerMode() === 'tokenizer') {
+                // Static path: the fallback <pre> IS the viewer (line-numbered
+                // rows, colored by diff line type). Streaming updates flow
+                // through updateDiffFallback; no Monaco editor is created.
+                return;
+            }
             if (cardInfo.monacoEditor) {
                 if (cardInfo.pendingDiff) updateDiffEditor(cardInfo.monacoEditor, cardInfo.pendingDiff);
                 return;
@@ -1842,33 +1883,41 @@
             const argsDiff = cardInfo.args && typeof cardInfo.args.diff === 'string' ? cardInfo.args.diff : '';
             const pending = cardInfo.pendingDiff || argsDiff;
 
-            if (name === 'patch_file') {
-                // Ensure the patch (from args) is visible; result is usually a short summary.
-                if (pending) {
-                    await ensurePatchViewer(cardInfo, pending);
-                }
-                if (result) {
+            try {
+                if (name === 'patch_file') {
+                    // Ensure the patch (from args) is visible; result is usually a short summary.
+                    if (pending) {
+                        await ensurePatchViewer(cardInfo, pending);
+                    }
+                    if (result) {
+                        appendExpandableResult(body, result, success, truncated);
+                    }
+                    card.appendChild(body);
+                } else if (name === 'show_diff') {
+                    // Same viewer machinery as patch_file (mount guard, fallback
+                    // sync, resize → gogen-colorized → scroll re-pin), so the
+                    // card behaves identically to a patch card.
+                    if (!cardInfo.monacoHost) {
+                        cardInfo.monacoHost = createDiffHost(cardInfo);
+                        body.appendChild(cardInfo.monacoHost);
+                    }
+                    card.appendChild(body);
+                    await ensurePatchViewer(cardInfo, result || '');
+                } else if (name === 'read_file') {
+                    const path = readFilePathFromArgs(cardInfo.args);
+                    appendExpandableResult(body, result, success, truncated, {
+                        language: languageFromPath(path),
+                    });
+                    card.appendChild(body);
+                } else {
                     appendExpandableResult(body, result, success, truncated);
+                    card.appendChild(body);
                 }
-                card.appendChild(body);
-            } else if (name === 'show_diff') {
-                const host = document.createElement('div');
-                host.className = 'monaco-tool-host';
-                body.appendChild(host);
-                card.appendChild(body);
-                await mountDiffEditor(host, result || '');
-            } else if (name === 'read_file') {
-                const path = readFilePathFromArgs(cardInfo.args);
-                appendExpandableResult(body, result, success, truncated, {
-                    language: languageFromPath(path),
-                });
-                card.appendChild(body);
-            } else {
-                appendExpandableResult(body, result, success, truncated);
-                card.appendChild(body);
+            } finally {
+                // Always re-sync the scroll position after the card update,
+                // even if a viewer mount failed or rejected.
+                smartScroll();
             }
-
-            smartScroll();
         }
 
         // A history replay rebuilds the whole pane with awaits (Monaco mounts,
@@ -1896,7 +1945,7 @@
 
         async function replayHistory(history) {
             // Session/history loads should always land at the bottom.
-            stickToBottom = true;
+            enableFollow();
             historyToolCallArgs = {};
             // Self-contained: a history snapshot replaces the whole pane, so
             // reset leftover tool-card state rather than relying on the caller
@@ -2264,7 +2313,7 @@
             // Sending while busy cancels the current turn (same as TUI interrupt + new prompt).
             cancelActiveTurn();
             hideSlashSuggest();
-            stickToBottom = true;
+            enableFollow();
             const el = appendMessage('user', text);
             if (el) el.dataset.pendingAck = '1';
             streamingToolCards = {};
@@ -2448,6 +2497,13 @@
                 showToast('Resend already in progress', 'info');
                 return;
             }
+            if (pendingSessionResponse) {
+                showToast('Session change already in progress', 'info');
+                return;
+            }
+            // Server cancels any in-flight turn to acquire the session lock;
+            // suppress its turn_end so it can't clear our pending flag early.
+            cancelActiveTurn();
             pendingSessionResponse = true;
             ws.send(JSON.stringify({ type: 'session_new' }));
         }
@@ -2462,10 +2518,17 @@
                 showToast('Resend already in progress', 'info');
                 return;
             }
+            if (pendingSessionResponse) {
+                showToast('Session change already in progress', 'info');
+                return;
+            }
             const displayName = label || id;
             if (!confirm(`Are you sure you want to delete session "${displayName}"?\n\nThis action cannot be undone.`)) {
                 return;
             }
+            // Server cancels any in-flight turn to acquire the session lock;
+            // suppress its turn_end so it can't clear our pending flag early.
+            cancelActiveTurn();
             pendingSessionResponse = true;
             ws.send(JSON.stringify({ type: 'session_delete', sessionId: id }));
         }
@@ -2480,6 +2543,13 @@
                 showToast('Resend already in progress', 'info');
                 return;
             }
+            if (pendingSessionResponse) {
+                showToast('Session change already in progress', 'info');
+                return;
+            }
+            // Server cancels any in-flight turn to acquire the session lock;
+            // suppress its turn_end so it can't clear our pending flag early.
+            cancelActiveTurn();
             pendingSessionResponse = true;
             ws.send(JSON.stringify({ type: 'session_resume', sessionId: id }));
         }
@@ -2710,11 +2780,6 @@
             return messagesDiv.scrollHeight - messagesDiv.scrollTop - messagesDiv.clientHeight;
         }
 
-        function eventInNestedScroller(e) {
-            const t = e && e.target;
-            return !!(t && typeof t.closest === 'function' && t.closest(NESTED_SCROLLER_SELECTOR));
-        }
-
         function updateScrollBottomBtn() {
             scrollBottomBtn.classList.toggle('visible', !stickToBottom || distanceFromBottom() > NEAR_BOTTOM_PX);
         }
@@ -2762,8 +2827,30 @@
         // is interacting with that content, not leaving the bottom.
         const messagesScrollable = () => messagesDiv.scrollHeight > messagesDiv.clientHeight;
         messagesDiv.addEventListener('wheel', (e) => {
-            if (e.deltaY < 0 && messagesScrollable() && !eventInNestedScroller(e)) unpinFromBottom();
+            if (!messagesScrollable()) return;
+            // Any wheel-up leaves the bottom; the recovery machinery (scroll
+            // back down, maybeRepinNearBottom, the jump button) re-engages
+            // follow.
+            if (e.deltaY < 0) unpinFromBottom();
         }, { passive: true });
+        // Capture-phase wheel takeover for Monaco diff viewers: Firefox's
+        // wheel chaining over Monaco can swallow edge wheels, trapping the
+        // cursor inside the diff. Capture runs before Monaco's handlers;
+        // preventDefault also makes Monaco back off (it checks
+        // defaultPrevented), so no double scroll. Boundary detection uses
+        // Monaco's editor API (DOM scroll metrics on the scrollable element
+        // are unreliable). Mid-diff wheels are left to Monaco.
+        messagesDiv.addEventListener('wheel', (e) => {
+            if (!messagesScrollable()) return;
+            const edge = chatDiffWheelEdge(e);
+            if (!edge.over) return;
+            if (!((e.deltaY < 0 && edge.atTop) || (e.deltaY > 0 && edge.atBottom))) return;
+            e.preventDefault();
+            const px = e.deltaMode === 1 ? e.deltaY * 16
+                : e.deltaMode === 2 ? e.deltaY * messagesDiv.clientHeight
+                : e.deltaY;
+            messagesDiv.scrollTop += px;
+        }, { capture: true });
         messagesDiv.addEventListener('touchstart', () => {
             // Touch scroll direction is known on touchmove; mark intent on any
             // touch interaction away from bottom after move.
@@ -2773,9 +2860,13 @@
             const y = e.touches[0]?.clientY;
             if (y == null) return;
             if (messagesDiv._touchY != null && y > messagesDiv._touchY + TOUCH_UNPIN_PX) {
-                // Finger moved down → content scrolls up (only for touches
-                // that started outside the nested scrollable children above).
-                if (messagesScrollable() && !eventInNestedScroller(e)) unpinFromBottom();
+                // Finger moved down → content scrolls up. Touches inside a
+                // nested scrollable (diff viewer, tool result) scroll that
+                // content natively, not the chat — skip those.
+                const t = e.target;
+                const inNested = t && typeof t.closest === 'function'
+                    && t.closest(NESTED_SCROLLER_SELECTOR);
+                if (messagesScrollable() && !inNested) unpinFromBottom();
             }
             messagesDiv._touchY = y;
         }, { passive: true });
@@ -2786,6 +2877,9 @@
             const inEditable = t && typeof t.closest === 'function' &&
                 t.closest('textarea, input, [contenteditable="true"], .monaco-editor');
             if (inEditable) return;
+            // Arrow keys on a focused button (fork/resend/expand/copy) don't
+            // navigate anything — not chat-scroll intent.
+            if (t && typeof t.closest === 'function' && t.closest('button')) return;
             if ((e.key === 'ArrowUp' || e.key === 'PageUp' || e.key === 'Home') && messagesScrollable()) unpinFromBottom();
         });
 
@@ -3105,6 +3199,20 @@
             if (e.key === 'gogen_file_click_behavior') {
                 const val = e.newValue || 'open';
                 if (fileClickSelect.value !== val) fileClickSelect.value = val;
+            }
+        });
+
+        // === Chat diff viewer: static tokenizer pre (default) or full Monaco editor ===
+        const diffViewerSelect = document.getElementById('chat-diff-viewer');
+        const savedDiffViewer = localStorage.getItem('gogen_chat_diff_viewer') || 'tokenizer';
+        diffViewerSelect.value = savedDiffViewer;
+        diffViewerSelect.addEventListener('change', () => {
+            localStorage.setItem('gogen_chat_diff_viewer', diffViewerSelect.value);
+        });
+        window.addEventListener('storage', (e) => {
+            if (e.key === 'gogen_chat_diff_viewer') {
+                const val = e.newValue || 'tokenizer';
+                if (diffViewerSelect.value !== val) diffViewerSelect.value = val;
             }
         });
 

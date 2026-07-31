@@ -691,6 +691,36 @@
         /* Override Monaco's default overflow:visible so the background
            doesn't extend beyond the container. */
         .monaco-tool-host .monaco-editor { overflow: hidden; }
+        /* Tokenizer (static) diff viewer mode: the fallback <pre> is the
+           viewer; the host sizes to its content up to the same 400px cap. */
+        .monaco-tool-host.diff-static {
+            height: auto;
+            overflow: hidden;
+        }
+        .monaco-tool-host.diff-static .diff-fallback {
+            position: static;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        /* Numbered rows for the static/fallback diff view. */
+        .diff-fallback .diff-row {
+            display: flex;
+            align-items: baseline;
+        }
+        .diff-fallback .diff-num {
+            flex: 0 0 3.25em;
+            text-align: right;
+            padding-right: 0.75em;
+            color: var(--fg-dim);
+            user-select: none;
+            flex-shrink: 0;
+        }
+        .diff-fallback .diff-code {
+            flex: 1;
+            min-width: 0;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
         .diff-fallback {
             margin: 0;
             padding: 8px 12px;

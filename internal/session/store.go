@@ -19,6 +19,12 @@ import (
 
 const version = 1
 
+// legacyLabelMaxLen is the label length older versions truncated to. Stored
+// labels of exactly this length are the only ones that may need migration to
+// the full untruncated label, so List can skip re-reading session files for
+// every other entry.
+const legacyLabelMaxLen = 50
+
 type file struct {
 	Version        int             `json:"version"`
 	ID             string          `json:"id"`
@@ -378,10 +384,13 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 	if idx != nil && len(idx.Entries) > 0 {
 		// Migration: older sessions may still have a truncated Label (50-char
 		// limit from before CSS handled dynamic truncation). Load the session
-		// file and refresh with the full untruncated label.
+		// file and refresh with the full untruncated label. Only entries whose
+		// stored label is exactly the legacy truncation length are ambiguous,
+		// so this is O(1) for the common case instead of re-reading every
+		// session file on every list.
 		needsRewrite := false
 		for i, e := range idx.Entries {
-			if e.Label != "" {
+			if len(e.Label) == legacyLabelMaxLen {
 				if raw := s.loadRawLabel(workingDir, e.ID); raw != "" && raw != e.Label {
 					idx.Entries[i].Label = raw
 					needsRewrite = true

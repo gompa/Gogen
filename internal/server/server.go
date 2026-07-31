@@ -687,20 +687,28 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleWSListSessions(ws *wsConn) {
-	var sessionID string
-	s.lockAgentRead(func() {
-		sessionID = s.agent.SessionID
-	})
-	_, sessions, listErr := s.agent.FormatSessionListForUI()
-	if listErr != nil {
-		_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", listErr)})
-		return
-	}
-	_ = ws.writeJSON(WSMessage{
-		Type:      "sessions",
-		Sessions:  sessionEntries(sessions, sessionID),
-		SessionID: sessionID,
-	})
+	// Listing hits the session store on disk (metadata index read, label
+	// migration file reads, legacy full-scan fallback). Run it off the WS
+	// read loop like handleWSListModels, so a slow store cannot block chat,
+	// FS, or editor messages behind the sidebar.
+	go func() {
+		_, sessions, listErr := s.agent.FormatSessionListForUI()
+		if listErr != nil {
+			_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", listErr)})
+			return
+		}
+		// Read the current session id after listing so the "current" marker
+		// is as fresh as possible.
+		var sessionID string
+		s.lockAgentRead(func() {
+			sessionID = s.agent.SessionID
+		})
+		_ = ws.writeJSON(WSMessage{
+			Type:      "sessions",
+			Sessions:  sessionEntries(sessions, sessionID),
+			SessionID: sessionID,
+		})
+	}()
 }
 
 func (s *Server) handleWSSessionAction(ws *wsConn, ctx context.Context, stream *wsConnStream, msg WSMessage) {
