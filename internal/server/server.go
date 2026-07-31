@@ -80,6 +80,18 @@ func (s *Server) tryAcquireTurn(wait time.Duration) bool {
 	}
 }
 
+// acquireTurnForHandler cancels any in-flight stream on this connection, then
+// tries to acquire the global agent turn lock. On failure it writes the
+// standard "busy" error and returns false.
+func (s *Server) acquireTurnForHandler(ws *wsConn, stream *wsConnStream) bool {
+	stream.cancelInFlight()
+	if !s.tryAcquireTurn(wsTurnAcquireWait) {
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+		return false
+	}
+	return true
+}
+
 func newWSConn(conn *websocket.Conn) *wsConn {
 	w := &wsConn{
 		conn:  conn,
@@ -692,9 +704,12 @@ func (s *Server) handleWSListSessions(ws *wsConn) {
 }
 
 func (s *Server) handleWSSessionAction(ws *wsConn, ctx context.Context, stream *wsConnStream, msg WSMessage) {
-	stream.cancelInFlight()
-	if !s.tryAcquireTurn(wsTurnAcquireWait) {
-		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+	if !s.acquireTurnForHandler(ws, stream) {
+		return
+	}
+	if (msg.Type == "session_resume" || msg.Type == "session_delete") && strings.TrimSpace(msg.SessionID) == "" {
+		s.turnMu.Unlock()
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: sessionId is required"})
 		return
 	}
 	var cmd string
@@ -702,21 +717,9 @@ func (s *Server) handleWSSessionAction(ws *wsConn, ctx context.Context, stream *
 	case "session_new":
 		cmd = "/new"
 	case "session_resume":
-		id := strings.TrimSpace(msg.SessionID)
-		if id == "" {
-			s.turnMu.Unlock()
-			_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: sessionId is required"})
-			return
-		}
-		cmd = "resume " + id
+		cmd = "resume " + strings.TrimSpace(msg.SessionID)
 	case "session_delete":
-		id := strings.TrimSpace(msg.SessionID)
-		if id == "" {
-			s.turnMu.Unlock()
-			_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: sessionId is required"})
-			return
-		}
-		cmd = "resume del " + id
+		cmd = "resume del " + strings.TrimSpace(msg.SessionID)
 	case "session_fork":
 		forkArg := fmt.Sprintf("%d", msg.MessageIndex)
 		if msg.MessageIndex < 0 {
@@ -750,9 +753,7 @@ func (s *Server) handleWSListModels(ws *wsConn, ctx context.Context) {
 }
 
 func (s *Server) handleWSSetModel(ws *wsConn, ctx context.Context, stream *wsConnStream, msg WSMessage) {
-	stream.cancelInFlight()
-	if !s.tryAcquireTurn(wsTurnAcquireWait) {
-		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+	if !s.acquireTurnForHandler(ws, stream) {
 		return
 	}
 	err := s.agent.SelectModel(ctx, msg.Model)
@@ -766,9 +767,7 @@ func (s *Server) handleWSSetModel(ws *wsConn, ctx context.Context, stream *wsCon
 }
 
 func (s *Server) handleWSSetMode(ws *wsConn, ctx context.Context, stream *wsConnStream, msg WSMessage) {
-	stream.cancelInFlight()
-	if !s.tryAcquireTurn(wsTurnAcquireWait) {
-		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+	if !s.acquireTurnForHandler(ws, stream) {
 		return
 	}
 	modeSet := false
@@ -789,9 +788,7 @@ func (s *Server) handleWSSetMode(ws *wsConn, ctx context.Context, stream *wsConn
 }
 
 func (s *Server) handleWSSetThinkingLevel(ws *wsConn, ctx context.Context, stream *wsConnStream, msg WSMessage) {
-	stream.cancelInFlight()
-	if !s.tryAcquireTurn(wsTurnAcquireWait) {
-		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+	if !s.acquireTurnForHandler(ws, stream) {
 		return
 	}
 	s.lockAgentWrite(func() {
@@ -815,9 +812,7 @@ func (s *Server) handleWSConfig(ws *wsConn, ctx context.Context, stream *wsConnS
 		_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: directory does not exist: %s", absDir)})
 		return
 	}
-	stream.cancelInFlight()
-	if !s.tryAcquireTurn(wsTurnAcquireWait) {
-		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+	if !s.acquireTurnForHandler(ws, stream) {
 		return
 	}
 	var cfg WSMessage

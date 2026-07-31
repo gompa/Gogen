@@ -159,7 +159,7 @@ func (a *Agent) resumeSessionByID(ctx context.Context, id string) (string, error
 	model := snap.Model
 	a.RestoreSessionLocal(snap, id)
 	a.SessionID = id
-	label := llm.SessionLabel(snap.Messages, llm.DefaultSessionLabelMaxLen)
+	label := llm.SessionLabel(snap.Messages)
 	var out string
 	if label != "" {
 		out = fmt.Sprintf("Resumed session %s (%d messages): \"%s\"", id, len(snap.Messages), label)

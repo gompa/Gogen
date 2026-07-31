@@ -1,6 +1,9 @@
 package agent
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Mode controls whether the agent may mutate the repository.
 type Mode int
@@ -99,7 +102,7 @@ func (a *Agent) checkPlanMode(toolName string) error {
 }
 
 func (a *Agent) isMCPTool(name string) bool {
-	return len(name) > 4 && name[:4] == "mcp_"
+	return strings.HasPrefix(name, "mcp_")
 }
 
 // AllowedToolNames returns tool names available to the LLM in the current mode.

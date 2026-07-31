@@ -10,7 +10,8 @@
             --fg-muted: #858585;
             --fg-dim: #6a6a6a;
             --accent: var(--user-accent, #569cd6);
-            --accent-soft: var(--user-accent-soft, rgba(86, 156, 214, 0.18));
+            /* Soft accent derived from the accent via color-mix — no JS needed */
+            --accent-soft: color-mix(in srgb, var(--accent) 18%, transparent);
             --success: #4ec9b0;
             --success-bg: rgba(46, 160, 67, 0.18);
             --error: #f14c4c;
@@ -1231,10 +1232,17 @@
             font-size: 0.75em;
         }
 
-        /* ===== Task 1: Textarea auto-resize ===== */
+        /* ===== Task 1: Textarea auto-resize (native) =====
+           field-sizing: content makes the textarea grow/shrink with its text
+           — no JS size tracking needed. min-height calc(1.4em + 18px) is the
+           natural single-line height (line-height 1.4em + padding 16px +
+           border 2px), so the empty box is exactly one line tall and typing
+           the first character doesn't change the size. Requires Firefox 152+ /
+           Chrome 123+ / Safari 26.2+; older engines keep the min-height box. */
         textarea#message-input {
             resize: none;
-            min-height: 38px;
+            field-sizing: content;
+            min-height: calc(1.4em + 18px);
             max-height: 200px;
             overflow-y: auto;
             line-height: 1.4;
@@ -1437,7 +1445,7 @@
             --fg-muted: #616161;
             --fg-dim: #999999;
             --accent: var(--user-accent, #0066cc);
-            --accent-soft: var(--user-accent-soft, rgba(0, 102, 204, 0.12));
+            --accent-soft: color-mix(in srgb, var(--accent) 12%, transparent);
             --success: #1a7f37;
             --success-bg: rgba(26, 127, 55, 0.12);
             --error: #cf222e;

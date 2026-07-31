@@ -783,7 +783,7 @@ func sessionLabel(messages []llm.Message, _ string) string {
 	// Always regenerate the label from messages — CSS text-overflow: ellipsis
 	// handles dynamic truncation. The stored label (if any) was truncated at
 	// 50 chars by an older version and is no longer desirable.
-	return llm.SessionLabel(messages, llm.DefaultSessionLabelMaxLen)
+	return llm.SessionLabel(messages)
 }
 
 // NewID generates a new session id.

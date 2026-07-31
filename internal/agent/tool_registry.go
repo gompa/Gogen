@@ -101,8 +101,8 @@ func handleListFiles(_ context.Context, a *Agent, args map[string]interface{}) (
 	if err != nil {
 		return "", err
 	}
-	recursive, _ := boolArgOptional(args, "recursive")
-	tracked, _ := boolArgOptional(args, "tracked_only")
+	recursive, _ := boolArg(args, "recursive", false)
+	tracked, _ := boolArg(args, "tracked_only", false)
 	return a.Executor.ListFiles(path, recursive, tracked)
 }
 
@@ -112,7 +112,7 @@ func handleGlobFiles(_ context.Context, a *Agent, args map[string]interface{}) (
 		return "", err
 	}
 	subpath, _ := stringArgOptional(args, "path")
-	tracked, _ := boolArgOptional(args, "tracked_only")
+	tracked, _ := boolArg(args, "tracked_only", false)
 	return a.Executor.GlobFiles(pattern, subpath, tracked)
 }
 
@@ -144,7 +144,7 @@ func handleReadFile(_ context.Context, a *Agent, args map[string]interface{}) (s
 		return "", err
 	}
 	search, _ := stringArgOptional(args, "search")
-	lineNumbers, _ := boolArgOptional(args, "line_numbers")
+	lineNumbers, _ := boolArg(args, "line_numbers", false)
 	return a.Executor.ReadFileRange(path, offset, limit, search, lineNumbers)
 }
 
@@ -195,7 +195,7 @@ func handleReplaceInFile(_ context.Context, a *Agent, args map[string]interface{
 	if err != nil {
 		return "", err
 	}
-	replaceAll, err := boolArgOptional(args, "replace_all")
+	replaceAll, err := boolArg(args, "replace_all", false)
 	if err != nil {
 		return "", err
 	}
@@ -207,11 +207,11 @@ func handlePatchFile(ctx context.Context, a *Agent, args map[string]interface{})
 	if err != nil {
 		return "", err
 	}
-	dryRun, err := boolArgOptional(args, "dry_run")
+	dryRun, err := boolArg(args, "dry_run", false)
 	if err != nil {
 		return "", err
 	}
-	fuzzy, err := boolArgDefault(args, "fuzzy", true)
+	fuzzy, err := boolArg(args, "fuzzy", true)
 	if err != nil {
 		return "", err
 	}
@@ -251,7 +251,7 @@ func handleMoveFile(_ context.Context, a *Agent, args map[string]interface{}) (s
 
 func handleShowDiff(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
 	subpath, _ := stringArgOptional(args, "path")
-	staged, err := boolArgOptional(args, "staged")
+	staged, err := boolArg(args, "staged", false)
 	if err != nil {
 		return "", err
 	}
@@ -330,13 +330,13 @@ func handleGitStage(ctx context.Context, a *Agent, args map[string]interface{}) 
 
 func handleGitBranch(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
 	name, _ := stringArgOptional(args, "name")
-	create, _ := boolArgOptional(args, "create")
+	create, _ := boolArg(args, "create", false)
 	return a.Executor.GitBranch(ctx, name, create)
 }
 
 func handleGitStash(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
 	message, _ := stringArgOptional(args, "message")
-	pop, _ := boolArgOptional(args, "pop")
+	pop, _ := boolArg(args, "pop", false)
 	return a.Executor.GitStash(ctx, message, pop)
 }
 
@@ -522,7 +522,7 @@ func handleRenameSymbol(ctx context.Context, a *Agent, args map[string]interface
 	}
 	subpath, _ := stringArgOptional(args, "path")
 	glob, _ := stringArgOptional(args, "glob")
-	dryRun, _ := boolArgOptional(args, "dry_run")
+	dryRun, _ := boolArg(args, "dry_run", false)
 	return a.Executor.RenameSymbol(ctx, oldName, newName, subpath, glob, dryRun)
 }
 
@@ -539,7 +539,7 @@ func handleMultiEdit(ctx context.Context, a *Agent, args map[string]interface{})
 	if err != nil {
 		return "", err
 	}
-	dryRun, _ := boolArgOptional(args, "dry_run")
+	dryRun, _ := boolArg(args, "dry_run", false)
 	return a.Executor.MultiEdit(ctx, pattern, search, replace, dryRun)
 }
 

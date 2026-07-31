@@ -206,7 +206,6 @@ func main() {
 		MaxAgeDays: cfg.SessionMaxAgeDays,
 	}
 	store := session.NewStoreWithOptions(sessionEnabled, sessionOpts)
-	_ = sessionOpts // suppress unused if globalMode not used below
 	if isGlobalMode {
 		// Use global session dir ~/.local/share/gogen/sessions/
 		store.SetGlobalDir(projectfile.GlobalSessionDir())
@@ -305,10 +304,10 @@ func main() {
 		if addr == "" {
 			addr = "127.0.0.1:8081"
 			isLoopback = true
-		} else if !strings.Contains(addr, ":") {
-			addr += ":8081"
-			isLoopback = server.IsLoopbackBind(addr)
 		} else {
+			if !strings.Contains(addr, ":") {
+				addr += ":8081"
+			}
 			isLoopback = server.IsLoopbackBind(addr)
 		}
 

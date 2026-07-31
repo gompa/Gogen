@@ -125,25 +125,30 @@ func (c *webCfgState) allowedDomains() []string {
 	return envAllowedDomains()
 }
 
+// parseDomainList splits a comma-separated domain allowlist, trimming,
+// lowercasing, and dropping empty entries. Returns nil for empty input.
+func parseDomainList(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(strings.ToLower(p))
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // envAllowedDomains parses and caches GOGEN_WEB_ALLOWED_DOMAINS from env.
 var envAllowedDomainsVal []string
 var envAllowedDomainsOnce sync.Once
 
 func envAllowedDomains() []string {
 	envAllowedDomainsOnce.Do(func() {
-		raw := strings.TrimSpace(os.Getenv("GOGEN_WEB_ALLOWED_DOMAINS"))
-		if raw == "" {
-			return
-		}
-		parts := strings.Split(raw, ",")
-		out := make([]string, 0, len(parts))
-		for _, p := range parts {
-			p = strings.TrimSpace(strings.ToLower(p))
-			if p != "" {
-				out = append(out, p)
-			}
-		}
-		envAllowedDomainsVal = out
+		envAllowedDomainsVal = parseDomainList(os.Getenv("GOGEN_WEB_ALLOWED_DOMAINS"))
 	})
 	return envAllowedDomainsVal
 }
@@ -171,19 +176,7 @@ func ConfigureWebFetch(enabled bool, mode string, allowedDomains string) {
 	if webCfg.fetchMode == "" {
 		webCfg.fetchMode = "https"
 	}
-	if strings.TrimSpace(allowedDomains) != "" {
-		parts := strings.Split(allowedDomains, ",")
-		list := make([]string, 0, len(parts))
-		for _, p := range parts {
-			p = strings.TrimSpace(strings.ToLower(p))
-			if p != "" {
-				list = append(list, p)
-			}
-		}
-		webCfg.fetchDomains = list
-	} else {
-		webCfg.fetchDomains = nil
-	}
+	webCfg.fetchDomains = parseDomainList(allowedDomains)
 }
 
 // ConfigureWebSearchEnabled sets whether web_search is allowed (independent of web_fetch).

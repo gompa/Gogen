@@ -2,9 +2,7 @@ package agent
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"os/exec"
 	"strconv"
 	"strings"
 )
@@ -33,24 +31,9 @@ func (e *Executor) GitLog(ctx context.Context, path string, limit int) (string, 
 		args = append(args, "--", path)
 	}
 
-	cmd, cmdErr := e.newGitCmd(ctx, args...)
-	if cmdErr != nil {
-		return "", cmdErr
-	}
-	out, err := cmd.CombinedOutput()
-	text := strings.TrimSpace(string(out))
+	text, err := e.runGitCommand(ctx, args)
 	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 128 && text != "" {
-			return "", fmt.Errorf("git log failed: %s", text)
-		}
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
-		if text == "" {
-			return "", fmt.Errorf("git log failed: %w", err)
-		}
-		return "", fmt.Errorf("git log failed: %s", text)
+		return "", gitError("log", text, err)
 	}
 	if text == "" {
 		return "No commits found", nil
@@ -84,20 +67,9 @@ func (e *Executor) GitBlame(ctx context.Context, path string, startLine, limit i
 		"--", path,
 	}
 
-	cmd, cmdErr := e.newGitCmd(ctx, args...)
-	if cmdErr != nil {
-		return "", cmdErr
-	}
-	out, err := cmd.CombinedOutput()
-	text := strings.TrimSpace(string(out))
+	text, err := e.runGitCommand(ctx, args)
 	if err != nil {
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
-		if text == "" {
-			return "", fmt.Errorf("git blame failed: %w", err)
-		}
-		return "", fmt.Errorf("git blame failed: %s", text)
+		return "", gitError("blame", text, err)
 	}
 	if text == "" {
 		return "No blame data found", nil

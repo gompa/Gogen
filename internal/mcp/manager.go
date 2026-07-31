@@ -29,6 +29,9 @@ const (
 	mcpMaxSkippedResponses = 100
 )
 
+// toolPrefix is prepended to every LLM-visible MCP tool name.
+const toolPrefix = "mcp_"
+
 var sanitizeRE = regexp.MustCompile(`[^a-z0-9_]+`)
 
 // Registry aggregates MCP tools for the agent.
@@ -401,7 +404,7 @@ func (m *Manager) Registry() *Registry {
 
 // ExternalToolName builds the LLM-visible MCP tool name.
 func ExternalToolName(server, tool string) string {
-	return "mcp_" + sanitize(server) + "_" + sanitize(tool)
+	return toolPrefix + sanitize(server) + "_" + sanitize(tool)
 }
 
 func sanitize(s string) string {

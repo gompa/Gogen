@@ -538,7 +538,7 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 	a.extendTokenCounts()
 	// If the session doesn't have a label yet, derive one from the first user message.
 	if a.SessionLabel == "" {
-		a.SessionLabel = llm.SessionLabel(a.Messages, llm.DefaultSessionLabelMaxLen)
+		a.SessionLabel = llm.SessionLabel(a.Messages)
 	}
 	// Persist immediately so a failed/cancelled turn does not drop the user message.
 	a.FlushSession()
@@ -755,19 +755,9 @@ func (a *Agent) toolContext(ctx context.Context) context.Context {
 	return ctx
 }
 
-func boolArgOptional(args map[string]interface{}, key string) (bool, error) {
-	val, ok := args[key]
-	if !ok {
-		return false, nil
-	}
-	b, ok := val.(bool)
-	if !ok {
-		return false, fmt.Errorf("argument %q must be a boolean", key)
-	}
-	return b, nil
-}
-
-func boolArgDefault(args map[string]interface{}, key string, def bool) (bool, error) {
+// boolArg reads an optional boolean tool argument, returning def when the
+// key is absent.
+func boolArg(args map[string]interface{}, key string, def bool) (bool, error) {
 	val, ok := args[key]
 	if !ok {
 		return def, nil

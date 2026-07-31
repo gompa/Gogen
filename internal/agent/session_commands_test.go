@@ -59,7 +59,7 @@ func (s *stubSessionStore) List(workingDir string) ([]SessionInfo, error) {
 		out = append(out, SessionInfo{
 			ID:           id,
 			MessageCount: len(snap.Messages),
-			Label:        llm.SessionLabel(snap.Messages, llm.DefaultSessionLabelMaxLen),
+			Label:        llm.SessionLabel(snap.Messages),
 		})
 	}
 	return out, nil

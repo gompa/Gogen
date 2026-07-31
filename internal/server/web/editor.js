@@ -326,6 +326,34 @@ function normalizeColorizeHTML(html) {
   return html.replace(/<\s*br\s*\/?>\s*$/i, '');
 }
 
+// Cache of Monaco colorize output keyed by `lang\0source`. During streaming
+// the message DOM is re-rendered every flush, which recreates every code
+// element — without this cache each flush would re-tokenize every completed
+// code block. Tokenization is deterministic for a given (language, source)
+// pair, so a cached result is always valid for the same text.
+const COLORIZE_CACHE_MAX = 300;
+const colorizeCache = new Map();
+
+/**
+ * Tokenize `source` for `lang` via Monaco, returning normalized HTML.
+ * Completed blocks (unchanged text between flushes) hit the cache and skip
+ * tokenization entirely; only growing in-flight blocks re-tokenize.
+ */
+function cachedColorize(m, source, lang) {
+  const key = lang + '\u0000' + source;
+  const hit = colorizeCache.get(key);
+  if (hit !== undefined) return Promise.resolve(hit);
+  return m.editor.colorize(source, lang, {}).then((raw) => {
+    const html = normalizeColorizeHTML(raw);
+    if (colorizeCache.size >= COLORIZE_CACHE_MAX) {
+      const oldest = colorizeCache.keys().next().value;
+      if (oldest !== undefined) colorizeCache.delete(oldest);
+    }
+    colorizeCache.set(key, html);
+    return html;
+  });
+}
+
 /**
  * Colorize a single element's textContent with Monaco.
  * langHint may be a language id or a file path.
@@ -403,7 +431,7 @@ export async function colorizeCodeBlocks(root) {
     tasks.push(
       (async () => {
         try {
-          const html = normalizeColorizeHTML(await m.editor.colorize(source, lang, {}));
+          const html = await cachedColorize(m, source, lang);
           if (root._gogenHlGen !== genSnapshot || !code.isConnected) return;
           code.innerHTML = html;
           code.dataset.monacoColorized = '1';
@@ -535,6 +563,9 @@ function showDiffPane() {
     diffEditor = monaco.editor.createDiffEditor(diffHost, {
       automaticLayout: true,
       readOnly: true,
+      // Read-only diff pane: no text cursor (avoids a permanent blink
+      // animation per editor keeping the refresh driver busy).
+      cursorBlinking: 'hidden',
       renderSideBySide: GOGEN_UI.diffRenderSideBySide,
       minimap: { enabled: false },
       fontSize: 13,
@@ -1273,6 +1304,10 @@ function resizeDiffContainer(container, ed) {
   const w = container.clientWidth || 0;
   if (w <= 0) return;
   const h = Math.max(DIFF_MIN_HEIGHT, Math.min(DIFF_MAX_HEIGHT, Math.ceil(ed.getContentHeight())));
+  // Hysteresis: ignore sub-2px changes so flex layout and Monaco's async
+  // layout passes cannot ping-pong the container height — every height change
+  // forces a reflow of the whole chat plus a repin scroll.
+  if (container._lastDiffH !== undefined && Math.abs(h - container._lastDiffH) < 2) return;
   container.style.height = h + 'px';
   ed.layout({ width: w, height: h });
   // The diff host grows asynchronously after the tool card is placed (Monaco
@@ -1306,6 +1341,10 @@ export async function mountDiffEditor(container, value, opts = {}) {
       value: value || '',
       language: 'diff',
       readOnly: true,
+      // No text cursor in a read-only diff viewer: Monaco's default blinking
+      // cursor runs a permanent CSS animation per editor (observed keeping the
+      // refresh driver ticking at ~60 Hz across all mounted diff cards).
+      cursorBlinking: 'hidden',
       // Fixed host size — avoid ResizeObserver fighting flex layout.
       automaticLayout: false,
       minimap: { enabled: false },

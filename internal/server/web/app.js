@@ -630,15 +630,24 @@
         let contextLimit = 0;
         let contextEstAdded = 0;
         let lastContextData = null;
+        // Coalesces per-token context badge updates into one rAF pass.
+        let ctxEstimateRafPending = false;
         // Map toolCallId → args for history replay of patch_file diffs
         let historyToolCallArgs = {};
         // True while replayHistory() rebuilds the pane; suppresses per-message
         // smartScroll so the rebuild doesn't force O(n) layout passes.
         let replayInProgress = false;
+        // Tool-result colorize requests made while a history replay is in
+        // flight are deferred until the replay finishes and first paint lands,
+        // so Monaco tokenization doesn't fight the transcript rebuild for
+        // main-thread time. Same colorize output, just later.
+        let deferredResultColorize = [];
         // Monotonic counter for message positions (used for forking)
         let msgIdxCounter = 0;
 
+        let _prevTurnActive = false;
         function setTurnActive(active) {
+            const wasActive = _prevTurnActive;
             turnActive = !!active;
             if (cancelBtn) cancelBtn.disabled = !turnActive;
             if (sendBtn) sendBtn.disabled = false; // send cancels+restarts; keep enabled
@@ -646,6 +655,13 @@
             document.getElementById('input-area').classList.toggle('turn-active', turnActive);
             if (!active) {
                 toolsStartedThisTurn = false;
+            }
+            // Turn-end notification on any active→inactive transition, except
+            // user-initiated stops that immediately start a new turn
+            // (send-while-busy / resend are tracked via suppressTurnEnds).
+            _prevTurnActive = turnActive;
+            if (wasActive && !turnActive && suppressTurnEnds === 0) {
+                sendNotification('GoGen', 'Agent finished responding.', 'gogen-turn-end');
             }
         }
 
@@ -658,15 +674,24 @@
         function bumpContextEstimate(delta) {
             if (!delta || (contextBaseUsed <= 0 && contextLimit <= 0)) return;
             contextEstAdded += estimateTokenCount(delta);
-            const used = contextBaseUsed + contextEstAdded;
-            const data = Object.assign({}, lastContextData || {}, {
-                usedTokens: used,
-                contextLimit: contextLimit || (lastContextData && lastContextData.contextLimit) || 0,
-                usedSource: 'estimated',
-                usedPercent: contextLimit > 0 ? used / contextLimit : 0,
-                toolTruncated: false,
+            // Batch the badge update to one rAF pass instead of a DOM write
+            // per token. The server sends an authoritative context message at
+            // turn end, which supersedes any pending estimate.
+            if (ctxEstimateRafPending) return;
+            ctxEstimateRafPending = true;
+            requestAnimationFrame(() => {
+                ctxEstimateRafPending = false;
+                if (contextEstAdded === 0) return;
+                const used = contextBaseUsed + contextEstAdded;
+                const data = Object.assign({}, lastContextData || {}, {
+                    usedTokens: used,
+                    contextLimit: contextLimit || (lastContextData && lastContextData.contextLimit) || 0,
+                    usedSource: 'estimated',
+                    usedPercent: contextLimit > 0 ? used / contextLimit : 0,
+                    toolTruncated: false,
+                });
+                updateContextInfo(data);
             });
-            updateContextInfo(data);
         }
 
         // Collapse only when output is genuinely large (DOM / scroll cost).
@@ -704,6 +729,49 @@
             return `(large output: ${lines} lines, ${chars} chars)`;
         }
 
+        // Tool-result syntax highlighting (Monaco tokenization) is deferred
+        // while a history replay is rebuilding the pane: restored sessions
+        // paint the transcript first, then colorize in idle-time slices.
+        // The colorize itself is unchanged, so restored cards end up looking
+        // identical to live ones.
+        function scheduleResultColorize(el, language) {
+            if (replayInProgress) {
+                deferredResultColorize.push(() => colorizeElement(el, language));
+                return;
+            }
+            colorizeElement(el, language);
+        }
+
+        // Run deferred tool-result colorizes after the replay finishes, in
+        // ~12ms idle slices so a session with many large results doesn't jank
+        // the main thread in one block. Each job is awaited so the slice
+        // deadline actually bounds the synchronous tokenization work.
+        function flushDeferredResultColorize() {
+            if (!deferredResultColorize.length) return;
+            const jobs = deferredResultColorize;
+            deferredResultColorize = [];
+            let i = 0;
+            const runSlice = async () => {
+                const deadline = performance.now() + 12;
+                while (i < jobs.length && performance.now() < deadline) {
+                    try { await jobs[i](); } catch (_) { /* keep going */ }
+                    i++;
+                }
+                if (i < jobs.length) {
+                    if (typeof requestIdleCallback === 'function') {
+                        requestIdleCallback(runSlice, { timeout: 100 });
+                    } else {
+                        setTimeout(runSlice, 0);
+                    }
+                }
+            };
+            if (typeof requestIdleCallback === 'function') {
+                requestIdleCallback(runSlice, { timeout: 400 });
+            } else {
+                setTimeout(runSlice, 50);
+            }
+        }
+
         function appendExpandableResult(body, result, success, truncated, options = {}) {
             const { language = '' } = options;
             const content = document.createElement('div');
@@ -725,7 +793,7 @@
             const canHighlight = success && language && language !== 'plaintext';
             const showingFull = summary === full.trim();
             if (canHighlight && showingFull) {
-                colorizeElement(content, language);
+                scheduleResultColorize(content, language);
             }
 
             if (summary !== full.trim() && (full.trim() || truncated)) {
@@ -849,6 +917,108 @@
                 el.appendChild(textWrap);
             }
             textWrap.innerHTML = renderMarkdownHTML(text);
+            messageRawStore.set(el, text);
+            enhanceCodeBlocksWithCopy(textWrap);
+            colorizeCodeBlocks(textWrap);
+        }
+
+        // ===== Incremental streaming render =====
+        // Streaming messages are re-rendered on a ~32ms cadence. Re-parsing,
+        // re-sanitizing and re-swapping the whole accumulated markdown on every
+        // flush is O(n²) in message length and forces a full reflow per flush.
+        // Instead we render stable markdown blocks once and only re-render the
+        // in-flight tail block. Block boundaries are conservative (blank lines
+        // outside fenced code blocks), so no paragraph is ever rendered
+        // partially. Any residual block-split artifacts (e.g. a list split at
+        // a blank line) are corrected by the final full render when the stream
+        // ends (see endStream/finalizeThinking).
+        function splitStreamBlocks(text) {
+            const blocks = [];
+            let cur = '';
+            let fence = null; // { mark: '`'|'~', len } while inside a fenced code block
+            for (const line of String(text).split('\n')) {
+                if (fence) {
+                    cur += line + '\n';
+                    // CommonMark closing rule: same char, length >= opener,
+                    // nothing but trailing whitespace after it. This keeps a
+                    // 3-tick line from closing a 4-tick outer fence (nested
+                    // code blocks) and "```js" from closing a fence.
+                    const c = /^\s*(`+|~+)\s*$/.exec(line);
+                    if (c && c[1][0] === fence.mark && c[1].length >= fence.len) fence = null;
+                    continue;
+                }
+                const m = /^\s*(```+|~~~+)/.exec(line);
+                if (m) {
+                    cur += line + '\n';
+                    fence = { mark: m[1][0], len: m[1].length };
+                    continue;
+                }
+                if (line.trim() === '') {
+                    if (cur !== '') {
+                        blocks.push(cur);
+                        cur = '';
+                    }
+                    continue;
+                }
+                cur += line + '\n';
+            }
+            if (cur !== '') blocks.push(cur);
+            return blocks;
+        }
+
+        // Incremental renderer for the live streaming paths (assistant stream
+        // and thinking). Per-element state lives on el._gogenBlocks; the DOM
+        // shape mirrors setMessageMarkdown (.msg-text wrapper) so edit/resend
+        // and history replay behave identically.
+        function renderStreamMarkdown(el, text) {
+            el.classList.add('md');
+            el._gogenHlGen = (el._gogenHlGen || 0) + 1;
+            let textWrap = el.querySelector('.msg-text');
+            if (!textWrap) {
+                textWrap = document.createElement('div');
+                textWrap.className = 'msg-text';
+                el.appendChild(textWrap);
+            }
+            const st = el._gogenBlocks || (el._gogenBlocks = { done: [], tailNode: null });
+            const blocks = splitStreamBlocks(text);
+            // The last block is the in-flight tail; everything before it is complete.
+            const doneCount = blocks.length > 0 ? blocks.length - 1 : 0;
+
+            // Completed blocks: keep stable nodes for unchanged text, render
+            // new ones. New nodes are inserted before the tail node so DOM
+            // order always matches document order.
+            for (let i = 0; i < doneCount; i++) {
+                const prev = st.done[i];
+                if (prev && prev.text === blocks[i]) continue;
+                const node = document.createElement('div');
+                node.className = 'md-block';
+                node.innerHTML = renderMarkdownHTML(blocks[i]);
+                if (prev) {
+                    prev.node.replaceWith(node);
+                    st.done[i] = { text: blocks[i], node };
+                } else if (st.tailNode) {
+                    textWrap.insertBefore(node, st.tailNode);
+                    st.done.push({ text: blocks[i], node });
+                } else {
+                    textWrap.appendChild(node);
+                    st.done.push({ text: blocks[i], node });
+                }
+            }
+            // Drop completed blocks that no longer exist (text rewound — this is
+            // defensive; streaming only ever grows).
+            while (st.done.length > doneCount) {
+                st.done.pop().node.remove();
+            }
+
+            // Tail: one stable node, re-rendered every flush.
+            const tailText = doneCount < blocks.length ? blocks[doneCount] : '';
+            if (!st.tailNode) {
+                st.tailNode = document.createElement('div');
+                st.tailNode.className = 'md-block md-tail';
+                textWrap.appendChild(st.tailNode);
+            }
+            st.tailNode.innerHTML = tailText ? renderMarkdownHTML(tailText) : '';
+
             messageRawStore.set(el, text);
             enhanceCodeBlocksWithCopy(textWrap);
             colorizeCodeBlocks(textWrap);
@@ -1105,12 +1275,10 @@
             streamLastRender = performance.now();
             if (!currentStreamDiv) return;
             const keepCursor = currentStreamDiv.classList.contains('cursor');
-            setMessageMarkdown(currentStreamDiv, currentStreamRaw);
+            renderStreamMarkdown(currentStreamDiv, currentStreamRaw);
             if (keepCursor) currentStreamDiv.classList.add('cursor');
             // Scroll after DOM height actually changes (tokens arrive before paint).
             smartScroll();
-            // Notify scroll system that DOM height may have changed
-            window.dispatchEvent(new CustomEvent('gogen-colorized', { bubbles: false }));
         }
 
         function scheduleStreamRender() {
@@ -1199,10 +1367,8 @@
             thinkingLastRender = performance.now();
             if (!currentThinkingSpan) return;
             // Live markdown render of the reasoning content, exactly like the
-            // assistant stream (same cadence, same per-flush colorize). The
-            // colorized and plain code states are height-identical, so the
-            // pinned scroll stays stable while colors apply mid-stream.
-            setMessageMarkdown(currentThinkingSpan, currentThinkingRaw);
+            // assistant stream (same cadence, same incremental renderer).
+            renderStreamMarkdown(currentThinkingSpan, currentThinkingRaw);
             smartScroll();
         }
 
@@ -1253,11 +1419,14 @@
 
         function finalizeThinking() {
             if (!currentThinkingDiv) return;
-            // Render any tokens that arrived since the last live flush so the
-            // final card shows the complete reasoning text.
-            flushThinkingRender();
             const div = currentThinkingDiv;
             const content = (currentThinkingRaw || '').trim();
+            if (content) {
+                // Final full render: corrects any block-split artifacts from
+                // the incremental live stream (e.g. a list split at a blank
+                // line) so the collapsed card matches a single-shot render.
+                setMessageMarkdown(currentThinkingSpan, currentThinkingRaw);
+            }
             currentThinkingDiv = null;
             currentThinkingSpan = null;
             currentThinkingRaw = '';
@@ -1272,7 +1441,11 @@
 
         function endStream() {
             if (currentStreamDiv) {
-                flushStreamRender();
+                // Final full render: the incremental live renderer keeps
+                // stable blocks plus an in-flight tail, so a full pass here
+                // guarantees the final DOM exactly matches a single-shot
+                // render (fixes any block-split artifacts from streaming).
+                setMessageMarkdown(currentStreamDiv, currentStreamRaw || '');
                 currentStreamDiv.classList.remove('cursor');
                 addTimestampToMsg(currentStreamDiv, new Date());
                 // Assign a message index and fork button.
@@ -1698,6 +1871,29 @@
             smartScroll();
         }
 
+        // A history replay rebuilds the whole pane with awaits (Monaco mounts,
+        // colorize, image loads). If one of those awaits never settles,
+        // replayInProgress stays true forever and every smartScroll() becomes a
+        // no-op: the view silently stops following new messages. The watchdog
+        // clears the flag and pins so the UI recovers even if a restore hangs.
+        const REPLAY_WATCHDOG_MS = 20000;
+        let replayWatchdog = null;
+        function armReplayWatchdog() {
+            clearTimeout(replayWatchdog);
+            replayWatchdog = setTimeout(() => {
+                replayWatchdog = null;
+                if (!replayInProgress) return;
+                console.warn('history replay watchdog fired; re-enabling scroll follow');
+                replayInProgress = false;
+                flushDeferredResultColorize();
+                pinToBottom();
+            }, REPLAY_WATCHDOG_MS);
+        }
+        function disarmReplayWatchdog() {
+            clearTimeout(replayWatchdog);
+            replayWatchdog = null;
+        }
+
         async function replayHistory(history) {
             // Session/history loads should always land at the bottom.
             stickToBottom = true;
@@ -1713,6 +1909,7 @@
             // forced layouts. The history handler's error fallback also resets
             // this so a failed replay still scrolls while re-appending.
             replayInProgress = true;
+            armReplayWatchdog();
             function msgDate(createdAt) {
                 return createdAt ? new Date(createdAt) : new Date();
             }
@@ -1789,6 +1986,8 @@
                 }
             }
             replayInProgress = false;
+            disarmReplayWatchdog();
+            flushDeferredResultColorize();
             // Pin twice: once immediately, then again after a frame to catch
             // late DOM mutations (Monaco colorization, image loads, etc.).
             pinToBottom();
@@ -2005,6 +2204,8 @@
                             // Ensure the replay scroll-suppression flag is off
                             // so the fallback re-append below scrolls normally.
                             replayInProgress = false;
+                            disarmReplayWatchdog();
+                            flushDeferredResultColorize();
                             for (const h of data.history) {
                                 if (h.role === 'user' || h.role === 'assistant') {
                                     if (h.content) {
@@ -2072,7 +2273,6 @@
             contextEstAdded = 0;
             ws.send(JSON.stringify({ type: 'message', content: text }));
             inputArea.value = '';
-            inputArea.style.height = 'auto';
         };
 
         cancelBtn.onclick = () => {
@@ -2086,11 +2286,11 @@
 
         inputArea.addEventListener('input', updateSlashSuggest);
 
-        /* Task 1: Auto-resize textarea */
-        inputArea.addEventListener('input', () => {
-            inputArea.style.height = 'auto';
-            inputArea.style.height = Math.min(inputArea.scrollHeight, 200) + 'px';
-        });
+        /* Task 1: Textarea auto-resize is handled natively by CSS
+           `field-sizing: content` (see styles.css) — no JS size tracking.
+           The browser grows/shrinks the box with its content and clamps it
+           via min-height/max-height. Firefox 152+ / Chrome 123+ / Safari
+           26.2+; older engines keep the box at min-height (static). */
 
         inputArea.addEventListener('blur', () => {
             // Delay so mousedown on a suggestion can fire first.
@@ -2481,9 +2681,38 @@
         // === Task 3: Scroll-to-bottom button ===
         const scrollBottomBtn = document.getElementById('scroll-bottom-btn');
         const NEAR_BOTTOM_PX = 32;
+        // Re-pin is suppressed for this long after an unpin so a single small
+        // wheel/touch nudge doesn't unpin and then immediately re-pin (which
+        // made streaming smartScroll yank the view back down mid-gesture).
+        const UNPIN_REPIN_GRACE_MS = 400;
+        // Touch drags shorter than this (in CSS px) are taps / accidental
+        // finger drift / momentum, not scroll intent. The old 2px threshold
+        // un-pinned on tap drift, pinch-zoom and overscroll.
+        const TOUCH_UNPIN_PX = 10;
+        // Vertically scrollable children inside #messages (Monaco diff
+        // viewers, tool-result bodies, diff fallbacks) consume wheel/touch
+        // input of their own. Events bubbling up from them must not un-pin the
+        // chat: the user is scrolling the diff, not leaving the bottom. Real
+        // chat scrolls still un-pin via the scroll handler below (native
+        // scroll chaining fires a #messages scroll event).
+        const NESTED_SCROLLER_SELECTOR = [
+            '.monaco-scrollable-element', // Monaco editor internals
+            '.monaco-tool-host',          // diff viewer host
+            '.diff-fallback',             // pre-Monaco diff fallback
+            '.tool-result-content',       // scrollable tool output bodies
+        ].join(', ');
+        // Timestamp (performance.now) of the last unpin; gates the d<=8
+        // re-pin branch in the scroll handler (see UNPIN_REPIN_GRACE_MS).
+        let lastUnpinAt = 0;
+        let unpinRecoverTimer = null;
 
         function distanceFromBottom() {
             return messagesDiv.scrollHeight - messagesDiv.scrollTop - messagesDiv.clientHeight;
+        }
+
+        function eventInNestedScroller(e) {
+            const t = e && e.target;
+            return !!(t && typeof t.closest === 'function' && t.closest(NESTED_SCROLLER_SELECTOR));
         }
 
         function updateScrollBottomBtn() {
@@ -2493,14 +2722,28 @@
         function unpinFromBottom() {
             if (!stickToBottom) return;
             stickToBottom = false;
+            lastUnpinAt = performance.now();
             updateScrollBottomBtn();
             // Re-enable browser scroll anchoring now that the user is reading
             // (prevents content from jumping when the streaming div changes height).
             messagesDiv.classList.remove('no-anchor');
+            // A tiny nudge (or a false-positive unpin) can leave the view just
+            // above the bottom with no further scroll events to re-pin it.
+            // Once the grace period passes, if the user is still within the
+            // "truly at the bottom" threshold, resume following instead of
+            // leaving the view stranded a few pixels up in history.
+            clearTimeout(unpinRecoverTimer);
+            unpinRecoverTimer = setTimeout(() => {
+                unpinRecoverTimer = null;
+                if (stickToBottom) return;
+                if (distanceFromBottom() <= 8) pinToBottom();
+            }, UNPIN_REPIN_GRACE_MS + 50);
         }
 
         function pinToBottom() {
             stickToBottom = true;
+            clearTimeout(unpinRecoverTimer);
+            unpinRecoverTimer = null;
             // Disable browser scroll anchoring while we're auto-following
             // (prevents anchoring from fighting smartScroll's scroll-to-bottom).
             messagesDiv.classList.add('no-anchor');
@@ -2514,9 +2757,12 @@
         // or streaming smartScroll will yank them back before they escape.
         // Only unpin when there is actually content to scroll: a non-scrollable
         // pane can't fire a scroll event to re-pin, leaving the button stuck.
+        // Wheel/touch/keyboard events bubbling up from nested scrollable
+        // children (Monaco diff viewers, tool results) are ignored: the user
+        // is interacting with that content, not leaving the bottom.
         const messagesScrollable = () => messagesDiv.scrollHeight > messagesDiv.clientHeight;
         messagesDiv.addEventListener('wheel', (e) => {
-            if (e.deltaY < 0 && messagesScrollable()) unpinFromBottom();
+            if (e.deltaY < 0 && messagesScrollable() && !eventInNestedScroller(e)) unpinFromBottom();
         }, { passive: true });
         messagesDiv.addEventListener('touchstart', () => {
             // Touch scroll direction is known on touchmove; mark intent on any
@@ -2526,13 +2772,20 @@
         messagesDiv.addEventListener('touchmove', (e) => {
             const y = e.touches[0]?.clientY;
             if (y == null) return;
-            if (messagesDiv._touchY != null && y > messagesDiv._touchY + 2) {
-                // Finger moved down → content scrolls up
-                if (messagesScrollable()) unpinFromBottom();
+            if (messagesDiv._touchY != null && y > messagesDiv._touchY + TOUCH_UNPIN_PX) {
+                // Finger moved down → content scrolls up (only for touches
+                // that started outside the nested scrollable children above).
+                if (messagesScrollable() && !eventInNestedScroller(e)) unpinFromBottom();
             }
             messagesDiv._touchY = y;
         }, { passive: true });
         messagesDiv.addEventListener('keydown', (e) => {
+            // ArrowUp/PageUp/Home pressed inside a Monaco editor or another
+            // editable element move that editor's cursor, not the chat.
+            const t = e.target;
+            const inEditable = t && typeof t.closest === 'function' &&
+                t.closest('textarea, input, [contenteditable="true"], .monaco-editor');
+            if (inEditable) return;
             if ((e.key === 'ArrowUp' || e.key === 'PageUp' || e.key === 'Home') && messagesScrollable()) unpinFromBottom();
         });
 
@@ -2553,10 +2806,19 @@
                     // Clearly away from bottom (scrollbar drag, etc.)
                     stickToBottom = false;
                     messagesDiv.classList.remove('no-anchor');
-                } else if (d <= 8) {
-                    // Truly back at the bottom — re-enable follow
+                } else if (d <= 8 && performance.now() - lastUnpinAt > UNPIN_REPIN_GRACE_MS) {
+                    // Truly back at the bottom — re-enable follow. The grace
+                    // window keeps a single small wheel/touch nudge from
+                    // unpinning and then immediately re-pinning (which yanked
+                    // the view back down mid-gesture while streaming).
+                    // lastUnpinAt is only set by the eager unpin gestures
+                    // (wheel/touch/keydown), NOT by the d>32 branch above:
+                    // otherwise a continuous scroll back down would keep
+                    // refreshing it and the re-pin would never fire.
                     stickToBottom = true;
                     messagesDiv.classList.add('no-anchor');
+                    clearTimeout(unpinRecoverTimer);
+                    unpinRecoverTimer = null;
                 }
                 // 8 < d <= NEAR_BOTTOM_PX: leave stickToBottom alone so a small
                 // upward scroll after wheel-unpin is not immediately re-pinned.
@@ -2571,12 +2833,33 @@
         // the DOM after we've already scrolled. Re-adjust when pinned, coalesced
         // to one rAF pass so bursts of events don't force repeated layouts.
         let _repinRafPending = false;
+        // While detached, re-engage follow if the user is near the bottom.
+        // Needed because content growing below (streaming tokens, colorize,
+        // images, fonts, resizes) keeps moving the bottom away, so a plain
+        // scroll event can pass through the 8px threshold and never fire again.
+        // The threshold here is deliberately more forgiving (NEAR_BOTTOM_PX)
+        // than the scroll-event re-pin (8px): a tall last tool card (Monaco
+        // diff up to 400px, tool result up to 70vh) leaves its tail below the
+        // fold next to the composer toolbar, so a user at the *visual* bottom
+        // can still be >8px from the scroll bottom. If content grew while they
+        // are within ~2 lines of the bottom, they were effectively at the
+        // bottom — pull them to the new bottom.
+        function maybeRepinNearBottom() {
+            if (stickToBottom || replayInProgress) return;
+            // Don't yank the chat while the user is composing: typing resizes
+            // the input row, which shrinks the messages viewport and moves the
+            // bottom — that's not scroll intent and shouldn't trigger re-pin.
+            if (document.activeElement === inputArea) return;
+            if (performance.now() - lastUnpinAt <= UNPIN_REPIN_GRACE_MS) return;
+            if (distanceFromBottom() <= NEAR_BOTTOM_PX) pinToBottom();
+        }
         function scheduleRepinIfPinned() {
-            if (!stickToBottom || _repinRafPending) return;
+            if (_repinRafPending) return;
             _repinRafPending = true;
             requestAnimationFrame(() => {
                 _repinRafPending = false;
                 if (stickToBottom) smartScroll();
+                else maybeRepinNearBottom();
             });
         }
         window.addEventListener('gogen-colorized', scheduleRepinIfPinned);
@@ -2593,8 +2876,8 @@
             // resize). scrollHeight growth is content, not the box, so the
             // streaming / colorize / image / font paths above cover that case.
             new ResizeObserver(() => {
-                if (stickToBottom) scheduleRepinIfPinned();
-                else updateScrollBottomBtn();
+                scheduleRepinIfPinned();
+                if (!stickToBottom) updateScrollBottomBtn();
             }).observe(messagesDiv);
         }
 
@@ -2604,7 +2887,11 @@
         // re-invokes smartScroll after Monaco finishes coloring.
         let _smartScrollRafPending = false;
         function smartScroll() {
-            if (!stickToBottom || replayInProgress) return;
+            if (replayInProgress) return;
+            if (!stickToBottom) {
+                maybeRepinNearBottom();
+                return;
+            }
             // Suppress the scroll event generated by this programmatic scroll.
             // The flag must survive until that event fires, so reset it on the
             // next frame (scroll events are dispatched as tasks before the next
@@ -2841,24 +3128,14 @@
         // === Accent color: persist and apply ===
         const accentInput = document.getElementById('accent-color-input');
 
-        function hexToRgba(hex, alpha) {
-            if (!/^#[0-9a-f]{6}$/i.test(hex)) return null;
-            const r = parseInt(hex.slice(1, 3), 16);
-            const g = parseInt(hex.slice(3, 5), 16);
-            const b = parseInt(hex.slice(5, 7), 16);
-            return 'rgba(' + r + ', ' + g + ', ' + b + ', ' + alpha + ')';
-        }
-
+        // The soft accent variant is derived in CSS via color-mix, so JS only
+        // needs to set the base --user-accent (see styles.css).
         function applyAccentColor(hex) {
             if (!hex) {
                 document.documentElement.style.removeProperty('--user-accent');
-                document.documentElement.style.removeProperty('--user-accent-soft');
                 return;
             }
-            const soft = hexToRgba(hex, 0.18);
-            if (!soft) return;
             document.documentElement.style.setProperty('--user-accent', hex);
-            document.documentElement.style.setProperty('--user-accent-soft', soft);
         }
 
         const savedAccent = localStorage.getItem('gogen-accent-color') || '';
@@ -2885,7 +3162,6 @@
         document.getElementById('accent-reset-btn').addEventListener('click', function () {
             localStorage.removeItem('gogen-accent-color');
             document.documentElement.style.removeProperty('--user-accent');
-            document.documentElement.style.removeProperty('--user-accent-soft');
             // Reset picker to the current theme's default accent
             const isLight = document.documentElement.classList.contains('light');
             accentInput.value = isLight ? '#0066cc' : '#569cd6';
@@ -2931,18 +3207,6 @@
         if (getNotificationPref() !== 'off') {
             requestNotificationPermission();
         }
-
-        // Detect turn_end by observing the cancel button's disabled attribute,
-        // which toggles whenever setTurnActive is called.
-        let _prevTurnActive = false;
-        const _turnObserver = new MutationObserver(() => {
-            const isActive = !cancelBtn.disabled;
-            if (_prevTurnActive && !isActive) {
-                sendNotification('GoGen', 'Agent finished responding.', 'gogen-turn-end');
-            }
-            _prevTurnActive = isActive;
-        });
-        _turnObserver.observe(cancelBtn, { attributes: true, attributeFilter: ['disabled'] });
 
         // Delete approval: always notify since it requires user action
         const _origShowDeleteApproval = showDeleteApproval;

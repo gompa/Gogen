@@ -33,13 +33,7 @@ type Executor struct {
 }
 
 func NewExecutor(wd string) *Executor {
-	return &Executor{
-		WorkingDir:            wd,
-		Commands:              NewCommandGuard("blocklist", nil),
-		RequireDeleteApproval: true,
-		CommandTimeout:        defaultCommandTimeout,
-		Sandbox:               "off",
-	}
+	return NewExecutorWithGuard(wd, nil)
 }
 
 func NewExecutorWithGuard(wd string, guard *CommandGuard) *Executor {
