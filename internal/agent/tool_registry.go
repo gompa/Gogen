@@ -463,7 +463,24 @@ func handleWebFetch(ctx context.Context, a *Agent, args map[string]interface{}) 
 	if err != nil {
 		return "", err
 	}
-	return a.Executor.WebFetch(ctx, rawURL, maxBytes)
+	selector, err := stringArgOptional(args, "selector")
+	if err != nil {
+		return "", err
+	}
+	query, err := stringArgOptional(args, "query")
+	if err != nil {
+		return "", err
+	}
+	contextLines, err := intArgOptional(args, "context")
+	if err != nil {
+		return "", err
+	}
+	return a.Executor.WebFetch(ctx, rawURL, WebFetchOptions{
+		MaxBytes: maxBytes,
+		Selector: selector,
+		Query:    query,
+		Context:  contextLines,
+	})
 }
 
 func handleDownloadFile(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {

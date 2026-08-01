@@ -5,16 +5,16 @@ import (
 	"testing"
 )
 
-func TestHTMLToText_basic(t *testing.T) {
+func TestHTMLToMarkdown_basic(t *testing.T) {
 	input := []byte(`<html><body><h1>Hello</h1><p>This is a paragraph with <b>bold</b> text.</p></body></html>`)
-	got := htmlToText(input)
-	want := "Hello\n\nThis is a paragraph with bold text."
+	got := htmlToMarkdown(input, "")
+	want := "# Hello\n\nThis is a paragraph with **bold** text."
 	if got != want {
 		t.Fatalf("got:\n%q\nwant:\n%q", got, want)
 	}
 }
 
-func TestHTMLToText_stripsScriptStyleHead(t *testing.T) {
+func TestHTMLToMarkdown_stripsNoise(t *testing.T) {
 	input := []byte(`<html>
 <head><title>ignored</title><meta charset="utf-8"></head>
 <body>
@@ -23,42 +23,34 @@ func TestHTMLToText_stripsScriptStyleHead(t *testing.T) {
 <p>Visible text</p>
 <noscript>You need JavaScript</noscript>
 </body></html>`)
-	got := htmlToText(input)
-	// <head>, <style>, <script>, <noscript> content should be stripped.
-	// <p> introduces a leading newline then "Visible text" then a trailing newline from </p>.
-	if !strings.Contains(got, "Visible text") {
-		t.Fatalf("missing expected text in: %q", got)
-	}
-	if strings.Contains(got, "ignored") {
-		t.Errorf("head content not stripped: %q", got)
-	}
-	if strings.Contains(got, "console.log") {
-		t.Errorf("script content not stripped: %q", got)
-	}
-	if strings.Contains(got, "body { color") {
-		t.Errorf("style content not stripped: %q", got)
-	}
-	if strings.Contains(got, "You need JavaScript") {
-		t.Errorf("noscript content not stripped: %q", got)
+	got := htmlToMarkdown(input, "")
+	want := "Visible text"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 
-func TestHTMLToText_entities(t *testing.T) {
+func TestHTMLToMarkdown_entities(t *testing.T) {
 	input := []byte(`<html><body><p>AT&amp;T &lt; Verizon &gt; T-Mobile</p></body></html>`)
-	got := htmlToText(input)
-	want := "AT&T < Verizon > T-Mobile"
+	got := htmlToMarkdown(input, "")
+	// The library deliberately keeps < and > entity-escaped in text (its
+	// safety choice for markdown); &amp; is unescaped. Cosmetic, but pinned
+	// here so the behavior is deliberate rather than accidental.
+	want := "AT&T &lt; Verizon &gt; T-Mobile"
 	if got != want {
 		t.Fatalf("got:\n%q\nwant:\n%q", got, want)
 	}
 }
 
-func TestHTMLToText_blockTags(t *testing.T) {
+func TestHTMLToMarkdown_blockBreaks(t *testing.T) {
 	// br, hr, and block tags should introduce line breaks.
 	input := []byte(`<div>Line 1</div><div>Line 2<br>Line 2.5</div><hr><p>After HR</p>`)
-	got := htmlToText(input)
-	// Should have line breaks between blocks.
+	got := htmlToMarkdown(input, "")
 	if !strings.Contains(got, "Line 1") && !strings.Contains(got, "Line 2") && !strings.Contains(got, "After HR") {
 		t.Fatalf("unexpected output: %q", got)
+	}
+	if !strings.Contains(got, "* * *") {
+		t.Fatalf("hr should become a thematic break: %q", got)
 	}
 	// Verify multiple lines exist.
 	lines := strings.Split(got, "\n")
@@ -67,30 +59,111 @@ func TestHTMLToText_blockTags(t *testing.T) {
 	}
 }
 
-func TestHTMLToText_whitespaceCollapse(t *testing.T) {
+func TestHTMLToMarkdown_whitespaceCollapse(t *testing.T) {
 	input := []byte("<html><body><p>   lots    of   spaces   </p></body></html>")
-	got := htmlToText(input)
-	if strings.Contains(got, "   ") {
-		t.Fatalf("multiple spaces not collapsed: %q", got)
-	}
-	if strings.Contains(got, "\n\n\n") {
-		t.Fatalf("multiple blank lines not collapsed: %q", got)
+	got := htmlToMarkdown(input, "")
+	if got != "lots of spaces" {
+		t.Fatalf("got %q, want %q", got, "lots of spaces")
 	}
 }
 
-func TestHTMLToText_empty(t *testing.T) {
-	got := htmlToText([]byte("<html><head><title>x</title></head><script>y</script><style>z</style><body></body></html>"))
+func TestHTMLToMarkdown_empty(t *testing.T) {
+	got := htmlToMarkdown([]byte("<html><head><title>x</title></head><script>y</script><style>z</style><body></body></html>"), "")
 	if got != "" {
 		t.Fatalf("expected empty, got %q", got)
 	}
 }
 
-func TestHTMLToText_listItems(t *testing.T) {
-	// <li> is a block tag, should introduce line breaks.
+func TestHTMLToMarkdown_listItems(t *testing.T) {
 	input := []byte("<ul><li>First item</li><li>Second item</li></ul>")
-	got := htmlToText(input)
-	if !strings.Contains(got, "First item") || !strings.Contains(got, "Second item") {
-		t.Fatalf("unexpected output: %q", got)
+	got := htmlToMarkdown(input, "")
+	want := "- First item\n- Second item"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestHTMLToMarkdown_codeBlocksPreserved(t *testing.T) {
+	// Regression: the old hand-rolled tokenizer collapsed 3+ spaces,
+	// destroying code indentation. Fenced code blocks must keep it intact.
+	input := []byte("<pre><code class=\"language-go\">func main() {\n\t\tfmt.Println(\"hi\")\n\t}</code></pre>")
+	got := htmlToMarkdown(input, "")
+	want := "```go\nfunc main() {\n\t\tfmt.Println(\"hi\")\n\t}\n```"
+	if got != want {
+		t.Fatalf("got:\n%q\nwant:\n%q", got, want)
+	}
+}
+
+func TestHTMLToMarkdown_boilerplateRemoved(t *testing.T) {
+	// Empirical: nav/footer/aside dominate pages like GitHub and starve the
+	// byte budget before the real content appears.
+	// Interactive chrome (forms, dialogs, JS templates, buttons) is removed
+	// for the same reason: it is never article content.
+	input := []byte(`<nav><a href="/a">Home</a><a href="/b">Pricing</a></nav><footer>Copyright 2026</footer><aside>Sidebar ad</aside><form><input name="q" placeholder="Search or jump to..."></form><dialog>Provide feedback</dialog><template>{{ message }}</template><button type="button">Open menu</button><main><p>Real content</p></main>`)
+	got := htmlToMarkdown(input, "")
+	if got != "Real content" {
+		t.Fatalf("got %q, want %q", got, "Real content")
+	}
+}
+
+func TestHTMLToMarkdown_headerKept(t *testing.T) {
+	// Page titles commonly live in <h1> inside <header> (pkg.go.dev's
+	// package title is one example); removing header would lose them.
+	input := []byte(`<header><h1>Package htmltomarkdown</h1></header><main><p>Body</p></main>`)
+	got := htmlToMarkdown(input, "")
+	want := "# Package htmltomarkdown\n\nBody"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestHTMLToMarkdown_noListEndComments(t *testing.T) {
+	// Regression: the commonmark plugin inserts "<!--THE END-->" markers
+	// between adjacent lists (a round-trip fidelity aid). They must not
+	// leak into the output — MDN's a11y-menu <ul> followed by the
+	// breadcrumb <ol> exposed exactly this.
+	input := []byte(`<ul><li>Skip</li></ul><ol><li>Web</li></ol>`)
+	got := htmlToMarkdown(input, "")
+	if strings.Contains(got, "THE END") || strings.Contains(got, "<!--") {
+		t.Fatalf("list-end comment leaked into output: %q", got)
+	}
+	if !strings.Contains(got, "- Skip") || !strings.Contains(got, "1. Web") {
+		t.Fatalf("adjacent lists not rendered: %q", got)
+	}
+}
+
+func TestHTMLToMarkdown_linksAndImages(t *testing.T) {
+	cases := []struct {
+		name    string
+		html    string
+		baseURL string
+		want    string
+	}{
+		{
+			name:    "links rendered",
+			html:    `<p>See <a href="https://example.com/doc">the docs</a>.</p>`,
+			baseURL: "",
+			want:    "See [the docs](https://example.com/doc).",
+		},
+		{
+			name:    "relative links made absolute",
+			html:    `<p>See <a href="/rel">this</a>.</p>`,
+			baseURL: "https://example.com",
+			want:    "See [this](https://example.com/rel).",
+		},
+		{
+			name:    "images removed",
+			html:    `<p><a href="https://example.com/"><img src="https://example.com/b.png" alt="build"></a> done</p>`,
+			baseURL: "",
+			want:    "done",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := htmlToMarkdown([]byte(tc.html), tc.baseURL); got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -132,17 +205,6 @@ func TestPlainTextBinaryGuard(t *testing.T) {
 	}
 }
 
-func TestHTMLToTextNonHTMLPassthrough(t *testing.T) {
-	// Regression: C code with `<` must not be fed to the HTML tokenizer,
-	// which would otherwise swallow everything after an unclosed tag
-	// (e.g. `a<b` opens a phantom <b> that consumes the rest of the file).
-	src := []byte("static const int tbl[] = { 1, 2, 3 };\nint f(int a, int b) { return a<b ? a : b; }\n")
-	got := htmlToText(src)
-	if !strings.Contains(got, "return a<b ? a : b") {
-		t.Fatalf("C source was mangled by HTML parsing: %q", got)
-	}
-}
-
 func TestExtractResponseText(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -164,6 +226,13 @@ func TestExtractResponseText(t *testing.T) {
 			finalURL:    "https://example.com/f.c",
 			body:        []byte("#include <stdio.h>\nint a<b;\n"),
 			want:        "#include <stdio.h>\nint a<b;",
+		},
+		{
+			name:        "text/plain wins over html-looking body",
+			contentType: "text/plain",
+			finalURL:    "https://example.com/gen.go",
+			body:        []byte("// renders a <div> for the user\n"),
+			want:        "// renders a <div> for the user",
 		},
 		{
 			name:        "octet-stream with source extension returns raw text",

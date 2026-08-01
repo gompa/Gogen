@@ -202,7 +202,7 @@ func TestWebFetchTruncationNotice(t *testing.T) {
 	useLocalFetchClient(t, srv)
 
 	exec := NewExecutor(t.TempDir())
-	out, err := exec.WebFetch(context.Background(), srv.URL, 0)
+	out, err := exec.WebFetch(context.Background(), srv.URL, WebFetchOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

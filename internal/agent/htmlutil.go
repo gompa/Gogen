@@ -5,26 +5,12 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
-	"regexp"
 	"strings"
 
-	"golang.org/x/net/html"
+	"github.com/JohannesKaufmann/html-to-markdown/v2/converter"
+	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/base"
+	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/commonmark"
 )
-
-var (
-	multiSpaceRE   = regexp.MustCompile(`\s{3,}`)
-	multiNewlineRE = regexp.MustCompile(`\n{3,}`)
-)
-
-// blockTags are HTML elements that introduce paragraph-like breaks.
-var blockTags = map[string]bool{
-	"br": true, "p": true, "li": true, "tr": true,
-	"h1": true, "h2": true, "h3": true, "h4": true, "h5": true, "h6": true,
-	"div": true, "section": true, "article": true, "header": true, "footer": true,
-	"nav": true, "aside": true, "main": true, "figure": true, "figcaption": true,
-	"blockquote": true, "pre": true, "table": true, "ul": true, "ol": true,
-	"dl": true, "dt": true, "dd": true, "form": true, "fieldset": true,
-}
 
 // plainFileExts are file extensions whose contents are textual source or
 // data files. web_fetch serves these as-is instead of parsing them as HTML,
@@ -132,95 +118,87 @@ func isPlainURL(rawURL string) bool {
 	return plainFileExts[strings.ToLower(filepath.Ext(u.Path))]
 }
 
+// mdConverter converts HTML documents to readable Markdown for the browsing
+// use case. It is safe for concurrent use (the library guards internally).
+//
+// Configuration notes, empirically driven (see web_fetch_test.go):
+//   - nav/footer/aside are removed: on content-heavy sites like GitHub these
+//     containers dominate the byte budget with menus before the real content
+//     appears (a repo page fetched at 128 KB yielded 1.8 KB of pure
+//     navigation and zero README).
+//   - img is removed: image markup is token noise for the model and the alt
+//     text rarely carries information worth the URL.
+//   - Links with an empty destination or empty content render as plain text
+//     instead of stray "[]()" artifacts (e.g. image-only links).
+//   - List-end comments are disabled: the commonmark plugin otherwise
+//     inserts "<!--THE END-->" markers between adjacent lists (a round-trip
+//     fidelity aid) that leak into the output (MDN showed this).
+//   - form/dialog/template/button are removed: they carry interactive chrome
+//     (search forms, overlays, JS templates, action buttons) that never
+//     contains article content. Verified against pkg.go.dev and GitHub:
+//     the noise disappears while the content survives.
+//   - header is deliberately KEPT: page titles commonly live in <h1> inside
+//     <header> (e.g. pkg.go.dev's package title) and are worth more than the
+//     site-header links it also carries.
+//
+// The base plugin already removes head/script/style/noscript/iframe/input/
+// textarea; the commonmark plugin emits headings, fenced code blocks (with
+// indentation intact), lists, blockquotes, and inline links.
+var mdConverter = func() *converter.Converter {
+	conv := converter.NewConverter(converter.WithPlugins(
+		base.NewBasePlugin(),
+		commonmark.NewCommonmarkPlugin(
+			commonmark.WithLinkEmptyContentBehavior(commonmark.LinkBehaviorSkip),
+			commonmark.WithLinkEmptyHrefBehavior(commonmark.LinkBehaviorSkip),
+			commonmark.WithListEndComment(false),
+		),
+	))
+	conv.Register.TagType("nav", converter.TagTypeRemove, converter.PriorityStandard)
+	conv.Register.TagType("footer", converter.TagTypeRemove, converter.PriorityStandard)
+	conv.Register.TagType("aside", converter.TagTypeRemove, converter.PriorityStandard)
+	conv.Register.TagType("img", converter.TagTypeRemove, converter.PriorityStandard)
+	conv.Register.TagType("form", converter.TagTypeRemove, converter.PriorityStandard)
+	conv.Register.TagType("dialog", converter.TagTypeRemove, converter.PriorityStandard)
+	conv.Register.TagType("template", converter.TagTypeRemove, converter.PriorityStandard)
+	conv.Register.TagType("button", converter.TagTypeRemove, converter.PriorityStandard)
+	return conv
+}()
+
+// htmlToMarkdown converts an HTML document into readable Markdown, making
+// relative links absolute against baseURL (may be empty). On conversion
+// failure the body is returned as plain text rather than erroring out.
+func htmlToMarkdown(body []byte, baseURL string) string {
+	var opts []converter.ConvertOptionFunc
+	if baseURL != "" {
+		opts = append(opts, converter.WithDomain(baseURL))
+	}
+	md, err := mdConverter.ConvertString(string(body), opts...)
+	if err != nil {
+		return plainText(body)
+	}
+	return strings.TrimSpace(md)
+}
+
 // extractResponseText converts a fetched response body into text. HTML
-// responses are stripped of markup via htmlToText; everything else (source
-// files, JSON, plain text, ...) is returned as-is so `<` characters and code
-// formatting survive.
+// responses are converted to Markdown via htmlToMarkdown; everything else
+// (source files, JSON, plain text, ...) is returned as-is so `<` characters
+// and code formatting survive.
 //
 // Content-Type wins when it is authoritative; for ambiguous or missing types
 // the URL extension and a body sniff decide.
 func extractResponseText(contentType, finalURL string, body []byte) string {
 	switch {
 	case isHTMLContentType(contentType):
-		return htmlToText(body)
+		return htmlToMarkdown(body, finalURL)
 	case isPlainContentType(contentType):
 		return plainText(body)
 	case isHTMLURL(finalURL):
-		return htmlToText(body)
+		return htmlToMarkdown(body, finalURL)
 	case isPlainURL(finalURL):
 		return plainText(body)
 	case looksLikeHTML(body):
-		return htmlToText(body)
+		return htmlToMarkdown(body, finalURL)
 	default:
 		return plainText(body)
 	}
-}
-
-func htmlToText(body []byte) string {
-	// Only tokenize as HTML when the content actually looks like HTML.
-	// Source files (e.g. C code) contain plenty of `<` characters that the
-	// tokenizer would otherwise interpret as (possibly unclosed) tags,
-	// silently dropping everything after the phantom tag.
-	if !looksLikeHTML(body) {
-		return plainText(body)
-	}
-	z := html.NewTokenizer(bytes.NewReader(body))
-	var b strings.Builder
-
-	var (
-		skipDepth int    // > 0 when inside a <script>, <style>, <head>, or <noscript>
-		skipTag   string // tag name that opened the skip region
-	)
-
-	for {
-		tt := z.Next()
-		if tt == html.ErrorToken {
-			break
-		}
-		tok := z.Token()
-
-		switch tt {
-		case html.StartTagToken, html.SelfClosingTagToken:
-			if skipDepth > 0 {
-				if tok.Data == skipTag {
-					skipDepth++
-				}
-				continue
-			}
-			switch tok.Data {
-			case "script", "style", "head", "noscript":
-				skipTag = tok.Data
-				skipDepth = 1
-			case "br", "hr":
-				b.WriteByte('\n')
-			default:
-				if blockTags[tok.Data] {
-					b.WriteByte('\n')
-				}
-			}
-
-		case html.EndTagToken:
-			if skipDepth > 0 {
-				if tok.Data == skipTag {
-					skipDepth--
-				}
-				continue
-			}
-			if blockTags[tok.Data] {
-				b.WriteByte('\n')
-			}
-
-		case html.TextToken:
-			if skipDepth > 0 {
-				continue
-			}
-			b.WriteString(tok.Data)
-		}
-	}
-
-	text := html.UnescapeString(b.String())
-	// Collapse whitespace.
-	text = multiNewlineRE.ReplaceAllString(text, "\n\n")
-	text = multiSpaceRE.ReplaceAllString(text, "  ")
-	return strings.TrimSpace(text)
 }

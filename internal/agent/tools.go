@@ -173,10 +173,13 @@ func BuiltinTools() []llm.Tool {
 				"query":       toolProp("string", "Query"),
 				"max_results": toolProp("integer", "Max results (default 10, max 20)"),
 			}, "query")),
-		toolDef("web_fetch", "Fetch web page, extract text (HTML stripped for pages; raw text for files).",
+		toolDef("web_fetch", "Fetch web page, extract readable text (HTML converted to Markdown, boilerplate removed; raw text for files). Optional selector extracts only matching CSS elements; optional query searches the extracted text and returns matches with context — use these on noisy or large pages to pull exactly what you need.",
 			toolSchema(map[string]interface{}{
 				"url":       toolProp("string", "URL (https)"),
 				"max_bytes": toolProp("integer", "Max bytes (default 65536)"),
+				"selector":  toolProp("string", "Optional CSS selector: extract only matching elements (e.g. article, .markdown-body, table, pre). Raises max_bytes on big pages"),
+				"query":     toolProp("string", "Optional case-insensitive text search over the extracted content; returns matches with context lines"),
+				"context":   toolProp("integer", "Context lines per query match (default 3, max 10)"),
 			}, "url")),
 		toolDef("download_file", "Download a file from a URL into the workspace (raw bytes, no HTML stripping; binary-safe). Use for large source files or binaries that would exceed web_fetch's text caps — then read/search the saved file with read_file offset/limit, search_code, list_definitions, or patch_file. HTTPS-only; private/internal hosts blocked.",
 			toolSchema(map[string]interface{}{

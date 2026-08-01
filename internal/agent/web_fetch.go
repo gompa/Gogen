@@ -27,6 +27,9 @@ const (
 	// instead (see doFetch). Default fetches stay at webFetchDefaultMax,
 	// which is small enough that the truncation notice fits under
 	// MaxToolResultBytes and passes through to the model intact.
+	// The output-limit branch below is still reachable: markdown conversion
+	// can expand a body (escaping, link/code markup), so a full-size 2 MB
+	// body can yield more than 2 MB of text.
 	webFetchOutputLimit = webFetchHardMax
 )
 
@@ -352,7 +355,27 @@ func isPrivateHost(host string) bool {
 	return false
 }
 
-func (e *Executor) WebFetch(ctx context.Context, rawURL string, maxBytes int) (string, error) {
+// WebFetchOptions configures a web_fetch call. Selector and Query are the
+// agent-driven extraction primitives for unseen pages: instead of relying
+// on pre-tuned boilerplate removal, the caller names exactly what it wants
+// (see extractBySelector and searchExtractedText).
+type WebFetchOptions struct {
+	// MaxBytes caps the response body read (default webFetchDefaultMax,
+	// capped at webFetchHardMax).
+	MaxBytes int
+	// Selector is an optional CSS selector: when set, only matching
+	// elements are converted to markdown.
+	Selector string
+	// Query is an optional case-insensitive text search over the extracted
+	// content: when set, matches with surrounding context lines are
+	// returned instead of the full text. Composes with Selector.
+	Query string
+	// Context is the number of context lines around each Query match
+	// (default searchDefaultContext, capped at searchMaxContextLines).
+	Context int
+}
+
+func (e *Executor) WebFetch(ctx context.Context, rawURL string, opts WebFetchOptions) (string, error) {
 	if !webCfg.isFetchOn() {
 		return "", fmt.Errorf("web_fetch is disabled (set GOGEN_WEB_FETCH=on to re-enable)")
 	}
@@ -361,6 +384,7 @@ func (e *Executor) WebFetch(ctx context.Context, rawURL string, maxBytes int) (s
 		return "", fmt.Errorf("url is required")
 	}
 
+	maxBytes := opts.MaxBytes
 	if maxBytes <= 0 {
 		maxBytes = webFetchDefaultMax
 	}
@@ -387,21 +411,47 @@ func (e *Executor) WebFetch(ctx context.Context, rawURL string, maxBytes int) (s
 		return "", err
 	}
 
-	text := extractResponseText(contentType, finalURL, body)
+	var text string
+	if opts.Selector != "" {
+		text, err = extractBySelector(body, opts.Selector, finalURL)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		text = extractResponseText(contentType, finalURL, body)
+	}
+
+	if opts.Query != "" {
+		result := searchExtractedText(text, opts.Query, opts.Context)
+		if truncated {
+			result = fmt.Sprintf("Note: body exceeded max_bytes and was cut before extraction; raise max_bytes (up to %d) if the match region is missing.\n\n", webFetchHardMax) + result
+		}
+		return result, nil
+	}
 
 	// Build result.
 	var b strings.Builder
 	if finalURL != parsed.String() {
 		fmt.Fprintf(&b, "Final URL (after redirects): %s\n\n", finalURL)
 	}
+	if opts.Selector != "" && truncated {
+		fmt.Fprintf(&b, "Note: body exceeded max_bytes and was cut before extraction; raise max_bytes (up to %d) if elements are missing.\n\n", webFetchHardMax)
+	}
 	switch {
 	case truncated:
 		// The body was cut by max_bytes. Report it explicitly — a silent
 		// mid-file cut previously looked like the complete document, and
 		// the marker keeps this result intact under MaxToolResultBytes.
-		fmt.Fprintf(&b, "Content (first %d of more than %d bytes):\n", len(text), maxBytes)
-		b.WriteString(text)
-		fmt.Fprintf(&b, "\n\n… truncated (body exceeds %d bytes; pass max_bytes up to %d to fetch more)", maxBytes, webFetchHardMax)
+		if opts.Selector == "" {
+			fmt.Fprintf(&b, "Content (first %d of more than %d bytes):\n", len(text), maxBytes)
+			b.WriteString(text)
+			fmt.Fprintf(&b, "\n\n… truncated (body exceeds %d bytes; pass max_bytes up to %d to fetch more)", maxBytes, webFetchHardMax)
+		} else {
+			// Selector mode: the element list is already complete for the
+			// bytes we read; just say the body was cut.
+			b.WriteString(text)
+			fmt.Fprintf(&b, "\n\n… body exceeded %d bytes and was cut before extraction (pass max_bytes up to %d to fetch more)", maxBytes, webFetchHardMax)
+		}
 	case len(text) > webFetchOutputLimit:
 		fmt.Fprintf(&b, "Content (first %d of %d bytes):\n", webFetchOutputLimit, len(text))
 		b.WriteString(text[:webFetchOutputLimit])
