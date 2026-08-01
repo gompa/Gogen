@@ -5,7 +5,7 @@ GoGen is a self-hosted, terminal or web-based coding assistant that can explore,
 ## Features
 
 - **Repository Exploration** — Top-level layout summary, directory listing, glob patterns, and symbol outlines before diving into files
-- **File Operations** — Read, write, patch, replace, and delete files safely
+- **File Operations** — Read, write, patch, replace, and delete files safely; `download_file` fetches remote source files/binaries into the workspace (SSRF-protected) for local exploration
 - **Code Search** — Regex and literal string search across your codebase (ripgrep with fallback)
 - **Symbol Extraction** — Lists functions, methods, classes, and types via [tree-sitter](https://tree-sitter.github.io/tree-sitter/) for 15 languages
 - **Safe Edits** — Prefers unified diffs (`patch_file`) over full file rewrites; syntax error detection after edits
@@ -178,7 +178,7 @@ Files without config (plain markdown) are treated as guidelines-only. The old co
 | `GOGEN_CONTEXT_LIMIT` | `0` | Manual token limit override (`0` = resolve from model) |
 | `GOGEN_COMPACT_THRESHOLD` | `0.75` | Fraction of context limit that triggers auto-compaction |
 | `GOGEN_KEEP_RECENT_MESSAGES` | `12` | Recent messages preserved during compaction |
-| `GOGEN_MAX_TOOL_RESULT_BYTES` | `8192` | Max bytes for tool output before truncation |
+| `GOGEN_MAX_TOOL_RESULT_BYTES` | `65536` | Max bytes for tool output before truncation (matches web_fetch's 64 KB limit) |
 | `GOGEN_COMPACT_RESERVE_TOKENS` | `4000` | Tokens reserved for new messages after compaction |
 
 After each agent turn, GoGen shows context usage in the CLI (dim line) and web UI (sidebar meter). Use `/context` for a detailed breakdown. When the provider returns usage stats (`prompt_tokens` from the API, including streaming with `include_usage`), the display labels this as **last request**; otherwise it falls back to a local token estimate.

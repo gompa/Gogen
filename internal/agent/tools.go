@@ -173,11 +173,18 @@ func BuiltinTools() []llm.Tool {
 				"query":       toolProp("string", "Query"),
 				"max_results": toolProp("integer", "Max results (default 10, max 20)"),
 			}, "query")),
-		toolDef("web_fetch", "Fetch web page, extract text (HTML stripped).",
+		toolDef("web_fetch", "Fetch web page, extract text (HTML stripped for pages; raw text for files).",
 			toolSchema(map[string]interface{}{
 				"url":       toolProp("string", "URL (https)"),
 				"max_bytes": toolProp("integer", "Max bytes (default 65536)"),
 			}, "url")),
+		toolDef("download_file", "Download a file from a URL into the workspace (raw bytes, no HTML stripping; binary-safe). Use for large source files or binaries that would exceed web_fetch's text caps — then read/search the saved file with read_file offset/limit, search_code, list_definitions, or patch_file. HTTPS-only; private/internal hosts blocked.",
+			toolSchema(map[string]interface{}{
+				"url":       toolProp("string", "URL (https)"),
+				"path":      toolProp("string", "Destination path under the working directory (must not exist unless overwrite=true)"),
+				"max_bytes": toolProp("integer", "Max download size in bytes (default 52428800, max 209715200)"),
+				"overwrite": toolProp("boolean", "Overwrite an existing file (default false)"),
+			}, "url", "path")),
 		toolDef("git_commit", "Commit (requires staged files).",
 			toolSchema(map[string]interface{}{
 				"message": toolProp("string", "Message"),

@@ -54,6 +54,7 @@ func BuiltinToolHandlers() map[string]ToolHandler {
 		"list_definitions":    handleListDefinitions,
 		"web_search":          handleWebSearch,
 		"web_fetch":           handleWebFetch,
+		"download_file":       handleDownloadFile,
 		"find_file":           handleFindFile,
 		"find_definition":     handleFindDefinition,
 		"session_rename":      handleSessionRename,
@@ -463,6 +464,26 @@ func handleWebFetch(ctx context.Context, a *Agent, args map[string]interface{}) 
 		return "", err
 	}
 	return a.Executor.WebFetch(ctx, rawURL, maxBytes)
+}
+
+func handleDownloadFile(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+	rawURL, err := stringArg(args, "url")
+	if err != nil {
+		return "", err
+	}
+	path, err := stringArg(args, "path")
+	if err != nil {
+		return "", err
+	}
+	maxBytes, err := intArgOptional(args, "max_bytes")
+	if err != nil {
+		return "", err
+	}
+	overwrite, err := boolArg(args, "overwrite", false)
+	if err != nil {
+		return "", err
+	}
+	return a.Executor.DownloadFile(ctx, rawURL, path, maxBytes, overwrite)
 }
 
 func handleFindFile(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {

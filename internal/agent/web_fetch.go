@@ -21,10 +21,21 @@ const (
 	webFetchDefaultMax   = 64 * 1024 // 64 KB — plenty for docs pages
 	webFetchHardMax      = 2 * 1024 * 1024
 	webFetchMaxRedirects = 3
-	webFetchOutputLimit  = 64 * 1024 // max bytes returned in the tool result string
+	// webFetchOutputLimit caps the tool-result string. It is kept equal to
+	// webFetchHardMax so an explicit max_bytes request is never silently cut
+	// short by a second, smaller cap: the body-read cap reports truncation
+	// instead (see doFetch). Default fetches stay at webFetchDefaultMax,
+	// which is small enough that the truncation notice fits under
+	// MaxToolResultBytes and passes through to the model intact.
+	webFetchOutputLimit = webFetchHardMax
 )
 
 var fetchPrivateRE = regexp.MustCompile(`^127\.|^10\.|^172\.(1[6-9]|2[0-9]|3[01])\.|^192\.168\.|^0\.0\.0\.0$|^::1$|^fe80:`)
+
+// fetchURLValidator is swappable in tests that exercise the fetch/download
+// paths against a local httptest server (the real validator blocks private
+// hosts, which is exactly what a local test server is).
+var fetchURLValidator = validateFetchURL
 
 // webCfg holds all runtime web fetch/search configuration behind a single mutex.
 var webCfg webCfgState
@@ -237,7 +248,9 @@ type fetchRequest struct {
 // doFetch performs a single HTTP request with SSRF protection and redirect
 // enforcement. It uses the shared client (dialContextPublicOnly + CheckRedirect)
 // so private/internal hosts are blocked at both the dial and redirect level.
-func doFetch(ctx context.Context, req fetchRequest) ([]byte, string, error) {
+// It returns the response body, its Content-Type header, the final URL after
+// redirects, and whether the body was cut short by req.MaxBytes.
+func doFetch(ctx context.Context, req fetchRequest) ([]byte, string, string, bool, error) {
 	if req.Method == "" {
 		req.Method = http.MethodGet
 	}
@@ -256,7 +269,7 @@ func doFetch(ctx context.Context, req fetchRequest) ([]byte, string, error) {
 		httpReq, err = http.NewRequestWithContext(ctx, http.MethodGet, req.URL, nil)
 	}
 	if err != nil {
-		return nil, req.URL, fmt.Errorf("request: %w", err)
+		return nil, "", req.URL, false, fmt.Errorf("request: %w", err)
 	}
 
 	httpReq.Header.Set("User-Agent", ua)
@@ -267,24 +280,32 @@ func doFetch(ctx context.Context, req fetchRequest) ([]byte, string, error) {
 
 	resp, err := sharedFetchClient.Do(httpReq)
 	if err != nil {
-		return nil, req.URL, fmt.Errorf("fetch: %w", err)
+		return nil, "", req.URL, false, fmt.Errorf("fetch: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return nil, resp.Request.URL.String(), fmt.Errorf("http %d", resp.StatusCode)
+		return nil, "", resp.Request.URL.String(), false, fmt.Errorf("http %d", resp.StatusCode)
 	}
 
+	contentType := resp.Header.Get("Content-Type")
 	maxBytes := req.MaxBytes
 	if maxBytes <= 0 {
 		maxBytes = webFetchDefaultMax
 	}
-	limited := io.LimitReader(resp.Body, int64(maxBytes))
+	// Read one byte past the cap so truncation is detectable instead of
+	// silently looking like the complete document (which previously made
+	// mid-file cuts indistinguishable from full files).
+	limited := io.LimitReader(resp.Body, int64(maxBytes)+1)
 	body, err := io.ReadAll(limited)
 	if err != nil {
-		return nil, resp.Request.URL.String(), fmt.Errorf("read body: %w", err)
+		return nil, "", resp.Request.URL.String(), false, fmt.Errorf("read body: %w", err)
 	}
-	return body, resp.Request.URL.String(), nil
+	truncated := len(body) > maxBytes
+	if truncated {
+		body = body[:maxBytes]
+	}
+	return body, contentType, resp.Request.URL.String(), truncated, nil
 }
 
 func dialContextPublicOnly(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -347,7 +368,7 @@ func (e *Executor) WebFetch(ctx context.Context, rawURL string, maxBytes int) (s
 		maxBytes = webFetchHardMax
 	}
 
-	parsed, err := validateFetchURL(rawURL)
+	parsed, err := fetchURLValidator(rawURL)
 	if err != nil {
 		return "", err
 	}
@@ -358,7 +379,7 @@ func (e *Executor) WebFetch(ctx context.Context, rawURL string, maxBytes int) (s
 	ctx, cancel := context.WithTimeout(ctx, webFetchTimeout)
 	defer cancel()
 
-	body, finalURL, err := doFetch(ctx, fetchRequest{
+	body, contentType, finalURL, truncated, err := doFetch(ctx, fetchRequest{
 		URL:      parsed.String(),
 		MaxBytes: maxBytes,
 	})
@@ -366,20 +387,28 @@ func (e *Executor) WebFetch(ctx context.Context, rawURL string, maxBytes int) (s
 		return "", err
 	}
 
-	text := htmlToText(body)
+	text := extractResponseText(contentType, finalURL, body)
 
 	// Build result.
 	var b strings.Builder
 	if finalURL != parsed.String() {
 		fmt.Fprintf(&b, "Final URL (after redirects): %s\n\n", finalURL)
 	}
-	if len(text) > webFetchOutputLimit {
+	switch {
+	case truncated:
+		// The body was cut by max_bytes. Report it explicitly — a silent
+		// mid-file cut previously looked like the complete document, and
+		// the marker keeps this result intact under MaxToolResultBytes.
+		fmt.Fprintf(&b, "Content (first %d of more than %d bytes):\n", len(text), maxBytes)
+		b.WriteString(text)
+		fmt.Fprintf(&b, "\n\n… truncated (body exceeds %d bytes; pass max_bytes up to %d to fetch more)", maxBytes, webFetchHardMax)
+	case len(text) > webFetchOutputLimit:
 		fmt.Fprintf(&b, "Content (first %d of %d bytes):\n", webFetchOutputLimit, len(text))
 		b.WriteString(text[:webFetchOutputLimit])
 		fmt.Fprintf(&b, "\n\n… truncated (%d bytes total)", len(text))
-	} else if text == "" {
+	case text == "":
 		b.WriteString("(empty body)")
-	} else {
+	default:
 		b.WriteString(text)
 	}
 	return b.String(), nil

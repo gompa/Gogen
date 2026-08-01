@@ -61,7 +61,7 @@ func searchDuckDuckGoHTML(ctx context.Context, query string, maxResults int) (st
 	}
 	u.RawQuery = url.Values{"q": {query}}.Encode()
 
-	body, _, err := doFetch(ctx, fetchRequest{
+	body, _, _, _, err := doFetch(ctx, fetchRequest{
 		URL:      u.String(),
 		UA:       ddgUA,
 		MaxBytes: 512 * 1024,

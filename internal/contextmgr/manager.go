@@ -27,7 +27,7 @@ func DefaultSettings() Settings {
 		ContextLimit:         0,
 		CompactThreshold:     0.75,
 		KeepRecentMessages:   12,
-		MaxToolResultBytes:   8192,
+		MaxToolResultBytes:   65536, // 64 KB — matches web_fetch's default body cap
 		CompactReserveTokens: 4000,
 	}
 }
