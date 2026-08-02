@@ -189,10 +189,9 @@ func TestDoFetchReportsTruncation(t *testing.T) {
 
 func TestWebFetchTruncationNotice(t *testing.T) {
 	enableWebFetchForTest(t)
-	payload := strings.Repeat("line of source\n", 1000) // ~15 KB > default 64 KB? No — keep under output limit
-	// Make the body clearly larger than the default 64 KB cap so the
+	// Make the body clearly larger than the default 256 KB cap so the
 	// truncated flag path is exercised with default max_bytes.
-	payload = strings.Repeat("static int line_of_source_0123456789 = 1;\n", 3000) // ~117 KB
+	payload := strings.Repeat("static int line_of_source_0123456789 = 1;\n", 8000) // ~288 KB
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte(payload))

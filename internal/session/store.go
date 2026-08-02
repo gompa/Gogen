@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"gogen/internal/agent"
+	"gogen/internal/config"
 	"gogen/internal/ioutil"
 	"gogen/internal/llm"
 )
@@ -90,8 +91,8 @@ var (
 
 // StoreOptions configures retention for persisted sessions.
 type StoreOptions struct {
-	MaxCount   int // keep at most this many sessions (0 = default 50)
-	MaxAgeDays int // drop sessions older than this many days (0 = default 30)
+	MaxCount   int // keep at most this many sessions (0 = config.DefaultSessionMaxCount)
+	MaxAgeDays int // drop sessions older than this many days (0 = config.DefaultSessionMaxAgeDays)
 }
 
 // maxCreatedCacheEntries limits the in-memory created-timestamp cache so it
@@ -115,11 +116,11 @@ func (s *Store) SetGlobalDir(dir string) {
 func NewStoreWithOptions(enabled bool, opts StoreOptions) *Store {
 	maxCount := opts.MaxCount
 	if maxCount <= 0 {
-		maxCount = 50
+		maxCount = config.DefaultSessionMaxCount
 	}
 	maxAge := opts.MaxAgeDays
 	if maxAge <= 0 {
-		maxAge = 30
+		maxAge = config.DefaultSessionMaxAgeDays
 	}
 	return &Store{enabled: enabled, maxCount: maxCount, maxAgeDays: maxAge, createdCache: make(map[string]time.Time)}
 }
@@ -302,7 +303,9 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 // The delta file is a lightweight JSON file that holds messages appended since
 // the last full snapshot. On restore, the delta is merged into the full snapshot.
 // This avoids rewriting the entire (potentially large) message list on every save.
-func (s *Store) AppendMessages(id string, snap agent.SessionSnapshot) error {
+// totalMsgCount is the agent's total message count at save time; because the
+// delta is cumulative, it is the correct index count between full snapshots.
+func (s *Store) AppendMessages(id string, snap agent.SessionSnapshot, totalMsgCount int) error {
 	if s == nil || !s.enabled || id == "" {
 		return nil
 	}
@@ -334,10 +337,11 @@ func (s *Store) AppendMessages(id string, snap agent.SessionSnapshot) error {
 	mainPath := s.path(snap.WorkingDir, id)
 	_ = os.Chtimes(mainPath, time.Now(), time.Now())
 
-	// Update index timestamp so the session appears recent in listings.
-	// The message count from the last full snapshot remains correct until
-	// the next full save overwrites it.
-	s.touchIndex(snap.WorkingDir, id, time.Now().UTC())
+	// Update the index so the session appears recent in listings. The delta
+	// file always holds every message since the last full snapshot, so the
+	// agent's total count is authoritative. Label and oneshot flags are
+	// preserved — appends do not change them.
+	s.updateIndexCount(snap.WorkingDir, id, time.Now().UTC(), totalMsgCount)
 	return nil
 }
 
@@ -730,6 +734,37 @@ func (s *Store) touchIndex(workingDir, id string, updated time.Time) error {
 	}
 	s.invalidateListCache(workingDir)
 	return nil
+}
+
+// updateIndexCount updates the timestamp and message count for a session in
+// the metadata index, preserving the label and oneshot flags. Used by
+// AppendMessages so listings stay accurate between full snapshots. Entries
+// missing from the index are skipped — the list fallback re-scans the
+// directory on the next miss.
+func (s *Store) updateIndexCount(workingDir, id string, updated time.Time, msgCount int) {
+	if s == nil || !s.enabled {
+		return
+	}
+	idx := s.readIndex(workingDir)
+	if idx == nil {
+		return
+	}
+	found := false
+	for i, e := range idx.Entries {
+		if e.ID == id {
+			idx.Entries[i].Updated = updated
+			idx.Entries[i].MessageCount = msgCount
+			found = true
+			break
+		}
+	}
+	if !found {
+		return
+	}
+	if err := s.writeIndex(workingDir, idx); err != nil {
+		return
+	}
+	s.invalidateListCache(workingDir)
 }
 
 // removeFromIndex deletes an entry from the session metadata index.

@@ -15,7 +15,8 @@ func TestStabilizeToolArgsPinsSharedBacking(t *testing.T) {
 			Args: map[string]interface{}{"path": "a.go"},
 		}},
 	}}
-	stabilizeToolArgs(msgs)
+	a := &Agent{Messages: msgs}
+	a.stabilizeToolArgs()
 	if msgs[0].ToolCalls[0].ArgsStr != `{"path":"a.go"}` {
 		t.Fatalf("expected pin into shared ToolCalls, got %q", msgs[0].ToolCalls[0].ArgsStr)
 	}

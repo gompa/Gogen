@@ -24,6 +24,7 @@ func (a *Agent) recordTurnUsage(u *llm.Usage) {
 	if u == nil {
 		return
 	}
+	a.statsMu.Lock()
 	a.lastTurnUsage = u
 	// Record baseline for accurate context stats: the API's PromptTokens
 	// is the exact token count for the view (system prompt + canonical msgs)
@@ -33,6 +34,7 @@ func (a *Agent) recordTurnUsage(u *llm.Usage) {
 		a.apiBaselinePromptTokens = u.PromptTokens
 		a.apiBaselineMsgCount = len(a.Messages)
 	}
+	a.statsMu.Unlock()
 }
 
 // clearTurnUsage clears last-turn API counters and the baseline used by
@@ -40,14 +42,21 @@ func (a *Agent) recordTurnUsage(u *llm.Usage) {
 // the session is reset — any time the stored usage no longer represents the
 // current conversation state.
 func (a *Agent) clearTurnUsage() {
+	a.statsMu.Lock()
 	a.lastTurnUsage = nil
 	a.apiBaselinePromptTokens = 0
 	a.apiBaselineMsgCount = 0
+	a.statsMu.Unlock()
 }
 
 // ContextStats is a read-only probe of current context usage.
 // It must not mutate Messages, compact history, or call the provider.
-// Web callers must hold Server.agentMu (see internal/server/agent_sync.go).
+// Safe to call concurrently with a running turn: the shared state it reads
+// (Messages, cached token counts, API usage baseline, project profile) is
+// snapshotted under Agent.statsMu before tokenization, which happens without
+// holding any server lock. Tokenization is slow, so avoid holding
+// Server.agentMu/turnMu across the call where practical; the /context WS path
+// still runs it under turnMu, which is safe (see internal/server/agent_sync.go).
 //
 // When an API baseline is available, Snapshot.Used reflects the API's exact
 // prompt_tokens for the messages that were in the last request, plus local
@@ -57,23 +66,33 @@ func (a *Agent) ContextStats(ctx context.Context) TurnContext {
 	// (web/TUI interrupt). Returning a minimal snapshot keeps cancel paths
 	// from stalling inside OnStart/OnRoundStart context probes.
 	if ctx != nil && ctx.Err() != nil {
+		a.statsMu.RLock()
+		n := len(a.Messages)
+		a.statsMu.RUnlock()
 		return TurnContext{
-			Snapshot: contextmgr.ContextSnapshot{MessageCount: len(a.Messages)},
+			Snapshot: contextmgr.ContextSnapshot{MessageCount: n},
 		}
 	}
-	msgs := a.Messages
+
+	// Snapshot the shared state (message list, cached token counts, API usage
+	// baseline, project profile) under the lock, then release before
+	// tokenizing. A concurrent turn goroutine may append messages, extend the
+	// cached counts, or record new API usage while ContextStats runs (web
+	// readers do not hold agentMu/turnMu). The message clone is deep so
+	// tokenization cannot race in-place stabilization on the live array.
+	a.statsMu.RLock()
+	msgs := cloneMessages(a.Messages)
+	counts := append([]int(nil), a.restoredTokenCounts...)
+	lastUsage := a.lastTurnUsage
+	baselinePromptTokens, baselineMsgCount := a.apiBaselinePromptTokens, a.apiBaselineMsgCount
+	projectProfile := a.projectProfile
+	a.statsMu.RUnlock()
+
 	view := msgs
 	if a.Context != nil {
-		// Copy so Snapshot iteration is stable if the caller releases agentMu
-		// and another turn appends (append may reallocate).
-		if n := len(msgs); n > 0 {
-			cp := make([]llm.Message, n)
-			copy(cp, msgs)
-			msgs = cp
-		}
 		view = withSystemPrompt(msgs, a.WorkingDir)
 		// Use cached profile only — do not run DetectProjectProfile here.
-		view = enrichSystemPrompt(view, a.WorkingDir, a.ProjectFilePath, a.ProjectGuidelines, a.projectProfile, a.Mode)
+		view = enrichSystemPrompt(view, a.WorkingDir, a.ProjectFilePath, a.ProjectGuidelines, projectProfile, a.Mode)
 	}
 
 	var snap contextmgr.ContextSnapshot
@@ -84,7 +103,6 @@ func (a *Agent) ContextStats(ctx context.Context) TurnContext {
 		// since restore), compute counts for only the missing messages locally
 		// so we still get the fast SnapshotWithCounts path without mutating
 		// shared state (ContextStats runs without agentMu).
-		counts := a.restoredTokenCounts
 		if counts != nil && len(counts) < len(msgs) {
 			extended := make([]int, len(msgs))
 			copy(extended, counts)
@@ -107,10 +125,10 @@ func (a *Agent) ContextStats(ctx context.Context) TurnContext {
 	// If we have an API baseline, use it as the authoritative count for
 	// messages that were in the last request, then add local estimates
 	// for any messages appended since then.
-	if a.lastTurnUsage != nil && a.apiBaselinePromptTokens > 0 && a.apiBaselineMsgCount > 0 && a.Context != nil {
-		baseline := a.apiBaselinePromptTokens
-		if n := len(msgs); n > a.apiBaselineMsgCount {
-			extra := msgs[a.apiBaselineMsgCount:]
+	if lastUsage != nil && baselinePromptTokens > 0 && baselineMsgCount > 0 && a.Context != nil {
+		baseline := baselinePromptTokens
+		if n := len(msgs); n > baselineMsgCount {
+			extra := msgs[baselineMsgCount:]
 			baseline += a.Context.EstimateTokens(extra)
 		}
 		snap.Used = baseline
@@ -121,14 +139,14 @@ func (a *Agent) ContextStats(ctx context.Context) TurnContext {
 
 	stats := TurnContext{
 		Snapshot:  snap,
-		LastUsage: a.lastTurnUsage,
+		LastUsage: lastUsage,
 	}
 
 	// Attach last-request API counters for detail views.
-	if a.lastTurnUsage != nil && a.lastTurnUsage.PromptTokens > 0 {
-		stats.PromptTokens = a.lastTurnUsage.PromptTokens
-		stats.CompletionTokens = a.lastTurnUsage.CompletionTokens
-		stats.CachedTokens = a.lastTurnUsage.CachedTokens
+	if lastUsage != nil && lastUsage.PromptTokens > 0 {
+		stats.PromptTokens = lastUsage.PromptTokens
+		stats.CompletionTokens = lastUsage.CompletionTokens
+		stats.CachedTokens = lastUsage.CachedTokens
 	}
 
 	return stats

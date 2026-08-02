@@ -8,6 +8,9 @@ import (
 )
 
 // UsageAccumulator tracks token usage across the session.
+// Fields are guarded by Agent.statsMu: the turn goroutine accumulates via
+// Add while web probes read via SnapshotUsageAccum without agentMu/turnMu.
+// Do not copy or mutate an accumulator without holding statsMu.
 type UsageAccumulator struct {
 	TotalPromptTokens     int
 	TotalCompletionTokens int
@@ -26,6 +29,16 @@ func (u *UsageAccumulator) Add(usage *llm.Usage) {
 	if usage.PromptTokens > 0 || usage.CompletionTokens > 0 {
 		u.TotalTurns++
 	}
+}
+
+// SnapshotUsageAccum returns a copy of the session token-usage totals.
+// Thread-safe: the turn goroutine accumulates under statsMu while web probes
+// read without agentMu/turnMu.
+func (a *Agent) SnapshotUsageAccum() UsageAccumulator {
+	a.statsMu.RLock()
+	u := a.UsageAccum
+	a.statsMu.RUnlock()
+	return u
 }
 
 // Format returns a human-readable summary of accumulated usage.

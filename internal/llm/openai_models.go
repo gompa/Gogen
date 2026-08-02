@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"gogen/internal/config"
 	"gogen/internal/modelinfo"
 
 	"github.com/openai/openai-go"
@@ -190,7 +191,7 @@ func (p *OpenAIProvider) ModelContextLimit(ctx context.Context) (int, error) {
 		return lim, nil
 	}
 	// 4. Fallback — return the default.
-	return 128000, nil
+	return config.DefaultContextLimit, nil
 }
 
 // contextLimitFromModels applies sole-model auto-select and provider JSON
@@ -305,5 +306,5 @@ func (p *OpenAIProvider) resolveContextLimit(rawJSON, modelID string) (int, *mod
 	if devLimit > 0 {
 		return devLimit, cost
 	}
-	return 128000, cost
+	return config.DefaultContextLimit, cost
 }

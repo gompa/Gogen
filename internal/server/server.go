@@ -399,7 +399,7 @@ func (s *Server) agentConfigMsgBasic() WSMessage {
 		ThinkingLevel: string(s.agent.ThinkingLevel),
 		GlobalMode:    s.agent.GlobalMode,
 		SessionID:     s.agent.SessionID,
-		SessionLabel:  s.agent.SessionLabel,
+		SessionLabel:  s.agent.SessionLabelSnapshot(),
 	}
 }
 
@@ -411,7 +411,7 @@ func (s *Server) agentConfigMsg(ctx context.Context) WSMessage {
 		msg = s.agentConfigMsgBasic()
 	})
 	s.fillModelPricing(ctx, &msg)
-	accum := s.agent.UsageAccum
+	accum := s.agent.SnapshotUsageAccum()
 	applyContextStats(&msg, s.agent.ContextStats(ctx), &accum)
 	return msg
 }
@@ -513,6 +513,7 @@ func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, resu
 
 	var cfg WSMessage
 	var history []llm.Message
+	needHistory := clearChat && err == nil && len(result.History) == 0
 	s.lockAgentRead(func() {
 		if err == nil && len(result.Sessions) > 0 {
 			resp.Type = "sessions"
@@ -521,12 +522,13 @@ func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, resu
 		cfg = s.agentConfigMsgBasic()
 		if len(result.History) > 0 {
 			history = append([]llm.Message(nil), result.History...)
-		} else if clearChat && err == nil {
-			// /new (and any clear with empty History) — still emit history so
-			// clients can reliably run post-session follow-ups (e.g. resend).
-			history = append([]llm.Message(nil), s.agent.Messages...)
 		}
 	})
+	if needHistory {
+		// /new (and any clear with empty History) — still emit history so
+		// clients can reliably run post-session follow-ups (e.g. resend).
+		history = s.agent.SnapshotMessages()
+	}
 	resp.SessionID = cfg.SessionID
 	resp.Mode = cfg.Mode
 	// Paint sessions/history before ContextStats tokenization (can be slow on
@@ -538,7 +540,7 @@ func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, resu
 		_ = ws.writeJSON(WSMessage{Type: "history", History: historyEntries(history)})
 	}
 	stats := s.agent.ContextStats(ctx)
-	accum := s.agent.UsageAccum
+	accum := s.agent.SnapshotUsageAccum()
 	applyContextStats(&cfg, stats, &accum)
 	s.fillModelPricing(ctx, &cfg)
 	ctxMsg := WSMessage{Type: "context"}
@@ -551,9 +553,9 @@ func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, resu
 // agentMu — ContextStats tokenizes the full history view.
 func (s *Server) contextMsg(ctx context.Context) WSMessage {
 	msg := WSMessage{Type: "context"}
-	accum := s.agent.UsageAccum
+	accum := s.agent.SnapshotUsageAccum()
 	applyContextStats(&msg, s.agent.ContextStats(ctx), &accum)
-	msg.SessionLabel = s.agent.SessionLabel
+	msg.SessionLabel = s.agent.SessionLabelSnapshot()
 	return msg
 }
 
@@ -622,9 +624,9 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	defer stream.close()
 
 	s.agentMu.RLock()
-	msgs := append([]llm.Message(nil), s.agent.Messages...)
 	cfgMsg := s.agentConfigMsgBasic()
 	s.agentMu.RUnlock()
+	msgs := s.agent.SnapshotMessages()
 	_ = ws.writeJSON(cfgMsg)
 	if len(msgs) > 0 {
 		_ = ws.writeJSON(WSMessage{Type: "history", History: historyEntries(msgs)})
@@ -789,7 +791,7 @@ func (s *Server) handleWSSetMode(ws *wsConn, ctx context.Context, stream *wsConn
 	})
 	s.turnMu.Unlock()
 	if modeSet {
-		accum := s.agent.UsageAccum
+		accum := s.agent.SnapshotUsageAccum()
 		applyContextStats(&cfg, s.agent.ContextStats(ctx), &accum)
 		_ = ws.writeJSON(cfg)
 	}
@@ -831,7 +833,7 @@ func (s *Server) handleWSConfig(ws *wsConn, ctx context.Context, stream *wsConnS
 	})
 	s.agent.AfterWorkingDirChange()
 	s.turnMu.Unlock()
-	accum := s.agent.UsageAccum
+	accum := s.agent.SnapshotUsageAccum()
 	applyContextStats(&cfg, s.agent.ContextStats(ctx), &accum)
 	_ = ws.writeJSON(WSMessage{Type: "config", WorkingDir: absDir, Model: cfg.Model, ContextLimit: cfg.ContextLimit, UsedTokens: cfg.UsedTokens, UsedSource: cfg.UsedSource, UsedPercent: cfg.UsedPercent, CompactAt: cfg.CompactAt, MessageCount: cfg.MessageCount, NearCompact: cfg.NearCompact, ToolTruncated: cfg.ToolTruncated, Mode: cfg.Mode})
 }
@@ -888,7 +890,7 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, stream *wsConn
 	})
 	if modeHandled {
 		s.turnMu.Unlock()
-		accum := s.agent.UsageAccum
+		accum := s.agent.SnapshotUsageAccum()
 		applyContextStats(&modeCfg, s.agent.ContextStats(r.Context()), &accum)
 		_ = ws.writeJSON(modeCfg)
 		_ = ws.writeJSON(WSMessage{Type: "response", Content: modeOut})
@@ -993,10 +995,7 @@ func (s *Server) startAsyncStreamingTurn(ws *wsConn, r *http.Request, stream *ws
 				// that StreamProcessInput just appended (for edit/resend).
 				// Index goes in Content because WSMessage.Index has omitempty
 				// and the first message is index 0.
-				var userIdx int
-				s.lockAgentRead(func() {
-					userIdx = len(s.agent.Messages) - 1
-				})
+				userIdx := s.agent.MessageCount() - 1
 				if userIdx >= 0 {
 					write(WSMessage{Type: "user_acked", Content: fmt.Sprintf("%d", userIdx)})
 				}

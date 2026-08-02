@@ -2,6 +2,7 @@ package projectfile
 
 import (
 	"encoding/json"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -90,6 +91,7 @@ func mergeMCPServers(file FileConfig) []config.MCPServerConfig {
 		}
 		var servers []config.MCPServerConfig
 		if err := json.Unmarshal([]byte(raw), &servers); err != nil {
+			log.Printf("warning: GOGEN_MCP_SERVERS is not a valid JSON array; ignoring it: %v", err)
 			return nil
 		}
 		return servers
@@ -140,9 +142,11 @@ func mergeString(envKey string, file FileConfig, fileKey, fileVal, def string) s
 
 func mergeInt(envKey string, file FileConfig, fileKey string, fileVal, def int) int {
 	if _, ok := os.LookupEnv(envKey); ok {
-		if n, err := strconv.Atoi(os.Getenv(envKey)); err == nil {
+		raw := os.Getenv(envKey)
+		if n, err := strconv.Atoi(raw); err == nil {
 			return n
 		}
+		log.Printf("warning: %s=%q is not a valid integer; using default %d", envKey, raw, def)
 		return def
 	}
 	if fileHasKey(file, fileKey) {
@@ -153,9 +157,11 @@ func mergeInt(envKey string, file FileConfig, fileKey string, fileVal, def int) 
 
 func mergeFloat(envKey string, file FileConfig, fileKey string, fileVal, def float64) float64 {
 	if _, ok := os.LookupEnv(envKey); ok {
-		if f, err := strconv.ParseFloat(os.Getenv(envKey), 64); err == nil {
+		raw := os.Getenv(envKey)
+		if f, err := strconv.ParseFloat(raw, 64); err == nil {
 			return f
 		}
+		log.Printf("warning: %s=%q is not a valid number; using default %g", envKey, raw, def)
 		return def
 	}
 	if fileHasKey(file, fileKey) {
@@ -166,8 +172,16 @@ func mergeFloat(envKey string, file FileConfig, fileKey string, fileVal, def flo
 
 func mergeBool(envKey string, file FileConfig, fileKey string, fileVal, def bool) bool {
 	if _, ok := os.LookupEnv(envKey); ok {
-		v := strings.TrimSpace(strings.ToLower(os.Getenv(envKey)))
-		return v == "1" || v == "true"
+		raw := os.Getenv(envKey)
+		switch strings.TrimSpace(strings.ToLower(raw)) {
+		case "1", "true", "on", "yes":
+			return true
+		case "0", "false", "off", "no":
+			return false
+		default:
+			log.Printf("warning: %s=%q is not a valid boolean; using default %t", envKey, raw, def)
+			return def
+		}
 	}
 	if fileHasKey(file, fileKey) {
 		return fileVal

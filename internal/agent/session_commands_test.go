@@ -15,7 +15,7 @@ type stubSessionStore struct {
 	saveErr  error
 }
 
-func (s *stubSessionStore) AppendMessages(id string, snap SessionSnapshot) error {
+func (s *stubSessionStore) AppendMessages(id string, snap SessionSnapshot, _ int) error {
 	if s.saveErr != nil {
 		return s.saveErr
 	}
@@ -356,5 +356,122 @@ func TestPersistSessionStoresProjectProfile(t *testing.T) {
 	}
 	if a.projectProfile == "" {
 		t.Fatal("expected in-memory projectProfile to be set")
+	}
+}
+
+// TestForkLastSkipsTruncatedGhostTurn reproduces the real-world fork case
+// (session 92a84ada → d792036a): a turn that ended with a reasoning-only
+// ghost after a complete tool round. "fork last" must skip the ghost and land
+// on the last assistant message that produced output, and must NOT carry the
+// tool round into the forked session.
+func TestForkLastSkipsTruncatedGhostTurn(t *testing.T) {
+	store := &stubSessionStore{}
+	a := &Agent{
+		Provider:     &statsStubProvider{},
+		WorkingDir:   "/tmp",
+		SessionStore: store,
+		SessionID:    "orig",
+		Messages: []llm.Message{
+			{Role: "user", Content: "investigate"},
+			{Role: "assistant", Content: "Let me check the flow.", ToolCalls: []llm.ToolCall{{ID: "c1", Name: "read_file"}}},
+			{Role: "tool", Content: "file contents", ToolCallID: "c1"},
+			{Role: "assistant", Content: "", Reasoning: "OK let me now step back and put together the analysis."},
+		},
+	}
+	if err := a.ForkSession(context.Background(), "last", "forked"); err != nil {
+		t.Fatal(err)
+	}
+	if a.SessionID != "forked" {
+		t.Fatalf("session=%s, want forked", a.SessionID)
+	}
+	if len(a.Messages) != 2 {
+		t.Fatalf("forked history has %d messages, want 2 (ghost + tool round excluded)", len(a.Messages))
+	}
+	last := a.Messages[len(a.Messages)-1]
+	if last.Role != "assistant" || last.Content != "Let me check the flow." {
+		t.Fatalf("fork point should be the last assistant with output, got %+v", last)
+	}
+	if len(last.ToolCalls) != 0 {
+		t.Fatalf("fork point tool calls should be stripped, got %+v", last.ToolCalls)
+	}
+	for _, m := range a.Messages {
+		if m.Role == "tool" {
+			t.Fatalf("tool round must not be forked: %+v", m)
+		}
+		if m.Role == "assistant" && m.Content == "" && len(m.ToolCalls) == 0 {
+			t.Fatalf("ghost must not be forked: %+v", m)
+		}
+	}
+}
+
+// TestForkLastToolCallOnlyForkPointDropsEmptyAssistant verifies that forking
+// from a tool-call-only assistant message (empty content) strips the tool
+// calls and drops the resulting fully-empty message instead of leaving a
+// ghost behind in the forked session.
+func TestForkLastToolCallOnlyForkPointDropsEmptyAssistant(t *testing.T) {
+	a := &Agent{
+		Provider:   &statsStubProvider{},
+		WorkingDir: "/tmp",
+		SessionID:  "orig",
+		Messages: []llm.Message{
+			{Role: "user", Content: "implement it"},
+			{Role: "assistant", Content: "", ToolCalls: []llm.ToolCall{{ID: "c1", Name: "read_file"}}},
+		},
+	}
+	if err := a.ForkSession(context.Background(), "last", "forked"); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.Messages) != 1 {
+		t.Fatalf("forked history has %d messages, want 1 (empty fork point dropped)", len(a.Messages))
+	}
+	if a.Messages[0].Role != "user" {
+		t.Fatalf("last message should be the user turn, got %+v", a.Messages[0])
+	}
+}
+
+// TestForkIndexOnGhostWalksBack verifies explicit index forks never land on an
+// invisible assistant message: the fork point walks back to the nearest
+// visible message.
+func TestForkIndexOnGhostWalksBack(t *testing.T) {
+	a := &Agent{
+		Provider:   &statsStubProvider{},
+		WorkingDir: "/tmp",
+		SessionID:  "orig",
+		Messages: []llm.Message{
+			{Role: "user", Content: "a"},
+			{Role: "assistant", Content: "reply 1"},
+			{Role: "user", Content: "b"},
+			{Role: "assistant", Content: "", Reasoning: "thinking only"},
+		},
+	}
+	if err := a.ForkSession(context.Background(), "3", "forked"); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.Messages) != 3 {
+		t.Fatalf("forked history has %d messages, want 3", len(a.Messages))
+	}
+	if last := a.Messages[len(a.Messages)-1]; last.Role != "user" || last.Content != "b" {
+		t.Fatalf("fork point should walk back to visible message, got %+v", last)
+	}
+}
+
+// TestForkLastNoVisibleAssistant verifies that when every assistant message is
+// a ghost, "fork last" reports an error instead of forking from a ghost.
+func TestForkLastNoVisibleAssistant(t *testing.T) {
+	a := &Agent{
+		Provider:   &statsStubProvider{},
+		WorkingDir: "/tmp",
+		SessionID:  "orig",
+		Messages: []llm.Message{
+			{Role: "user", Content: "a"},
+			{Role: "assistant", Content: "", Reasoning: "thinking only"},
+		},
+	}
+	err := a.ForkSession(context.Background(), "last", "forked")
+	if err == nil {
+		t.Fatal("expected error when no visible assistant message exists")
+	}
+	if !strings.Contains(err.Error(), "no assistant message") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

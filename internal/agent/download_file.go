@@ -29,7 +29,7 @@ const (
 // written verbatim, so source files and binaries arrive intact and can then
 // be explored with read_file offset/limit, search_code, list_definitions,
 // patch_file, etc. This is the intended path for files larger than the
-// web_fetch text caps (~64 KB default body / 2 MB max).
+// web_fetch text caps (~256 KB default body / 2 MB max).
 //
 // The same network policy as web_fetch applies: https-only in the default
 // mode, private/internal hosts and redirects blocked, domain allowlist

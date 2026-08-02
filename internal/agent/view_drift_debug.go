@@ -54,9 +54,13 @@ func (a *Agent) clearViewDriftSnapshot() {
 // compaction or updating the drift snapshot.
 func (a *Agent) wireViewForDebug() []llm.Message {
 	if a.Context != nil {
+		// In-place rewrite of oversized tool bodies — exclude concurrent
+		// ContextStats/SnapshotMessages clones (see prepareMessages).
+		a.statsMu.Lock()
 		a.Context.EnsureToolResultsCapped(a.Messages)
+		a.statsMu.Unlock()
 	}
-	stabilizeToolArgs(a.Messages)
+	a.stabilizeToolArgs()
 	view := withSystemPrompt(a.Messages, a.WorkingDir)
 	view = enrichSystemPrompt(view, a.WorkingDir, a.ProjectFilePath, a.ProjectGuidelines, a.ensureProjectProfile(), a.Mode)
 	return view

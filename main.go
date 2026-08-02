@@ -180,7 +180,7 @@ func main() {
 	})
 
 	exec := agent.NewExecutorWithGuard(cfg.WorkingDir, agent.NewCommandGuard(cfg.CommandSafetyMode, agent.ParseAllowlist(cfg.CommandAllowlist)))
-	exec.RequireDeleteApproval = cfg.DeleteApproval != "off"
+	exec.RequireDeleteApproval = !strings.EqualFold(cfg.DeleteApproval, "off")
 	exec.Sandbox = cfg.CommandSandbox
 	if cfg.CommandTimeoutSecs > 0 {
 		exec.CommandTimeout = time.Duration(cfg.CommandTimeoutSecs) * time.Second
@@ -200,7 +200,7 @@ func main() {
 		a.DebugCompareMessages = false
 	}
 
-	sessionEnabled := os.Getenv("GOGEN_SESSION_PERSIST") != "off"
+	sessionEnabled := !strings.EqualFold(os.Getenv("GOGEN_SESSION_PERSIST"), "off")
 	sessionOpts := session.StoreOptions{
 		MaxCount:   cfg.SessionMaxCount,
 		MaxAgeDays: cfg.SessionMaxAgeDays,
@@ -363,8 +363,16 @@ func main() {
 // runSinglePrompt processes one user prompt and exits.
 // It uses the already-initialized agent and config but skips the TUI/web.
 func runSinglePrompt(ctx context.Context, a *agent.Agent, prompt string, cfg *config.Config) {
-	// In single-prompt mode, skip delete approvals (no interactive modal).
-	a.Executor.RequireDeleteApproval = false
+	// In single-prompt mode there is no interactive approval modal, so a
+	// delete that requires approval would be blocked (safely) by the
+	// ErrDeleteApprovalRequired error. Only skip the approval check when the
+	// user explicitly opted out via delete_approval: off; otherwise warn so
+	// the block is not surprising.
+	if strings.EqualFold(cfg.DeleteApproval, "off") {
+		a.Executor.RequireDeleteApproval = false
+	} else if a.Executor.RequireDeleteApproval {
+		fmt.Fprintf(os.Stderr, "Note: delete_file requires approval (delete_approval: %s) and is blocked in single-prompt mode; set GOGEN_DELETE_APPROVAL=off to allow deletes.\n", cfg.DeleteApproval)
+	}
 
 	// Start a fresh session: clear any restored conversation state.
 	a.ResetSessionState()

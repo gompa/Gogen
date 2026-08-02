@@ -50,7 +50,7 @@ func (a *Agent) HandleSessionCommand(ctx context.Context, input, newSessionID st
 		if err := a.ForkSession(ctx, args, newSessionID); err != nil {
 			return SessionCommandResult{}, true, err
 		}
-		return SessionCommandResult{Output: AppendContextBrief(ctx, a, fmt.Sprintf("Forked new session %s.", newSessionID)), Action: SessionActionClearChat, History: append([]llm.Message(nil), a.Messages...)}, true, nil
+		return SessionCommandResult{Output: AppendContextBrief(ctx, a, fmt.Sprintf("Forked new session %s.", newSessionID)), Action: SessionActionClearChat, History: a.SnapshotMessages()}, true, nil
 	}
 	return SessionCommandResult{}, false, nil
 }
@@ -70,13 +70,14 @@ func parseSessionCommand(input string) (cmd, args string) {
 // ResetSessionState clears all session-related state for starting fresh.
 // This is used when creating a new session or replacing a deleted current session.
 func (a *Agent) ResetSessionState() {
-	a.Messages = nil
+	a.replaceMessages(nil)
 	a.clearTurnUsage()
-	a.restoredTokenCounts = nil
+	a.statsMu.Lock()
 	a.UsageAccum = UsageAccumulator{}
+	a.statsMu.Unlock()
 	a.resetSaveTracking()
 	a.clearViewDriftSnapshot()
-	a.SessionLabel = ""
+	a.setSessionLabel("")
 	a.SessionOneshot = false
 	if a.PinManager != nil {
 		a.PinManager.ClearPins()
@@ -107,13 +108,13 @@ func (a *Agent) handleResumeArg(ctx context.Context, args, newSessionID string) 
 		if err != nil {
 			return SessionCommandResult{}, true, err
 		}
-		return SessionCommandResult{Output: out, Action: SessionActionClearChat, History: append([]llm.Message(nil), a.Messages...)}, true, nil
+		return SessionCommandResult{Output: out, Action: SessionActionClearChat, History: a.SnapshotMessages()}, true, nil
 	}
 	out, err := a.resumeSessionByID(ctx, args)
 	if err != nil {
 		return SessionCommandResult{}, true, err
 	}
-	return SessionCommandResult{Output: out, Action: SessionActionClearChat, History: append([]llm.Message(nil), a.Messages...)}, true, nil
+	return SessionCommandResult{Output: out, Action: SessionActionClearChat, History: a.SnapshotMessages()}, true, nil
 }
 
 func (a *Agent) startNewSession(newID string) (string, error) {
@@ -255,16 +256,33 @@ func (a *Agent) FormatSessionListForUI() (string, []SessionInfo, error) {
 
 // ForkSession starts a new session that is a copy of the current conversation
 // up to (and including) a specific message. args can be:
-//   - "" or "last": fork from the last assistant message
+//   - "" or "last": fork from the last assistant message that produced output
+//     (ghosts — reasoning-only or fully-empty assistant turns — are skipped so
+//     forks can't land on truncated turns)
 //   - "<N>": fork from the Nth displayed message (0-indexed, counting only user+assistant)
 //   - "assistant <N>": fork from the Nth assistant message (0-indexed)
 //   - "created <RFC3339Nano>": fork from message with the given CreatedAt timestamp
+//
+// Invisible assistant messages (no content, no refusal, no tool calls) are
+// never used as a fork point: explicit index forks walk back to the nearest
+// visible message, and stripping tool calls from a tool-call-only fork point
+// drops the resulting empty message instead of leaving a ghost in the forked
+// history.
 func (a *Agent) ForkSession(ctx context.Context, args, newSessionID string) error {
 	if strings.TrimSpace(newSessionID) == "" {
 		return fmt.Errorf("session id is required")
 	}
 	if len(a.Messages) == 0 {
 		return fmt.Errorf("no messages to fork from")
+	}
+
+	// isInvisibleAssistant reports whether an assistant message carries no
+	// user-visible output (no content, no refusal, no tool calls). Such
+	// messages — truncated reasoning-only turns, or ghosts left behind by
+	// stripping tool calls — render as nothing in the UI, cannot be forked
+	// from, and are invalid as the last message of a forked session.
+	isInvisibleAssistant := func(m llm.Message) bool {
+		return m.Role == "assistant" && m.Content == "" && m.Refusal == "" && len(m.ToolCalls) == 0
 	}
 
 	// Determine the fork index
@@ -274,7 +292,7 @@ func (a *Agent) ForkSession(ctx context.Context, args, newSessionID string) erro
 	case args == "" || args == "last":
 		// Fork from the last assistant message
 		for i := len(a.Messages) - 1; i >= 0; i-- {
-			if a.Messages[i].Role == "assistant" {
+			if a.Messages[i].Role == "assistant" && !isInvisibleAssistant(a.Messages[i]) {
 				idx = i
 				break
 			}
@@ -328,6 +346,16 @@ func (a *Agent) ForkSession(ctx context.Context, args, newSessionID string) erro
 		idx = n
 	}
 
+	// Never fork from an invisible assistant message (a truncated
+	// reasoning-only turn or a fully-empty ghost): walk back to the nearest
+	// visible message so the forked session ends on a meaningful turn.
+	for idx > 0 && isInvisibleAssistant(a.Messages[idx]) {
+		idx--
+	}
+	if isInvisibleAssistant(a.Messages[idx]) {
+		return fmt.Errorf("no visible message found to fork from")
+	}
+
 	// Save current session (the original branch)
 	if a.SessionStore != nil {
 		a.FlushSession()
@@ -343,17 +371,28 @@ func (a *Agent) ForkSession(ctx context.Context, args, newSessionID string) erro
 	// tool calls with no corresponding results.
 	if forkedMsgs[idx].Role == "assistant" && len(forkedMsgs[idx].ToolCalls) > 0 {
 		forkedMsgs[idx].ToolCalls = nil
+		// Stripping tool calls from a tool-call-only message (empty content,
+		// empty refusal) leaves a fully-empty assistant message behind. Drop
+		// any trailing empty assistant messages so the forked session doesn't
+		// start with a ghost turn.
+		for len(forkedMsgs) > 0 && isInvisibleAssistant(forkedMsgs[len(forkedMsgs)-1]) {
+			forkedMsgs = forkedMsgs[:len(forkedMsgs)-1]
+		}
+		if len(forkedMsgs) == 0 {
+			return fmt.Errorf("cannot fork from an empty assistant message")
+		}
 	}
 
 	// Start new session with the truncated history
 	a.SessionID = newSessionID
-	a.Messages = forkedMsgs
+	a.replaceMessages(forkedMsgs)
 	a.clearTurnUsage()
-	a.restoredTokenCounts = nil
+	a.statsMu.Lock()
 	a.UsageAccum = UsageAccumulator{}
+	a.statsMu.Unlock()
 	a.resetSaveTracking()
 	a.clearViewDriftSnapshot()
-	a.SessionLabel = ""
+	a.setSessionLabel("")
 	a.SessionOneshot = false
 	if a.PinManager != nil {
 		a.PinManager.ClearPins()

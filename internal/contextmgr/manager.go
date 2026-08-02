@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"gogen/internal/config"
 	"gogen/internal/llm"
 )
 
@@ -25,10 +26,10 @@ type Settings struct {
 func DefaultSettings() Settings {
 	return Settings{
 		ContextLimit:         0,
-		CompactThreshold:     0.75,
-		KeepRecentMessages:   12,
-		MaxToolResultBytes:   65536, // 64 KB — matches web_fetch's default body cap
-		CompactReserveTokens: 4000,
+		CompactThreshold:     config.DefaultCompactThreshold,
+		KeepRecentMessages:   config.DefaultKeepRecentMessages,
+		MaxToolResultBytes:   config.DefaultMaxToolResultBytes,
+		CompactReserveTokens: config.DefaultCompactReserveTokens,
 	}
 }
 
@@ -105,7 +106,7 @@ func (m *Manager) EnsureContextLimit(ctx context.Context) {
 // stores the result. Concurrent resolvers are safe: the first successful store
 // wins unless a manual override lands mid-flight.
 func (m *Manager) resolveContextLimit(ctx context.Context) {
-	limit := 128000
+	limit := config.DefaultContextLimit
 	if m.Provider != nil {
 		if n, err := m.Provider.ModelContextLimit(ctx); err == nil && n > 0 {
 			limit = n
@@ -199,7 +200,7 @@ func (m *Manager) snapshot(canonical, llmView []llm.Message, stored int) Context
 	m.mu.RLock()
 	limit := m.Settings.ContextLimit
 	if limit <= 0 {
-		limit = 128000
+		limit = config.DefaultContextLimit
 	}
 	compactAt := m.compactBudgetLocked()
 	m.mu.RUnlock()
@@ -245,7 +246,7 @@ func hasTruncatedToolResults(messages []llm.Message) bool {
 func (m *Manager) compactBudgetLocked() int {
 	limit := m.Settings.ContextLimit
 	if limit <= 0 {
-		limit = 128000
+		limit = config.DefaultContextLimit
 	}
 	budget := int(float64(limit) * m.Settings.CompactThreshold)
 	budget -= m.Settings.CompactReserveTokens
@@ -456,7 +457,7 @@ func (m *Manager) summarizeMessages(ctx context.Context, messages []llm.Message,
 func (m *Manager) maxSummaryInputTokensLocked() int {
 	limit := m.Settings.ContextLimit
 	if limit <= 0 {
-		limit = 128000
+		limit = config.DefaultContextLimit
 	}
 	budget := limit/2 - m.Settings.CompactReserveTokens
 	if budget < 2000 {

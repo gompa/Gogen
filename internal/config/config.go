@@ -4,6 +4,33 @@ import (
 	"strings"
 )
 
+// Exported defaults for configurable settings. Other packages reference these
+// constants instead of duplicating literals, so the values have a single
+// source of truth.
+const (
+	// DefaultCompactThreshold is the fraction of the context limit that
+	// triggers auto-compaction.
+	DefaultCompactThreshold = 0.75
+	// DefaultKeepRecentMessages is the number of recent messages preserved
+	// during compaction.
+	DefaultKeepRecentMessages = 12
+	// DefaultMaxToolResultBytes is the cap for tool output before truncation
+	// (256 KB — matches web_fetch's default body cap).
+	DefaultMaxToolResultBytes = 262144
+	// DefaultCompactReserveTokens is the token budget reserved for new
+	// messages after compaction.
+	DefaultCompactReserveTokens = 4000
+	// DefaultCommandTimeoutSecs is the maximum duration for execute_command.
+	DefaultCommandTimeoutSecs = 120
+	// DefaultSessionMaxCount is the maximum saved sessions per working dir.
+	DefaultSessionMaxCount = 50
+	// DefaultSessionMaxAgeDays is the retention window for saved sessions.
+	DefaultSessionMaxAgeDays = 30
+	// DefaultContextLimit is the fallback context window size (tokens) when
+	// it cannot be resolved from the provider.
+	DefaultContextLimit = 128000
+)
+
 // MCPServerConfig describes one MCP stdio server entry.
 type MCPServerConfig struct {
 	Name    string            `json:"name"`
@@ -79,10 +106,10 @@ func Defaults() Config {
 		OpenAIURL:            "",
 		WorkingDir:           ".",
 		ContextLimit:         0,
-		CompactThreshold:     0.75,
-		KeepRecentMessages:   12,
-		MaxToolResultBytes:   65536, // 64 KB — matches web_fetch's default body cap
-		CompactReserveTokens: 4000,
+		CompactThreshold:     DefaultCompactThreshold,
+		KeepRecentMessages:   DefaultKeepRecentMessages,
+		MaxToolResultBytes:   DefaultMaxToolResultBytes,
+		CompactReserveTokens: DefaultCompactReserveTokens,
 		CommandSafetyMode:    "blocklist",
 		CommandAllowlist:     "",
 		DeleteApproval:       "required",
@@ -97,8 +124,8 @@ func Defaults() Config {
 		WebAllowedOrigins:    "",
 		WebTLSCertFile:       "",
 		WebTLSKeyFile:        "",
-		SessionMaxCount:      50,
-		SessionMaxAgeDays:    30,
+		SessionMaxCount:      DefaultSessionMaxCount,
+		SessionMaxAgeDays:    DefaultSessionMaxAgeDays,
 		WebFetch:             "on",
 		WebSearch:            "on",
 		WebSearchBackend:     "",
@@ -106,7 +133,7 @@ func Defaults() Config {
 		WebAllowedDomains:    "",
 		WebFetchMode:         "https",
 		CommandSandbox:       "off",
-		CommandTimeoutSecs:   120,
+		CommandTimeoutSecs:   DefaultCommandTimeoutSecs,
 		PreserveReasoning:    "auto",
 	}
 }

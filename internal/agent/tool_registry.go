@@ -532,7 +532,8 @@ func handleSessionRename(_ context.Context, a *Agent, args map[string]interface{
 }
 
 func handleSessionUsage(_ context.Context, a *Agent, _ map[string]interface{}) (string, error) {
-	return a.UsageAccum.Format(), nil
+	u := a.SnapshotUsageAccum()
+	return u.Format(), nil
 }
 
 func handleContextPinLast(_ context.Context, a *Agent, _ map[string]interface{}) (string, error) {

@@ -167,7 +167,7 @@ Files without config (plain markdown) are treated as guidelines-only. The old co
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OPENAI_API_KEY` | *(required)* | API key for an OpenAI-compatible endpoint |
-| `OPENAI_MODEL` | `gpt-4o` | Model to use |
+| `OPENAI_MODEL` | *(empty)* | Model to use; leave empty to use the endpoint's default model or pick one with `/models` |
 | `OPENAI_BASE_URL` | *(empty)* | API base URL (e.g. `https://api.openai.com/v1` or a local proxy) |
 | `GOGEN_WORKING_DIR` | `.` | Default working directory |
 
@@ -178,7 +178,7 @@ Files without config (plain markdown) are treated as guidelines-only. The old co
 | `GOGEN_CONTEXT_LIMIT` | `0` | Manual token limit override (`0` = resolve from model) |
 | `GOGEN_COMPACT_THRESHOLD` | `0.75` | Fraction of context limit that triggers auto-compaction |
 | `GOGEN_KEEP_RECENT_MESSAGES` | `12` | Recent messages preserved during compaction |
-| `GOGEN_MAX_TOOL_RESULT_BYTES` | `65536` | Max bytes for tool output before truncation (matches web_fetch's 64 KB limit) |
+| `GOGEN_MAX_TOOL_RESULT_BYTES` | `262144` | Max bytes for tool output before truncation (matches web_fetch's 256 KB limit) |
 | `GOGEN_COMPACT_RESERVE_TOKENS` | `4000` | Tokens reserved for new messages after compaction |
 
 After each agent turn, GoGen shows context usage in the CLI (dim line) and web UI (sidebar meter). Use `/context` for a detailed breakdown. When the provider returns usage stats (`prompt_tokens` from the API, including streaming with `include_usage`), the display labels this as **last request**; otherwise it falls back to a local token estimate.
@@ -235,7 +235,8 @@ These can be set in `.gogen/gogen.conf` or as CLI flags. They are loaded from th
 | `GOGEN_SESSION_PERSIST` | on | Set to `off` to disable session save/resume |
 | `GOGEN_SESSION_MAX_COUNT` | `50` | Max saved sessions per working directory |
 | `GOGEN_SESSION_MAX_AGE_DAYS` | `30` | Auto-delete sessions older than N days |
-| `GOGEN_SESSION_PERSIST` is listed above; the other two are config-only via `.gogen/gogen.conf` (`session_max_count`, `session_max_age_days`). |
+
+`GOGEN_SESSION_MAX_COUNT` and `GOGEN_SESSION_MAX_AGE_DAYS` can also be set in `.gogen/gogen.conf` (`session_max_count`, `session_max_age_days`); env vars take precedence.
 
 ### Sessions and debug
 

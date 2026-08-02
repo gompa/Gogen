@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"gogen/internal/config"
 )
 
 const (
@@ -20,7 +22,7 @@ const (
 )
 
 // defaultCommandTimeout is the default maximum duration for command execution.
-const defaultCommandTimeout = 2 * time.Minute
+const defaultCommandTimeout = time.Duration(config.DefaultCommandTimeoutSecs) * time.Second
 
 type Executor struct {
 	wdMu                  sync.RWMutex

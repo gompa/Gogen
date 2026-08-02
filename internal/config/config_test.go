@@ -123,8 +123,8 @@ func TestConfigDefaults(t *testing.T) {
 	if d.CompactThreshold != 0.75 {
 		t.Errorf("default compact threshold = %f, want 0.75", d.CompactThreshold)
 	}
-	if d.MaxToolResultBytes != 65536 {
-		t.Errorf("default max tool result bytes = %d, want 65536", d.MaxToolResultBytes)
+	if d.MaxToolResultBytes != 262144 {
+		t.Errorf("default max tool result bytes = %d, want 262144", d.MaxToolResultBytes)
 	}
 	if d.CommandTimeoutSecs != 120 {
 		t.Errorf("default command timeout = %d, want 120", d.CommandTimeoutSecs)

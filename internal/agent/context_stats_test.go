@@ -2,8 +2,10 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"gogen/internal/contextmgr"
@@ -11,8 +13,9 @@ import (
 )
 
 type statsStubProvider struct {
-	limit  int
-	models []llm.ModelInfo
+	limit        int
+	models       []llm.ModelInfo
+	streamResult *llm.StreamResult // optional override for GenerateResponseStream
 }
 
 func (s *statsStubProvider) GenerateResponse(_ context.Context, _ []llm.Message, _ map[string]struct{}, _ []llm.Tool) (llm.Response, error) {
@@ -20,6 +23,9 @@ func (s *statsStubProvider) GenerateResponse(_ context.Context, _ []llm.Message,
 }
 
 func (s *statsStubProvider) GenerateResponseStream(_ context.Context, _ []llm.Message, _ map[string]struct{}, _ []llm.Tool, _ *llm.StreamHandlers) (*llm.StreamResult, error) {
+	if s.streamResult != nil {
+		return s.streamResult, nil
+	}
 	return &llm.StreamResult{}, nil
 }
 
@@ -133,6 +139,76 @@ func TestRecordTurnUsageIgnoresNil(t *testing.T) {
 	a.recordTurnUsage(nil)
 	if a.lastTurnUsage == nil || a.lastTurnUsage.PromptTokens != 10 {
 		t.Fatalf("nil usage cleared lastTurnUsage: %+v", a.lastTurnUsage)
+	}
+}
+
+// TestContextStatsConcurrentWithTurn verifies ContextStats is safe to call
+// while a turn goroutine appends messages, extends the cached token counts,
+// records API usage, and stabilizes tool args in place. The web server calls
+// ContextStats and SnapshotMessages without agentMu/turnMu during a stream
+// (connect-time and /models goroutines), so the shared state must be
+// synchronized independently of the turn lock. Run with -race (make test)
+// to catch regressions.
+func TestContextStatsConcurrentWithTurn(t *testing.T) {
+	provider := &statsStubProvider{limit: 1000}
+	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{ContextLimit: 1000})
+	a := NewAgent(provider, &Executor{WorkingDir: "."}, ctxMgr)
+	a.Messages = []llm.Message{
+		{Role: "user", Content: "q1"},
+		{Role: "assistant", Content: "a1"},
+		{Role: "user", Content: "q2"},
+		{Role: "assistant", Content: "a2"},
+	}
+	// Restore a shorter count cache (as after a session restore with new
+	// messages) so appendMessage has to extend it while readers run.
+	a.restoreMessages(a.Messages, []int{1, 2, 3, 4})
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	// Readers: simulate web WS readers probing context stats mid-turn.
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					stats := a.ContextStats(context.Background())
+					if stats.Snapshot.MessageCount < 4 || stats.Snapshot.MessageCount > 4+200 {
+						// The writer appends up to 200 messages; a torn or
+						// overlapping snapshot outside this range would mean
+						// the lock discipline is broken. Keep the read
+						// observable to the race detector.
+						t.Errorf("MessageCount=%d out of range", stats.Snapshot.MessageCount)
+						return
+					}
+					if msgs := a.SnapshotMessages(); len(msgs) < 4 || len(msgs) > 4+200 {
+						t.Errorf("SnapshotMessages len=%d out of range", len(msgs))
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	// Writer: simulate the turn goroutine appending messages (with tool calls
+	// so the deep clone and in-place stabilization paths are exercised),
+	// extending counts, and recording usage.
+	for i := 0; i < 200; i++ {
+		tc := []llm.ToolCall{{ID: fmt.Sprintf("call_%d", i), Name: "read_file", Args: map[string]interface{}{"path": "a.go"}}}
+		a.appendMessage(llm.Message{Role: "assistant", Content: "resp", ToolCalls: tc})
+		a.stabilizeToolArgs()
+		a.recordTurnUsage(&llm.Usage{PromptTokens: 10 + i, CompletionTokens: 1, TotalTokens: 11 + i})
+	}
+	close(stop)
+	wg.Wait()
+
+	a.statsMu.RLock()
+	defer a.statsMu.RUnlock()
+	if len(a.restoredTokenCounts) != len(a.Messages) {
+		t.Fatalf("restoredTokenCounts len=%d, want %d", len(a.restoredTokenCounts), len(a.Messages))
 	}
 }
 

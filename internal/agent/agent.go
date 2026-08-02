@@ -34,7 +34,20 @@ type Agent struct {
 	SessionLabel   string
 	SessionOneshot bool // true if this session was created by a single-prompt (-p) invocation
 	UsageAccum     UsageAccumulator
-	lastTurnUsage  *llm.Usage
+
+	// statsMu serializes the agent state that ContextStats/SnapshotMessages
+	// read without agentMu or turnMu: Messages, the cached token counts
+	// (restoredTokenCounts), the API-usage baseline (lastTurnUsage,
+	// apiBaseline*), projectProfile, UsageAccum, and SessionLabel. Every
+	// mutation of these fields from any goroutine must take statsMu. Leaf
+	// lock: while holding it, never call out to code that takes turnMu or
+	// agentMu. The reverse order does occur — server paths call
+	// SessionLabelSnapshot/ContextStats while holding agentMu/turnMu — so
+	// statsMu critical sections must stay short and never block on I/O or
+	// other locks.
+	statsMu sync.RWMutex
+
+	lastTurnUsage *llm.Usage
 	// apiBaselinePromptTokens and apiBaselineMsgCount let ContextStats use the
 	// API's exact prompt_tokens as the authoritative baseline for Snapshot.Used,
 	// only estimating messages added after the last API round.
@@ -100,7 +113,9 @@ func (a *Agent) SetProjectContext(path, guidelines, testCommand, lintCommand str
 	a.ProjectGuidelines = guidelines
 	a.TestCommand = strings.TrimSpace(testCommand)
 	a.LintCommand = strings.TrimSpace(lintCommand)
+	a.statsMu.Lock()
 	a.projectProfile = ""
+	a.statsMu.Unlock()
 }
 
 func (a *Agent) SetMCPRegistry(reg MCPToolRegistry) {
@@ -215,7 +230,16 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 	// snapshot path can reuse them instead of re-tokenizing everything.
 	a.extendTokenCounts()
 
-	count := len(a.Messages)
+	// Snapshot the conversation and label under statsMu: web probes read
+	// them without turnMu/agentMu, so doPersist must not touch the live
+	// fields outside the lock. The clone is deep (ToolCalls included) so
+	// the snapshot cannot race a concurrent in-place stabilization, and it
+	// is safe to tokenize and serialize after releasing the lock.
+	a.statsMu.RLock()
+	msgs := cloneMessages(a.Messages)
+	label := a.SessionLabel
+	a.statsMu.RUnlock()
+	count := len(msgs)
 	profile := a.ensureProjectProfile()
 
 	// Safety: if the message list was truncated since last save (e.g.
@@ -232,21 +256,25 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 		time.Since(a.lastFullSaveTime) > 30*time.Second
 
 	if needsFullSave {
-		msgs := append([]llm.Message(nil), a.Messages...)
 		snap := SessionSnapshot{
 			WorkingDir:     a.WorkingDir,
 			Model:          a.CurrentModel(),
 			Mode:           a.Mode.String(),
 			ThinkingLevel:  string(a.ThinkingLevel),
 			Oneshot:        a.SessionOneshot,
-			Label:          a.SessionLabel,
+			Label:          label,
 			ProjectProfile: profile,
 			Todos:          todoSnapshot(a.TodoManager),
 			Messages:       msgs,
 			ContextLimit:   a.ContextLimit(),
 		}
-		if len(a.restoredTokenCounts) == len(msgs) {
-			snap.TokenCounts = append([]int(nil), a.restoredTokenCounts...)
+		// Snapshot the restored counts under the stats lock: a concurrent
+		// ContextStats/turn may extend them while doPersist runs.
+		a.statsMu.RLock()
+		tokenCounts := append([]int(nil), a.restoredTokenCounts...)
+		a.statsMu.RUnlock()
+		if len(tokenCounts) == len(msgs) {
+			snap.TokenCounts = tokenCounts
 		} else if a.Context != nil && !skipTokenCounts {
 			snap.TokenCounts = a.Context.TokenCounts(msgs)
 		}
@@ -259,7 +287,7 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 		a.lastFullSaveTime = time.Now()
 	} else {
 		// Incremental: only serialise new messages since the last full save.
-		newMsgs := a.Messages[a.lastSavedMsgCount:]
+		newMsgs := msgs[a.lastSavedMsgCount:]
 		var newCounts []int
 		if a.Context != nil && !skipTokenCounts {
 			newCounts = make([]int, len(newMsgs))
@@ -270,11 +298,11 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 		deltaSnap := SessionSnapshot{
 			WorkingDir:  a.WorkingDir,
 			Oneshot:     a.SessionOneshot,
-			Label:       a.SessionLabel,
+			Label:       label,
 			Messages:    newMsgs,
 			TokenCounts: newCounts,
 		}
-		if err := a.SessionStore.AppendMessages(a.SessionID, deltaSnap); err != nil {
+		if err := a.SessionStore.AppendMessages(a.SessionID, deltaSnap, count); err != nil {
 			log.Printf("session delta save failed (id=%s): %v", a.SessionID, err)
 			a.lastPersistErr = err
 			return
@@ -303,12 +331,128 @@ func (a *Agent) resetSaveTracking() {
 	a.lastFullSaveTime = time.Time{}
 }
 
+// appendMessage appends one message to the conversation and, when restored
+// token counts are cached, extends them in the same critical section so the
+// message list and the counts cache stay consistent for concurrent readers.
+// This is the only way Messages grows during a turn. Thread-safe: ContextStats
+// and SnapshotMessages snapshot Messages + counts under statsMu while the
+// turn goroutine appends. Leaf lock: never acquire turnMu/agentMu under it.
+func (a *Agent) appendMessage(m llm.Message) {
+	a.statsMu.Lock()
+	a.Messages = append(a.Messages, m)
+	if a.restoredTokenCounts != nil {
+		a.restoredTokenCounts = append(a.restoredTokenCounts,
+			contextmgr.ComputeMessageTokens(m))
+	}
+	a.statsMu.Unlock()
+}
+
+// replaceMessages swaps the conversation wholesale and invalidates the cached
+// token counts (compaction, session restore, fork, reset). Publishing the new
+// slice and clearing the counts in one critical section means a concurrent
+// ContextStats never pairs new messages with stale counts. Leaf lock.
+func (a *Agent) replaceMessages(msgs []llm.Message) {
+	a.statsMu.Lock()
+	a.Messages = msgs
+	a.restoredTokenCounts = nil
+	a.statsMu.Unlock()
+}
+
+// restoreMessages publishes a restored session's messages together with their
+// pre-computed token counts and marks every message as already-stabilized
+// (persisted ArgsStr). One atomic publish so concurrent readers never observe
+// partially-initialized messages. Takes ownership of msgs (no defensive copy).
+// Leaf lock.
+func (a *Agent) restoreMessages(msgs []llm.Message, counts []int) {
+	a.statsMu.Lock()
+	a.Messages = msgs
+	a.restoredTokenCounts = counts
+	for i := range a.Messages {
+		a.Messages[i].ArgsStabilized = true
+	}
+	a.statsMu.Unlock()
+}
+
+// truncateMessages removes the last n messages (rollback paths) and trims the
+// cached token counts to match, keeping the fast SnapshotWithCounts path valid
+// after a rollback. Caller must guarantee n <= len(a.Messages). Leaf lock.
+func (a *Agent) truncateMessages(n int) {
+	a.statsMu.Lock()
+	a.Messages = a.Messages[:len(a.Messages)-n]
+	if a.restoredTokenCounts != nil && len(a.restoredTokenCounts) > len(a.Messages) {
+		a.restoredTokenCounts = a.restoredTokenCounts[:len(a.Messages)]
+	}
+	a.statsMu.Unlock()
+}
+
+// SnapshotMessages returns a deep copy of the current conversation messages
+// (including ToolCalls). Safe to call concurrently with a running turn; used
+// by the web server for history snapshots without holding agentMu.
+func (a *Agent) SnapshotMessages() []llm.Message {
+	a.statsMu.RLock()
+	msgs := cloneMessages(a.Messages)
+	a.statsMu.RUnlock()
+	return msgs
+}
+
+// MessageCount returns the current conversation message count. Thread-safe.
+func (a *Agent) MessageCount() int {
+	a.statsMu.RLock()
+	n := len(a.Messages)
+	a.statsMu.RUnlock()
+	return n
+}
+
+// cloneMessages deep-copies a message slice (including the ToolCalls slices)
+// so the result can be read after statsMu is released without racing the turn
+// goroutine's in-place stabilization (stabilizeToolArgs rewrites ToolCall
+// ArgsStr under statsMu). Callers must hold statsMu (R or W).
+func cloneMessages(msgs []llm.Message) []llm.Message {
+	out := append([]llm.Message(nil), msgs...)
+	for i := range out {
+		if len(out[i].ToolCalls) > 0 {
+			out[i].ToolCalls = append([]llm.ToolCall(nil), out[i].ToolCalls...)
+		}
+	}
+	return out
+}
+
+// cachedProjectProfile returns the sticky project-profile string, or "" when
+// none has been detected. Thread-safe: ensureProjectProfile/SetProjectContext/
+// SetWorkingDir/RestoreSessionLocal write it under statsMu, and ContextStats
+// reads it here so a concurrent turn's profile detection cannot race readers.
+func (a *Agent) cachedProjectProfile() string {
+	a.statsMu.RLock()
+	p := a.projectProfile
+	a.statsMu.RUnlock()
+	return p
+}
+
+// ensureProjectProfile detects and caches the project profile on first use.
+// Detection (disk reads) happens outside the lock; the store is double-checked
+// so a concurrent ContextStats read never sees a torn value. Called from the
+// turn goroutine (prepareMessages) and doPersist.
+func (a *Agent) ensureProjectProfile() string {
+	if p := a.cachedProjectProfile(); p != "" {
+		return p
+	}
+	profile := DetectProjectProfile(a.WorkingDir, a.TestCommand, a.LintCommand)
+	a.statsMu.Lock()
+	if a.projectProfile == "" {
+		a.projectProfile = profile
+	}
+	p := a.projectProfile
+	a.statsMu.Unlock()
+	return p
+}
+
 // extendTokenCounts extends restoredTokenCounts to cover any messages
-// appended since the last restore or extension. Call after appending to
-// a.Messages when restoredTokenCounts is non-nil. This preserves the
-// fast SnapshotWithCounts path in ContextStats and avoids re-tokenizing
-// the entire history on every call.
+// appended since the last restore or extension. With appendMessage maintaining
+// the counts inline this is normally a no-op; it is kept as a safety net for
+// doPersist so a full snapshot can reuse the fast counts path.
 func (a *Agent) extendTokenCounts() {
+	a.statsMu.Lock()
+	defer a.statsMu.Unlock()
 	if a.restoredTokenCounts == nil {
 		return
 	}
@@ -331,7 +475,9 @@ func (a *Agent) ConsumePersistError() error {
 // AfterWorkingDirChange for that, and never while holding server agentMu.
 func (a *Agent) SetWorkingDir(dir string) {
 	a.WorkingDir = dir
+	a.statsMu.Lock()
 	a.projectProfile = ""
+	a.statsMu.Unlock()
 	if a.Executor != nil {
 		a.Executor.SetWorkingDir(dir)
 	}
@@ -385,14 +531,6 @@ func (a *Agent) persistTodos() {
 	}
 }
 
-func (a *Agent) ensureProjectProfile() string {
-	if a.projectProfile != "" {
-		return a.projectProfile
-	}
-	a.projectProfile = DetectProjectProfile(a.WorkingDir, a.TestCommand, a.LintCommand)
-	return a.projectProfile
-}
-
 func finishStreamUI(h *llm.StreamHandlers) {
 	if h != nil && h.OnStreamEnd != nil {
 		h.OnStreamEnd()
@@ -439,9 +577,9 @@ func (a *Agent) prepareMessages(ctx context.Context) []llm.Message {
 				}
 				compacted, newPins, err := a.Context.CompactPinned(ctx, a.Messages, pinned)
 				if err == nil {
-					a.Messages = compacted
-					// Messages replaced — cached token counts invalid.
-					a.restoredTokenCounts = nil
+					// Publish the compacted history and invalidate the cached
+					// token counts in one atomic step.
+					a.replaceMessages(compacted)
 					if a.PinManager != nil {
 						a.PinManager.ReplacePins(newPins)
 					}
@@ -451,12 +589,16 @@ func (a *Agent) prepareMessages(ctx context.Context) []llm.Message {
 				}
 			}
 		}
+		// EnsureToolResultsCapped rewrites oversized tool bodies in place on
+		// the live message array; exclude concurrent ContextStats clones.
+		a.statsMu.Lock()
 		a.Context.EnsureToolResultsCapped(a.Messages)
+		a.statsMu.Unlock()
 		view = a.Messages
 	}
 	// Stabilize tool args on a.Messages (not view, which may be a copy) so
 	// ArgsStabilized is persisted and we skip already-stable messages.
-	stabilizeToolArgs(a.Messages)
+	a.stabilizeToolArgs()
 
 	view = withSystemPrompt(view, a.WorkingDir)
 	view = enrichSystemPrompt(view, a.WorkingDir, a.ProjectFilePath, a.ProjectGuidelines, a.ensureProjectProfile(), a.Mode)
@@ -468,15 +610,19 @@ func (a *Agent) prepareMessages(ctx context.Context) []llm.Message {
 // stabilizeToolArgs ensures every unstabilized tool call has its ArgsStr set.
 // Skipped messages with ArgsStabilized=true — this turns an O(total_tool_calls)
 // scan into O(new_tool_calls) per turn.
-func stabilizeToolArgs(msgs []llm.Message) {
-	for i := range msgs {
-		if msgs[i].ArgsStabilized {
+// It mutates Messages in place (ArgsStabilized, ToolCall ArgsStr), so it runs
+// under statsMu to exclude concurrent clones (ContextStats/SnapshotMessages).
+func (a *Agent) stabilizeToolArgs() {
+	a.statsMu.Lock()
+	defer a.statsMu.Unlock()
+	for i := range a.Messages {
+		if a.Messages[i].ArgsStabilized {
 			continue
 		}
-		for j := range msgs[i].ToolCalls {
-			llm.StabilizeToolCallArgs(&msgs[i].ToolCalls[j])
+		for j := range a.Messages[i].ToolCalls {
+			llm.StabilizeToolCallArgs(&a.Messages[i].ToolCalls[j])
 		}
-		msgs[i].ArgsStabilized = true
+		a.Messages[i].ArgsStabilized = true
 	}
 }
 
@@ -492,12 +638,10 @@ func (a *Agent) CompactHistory(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	a.Messages = compacted
+	a.replaceMessages(compacted)
 	if a.PinManager != nil {
 		a.PinManager.ReplacePins(newPins)
 	}
-	// Compacted messages have different content — cached token counts invalid.
-	a.restoredTokenCounts = nil
 	// lastTurnUsage is no longer representative after compaction.
 	a.clearTurnUsage()
 	a.resetSaveTracking()
@@ -522,29 +666,27 @@ func (a *Agent) appendToolResult(tc llm.ToolCall, result string) {
 	if a.Context != nil {
 		result = a.Context.TruncateToolResult(result)
 	}
-	a.Messages = append(a.Messages, llm.Message{
+	a.appendMessage(llm.Message{
 		Role:       "tool",
 		Content:    result,
 		ToolCallID: tc.ID,
 		CreatedAt:  time.Now().Truncate(time.Millisecond),
 	})
-	a.extendTokenCounts()
 }
 
 // StreamProcessInput streams tokens to the handlers as they arrive.
 // It returns the final accumulated response or an error.
 func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.StreamHandlers) (string, error) {
-	a.Messages = append(a.Messages, llm.Message{Role: "user", Content: input, CreatedAt: time.Now().Truncate(time.Millisecond)})
-	a.extendTokenCounts()
+	a.appendMessage(llm.Message{Role: "user", Content: input, CreatedAt: time.Now().Truncate(time.Millisecond)})
 	// If the session doesn't have a label yet, derive one from the first user message.
-	if a.SessionLabel == "" {
-		a.SessionLabel = llm.SessionLabel(a.Messages)
+	if a.SessionLabelSnapshot() == "" {
+		a.setSessionLabel(llm.SessionLabel(a.Messages))
 	}
 	// Persist immediately so a failed/cancelled turn does not drop the user message.
 	a.FlushSession()
 
 	if err := a.requireModelSelected(ctx); err != nil {
-		a.Messages = a.Messages[:len(a.Messages)-1]
+		a.truncateMessages(1)
 		a.resetSaveTracking()
 		a.FlushSession()
 		return "", err
@@ -585,18 +727,28 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 			return "", err
 		}
 		a.recordTurnUsage(result.Usage)
+		a.statsMu.Lock()
 		a.UsageAccum.Add(result.Usage)
+		a.statsMu.Unlock()
 
 		if len(result.ToolCalls) == 0 {
 			finishStreamUI(h)
-			a.Messages = append(a.Messages, llm.Message{
+			// A result with no content, no refusal, and no tool calls is a
+			// truncated turn (e.g. finish_reason="length" after consuming the
+			// output budget on reasoning). Persisting it would leave a ghost
+			// assistant message that renders as an empty reply, pollutes later
+			// turns, and becomes a fork point. Surface it as an error instead
+			// and let the user retry.
+			if result.Content == "" && result.Refusal == "" {
+				return "", fmt.Errorf("model returned no output (response was truncated mid-reasoning); please try again")
+			}
+			a.appendMessage(llm.Message{
 				Role:      "assistant",
 				Content:   result.Content,
 				Reasoning: result.Reasoning,
 				Refusal:   result.Refusal,
 				CreatedAt: time.Now().Truncate(time.Millisecond),
 			})
-			a.extendTokenCounts()
 			a.FlushSession()
 			if result.Content != "" {
 				return result.Content, nil
@@ -618,7 +770,7 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 			llm.StabilizeToolCallArgs(&result.ToolCalls[i])
 		}
 
-		a.Messages = append(a.Messages, llm.Message{
+		a.appendMessage(llm.Message{
 			Role:      "assistant",
 			Content:   result.Content,
 			Reasoning: result.Reasoning,
@@ -626,7 +778,6 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 			ToolCalls: result.ToolCalls,
 			CreatedAt: time.Now().Truncate(time.Millisecond),
 		})
-		a.extendTokenCounts()
 
 		for i, tc := range result.ToolCalls {
 			if ctx.Err() != nil {

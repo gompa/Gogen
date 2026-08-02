@@ -115,3 +115,107 @@ func TestSavePreservesCreatedOnCacheMiss(t *testing.T) {
 		t.Fatalf("Created reset on cache miss: first=%v second=%v", first.Created, second.Created)
 	}
 }
+
+// TestAppendMessagesUpdatesIndexMessageCount verifies that incremental delta
+// saves keep the session index's MessageCount accurate, so List does not
+// report a stale count between full snapshots. The delta file is cumulative
+// (all messages since the last full snapshot), so each AppendMessages carries
+// the agent's total message count.
+func TestAppendMessagesUpdatesIndexMessageCount(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(true)
+	id := "delta-count"
+	base := []llm.Message{
+		{Role: "user", Content: "q1"},
+		{Role: "assistant", Content: "a1"},
+	}
+	if err := store.Save(id, agent.SessionSnapshot{WorkingDir: dir, Messages: base}); err != nil {
+		t.Fatal(err)
+	}
+
+	// First incremental save: one new message (total 3).
+	if err := store.AppendMessages(id, agent.SessionSnapshot{
+		WorkingDir: dir,
+		Messages:   []llm.Message{{Role: "user", Content: "q2"}},
+	}, 3); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := store.List(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 || sessions[0].MessageCount != 3 {
+		t.Fatalf("after first delta, want 3 messages, got %+v", sessions)
+	}
+
+	// Second incremental save: the delta is cumulative (both new messages,
+	// matching how doPersist writes a.Messages[lastSavedMsgCount:]); total 4.
+	if err := store.AppendMessages(id, agent.SessionSnapshot{
+		WorkingDir: dir,
+		Messages: []llm.Message{
+			{Role: "user", Content: "q2"},
+			{Role: "assistant", Content: "a2"},
+		},
+	}, 4); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err = store.List(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 || sessions[0].MessageCount != 4 {
+		t.Fatalf("after second delta, want 4 messages, got %+v", sessions)
+	}
+
+	// A full save refreshes the count from the snapshot itself.
+	full := append(append([]llm.Message{}, base...),
+		llm.Message{Role: "user", Content: "q2"},
+		llm.Message{Role: "assistant", Content: "a2"},
+	)
+	if err := store.Save(id, agent.SessionSnapshot{WorkingDir: dir, Messages: full}); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err = store.List(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 || sessions[0].MessageCount != 4 {
+		t.Fatalf("after full save, want 4 messages, got %+v", sessions)
+	}
+}
+
+// TestAppendMessagesMissingIndexEntry verifies a delta save for a session
+// absent from the index is a no-op for the index (no entry created), keeping
+// the legacy fallback scan as the source of truth.
+func TestAppendMessagesMissingIndexEntry(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(true)
+	id := "no-index-entry"
+	// Write a session file without touching the index (simulates a legacy
+	// directory before the first full save indexed it).
+	path := filepath.Join(dir, ".gogen", "sessions", id+".json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"version":1,"id":"no-index-entry","messages":[{"role":"user","content":"hi"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendMessages(id, agent.SessionSnapshot{
+		WorkingDir: dir,
+		Messages:   []llm.Message{{Role: "user", Content: "q2"}},
+	}, 2); err != nil {
+		t.Fatal(err)
+	}
+	// The index file must not be created by AppendMessages; List falls back
+	// to the legacy scan.
+	if _, err := os.Stat(filepath.Join(dir, ".gogen", "sessions", "index.json")); !os.IsNotExist(err) {
+		t.Fatalf("index should not be created by AppendMessages: %v", err)
+	}
+	sessions, err := store.List(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("expected 1 session from legacy scan, got %+v", sessions)
+	}
+}

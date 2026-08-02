@@ -29,7 +29,9 @@ type SessionSnapshot struct {
 // SessionPersister stores and loads agent sessions.
 type SessionPersister interface {
 	Save(id string, snap SessionSnapshot) error
-	AppendMessages(id string, snap SessionSnapshot) error
+	// AppendMessages writes a cumulative delta (all messages since the last
+	// full snapshot); totalMsgCount is the agent's total message count.
+	AppendMessages(id string, snap SessionSnapshot, totalMsgCount int) error
 	LoadInWorkingDir(workingDir, id string) (SessionSnapshot, error)
 	List(workingDir string) ([]SessionInfo, error)
 	LatestID(workingDir string) (string, error)
@@ -57,8 +59,9 @@ type SessionInfo struct {
 func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 	prevSessionID := a.SessionID
 
-	// Take ownership of the snapshot's message slice — no defensive copy.
-	a.Messages = snap.Messages
+	// Publish messages, their pre-computed token counts, and the stabilized
+	// flag atomically (no defensive copy of the message slice).
+	a.restoreMessages(snap.Messages, snap.TokenCounts)
 	// Token counts are keyed by content fingerprint, so entries from the
 	// previous session remain valid as long as the content hasn't changed.
 	// Keep the sticky project profile when resuming in the same working
@@ -66,9 +69,13 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 	// prompt caching. Re-detect only when the directory changed (or the
 	// snapshot has no profile).
 	if snap.ProjectProfile != "" && sameWorkingDir(snap.WorkingDir, a.WorkingDir) {
+		a.statsMu.Lock()
 		a.projectProfile = snap.ProjectProfile
+		a.statsMu.Unlock()
 	} else {
+		a.statsMu.Lock()
 		a.projectProfile = ""
+		a.statsMu.Unlock()
 	}
 	// Pins are not persisted; drop any in-process indices from the previous
 	// session so they cannot apply to the restored history.
@@ -81,11 +88,13 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 		a.TodoManager.Replace(snap.Todos)
 	}
 	a.clearTurnUsage()
+	a.statsMu.Lock()
 	a.UsageAccum = UsageAccumulator{}
+	a.statsMu.Unlock()
 	// Reset save tracking — next doPersist will write a full snapshot that
 	// merges any existing delta file from a previous process lifetime.
 	a.resetSaveTracking()
-	a.SessionLabel = snap.Label
+	a.setSessionLabel(snap.Label)
 	a.SessionOneshot = snap.Oneshot
 	if m, ok := ParseMode(snap.Mode); ok {
 		a.Mode = m
@@ -99,23 +108,11 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 		_ = a.Provider.SetModel(snap.Model)
 	}
 
-	// Pre-warm the token-count cache from the snapshot so subsequent
-	// ContextStats calls can avoid re-tokenizing every message (expensive
-	// for large sessions). Cleared when messages are modified (append,
-	// compaction, session reset).
-	a.restoredTokenCounts = snap.TokenCounts
-
 	// Pre-warm the context limit from the snapshot so the first ContextStats
 	// call after restore sees the correct max context size immediately,
 	// without waiting for the async ValidateRestoredModel refresh.
 	if a.Context != nil && snap.ContextLimit > 0 {
 		a.Context.SetContextLimit(snap.ContextLimit)
-	}
-
-	// Snapshot messages were persisted with stable ArgsStr, so mark them
-	// as stabilized to avoid re-serializing on the next turn.
-	for i := range a.Messages {
-		a.Messages[i].ArgsStabilized = true
 	}
 
 	a.compareViewOnRestore(prevSessionID, newSessionID)
@@ -174,9 +171,26 @@ func sameWorkingDir(snapDir, currentDir string) bool {
 	return filepath.Clean(a) == filepath.Clean(b)
 }
 
+// setSessionLabel stores the session label under statsMu: web probes read it
+// without agentMu/turnMu (agentConfigMsgBasic, contextMsg) while the turn
+// goroutine may derive it from the first user message.
+func (a *Agent) setSessionLabel(label string) {
+	a.statsMu.Lock()
+	a.SessionLabel = label
+	a.statsMu.Unlock()
+}
+
+// SessionLabelSnapshot returns the current session label. Thread-safe.
+func (a *Agent) SessionLabelSnapshot() string {
+	a.statsMu.RLock()
+	l := a.SessionLabel
+	a.statsMu.RUnlock()
+	return l
+}
+
 // RenameSession sets a user-visible label for the current session and persists it.
 func (a *Agent) RenameSession(label string) (string, error) {
-	a.SessionLabel = label
+	a.setSessionLabel(label)
 	a.FlushSession()
 	return "Session label set to " + label, nil
 }

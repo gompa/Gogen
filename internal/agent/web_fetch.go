@@ -18,15 +18,15 @@ import (
 
 const (
 	webFetchTimeout      = 15 * time.Second
-	webFetchDefaultMax   = 64 * 1024 // 64 KB — plenty for docs pages
+	webFetchDefaultMax   = 256 * 1024 // 256 KB — enough for readability to reach the article on most pages
 	webFetchHardMax      = 2 * 1024 * 1024
 	webFetchMaxRedirects = 3
 	// webFetchOutputLimit caps the tool-result string. It is kept equal to
 	// webFetchHardMax so an explicit max_bytes request is never silently cut
 	// short by a second, smaller cap: the body-read cap reports truncation
 	// instead (see doFetch). Default fetches stay at webFetchDefaultMax,
-	// which is small enough that the truncation notice fits under
-	// MaxToolResultBytes and passes through to the model intact.
+	// which is matched to the default MaxToolResultBytes so a truncation
+	// notice passes through to the model intact.
 	// The output-limit branch below is still reachable: markdown conversion
 	// can expand a body (escaping, link/code markup), so a full-size 2 MB
 	// body can yield more than 2 MB of text.
@@ -83,14 +83,26 @@ var fetchOnToggle, searchOnToggle envToggle
 func envFetchOn() bool  { return fetchOnToggle.get("GOGEN_WEB_FETCH") }
 func envSearchOn() bool { return searchOnToggle.get("GOGEN_WEB_SEARCH") }
 
+// normalizeFetchMode validates a web fetch mode ("https" or "all"). Unknown
+// values are clamped to "https" so a typo cannot silently permit plaintext
+// HTTP — "all" is the only value that allows http.
+func normalizeFetchMode(mode string) string {
+	mode = strings.TrimSpace(strings.ToLower(mode))
+	switch mode {
+	case "", "https":
+		return "https"
+	case "all":
+		return "all"
+	default:
+		fmt.Fprintf(os.Stderr, "Warning: unknown web_fetch_mode %q; using \"https\" (set \"all\" to allow http)\n", mode)
+		return "https"
+	}
+}
+
 // envFetchMode returns the web fetch mode from env. Cached after first read.
 func envFetchMode() string {
 	envDefaults.fetchModeOnce.Do(func() {
-		mode := strings.ToLower(strings.TrimSpace(os.Getenv("GOGEN_WEB_FETCH_MODE")))
-		if mode == "" {
-			mode = "https"
-		}
-		envDefaults.fetchMode = mode
+		envDefaults.fetchMode = normalizeFetchMode(os.Getenv("GOGEN_WEB_FETCH_MODE"))
 	})
 	return envDefaults.fetchMode
 }
@@ -186,10 +198,7 @@ func ConfigureWebFetch(enabled bool, mode string, allowedDomains string) {
 	webCfg.mu.Lock()
 	defer webCfg.mu.Unlock()
 	webCfg.fetchOn = &enabled
-	webCfg.fetchMode = strings.TrimSpace(strings.ToLower(mode))
-	if webCfg.fetchMode == "" {
-		webCfg.fetchMode = "https"
-	}
+	webCfg.fetchMode = normalizeFetchMode(mode)
 	webCfg.fetchDomains = parseDomainList(allowedDomains)
 }
 
@@ -412,10 +421,22 @@ func (e *Executor) WebFetch(ctx context.Context, rawURL string, opts WebFetchOpt
 	}
 
 	var text string
+	readable := false          // text came from readability main-content extraction
+	readabilityFailed := false // readability found no article; full page returned
 	if opts.Selector != "" {
 		text, err = extractBySelector(body, opts.Selector, finalURL)
 		if err != nil {
 			return "", err
+		}
+	} else if isHTMLLike(contentType, finalURL, body) {
+		if md, ok := extractReadable(body, finalURL); ok {
+			text = md
+			readable = true
+		} else {
+			// Readability found no single main article (list pages, docs
+			// indexes, tables, ...): fall back to full-page conversion.
+			text = extractResponseText(contentType, finalURL, body)
+			readabilityFailed = true
 		}
 	} else {
 		text = extractResponseText(contentType, finalURL, body)
@@ -434,21 +455,25 @@ func (e *Executor) WebFetch(ctx context.Context, rawURL string, opts WebFetchOpt
 	if finalURL != parsed.String() {
 		fmt.Fprintf(&b, "Final URL (after redirects): %s\n\n", finalURL)
 	}
-	if opts.Selector != "" && truncated {
-		fmt.Fprintf(&b, "Note: body exceeded max_bytes and was cut before extraction; raise max_bytes (up to %d) if elements are missing.\n\n", webFetchHardMax)
+	if readabilityFailed {
+		fmt.Fprintf(&b, "Note: no single main article found; returning the full page instead.\n\n")
+	}
+	extraction := opts.Selector != "" || readable
+	if extraction && truncated {
+		fmt.Fprintf(&b, "Note: body exceeded max_bytes and was cut before extraction; raise max_bytes (up to %d) if the result seems incomplete.\n\n", webFetchHardMax)
 	}
 	switch {
 	case truncated:
 		// The body was cut by max_bytes. Report it explicitly — a silent
 		// mid-file cut previously looked like the complete document, and
 		// the marker keeps this result intact under MaxToolResultBytes.
-		if opts.Selector == "" {
+		if !extraction {
 			fmt.Fprintf(&b, "Content (first %d of more than %d bytes):\n", len(text), maxBytes)
 			b.WriteString(text)
 			fmt.Fprintf(&b, "\n\n… truncated (body exceeds %d bytes; pass max_bytes up to %d to fetch more)", maxBytes, webFetchHardMax)
 		} else {
-			// Selector mode: the element list is already complete for the
-			// bytes we read; just say the body was cut.
+			// Selector/readability mode: extraction already ran on the bytes
+			// we read; just say the body was cut.
 			b.WriteString(text)
 			fmt.Fprintf(&b, "\n\n… body exceeded %d bytes and was cut before extraction (pass max_bytes up to %d to fetch more)", maxBytes, webFetchHardMax)
 		}
@@ -476,8 +501,9 @@ func validateFetchURL(rawURL string) (*url.URL, error) {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, fmt.Errorf("web_fetch only supports http/https URLs (got %q)", u.Scheme)
 	}
-	// Enforce HTTPS-only unless explicitly allowed.
-	if webCfg.mode() == "https" && u.Scheme != "https" {
+	// Enforce HTTPS-only unless "all" is explicitly configured. Fails closed:
+	// any value other than "all" (normalizeFetchMode clamps unknown ones) blocks http.
+	if webCfg.mode() != "all" && u.Scheme != "https" {
 		return nil, fmt.Errorf("web_fetch requires https (got %s). Set GOGEN_WEB_FETCH_MODE=all for http", u.Scheme)
 	}
 	if allowedDomains := webCfg.allowedDomains(); len(allowedDomains) > 0 {

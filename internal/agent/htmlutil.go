@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"codeberg.org/readeck/go-readability/v2"
+
 	"github.com/JohannesKaufmann/html-to-markdown/v2/converter"
 	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/base"
 	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/commonmark"
@@ -177,6 +179,60 @@ func htmlToMarkdown(body []byte, baseURL string) string {
 		return plainText(body)
 	}
 	return strings.TrimSpace(md)
+}
+
+// extractReadable attempts main-content extraction on an HTML body using the
+// Readability algorithm (the same one Firefox reader mode uses). When the page
+// contains a single main article it returns the condensed result — the page
+// title as a heading plus the article converted to Markdown — and ok=true.
+// Otherwise ok=false so the caller can fall back to full-page conversion.
+//
+// This is the "best condensed information" default: unlike the tag-based
+// chrome removal in htmlToMarkdown, Readability scores nodes by text and link
+// density, so boilerplate survives no matter what tag it lives in (a sidebar
+// of links is pruned whether it is <nav> or a bare <div> portlet).
+func extractReadable(body []byte, baseURL string) (string, bool) {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		u = &url.URL{}
+	}
+	article, err := readability.FromReader(bytes.NewReader(body), u)
+	if err != nil || article.Node == nil {
+		return "", false
+	}
+	var htmlBuf bytes.Buffer
+	if err := article.RenderHTML(&htmlBuf); err != nil {
+		return "", false
+	}
+	md := htmlToMarkdown(htmlBuf.Bytes(), baseURL)
+	if strings.TrimSpace(md) == "" {
+		return "", false
+	}
+	var b strings.Builder
+	if title := strings.TrimSpace(article.Title()); title != "" {
+		b.WriteString("# " + title + "\n\n")
+	}
+	b.WriteString(md)
+	return b.String(), true
+}
+
+// isHTMLLike reports whether extractResponseText would treat the response as
+// HTML (in which case readability extraction is attempted before falling back
+// to full-page conversion). It mirrors the HTML branches of extractResponseText.
+func isHTMLLike(contentType, finalURL string, body []byte) bool {
+	if isHTMLContentType(contentType) {
+		return true
+	}
+	if isPlainContentType(contentType) {
+		return false
+	}
+	if isHTMLURL(finalURL) {
+		return true
+	}
+	if isPlainURL(finalURL) {
+		return false
+	}
+	return looksLikeHTML(body)
 }
 
 // extractResponseText converts a fetched response body into text. HTML

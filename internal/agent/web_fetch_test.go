@@ -5,6 +5,29 @@ import (
 	"testing"
 )
 
+func TestNormalizeFetchMode(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty defaults to https", "", "https"},
+		{"https kept", "https", "https"},
+		{"https case/space normalized", "  HTTPS ", "https"},
+		{"all kept", "all", "all"},
+		{"typo fails closed to https", "hhtps", "https"},
+		{"http fails closed to https", "http", "https"},
+		{"garbage fails closed to https", "mixed", "https"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeFetchMode(tt.in); got != tt.want {
+				t.Errorf("normalizeFetchMode(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestHTMLToMarkdown_basic(t *testing.T) {
 	input := []byte(`<html><body><h1>Hello</h1><p>This is a paragraph with <b>bold</b> text.</p></body></html>`)
 	got := htmlToMarkdown(input, "")
