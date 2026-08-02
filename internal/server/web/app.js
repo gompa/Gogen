@@ -21,6 +21,8 @@
             saveActive,
             openFileAtLine,
             setMonacoTheme,
+            openModal,
+            closeModal,
         } from '/editor.js';
         import { marked } from '/vendor/marked.esm.js';
         import DOMPurify from '/vendor/dompurify.esm.js';
@@ -53,7 +55,11 @@
         const tbModelBtn = document.getElementById('tb-model-btn');
         const tbModelPopover = document.getElementById('tb-model-popover');
         const tbModelList = document.getElementById('tb-model-list');
+        const tbModelFilter = document.getElementById('tb-model-filter');
         const tbThinkingGrid = document.getElementById('tb-thinking-grid');
+        const nearCompactBanner = document.getElementById('near-compact-banner');
+        const ncbCompactBtn = document.getElementById('ncb-compact-btn');
+        const ncbDismissBtn = document.getElementById('ncb-dismiss-btn');
         const tbModeBtn = document.getElementById('tb-mode-btn');
         const tbContextBadge = document.getElementById('tb-context-badge');
 
@@ -160,6 +166,15 @@
         // Main Chat | Editor tabs
         document.querySelectorAll('.main-tab').forEach((btn) => {
             btn.addEventListener('click', async () => {
+                if (btn.dataset.pane === 'terminal') {
+                    terminalToggleMobile();
+                    return;
+                }
+                // Switching to a regular pane on mobile dismisses the
+                // full-screen terminal overlay so it can't cover the chat.
+                if (terminalIsMobile() && terminalPanel.classList.contains('mobile-full')) {
+                    terminalCloseMobile();
+                }
                 document.querySelectorAll('.main-tab').forEach((b) => b.classList.remove('active'));
                 document.querySelectorAll('.pane').forEach((p) => p.classList.remove('active'));
                 btn.classList.add('active');
@@ -175,9 +190,12 @@
         setupEditorUI();
 
         function respondDeleteApproval(approved) {
+            deleteOverlay.removeEventListener('keydown', deleteApprovalEsc);
             if (!pendingDeleteApprovalId || !ws || ws.readyState !== WebSocket.OPEN) {
-                deleteOverlay.classList.remove('active');
                 pendingDeleteApprovalId = null;
+                inputArea.disabled = false;
+                sendBtn.disabled = false;
+                closeModal(deleteOverlay);
                 return;
             }
             ws.send(JSON.stringify({
@@ -185,10 +203,17 @@
                 approvalId: pendingDeleteApprovalId,
                 approved: approved
             }));
-            deleteOverlay.classList.remove('active');
             pendingDeleteApprovalId = null;
             inputArea.disabled = false;
             sendBtn.disabled = false;
+            closeModal(deleteOverlay);
+        }
+
+        function deleteApprovalEsc(e) {
+            if (e.key === 'Escape') {
+                e.stopPropagation(); // keep the document handler from cancelling the agent turn
+                respondDeleteApproval(false);
+            }
         }
 
         deleteAllowBtn.onclick = () => respondDeleteApproval(true);
@@ -198,16 +223,24 @@
             pendingDeleteApprovalId = data.approvalId;
             deleteReason.textContent = data.reason ? `Requested by: ${data.reason}` : 'The agent wants to delete files.';
             deletePaths.textContent = (data.paths || []).map(p => `- ${p}`).join('\n');
-            deleteOverlay.classList.add('active');
             inputArea.disabled = true;
             sendBtn.disabled = true;
+            openModal(deleteOverlay);
+            deleteOverlay.addEventListener('keydown', deleteApprovalEsc);
         }
 
         // ── Toolbar: model picker popover ──
         let tbModelPopoverOpen = false;
+        let modelFilterQuery = '';
 
         function toggleModelPopover() {
             tbModelPopoverOpen = !tbModelPopoverOpen;
+            if (tbModelPopoverOpen) {
+                // Start from a clean slate each time the popover opens.
+                if (tbModelFilter) tbModelFilter.value = '';
+                modelFilterQuery = '';
+                renderToolbarModelList(availableModels, availableModels.find((m) => m.current)?.id || '');
+            }
             tbModelPopover.classList.toggle('open', tbModelPopoverOpen);
         }
 
@@ -221,6 +254,11 @@
             if (tbModelPopoverOpen && !tbModelBtn.contains(e.target) && !tbModelPopover.contains(e.target)) {
                 closeModelPopover();
             }
+        });
+
+        tbModelFilter?.addEventListener('input', () => {
+            modelFilterQuery = tbModelFilter.value.trim().toLowerCase();
+            renderToolbarModelList(availableModels, availableModels.find((m) => m.current)?.id || '');
         });
 
         tbModelBtn.addEventListener('click', (e) => {
@@ -246,7 +284,19 @@
                 tbModelList.appendChild(empty);
                 return;
             }
-            for (const m of models) {
+            const q = modelFilterQuery;
+            const filtered = q ? models.filter((m) => m.id.toLowerCase().includes(q)) : models;
+            if (filtered.length === 0) {
+                const empty = document.createElement('div');
+                empty.className = 'tb-model-row';
+                empty.textContent = `No models match "${tbModelFilter ? tbModelFilter.value : q}"`;
+                empty.style.color = 'var(--fg-muted)';
+                empty.style.fontSize = '0.82em';
+                empty.style.cursor = 'default';
+                tbModelList.appendChild(empty);
+                return;
+            }
+            for (const m of filtered) {
                 const active = m.id === current || m.current;
                 const row = document.createElement('button');
                 row.className = 'tb-model-row' + (active ? ' active' : '');
@@ -508,8 +558,34 @@
             ws.send(JSON.stringify({ type: 'list_models' }));
         }
 
+        // ── Near-compact banner ──
+        // The server flags nearCompact once usage is about to trigger context
+        // compaction; surface an actionable one-liner instead of only a
+        // warning-colored badge. Dismissed state resets on session change.
+        let nearCompactDismissed = false;
+
+        function updateNearCompactBanner(nearCompact) {
+            if (!nearCompactBanner) return;
+            nearCompactBanner.hidden = nearCompactDismissed || !nearCompact;
+        }
+
+        ncbCompactBtn?.addEventListener('click', () => {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                showToast('Not connected', 'error');
+                return;
+            }
+            ws.send(JSON.stringify({ type: 'message', content: '/compact' }));
+            showToast('Compacting context…', 'info');
+        });
+
+        ncbDismissBtn?.addEventListener('click', () => {
+            nearCompactDismissed = true;
+            nearCompactBanner.hidden = true;
+        });
+
         function updateContextInfo(data) {
             lastContextData = data || lastContextData;
+            if (typeof data.nearCompact === 'boolean') updateNearCompactBanner(data.nearCompact);
             const used = data.usedTokens || 0;
             const limit = data.contextLimit || 0;
             if (data.usedSource !== 'estimated') {
@@ -591,6 +667,66 @@
             setTurnActive(false);
             setInputProgress(null);
             scrollBottomBtn.classList.remove('visible');
+            maybeShowEmptyState();
+        }
+
+        // ── Empty chat state (fresh session) ──
+        // Shown only while the transcript is truly empty; any message render
+        // (appendMessageAtTime / startStream / showThinking) removes it.
+        const EMPTY_STATE_STARTERS = [
+            'Explain this codebase',
+            'Run the tests and fix any failures',
+            'Plan a new feature',
+        ];
+
+        function sendStarterPrompt(text) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                showToast('Not connected', 'error');
+                return;
+            }
+            inputArea.value = text;
+            sendBtn.onclick();
+        }
+
+        function buildEmptyState() {
+            const wrap = document.createElement('div');
+            wrap.className = 'empty-state';
+            const emoji = document.createElement('div');
+            emoji.className = 'empty-state-emoji';
+            emoji.textContent = '🤖';
+            const title = document.createElement('div');
+            title.className = 'empty-state-title';
+            title.textContent = 'GoGen is ready';
+            const sub = document.createElement('div');
+            sub.className = 'empty-state-sub';
+            sub.textContent = 'Ask me to explore, fix, or build something in this repository.';
+            const prompts = document.createElement('div');
+            prompts.className = 'empty-state-prompts';
+            for (const p of EMPTY_STATE_STARTERS) {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'empty-state-btn';
+                btn.textContent = p;
+                btn.addEventListener('click', () => sendStarterPrompt(p));
+                prompts.appendChild(btn);
+            }
+            const hint = document.createElement('div');
+            hint.className = 'empty-state-hint';
+            hint.textContent = 'Type / for commands · Ctrl+K for the command palette';
+            wrap.append(emoji, title, sub, prompts, hint);
+            return wrap;
+        }
+
+        function maybeShowEmptyState() {
+            if (!messagesDiv) return;
+            if (messagesDiv.querySelector('.message, .thought-card, .tool-card')) return;
+            if (messagesDiv.querySelector('.empty-state')) return;
+            messagesDiv.appendChild(buildEmptyState());
+        }
+
+        function removeEmptyState() {
+            const el = messagesDiv.querySelector('.empty-state');
+            if (el) el.remove();
         }
 
         let pendingSessionResponse = false;
@@ -1034,8 +1170,11 @@
         }
 
         // ===== Message timestamps =====
-        function formatRelativeTime(date) {
-            const diff = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000));
+        // Single relative-time helper for messages and session rows. `now` is
+        // passed in by the periodic refresh so all timestamps tick together
+        // without re-reading the clock per element.
+        function formatRelativeTime(date, now = Date.now()) {
+            const diff = Math.max(0, Math.floor((now - date.getTime()) / 1000));
             if (diff < 5) return 'now';
             if (diff < 60) return `${diff}s ago`;
             if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
@@ -1044,12 +1183,37 @@
             return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
         }
 
+        function relativeTime(value, now = Date.now()) {
+            if (!value) return '';
+            const date = value instanceof Date ? value : new Date(value);
+            if (Number.isNaN(date.getTime())) return '';
+            return formatRelativeTime(date, now);
+        }
+
         function formatExactTime(date) {
             return date.toLocaleString(undefined, {
                 year: 'numeric', month: 'short', day: 'numeric',
                 hour: '2-digit', minute: '2-digit'
             });
         }
+
+        // Relative labels ("now", "3m ago") go stale; re-derive them on a
+        // light cadence (and when the tab becomes visible again) so the
+        // transcript stays truthful without re-rendering anything.
+        function refreshMessageTimestamps() {
+            if (document.hidden) return;
+            const now = Date.now();
+            for (const el of messagesDiv.querySelectorAll('.message-time')) {
+                const msg = el.closest('.message');
+                if (!msg || !msg.dataset.createdAt) continue;
+                const t = Date.parse(msg.dataset.createdAt);
+                if (Number.isNaN(t)) continue;
+                const text = formatRelativeTime(new Date(t), now);
+                if (el.textContent !== text) el.textContent = text;
+            }
+        }
+        setInterval(refreshMessageTimestamps, 30000);
+        document.addEventListener('visibilitychange', refreshMessageTimestamps);
 
         function addTimestampToMsg(msgDiv, date) {
             if (msgDiv.querySelector('.message-time')) return; // already added
@@ -1241,6 +1405,7 @@
         }
 
         function appendMessageAtTime(role, text, date, histIdx) {
+            removeEmptyState();
             const msgDiv = document.createElement('div');
             msgDiv.className = `message ${role}`;
             const idx = msgIdxCounter++;
@@ -1311,6 +1476,7 @@
         }
 
         function startStream() {
+            removeEmptyState();
             streamRafPending = false;
             streamLastRender = 0;
             const msgDiv = document.createElement('div');
@@ -1329,6 +1495,7 @@
         }
 
         function showThinking() {
+            removeEmptyState();
             finalizeThinking();
             const div = document.createElement('div');
             div.className = 'thought-card';
@@ -2050,6 +2217,653 @@
             });
         }
 
+        // ===== Terminal panel =====
+        // A docked strip at the bottom of the page (collapsed by default) with
+        // terminal tabs: a pinned interactive "User" shell (the default
+        // terminal) plus one read-only tab per agent command (execute_command,
+        // run_tests, run_lint) streaming live output. On mobile the dock is
+        // replaced by the "Terminal" header tab (full-screen).
+        const terminalPanel = document.getElementById('terminal-panel');
+        const terminalBody = document.getElementById('terminal-body');
+        const terminalTabsEl = document.getElementById('terminal-tabs');
+        const terminalChevron = document.getElementById('terminal-chevron');
+        const terminalResizeHandle = document.getElementById('terminal-resize-handle');
+        const terminalTabBtn = document.getElementById('terminal-tab');
+        const terminalTabBadge = document.getElementById('terminal-tab-badge');
+        const terminalHint = document.getElementById('terminal-hint');
+        const terminalMoreBtn = document.getElementById('terminal-more');
+        const terminalMoreMenu = document.getElementById('terminal-more-menu');
+
+        const TERM_STORE_KEY = 'gogen.terminalPanel.v1';
+        const TERM_MAX_TABS = 8;
+        const TERM_MIN_HEIGHT = 120;
+        const TERM_MAX_HEIGHT_RATIO = 0.7;
+        const TERM_DEFAULT_HEIGHT = 280;
+        const USER_TERM_ID = 'user';
+
+        const terminals = new Map(); // termId -> {id, tab, host, term, fit, statusEl, titleEl, restartEl, closable, user, done, success}
+        let terminalActiveId = null;
+        let userTermState = 'spawning'; // spawning | ready | dead
+        let userTermFocused = false;
+        let terminalExpanded = false;
+        let terminalHeight = TERM_DEFAULT_HEIGHT;
+        try {
+            const stored = JSON.parse(localStorage.getItem(TERM_STORE_KEY) || '{}');
+            terminalExpanded = !!stored.expanded;
+            if (Number.isFinite(stored.height) && stored.height >= TERM_MIN_HEIGHT) {
+                // The height is only capped at drag time; a stored height from a
+                // taller window must not be reapplied unclamped on load, or the
+                // panel overflows the body (which is fixed at 100vh).
+                terminalHeight = Math.min(stored.height, terminalMaxHeight());
+            }
+        } catch (_) { /* corrupt storage — keep defaults */ }
+
+        function terminalMaxHeight() {
+            return Math.round(window.innerHeight * TERM_MAX_HEIGHT_RATIO);
+        }
+
+        function terminalSaveState() {
+            try {
+                localStorage.setItem(TERM_STORE_KEY, JSON.stringify({
+                    expanded: terminalExpanded,
+                    height: terminalHeight,
+                }));
+            } catch (_) {}
+        }
+
+        function terminalIsMobile() {
+            return window.matchMedia('(max-width: 767px)').matches;
+        }
+
+        function terminalTheme() {
+            const cs = getComputedStyle(document.documentElement);
+            return {
+                background: cs.getPropertyValue('--bg').trim() || '#1e1e1e',
+                foreground: cs.getPropertyValue('--fg').trim() || '#d4d4d4',
+                cursor: cs.getPropertyValue('--accent').trim() || '#569cd6',
+            };
+        }
+
+        function terminalFit() {
+            // Only fit when the terminal body is actually laid out; hidden or
+            // zero-sized containers make xterm report bogus dimensions.
+            if (!terminalPanel.classList.contains('expanded')) return;
+            const t = terminals.get(terminalActiveId);
+            if (!t || !t.fit) return;
+            try {
+                let dims = t.fit.proposeDimensions();
+                if (!dims && t.term) {
+                    // The terminal may have been opened while its container was
+                    // hidden (collapsed panel), leaving xterm's char-size
+                    // measurement at 0. Fit then refuses to do anything and the
+                    // screen keeps its default 80x24 size, spilling past the
+                    // panel. Resize with the current size to force a re-measure
+                    // now that the panel is laid out, then fit for real.
+                    t.term.resize(t.term.cols, t.term.rows);
+                    dims = t.fit.proposeDimensions();
+                }
+                if (dims) t.fit.fit();
+                if (t.user) terminalSendResize(t);
+            } catch (_) {}
+        }
+
+        let terminalFitRaf = 0;
+        function terminalFitSoon() {
+            if (terminalFitRaf) return;
+            terminalFitRaf = requestAnimationFrame(() => {
+                terminalFitRaf = 0;
+                terminalFit();
+            });
+        }
+
+        function terminalSetExpanded(expanded, opts = {}) {
+            terminalExpanded = expanded;
+            terminalPanel.classList.toggle('expanded', expanded);
+            if (expanded) {
+                terminalHeight = Math.min(terminalHeight, terminalMaxHeight());
+                // The mobile overlay is positioned with top/bottom, so a pixel
+                // height would override bottom and shrink it to a small strip.
+                if (!terminalPanel.classList.contains('mobile-full')) {
+                    terminalPanel.style.height = terminalHeight + 'px';
+                }
+            } else {
+                terminalPanel.style.height = '';
+            }
+            terminalChevron.textContent = expanded ? '▾' : '▴';
+            terminalSaveState();
+            if (expanded) {
+                terminalFitSoon();
+            } else if (terminalIsMobile()) {
+                terminalCloseMobile();
+            }
+        }
+
+        function terminalUpdateHint() {
+            terminalHint.style.display = terminals.size > 0 ? 'none' : '';
+        }
+
+        // Creates a terminal tab and its xterm instance. opts:
+        //   title/tooltip — tab label + hover text
+        //   closable      — show a close button (agent tabs yes, user tab no)
+        //   user          — interactive terminal (stdin enabled) vs read-only
+        function terminalCreateTab(id, opts = {}) {
+            const tab = document.createElement('div');
+            tab.className = 'term-tab active' + (opts.user ? ' user-tab' : '');
+            tab.title = opts.tooltip || opts.title || '';
+            const titleEl = document.createElement('span');
+            titleEl.className = 'term-tab-title';
+            titleEl.textContent = opts.title || id;
+            const statusEl = document.createElement('span');
+            statusEl.className = 'term-tab-status';
+            const restartEl = document.createElement('span');
+            restartEl.className = 'term-tab-restart';
+            restartEl.textContent = '↻';
+            restartEl.title = 'Restart shell';
+            restartEl.hidden = true;
+            restartEl.addEventListener('click', (e) => {
+                e.stopPropagation();
+                terminalRestartUser();
+            });
+            const closeEl = document.createElement('span');
+            closeEl.className = 'term-tab-close';
+            closeEl.textContent = '✕';
+            if (opts.closable === false) {
+                closeEl.style.display = 'none';
+            } else {
+                closeEl.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    terminalClose(id);
+                });
+            }
+            tab.appendChild(titleEl);
+            tab.appendChild(statusEl);
+            tab.appendChild(restartEl);
+            tab.appendChild(closeEl);
+            tab.addEventListener('click', () => terminalSelectAndFocus(id));
+            terminalTabsEl.appendChild(tab);
+
+            const host = document.createElement('div');
+            host.className = 'term-host';
+            const inst = document.createElement('div');
+            inst.className = 'term-instance';
+            host.appendChild(inst);
+            terminalBody.appendChild(host);
+
+            const term = new Terminal({
+                disableStdin: !opts.user, // agent tabs are read-only mirrors
+                cursorBlink: !!opts.user,
+                convertEol: true,
+                scrollback: 2000,
+                fontSize: 12,
+                fontFamily: getComputedStyle(document.documentElement)
+                    .getPropertyValue('--mono').trim() || 'monospace',
+                theme: terminalTheme(),
+            });
+            let fit = null;
+            try {
+                const FA = (window.FitAddon && window.FitAddon.FitAddon) || window.FitAddon;
+                if (FA) {
+                    fit = new FA();
+                    term.loadAddon(fit);
+                }
+            } catch (_) {}
+            if (opts.user) {
+                term.onData((d) => {
+                    if (userTermState === 'ready' && ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: 'user_term_input', content: d }));
+                    }
+                });
+            }
+            term.open(inst);
+            if (opts.user) {
+                // xterm >= 6.0.0 removed onFocus/onBlur from the public
+                // Terminal API; the textarea (created by open()) is public
+                // and stable across versions, so track focus via its DOM
+                // events (falling back to the typed events on older xterm).
+                const markFocused = () => { userTermFocused = true; };
+                const markBlurred = () => { userTermFocused = false; };
+                if (typeof term.onFocus === 'function' && typeof term.onBlur === 'function') {
+                    term.onFocus(markFocused);
+                    term.onBlur(markBlurred);
+                } else if (term.textarea) {
+                    term.textarea.addEventListener('focus', markFocused);
+                    term.textarea.addEventListener('blur', markBlurred);
+                }
+            }
+
+            const entry = {
+                id,
+                tab,
+                host,
+                term,
+                fit,
+                statusEl,
+                titleEl,
+                restartEl,
+                closable: opts.closable !== false,
+                user: !!opts.user,
+                done: false,
+                success: false,
+            };
+            terminals.set(id, entry);
+            return entry;
+        }
+
+        // Opens a read-only tab for one agent tool command.
+        function terminalOpen(id, name, title) {
+            if (terminals.has(id)) return;
+            if (typeof window.Terminal !== 'function') {
+                // xterm failed to load — degrade gracefully, the chat tool
+                // cards still show the full result.
+                console.error('xterm.js not loaded; terminal tabs disabled');
+                return;
+            }
+            terminalPrune();
+            const t = terminalCreateTab(id, { title: title || id, closable: true, user: false });
+            // Echo the command like a shell prompt (title already includes "$ ").
+            try { t.term.write('\x1b[90m' + (title || '') + '\x1b[0m\r\n'); } catch (_) {}
+            // Select the new tab unless the user is actively typing in their
+            // own terminal — don't yank focus away mid-command.
+            if (!userTermFocused) terminalSelect(id);
+            terminalUpdateHint();
+            terminalFlashTab(id);
+            terminalUpdateBadge();
+            terminalMoreRender();
+        }
+
+        // The pinned default terminal: created on load, interactive, never
+        // pruned. It exists client-side regardless of the server shell state;
+        // user_term_opened/exit drive its ready/dead states.
+        function terminalEnsureUserTab() {
+            if (terminals.has(USER_TERM_ID)) return;
+            if (typeof window.Terminal !== 'function') return;
+            terminalCreateTab(USER_TERM_ID, {
+                title: 'starting…',
+                tooltip: 'User shell (interactive)',
+                closable: false,
+                user: true,
+            });
+            terminalSelect(USER_TERM_ID);
+            terminalUpdateHint();
+            terminalUpdateBadge();
+            terminalMoreRender();
+        }
+
+        function terminalUserOpened(title, wd) {
+            terminalEnsureUserTab();
+            const t = terminals.get(USER_TERM_ID);
+            if (!t) return;
+            userTermState = 'ready';
+            t.titleEl.textContent = title || 'shell';
+            t.tab.title = wd ? (title || 'shell') + ' — ' + wd : (title || 'shell');
+            t.restartEl.hidden = true;
+            t.done = false;
+            t.statusEl.textContent = '';
+            t.statusEl.className = 'term-tab-status';
+            terminalSendResize(t);
+            terminalUpdateBadge();
+            terminalMoreRender();
+        }
+
+        function terminalUserExited(code) {
+            const t = terminals.get(USER_TERM_ID);
+            userTermState = 'dead';
+            if (!t) return;
+            t.done = true;
+            t.success = code === 0;
+            t.tab.classList.add('done');
+            t.statusEl.textContent = t.success ? '✓' : '✗';
+            t.statusEl.classList.add(t.success ? 'ok' : 'err');
+            t.restartEl.hidden = false;
+            try {
+                t.term.write('\r\n\x1b[90m[' + (t.success ? 'exited' : 'exited (' + code + ')') + ' — click ↻ to restart]\x1b[0m');
+            } catch (_) {}
+            terminalUpdateBadge();
+            terminalMoreRender();
+        }
+
+        function terminalRestartUser() {
+            if (userTermState !== 'dead') return;
+            userTermState = 'spawning';
+            const t = terminals.get(USER_TERM_ID);
+            if (t) {
+                t.done = false;
+                t.tab.classList.remove('done');
+                t.statusEl.textContent = '…';
+                t.statusEl.className = 'term-tab-status';
+                t.restartEl.hidden = true;
+            }
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'user_term_request' }));
+            }
+        }
+
+        // Sends the fitted terminal size to the server for the user shell.
+        function terminalSendResize(t) {
+            if (!t || !t.fit || !t.term || userTermState !== 'ready') return;
+            // While the panel is collapsed the terminal has no layout; a resize
+            // here would report a bogus 1-row x 2-col size to the shell.
+            if (!terminalPanel.classList.contains('expanded')) return;
+            try {
+                const dims = t.fit.proposeDimensions();
+                if (dims && dims.cols > 0 && dims.rows > 0 && ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        type: 'user_term_resize',
+                        cols: Math.max(2, Math.round(dims.cols)),
+                        rows: Math.max(2, Math.round(dims.rows)),
+                    }));
+                }
+            } catch (_) {}
+        }
+
+        function terminalWrite(id, chunk) {
+            const t = terminals.get(id);
+            if (!t || !chunk || t.done) return;
+            try { t.term.write(chunk); } catch (_) {}
+        }
+
+        function terminalExit(id, success) {
+            const t = terminals.get(id);
+            if (!t || t.done) return;
+            t.done = true;
+            t.success = success;
+            t.tab.classList.add('done');
+            t.statusEl.textContent = success ? '✓' : '✗';
+            t.statusEl.classList.add(success ? 'ok' : 'err');
+            try {
+                t.term.write('\r\n\x1b[90m[' + (success ? 'exit 0' : 'failed') + ']\x1b[0m');
+            } catch (_) {}
+            terminalUpdateBadge();
+            terminalMoreRender();
+        }
+
+        function terminalSelect(id) {
+            terminalActiveId = id;
+            for (const [tid, t] of terminals) {
+                t.tab.classList.toggle('active', tid === id);
+                t.host.style.display = tid === id ? '' : 'none';
+                if (tid !== id && t.user && t.term) {
+                    // Blur the interactive terminal so keystrokes don't keep
+                    // flowing into a hidden tab.
+                    try { t.term.blur(); } catch (_) {}
+                }
+            }
+            const t = terminals.get(id);
+            if (t && t.user && userTermState === 'ready') terminalSendResize(t);
+            terminalMoreRender();
+            terminalFitSoon();
+        }
+
+        function terminalSelectAndFocus(id) {
+            terminalSelect(id);
+            const t = terminals.get(id);
+            if (t && t.user && userTermState === 'ready' && t.term) {
+                try { t.term.focus(); } catch (_) {}
+            }
+        }
+
+        function terminalClose(id) {
+            const t = terminals.get(id);
+            if (!t) return;
+            try { t.term.dispose(); } catch (_) {}
+            t.tab.remove();
+            t.host.remove();
+            terminals.delete(id);
+            if (terminalActiveId === id) {
+                terminalActiveId = null;
+                const remaining = [...terminals.keys()];
+                if (remaining.length > 0) terminalSelect(remaining[remaining.length - 1]);
+            }
+            terminalUpdateHint();
+            terminalUpdateBadge();
+            terminalMoreRender();
+        }
+
+        // Keep the tab strip tidy: when over the cap, auto-close the oldest
+        // finished tabs (their full output stays in the chat tool card). The
+        // pinned user tab is never pruned.
+        function terminalPrune() {
+            if (terminals.size < TERM_MAX_TABS) return;
+            for (const [id, t] of terminals) {
+                if (terminals.size < TERM_MAX_TABS) break;
+                if (t.done && id !== USER_TERM_ID) terminalClose(id);
+            }
+        }
+
+        function terminalFlashTab(id) {
+            const t = terminals.get(id);
+            if (!t) return;
+            t.tab.classList.remove('flash');
+            void t.tab.offsetWidth; // restart the animation
+            t.tab.classList.add('flash');
+            setTimeout(() => t.tab.classList.remove('flash'), 900);
+        }
+
+        // Badge on the mobile "Terminal" header tab: number of running agent
+        // commands, shown only while the terminal panel itself is hidden.
+        function terminalUpdateBadge() {
+            if (!terminalTabBadge) return;
+            // Count running AGENT commands only — the user shell is always
+            // "not done" but shouldn't keep the badge lit.
+            const running = [...terminals.values()].filter((t) => !t.done && t.id !== USER_TERM_ID).length;
+            const visible = terminalIsMobile()
+                ? terminalPanel.classList.contains('mobile-full')
+                : true;
+            terminalTabBadge.hidden = !(running > 0 && !visible);
+            terminalTabBadge.textContent = running > 0 ? String(running) : '';
+            terminalTabBadge.classList.toggle('pulse', running > 0 && !visible);
+        }
+
+        // WS closed mid-command: the server will never finish these tabs, so
+        // mark every still-running one as interrupted so the UI isn't stuck.
+        // The user shell is also killed server-side on disconnect — show it
+        // as dead with a restart affordance (revived on reconnect's opened).
+        function terminalInterruptAll() {
+            for (const id of [...terminals.keys()]) {
+                if (id === USER_TERM_ID) terminalUserExited(-1);
+                else terminalExit(id, false);
+            }
+        }
+
+        // ===== Overflow: '»' dropdown + wheel scrolling =====
+        // The tab strip clips when many agent terminals accumulate; the '»'
+        // menu keeps every terminal selectable (and closable) regardless of
+        // how many there are. Shown once more than the user tab exists.
+        function terminalMoreRender() {
+            if (!terminalMoreBtn || !terminalMoreMenu) return;
+            terminalMoreBtn.hidden = terminals.size < 2;
+            if (terminals.size < 2) {
+                terminalMoreMenu.hidden = true;
+                return;
+            }
+            terminalMoreMenu.innerHTML = '';
+            for (const [id, t] of terminals) {
+                const row = document.createElement('div');
+                row.className = 'term-more-row' + (id === terminalActiveId ? ' active' : '');
+                const status = document.createElement('span');
+                status.className = 'term-more-status'
+                    + (t.done ? (t.success ? ' ok' : ' err') : ' running');
+                status.textContent = t.done ? (t.success ? '✓' : '✗') : '●';
+                const title = document.createElement('span');
+                title.className = 'term-more-title';
+                title.textContent = t.titleEl.textContent;
+                title.title = t.tab.title || t.titleEl.textContent;
+                row.appendChild(status);
+                row.appendChild(title);
+                if (t.closable) {
+                    const close = document.createElement('span');
+                    close.className = 'term-more-close';
+                    close.textContent = '✕';
+                    close.title = 'Close terminal';
+                    close.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        terminalClose(id);
+                    });
+                    row.appendChild(close);
+                }
+                row.addEventListener('click', () => {
+                    terminalSelectAndFocus(id);
+                    terminalMoreMenu.hidden = true;
+                });
+                terminalMoreMenu.appendChild(row);
+            }
+        }
+
+        function terminalMoreToggle() {
+            if (!terminalMoreMenu) return;
+            if (terminalMoreMenu.hidden) {
+                terminalMoreRender();
+                terminalMoreMenu.hidden = false;
+            } else {
+                terminalMoreMenu.hidden = true;
+            }
+        }
+
+        if (terminalMoreBtn) {
+            terminalMoreBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                terminalMoreToggle();
+            });
+        }
+        document.addEventListener('click', (e) => {
+            if (terminalMoreMenu && !terminalMoreMenu.hidden
+                && !terminalMoreMenu.contains(e.target)
+                && e.target !== terminalMoreBtn) {
+                terminalMoreMenu.hidden = true;
+            }
+        });
+
+        // Scroll the tab strip horizontally with the wheel (the scrollbar is
+        // hidden to avoid a stray track under the tabs).
+        terminalTabsEl.addEventListener('wheel', (e) => {
+            if (terminalTabsEl.scrollWidth <= terminalTabsEl.clientWidth) return;
+            e.preventDefault();
+            terminalTabsEl.scrollLeft += e.deltaY || e.deltaX;
+        }, { passive: false });
+
+        // ===== Terminal panel: expand/collapse + resize =====
+        terminalChevron.addEventListener('click', () => {
+            terminalSetExpanded(!terminalExpanded, { focus: false });
+        });
+
+        let termDrag = null;
+        terminalResizeHandle.addEventListener('mousedown', (e) => {
+            // The mobile overlay is positioned with top/bottom; dragging its
+            // handle must not set a pixel height (it would override bottom).
+            if (!terminalExpanded || terminalPanel.classList.contains('mobile-full')) return;
+            termDrag = { startY: e.clientY, startH: terminalPanel.offsetHeight };
+            terminalResizeHandle.classList.add('active');
+            e.preventDefault();
+        });
+        document.addEventListener('mousemove', (e) => {
+            if (!termDrag) return;
+            const h = Math.min(
+                Math.max(termDrag.startH + (termDrag.startY - e.clientY), TERM_MIN_HEIGHT),
+                terminalMaxHeight()
+            );
+            terminalHeight = h;
+            terminalPanel.style.height = h + 'px';
+        });
+        document.addEventListener('mouseup', () => {
+            if (!termDrag) return;
+            termDrag = null;
+            terminalResizeHandle.classList.remove('active');
+            terminalSaveState();
+            terminalFitSoon();
+        });
+
+        // ===== Mobile: "Terminal" header tab toggles a full-screen overlay =====
+        function terminalOpenMobile() {
+            terminalPanel.classList.add('mobile-full');
+            // The overlay is positioned with top/bottom; clear any docked
+            // height (e.g. restored at init) so it fills the viewport instead
+            // of shrinking to a strip.
+            terminalPanel.style.height = '';
+            // Align the overlay's top edge with the bottom of the header
+            // (its height varies with wrapping on narrow screens).
+            const tabs = document.getElementById('top-tabs');
+            terminalPanel.style.top = (tabs ? tabs.getBoundingClientRect().height : 41) + 'px';
+            terminalTabBtn.classList.add('active');
+            terminalSetExpanded(true, { focus: true });
+            terminalUpdateBadge();
+            terminalFitSoon();
+        }
+
+        function terminalCloseMobile() {
+            terminalPanel.classList.remove('mobile-full');
+            terminalPanel.style.top = '';
+            terminalTabBtn.classList.remove('active');
+            terminalUpdateBadge();
+        }
+
+        function terminalToggleMobile() {
+            if (terminalPanel.classList.contains('mobile-full')) {
+                terminalCloseMobile();
+                if (terminalExpanded) terminalSetExpanded(false);
+            } else {
+                terminalOpenMobile();
+            }
+        }
+
+        function initTerminal() {
+            terminalPanel.classList.toggle('expanded', terminalExpanded);
+            if (terminalExpanded) {
+                terminalHeight = Math.min(terminalHeight, terminalMaxHeight());
+                terminalPanel.style.height = terminalHeight + 'px';
+            }
+            terminalChevron.textContent = terminalExpanded ? '▾' : '▴';
+            if (terminalIsMobile()) terminalCloseMobile();
+            // The user shell is the default terminal: pinned tab, selected now.
+            terminalEnsureUserTab();
+            terminalUpdateHint();
+            terminalUpdateBadge();
+            const mq = window.matchMedia('(max-width: 767px)');
+            const onMQChange = () => {
+                if (mq.matches) {
+                    terminalCloseMobile();
+                    if (terminalExpanded) terminalSetExpanded(false);
+                } else {
+                    // Clears mobile-full, the inline top offset and the tab
+                    // highlight.
+                    terminalCloseMobile();
+                    // Coming back to a desktop viewport: restore the docked
+                    // pixel height that mobile-full had cleared.
+                    if (terminalExpanded) {
+                        terminalHeight = Math.min(terminalHeight, terminalMaxHeight());
+                        terminalPanel.style.height = terminalHeight + 'px';
+                    }
+                }
+                terminalFitSoon();
+            };
+            if (typeof mq.addEventListener === 'function') mq.addEventListener('change', onMQChange);
+            else if (typeof mq.addListener === 'function') mq.addListener(onMQChange);
+            window.addEventListener('resize', () => {
+                // The panel height is only capped while dragging; re-clamp it on
+                // viewport changes too (e.g. opening devtools docked at the
+                // bottom) so the panel can never exceed the body.
+                if (terminalExpanded && !terminalPanel.classList.contains('mobile-full')) {
+                    terminalHeight = Math.min(terminalHeight, terminalMaxHeight());
+                    terminalPanel.style.height = terminalHeight + 'px';
+                }
+                terminalFitSoon();
+            });
+        }
+        try {
+            initTerminal();
+        } catch (err) {
+            // A terminal-init failure must never block the chat connection:
+            // tear down any half-created terminal UI and keep going so
+            // connect() below still runs.
+            console.error('terminal init failed:', err);
+            document.querySelectorAll('#terminal-tabs .term-tab, #terminal-body .term-host')
+                .forEach((el) => el.remove());
+            terminals.clear();
+            userTermState = 'dead';
+            terminalUpdateHint();
+            terminalUpdateBadge();
+            terminalMoreRender();
+        }
+
         function connect() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
@@ -2153,7 +2967,10 @@
                         updateToolCardWithResult(
                             cardInfo,
                             data.result,
-                            data.success !== false,
+                            // Server serializes Success with omitempty, so a
+                            // failed tool omits the field entirely (undefined).
+                            // Only an explicit true means success.
+                            data.success === true,
                             data.resultTruncated,
                             data.tool || cardInfo.toolName
                         );
@@ -2161,6 +2978,22 @@
                     } else {
                         appendMessage('system', `[${data.tool}] ${data.result}`);
                     }
+                } else if (data.type === 'term_opened') {
+                    terminalOpen(data.termId, data.tool || '', data.content || '');
+                } else if (data.type === 'term_output') {
+                    terminalWrite(data.termId, data.content || '');
+                } else if (data.type === 'term_exit') {
+                    // Success is omitted when false, so only an explicit true
+                    // marks the tab as ok; anything else is a failure.
+                    terminalExit(data.termId, data.success === true);
+                    terminalFitSoon();
+                } else if (data.type === 'user_term_opened') {
+                    terminalUserOpened(data.content || 'shell', data.workingDir || '');
+                } else if (data.type === 'user_term_output') {
+                    terminalEnsureUserTab();
+                    terminalWrite(USER_TERM_ID, data.content || '');
+                } else if (data.type === 'user_term_exit') {
+                    terminalUserExited(data.code || 0);
                 } else if (data.type === 'cancelled') {
                     // Stale cancel from a turn we replaced with resend/send — ignore.
                     if (suppressTurnEnds > 0) return;
@@ -2204,6 +3037,7 @@
                     endStream();
                     if (pendingSessionResponse) {
                         pendingSessionResponse = false;
+                        nearCompactDismissed = false; // new session: allow the banner again
                         if (data.sessionId) sessionInfoDiv.textContent = data.sessionId;
                         updateContextInfo(data);
                         const msg = (data.content || '').split('\n')[0] || 'Session updated';
@@ -2291,6 +3125,7 @@
                 suppressTurnEnds = 0;
                 pendingSessionResponse = false;
                 setTurnActive(false);
+                terminalInterruptAll();
                 setInputProgress(null);
                 clearTimeout(reconnectTimer);
                 setConnState('reconnecting');
@@ -2409,18 +3244,6 @@
             ws.send(JSON.stringify({ type: 'list_sessions' }));
         }
 
-        function relativeTime(iso) {
-            if (!iso) return '';
-            const t = Date.parse(iso);
-            if (Number.isNaN(t)) return '';
-            const sec = Math.round((Date.now() - t) / 1000);
-            if (sec < 60) return 'just now';
-            if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
-            if (sec < 86400) return `${Math.floor(sec / 3600)}h ago`;
-            if (sec < 86400 * 7) return `${Math.floor(sec / 86400)}d ago`;
-            return new Date(t).toLocaleDateString();
-        }
-
         function renderSessionList(sessions) {
             if (!sessionListDiv) return;
             sessionListDiv.innerHTML = '';
@@ -2508,7 +3331,7 @@
             ws.send(JSON.stringify({ type: 'session_new' }));
         }
 
-        function deleteSession(id, label) {
+        async function deleteSession(id, label) {
             if (!ws || ws.readyState !== WebSocket.OPEN) {
                 showToast('Not connected', 'error');
                 return;
@@ -2523,14 +3346,45 @@
                 return;
             }
             const displayName = label || id;
-            if (!confirm(`Are you sure you want to delete session "${displayName}"?\n\nThis action cannot be undone.`)) {
-                return;
-            }
+            const confirmed = await showSessionDeleteModal(displayName);
+            if (!confirmed) return;
             // Server cancels any in-flight turn to acquire the session lock;
             // suppress its turn_end so it can't clear our pending flag early.
             cancelActiveTurn();
             pendingSessionResponse = true;
             ws.send(JSON.stringify({ type: 'session_delete', sessionId: id }));
+        }
+
+        // Custom confirm modal for session deletion (matches the other dialogs).
+        // Esc cancels; the safe default (Cancel) is focused on open.
+        function showSessionDeleteModal(displayName) {
+            return new Promise((resolve) => {
+                const overlay = document.getElementById('session-delete-overlay');
+                const filenameEl = document.getElementById('session-delete-filename');
+                const cancelBtn = document.getElementById('session-delete-cancel-btn');
+                const confirmBtn = document.getElementById('session-delete-confirm-btn');
+                if (!overlay) { resolve(window.confirm(`Delete session "${displayName}"? This cannot be undone.`)); return; }
+                filenameEl.textContent = `Session "${displayName}" and its message history will be permanently deleted.`;
+                openModal(overlay);
+                const cleanup = (result) => {
+                    closeModal(overlay);
+                    cancelBtn.removeEventListener('click', onCancel);
+                    confirmBtn.removeEventListener('click', onConfirm);
+                    overlay.removeEventListener('keydown', onKey);
+                    resolve(result);
+                };
+                const onCancel = () => cleanup(false);
+                const onConfirm = () => cleanup(true);
+                const onKey = (e) => {
+                    if (e.key === 'Escape') {
+                        e.stopPropagation(); // keep the document handler from cancelling the agent turn
+                        onCancel();
+                    }
+                };
+                cancelBtn.addEventListener('click', onCancel);
+                confirmBtn.addEventListener('click', onConfirm);
+                overlay.addEventListener('keydown', onKey);
+            });
         }
 
         function resumeSession(id) {
@@ -2555,6 +3409,9 @@
         }
 
         function switchMainPane(pane) {
+            if (pane !== 'terminal' && terminalIsMobile() && terminalPanel.classList.contains('mobile-full')) {
+                terminalCloseMobile();
+            }
             document.querySelectorAll('.main-tab').forEach((t) => {
                 t.classList.toggle('active', t.dataset.pane === pane);
             });
@@ -2639,19 +3496,16 @@
         let paletteIndex = 0;
 
         function closePalette() {
-            paletteOverlay.classList.remove('open');
-            paletteOverlay.setAttribute('aria-hidden', 'true');
+            closeModal(paletteOverlay, { className: 'open' });
             paletteInput.value = '';
             paletteList.innerHTML = '';
         }
 
         function openPalette() {
-            paletteOverlay.classList.add('open');
-            paletteOverlay.setAttribute('aria-hidden', 'false');
+            openModal(paletteOverlay, { className: 'open', focusSelector: '#command-palette-input' });
             paletteInput.value = '';
             paletteIndex = 0;
             renderPalette();
-            paletteInput.focus();
         }
 
         function renderPalette() {
@@ -2730,15 +3584,40 @@
                 exportChat();
                 return;
             }
+            if (mod && e.key === '`') {
+                // Toggle the terminal panel (Ctrl+` like VS Code). On mobile
+                // this opens the full-screen terminal; on desktop it switches
+                // between the strip and the expanded panel.
+                e.preventDefault();
+                if (terminalIsMobile()) terminalOpenMobile();
+                else terminalSetExpanded(!terminalExpanded, { focus: true });
+                return;
+            }
             if (e.key === 'Escape') {
+                if (terminalMoreMenu && !terminalMoreMenu.hidden) {
+                    e.preventDefault();
+                    terminalMoreMenu.hidden = true;
+                    return;
+                }
                 if (settingsOverlay.classList.contains('active')) {
                     e.preventDefault();
-                    settingsOverlay.classList.remove('active');
+                    closeModal(settingsOverlay);
                     return;
                 }
                 if (paletteOverlay.classList.contains('open')) {
                     e.preventDefault();
                     closePalette();
+                    return;
+                }
+                // Decision dialogs handle Esc themselves when focus is inside;
+                // this guard covers the backdrop/focus-outside case so Esc
+                // can't leak through to the turn-cancel below.
+                const decisionModal = document.querySelector(
+                    '#delete-approval-overlay.active, #session-delete-overlay.active, ' +
+                    '#close-tab-overlay.active, #replace-preview-overlay.active'
+                );
+                if (decisionModal) {
+                    e.preventDefault();
                     return;
                 }
                 if (!typing && turnActive) {
@@ -3148,10 +4027,13 @@
         const themeSelect = document.getElementById('theme-select');
 
         settingsBtn.addEventListener('click', () => {
-            settingsOverlay.classList.add('active');
+            openModal(settingsOverlay);
+        });
+        document.getElementById('settings-close-btn')?.addEventListener('click', () => {
+            closeModal(settingsOverlay);
         });
         settingsOverlay.addEventListener('click', (e) => {
-            if (e.target === settingsOverlay) settingsOverlay.classList.remove('active');
+            if (e.target === settingsOverlay) closeModal(settingsOverlay);
         });
 
         // === Theme: detect system preference, allow override ===

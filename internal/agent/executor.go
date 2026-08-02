@@ -387,8 +387,19 @@ func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, 
 	}
 	configureCancelableCmd(cmd)
 	cmd.Dir = e.GetWorkingDir()
-	out, err := cmd.CombinedOutput()
-	outStr := string(out)
+
+	// Combined-output writer: accumulates the full output (returned to the
+	// caller exactly as before) while streaming each chunk to the optional
+	// ToolOutputSink so frontends can render live terminal output.
+	out := newCommandOutputWriter(command, ToolOutputFromContext(ctx))
+	cmd.Stdout = out
+	cmd.Stderr = out
+
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("execution error: %w", err)
+	}
+	err = cmd.Wait()
+	outStr := out.String()
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return outStr, fmt.Errorf("command timed out after %s: %s", timeout.Round(time.Second), command)
@@ -399,6 +410,47 @@ func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, 
 		return outStr, fmt.Errorf("execution error: %w", err)
 	}
 	return outStr, nil
+}
+
+// commandOutputWriter accumulates a command's combined stdout+stderr and
+// forwards each chunk to the optional sink as it arrives. Using a single
+// writer for both streams keeps the merged order as close as possible to
+// the child's write order — the same approach CombinedOutput uses.
+//
+// Write may be called concurrently by exec's pipe-copy goroutines, so the
+// sink callback is invoked while holding the internal lock to preserve
+// chunk ordering. Sinks must therefore be fast and must not call back into
+// the executor.
+type commandOutputWriter struct {
+	mu      sync.Mutex
+	buf     bytes.Buffer
+	command string
+	sink    ToolOutputSink
+}
+
+func newCommandOutputWriter(command string, sink ToolOutputSink) *commandOutputWriter {
+	return &commandOutputWriter{command: command, sink: sink}
+}
+
+func (w *commandOutputWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.buf.Write(p)
+	if w.sink != nil {
+		w.sink(w.command, string(p))
+	}
+	return len(p), nil
+}
+
+// String returns the accumulated output. Safe to call after Wait returns
+// (exec waits for the pipe-copy goroutines before Wait completes).
+func (w *commandOutputWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
 }
 
 func (e *Executor) buildShellCommand(ctx context.Context, command string) (*exec.Cmd, error) {

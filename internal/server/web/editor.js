@@ -55,6 +55,65 @@ function toast(message, kind = 'info') {
   if (toastFn) toastFn(message, kind);
 }
 
+// ── Modal focus management (shared by chat + editor overlays) ──
+// openModal shows an overlay, moves focus inside it, traps Tab within it and
+// remembers the trigger element so closeModal can hand focus back. Each modal
+// adds its own Esc handling on top (dismiss = non-destructive action).
+let modalLastFocus = null;
+
+function focusablesOf(container) {
+  if (!container) return [];
+  const sel = 'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])';
+  return [...container.querySelectorAll(sel)].filter((n) => n.offsetParent !== null);
+}
+
+function trapFocusIn(overlay) {
+  const onKeydown = (e) => {
+    if (e.key !== 'Tab') return;
+    const focusables = focusablesOf(overlay);
+    if (!focusables.length) return;
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    if (e.shiftKey && (document.activeElement === first || !overlay.contains(document.activeElement))) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  };
+  overlay.addEventListener('keydown', onKeydown);
+  return () => overlay.removeEventListener('keydown', onKeydown);
+}
+
+export function openModal(overlay, opts = {}) {
+  if (!overlay) return;
+  if (modalLastFocus === null) modalLastFocus = document.activeElement;
+  overlay.classList.add(opts.className || 'active');
+  overlay.setAttribute('aria-hidden', 'false');
+  if (overlay.__gogenTrap) overlay.__gogenTrap();
+  overlay.__gogenTrap = trapFocusIn(overlay);
+  const target = opts.focusSelector ? overlay.querySelector(opts.focusSelector) : null;
+  const focusables = focusablesOf(overlay);
+  const el = target || (focusables.length ? focusables[0] : null);
+  if (el && el.focus) el.focus();
+}
+
+export function closeModal(overlay, opts = {}) {
+  if (!overlay) return;
+  overlay.classList.remove(opts.className || 'active');
+  overlay.setAttribute('aria-hidden', 'true');
+  if (overlay.__gogenTrap) {
+    overlay.__gogenTrap();
+    overlay.__gogenTrap = null;
+  }
+  const target = modalLastFocus;
+  modalLastFocus = null;
+  if (target && target.focus && document.contains(target)) {
+    try { target.focus(); } catch (_) {}
+  }
+}
+
 export function setWebSocket(ws) {
   wsRef = ws;
 }
@@ -749,17 +808,25 @@ function showCloseTabModal(filename) {
     const keepBtn = document.getElementById('close-tab-keep-btn');
     if (!overlay) { resolve(window.confirm(`Close ${filename} and discard unsaved changes?`)); return; }
     filenameEl.textContent = `${filename} has unsaved changes that will be lost.`;
-    overlay.classList.add('active');
+    openModal(overlay);
     const cleanup = (result) => {
-      overlay.classList.remove('active');
+      closeModal(overlay);
       discardBtn.removeEventListener('click', onDiscard);
       keepBtn.removeEventListener('click', onKeep);
+      overlay.removeEventListener('keydown', onKey);
       resolve(result);
     };
     const onDiscard = () => cleanup(true);
     const onKeep = () => cleanup(false);
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation(); // keep the document handler from cancelling the agent turn
+        onKeep();
+      }
+    };
     discardBtn.addEventListener('click', onDiscard);
     keepBtn.addEventListener('click', onKeep);
+    overlay.addEventListener('keydown', onKey);
   });
 }
 
@@ -1212,21 +1279,29 @@ export function setupEditorUI() {
       const fileCount = new Set(matches.map(m => m.path)).size;
       summary.textContent = `${matches.length} occurrence(s) in ${fileCount} file(s)${scopeLabel ? ' — ' + scopeLabel : ''}`;
       body.innerHTML = buildPreviewHTML(matches, search, replacement);
-      overlay.classList.add('active');
+      openModal(overlay);
 
       const cleanup = (result) => {
-        overlay.classList.remove('active');
+        closeModal(overlay);
         confirmBtn.removeEventListener('click', onConfirm);
         cancelBtn.removeEventListener('click', onCancel);
         overlay.removeEventListener('click', onBackdrop);
+        overlay.removeEventListener('keydown', onKey);
         resolve(result);
       };
       const onConfirm = () => cleanup(true);
       const onCancel = () => cleanup(false);
       const onBackdrop = (e) => { if (e.target === overlay) cleanup(false); };
+      const onKey = (e) => {
+        if (e.key === 'Escape') {
+          e.stopPropagation(); // keep the document handler from cancelling the agent turn
+          onCancel();
+        }
+      };
       confirmBtn.addEventListener('click', onConfirm);
       cancelBtn.addEventListener('click', onCancel);
       overlay.addEventListener('click', onBackdrop);
+      overlay.addEventListener('keydown', onKey);
     });
   }
 

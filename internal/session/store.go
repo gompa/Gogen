@@ -47,6 +47,13 @@ type file struct {
 type deltaFile struct {
 	Messages    []llm.Message `json:"messages"`
 	TokenCounts []int         `json:"tokenCounts,omitempty"`
+	// BaseCount is the number of messages in the full snapshot this delta
+	// was written against (the message index where Messages starts). Load
+	// uses it to tell "snapshot is the delta's base" (merge) from "snapshot
+	// already contains the delta" (stale) and "snapshot was truncated after
+	// the delta was written" (drop). Zero means a legacy delta predating
+	// this field; legacy deltas are merged unconditionally.
+	BaseCount int `json:"baseCount,omitempty"`
 }
 
 // sessionIndexEntry is a lightweight entry in the session index file.
@@ -208,15 +215,20 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 		TokenCounts:    snap.TokenCounts,
 		ContextLimit:   snap.ContextLimit,
 	}
-	// Remove stale delta — the full snapshot supersedes it.
-	_ = s.clearDeltaFile(snap.WorkingDir, id)
-
 	data, err := json.Marshal(out)
 	if err != nil {
 		return err
 	}
 	if err := writeFileAtomic(path, data, 0o600); err != nil {
 		return err
+	}
+	// The full snapshot now supersedes the delta. Remove it only after the
+	// snapshot write succeeded: clearing it first meant a crash or a write
+	// failure between the two operations permanently lost the messages that
+	// existed only in the delta. A stale delta that survives into a later
+	// load is detected and dropped by LoadInWorkingDir's baseCount check.
+	if err := s.clearDeltaFile(snap.WorkingDir, id); err != nil && !os.IsNotExist(err) {
+		log.Printf("warning: failed to remove delta for session %s: %v", id, err)
 	}
 	s.setCreatedCache(id, created)
 	s.saveCount++
@@ -274,15 +286,41 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 		s.setCreatedCache(id, f.Created)
 	}
 
-	// Merge any delta file (messages appended since last full snapshot).
+	// Merge any delta file (messages appended since the last full snapshot).
+	// The delta is deliberately NOT removed after a successful merge: it
+	// stays on disk until the next full save replaces it, so a crash or an
+	// early exit after restore cannot lose messages that only exist in the
+	// delta. The baseCount check below also detects stale deltas (the
+	// snapshot already contains them) and truncated sessions (the delta's
+	// messages were deliberately dropped).
 	snap, deltaErr := s.loadDelta(workingDir, id)
 	if deltaErr == nil && snap.Messages != nil {
-		f.Messages = append(f.Messages, snap.Messages...)
-		if len(snap.TokenCounts) > 0 {
-			f.TokenCounts = append(f.TokenCounts, snap.TokenCounts...)
+		merge := false
+		switch {
+		case snap.BaseCount == 0:
+			// Legacy delta written before baseCount was recorded: the
+			// historic behavior was to merge unconditionally.
+			merge = true
+		case len(f.Messages) == snap.BaseCount:
+			// Snapshot is exactly the base the delta was written against:
+			// the delta extends it.
+			merge = true
+		case len(f.Messages) >= snap.BaseCount+len(snap.Messages):
+			// Snapshot already contains the delta's messages (a full save
+			// wrote the snapshot but crashed before removing the delta).
+			_ = s.clearDeltaFile(workingDir, id)
+		default:
+			// Snapshot is shorter than the delta's base: the conversation
+			// was truncated (compaction/rollback) and re-saved, so the
+			// delta's messages were deliberately dropped.
+			_ = s.clearDeltaFile(workingDir, id)
 		}
-		// Delta consumed — remove it so we don't double-merge on next load.
-		_ = s.clearDeltaFile(workingDir, id)
+		if merge {
+			f.Messages = append(f.Messages, snap.Messages...)
+			if len(snap.TokenCounts) > 0 {
+				f.TokenCounts = append(f.TokenCounts, snap.TokenCounts...)
+			}
+		}
 	}
 
 	return agent.SessionSnapshot{
@@ -305,6 +343,8 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 // This avoids rewriting the entire (potentially large) message list on every save.
 // totalMsgCount is the agent's total message count at save time; because the
 // delta is cumulative, it is the correct index count between full snapshots.
+// BaseCount (totalMsgCount minus the delta length) records the message count
+// of the snapshot the delta extends, letting loads detect stale deltas.
 func (s *Store) AppendMessages(id string, snap agent.SessionSnapshot, totalMsgCount int) error {
 	if s == nil || !s.enabled || id == "" {
 		return nil
@@ -324,6 +364,10 @@ func (s *Store) AppendMessages(id string, snap agent.SessionSnapshot, totalMsgCo
 	df := deltaFile{
 		Messages:    snap.Messages,
 		TokenCounts: snap.TokenCounts,
+	}
+	df.BaseCount = totalMsgCount - len(snap.Messages)
+	if df.BaseCount < 0 {
+		df.BaseCount = 0
 	}
 	data, err := json.Marshal(df)
 	if err != nil {
@@ -560,6 +604,10 @@ func (s *Store) Delete(workingDir, id string) error {
 			return fmt.Errorf("session not found: %s", id)
 		}
 		return err
+	}
+	// Remove any pending delta for the session as well.
+	if err := s.clearDeltaFile(workingDir, id); err != nil && !os.IsNotExist(err) {
+		log.Printf("warning: failed to remove delta for session %s: %v", id, err)
 	}
 	delete(s.createdCache, id)
 	// Remove from index and invalidate in-memory cache.

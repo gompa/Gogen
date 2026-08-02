@@ -196,6 +196,56 @@ func TestResolveContextLimitUnavailableNoCache(t *testing.T) {
 	}
 }
 
+// TestRefreshFailBackoff verifies that after a failed registry fetch, further
+// lookups within the failBackoff window do not start another network attempt.
+// Regression guard: the backoff branch used to be dead code because lastFail
+// was reset before the check, so every lookup re-probed a dead endpoint.
+func TestRefreshFailBackoff(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	r := NewResolver("")
+	r.url = srv.URL
+	r.client = &http.Client{Timeout: 2 * time.Second}
+
+	// First lookup misses (no data, no disk cache) and kicks off a failing fetch.
+	if _, err := r.ResolveContextLimit("https://opencode.ai/zen/v1", "claude-opus-4-8"); err == nil {
+		t.Fatal("expected miss before registry is loaded")
+	}
+
+	// Wait until the failing fetch has completed and recorded lastFail.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		r.mu.RLock()
+		failed := !r.lastFail.IsZero() && !r.refreshing
+		r.mu.RUnlock()
+		if failed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for failed fetch to record backoff")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	hitsAfterFirst := hits.Load()
+	if hitsAfterFirst == 0 {
+		t.Fatal("expected the first fetch to hit the server")
+	}
+
+	// A second lookup inside the backoff window must NOT start another fetch.
+	if _, err := r.ResolveContextLimit("https://opencode.ai/zen/v1", "claude-opus-4-8"); err == nil {
+		t.Fatal("expected miss (registry still not loaded)")
+	}
+	time.Sleep(100 * time.Millisecond)
+	if n := hits.Load(); n != hitsAfterFirst {
+		t.Fatalf("fail backoff not honored: hits %d → %d", hitsAfterFirst, n)
+	}
+}
+
 func TestProviderID(t *testing.T) {
 	r := NewResolver("")
 	r.mu.Lock()

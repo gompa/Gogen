@@ -1,9 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -29,6 +32,78 @@ import (
 var webAssets embed.FS
 
 var errWSClosed = errors.New("websocket closed")
+
+// staticAsset is a lazily compressed embedded asset served by HandleStatic.
+// raw and gzip are cached after first use so a page load does not re-compress
+// the multi-MB Monaco bundle on every request.
+type staticAsset struct {
+	contentType string
+	etag        string // weak ETag derived from the raw content hash
+	raw         []byte
+	gzip        []byte // nil when the asset is not worth gzip-ing
+}
+
+// staticAssetCache caches embedded assets after their first request. Entries
+// are immutable once stored, so readers can use the returned pointer freely
+// after the mutex is released.
+type staticAssetCache struct {
+	mu      sync.Mutex
+	entries map[string]*staticAsset
+}
+
+// peek returns the cached asset for name without reading or compressing anything.
+func (c *staticAssetCache) peek(name string) (*staticAsset, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	a, ok := c.entries[name]
+	return a, ok
+}
+
+// get returns the cached asset for name, filling it from content on first use.
+// gzipable + minGzipSize control whether gzip bytes are produced (gzip when
+// len(content) > minGzipSize); pass minGzipSize = -1 to compress any size.
+func (c *staticAssetCache) get(name string, content []byte, contentType string, gzipable bool, minGzipSize int) *staticAsset {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if a, ok := c.entries[name]; ok {
+		return a
+	}
+	a := &staticAsset{contentType: contentType, raw: content, etag: weakETag(content)}
+	if gzipable && len(content) > minGzipSize {
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		_, _ = gz.Write(content)
+		_ = gz.Close()
+		a.gzip = buf.Bytes()
+	}
+	if c.entries == nil {
+		c.entries = make(map[string]*staticAsset)
+	}
+	c.entries[name] = a
+	return a
+}
+
+// weakETag returns a weak validator for content. Weak is used because the same
+// entity is served both identity- and gzip-encoded (differing bytes but equal
+// semantics); Vary: Accept-Encoding keeps the variants apart in caches.
+func weakETag(content []byte) string {
+	sum := sha256.Sum256(content)
+	return `W/"` + hex.EncodeToString(sum[:16]) + `"`
+}
+
+// etagMatches reports whether an If-None-Match header matches etag (exact
+// match, one of several comma-separated candidates, or a `*` wildcard).
+func etagMatches(header, etag string) bool {
+	if header == "*" {
+		return true
+	}
+	for _, part := range strings.Split(header, ",") {
+		if strings.TrimSpace(part) == etag {
+			return true
+		}
+	}
+	return false
+}
 
 type wsConn struct {
 	conn *websocket.Conn
@@ -90,6 +165,39 @@ func (s *Server) acquireTurnForHandler(ws *wsConn, stream *wsConnStream) bool {
 		return false
 	}
 	return true
+}
+
+// spawnUserTerminal starts the interactive user shell for a WebSocket
+// connection (if none is alive) and reports its lifecycle over the socket:
+// user_term_opened once the shell is up, user_term_exit when it exits. Output
+// is streamed as user_term_output chunks from the PTY read goroutine. The
+// shell runs in the agent's current working directory at spawn time.
+func (s *Server) spawnUserTerminal(ws *wsConn, holder *userTermHolder) {
+	if holder.get() != nil {
+		return
+	}
+	var wd string
+	s.lockAgentRead(func() {
+		wd = s.agent.Executor.GetWorkingDir()
+	})
+	ut, err := startUserTerminal(wd, func(chunk string) {
+		_ = ws.writeJSON(WSMessage{Type: "user_term_output", Content: chunk})
+	})
+	if err != nil {
+		_ = ws.writeJSON(WSMessage{Type: "user_term_exit", Content: "failed to start shell: " + err.Error(), Code: -1})
+		return
+	}
+	holder.set(ut)
+	_ = ws.writeJSON(WSMessage{Type: "user_term_opened", Content: ut.Title(), WorkingDir: wd})
+	go func() {
+		<-ut.Done()
+		code := ut.ExitCode()
+		// Only report the exit if this terminal is still the connection's
+		// current one (a respawn may already have replaced it).
+		if holder.clear(ut) {
+			_ = ws.writeJSON(WSMessage{Type: "user_term_exit", Content: fmt.Sprintf("shell exited (%d)", code), Code: code})
+		}
+	}()
 }
 
 func newWSConn(conn *websocket.Conn) *wsConn {
@@ -210,6 +318,7 @@ type Server struct {
 	wsConns        []*websocket.Conn
 	connLimiter    *rateLimitState
 	upgradeLimiter *ipLimiter
+	staticAssets   staticAssetCache // lazily gzip-compressed embedded assets
 }
 
 type ModelEntry struct {
@@ -253,6 +362,10 @@ type WSMessage struct {
 	Type            string                 `json:"type"`
 	Content         string                 `json:"content,omitempty"`
 	Tool            string                 `json:"tool,omitempty"`
+	TermID          string                 `json:"termId,omitempty"`
+	Cols            int                    `json:"cols,omitempty"`
+	Rows            int                    `json:"rows,omitempty"`
+	Code            int                    `json:"code,omitempty"`
 	ToolCallID      string                 `json:"toolCallId,omitempty"`
 	Index           int                    `json:"index,omitempty"`
 	ArgsDelta       string                 `json:"argsDelta,omitempty"`
@@ -623,6 +736,16 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	stream := &wsConnStream{}
 	defer stream.close()
 
+	// Interactive user shell for this connection, killed on disconnect. The
+	// shell itself is spawned after the config/history handshake below so
+	// connection setup never depends on pty availability.
+	userTermHolder := &userTermHolder{}
+	defer func() {
+		if ut := userTermHolder.get(); ut != nil {
+			ut.Close()
+		}
+	}()
+
 	s.agentMu.RLock()
 	cfgMsg := s.agentConfigMsgBasic()
 	s.agentMu.RUnlock()
@@ -637,6 +760,10 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		_ = ws.writeJSON(s.agentConfigMsg(r.Context()))
 	}()
+
+	// Spawn the user shell after the handshake so a pty failure (sandboxed
+	// or headless environments) can never delay the config/history messages.
+	s.spawnUserTerminal(ws, userTermHolder)
 
 	incoming := make(chan WSMessage, 8)
 	go func() {
@@ -682,6 +809,16 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			s.handleWSConfig(ws, r.Context(), stream, msg)
 		case "cancel":
 			stream.cancelInFlight()
+		case "user_term_input":
+			if ut := userTermHolder.get(); ut != nil {
+				_ = ut.Write([]byte(msg.Content))
+			}
+		case "user_term_resize":
+			if ut := userTermHolder.get(); ut != nil && msg.Cols > 0 && msg.Rows > 0 {
+				_ = ut.Resize(uint16(msg.Cols), uint16(msg.Rows))
+			}
+		case "user_term_request":
+			s.spawnUserTerminal(ws, userTermHolder)
 		case "message":
 			s.handleWSUserMessage(ws, r, stream, session, msg)
 		}
@@ -989,6 +1126,16 @@ func (s *Server) startAsyncStreamingTurn(ws *wsConn, r *http.Request, stream *ws
 			}
 		}, wsTokenFlushInterval)
 
+		// Live terminal tabs for shell tools: a tab is opened lazily on the
+		// first output chunk (which carries the exact command string), fed by
+		// a per-tool batcher, and closed on tool end. Both maps are keyed by
+		// the tool call ID, which doubles as the terminal tab ID. They are
+		// accessed from the exec pipe goroutine (OnToolOutput) and the stream
+		// goroutine (OnToolResult), so access is mutex-guarded.
+		var termMu sync.Mutex
+		termBatches := map[string]*streamutil.TokenBatcher{}
+		termOpened := map[string]struct{}{}
+
 		handlers := &llm.StreamHandlers{
 			OnStart: func() {
 				// Tell the client the server-side index of the user message
@@ -1054,7 +1201,46 @@ func (s *Server) startAsyncStreamingTurn(ws *wsConn, r *http.Request, stream *ws
 			OnToolExecute: func(name string) {
 				write(WSMessage{Type: "tool_execute", Tool: name})
 			},
+			OnToolOutput: func(id, name, command, chunk string) {
+				if ctx.Err() != nil {
+					return
+				}
+				termMu.Lock()
+				first := false
+				if _, ok := termOpened[id]; !ok {
+					termOpened[id] = struct{}{}
+					first = true
+				}
+				b := termBatches[id]
+				if b == nil {
+					b = streamutil.NewTokenBatcher(func(_ bool, text string) {
+						write(WSMessage{Type: "term_output", TermID: id, Content: text})
+					}, wsTokenFlushInterval)
+					termBatches[id] = b
+				}
+				termMu.Unlock()
+				if first {
+					write(WSMessage{Type: "term_opened", TermID: id, ToolCallID: id, Tool: name, Content: "$ " + command})
+				}
+				b.StreamToken(chunk)
+			},
 			OnToolResult: func(id, name, result string, success bool) {
+				// Close this tool call's live terminal tab, if one was
+				// opened. Flush first so buffered chunks land before
+				// term_exit (the send queue is FIFO).
+				termMu.Lock()
+				b := termBatches[id]
+				delete(termBatches, id)
+				_, opened := termOpened[id]
+				delete(termOpened, id)
+				termMu.Unlock()
+				if b != nil {
+					b.Flush()
+					b.Close()
+				}
+				if opened {
+					write(WSMessage{Type: "term_exit", TermID: id, ToolCallID: id, Success: success})
+				}
 				truncated := false
 				const maxResult = 128 * 1024
 				origLen := len(result)
@@ -1128,24 +1314,9 @@ func (s *Server) HandleStatic(w http.ResponseWriter, r *http.Request) {
 
 	path := r.URL.Path
 	if path == "/" || path == "" {
-		content, err := webAssets.ReadFile("web/index.html")
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache")
-		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-			w.Header().Set("Content-Encoding", "gzip")
-			w.Header().Add("Vary", "Accept-Encoding")
-			gz := gzip.NewWriter(w)
-			defer gz.Close()
-			if _, err := gz.Write(content); err != nil {
-				return
-			}
-			return
-		}
-		_, _ = w.Write(content)
+		// index.html is compressed regardless of size (it is the bootstrap
+		// page); everything else follows the staticGzipMime + 512-byte rule.
+		s.serveEmbedded(w, r, "web/index.html", "text/html; charset=utf-8", "no-cache", true)
 		return
 	}
 
@@ -1156,25 +1327,50 @@ func (s *Server) HandleStatic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := "web/" + rel
-	content, err := webAssets.ReadFile(name)
-	if err != nil {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
 	ct := contentTypeForExt(filepath.Ext(name))
-	w.Header().Set("Content-Type", ct)
-	w.Header().Set("Cache-Control", "public, max-age=86400")
-	if staticGzipMime(ct) && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") && len(content) > 512 {
-		w.Header().Set("Content-Encoding", "gzip")
-		w.Header().Add("Vary", "Accept-Encoding")
-		gz := gzip.NewWriter(w)
-		defer gz.Close()
-		if _, err := gz.Write(content); err != nil {
+	s.serveEmbedded(w, r, name, ct, "public, max-age=86400", false)
+}
+
+// serveEmbedded serves an embedded asset from the static asset cache, reading
+// and gzip-compressing it on first use only. Repeated requests reuse the
+// cached bytes and revalidate via ETag/If-None-Match (304), so a page reload
+// never re-compresses the multi-MB Monaco bundle.
+func (s *Server) serveEmbedded(w http.ResponseWriter, r *http.Request, name, contentType, cacheControl string, gzipAlways bool) {
+	asset, ok := s.staticAssets.peek(name)
+	if !ok {
+		content, err := webAssets.ReadFile(name)
+		if err != nil {
+			if gzipAlways {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			} else {
+				http.Error(w, "not found", http.StatusNotFound)
+			}
 			return
 		}
+		minGzipSize := 512
+		if gzipAlways {
+			minGzipSize = -1
+		}
+		asset = s.staticAssets.get(name, content, contentType, staticGzipMime(contentType), minGzipSize)
+	}
+
+	w.Header().Set("Content-Type", asset.contentType)
+	w.Header().Set("Cache-Control", cacheControl)
+	w.Header().Set("ETag", asset.etag)
+
+	if match := strings.TrimSpace(r.Header.Get("If-None-Match")); match != "" && etagMatches(match, asset.etag) {
+		w.Header().Set("Vary", "Accept-Encoding")
+		w.WriteHeader(http.StatusNotModified)
 		return
 	}
-	_, _ = w.Write(content)
+
+	if asset.gzip != nil && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Add("Vary", "Accept-Encoding")
+		_, _ = w.Write(asset.gzip)
+		return
+	}
+	_, _ = w.Write(asset.raw)
 }
 
 // staticGzipMime reports whether content of the given type is worth gzip-ing

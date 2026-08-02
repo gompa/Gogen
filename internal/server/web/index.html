@@ -5,11 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>GoGen AI Agent</title>
     <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="/xterm/xterm.css">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤖</text></svg>">
 </head>
 <body>
     <div id="top-tabs">
         <button type="button" class="main-tab active" data-pane="chat">Chat</button>
         <button type="button" class="main-tab" data-pane="editor">Editor</button>
+        <button type="button" class="main-tab" id="terminal-tab" data-pane="terminal" title="Terminal">Terminal<span id="terminal-tab-badge" hidden></span></button>
         <span id="global-mode-badge" title="Global mode active — agent is not scoped to working directory">🌐 Global</span>
         <span id="conn-indicator" class="disconnected" title="Disconnected" role="status" aria-live="polite" aria-label="Disconnected"></span>
         <button type="button" id="settings-btn" title="Settings">⚙</button>
@@ -41,6 +44,7 @@
                         <div id="tb-model-popover" class="tb-popover">
                             <div class="tb-popover-section">
                                 <div class="tb-popover-heading">Model</div>
+                                <input type="search" id="tb-model-filter" class="tb-model-filter" placeholder="Filter models…" autocomplete="off">
                                 <div id="tb-model-list" class="tb-model-list"></div>
                             </div>
                             <div class="tb-popover-section">
@@ -65,6 +69,11 @@
                         <span id="tb-context-badge" class="tb-context-badge" role="status">—</span>
                         <div id="context-tooltip"></div>
                     </div>
+                </div>
+                <div id="near-compact-banner" hidden>
+                    <span id="ncb-text">Context is nearly full — compact to keep responses focused.</span>
+                    <button type="button" id="ncb-compact-btn">Compact now</button>
+                    <button type="button" id="ncb-dismiss-btn" title="Dismiss" aria-label="Dismiss">✕</button>
                 </div>
                 <div id="input-area">
                     <div id="input-wrap">
@@ -123,9 +132,20 @@
             </div>
         </div>
     </div>
+    <div id="terminal-panel" aria-label="Terminal">
+        <div id="terminal-resize-handle" title="Drag to resize terminal"></div>
+        <div id="terminal-tabbar">
+            <button type="button" id="terminal-chevron" title="Collapse or expand terminal (Ctrl+`)">▴</button>
+            <div id="terminal-tabs"></div>
+            <button type="button" id="terminal-more" title="All terminals" hidden>»</button>
+            <span id="terminal-hint">Terminal unavailable (xterm.js failed to load)</span>
+            <div id="terminal-more-menu" hidden></div>
+        </div>
+        <div id="terminal-body"></div>
+    </div>
     <div id="delete-approval-overlay">
-        <div id="delete-approval-dialog">
-            <h3>Approve file delete?</h3>
+        <div id="delete-approval-dialog" role="dialog" aria-labelledby="delete-approval-title">
+            <h3 id="delete-approval-title">Approve file delete?</h3>
             <p id="delete-approval-reason"></p>
             <div id="delete-approval-paths"></div>
             <div id="delete-approval-actions">
@@ -144,9 +164,19 @@
             </div>
         </div>
     </div>
+    <div id="session-delete-overlay">
+        <div id="session-delete-dialog" role="dialog" aria-label="Delete session">
+            <h3>Delete session?</h3>
+            <p id="session-delete-filename"></p>
+            <div id="session-delete-actions">
+                <button class="keep" id="session-delete-cancel-btn">Cancel</button>
+                <button class="discard" id="session-delete-confirm-btn">Delete</button>
+            </div>
+        </div>
+    </div>
     <div id="replace-preview-overlay">
-        <div id="replace-preview-dialog">
-            <h3>Replace Preview</h3>
+        <div id="replace-preview-dialog" role="dialog" aria-labelledby="replace-preview-title">
+            <h3 id="replace-preview-title">Replace Preview</h3>
             <div id="replace-preview-summary"></div>
             <div id="replace-preview-body"></div>
             <div id="replace-preview-actions">
@@ -157,7 +187,10 @@
     </div>
     <div id="settings-overlay">
         <div id="settings-dialog" role="dialog" aria-label="Settings">
-            <h3>Settings</h3>
+            <div class="settings-header">
+                <h3>Settings</h3>
+                <button type="button" id="settings-close-btn" title="Close (Esc)" aria-label="Close settings">✕</button>
+            </div>
             <div class="setting-row">
                 <div>
                     <label>Theme</label>
@@ -212,6 +245,8 @@
         </div>
     </div>
     <div id="toast-host" aria-live="polite"></div>
+    <script src="/xterm/xterm.js"></script>
+    <script src="/xterm/addon-fit.js"></script>
     <script type="module" src="/app.js"></script>
 </body>
 </html>

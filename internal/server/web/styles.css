@@ -365,6 +365,14 @@
             font-family: var(--mono);
         }
         .tb-model-row .tb-check { color: var(--accent); margin-left: 4px; }
+        .tb-model-filter {
+            width: 100%;
+            margin-bottom: 4px;
+            padding: 4px 8px;
+            font-size: 0.8em;
+            font-family: var(--sans);
+            box-sizing: border-box;
+        }
 
         /* Thinking level chips */
         .tb-thinking-grid {
@@ -416,6 +424,43 @@
             border-color: var(--accent);
             box-shadow: 0 0 0 1px rgba(86,156,214,0.3);
         }
+
+        /* ===== Near-compact banner (shown when context is about to compact) ===== */
+        #near-compact-banner {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 6px 16px;
+            font-size: 0.82em;
+            color: var(--warn);
+            background: var(--warn-bg);
+            border-top: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+        #near-compact-banner[hidden] { display: none; }
+        #near-compact-banner #ncb-text {
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        #near-compact-banner button {
+            padding: 3px 10px;
+            font-size: 0.8em;
+            background: transparent;
+            border: 1px solid var(--warn);
+            color: var(--warn);
+            border-radius: 3px;
+            flex-shrink: 0;
+        }
+        #near-compact-banner button:hover:not(:disabled) { background: var(--warn-bg); }
+        #near-compact-banner #ncb-dismiss-btn {
+            border: none;
+            padding: 2px 6px;
+            opacity: 0.7;
+        }
+        #near-compact-banner #ncb-dismiss-btn:hover { opacity: 1; }
 
         .message {
             padding: 10px 12px;
@@ -561,6 +606,34 @@
             width: fit-content;
             max-width: 90%;
         }
+        /* ===== Empty chat state (fresh session) ===== */
+        .empty-state {
+            margin: auto;
+            max-width: 440px;
+            padding: 32px 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 10px;
+            text-align: center;
+            color: var(--fg-muted);
+            user-select: none;
+        }
+        .empty-state-emoji { font-size: 2.6em; line-height: 1; }
+        .empty-state-title { font-size: 1.15em; font-weight: 600; color: var(--fg); }
+        .empty-state-sub { font-size: 0.9em; line-height: 1.5; max-width: 360px; }
+        .empty-state-prompts { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 6px; }
+        .empty-state-btn {
+            padding: 6px 14px;
+            font-size: 0.85em;
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            background: var(--bg-elevated);
+            color: var(--fg);
+        }
+        .empty-state-btn:hover { background: var(--bg-hover); border-color: var(--accent); }
+        .empty-state-hint { font-size: 0.75em; font-family: var(--mono); opacity: 0.75; margin-top: 8px; }
+
         input, button, select {
             padding: 8px 12px;
             border: 1px solid var(--border);
@@ -1346,7 +1419,7 @@
         }
 
         /* ===== Task 6: Custom close-tab modal ===== */
-        #close-tab-overlay {
+        #close-tab-overlay, #session-delete-overlay {
             display: none;
             position: fixed;
             inset: 0;
@@ -1355,8 +1428,8 @@
             align-items: center;
             justify-content: center;
         }
-        #close-tab-overlay.active { display: flex; }
-        #close-tab-dialog {
+        #close-tab-overlay.active, #session-delete-overlay.active { display: flex; }
+        #close-tab-dialog, #session-delete-dialog {
             background: var(--bg-elevated);
             border: 1px solid var(--border);
             border-radius: 6px;
@@ -1366,11 +1439,11 @@
             box-shadow: 0 8px 32px rgba(0,0,0,0.45);
             color: var(--fg);
         }
-        #close-tab-dialog h3 { margin: 0 0 12px; font-size: 1em; }
-        #close-tab-dialog p { margin: 0 0 16px; font-size: 0.9em; color: var(--fg-muted); }
-        #close-tab-actions { display: flex; gap: 10px; justify-content: flex-end; }
-        #close-tab-actions button.discard { background: var(--error-bg); border-color: #7a3030; color: #ff7b72; }
-        #close-tab-actions button.keep { background: var(--success-bg); border-color: #2d6a4f; color: var(--success); }
+        #close-tab-dialog h3, #session-delete-dialog h3 { margin: 0 0 12px; font-size: 1em; }
+        #close-tab-dialog p, #session-delete-dialog p { margin: 0 0 16px; font-size: 0.9em; color: var(--fg-muted); }
+        #close-tab-actions, #session-delete-actions { display: flex; gap: 10px; justify-content: flex-end; }
+        #close-tab-actions button.discard, #session-delete-actions button.discard { background: var(--error-bg); border-color: #7a3030; color: #ff7b72; }
+        #close-tab-actions button.keep, #session-delete-actions button.keep { background: var(--success-bg); border-color: #2d6a4f; color: var(--success); }
 
         /* ===== Context tooltip (inside toolbar) ===== */
         #context-tooltip {
@@ -1427,7 +1500,22 @@
             box-shadow: 0 8px 32px rgba(0,0,0,0.45);
             color: var(--fg);
         }
-        #settings-dialog h3 { margin: 0 0 16px; font-size: 1em; font-weight: 600; }
+        .settings-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 16px;
+        }
+        .settings-header h3 { margin: 0; font-size: 1em; font-weight: 600; }
+        #settings-close-btn {
+            background: transparent;
+            border: none;
+            color: var(--fg-muted);
+            font-size: 1em;
+            padding: 2px 8px;
+            border-radius: 3px;
+        }
+        #settings-close-btn:hover { color: var(--fg); background: var(--bg-hover); }
         #settings-dialog label {
             display: block;
             font-size: 0.75em;
@@ -1624,5 +1712,261 @@
         .inline-edit-cancel:hover {
             color: #f44;
             border-color: #f44;
+        }
+
+        /* ===== Terminal panel (docked at bottom; strip with chevron by default) ===== */
+        #terminal-panel {
+            flex-shrink: 0;
+            display: flex;
+            flex-direction: column;
+            background: var(--bg-elevated);
+            border-top: 1px solid var(--border);
+            min-height: 28px;
+            position: relative;
+            z-index: 30;
+        }
+        #terminal-resize-handle {
+            height: 4px;
+            cursor: row-resize;
+            flex-shrink: 0;
+            background: transparent;
+            transition: background 0.15s ease;
+        }
+        #terminal-resize-handle:hover,
+        #terminal-resize-handle.active {
+            background: var(--accent);
+        }
+        #terminal-tabbar {
+            display: flex;
+            align-items: center;
+            gap: 2px;
+            height: 28px;
+            flex-shrink: 0;
+            padding: 0 6px;
+            background: var(--bg-elevated);
+            position: relative;
+            /* Must stay visible: the '»' dropdown (#terminal-more-menu) is
+               absolutely positioned above this bar and would be clipped. */
+            overflow: visible;
+        }
+        #terminal-chevron {
+            border: none;
+            background: transparent;
+            color: var(--fg-muted);
+            cursor: pointer;
+            font-size: 0.8em;
+            padding: 4px 6px;
+            flex-shrink: 0;
+            border-radius: 3px;
+        }
+        #terminal-chevron:hover { color: var(--fg); background: var(--bg-hover); }
+        #terminal-tabs {
+            display: flex;
+            align-items: center;
+            gap: 2px;
+            overflow-x: auto;
+            overflow-y: hidden;
+            scrollbar-width: none; /* no stray track under the tabs */
+            min-width: 0;
+            flex: 1 1 auto;
+        }
+        #terminal-tabs::-webkit-scrollbar { display: none; }
+        .term-tab.user-tab {
+            background: var(--accent-soft);
+            color: var(--fg);
+        }
+        .term-tab.user-tab:hover { background: var(--accent-soft); color: var(--fg); }
+        .term-tab.user-tab .term-tab-title { font-weight: 600; }
+        .term-tab {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 10px;
+            font-size: 0.76em;
+            font-family: var(--mono);
+            color: var(--fg-muted);
+            border: none;
+            background: transparent;
+            cursor: pointer;
+            border-radius: 3px;
+            white-space: nowrap;
+            max-width: 280px;
+            user-select: none;
+        }
+        .term-tab .term-tab-title {
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .term-tab:hover { background: var(--bg-hover); color: var(--fg); }
+        .term-tab.active { background: var(--bg-active); color: var(--fg); }
+        .term-tab.done { opacity: 0.6; }
+        .term-tab.flash { animation: term-flash 0.9s ease; }
+        .term-tab .term-tab-status { font-weight: 700; font-size: 1.05em; }
+        .term-tab .term-tab-status.ok { color: var(--success); }
+        .term-tab .term-tab-status.err { color: var(--error); }
+        .term-tab .term-tab-close {
+            border: none;
+            background: none;
+            color: var(--fg-dim);
+            cursor: pointer;
+            font-size: 0.9em;
+            padding: 0 2px;
+            border-radius: 3px;
+        }
+        .term-tab .term-tab-close:hover { color: var(--error); }
+        .term-tab .term-tab-restart {
+            border: none;
+            background: none;
+            color: var(--accent);
+            cursor: pointer;
+            font-size: 0.95em;
+            padding: 0 2px;
+            border-radius: 3px;
+        }
+        .term-tab .term-tab-restart:hover { color: var(--fg); background: var(--bg-hover); }
+        #terminal-more {
+            border: none;
+            background: transparent;
+            color: var(--fg-muted);
+            cursor: pointer;
+            font-size: 0.95em;
+            padding: 2px 8px;
+            flex-shrink: 0;
+            border-radius: 3px;
+        }
+        #terminal-more:hover { color: var(--fg); background: var(--bg-hover); }
+        #terminal-more-menu {
+            position: absolute;
+            right: 6px;
+            bottom: 30px;
+            z-index: 40;
+            min-width: 280px;
+            max-width: 460px;
+            max-height: 320px;
+            overflow-y: auto;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+            padding: 4px;
+        }
+        .term-more-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 5px 8px;
+            font-size: 0.78em;
+            font-family: var(--mono);
+            color: var(--fg);
+            cursor: pointer;
+            border-radius: 4px;
+            white-space: nowrap;
+        }
+        .term-more-row:hover { background: var(--bg-hover); }
+        .term-more-row.active { background: var(--bg-active); }
+        .term-more-row .term-more-title {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            flex: 1;
+        }
+        .term-more-row .term-more-status { flex-shrink: 0; font-weight: 700; }
+        .term-more-row .term-more-status.running { color: var(--accent); }
+        .term-more-row .term-more-status.ok { color: var(--success); }
+        .term-more-row .term-more-status.err { color: var(--error); }
+        .term-more-row .term-more-close {
+            border: none;
+            background: none;
+            color: var(--fg-dim);
+            cursor: pointer;
+            font-size: 0.9em;
+            padding: 0 4px;
+            border-radius: 3px;
+            flex-shrink: 0;
+        }
+        .term-more-row .term-more-close:hover { color: var(--error); }
+        #terminal-hint {
+            margin-left: auto;
+            font-size: 0.72em;
+            color: var(--fg-dim);
+            padding-right: 8px;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+        #terminal-body {
+            display: none;
+            flex: 1;
+            min-height: 0;
+            background: var(--bg);
+            position: relative;
+        }
+        #terminal-panel.expanded #terminal-body { display: block; }
+        #terminal-body .term-host {
+            position: absolute;
+            inset: 0;
+            padding: 6px 4px 6px 10px;
+        }
+        #terminal-body .term-host .term-instance {
+            width: 100%;
+            height: 100%;
+            /* xterm 5.5+ keeps its scroll container in normal flow with
+               overflow: visible, so a screen that is taller than the host
+               (e.g. before the first fit has run) would spill below the
+               terminal panel. Clip it at the host bounds instead. */
+            overflow: hidden;
+        }
+        #terminal-body .term-host .term-instance .xterm {
+            width: 100%;
+            height: 100%;
+        }
+        /* The empty .xterm-viewport (absolute, stock #000 background) peeks out
+           as a dark strip below the scroll container when the fitted screen is
+           a few px shorter than the host; the theme background already comes
+           from the scroll container, so make it transparent. */
+        #terminal-body .term-host .term-instance .xterm .xterm-viewport {
+            background: transparent;
+        }
+        @keyframes term-flash {
+            0% { background: var(--accent-soft); }
+            100% { background: transparent; }
+        }
+
+        /* Header "Terminal" tab: hidden on desktop, the docked strip is the
+           affordance there. Shown on mobile instead of the dock. */
+        #terminal-tab { display: none; position: relative; }
+        #terminal-tab-badge {
+            position: absolute;
+            top: 4px;
+            right: 4px;
+            min-width: 14px;
+            height: 14px;
+            padding: 0 3px;
+            border-radius: 8px;
+            background: var(--accent);
+            color: #fff;
+            font-size: 0.6em;
+            line-height: 14px;
+            text-align: center;
+            pointer-events: none;
+        }
+        #terminal-tab-badge.pulse { animation: conn-pulse 1s ease-in-out infinite; }
+
+        @media (max-width: 767px) {
+            #terminal-tab { display: inline-flex; align-items: center; gap: 6px; }
+            #terminal-panel { display: none; }
+            #terminal-panel.mobile-full {
+                display: flex;
+                position: fixed;
+                top: 41px;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                z-index: 60;
+                background: var(--bg-elevated);
+            }
+            #terminal-panel.mobile-full #terminal-body { display: block; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .term-tab.flash { animation: none; }
+            #terminal-tab-badge.pulse { animation: none; }
         }
 

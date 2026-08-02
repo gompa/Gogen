@@ -219,3 +219,241 @@ func TestAppendMessagesMissingIndexEntry(t *testing.T) {
 		t.Fatalf("expected 1 session from legacy scan, got %+v", sessions)
 	}
 }
+
+// TestLoadInWorkingDirKeepsDeltaUntilFullSave verifies that loading a session
+// does not delete its delta file: the merged state is only made durable by the
+// next full save, so a crash or early exit between load and save cannot lose
+// the delta messages. Regression: LoadInWorkingDir used to delete the delta
+// immediately, so the tail of the history existed only in memory until the
+// next persist.
+func TestLoadInWorkingDirKeepsDeltaUntilFullSave(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(true)
+	id := "keep-delta"
+	base := []llm.Message{{Role: "user", Content: "q1"}}
+	if err := store.Save(id, agent.SessionSnapshot{WorkingDir: dir, Messages: base}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendMessages(id, agent.SessionSnapshot{
+		WorkingDir: dir,
+		Messages:   []llm.Message{{Role: "assistant", Content: "a1"}},
+	}, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	// The delta records the snapshot message count it extends (baseCount).
+	dpath := filepath.Join(dir, ".gogen", "sessions", id+".delta")
+	data, err := os.ReadFile(dpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var df deltaFile
+	if err := json.Unmarshal(data, &df); err != nil {
+		t.Fatal(err)
+	}
+	if df.BaseCount != 1 {
+		t.Fatalf("expected baseCount 1, got %d", df.BaseCount)
+	}
+
+	loaded, err := store.LoadInWorkingDir(dir, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Messages) != 2 {
+		t.Fatalf("expected 2 messages after merge, got %d", len(loaded.Messages))
+	}
+	// The delta must still exist after load.
+	if _, err := os.Stat(dpath); err != nil {
+		t.Fatalf("delta file should survive a load: %v", err)
+	}
+	// Loading again must be idempotent (no double-merge).
+	again, err := store.LoadInWorkingDir(dir, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again.Messages) != 2 {
+		t.Fatalf("second load must not double-merge: got %d messages", len(again.Messages))
+	}
+	// A full save supersedes the delta and removes it.
+	full := []llm.Message{{Role: "user", Content: "q1"}, {Role: "assistant", Content: "a1"}}
+	if err := store.Save(id, agent.SessionSnapshot{WorkingDir: dir, Messages: full}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dpath); !os.IsNotExist(err) {
+		t.Fatalf("full save should remove the delta, err=%v", err)
+	}
+	loaded, err = store.LoadInWorkingDir(dir, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Messages) != 2 {
+		t.Fatalf("expected 2 messages after full save, got %d", len(loaded.Messages))
+	}
+}
+
+// TestLoadSkipsStaleDeltaWhenSnapshotAlreadyContainsIt simulates the crash
+// window between a full snapshot write and the delta removal: the snapshot
+// already contains the delta's messages, so loading must not merge them
+// again (which would duplicate history).
+func TestLoadSkipsStaleDeltaWhenSnapshotAlreadyContainsIt(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(true)
+	id := "stale-delta"
+	base := []llm.Message{
+		{Role: "user", Content: "q1"},
+		{Role: "assistant", Content: "a1"},
+	}
+	if err := store.Save(id, agent.SessionSnapshot{WorkingDir: dir, Messages: base}); err != nil {
+		t.Fatal(err)
+	}
+	delta := []llm.Message{
+		{Role: "user", Content: "q2"},
+		{Role: "assistant", Content: "a2"},
+	}
+	if err := store.AppendMessages(id, agent.SessionSnapshot{WorkingDir: dir, Messages: delta}, 4); err != nil {
+		t.Fatal(err)
+	}
+	// Full save: the snapshot now contains all 4 messages and Save removes
+	// the delta. Then simulate the crash window by writing the delta back
+	// (snapshot write succeeded, delta unlink never happened).
+	full := append([]llm.Message{}, base...)
+	full = append(full, delta...)
+	if err := store.Save(id, agent.SessionSnapshot{WorkingDir: dir, Messages: full}); err != nil {
+		t.Fatal(err)
+	}
+	df := deltaFile{Messages: delta, BaseCount: 2}
+	data, err := json.Marshal(df)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dpath := filepath.Join(dir, ".gogen", "sessions", id+".delta")
+	if err := os.WriteFile(dpath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := store.LoadInWorkingDir(dir, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Messages) != 4 {
+		t.Fatalf("expected 4 messages without duplication, got %d", len(loaded.Messages))
+	}
+	// The stale delta is removed so a later load cannot double-merge.
+	if _, err := os.Stat(dpath); !os.IsNotExist(err) {
+		t.Fatalf("stale delta should be removed on load, err=%v", err)
+	}
+}
+
+// TestLoadDropsDeltaWhenSnapshotTruncated verifies that when the snapshot was
+// rewritten with fewer messages than the delta's base (compaction or error
+// rollback), the delta's messages are treated as deliberately dropped rather
+// than merged back into the history.
+func TestLoadDropsDeltaWhenSnapshotTruncated(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(true)
+	id := "truncated-delta"
+	base := []llm.Message{
+		{Role: "user", Content: "q1"},
+		{Role: "assistant", Content: "a1"},
+	}
+	if err := store.Save(id, agent.SessionSnapshot{WorkingDir: dir, Messages: base}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendMessages(id, agent.SessionSnapshot{
+		WorkingDir: dir,
+		Messages: []llm.Message{
+			{Role: "user", Content: "q2"},
+			{Role: "assistant", Content: "a2"},
+		},
+	}, 4); err != nil {
+		t.Fatal(err)
+	}
+	// Truncated re-save (1 message) — simulates a compacted/rolled-back
+	// session whose full save crashed before removing the delta.
+	truncated := []llm.Message{{Role: "user", Content: "q1"}}
+	if err := store.Save(id, agent.SessionSnapshot{WorkingDir: dir, Messages: truncated}); err != nil {
+		t.Fatal(err)
+	}
+	df := deltaFile{
+		Messages: []llm.Message{
+			{Role: "user", Content: "q2"},
+			{Role: "assistant", Content: "a2"},
+		},
+		BaseCount: 2,
+	}
+	data, err := json.Marshal(df)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dpath := filepath.Join(dir, ".gogen", "sessions", id+".delta")
+	if err := os.WriteFile(dpath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := store.LoadInWorkingDir(dir, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Messages) != 1 {
+		t.Fatalf("expected 1 message (delta dropped), got %d", len(loaded.Messages))
+	}
+	if _, err := os.Stat(dpath); !os.IsNotExist(err) {
+		t.Fatalf("stale delta should be removed on load, err=%v", err)
+	}
+}
+
+// TestLegacyDeltaWithoutBaseCountIsMerged verifies backward compatibility:
+// delta files written before the baseCount field (absent → 0) are merged
+// unconditionally, matching the historic behavior.
+func TestLegacyDeltaWithoutBaseCountIsMerged(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(true)
+	id := "legacy-delta"
+	if err := store.Save(id, agent.SessionSnapshot{
+		WorkingDir: dir,
+		Messages:   []llm.Message{{Role: "user", Content: "q1"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dpath := filepath.Join(dir, ".gogen", "sessions", id+".delta")
+	if err := os.WriteFile(dpath, []byte(`{"messages":[{"role":"assistant","content":"a1"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LoadInWorkingDir(dir, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Messages) != 2 {
+		t.Fatalf("expected 2 messages from legacy delta merge, got %d", len(loaded.Messages))
+	}
+}
+
+// TestDeleteRemovesDelta verifies Delete cleans up both the snapshot file and
+// any pending delta for the session.
+func TestDeleteRemovesDelta(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(true)
+	id := "delete-delta"
+	if err := store.Save(id, agent.SessionSnapshot{
+		WorkingDir: dir,
+		Messages:   []llm.Message{{Role: "user", Content: "q1"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendMessages(id, agent.SessionSnapshot{
+		WorkingDir: dir,
+		Messages:   []llm.Message{{Role: "assistant", Content: "a1"}},
+	}, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Delete(dir, id); err != nil {
+		t.Fatal(err)
+	}
+	sessDir := filepath.Join(dir, ".gogen", "sessions")
+	if _, err := os.Stat(filepath.Join(sessDir, id+".json")); !os.IsNotExist(err) {
+		t.Fatalf("expected session file removed, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(sessDir, id+".delta")); !os.IsNotExist(err) {
+		t.Fatalf("expected delta file removed, err=%v", err)
+	}
+}

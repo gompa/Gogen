@@ -86,6 +86,42 @@ func TestGlobFiles(t *testing.T) {
 	}
 }
 
+// TestFilterByTrackedSet verifies the tracked_only filter contract: only paths
+// present in the tracked set survive, and a tree with no tracked matches yields
+// an empty result rather than silently falling back to the unfiltered list.
+func TestFilterByTrackedSet(t *testing.T) {
+	tracked := map[string]struct{}{
+		"a.go":   {},
+		"b/c.go": {},
+	}
+
+	// No tracked files known: empty result, never the original list.
+	if got := filterByTrackedSet([]string{"x.go"}, nil); got != nil {
+		t.Fatalf("empty tracked set: got %v, want nil", got)
+	}
+	if got := filterByTrackedSet(nil, tracked); got != nil {
+		t.Fatalf("empty paths: got %v, want nil", got)
+	}
+
+	// All paths tracked: everything survives.
+	got := filterByTrackedSet([]string{"a.go", "b/c.go"}, tracked)
+	if len(got) != 2 || got[0] != "a.go" || got[1] != "b/c.go" {
+		t.Fatalf("all tracked: got %v, want [a.go b/c.go]", got)
+	}
+
+	// Partial match: only tracked paths survive.
+	got = filterByTrackedSet([]string{"a.go", "untracked.go"}, tracked)
+	if len(got) != 1 || got[0] != "a.go" {
+		t.Fatalf("partial match: got %v, want [a.go]", got)
+	}
+
+	// No match: must return empty, not the unfiltered list (this previously
+	// surfaced ignored/untracked files under tracked_only=true).
+	if got := filterByTrackedSet([]string{"untracked.go", "junk.txt"}, tracked); got != nil {
+		t.Fatalf("no match: got %v, want nil (must not show untracked files)", got)
+	}
+}
+
 func TestReadFiles(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("alpha"), 0o644); err != nil {

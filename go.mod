@@ -11,6 +11,7 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/charmbracelet/x/ansi v0.11.7
+	github.com/creack/pty v1.1.24
 	github.com/ericchiang/css v1.4.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/gortexhq/tree-sitter-dockerfile v0.1.0

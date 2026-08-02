@@ -207,8 +207,105 @@ func TestContextStatsConcurrentWithTurn(t *testing.T) {
 
 	a.statsMu.RLock()
 	defer a.statsMu.RUnlock()
-	if len(a.restoredTokenCounts) != len(a.Messages) {
-		t.Fatalf("restoredTokenCounts len=%d, want %d", len(a.restoredTokenCounts), len(a.Messages))
+	if len(a.tokenCounts) != len(a.Messages) {
+		t.Fatalf("tokenCounts len=%d, want %d", len(a.tokenCounts), len(a.Messages))
+	}
+}
+
+// TestTokenCountsCacheIncremental verifies the per-message token-count cache:
+// appendMessage extends a complete cache, ContextStats backfills an empty or
+// incomplete one, and wholesale replacements (compaction/restore/rollback)
+// clear it so stale counts are never reused.
+func TestTokenCountsCacheIncremental(t *testing.T) {
+	provider := &statsStubProvider{limit: 1000}
+	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{ContextLimit: 1000})
+	a := NewAgent(provider, &Executor{WorkingDir: "."}, ctxMgr)
+
+	// Fresh session: no cache until the first ContextStats backfills it.
+	a.appendMessage(llm.Message{Role: "user", Content: "hello world"})
+	a.statsMu.RLock()
+	if a.tokenCounts != nil {
+		t.Fatalf("expected nil cache before first ContextStats, got %d entries", len(a.tokenCounts))
+	}
+	a.statsMu.RUnlock()
+
+	stats := a.ContextStats(context.Background())
+	if stats.Snapshot.MessageCount != 1 {
+		t.Fatalf("MessageCount=%d, want 1", stats.Snapshot.MessageCount)
+	}
+	a.statsMu.RLock()
+	got := a.tokenCounts
+	a.statsMu.RUnlock()
+	if len(got) != 1 {
+		t.Fatalf("cache not backfilled after ContextStats: len=%d", len(got))
+	}
+	want := contextmgr.ComputeMessageTokens(llm.Message{Role: "user", Content: "hello world"})
+	if got[0] != want {
+		t.Fatalf("cached count=%d, want %d", got[0], want)
+	}
+
+	// Appends extend a complete cache without invalidating earlier entries.
+	a.appendMessage(llm.Message{Role: "assistant", Content: "hi"})
+	a.statsMu.RLock()
+	got = a.tokenCounts
+	a.statsMu.RUnlock()
+	if len(got) != 2 || got[0] != want {
+		t.Fatalf("cache not extended on append: len=%d first=%d", len(got), got[0])
+	}
+
+	// A second ContextStats must be the fast path (cache already complete).
+	if stats := a.ContextStats(context.Background()); stats.Snapshot.MessageCount != 2 {
+		t.Fatalf("MessageCount=%d, want 2", stats.Snapshot.MessageCount)
+	}
+
+	// A wholesale replacement (compaction / fork / reset) clears the cache.
+	a.replaceMessages([]llm.Message{{Role: "user", Content: "fresh"}})
+	a.statsMu.RLock()
+	got = a.tokenCounts
+	a.statsMu.RUnlock()
+	if got != nil {
+		t.Fatalf("expected cache cleared after replaceMessages, got %d entries", len(got))
+	}
+
+	// Rollback (truncateMessages) trims a complete cache to match.
+	a.appendMessage(llm.Message{Role: "user", Content: "q"})
+	a.appendMessage(llm.Message{Role: "assistant", Content: "a"})
+	_ = a.ContextStats(context.Background()) // backfill
+	a.truncateMessages(1)
+	a.statsMu.RLock()
+	got = a.tokenCounts
+	n := len(a.Messages)
+	a.statsMu.RUnlock()
+	if len(got) != n {
+		t.Fatalf("cache not trimmed after rollback: len=%d, messages=%d", len(got), n)
+	}
+}
+
+// TestShouldCompactUsingCountsMatchesDirect verifies the cached-count
+// compaction decision agrees with the full EstimateTokens pass.
+func TestShouldCompactUsingCountsMatchesDirect(t *testing.T) {
+	provider := &statsStubProvider{limit: 1000}
+	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{
+		ContextLimit:       1000,
+		KeepRecentMessages: 2,
+	})
+	a := NewAgent(provider, &Executor{WorkingDir: "."}, ctxMgr)
+
+	// Enough messages to exceed KeepRecentMessages+1.
+	for i := 0; i < 12; i++ {
+		a.appendMessage(llm.Message{Role: "user", Content: strings.Repeat("x", 400)})
+		a.appendMessage(llm.Message{Role: "assistant", Content: strings.Repeat("y", 400)})
+	}
+
+	// Without a cache the helper must fall back to the direct computation.
+	if got, want := a.shouldCompactUsingCounts(), a.Context.ShouldCompact(a.Messages); got != want {
+		t.Fatalf("fallback decision=%v, want %v", got, want)
+	}
+
+	// Once ContextStats fills the cache, the decisions must still agree.
+	_ = a.ContextStats(context.Background())
+	if got, want := a.shouldCompactUsingCounts(), a.Context.ShouldCompact(a.Messages); got != want {
+		t.Fatalf("cached decision=%v, want %v", got, want)
 	}
 }
 

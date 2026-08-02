@@ -37,7 +37,7 @@ type Agent struct {
 
 	// statsMu serializes the agent state that ContextStats/SnapshotMessages
 	// read without agentMu or turnMu: Messages, the cached token counts
-	// (restoredTokenCounts), the API-usage baseline (lastTurnUsage,
+	// (tokenCounts), the API-usage baseline (lastTurnUsage,
 	// apiBaseline*), projectProfile, UsageAccum, and SessionLabel. Every
 	// mutation of these fields from any goroutine must take statsMu. Leaf
 	// lock: while holding it, never call out to code that takes turnMu or
@@ -71,11 +71,20 @@ type Agent struct {
 	DebugCompareMessages bool
 	lastViewMessages     []llm.Message // debug builds only; unused in release
 
-	// restoredTokenCounts holds pre-computed token counts from a restored
-	// session snapshot. When non-nil and len matches a.Messages, ContextStats
-	// uses these counts instead of re-tokenizing every message, which is
-	// expensive for large sessions. Cleared when messages are modified.
-	restoredTokenCounts []int
+	// tokenCounts caches per-message token estimates aligned 1:1 with
+	// Messages[0:len(tokenCounts)] (a prefix). When len(tokenCounts) ==
+	// len(Messages) every message has a cached count and ContextStats /
+	// ShouldCompact can avoid re-tokenizing the whole conversation. The cache
+	// is filled incrementally: appendMessage extends a complete cache, and
+	// ContextStats / doPersist backfill the missing suffix on demand. It is
+	// cleared (nil) whenever the message list is replaced wholesale
+	// (compaction, restore, fork, reset, rollback).
+	//
+	// countsEpoch is bumped on every wholesale message-list change so a
+	// concurrent ContextStats that computed counts for an older snapshot can
+	// detect the list moved under it and skip publishing stale counts.
+	tokenCounts []int
+	countsEpoch uint64
 
 	// ThinkingLevel controls how much reasoning/thinking the model should use.
 	// When "off", no thinking parameter is sent to the API.
@@ -238,6 +247,7 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 	a.statsMu.RLock()
 	msgs := cloneMessages(a.Messages)
 	label := a.SessionLabel
+	countsEpoch := a.countsEpoch
 	a.statsMu.RUnlock()
 	count := len(msgs)
 	profile := a.ensureProjectProfile()
@@ -268,15 +278,23 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 			Messages:       msgs,
 			ContextLimit:   a.ContextLimit(),
 		}
-		// Snapshot the restored counts under the stats lock: a concurrent
+		// Snapshot the cached counts under the stats lock: a concurrent
 		// ContextStats/turn may extend them while doPersist runs.
 		a.statsMu.RLock()
-		tokenCounts := append([]int(nil), a.restoredTokenCounts...)
+		tokenCounts := append([]int(nil), a.tokenCounts...)
 		a.statsMu.RUnlock()
 		if len(tokenCounts) == len(msgs) {
 			snap.TokenCounts = tokenCounts
 		} else if a.Context != nil && !skipTokenCounts {
 			snap.TokenCounts = a.Context.TokenCounts(msgs)
+			// Backfill the in-memory cache so the next save or context probe
+			// reuses these counts instead of re-tokenizing. The epoch guard
+			// drops the result if the message list changed underneath us.
+			a.statsMu.Lock()
+			if a.countsEpoch == countsEpoch && len(a.tokenCounts) < len(msgs) {
+				a.tokenCounts = append(a.tokenCounts, snap.TokenCounts[len(a.tokenCounts):]...)
+			}
+			a.statsMu.Unlock()
 		}
 		if err := a.SessionStore.Save(a.SessionID, snap); err != nil {
 			log.Printf("session save failed (id=%s): %v", a.SessionID, err)
@@ -331,17 +349,18 @@ func (a *Agent) resetSaveTracking() {
 	a.lastFullSaveTime = time.Time{}
 }
 
-// appendMessage appends one message to the conversation and, when restored
-// token counts are cached, extends them in the same critical section so the
-// message list and the counts cache stay consistent for concurrent readers.
-// This is the only way Messages grows during a turn. Thread-safe: ContextStats
-// and SnapshotMessages snapshot Messages + counts under statsMu while the
-// turn goroutine appends. Leaf lock: never acquire turnMu/agentMu under it.
+// appendMessage appends one message to the conversation and, when the token
+// count cache is complete (covers every previous message), extends it in the
+// same critical section so the message list and the counts cache stay
+// consistent for concurrent readers. This is the only way Messages grows
+// during a turn. Thread-safe: ContextStats and SnapshotMessages snapshot
+// Messages + counts under statsMu while the turn goroutine appends. Leaf
+// lock: never acquire turnMu/agentMu under it.
 func (a *Agent) appendMessage(m llm.Message) {
 	a.statsMu.Lock()
 	a.Messages = append(a.Messages, m)
-	if a.restoredTokenCounts != nil {
-		a.restoredTokenCounts = append(a.restoredTokenCounts,
+	if a.tokenCounts != nil && len(a.tokenCounts) == len(a.Messages)-1 {
+		a.tokenCounts = append(a.tokenCounts,
 			contextmgr.ComputeMessageTokens(m))
 	}
 	a.statsMu.Unlock()
@@ -354,7 +373,8 @@ func (a *Agent) appendMessage(m llm.Message) {
 func (a *Agent) replaceMessages(msgs []llm.Message) {
 	a.statsMu.Lock()
 	a.Messages = msgs
-	a.restoredTokenCounts = nil
+	a.tokenCounts = nil
+	a.countsEpoch++
 	a.statsMu.Unlock()
 }
 
@@ -366,7 +386,8 @@ func (a *Agent) replaceMessages(msgs []llm.Message) {
 func (a *Agent) restoreMessages(msgs []llm.Message, counts []int) {
 	a.statsMu.Lock()
 	a.Messages = msgs
-	a.restoredTokenCounts = counts
+	a.tokenCounts = counts
+	a.countsEpoch++
 	for i := range a.Messages {
 		a.Messages[i].ArgsStabilized = true
 	}
@@ -379,9 +400,10 @@ func (a *Agent) restoreMessages(msgs []llm.Message, counts []int) {
 func (a *Agent) truncateMessages(n int) {
 	a.statsMu.Lock()
 	a.Messages = a.Messages[:len(a.Messages)-n]
-	if a.restoredTokenCounts != nil && len(a.restoredTokenCounts) > len(a.Messages) {
-		a.restoredTokenCounts = a.restoredTokenCounts[:len(a.Messages)]
+	if a.tokenCounts != nil && len(a.tokenCounts) > len(a.Messages) {
+		a.tokenCounts = a.tokenCounts[:len(a.Messages)]
 	}
+	a.countsEpoch++
 	a.statsMu.Unlock()
 }
 
@@ -446,21 +468,48 @@ func (a *Agent) ensureProjectProfile() string {
 	return p
 }
 
-// extendTokenCounts extends restoredTokenCounts to cover any messages
-// appended since the last restore or extension. With appendMessage maintaining
-// the counts inline this is normally a no-op; it is kept as a safety net for
-// doPersist so a full snapshot can reuse the fast counts path.
+// extendTokenCounts extends tokenCounts to cover any messages appended since
+// the last extension. With appendMessage maintaining the counts inline this is
+// normally a no-op; it is kept as a safety net for doPersist so a full
+// snapshot can reuse the fast counts path.
 func (a *Agent) extendTokenCounts() {
 	a.statsMu.Lock()
 	defer a.statsMu.Unlock()
-	if a.restoredTokenCounts == nil {
+	if a.tokenCounts == nil {
 		return
 	}
-	for len(a.restoredTokenCounts) < len(a.Messages) {
-		idx := len(a.restoredTokenCounts)
-		a.restoredTokenCounts = append(a.restoredTokenCounts,
+	for len(a.tokenCounts) < len(a.Messages) {
+		idx := len(a.tokenCounts)
+		a.tokenCounts = append(a.tokenCounts,
 			contextmgr.ComputeMessageTokens(a.Messages[idx]))
 	}
+}
+
+// shouldCompactUsingCounts reports whether auto-compaction should trigger,
+// summing the cached per-message token counts when they are complete to avoid
+// re-tokenizing the whole conversation on every turn. Falls back to
+// Manager.ShouldCompact (a full EstimateTokens pass) when the cache is empty
+// or incomplete (e.g. right after a compaction or session restore).
+func (a *Agent) shouldCompactUsingCounts() bool {
+	if a.Context == nil {
+		return false
+	}
+	a.statsMu.RLock()
+	counts := a.tokenCounts
+	msgs := a.Messages
+	complete := counts != nil && len(counts) == len(msgs)
+	a.statsMu.RUnlock()
+	if !complete {
+		return a.Context.ShouldCompact(msgs)
+	}
+	if len(msgs) <= a.Context.KeepRecentMessages()+1 {
+		return false
+	}
+	total := 0
+	for _, c := range counts {
+		total += c
+	}
+	return total >= a.Context.CompactBudget()
 }
 
 // ConsumePersistError returns and clears the last session save failure, if any.
@@ -570,7 +619,7 @@ func (a *Agent) prepareMessages(ctx context.Context) []llm.Message {
 		// mid-tool-loop can drop assistant tool-call messages
 		// whose results are still pending, confusing the LLM.
 		if len(a.Messages) > 0 && a.Messages[len(a.Messages)-1].Role == "user" {
-			if a.Context.ShouldCompact(a.Messages) {
+			if a.shouldCompactUsingCounts() {
 				var pinned map[int]struct{}
 				if a.PinManager != nil {
 					pinned = a.PinManager.PinnedSet()
@@ -592,7 +641,12 @@ func (a *Agent) prepareMessages(ctx context.Context) []llm.Message {
 		// EnsureToolResultsCapped rewrites oversized tool bodies in place on
 		// the live message array; exclude concurrent ContextStats clones.
 		a.statsMu.Lock()
-		a.Context.EnsureToolResultsCapped(a.Messages)
+		if a.Context.EnsureToolResultsCapped(a.Messages) {
+			// Tool bodies were rewritten in place, so cached counts for the
+			// affected messages are stale. Drop the cache; it is rebuilt on
+			// the next ContextStats/save.
+			a.tokenCounts = nil
+		}
 		a.statsMu.Unlock()
 		view = a.Messages
 	}
@@ -794,7 +848,17 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 				h.OnToolExecute(tc.Name)
 			}
 
-			res, errTool := a.executeTool(ctx, tc)
+			// Attach the live-output sink (if any) to this tool call's
+			// context so shell tools can stream chunks to the UI as the
+			// command runs. The sink is per-tool so each command gets its
+			// own identity (id/name) in the handler.
+			toolCtx := ctx
+			if h.OnToolOutput != nil {
+				toolCtx = ContextWithToolOutput(ctx, func(command, chunk string) {
+					h.OnToolOutput(tc.ID, tc.Name, command, chunk)
+				})
+			}
+			res, errTool := a.executeTool(toolCtx, tc)
 			if ctx.Err() != nil {
 				if errTool == nil {
 					res = "The operation was cancelled by the user."

@@ -233,7 +233,7 @@ func filterByTrackedSet(paths []string, tracked map[string]struct{}) []string {
 		}
 	}
 	if len(filtered) == 0 {
-		return paths
+		return nil
 	}
 	return filtered
 }

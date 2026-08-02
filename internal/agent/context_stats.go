@@ -82,7 +82,8 @@ func (a *Agent) ContextStats(ctx context.Context) TurnContext {
 	// tokenization cannot race in-place stabilization on the live array.
 	a.statsMu.RLock()
 	msgs := cloneMessages(a.Messages)
-	counts := append([]int(nil), a.restoredTokenCounts...)
+	counts := append([]int(nil), a.tokenCounts...)
+	countsEpoch := a.countsEpoch
 	lastUsage := a.lastTurnUsage
 	baselinePromptTokens, baselineMsgCount := a.apiBaselinePromptTokens, a.apiBaselineMsgCount
 	projectProfile := a.projectProfile
@@ -97,24 +98,44 @@ func (a *Agent) ContextStats(ctx context.Context) TurnContext {
 
 	var snap contextmgr.ContextSnapshot
 	if a.Context != nil {
-		// Use pre-computed token counts from a restored session snapshot to
-		// avoid re-tokenizing every message (expensive for large sessions).
-		// When counts are available but shorter than msgs (messages appended
-		// since restore), compute counts for only the missing messages locally
-		// so we still get the fast SnapshotWithCounts path without mutating
-		// shared state (ContextStats runs without agentMu).
-		if counts != nil && len(counts) < len(msgs) {
+		switch {
+		case counts == nil:
+			// No cached counts (fresh session, or a compaction/restore just
+			// cleared them): compute them once for this snapshot, then publish
+			// the result so subsequent probes skip re-tokenization entirely.
+			// The computed counts stay valid for the cloned snapshot even if
+			// the live list changes before the store; the epoch guard keeps
+			// stale counts from ever being published.
+			counts = make([]int, len(msgs))
+			for i := range msgs {
+				counts[i] = contextmgr.ComputeMessageTokens(msgs[i])
+			}
+			snap = a.Context.SnapshotWithCounts(msgs, view, counts)
+			a.statsMu.Lock()
+			if a.countsEpoch == countsEpoch && len(a.tokenCounts) < len(msgs) {
+				a.tokenCounts = append(a.tokenCounts, counts[len(a.tokenCounts):]...)
+			}
+			a.statsMu.Unlock()
+		case len(counts) < len(msgs):
+			// The cache is a valid prefix but messages were appended since it
+			// was last extended (ContextStats can race a burst of appends).
+			// Compute counts for only the missing suffix locally and publish
+			// the extension under the epoch guard.
 			extended := make([]int, len(msgs))
 			copy(extended, counts)
 			for i := len(counts); i < len(msgs); i++ {
 				extended[i] = contextmgr.ComputeMessageTokens(msgs[i])
 			}
 			counts = extended
-		}
-		if len(counts) == len(msgs) {
 			snap = a.Context.SnapshotWithCounts(msgs, view, counts)
-		} else {
-			snap = a.Context.Snapshot(msgs, view)
+			a.statsMu.Lock()
+			if a.countsEpoch == countsEpoch && len(a.tokenCounts) < len(msgs) {
+				a.tokenCounts = append(a.tokenCounts, counts[len(a.tokenCounts):]...)
+			}
+			a.statsMu.Unlock()
+		default:
+			// Complete cache: the fast path — no tokenization at all.
+			snap = a.Context.SnapshotWithCounts(msgs, view, counts)
 		}
 	} else {
 		snap = contextmgr.ContextSnapshot{

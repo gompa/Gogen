@@ -133,6 +133,24 @@ func (m *Manager) ContextLimit() int {
 	return m.Settings.ContextLimit
 }
 
+// CompactBudget returns the token budget at which auto-compaction triggers
+// (CompactThreshold fraction of the context limit, minus the reserve). The
+// caller can compare a cached token total against this to avoid re-tokenizing
+// the whole conversation.
+func (m *Manager) CompactBudget() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.compactBudgetLocked()
+}
+
+// KeepRecentMessages returns how many recent messages are preserved during
+// compaction.
+func (m *Manager) KeepRecentMessages() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.Settings.KeepRecentMessages
+}
+
 // SetContextLimit sets the context window size directly, bypassing provider
 // resolution. Used when restoring a session snapshot so the limit is available
 // synchronously before the async provider refresh completes.

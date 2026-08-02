@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -147,5 +148,93 @@ func TestExecuteCommandUnknownSandboxErrors(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "unknown command_sandbox") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestExecuteCommandStreamsOutputToSink(t *testing.T) {
+	dir := t.TempDir()
+	exec := NewExecutor(dir)
+
+	var mu sync.Mutex
+	var gotCmd string
+	var chunks []string
+	sink := func(command, chunk string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if gotCmd == "" {
+			gotCmd = command
+		}
+		chunks = append(chunks, chunk)
+	}
+
+	out, err := exec.ExecuteCommand(
+		ContextWithToolOutput(context.Background(), sink),
+		"printf 'one\\ntwo\\n' && echo err >&2",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	joined := strings.Join(chunks, "")
+	cmd := gotCmd
+	mu.Unlock()
+
+	if cmd != "printf 'one\\ntwo\\n' && echo err >&2" {
+		t.Fatalf("sink received wrong command: %q", cmd)
+	}
+	// Chunk boundaries are pipe-dependent, but the concatenation must be
+	// byte-identical to the returned (accumulated) output, and both stdout
+	// and stderr must be present.
+	if joined != out {
+		t.Fatalf("sink output %q != returned output %q", joined, out)
+	}
+	if !strings.Contains(joined, "one\ntwo") || !strings.Contains(joined, "err") {
+		t.Fatalf("sink output missing stdout/stderr content: %q", joined)
+	}
+}
+
+func TestExecuteCommandSinkReceivesPartialOutputOnTimeout(t *testing.T) {
+	dir := t.TempDir()
+	exec := NewExecutor(dir)
+
+	var mu sync.Mutex
+	joined := ""
+	sink := func(_ string, chunk string) {
+		mu.Lock()
+		joined += chunk
+		mu.Unlock()
+	}
+	ctx, cancel := context.WithTimeout(
+		ContextWithToolOutput(context.Background(), sink),
+		50*time.Millisecond,
+	)
+	defer cancel()
+
+	out, err := exec.ExecuteCommand(ctx, "echo partial && sleep 2")
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	mu.Lock()
+	sinkOut := joined
+	mu.Unlock()
+	if !strings.Contains(out, "partial") || !strings.Contains(sinkOut, "partial") {
+		t.Fatalf("expected partial output in both return and sink; out=%q sink=%q", out, sinkOut)
+	}
+}
+
+func TestExecuteCommandNoSinkMatchesReturnedOutput(t *testing.T) {
+	dir := t.TempDir()
+	exec := NewExecutor(dir)
+
+	out, err := exec.ExecuteCommand(context.Background(), "printf 'x\\ny\\n' && echo z >&2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "x\ny\nz\n" {
+		t.Fatalf("unexpected output: %q", out)
 	}
 }

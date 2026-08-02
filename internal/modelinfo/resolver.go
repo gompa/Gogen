@@ -177,7 +177,6 @@ func (r *Resolver) load() error {
 // existing data untouched and apply failBackoff before the next attempt.
 func (r *Resolver) refreshAsync() {
 	r.mu.Lock()
-	r.lastFail = time.Time{} // allow immediate retry (reset is atomic with the check below)
 	if r.refreshing {
 		r.mu.Unlock()
 		return
@@ -186,10 +185,13 @@ func (r *Resolver) refreshAsync() {
 		r.mu.Unlock()
 		return
 	}
-	if r.data == nil && !r.lastFail.IsZero() && time.Since(r.lastFail) < failBackoff {
+	// Respect the fail-backoff window after a failed fetch so a dead endpoint
+	// is not re-probed on every lookup (data present but stale included).
+	if !r.lastFail.IsZero() && time.Since(r.lastFail) < failBackoff {
 		r.mu.Unlock()
 		return
 	}
+	r.lastFail = time.Time{}
 	r.refreshing = true
 	r.mu.Unlock()
 
