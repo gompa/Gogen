@@ -196,7 +196,7 @@ func TestSaveConfigOutputShape(t *testing.T) {
 		"openai_model: gpt-4o",
 		"openai_base_url:",
 		"working_dir: /home/user/proj",
-		"compact_threshold: 0.75",
+		"compact_threshold: 0.85",
 		"mcp_servers:",
 		"  - name: fetch",
 		"    command: npx",

@@ -247,6 +247,10 @@
             border-top-color: var(--success);
             animation-duration: 1s;
         }
+        #input-progress .progress-spinner.compacting {
+            border-top-color: var(--warn);
+            animation-duration: 1.2s;
+        }
         @keyframes input-spin {
             to { transform: rotate(360deg); }
         }
@@ -1263,6 +1267,26 @@
             text-overflow: ellipsis;
             white-space: nowrap;
         }
+        #editor-toolbar .toolbar-icon-btn {
+            padding: 5px 9px;
+            min-width: 28px;
+        }
+        #editor-statusbar {
+            display: flex;
+            gap: 14px;
+            align-items: center;
+            padding: 3px 10px;
+            border-top: 1px solid var(--border);
+            background: var(--bg-elevated);
+            font-family: var(--mono);
+            font-size: 0.75em;
+            color: var(--fg-muted);
+            flex-shrink: 0;
+            min-height: 20px;
+            user-select: none;
+        }
+        #editor-statusbar .status-problems-error { color: #f85149; }
+        #editor-statusbar .status-problems-warn { color: #d29922; }
         #editor-tabs {
             display: flex;
             gap: 1px;
@@ -1306,6 +1330,30 @@
         }
         .file-tab-close:hover { color: var(--fg); }
         #monaco-wrap { flex: 1; position: relative; min-height: 0; background: var(--bg); }
+        .file-tab-badge {
+            font-size: 0.7em;
+            line-height: 1;
+            padding: 1px 5px;
+            border-radius: 8px;
+            background: var(--bg-input);
+            color: var(--fg-muted);
+            font-family: var(--mono);
+        }
+        .file-tab-badge.has-errors { background: #f8514922; color: #f85149; }
+        .file-tab-badge.has-warnings { background: #d2992222; color: #d29922; }
+        .gogen-ref-highlight {
+            background: var(--accent-soft, rgba(86, 156, 214, 0.18));
+            box-shadow: inset 2px 0 0 var(--accent);
+        }
+        .gogen-ref-highlight-gutter {
+            border-left: 2px solid var(--accent);
+        }
+        .file-ref {
+            color: var(--accent);
+            cursor: pointer;
+            border-bottom: 1px dotted var(--accent);
+        }
+        .file-ref:hover { text-decoration: none; background: var(--bg-hover); }
         #monaco-host, #monaco-diff-host { position: absolute; inset: 0; }
         #monaco-diff-host { display: none; }
         .thought-card {
@@ -1329,6 +1377,25 @@
             color: var(--accent);
         }
         .btn-link:hover { background: var(--bg-hover); }
+        .patch-apply-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 12px 8px;
+            font-size: 0.8em;
+        }
+        .patch-apply-btn {
+            padding: 4px 12px;
+            font-size: 0.8em;
+            cursor: pointer;
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--accent);
+            border-radius: 3px;
+        }
+        .patch-apply-btn:hover:not(:disabled) { background: var(--bg-hover); }
+        .patch-apply-btn:disabled { opacity: 0.5; cursor: default; }
+        .patch-apply-status { color: var(--fg-muted); }
         #btn-refresh-explorer {
             float: right;
             padding: 2px 8px;
@@ -1550,6 +1617,69 @@
         #settings-dialog .settings-btn-secondary:hover {
             color: var(--fg);
             background: var(--bg-hover);
+        }
+        #keybindings-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.45);
+            z-index: 1500;
+            align-items: center;
+            justify-content: center;
+        }
+        #keybindings-overlay.active { display: flex; }
+        #keybindings-dialog {
+            background: var(--bg-elevated);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 20px;
+            max-width: 480px;
+            width: 92%;
+            max-height: 80vh;
+            overflow-y: auto;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.45);
+            color: var(--fg);
+        }
+        #keybindings-close-btn {
+            background: transparent;
+            border: none;
+            color: var(--fg-muted);
+            font-size: 1em;
+            padding: 2px 8px;
+            border-radius: 3px;
+        }
+        #keybindings-close-btn:hover { color: var(--fg); background: var(--bg-hover); }
+        .keybindings-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.85em;
+        }
+        .keybindings-table th {
+            text-align: left;
+            font-size: 0.75em;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: var(--fg-muted);
+            padding: 4px 8px 8px 0;
+            border-bottom: 1px solid var(--border);
+        }
+        .keybindings-table td {
+            padding: 6px 8px 6px 0;
+            border-bottom: 1px solid var(--border);
+            vertical-align: top;
+        }
+        .keybindings-table kbd {
+            font-family: var(--mono);
+            font-size: 0.85em;
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            padding: 1px 5px;
+        }
+        .keybindings-note {
+            font-size: 0.8em;
+            color: var(--fg-muted);
+            margin: 12px 0 0;
         }
         :root.light {
             --bg: #ffffff;

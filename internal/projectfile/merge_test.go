@@ -108,7 +108,7 @@ func TestMergePreservesExplicitZeros(t *testing.T) {
 
 	pfAbsent := &ProjectFile{Config: FileConfig{}}
 	cfgAbsent := Merge(pfAbsent, FlagOverrides{})
-	if cfgAbsent.CompactThreshold != 0.75 || cfgAbsent.KeepRecentMessages != 12 || cfgAbsent.MaxToolResultBytes != 262144 || cfgAbsent.CompactReserveTokens != 4000 {
+	if cfgAbsent.CompactThreshold != 0.85 || cfgAbsent.KeepRecentMessages != 12 || cfgAbsent.MaxToolResultBytes != 262144 || cfgAbsent.CompactReserveTokens != 4000 {
 		t.Fatalf("absent keys should fall back to defaults: threshold=%v keep=%d max=%d reserve=%d",
 			cfgAbsent.CompactThreshold, cfgAbsent.KeepRecentMessages, cfgAbsent.MaxToolResultBytes, cfgAbsent.CompactReserveTokens)
 	}

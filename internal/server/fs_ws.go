@@ -72,12 +72,9 @@ func (s *Server) handleFSWriteMessage(ws *wsConn, ctx context.Context, msg WSMes
 	reqID := msg.RequestID
 	path := msg.Path
 	if !s.tryAcquireTurn(wsTurnAcquireWait) {
+		// Result type follows the request convention ("fs_<op>_result"), so
+		// new write message types get correct busy responses automatically.
 		resp := WSMessage{Type: msg.Type + "_result", Path: path, RequestID: reqID, Pattern: msg.Pattern}
-		if msg.Type == "fs_write" {
-			resp.Type = "fs_write_result"
-		} else if msg.Type == "fs_replace" {
-			resp.Type = "fs_replace_result"
-		}
 		resp.Error = "agent is busy with another client"
 		_ = ws.writeJSON(resp)
 		return
@@ -102,6 +99,23 @@ func (s *Server) handleFSWriteMessage(ws *wsConn, ctx context.Context, msg WSMes
 			resp.Success = true
 			resp.Replaced = replaced
 			resp.FileCount = fileCount
+		}
+		_ = ws.writeJSON(resp)
+	case "fs_apply_patch":
+		// Applies a unified diff to files under the working directory using
+		// the agent's patch engine (exact-context match, no fuzzy relocation).
+		// Delete-only patches require approval and are rejected here; use the
+		// agent for those.
+		report, err := s.agent.Executor.PatchFile(ctx, msg.Diff, false, false)
+		resp := WSMessage{Type: "fs_apply_patch_result", RequestID: reqID}
+		if err != nil {
+			resp.Error = err.Error()
+			if report != "" {
+				resp.Result = report
+			}
+		} else {
+			resp.Success = true
+			resp.Result = report
 		}
 		_ = ws.writeJSON(resp)
 	}

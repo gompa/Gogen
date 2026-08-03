@@ -333,11 +333,12 @@ func TestCompactHistoryClearsLastTurnUsage(t *testing.T) {
 		KeepRecentMessages: 2,
 	})
 	a := NewAgent(provider, &Executor{WorkingDir: "."}, ctxMgr)
-	// Enough messages to exceed KeepRecentMessages+1 for compaction.
+	// Enough messages to exceed KeepRecentMessages+1 for compaction, sized so
+	// the summarized middle clears the minimum-middle guard.
 	for i := 0; i < 6; i++ {
 		a.Messages = append(a.Messages,
-			llm.Message{Role: "user", Content: "q " + strconv.Itoa(i)},
-			llm.Message{Role: "assistant", Content: "a " + strconv.Itoa(i)},
+			llm.Message{Role: "user", Content: "q " + strconv.Itoa(i) + " " + strings.Repeat("x", 300)},
+			llm.Message{Role: "assistant", Content: "a " + strconv.Itoa(i) + " " + strings.Repeat("y", 300)},
 		)
 	}
 	a.recordTurnUsage(&llm.Usage{PromptTokens: 900, CompletionTokens: 50, TotalTokens: 950})

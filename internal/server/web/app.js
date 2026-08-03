@@ -21,6 +21,8 @@
             saveActive,
             openFileAtLine,
             setMonacoTheme,
+            applyEditorPrefs,
+            applyPatchFromDiff,
             openModal,
             closeModal,
         } from '/editor.js';
@@ -559,9 +561,10 @@
         }
 
         // ── Near-compact banner ──
-        // The server flags nearCompact once usage is about to trigger context
-        // compaction; surface an actionable one-liner instead of only a
-        // warning-colored badge. Dismissed state resets on session change.
+        // The server flags warnNearCompact once usage reaches 75% of the
+        // window — before the auto-compaction trigger (nearCompact) — so the
+        // user gets lead time to compact manually. Dismissed state resets on
+        // session change.
         let nearCompactDismissed = false;
 
         function updateNearCompactBanner(nearCompact) {
@@ -569,13 +572,27 @@
             nearCompactBanner.hidden = nearCompactDismissed || !nearCompact;
         }
 
-        ncbCompactBtn?.addEventListener('click', () => {
+        // True while a compact command is in flight (server-side summarization
+        // can take a while); drives the persistent "Compacting context…"
+        // indicator and gates duplicate clicks. Cleared when the compact
+        // response arrives or on disconnect.
+        let compacting = false;
+
+        function startCompact() {
             if (!ws || ws.readyState !== WebSocket.OPEN) {
                 showToast('Not connected', 'error');
                 return;
             }
-            ws.send(JSON.stringify({ type: 'message', content: '/compact' }));
-            showToast('Compacting context…', 'info');
+            if (compacting) return;
+            compacting = true;
+            ws.send(JSON.stringify({ type: 'compact' }));
+            // Persistent progress, not a 3s toast: it stays until the server
+            // reports the compact result (see the 'response' handler).
+            setInputProgress('compacting', 'Compacting context…');
+        }
+
+        ncbCompactBtn?.addEventListener('click', () => {
+            startCompact();
         });
 
         ncbDismissBtn?.addEventListener('click', () => {
@@ -585,7 +602,10 @@
 
         function updateContextInfo(data) {
             lastContextData = data || lastContextData;
-            if (typeof data.nearCompact === 'boolean') updateNearCompactBanner(data.nearCompact);
+            // warnNearCompact drives the banner (early warning); the server
+            // always sends it explicitly, false included, so a post-compaction
+            // message reliably hides a banner that was previously shown.
+            if (typeof data.warnNearCompact === 'boolean') updateNearCompactBanner(data.warnNearCompact);
             const used = data.usedTokens || 0;
             const limit = data.contextLimit || 0;
             if (data.usedSource !== 'estimated') {
@@ -1064,7 +1084,58 @@
             textWrap.innerHTML = renderMarkdownHTML(text);
             messageRawStore.set(el, text);
             enhanceCodeBlocksWithCopy(textWrap);
+            linkifyMessageRefs(textWrap);
             colorizeCodeBlocks(textWrap);
+        }
+
+        /**
+         * Make `@path:line` (and `@path:start-end`) references in rendered
+         * assistant messages clickable. Code blocks, links and already-wrapped
+         * nodes are skipped. Clicking opens the file in the editor, reveals the
+         * line and highlights the range (matches the "Add Reference to Chat"
+         * context-menu format).
+         */
+        function linkifyMessageRefs(root) {
+            if (!root || !root.querySelectorAll) return;
+            const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+            const candidates = [];
+            while (walker.nextNode()) {
+                const n = walker.currentNode;
+                if (!n.nodeValue || !n.nodeValue.includes('@')) continue;
+                const pe = n.parentElement;
+                if (pe && pe.closest('pre, code, a')) continue;
+                candidates.push(n);
+            }
+            const re = /(^|\s)@([\w./\\~-]+):(\d+)(?:-(\d+))?/g;
+            for (const node of candidates) {
+                const text = node.nodeValue;
+                const frag = document.createDocumentFragment();
+                let last = 0;
+                let changed = false;
+                let m;
+                re.lastIndex = 0;
+                while ((m = re.exec(text))) {
+                    changed = true;
+                    if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+                    const path = m[2];
+                    const start = parseInt(m[3], 10);
+                    const end = m[4] ? parseInt(m[4], 10) : start;
+                    const span = document.createElement('span');
+                    span.className = 'file-ref';
+                    span.textContent = m[1] + '@' + path + ':' + m[3] + (m[4] ? '-' + m[4] : '');
+                    span.title = `Open ${path}:${start} in editor`;
+                    span.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        openFileAtLine(path, start, end).catch(() => {});
+                    });
+                    frag.appendChild(span);
+                    last = m.index + m[0].length;
+                }
+                if (changed) {
+                    if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+                    node.parentNode.replaceChild(frag, node);
+                }
+            }
         }
 
         // ===== Incremental streaming render =====
@@ -1925,6 +1996,7 @@
                 else cardInfo.card.appendChild(host);
             }
             updateDiffFallback(cardInfo.monacoHost, cardInfo.pendingDiff || '');
+            ensurePatchApplyRow(cardInfo);
 
             if (diffViewerMode() === 'tokenizer') {
                 // Static path: the fallback <pre> IS the viewer (line-numbered
@@ -1958,6 +2030,65 @@
                     cardInfo.monacoMounting = null;
                 });
             await cardInfo.monacoMounting;
+        }
+
+        /**
+         * Add an "Apply patch" button to a patch_file tool card. It re-sends
+         * the displayed diff to the server's patch engine (exact match), which
+         * is useful when the agent ran a dry-run or the apply failed. When the
+         * patch is already applied, the server reports the context mismatch.
+         */
+        function ensurePatchApplyRow(cardInfo) {
+            if (!cardInfo || cardInfo.applyRow || !cardInfo.card) return;
+            // Only patch_file cards carry a diff that makes sense to re-apply;
+            // show_diff cards display the current unstaged diff, which is
+            // already in the working tree (re-applying would always fail).
+            if (cardInfo.toolName !== 'patch_file') return;
+            const row = document.createElement('div');
+            row.className = 'patch-apply-row';
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'patch-apply-btn';
+            btn.textContent = 'Apply patch';
+            btn.title = 'Apply this diff to the working tree (exact match; no-op if already applied)';
+            const status = document.createElement('span');
+            status.className = 'patch-apply-status';
+            row.appendChild(btn);
+            row.appendChild(status);
+            if (cardInfo.monacoHost && cardInfo.monacoHost.nextSibling) {
+                cardInfo.card.insertBefore(row, cardInfo.monacoHost.nextSibling);
+            } else {
+                cardInfo.card.appendChild(row);
+            }
+            cardInfo.applyRow = row;
+            cardInfo.applyBtn = btn;
+            cardInfo.applyStatus = status;
+
+            btn.addEventListener('click', async () => {
+                const diff = cardInfo.pendingDiff || '';
+                if (!diff.trim()) {
+                    status.textContent = 'Diff not ready yet.';
+                    return;
+                }
+                btn.disabled = true;
+                status.textContent = 'Applying…';
+                try {
+                    const data = await applyPatchFromDiff(diff);
+                    if (data.error) {
+                        status.textContent = 'Apply failed.';
+                        showToast(`Apply failed: ${data.error}`, 'error');
+                    } else {
+                        status.textContent = 'Applied.';
+                        showToast('Patch applied', 'success');
+                        refreshGitStatus();
+                    }
+                } catch (err) {
+                    status.textContent = 'Apply failed.';
+                    showToast(`Apply failed: ${err.message}`, 'error');
+                } finally {
+                    btn.disabled = false;
+                }
+            });
         }
 
         function startStreamingToolCard(index, name) {
@@ -2905,7 +3036,13 @@
                 }
                 if (handleServerMessage(data)) return;
 
-                if (data.type === 'thinking') {
+                if (data.type === 'compacting') {
+                    // Auto-compaction inside a normal turn (or the manual
+                    // /compact command): keep a live indicator until the next
+                    // progress event (thinking/stream/tool) or the compact
+                    // response replaces it.
+                    setInputProgress('compacting', 'Compacting context\u2026');
+                } else if (data.type === 'thinking') {
                     setTurnActive(true);
                     updateTitle('thinking');
                     // New model round (OnStart / OnRoundStart): clear per-round
@@ -3035,7 +3172,21 @@
                 } else if (data.type === 'response') {
                     finalizeThinking();
                     endStream();
-                    if (pendingSessionResponse) {
+                    if (compacting) {
+                        // Terminal event for the manual /compact command:
+                        // clear the persistent indicator and surface the
+                        // outcome (the context message that follows will
+                        // refresh the badge/banner).
+                        compacting = false;
+                        setInputProgress(null);
+                        const text = data.content || '';
+                        if (String(text).startsWith('Error:')) {
+                            showToast(text, 'error');
+                        } else {
+                            showToast(text, 'success');
+                        }
+                        appendMessage('system', text);
+                    } else if (pendingSessionResponse) {
                         pendingSessionResponse = false;
                         nearCompactDismissed = false; // new session: allow the banner again
                         if (data.sessionId) sessionInfoDiv.textContent = data.sessionId;
@@ -3124,6 +3275,7 @@
                 clearPendingResend();
                 suppressTurnEnds = 0;
                 pendingSessionResponse = false;
+                compacting = false;
                 setTurnActive(false);
                 terminalInterruptAll();
                 setInputProgress(null);
@@ -3471,7 +3623,7 @@
             { id: 'save', label: 'Save file', hint: 'Ctrl+S', run: () => saveActive() },
             { id: 'save-all', label: 'Save all', hint: '', run: () => saveAll() },
             { id: 'compact', label: 'Compact context', hint: '', run: () => {
-                if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'message', content: '/compact' }));
+                startCompact();
             }},
             { id: 'context-detail', label: 'Show context usage', hint: '', run: () => {
                 if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'message', content: '/context' }));
@@ -3602,6 +3754,12 @@
                 if (settingsOverlay.classList.contains('active')) {
                     e.preventDefault();
                     closeModal(settingsOverlay);
+                    return;
+                }
+                const kbOverlay = document.getElementById('keybindings-overlay');
+                if (kbOverlay && kbOverlay.classList.contains('active')) {
+                    e.preventDefault();
+                    closeModal(kbOverlay);
                     return;
                 }
                 if (paletteOverlay.classList.contains('open')) {
@@ -4096,6 +4254,59 @@
                 const val = e.newValue || 'tokenizer';
                 if (diffViewerSelect.value !== val) diffViewerSelect.value = val;
             }
+        });
+
+        // === Editor preferences: persist and apply to the live Monaco editor ===
+        const editorMinimapSelect = document.getElementById('editor-minimap');
+        const editorWordwrapSelect = document.getElementById('editor-wordwrap');
+        const editorStickySelect = document.getElementById('editor-sticky');
+        const editorFontsizeInput = document.getElementById('editor-fontsize');
+
+        function clampFontSize(v) {
+            // Mirror getEditorPrefs() clamping so the control can never show a
+            // value the editor won't actually apply.
+            const min = parseInt(editorFontsizeInput?.min || '8', 10);
+            const max = parseInt(editorFontsizeInput?.max || '32', 10);
+            let n = parseInt(v, 10);
+            if (!Number.isFinite(n)) n = 13;
+            return Math.max(min, Math.min(max, n));
+        }
+
+        function initEditorPrefControl(control, key, dflt) {
+            if (!control) return;
+            const saved = localStorage.getItem(key) || dflt;
+            control.value = saved;
+            control.addEventListener('change', () => {
+                if (control.type === 'number') {
+                    // Keep the visible value in sync with what the editor will
+                    // actually apply (getEditorPrefs clamps to [min, max]).
+                    control.value = String(clampFontSize(control.value));
+                }
+                localStorage.setItem(key, control.value);
+                applyEditorPrefs();
+            });
+        }
+        initEditorPrefControl(editorMinimapSelect, 'gogen_editor_minimap', 'off');
+        initEditorPrefControl(editorWordwrapSelect, 'gogen_editor_wordwrap', 'on');
+        initEditorPrefControl(editorStickySelect, 'gogen_editor_sticky', 'on');
+        initEditorPrefControl(editorFontsizeInput, 'gogen_editor_fontsize', '13');
+        // Keep editor prefs in sync across tabs (mirrors the other settings).
+        window.addEventListener('storage', (e) => {
+            let changed = false;
+            if (e.key === 'gogen_editor_minimap' && editorMinimapSelect) {
+                editorMinimapSelect.value = e.newValue || 'off';
+                changed = true;
+            } else if (e.key === 'gogen_editor_wordwrap' && editorWordwrapSelect) {
+                editorWordwrapSelect.value = e.newValue || 'on';
+                changed = true;
+            } else if (e.key === 'gogen_editor_sticky' && editorStickySelect) {
+                editorStickySelect.value = e.newValue || 'on';
+                changed = true;
+            } else if (e.key === 'gogen_editor_fontsize' && editorFontsizeInput) {
+                editorFontsizeInput.value = String(clampFontSize(e.newValue || '13'));
+                changed = true;
+            }
+            if (changed) applyEditorPrefs();
         });
 
         // === Desktop notifications ===

@@ -120,8 +120,8 @@ func TestWebToolsEnabled(t *testing.T) {
 
 func TestConfigDefaults(t *testing.T) {
 	d := Defaults()
-	if d.CompactThreshold != 0.75 {
-		t.Errorf("default compact threshold = %f, want 0.75", d.CompactThreshold)
+	if d.CompactThreshold != 0.85 {
+		t.Errorf("default compact threshold = %f, want 0.85", d.CompactThreshold)
 	}
 	if d.MaxToolResultBytes != 262144 {
 		t.Errorf("default max tool result bytes = %d, want 262144", d.MaxToolResultBytes)

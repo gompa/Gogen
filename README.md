@@ -152,7 +152,7 @@ setting:
 | `compact_reserve_tokens` | reserve no tokens for new messages after compaction |
 
 Negative values are invalid and fall back to defaults. `compact_threshold`
-must be in `(0, 1]` when set; values outside that range fall back to `0.75`.
+must be in `(0, 1]` when set; values outside that range fall back to `0.85`.
 Note that disabling auto-compaction means the full conversation is sent to the
 model each turn, so it will eventually exceed the model's context window.
 
@@ -200,7 +200,7 @@ Files without config (plain markdown) are treated as guidelines-only. The old co
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GOGEN_CONTEXT_LIMIT` | `0` | Manual token limit override (`0` = resolve from model) |
-| `GOGEN_COMPACT_THRESHOLD` | `0.75` | Fraction of context limit that triggers auto-compaction |
+| `GOGEN_COMPACT_THRESHOLD` | `0.85` | Fraction of context limit that triggers auto-compaction (the UI warns earlier, at 75%) |
 | `GOGEN_KEEP_RECENT_MESSAGES` | `12` | Recent messages preserved during compaction |
 | `GOGEN_MAX_TOOL_RESULT_BYTES` | `262144` | Max bytes for tool output before truncation (matches web_fetch's 256 KB limit) |
 | `GOGEN_COMPACT_RESERVE_TOKENS` | `4000` | Tokens reserved for new messages after compaction |

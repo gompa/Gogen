@@ -120,14 +120,23 @@
                     <button type="button" id="btn-undo" title="Undo (Ctrl+Z)" disabled>Undo</button>
                     <button type="button" id="btn-redo" title="Redo (Ctrl+Shift+Z)" disabled>Redo</button>
                     <button type="button" id="btn-diff-layout" title="Toggle DiffEditor side-by-side vs inline">Side-by-side</button>
+                    <button type="button" id="btn-diff-prev" class="toolbar-icon-btn" title="Previous change" disabled>‹</button>
+                    <button type="button" id="btn-diff-next" class="toolbar-icon-btn" title="Next change" disabled>›</button>
+                    <button type="button" id="btn-format" title="Format document (Shift+Alt+F)" disabled>Format</button>
                     <button type="button" id="btn-save-file">Save</button>
                     <button type="button" id="btn-save-all">Save all</button>
+                    <button type="button" id="btn-keys-help" class="toolbar-icon-btn" title="Keyboard shortcuts">?</button>
                     <span id="save-all-loading">Saving…</span>
                 </div>
                 <div id="editor-tabs"></div>
                 <div id="monaco-wrap">
                     <div id="monaco-host"></div>
                     <div id="monaco-diff-host"></div>
+                </div>
+                <div id="editor-statusbar">
+                    <span id="editor-status-lncol"></span>
+                    <span id="editor-status-lang"></span>
+                    <span id="editor-status-problems"></span>
                 </div>
             </div>
         </div>
@@ -219,6 +228,39 @@
                     </select>
                 </div>
             </div>
+            <div class="setting-row">
+                <div>
+                    <label>Minimap</label>
+                    <select id="editor-minimap" aria-label="Minimap">
+                        <option value="off">Off</option>
+                        <option value="on">On</option>
+                    </select>
+                </div>
+            </div>
+            <div class="setting-row">
+                <div>
+                    <label>Word wrap</label>
+                    <select id="editor-wordwrap" aria-label="Word wrap">
+                        <option value="on">On</option>
+                        <option value="off">Off</option>
+                    </select>
+                </div>
+            </div>
+            <div class="setting-row">
+                <div>
+                    <label>Sticky scroll</label>
+                    <select id="editor-sticky" aria-label="Sticky scroll">
+                        <option value="on">On</option>
+                        <option value="off">Off</option>
+                    </select>
+                </div>
+            </div>
+            <div class="setting-row">
+                <div>
+                    <label>Font size</label>
+                    <input type="number" id="editor-fontsize" min="8" max="32" step="1" aria-label="Font size">
+                </div>
+            </div>
             <div class="setting-row" id="accent-setting-row">
                 <div>
                     <label>Accent color</label>
@@ -236,6 +278,36 @@
                     </select>
                 </div>
             </div>
+        </div>
+    </div>
+    <div id="keybindings-overlay">
+        <div id="keybindings-dialog" role="dialog" aria-label="Keyboard shortcuts">
+            <div class="settings-header">
+                <h3>Keyboard shortcuts</h3>
+                <button type="button" id="keybindings-close-btn" title="Close (Esc)" aria-label="Close shortcuts">✕</button>
+            </div>
+            <table class="keybindings-table">
+                <thead>
+                    <tr><th>Shortcut</th><th>Action</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>Save file</td></tr>
+                    <tr><td><kbd>Ctrl</kbd>+<kbd>F</kbd></td><td>Find in file</td></tr>
+                    <tr><td><kbd>Ctrl</kbd>+<kbd>H</kbd></td><td>Find &amp; replace in file</td></tr>
+                    <tr><td><kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>F</kbd></td><td>Format document (TS/JS/JSON/CSS/HTML)</td></tr>
+                    <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd></td><td>Undo / Redo</td></tr>
+                    <tr><td><kbd>Ctrl</kbd>+<kbd>Space</kbd></td><td>Suggestions (IntelliSense)</td></tr>
+                    <tr><td><kbd>F12</kbd></td><td>Go to definition</td></tr>
+                    <tr><td><kbd>Alt</kbd>+<kbd>F12</kbd></td><td>Peek definition</td></tr>
+                    <tr><td><kbd>F2</kbd></td><td>Rename symbol</td></tr>
+                    <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>O</kbd></td><td>Go to symbol in file (TS/JS/JSON/CSS/HTML)</td></tr>
+                    <tr><td><kbd>Alt</kbd>+<kbd>Click</kbd></td><td>Multiple cursors</td></tr>
+                    <tr><td><kbd>Ctrl</kbd>+<kbd>`</kbd></td><td>Toggle terminal</td></tr>
+                    <tr><td>Hover</td><td>View type info / errors</td></tr>
+                    <tr><td>Right-click</td><td>Context menu (go to def, rename, add reference to chat…)</td></tr>
+                </tbody>
+            </table>
+            <p class="keybindings-note">IntelliSense (suggestions, hover, go-to-definition, diagnostics) is available for files whose language ships a service: TypeScript, JavaScript, JSON, CSS, HTML.</p>
         </div>
     </div>
     <div id="command-palette-overlay" aria-hidden="true">

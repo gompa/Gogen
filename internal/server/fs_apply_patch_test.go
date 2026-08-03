@@ -1,0 +1,251 @@
+package server
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
+
+	"gogen/internal/agent"
+	"gogen/internal/config"
+	"gogen/internal/contextmgr"
+	"gogen/internal/llm"
+)
+
+// TestFSApplyPatchAppliesDiff exercises the fs_apply_patch WS handler end to
+// end: a unified diff sent over the socket is applied to the working tree via
+// the agent's patch engine, and the response reports success.
+func TestFSApplyPatchAppliesDiff(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "greet.go")
+	orig := "package main\n\nfunc main() {}\n"
+	if err := os.WriteFile(target, []byte(orig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	prov := llm.NewMockProvider()
+	exec := agent.NewExecutor(dir)
+	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
+	a := agent.NewAgent(prov, exec, ctxMgr)
+	s := NewServer(a, &config.Config{})
+
+	diff := "--- a/greet.go\n+++ b/greet.go\n@@ -1,3 +1,4 @@\n package main\n \n+// greeting\n func main() {}\n"
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		ws := newWSConn(conn)
+		s.handleFSWriteMessage(ws, context.Background(), WSMessage{
+			Type: "fs_apply_patch",
+			Diff: diff,
+		})
+	}))
+	defer ts.Close()
+
+	client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+	var resp WSMessage
+	if err := client.ReadJSON(&resp); err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if resp.Type != "fs_apply_patch_result" {
+		t.Fatalf("type = %q, want fs_apply_patch_result", resp.Type)
+	}
+	if !resp.Success {
+		t.Fatalf("apply failed: %s", resp.Error)
+	}
+
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "// greeting") {
+		t.Fatalf("file was not patched:\n%s", got)
+	}
+}
+
+// TestFSApplyPatchRejectsStaleDiff verifies that re-applying an already
+// applied patch (context no longer matches) reports an error instead of
+// corrupting the file.
+func TestFSApplyPatchRejectsStaleDiff(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "greet.go")
+	if err := os.WriteFile(target, []byte("package main\n\n// greeting\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	prov := llm.NewMockProvider()
+	exec := agent.NewExecutor(dir)
+	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
+	a := agent.NewAgent(prov, exec, ctxMgr)
+	s := NewServer(a, &config.Config{})
+
+	diff := "--- a/greet.go\n+++ b/greet.go\n@@ -1,3 +1,4 @@\n package main\n \n+// greeting\n func main() {}\n"
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		ws := newWSConn(conn)
+		s.handleFSWriteMessage(ws, context.Background(), WSMessage{
+			Type: "fs_apply_patch",
+			Diff: diff,
+		})
+	}))
+	defer ts.Close()
+
+	client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+	var resp WSMessage
+	if err := client.ReadJSON(&resp); err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if resp.Success {
+		t.Fatal("expected apply of a stale diff to fail")
+	}
+	if resp.Error == "" {
+		t.Fatal("expected an error message for a stale diff")
+	}
+	if resp.Result == "" {
+		t.Fatal("expected the patch report in Result for a failed apply")
+	}
+}
+
+// TestFSApplyPatchRejectsDeleteOnly verifies that a delete-only patch is
+// refused: the WS message context carries no delete approver, so the
+// executor's approval gate rejects it and the file is left untouched.
+func TestFSApplyPatchRejectsDeleteOnly(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "remove.txt")
+	if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	prov := llm.NewMockProvider()
+	exec := agent.NewExecutor(dir)
+	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
+	a := agent.NewAgent(prov, exec, ctxMgr)
+	s := NewServer(a, &config.Config{})
+
+	diff := "--- a/remove.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n"
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		ws := newWSConn(conn)
+		s.handleFSWriteMessage(ws, context.Background(), WSMessage{
+			Type: "fs_apply_patch",
+			Diff: diff,
+		})
+	}))
+	defer ts.Close()
+
+	client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+	var resp WSMessage
+	if err := client.ReadJSON(&resp); err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if resp.Type != "fs_apply_patch_result" {
+		t.Fatalf("type = %q, want fs_apply_patch_result", resp.Type)
+	}
+	if resp.Success {
+		t.Fatal("expected a delete-only patch to be rejected")
+	}
+	if !strings.Contains(resp.Error, "delete blocked: approval is required") {
+		t.Fatalf("unexpected error %q", resp.Error)
+	}
+	if _, statErr := os.Stat(target); statErr != nil {
+		t.Fatal("file should still exist after a rejected delete")
+	}
+}
+
+// TestFSApplyPatchBusyRejects verifies that the busy-path response uses the
+// request type convention ("fs_<op>_result") and reports the agent is busy.
+func TestFSApplyPatchBusyRejects(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "greet.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	prov := llm.NewMockProvider()
+	exec := agent.NewExecutor(dir)
+	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
+	a := agent.NewAgent(prov, exec, ctxMgr)
+	s := NewServer(a, &config.Config{})
+
+	diff := "--- a/greet.go\n+++ b/greet.go\n@@ -1,3 +1,4 @@\n package main\n \n+// greeting\n func main() {}\n"
+
+	// Hold the turn lock so tryAcquireTurn times out and the busy response is
+	// written instead of applying the patch.
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		ws := newWSConn(conn)
+		s.handleFSWriteMessage(ws, context.Background(), WSMessage{
+			Type: "fs_apply_patch",
+			Diff: diff,
+		})
+	}))
+	defer ts.Close()
+
+	client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+	var resp WSMessage
+	if err := client.ReadJSON(&resp); err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if resp.Type != "fs_apply_patch_result" {
+		t.Fatalf("type = %q, want fs_apply_patch_result", resp.Type)
+	}
+	if resp.Success {
+		t.Fatal("expected busy response to report failure")
+	}
+	if !strings.Contains(resp.Error, "agent is busy") {
+		t.Fatalf("unexpected error %q", resp.Error)
+	}
+}

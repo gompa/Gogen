@@ -9,8 +9,11 @@ import (
 // source of truth.
 const (
 	// DefaultCompactThreshold is the fraction of the context limit that
-	// triggers auto-compaction.
-	DefaultCompactThreshold = 0.75
+	// triggers auto-compaction. 0.85 leaves less headroom before the window
+	// fills than the old 0.75, but the continuation-summary request is a
+	// cache-friendly prefix (see contextmgr.summarizeMiddle), so compacting
+	// later is cheap and the headroom is covered by the reserve.
+	DefaultCompactThreshold = 0.85
 	// DefaultKeepRecentMessages is the number of recent messages preserved
 	// during compaction.
 	DefaultKeepRecentMessages = 12

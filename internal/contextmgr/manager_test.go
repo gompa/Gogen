@@ -168,6 +168,7 @@ func TestShouldCompactSeesGrowthAcrossCalls(t *testing.T) {
 func TestCompactPreservesHeadAndTail(t *testing.T) {
 	provider := &stubProvider{summary: "did auth work"}
 	m := NewManager(provider, Settings{KeepRecentMessages: 2})
+	m.minMiddleTokens = 0 // tiny messages: skip the minimum-middle guard
 	msgs := []llm.Message{
 		{Role: "user", Content: "fix auth"},
 		{Role: "assistant", Content: "reading"},

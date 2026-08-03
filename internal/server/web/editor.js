@@ -42,6 +42,10 @@ const chatEditors = new Set(); // disposable Monaco editors in chat tool cards
 let toastFn = null;
 let searchDebounceTimer = null;
 let searchGen = 0;
+let diffStatText = ''; // "+N −M" summary for the unstaged-diff pane
+let diffChangeCount = 0; // number of hunks in the unstaged-diff pane (nav buttons)
+let refDecorationIds = []; // range-highlight decorations from chat references
+const markerCounts = new Map(); // path -> { errors, warnings }
 
 function $(id) {
   return document.getElementById(id);
@@ -139,6 +143,21 @@ function wsRequest(type, payload = {}) {
   });
 }
 
+/**
+ * Apply a unified diff to the working tree via the server's patch engine
+ * (exact-context match). Resolves with the server response, or with
+ * `{ error }` when the apply failed (context mismatch, agent busy, ...).
+ */
+export async function applyPatchFromDiff(diff) {
+  try {
+    return await wsRequest('fs_apply_patch', { diff });
+  } catch (err) {
+    // wsRequest rejects whenever the server sets `error`; resolve with the
+    // error payload instead so callers can read it without a try/catch.
+    return { error: err.message };
+  }
+}
+
 export async function initMonaco() {
   if (monacoReady) return monaco;
   if (monacoInitPromise) return monacoInitPromise;
@@ -230,6 +249,9 @@ export async function initMonaco() {
       },
     });
     monaco.editor.setTheme('gogen-dark');
+    // Language services push diagnostics asynchronously; refresh tab badges
+    // and the status bar whenever markers change.
+    monaco.editor.onDidChangeMarkers(() => refreshTabBadges());
     monacoReady = true;
     return monaco;
   })();
@@ -541,22 +563,73 @@ export function applyUnifiedDiffDecorations(ed) {
   ed.__gogenDiffDecorations = ed.deltaDecorations(prev, decorations);
 }
 
+// ── Editor preferences (settings modal ↔ Monaco options) ──
+function getEditorPrefs() {
+  const ls = (key, dflt) => localStorage.getItem(key) || dflt;
+  let fontSize = parseInt(ls('gogen_editor_fontsize', ''), 10);
+  if (!Number.isFinite(fontSize) || fontSize < 8 || fontSize > 32) fontSize = 13;
+  return {
+    minimap: ls('gogen_editor_minimap', 'off') === 'on',
+    wordWrap: ls('gogen_editor_wordwrap', 'on') === 'on' ? 'on' : 'off',
+    stickyScroll: ls('gogen_editor_sticky', 'on') !== 'off',
+    fontSize,
+  };
+}
+
+function editorOptions(prefs) {
+  return {
+    automaticLayout: true,
+    minimap: { enabled: prefs.minimap },
+    fontSize: prefs.fontSize,
+    wordWrap: prefs.wordWrap,
+    stickyScroll: { enabled: prefs.stickyScroll },
+    scrollBeyondLastLine: false,
+  };
+}
+
+/**
+ * Re-apply editor preferences to the live edit editor (called when settings
+ * change). Deliberately NOT applied to diffEditor: the diff panes keep fixed
+ * options for documented reasons (wheel chaining to chat, ResizeObserver vs
+ * flex layout, cursor-blink keeping the refresh driver at 60 Hz, sticky
+ * scroll disabled in diff view). See showDiffPane()/mountDiffEditor().
+ */
+export function applyEditorPrefs() {
+  const opts = editorOptions(getEditorPrefs());
+  if (editor) editor.updateOptions(opts);
+}
+
 function ensureEditors() {
   const host = $('monaco-host');
   if (!host) return;
   if (!editor) {
-    editor = monaco.editor.create(host, {
-      automaticLayout: true,
-      minimap: { enabled: false },
-      fontSize: 13,
-      wordWrap: 'on',
-      scrollBeyondLastLine: false,
-    });
+    editor = monaco.editor.create(host, editorOptions(getEditorPrefs()));
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
       saveActive();
     });
+    // Shift+Alt+F (VS Code convention) rather than Ctrl+Shift+F, which the
+    // app reserves for Find in Files (document keydown handler in app.js).
+    editor.addCommand(monaco.KeyMod.Shift | monaco.KeyMod.Alt | monaco.KeyCode.KeyF, () => {
+      formatActive(editor);
+    });
     editor.onDidChangeModelContent(() => {
       updateDirtyState();
+      // A reference highlight is a pointer, not an edit — drop it on the
+      // first content change so it never lingers over the user's work.
+      if (refDecorationIds.length) {
+        refDecorationIds = editor.deltaDecorations(refDecorationIds, []);
+      }
+    });
+    editor.onDidChangeCursorPosition(() => updateStatusBar());
+    editor.onDidChangeModel(() => {
+      // Model switch invalidates any reference-highlight decoration ids.
+      refDecorationIds = [];
+      updateStatusBar();
+      refreshTabBadges();
+    });
+    editor.onDidChangeModelLanguage(() => {
+      updateStatusBar();
+      updateUndoRedoButtons(); // Format button visibility depends on language
     });
 
     // --- Context menu: add selection reference to chat input ---
@@ -598,6 +671,55 @@ function ensureEditors() {
         inputEl.dispatchEvent(new Event('input', { bubbles: true }));
       },
     });
+
+    // --- Context menu: navigation + symbol actions (silently no-op for
+    // languages without a language service). ---
+    editor.addAction({
+      id: 'gogen-go-to-definition',
+      label: 'Go to Definition',
+      contextMenuGroupId: 'navigation',
+      contextMenuOrder: 1.1,
+      run(ed) {
+        ed.getAction('editor.action.revealDefinition')?.run();
+      },
+    });
+    editor.addAction({
+      id: 'gogen-peek-definition',
+      label: 'Peek Definition',
+      contextMenuGroupId: 'navigation',
+      contextMenuOrder: 1.2,
+      run(ed) {
+        ed.getAction('editor.action.peekDefinition')?.run();
+      },
+    });
+    editor.addAction({
+      id: 'gogen-rename-symbol',
+      label: 'Rename Symbol',
+      contextMenuGroupId: 'navigation',
+      contextMenuOrder: 1.3,
+      run(ed) {
+        ed.getAction('editor.action.rename')?.run();
+      },
+    });
+    editor.addAction({
+      id: 'gogen-format-document',
+      label: 'Format Document',
+      contextMenuGroupId: '1_modification',
+      contextMenuOrder: 1.1,
+      run(ed) {
+        formatActive(ed);
+      },
+    });
+    editor.addAction({
+      id: 'gogen-copy-path',
+      label: 'Copy Path',
+      contextMenuGroupId: '9_cutcopypaste',
+      contextMenuOrder: 5,
+      run(ed) {
+        if (!activePath || !navigator.clipboard) return;
+        navigator.clipboard.writeText(activePath).catch(() => {});
+      },
+    });
   }
 }
 
@@ -610,6 +732,7 @@ function showEditPane() {
   if (diffEditor) {
     // Keep models; just hide
   }
+  updateStatusBar();
 }
 
 function showDiffPane() {
@@ -628,12 +751,15 @@ function showDiffPane() {
       renderSideBySide: GOGEN_UI.diffRenderSideBySide,
       minimap: { enabled: false },
       fontSize: 13,
+      stickyScroll: { enabled: false },
       renderIndicators: true,
       originalEditable: false,
     });
+    diffEditor.onDidUpdateDiff(() => updateDiffStat());
   } else {
     diffEditor.updateOptions({ renderSideBySide: GOGEN_UI.diffRenderSideBySide });
   }
+  updateStatusBar();
 }
 
 function basename(path) {
@@ -656,7 +782,7 @@ function updatePathLabel() {
   const label = $('editor-path-label');
   if (!label) return;
   if (mode === 'diff' && activePath) {
-    label.textContent = `${activePath} (unstaged diff)`;
+    label.textContent = `${activePath} (unstaged diff)${diffStatText}`;
   } else if (activePath) {
     label.textContent = isDirty(activePath) ? `${activePath} *` : activePath;
   } else {
@@ -698,6 +824,29 @@ function updateUndoRedoButtons() {
   }
   if (undoBtn) undoBtn.disabled = !canUndo;
   if (redoBtn) redoBtn.disabled = !canRedo;
+  const fmtBtn = $('btn-format');
+  // The Format button is only useful for languages with a formatting provider
+  // (the four Monaco language services); hide it for everything else so no
+  // dead control remains visible.
+  const fmtLang = editor && editor.getModel() ? editor.getModel().getLanguageId() : '';
+  const canFormat = canEdit && FORMATTER_LANGS.has(fmtLang);
+  if (fmtBtn) {
+    fmtBtn.hidden = !canFormat;
+    fmtBtn.disabled = !canFormat;
+  }
+  const prevBtn = $('btn-diff-prev');
+  const nextBtn = $('btn-diff-next');
+  // Navigation is only meaningful while viewing a diff that has changes —
+  // hide the buttons entirely otherwise so no dead controls remain visible.
+  const hasDiffChanges = mode === 'diff' && !!diffEditor && !!diffEditor.getModel() && diffChangeCount > 0;
+  if (prevBtn) {
+    prevBtn.hidden = !hasDiffChanges;
+    prevBtn.disabled = !hasDiffChanges;
+  }
+  if (nextBtn) {
+    nextBtn.hidden = !hasDiffChanges;
+    nextBtn.disabled = !hasDiffChanges;
+  }
 }
 
 export function editorUndo() {
@@ -733,10 +882,171 @@ function renderTabs() {
       closeTab(path);
     };
     tab.appendChild(name);
+    const badge = bufferBadge(path);
+    if (badge) tab.appendChild(badge);
     tab.appendChild(close);
     tab.onclick = () => activatePath(path);
     strip.appendChild(tab);
   }
+}
+
+/** Error/warning badge span for a tab, or null when the buffer is clean. */
+function bufferBadge(path) {
+  const counts = markerCounts.get(path);
+  if (!counts || (!counts.errors && !counts.warnings)) return null;
+  const span = document.createElement('span');
+  span.className = 'file-tab-badge';
+  // Error color wins when both are present; the text always shows both counts.
+  if (counts.errors) span.classList.add('has-errors');
+  else if (counts.warnings) span.classList.add('has-warnings');
+  const parts = [];
+  if (counts.errors) parts.push(`⨯${counts.errors}`);
+  if (counts.warnings) parts.push(`⚠${counts.warnings}`);
+  span.textContent = parts.join(' ');
+  span.title = `${counts.errors} error(s), ${counts.warnings} warning(s)`;
+  return span;
+}
+
+/** Recompute marker counts for all open buffers and refresh badges in place. */
+function refreshTabBadges() {
+  if (!monaco) return;
+  let changed = false;
+  for (const [path, b] of buffers) {
+    if (!b || !b.model) continue;
+    let errors = 0;
+    let warnings = 0;
+    for (const m of monaco.editor.getModelMarkers({ resource: b.model.uri })) {
+      if (m.severity === monaco.MarkerSeverity.Error) errors++;
+      else if (m.severity === monaco.MarkerSeverity.Warning) warnings++;
+    }
+    const prev = markerCounts.get(path);
+    if (!prev || prev.errors !== errors || prev.warnings !== warnings) {
+      markerCounts.set(path, { errors, warnings });
+      changed = true;
+    }
+  }
+  if (!changed) return; // nothing to repaint
+  const strip = $('editor-tabs');
+  if (!strip) return;
+  if (strip.children.length !== openOrder.length) {
+    // Tab list drifted (open/close since the last render) — rebuild.
+    renderTabs();
+    updateStatusBar();
+    return;
+  }
+  // Update badges in place instead of rebuilding the whole strip: markers can
+  // change per keystroke while typing, and a full rebuild would also fire for
+  // transient diff-pane models whose counts never enter markerCounts.
+  for (let i = 0; i < openOrder.length; i++) {
+    const tab = strip.children[i];
+    if (!tab || !tab.classList.contains('file-tab')) continue;
+    const old = tab.querySelector('.file-tab-badge');
+    if (old) old.remove();
+    const badge = bufferBadge(openOrder[i]);
+    if (badge) tab.insertBefore(badge, tab.querySelector('.file-tab-close'));
+  }
+  updateStatusBar();
+}
+
+/** Render the error/warning readout for the active file (diff or edit pane). */
+function renderProblemsText(probs) {
+  let errors = 0;
+  let warnings = 0;
+  if (mode === 'diff' && diffEditor && diffEditor.getModel() && monaco) {
+    // The diff pane's transient models are separate from edit buffers; count
+    // their diagnostics directly so the readout matches the diff being viewed.
+    const dm = diffEditor.getModel();
+    for (const model of [dm.original, dm.modified]) {
+      if (!model) continue;
+      for (const mk of monaco.editor.getModelMarkers({ resource: model.uri })) {
+        if (mk.severity === monaco.MarkerSeverity.Error) errors++;
+        else if (mk.severity === monaco.MarkerSeverity.Warning) warnings++;
+      }
+    }
+  } else {
+    const counts = markerCounts.get(activePath);
+    if (counts) {
+      errors = counts.errors;
+      warnings = counts.warnings;
+    }
+  }
+  probs.textContent = '';
+  probs.className = '';
+  if (errors || warnings) {
+    probs.textContent = `⨯ ${errors}   ⚠ ${warnings}`;
+    probs.classList.add(errors ? 'status-problems-error' : 'status-problems-warn');
+  }
+}
+
+/** Update the Ln/Col, language and problems readout in the status bar. */
+function updateStatusBar() {
+  const lncol = $('editor-status-lncol');
+  const lang = $('editor-status-lang');
+  const probs = $('editor-status-problems');
+  if (mode === 'diff') {
+    // The edit editor is hidden while viewing a diff; its cursor position and
+    // language would be misleading. Show the diff file's problems only.
+    if (lncol) lncol.textContent = '';
+    if (lang) lang.textContent = 'diff';
+    if (probs) renderProblemsText(probs);
+    return;
+  }
+  if (lncol) {
+    const pos = editor && editor.getModel() ? editor.getPosition() : null;
+    lncol.textContent = pos ? `Ln ${pos.lineNumber}, Col ${pos.column}` : '';
+  }
+  if (lang) {
+    const model = editor && editor.getModel();
+    lang.textContent = model ? model.getLanguageId() : '';
+  }
+  if (probs) renderProblemsText(probs);
+}
+
+// Monaco standalone only ships formatting providers for the four language
+// services (TypeScript/JavaScript, JSON, CSS, HTML); every other language is
+// tokenizer-only, so the Format action would be a silent no-op for them.
+const FORMATTER_LANGS = new Set(['typescript', 'javascript', 'json', 'css', 'html']);
+
+/** Format the active document, reporting when the language has no formatter. */
+export function formatActive(ed) {
+  const target = ed || editor;
+  if (!target || !target.getModel()) return;
+  const lang = target.getModel().getLanguageId();
+  if (!FORMATTER_LANGS.has(lang)) {
+    if (toastFn) toastFn(`No formatter available for ${lang || 'plaintext'}`, 'info');
+    return;
+  }
+  target.focus();
+  const action = target.getAction('editor.action.formatDocument');
+  if (action) action.run();
+}
+
+/** Jump to the previous/next diff change in the unstaged-diff pane. */
+export function diffNav(target) {
+  if (mode !== 'diff' || !diffEditor) return;
+  diffEditor.goToDiff(target === 'prev' ? 'previous' : 'next');
+}
+
+/** Recompute "+N −M" from the diff editor's change list and refresh the label. */
+function updateDiffStat() {
+  diffStatText = '';
+  diffChangeCount = 0;
+  if (diffEditor && diffEditor.getModel()) {
+    const changes = diffEditor.getLineChanges();
+    if (changes) {
+      diffChangeCount = changes.length;
+      let added = 0;
+      let removed = 0;
+      for (const ch of changes) {
+        // Empty ranges (end < start) represent pure insertions/deletions; clamp to 0.
+        added += Math.max(0, ch.modifiedEndLineNumber - ch.modifiedStartLineNumber + 1);
+        removed += Math.max(0, ch.originalEndLineNumber - ch.originalStartLineNumber + 1);
+      }
+      if (added || removed) diffStatText = `  +${added} −${removed}`;
+    }
+  }
+  updatePathLabel();
+  updateUndoRedoButtons();
 }
 
 async function enforceTabCap() {
@@ -776,6 +1086,7 @@ function disposeBuffer(path) {
   const b = buffers.get(path);
   if (b && b.model) b.model.dispose();
   buffers.delete(path);
+  markerCounts.delete(path);
   openOrder = openOrder.filter((p) => p !== path);
   if (activePath === path) {
     activePath = openOrder.length ? openOrder[openOrder.length - 1] : null;
@@ -841,13 +1152,18 @@ function activatePath(path) {
   showEditPane();
   ensureEditors();
   const b = buffers.get(path);
+  // Drop any reference highlight from the previous model before switching
+  // away, so it can't resurface when the old tab is reopened.
+  if (refDecorationIds.length) {
+    refDecorationIds = editor.deltaDecorations(refDecorationIds, []);
+  }
   editor.setModel(b.model);
   if (b.viewState) editor.restoreViewState(b.viewState);
   editor.focus();
   updateDirtyIndicators();
 }
 
-async function openFile(path, line) {
+async function openFile(path, line, endLine) {
   await initMonaco();
   ensureEditors();
   if (buffers.has(path)) {
@@ -874,11 +1190,13 @@ async function openFile(path, line) {
     openOrder.push(path);
     await enforceTabCap();
     activatePath(path);
+    refreshTabBadges();
   }
   if (line && line > 0 && editor) {
     editor.revealLineInCenter(line);
     editor.setPosition({ lineNumber: line, column: 1 });
     editor.focus();
+    highlightRefRange(line, endLine);
   }
   // Optional: switch to Editor pane when opening a file from chat
   if (localStorage.getItem('gogen_file_click_behavior') === 'open-switch') {
@@ -886,8 +1204,30 @@ async function openFile(path, line) {
   }
 }
 
-export async function openFileAtLine(path, line) {
-  await openFile(path, line);
+export async function openFileAtLine(path, line, endLine) {
+  await openFile(path, line, endLine);
+}
+
+/**
+ * Highlight a line range in the edit pane (used when jumping from a chat
+ * reference like @path:12-20). The highlight clears on the next content
+ * change so it never lingers over edits.
+ */
+function highlightRefRange(startLine, endLine) {
+  if (!editor || !editor.getModel()) return;
+  const model = editor.getModel();
+  const lastLine = Math.max(startLine, endLine || startLine);
+  if (lastLine > model.getLineCount()) return;
+  refDecorationIds = editor.deltaDecorations(refDecorationIds, [
+    {
+      range: new monaco.Range(startLine, 1, lastLine, model.getLineMaxColumn(lastLine)),
+      options: {
+        isWholeLine: true,
+        className: 'gogen-ref-highlight',
+        linesDecorationsClassName: 'gogen-ref-highlight-gutter',
+      },
+    },
+  ]);
 }
 
 async function savePath(path) {
@@ -943,7 +1283,9 @@ async function openUnstagedDiff(path) {
     const original = monaco.editor.createModel(data.original || '', lang);
     const modified = monaco.editor.createModel(data.modified || '', lang);
     const prev = diffEditor.getModel();
+    diffChangeCount = 0; // unknown until the diff is computed; onDidUpdateDiff corrects it
     diffEditor.setModel({ original, modified });
+    updateUndoRedoButtons();
     if (prev) {
       if (prev.original) prev.original.dispose();
       if (prev.modified) prev.modified.dispose();
@@ -1142,6 +1484,23 @@ export function setupEditorUI() {
   $('btn-save-all')?.addEventListener('click', () => saveAll());
   $('btn-undo')?.addEventListener('click', () => editorUndo());
   $('btn-redo')?.addEventListener('click', () => editorRedo());
+  $('btn-format')?.addEventListener('click', () => formatActive());
+  $('btn-diff-prev')?.addEventListener('click', () => diffNav('prev'));
+  $('btn-diff-next')?.addEventListener('click', () => diffNav('next'));
+  // Keyboard shortcuts help modal (toolbar "?" button).
+  $('btn-keys-help')?.addEventListener('click', () => {
+    const overlay = $('keybindings-overlay');
+    if (overlay) openModal(overlay);
+  });
+  $('keybindings-close-btn')?.addEventListener('click', () => {
+    closeModal($('keybindings-overlay'));
+  });
+  const kbOverlay = $('keybindings-overlay');
+  if (kbOverlay) {
+    kbOverlay.addEventListener('click', (e) => {
+      if (e.target === kbOverlay) closeModal(kbOverlay);
+    });
+  }
   $('btn-diff-layout')?.addEventListener('click', () => {
     GOGEN_UI.diffRenderSideBySide = !GOGEN_UI.diffRenderSideBySide;
     if (diffEditor) {

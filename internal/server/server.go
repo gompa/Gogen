@@ -387,9 +387,13 @@ type WSMessage struct {
 	CachedTokens     int     `json:"cachedTokens,omitempty"`
 	CompactAt        int     `json:"compactAt,omitempty"`
 	MessageCount     int     `json:"messageCount,omitempty"`
-	NearCompact      bool    `json:"nearCompact,omitempty"`
-	UsedPercent      float64 `json:"usedPercent,omitempty"`
-	ToolTruncated    bool    `json:"toolTruncated,omitempty"`
+	// NearCompact and WarnNearCompact intentionally have NO omitempty: a
+	// false value must reach the client or a previously shown near-compact
+	// banner never hides after a compaction.
+	NearCompact     bool    `json:"nearCompact"`
+	WarnNearCompact bool    `json:"warnNearCompact"`
+	UsedPercent     float64 `json:"usedPercent,omitempty"`
+	ToolTruncated   bool    `json:"toolTruncated,omitempty"`
 	// Accumulated session usage
 	TotalPromptTokens     int            `json:"totalPromptTokens,omitempty"`
 	TotalCompletionTokens int            `json:"totalCompletionTokens,omitempty"`
@@ -421,6 +425,7 @@ type WSMessage struct {
 	Truncated   bool                `json:"truncated,omitempty"`
 	Original    string              `json:"original,omitempty"`
 	Modified    string              `json:"modified,omitempty"`
+	Diff        string              `json:"diff,omitempty"`
 	RequestID   string              `json:"requestId,omitempty"`
 	Replacement string              `json:"replacement,omitempty"`
 	Replaced    int                 `json:"replaced,omitempty"`
@@ -481,6 +486,7 @@ func applyContextStats(msg *WSMessage, stats agent.TurnContext, accum *agent.Usa
 	msg.CompactAt = snap.CompactAt
 	msg.MessageCount = snap.MessageCount
 	msg.NearCompact = snap.NearCompact
+	msg.WarnNearCompact = snap.WarnNearCompact
 	msg.ToolTruncated = snap.ToolTruncated
 	// When the API returned exact usage, the Snapshot.Used incorporates that
 	// authoritative baseline (plus estimates for any messages added after the
@@ -791,7 +797,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 		switch msg.Type {
 		case "fs_list", "fs_read", "fs_search", "git_status", "git_file_diff":
 			s.handleFSReadMessage(ws, r.Context(), msg)
-		case "fs_write", "fs_replace":
+		case "fs_write", "fs_replace", "fs_apply_patch":
 			s.handleFSWriteMessage(ws, r.Context(), msg)
 		case "list_sessions":
 			s.handleWSListSessions(ws)
@@ -819,6 +825,8 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			}
 		case "user_term_request":
 			s.spawnUserTerminal(ws, userTermHolder)
+		case "compact":
+			s.handleWSCompact(ws, r, stream)
 		case "message":
 			s.handleWSUserMessage(ws, r, stream, session, msg)
 		}
@@ -972,11 +980,49 @@ func (s *Server) handleWSConfig(ws *wsConn, ctx context.Context, stream *wsConnS
 	s.turnMu.Unlock()
 	accum := s.agent.SnapshotUsageAccum()
 	applyContextStats(&cfg, s.agent.ContextStats(ctx), &accum)
-	_ = ws.writeJSON(WSMessage{Type: "config", WorkingDir: absDir, Model: cfg.Model, ContextLimit: cfg.ContextLimit, UsedTokens: cfg.UsedTokens, UsedSource: cfg.UsedSource, UsedPercent: cfg.UsedPercent, CompactAt: cfg.CompactAt, MessageCount: cfg.MessageCount, NearCompact: cfg.NearCompact, ToolTruncated: cfg.ToolTruncated, Mode: cfg.Mode})
+	_ = ws.writeJSON(WSMessage{Type: "config", WorkingDir: absDir, Model: cfg.Model, ContextLimit: cfg.ContextLimit, UsedTokens: cfg.UsedTokens, UsedSource: cfg.UsedSource, UsedPercent: cfg.UsedPercent, CompactAt: cfg.CompactAt, MessageCount: cfg.MessageCount, NearCompact: cfg.NearCompact, WarnNearCompact: cfg.WarnNearCompact, ToolTruncated: cfg.ToolTruncated, Mode: cfg.Mode})
+}
+
+// handleWSCompact runs the manual compaction command (/compact) for a web
+// client. Unlike a regular message it never reaches the LLM as a prompt: it
+// cancels any in-flight turn, acquires the agent turn lock, emits a
+// "compacting" event so the client can show a persistent progress indicator,
+// runs CompactHistory (which may take a while — it summarizes the middle via
+// the provider), then reports the result and refreshed context stats. Runs in
+// a goroutine so the slow summarization does not block the WS read loop.
+func (s *Server) handleWSCompact(ws *wsConn, r *http.Request, stream *wsConnStream) {
+	stream.cancelInFlight()
+	if !s.tryAcquireTurn(wsTurnAcquireWait) {
+		// Cancel may have timed out while a tool was still exiting; wait once more.
+		stream.cancelInFlight()
+		if !s.tryAcquireTurn(wsStreamDrainWait) {
+			_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+			return
+		}
+	}
+	go func() {
+		defer s.turnMu.Unlock()
+		_ = ws.writeJSON(WSMessage{Type: "compacting"})
+		if err := s.agent.CompactHistory(r.Context()); err != nil {
+			_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: " + err.Error()})
+		} else {
+			_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("History compacted (%d messages remaining).", s.agent.MessageCount())})
+		}
+		_ = ws.writeJSON(s.contextMsg(r.Context()))
+	}()
 }
 
 func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, stream *wsConnStream, session *wsSession, msg WSMessage) {
 	stream.cancelInFlight()
+
+	// A literal /compact typed into the composer (or sent by older clients)
+	// routes to the real compact command instead of reaching the LLM as a
+	// prompt. /compact is registered TUI-only, but the web banner and command
+	// palette rely on this path.
+	if strings.TrimSpace(msg.Content) == "/compact" {
+		s.handleWSCompact(ws, r, stream)
+		return
+	}
 
 	if out, handled := agent.HandleHelpCommand(msg.Content, true, false); handled {
 		_ = ws.writeJSON(WSMessage{Type: "response", Content: out})
@@ -1137,6 +1183,9 @@ func (s *Server) startAsyncStreamingTurn(ws *wsConn, r *http.Request, stream *ws
 		termOpened := map[string]struct{}{}
 
 		handlers := &llm.StreamHandlers{
+			OnCompacting: func() {
+				write(WSMessage{Type: "compacting"})
+			},
 			OnStart: func() {
 				// Tell the client the server-side index of the user message
 				// that StreamProcessInput just appended (for edit/resend).

@@ -8,6 +8,80 @@ import (
 	"gogen/internal/llm"
 )
 
+// recordingProvider captures the summarization request so tests can verify
+// its shape (view prefix + head + middle + instruction).
+type recordingProvider struct {
+	stubProvider
+	requests [][]llm.Message
+}
+
+func (p *recordingProvider) GenerateResponse(_ context.Context, msgs []llm.Message, _ map[string]struct{}, _ []llm.Tool) (llm.Response, error) {
+	p.requests = append(p.requests, msgs)
+	return llm.Response{Content: "middle summary"}, nil
+}
+
+func TestCompactSummaryRequestUsesConversationPrefix(t *testing.T) {
+	provider := &recordingProvider{}
+	m := NewManager(provider, Settings{KeepRecentMessages: 2, ContextLimit: 100000, CompactThreshold: 0.01})
+	m.minMiddleTokens = 0 // tiny messages: skip the minimum-middle guard
+	viewPrefix := []llm.Message{{Role: "system", Content: "You are a coding agent."}}
+	msgs := []llm.Message{
+		{Role: "user", Content: "first"},
+		{Role: "assistant", Content: "a1"},
+		{Role: "user", Content: "middle user"},
+		{Role: "assistant", Content: "a2"},
+		{Role: "user", Content: "later"},
+		{Role: "assistant", Content: "a3"},
+		{Role: "user", Content: "tail"},
+	}
+	out, _, err := m.CompactPinned(context.Background(), viewPrefix, msgs, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.requests) != 1 {
+		t.Fatalf("expected one summarization request, got %d", len(provider.requests))
+	}
+	req := provider.requests[0]
+	if len(req) < len(viewPrefix)+2 {
+		t.Fatalf("summarization request too short: %d messages", len(req))
+	}
+	if req[0].Content != "You are a coding agent." {
+		t.Fatalf("expected view prefix first, got %q", req[0].Content)
+	}
+	if req[len(viewPrefix)].Content != "first" {
+		t.Fatalf("expected first user message after prefix, got %q", req[len(viewPrefix)].Content)
+	}
+	last := req[len(req)-1]
+	if last.Role != "system" || !strings.Contains(last.Content, "Summarize everything after the first user message") {
+		t.Fatalf("expected summary instruction last, got %q", last.Content)
+	}
+	if !strings.Contains(last.Content, "not a conversation turn") || !strings.Contains(last.Content, "Do not continue the conversation") {
+		t.Fatalf("instruction must be framed as a task, not a chat turn: %q", last.Content)
+	}
+	if strings.Contains(last.Content, "most recent") || strings.Contains(last.Content, "not shown") {
+		t.Fatalf("instruction must not mention cut messages: %q", last.Content)
+	}
+	if strings.Contains(last.Content, "lead-in") || strings.Contains(last.Content, "continues after this point") {
+		t.Fatalf("instruction must not cue conversation continuation: %q", last.Content)
+	}
+	if out[0].Content != "first" {
+		t.Fatalf("head not preserved: %+v", out[0])
+	}
+	if out[len(out)-1].Content != "tail" {
+		t.Fatalf("tail not preserved: %+v", out[len(out)-1])
+	}
+	foundSummary := false
+	for _, msg := range out {
+		if msg.Role == "assistant" && strings.Contains(msg.Content, "middle summary") {
+			foundSummary = true
+			break
+		}
+	}
+	if !foundSummary {
+		t.Fatalf("expected summary message in compacted history: %+v", out)
+	}
+}
+
 func TestAdjustCompactTailStartIncludesToolCallAssistant(t *testing.T) {
 	messages := []llm.Message{
 		{Role: "user", Content: "task"},
@@ -36,6 +110,7 @@ func TestRenderMessagesForSummaryIncludesToolName(t *testing.T) {
 func TestCompactKeepsToolCallPairInTail(t *testing.T) {
 	provider := &stubProvider{summary: "summary"}
 	m := NewManager(provider, Settings{KeepRecentMessages: 3})
+	m.minMiddleTokens = 0 // tiny messages: skip the minimum-middle guard
 	msgs := []llm.Message{
 		{Role: "user", Content: "fix auth"},
 		{Role: "assistant", Content: "reading"},
@@ -61,6 +136,7 @@ func TestCompactKeepsToolCallPairInTail(t *testing.T) {
 func TestCompactKeepZeroKeepsOnlyHead(t *testing.T) {
 	provider := &stubProvider{summary: "summary"}
 	m := NewManager(provider, Settings{KeepRecentMessages: 0})
+	m.minMiddleTokens = 0 // tiny messages: skip the minimum-middle guard
 	msgs := []llm.Message{
 		{Role: "user", Content: "task"},
 		{Role: "assistant", Content: "a"},
@@ -116,5 +192,41 @@ func TestSnapshotAutoCompactEnabledByDefault(t *testing.T) {
 	snap := m.Snapshot(nil, nil)
 	if snap.CompactDisabled {
 		t.Fatal("expected auto-compaction enabled at threshold 0.5")
+	}
+}
+
+// TestCompactRefusesTinyMiddle verifies the minimum-middle guard: compacting a
+// history whose summarized middle is trivially small is refused (the model
+// would echo the one or two messages instead of recapping them), and the same
+// history compacts fine once the guard is lifted.
+func TestCompactRefusesTinyMiddle(t *testing.T) {
+	provider := &recordingProvider{}
+	m := NewManager(provider, Settings{KeepRecentMessages: 2, ContextLimit: 100000, CompactThreshold: 0.01})
+	msgs := []llm.Message{
+		{Role: "user", Content: "first"},
+		{Role: "assistant", Content: "a1"},
+		{Role: "user", Content: "middle user"},
+		{Role: "assistant", Content: "a2"},
+		{Role: "user", Content: "tail"},
+	}
+	if _, _, err := m.CompactPinned(context.Background(), nil, msgs, nil); err == nil {
+		t.Fatal("expected compaction of a tiny middle to be refused")
+	}
+
+	// Same history with the guard lifted compacts normally.
+	m.minMiddleTokens = 0
+	if _, _, err := m.CompactPinned(context.Background(), nil, msgs, nil); err != nil {
+		t.Fatalf("expected compaction to succeed with guard lifted: %v", err)
+	}
+
+	// A middle above the default threshold is not refused.
+	big := NewManager(&recordingProvider{}, Settings{KeepRecentMessages: 2, ContextLimit: 100000, CompactThreshold: 0.01})
+	bigMsgs := append([]llm.Message{
+		{Role: "user", Content: "first"},
+		{Role: "user", Content: strings.Repeat("substantial middle content ", 120)}, // ~1.5k tokens
+		{Role: "assistant", Content: strings.Repeat("and assistant replies ", 120)},
+	}, msgs[3:]...)
+	if _, _, err := big.CompactPinned(context.Background(), nil, bigMsgs, nil); err != nil {
+		t.Fatalf("expected compaction of a substantial middle to succeed: %v", err)
 	}
 }

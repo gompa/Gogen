@@ -611,7 +611,11 @@ func newToolCallID() string {
 	return fmt.Sprintf("call_%x_%x", toolCallIDSeed, seq)
 }
 
-func (a *Agent) prepareMessages(ctx context.Context) []llm.Message {
+// prepareMessages builds the LLM view for the next round, compacting history
+// at conversation boundaries when auto-compaction triggers. h carries the
+// stream handlers for the round; OnCompacting fires before the summarization
+// call so the UI can show compaction progress.
+func (a *Agent) prepareMessages(ctx context.Context, h *llm.StreamHandlers) []llm.Message {
 	var view []llm.Message
 	if a.Context == nil {
 		view = a.Messages
@@ -623,11 +627,14 @@ func (a *Agent) prepareMessages(ctx context.Context) []llm.Message {
 		// whose results are still pending, confusing the LLM.
 		if len(a.Messages) > 0 && a.Messages[len(a.Messages)-1].Role == "user" {
 			if a.shouldCompactUsingCounts() {
+				if h != nil && h.OnCompacting != nil {
+					h.OnCompacting()
+				}
 				var pinned map[int]struct{}
 				if a.PinManager != nil {
 					pinned = a.PinManager.PinnedSet()
 				}
-				compacted, newPins, err := a.Context.CompactPinned(ctx, a.Messages, pinned)
+				compacted, newPins, err := a.Context.CompactPinned(ctx, a.systemPromptPrefix(), a.Messages, pinned)
 				if err == nil {
 					// Publish the compacted history and invalidate the cached
 					// token counts in one atomic step.
@@ -664,6 +671,19 @@ func (a *Agent) prepareMessages(ctx context.Context) []llm.Message {
 	return view
 }
 
+// systemPromptPrefix returns the system/enrichment messages that precede
+// canonical history on the wire (the view minus a.Messages). CompactPinned
+// prepends these to the summarization request so the conversation prefix is
+// byte-identical to the previous turn and provider prompt caching applies.
+func (a *Agent) systemPromptPrefix() []llm.Message {
+	if len(a.Messages) == 0 {
+		return nil
+	}
+	view := withSystemPrompt(a.Messages, a.WorkingDir)
+	view = enrichSystemPrompt(view, a.WorkingDir, a.ProjectFilePath, a.ProjectGuidelines, a.ensureProjectProfile(), a.Mode)
+	return view[:len(view)-len(a.Messages)]
+}
+
 // stabilizeToolArgs ensures every unstabilized tool call has its ArgsStr set.
 // Skipped messages with ArgsStabilized=true — this turns an O(total_tool_calls)
 // scan into O(new_tool_calls) per turn.
@@ -691,7 +711,7 @@ func (a *Agent) CompactHistory(ctx context.Context) error {
 	if len(a.Messages) <= a.Context.Settings.KeepRecentMessages+1 {
 		return fmt.Errorf("not enough history to compact (%d messages)", len(a.Messages))
 	}
-	compacted, newPins, err := a.Context.CompactPinned(ctx, a.Messages, pinnedSet(a.PinManager))
+	compacted, newPins, err := a.Context.CompactPinned(ctx, a.systemPromptPrefix(), a.Messages, pinnedSet(a.PinManager))
 	if err != nil {
 		return err
 	}
@@ -759,7 +779,7 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 			a.FlushSession()
 			return "", ctx.Err()
 		}
-		view := a.prepareMessages(ctx)
+		view := a.prepareMessages(ctx, h)
 
 		if first && h.OnStart != nil {
 			h.OnStart()
