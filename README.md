@@ -137,6 +137,30 @@ mcp_servers:
     args: ["-y", "@modelcontextprotocol/server-fetch"]
 ```
 
+Config values follow a strict schema (typed yaml.v3 decoding): unknown keys are
+ignored, and each key has one canonical spelling — `on`/`off` settings are
+strings, booleans are `true`/`false`, lists are comma-separated strings (e.g.
+`command_allowlist: "go,git"`), and integers are YAML integers. An empty or
+zero value means "use the default", with these exceptions where `0` is a real
+setting:
+
+| Key | `0` means |
+|-----|-----------|
+| `compact_threshold` | auto-compaction disabled (never compact automatically; manual `/compact` still works) |
+| `keep_recent_messages` | keep no recent messages when a compaction runs (only the first user message survives, rest summarized) |
+| `max_tool_result_bytes` | no truncation cap on tool output |
+| `compact_reserve_tokens` | reserve no tokens for new messages after compaction |
+
+Negative values are invalid and fall back to defaults. `compact_threshold`
+must be in `(0, 1]` when set; values outside that range fall back to `0.75`.
+Note that disabling auto-compaction means the full conversation is sent to the
+model each turn, so it will eventually exceed the model's context window.
+
+`--save-config` writes pure YAML (no `---` front-matter markers). `on`/`off`
+values may be emitted quoted (`"on"`), which parses identically; secrets
+(`openai_api_key`, MCP server `env`) are omitted unless
+`--save-config-secrets` is passed.
+
 Snapshot effective settings:
 
 ```bash

@@ -18,54 +18,14 @@ type MCPToolRegistry interface {
 type ToolHandler func(ctx context.Context, a *Agent, args map[string]interface{}) (string, error)
 
 // BuiltinToolHandlers returns the registry of builtin tool implementations.
+// It is derived from builtinToolDefs, so every tool's schema and handler are
+// declared in exactly one place and can never drift apart.
 func BuiltinToolHandlers() map[string]ToolHandler {
-	return map[string]ToolHandler{
-		"list_files":          handleListFiles,
-		"glob_files":          handleGlobFiles,
-		"repo_overview":       handleRepoOverview,
-		"read_file":           handleReadFile,
-		"read_files":          handleReadFiles,
-		"write_file":          handleWriteFile,
-		"execute_command":     handleExecuteCommand,
-		"replace_in_file":     handleReplaceInFile,
-		"patch_file":          handlePatchFile,
-		"run_tests":           handleRunTests,
-		"run_lint":            handleRunLint,
-		"delete_file":         handleDeleteFile,
-		"move_file":           handleMoveFile,
-		"show_diff":           handleShowDiff,
-		"search_code":         handleSearchCode,
-		"find_references":     handleFindReferences,
-		"git_log":             handleGitLog,
-		"git_blame":           handleGitBlame,
-		"git_status":          handleGitStatus,
-		"git_commit":          handleGitCommit,
-		"git_stage":           handleGitStage,
-		"git_branch":          handleGitBranch,
-		"git_stash":           handleGitStash,
-		"git_stash_list":      handleGitStashList,
-		"git_show":            handleGitShow,
-		"copy_file":           handleCopyFile,
-		"todo_add":            handleTodoAdd,
-		"todo_list":           handleTodoList,
-		"todo_done":           handleTodoDone,
-		"todo_remove":         handleTodoRemove,
-		"todo_clear_done":     handleTodoClearDone,
-		"list_definitions":    handleListDefinitions,
-		"web_search":          handleWebSearch,
-		"web_fetch":           handleWebFetch,
-		"download_file":       handleDownloadFile,
-		"find_file":           handleFindFile,
-		"find_definition":     handleFindDefinition,
-		"session_rename":      handleSessionRename,
-		"session_usage":       handleSessionUsage,
-		"context_pin_last":    handleContextPinLast,
-		"context_pins":        handleContextPins,
-		"rename_symbol":       handleRenameSymbol,
-		"multi_edit":          handleMultiEdit,
-		"call_graph":          handleCallGraph,
-		"dependency_analysis": handleDependencyAnalysis,
+	handlers := make(map[string]ToolHandler, len(builtinToolDefs))
+	for _, d := range builtinToolDefs {
+		handlers[d.Definition.Name] = d.Handler
 	}
+	return handlers
 }
 
 func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error) {

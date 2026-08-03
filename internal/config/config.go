@@ -31,12 +31,13 @@ const (
 	DefaultContextLimit = 128000
 )
 
-// MCPServerConfig describes one MCP stdio server entry.
+// MCPServerConfig describes one MCP stdio server entry. Tags cover both the
+// JSON env-var form (GOGEN_MCP_SERVERS) and the YAML project-file form.
 type MCPServerConfig struct {
-	Name    string            `json:"name"`
-	Command string            `json:"command"`
-	Args    []string          `json:"args,omitempty"`
-	Env     map[string]string `json:"env,omitempty"`
+	Name    string            `json:"name" yaml:"name"`
+	Command string            `json:"command" yaml:"command"`
+	Args    []string          `json:"args,omitempty" yaml:"args,omitempty"`
+	Env     map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
 }
 
 type Config struct {

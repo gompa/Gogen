@@ -502,6 +502,9 @@ func (a *Agent) shouldCompactUsingCounts() bool {
 	if !complete {
 		return a.Context.ShouldCompact(msgs)
 	}
+	if !a.Context.AutoCompactEnabled() {
+		return false
+	}
 	if len(msgs) <= a.Context.KeepRecentMessages()+1 {
 		return false
 	}

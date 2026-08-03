@@ -19,44 +19,44 @@ func Merge(pf *ProjectFile, flags FlagOverrides) *config.Config {
 	}
 
 	cfg := &config.Config{
-		OpenAIKey:            mergeString("OPENAI_API_KEY", file, "openai_api_key", file.OpenAIAPIKey, def.OpenAIKey),
-		OpenAIModel:          mergeString("OPENAI_MODEL", file, "openai_model", file.OpenAIModel, def.OpenAIModel),
-		OpenAIURL:            mergeString("OPENAI_BASE_URL", file, "openai_base_url", file.OpenAIBaseURL, def.OpenAIURL),
-		WorkingDir:           mergeString("GOGEN_WORKING_DIR", file, "working_dir", file.WorkingDir, def.WorkingDir),
-		ContextLimit:         mergeInt("GOGEN_CONTEXT_LIMIT", file, "context_limit", file.ContextLimit, def.ContextLimit),
-		CompactThreshold:     mergeFloat("GOGEN_COMPACT_THRESHOLD", file, "compact_threshold", file.CompactThreshold, def.CompactThreshold),
-		KeepRecentMessages:   mergeInt("GOGEN_KEEP_RECENT_MESSAGES", file, "keep_recent_messages", file.KeepRecentMessages, def.KeepRecentMessages),
-		MaxToolResultBytes:   mergeInt("GOGEN_MAX_TOOL_RESULT_BYTES", file, "max_tool_result_bytes", file.MaxToolResultBytes, def.MaxToolResultBytes),
-		CompactReserveTokens: mergeInt("GOGEN_COMPACT_RESERVE_TOKENS", file, "compact_reserve_tokens", file.CompactReserveTokens, def.CompactReserveTokens),
-		CommandSafetyMode:    mergeString("GOGEN_COMMAND_SAFETY", file, "command_safety", file.CommandSafety, def.CommandSafetyMode),
-		CommandAllowlist:     mergeString("GOGEN_COMMAND_ALLOWLIST", file, "command_allowlist", file.CommandAllowlist, def.CommandAllowlist),
-		DeleteApproval:       mergeString("GOGEN_DELETE_APPROVAL", file, "delete_approval", file.DeleteApproval, def.DeleteApproval),
-		TreeSitter:           mergeString("GOGEN_TREESITTER", file, "treesitter", file.TreeSitter, def.TreeSitter),
-		TreeSitterLangs:      mergeString("GOGEN_TREESITTER_LANGS", file, "treesitter_langs", file.TreeSitterLangs, def.TreeSitterLangs),
-		CLIVerbose:           mergeBool("GOGEN_CLI_VERBOSE", file, "cli_verbose", file.CLIVerbose, def.CLIVerbose),
-		DebugLog:             mergeString("GOGEN_DEBUG_LOG", file, "debug_log", file.DebugLog, def.DebugLog),
-		DebugSession:         mergeString("GOGEN_DEBUG_SESSION", file, "debug_session", file.DebugSession, def.DebugSession),
-		MCP:                  mergeString("GOGEN_MCP", file, "mcp", file.MCP, def.MCP),
-		DebugCompareMessages: mergeBool("GOGEN_DEBUG_COMPARE_MESSAGES", file, "debug_compare_messages", file.DebugCompareMessages, def.DebugCompareMessages),
+		OpenAIKey:            mergeString("OPENAI_API_KEY", file.OpenAIAPIKey, def.OpenAIKey),
+		OpenAIModel:          mergeString("OPENAI_MODEL", file.OpenAIModel, def.OpenAIModel),
+		OpenAIURL:            mergeString("OPENAI_BASE_URL", file.OpenAIBaseURL, def.OpenAIURL),
+		WorkingDir:           mergeString("GOGEN_WORKING_DIR", file.WorkingDir, def.WorkingDir),
+		ContextLimit:         mergeInt("GOGEN_CONTEXT_LIMIT", file.ContextLimit, def.ContextLimit),
+		CompactThreshold:     mergeFloatOpt("GOGEN_COMPACT_THRESHOLD", file.CompactThreshold, def.CompactThreshold),
+		KeepRecentMessages:   mergeIntOpt("GOGEN_KEEP_RECENT_MESSAGES", file.KeepRecentMessages, def.KeepRecentMessages),
+		MaxToolResultBytes:   mergeIntOpt("GOGEN_MAX_TOOL_RESULT_BYTES", file.MaxToolResultBytes, def.MaxToolResultBytes),
+		CompactReserveTokens: mergeIntOpt("GOGEN_COMPACT_RESERVE_TOKENS", file.CompactReserveTokens, def.CompactReserveTokens),
+		CommandSafetyMode:    mergeString("GOGEN_COMMAND_SAFETY", file.CommandSafety, def.CommandSafetyMode),
+		CommandAllowlist:     mergeString("GOGEN_COMMAND_ALLOWLIST", file.CommandAllowlist, def.CommandAllowlist),
+		DeleteApproval:       mergeString("GOGEN_DELETE_APPROVAL", file.DeleteApproval, def.DeleteApproval),
+		TreeSitter:           mergeString("GOGEN_TREESITTER", file.TreeSitter, def.TreeSitter),
+		TreeSitterLangs:      mergeString("GOGEN_TREESITTER_LANGS", file.TreeSitterLangs, def.TreeSitterLangs),
+		CLIVerbose:           mergeBool("GOGEN_CLI_VERBOSE", file.CLIVerbose, def.CLIVerbose),
+		DebugLog:             mergeString("GOGEN_DEBUG_LOG", file.DebugLog, def.DebugLog),
+		DebugSession:         mergeString("GOGEN_DEBUG_SESSION", file.DebugSession, def.DebugSession),
+		MCP:                  mergeString("GOGEN_MCP", file.MCP, def.MCP),
+		DebugCompareMessages: mergeBool("GOGEN_DEBUG_COMPARE_MESSAGES", file.DebugCompareMessages, def.DebugCompareMessages),
 		MCPServers:           mergeMCPServers(file),
-		TestCommand:          mergeString("", file, "test_command", file.TestCommand, ""),
-		LintCommand:          mergeString("", file, "lint_command", file.LintCommand, ""),
-		WebBind:              mergeString("GOGEN_WEB_BIND", file, "", "", def.WebBind),
-		WebAllowedOrigins:    mergeString("GOGEN_WEB_ALLOWED_ORIGINS", file, "", "", def.WebAllowedOrigins),
-		WebAuthToken:         mergeString("GOGEN_WEB_TOKEN", file, "web_auth_token", file.WebAuthToken, def.WebAuthToken),
-		WebTLSCertFile:       mergeString("GOGEN_WEB_TLS_CERT", file, "web_tls_cert_file", file.WebTLSCertFile, def.WebTLSCertFile),
-		WebTLSKeyFile:        mergeString("GOGEN_WEB_TLS_KEY", file, "web_tls_key_file", file.WebTLSKeyFile, def.WebTLSKeyFile),
-		SessionMaxCount:      mergeInt("GOGEN_SESSION_MAX_COUNT", file, "session_max_count", file.SessionMaxCount, def.SessionMaxCount),
-		SessionMaxAgeDays:    mergeInt("GOGEN_SESSION_MAX_AGE_DAYS", file, "session_max_age_days", file.SessionMaxAgeDays, def.SessionMaxAgeDays),
-		WebFetch:             mergeString("GOGEN_WEB_FETCH", file, "web_fetch", file.WebFetch, def.WebFetch),
-		WebSearch:            mergeString("GOGEN_WEB_SEARCH", file, "web_search", file.WebSearch, def.WebSearch),
-		WebSearchBackend:     mergeString("GOGEN_WEB_SEARCH_BACKEND", file, "web_search_backend", file.WebSearchBackend, def.WebSearchBackend),
-		WebSearchAPIKey:      mergeString("GOGEN_WEB_SEARCH_API_KEY", file, "web_search_api_key", file.WebSearchAPIKey, def.WebSearchAPIKey),
-		WebAllowedDomains:    mergeString("GOGEN_WEB_ALLOWED_DOMAINS", file, "web_allowed_domains", file.WebAllowedDomains, def.WebAllowedDomains),
-		WebFetchMode:         mergeString("GOGEN_WEB_FETCH_MODE", file, "web_fetch_mode", file.WebFetchMode, def.WebFetchMode),
-		CommandSandbox:       mergeString("GOGEN_COMMAND_SANDBOX", file, "command_sandbox", file.CommandSandbox, def.CommandSandbox),
-		CommandTimeoutSecs:   mergeInt("GOGEN_COMMAND_TIMEOUT_SECS", file, "command_timeout_secs", file.CommandTimeoutSecs, def.CommandTimeoutSecs),
-		PreserveReasoning:    mergeString("GOGEN_PRESERVE_REASONING", file, "preserve_reasoning", file.PreserveReasoning, def.PreserveReasoning),
+		TestCommand:          mergeString("", file.TestCommand, ""),
+		LintCommand:          mergeString("", file.LintCommand, ""),
+		WebBind:              mergeString("GOGEN_WEB_BIND", "", def.WebBind),
+		WebAllowedOrigins:    mergeString("GOGEN_WEB_ALLOWED_ORIGINS", "", def.WebAllowedOrigins),
+		WebAuthToken:         mergeString("GOGEN_WEB_TOKEN", file.WebAuthToken, def.WebAuthToken),
+		WebTLSCertFile:       mergeString("GOGEN_WEB_TLS_CERT", file.WebTLSCertFile, def.WebTLSCertFile),
+		WebTLSKeyFile:        mergeString("GOGEN_WEB_TLS_KEY", file.WebTLSKeyFile, def.WebTLSKeyFile),
+		SessionMaxCount:      mergeInt("GOGEN_SESSION_MAX_COUNT", file.SessionMaxCount, def.SessionMaxCount),
+		SessionMaxAgeDays:    mergeInt("GOGEN_SESSION_MAX_AGE_DAYS", file.SessionMaxAgeDays, def.SessionMaxAgeDays),
+		WebFetch:             mergeString("GOGEN_WEB_FETCH", file.WebFetch, def.WebFetch),
+		WebSearch:            mergeString("GOGEN_WEB_SEARCH", file.WebSearch, def.WebSearch),
+		WebSearchBackend:     mergeString("GOGEN_WEB_SEARCH_BACKEND", file.WebSearchBackend, def.WebSearchBackend),
+		WebSearchAPIKey:      mergeString("GOGEN_WEB_SEARCH_API_KEY", file.WebSearchAPIKey, def.WebSearchAPIKey),
+		WebAllowedDomains:    mergeString("GOGEN_WEB_ALLOWED_DOMAINS", file.WebAllowedDomains, def.WebAllowedDomains),
+		WebFetchMode:         mergeString("GOGEN_WEB_FETCH_MODE", file.WebFetchMode, def.WebFetchMode),
+		CommandSandbox:       mergeString("GOGEN_COMMAND_SANDBOX", file.CommandSandbox, def.CommandSandbox),
+		CommandTimeoutSecs:   mergeInt("GOGEN_COMMAND_TIMEOUT_SECS", file.CommandTimeoutSecs, def.CommandTimeoutSecs),
+		PreserveReasoning:    mergeString("GOGEN_PRESERVE_REASONING", file.PreserveReasoning, def.PreserveReasoning),
 	}
 
 	if flags.WorkingDir != "" {
@@ -96,7 +96,7 @@ func mergeMCPServers(file FileConfig) []config.MCPServerConfig {
 		}
 		return servers
 	}
-	if _, ok := file.Keys["mcp_servers"]; ok {
+	if file.MCPServers != nil {
 		out := make([]config.MCPServerConfig, len(file.MCPServers))
 		for i, s := range file.MCPServers {
 			out[i] = config.MCPServerConfig{
@@ -122,69 +122,119 @@ func cloneStringMap(in map[string]string) map[string]string {
 	return out
 }
 
-func fileHasKey(file FileConfig, key string) bool {
-	if file.Keys == nil {
-		return false
-	}
-	_, ok := file.Keys[key]
-	return ok
+func envString(envKey string) (string, bool) {
+	v, ok := os.LookupEnv(envKey)
+	return v, ok
 }
 
-func mergeString(envKey string, file FileConfig, fileKey, fileVal, def string) string {
-	if _, ok := os.LookupEnv(envKey); ok {
-		return os.Getenv(envKey)
+func envInt(envKey string, def int) (int, bool) {
+	v, ok := os.LookupEnv(envKey)
+	if !ok {
+		return 0, false
 	}
-	if fileHasKey(file, fileKey) {
+	if n, err := strconv.Atoi(v); err == nil {
+		return n, true
+	}
+	log.Printf("warning: %s=%q is not a valid integer; using default %d", envKey, v, def)
+	return def, true
+}
+
+func envFloat(envKey string, def float64) (float64, bool) {
+	v, ok := os.LookupEnv(envKey)
+	if !ok {
+		return 0, false
+	}
+	if f, err := strconv.ParseFloat(v, 64); err == nil {
+		return f, true
+	}
+	log.Printf("warning: %s=%q is not a valid number; using default %g", envKey, v, def)
+	return def, true
+}
+
+func envBool(envKey string, def bool) (bool, bool) {
+	v, ok := os.LookupEnv(envKey)
+	if !ok {
+		return false, false
+	}
+	switch strings.TrimSpace(strings.ToLower(v)) {
+	case "1", "true", "on", "yes":
+		return true, true
+	case "0", "false", "off", "no":
+		return false, true
+	default:
+		log.Printf("warning: %s=%q is not a valid boolean; using default %t", envKey, v, def)
+		return def, true
+	}
+}
+
+// mergeString returns the env value when set, the file value when non-empty,
+// or the default.
+func mergeString(envKey string, fileVal, def string) string {
+	if v, ok := envString(envKey); ok {
+		return v
+	}
+	if fileVal != "" {
 		return fileVal
 	}
 	return def
 }
 
-func mergeInt(envKey string, file FileConfig, fileKey string, fileVal, def int) int {
-	if _, ok := os.LookupEnv(envKey); ok {
-		raw := os.Getenv(envKey)
-		if n, err := strconv.Atoi(raw); err == nil {
-			return n
-		}
-		log.Printf("warning: %s=%q is not a valid integer; using default %d", envKey, raw, def)
-		return def
+// mergeInt returns the env value when set, the file value when non-zero, or
+// the default.
+func mergeInt(envKey string, fileVal, def int) int {
+	if v, ok := envInt(envKey, def); ok {
+		return v
 	}
-	if fileHasKey(file, fileKey) {
+	if fileVal != 0 {
 		return fileVal
 	}
 	return def
 }
 
-func mergeFloat(envKey string, file FileConfig, fileKey string, fileVal, def float64) float64 {
-	if _, ok := os.LookupEnv(envKey); ok {
-		raw := os.Getenv(envKey)
-		if f, err := strconv.ParseFloat(raw, 64); err == nil {
-			return f
-		}
-		log.Printf("warning: %s=%q is not a valid number; using default %g", envKey, raw, def)
-		return def
+// mergeIntOpt is like mergeInt for pointer fields: a non-nil pointer (an
+// explicitly present key, including an explicit 0) wins over the default.
+func mergeIntOpt(envKey string, fileVal *int, def int) int {
+	if v, ok := envInt(envKey, def); ok {
+		return v
 	}
-	if fileHasKey(file, fileKey) {
+	if fileVal != nil {
+		return *fileVal
+	}
+	return def
+}
+
+// mergeFloat returns the env value when set, the file value when non-zero,
+// or the default.
+func mergeFloat(envKey string, fileVal, def float64) float64 {
+	if v, ok := envFloat(envKey, def); ok {
+		return v
+	}
+	if fileVal != 0 {
 		return fileVal
 	}
 	return def
 }
 
-func mergeBool(envKey string, file FileConfig, fileKey string, fileVal, def bool) bool {
-	if _, ok := os.LookupEnv(envKey); ok {
-		raw := os.Getenv(envKey)
-		switch strings.TrimSpace(strings.ToLower(raw)) {
-		case "1", "true", "on", "yes":
-			return true
-		case "0", "false", "off", "no":
-			return false
-		default:
-			log.Printf("warning: %s=%q is not a valid boolean; using default %t", envKey, raw, def)
-			return def
-		}
+// mergeFloatOpt is like mergeFloat for pointer fields.
+func mergeFloatOpt(envKey string, fileVal *float64, def float64) float64 {
+	if v, ok := envFloat(envKey, def); ok {
+		return v
 	}
-	if fileHasKey(file, fileKey) {
-		return fileVal
+	if fileVal != nil {
+		return *fileVal
+	}
+	return def
+}
+
+// mergeBool returns the env value when set, the file value when true, or the
+// default. Both boolean settings default to false, so an explicit false in
+// the file is equivalent to absent.
+func mergeBool(envKey string, fileVal, def bool) bool {
+	if v, ok := envBool(envKey, def); ok {
+		return v
+	}
+	if fileVal {
+		return true
 	}
 	return def
 }

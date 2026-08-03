@@ -243,3 +243,89 @@ func TestSnapshot(t *testing.T) {
 		t.Fatalf("got compactAt %d", snap.CompactAt)
 	}
 }
+
+// Zero values are meaningful for the four context settings: they must pass
+// through NewManager untouched instead of being clamped to defaults.
+func TestNewManagerZeroValuesPreserved(t *testing.T) {
+	m := NewManager(&stubProvider{}, Settings{
+		CompactThreshold:     0,
+		KeepRecentMessages:   0,
+		MaxToolResultBytes:   0,
+		CompactReserveTokens: 0,
+	})
+	if m.Settings.CompactThreshold != 0 {
+		t.Errorf("CompactThreshold = %v, want 0", m.Settings.CompactThreshold)
+	}
+	if m.Settings.KeepRecentMessages != 0 {
+		t.Errorf("KeepRecentMessages = %d, want 0", m.Settings.KeepRecentMessages)
+	}
+	if m.Settings.MaxToolResultBytes != 0 {
+		t.Errorf("MaxToolResultBytes = %d, want 0", m.Settings.MaxToolResultBytes)
+	}
+	if m.Settings.CompactReserveTokens != 0 {
+		t.Errorf("CompactReserveTokens = %d, want 0", m.Settings.CompactReserveTokens)
+	}
+}
+
+func TestNewManagerNegativeValuesFallBackToDefaults(t *testing.T) {
+	m := NewManager(&stubProvider{}, Settings{
+		CompactThreshold:     -1,
+		KeepRecentMessages:   -2,
+		MaxToolResultBytes:   -3,
+		CompactReserveTokens: -4,
+	})
+	d := DefaultSettings()
+	if m.Settings.CompactThreshold != d.CompactThreshold {
+		t.Errorf("CompactThreshold = %v, want default %v", m.Settings.CompactThreshold, d.CompactThreshold)
+	}
+	if m.Settings.KeepRecentMessages != d.KeepRecentMessages {
+		t.Errorf("KeepRecentMessages = %d, want default %d", m.Settings.KeepRecentMessages, d.KeepRecentMessages)
+	}
+	if m.Settings.MaxToolResultBytes != d.MaxToolResultBytes {
+		t.Errorf("MaxToolResultBytes = %d, want default %d", m.Settings.MaxToolResultBytes, d.MaxToolResultBytes)
+	}
+	if m.Settings.CompactReserveTokens != d.CompactReserveTokens {
+		t.Errorf("CompactReserveTokens = %d, want default %d", m.Settings.CompactReserveTokens, d.CompactReserveTokens)
+	}
+}
+
+func TestAutoCompactDisabledAtZeroThreshold(t *testing.T) {
+	m := NewManager(&stubProvider{}, Settings{ContextLimit: 8000, CompactThreshold: 0, KeepRecentMessages: 2})
+	if m.AutoCompactEnabled() {
+		t.Fatal("expected auto-compaction disabled at threshold 0")
+	}
+	if m.ShouldCompact([]llm.Message{{Role: "user", Content: strings.Repeat("word ", 20000)}}) {
+		t.Fatal("expected no auto-compaction at threshold 0")
+	}
+	if got := m.CompactBudget(); got != 0 {
+		t.Fatalf("CompactBudget = %d, want 0 (disabled)", got)
+	}
+}
+
+func TestAutoCompactEnabledAtPositiveThreshold(t *testing.T) {
+	m := NewManager(&stubProvider{}, Settings{CompactThreshold: 0.5})
+	if !m.AutoCompactEnabled() {
+		t.Fatal("expected auto-compaction enabled at threshold 0.5")
+	}
+}
+
+func TestCompactBudgetZeroReserve(t *testing.T) {
+	m := NewManager(&stubProvider{}, Settings{ContextLimit: 8000, CompactThreshold: 0.5, CompactReserveTokens: 0})
+	if got := m.CompactBudget(); got != 4000 {
+		t.Fatalf("CompactBudget = %d, want 4000 (threshold fraction, no reserve)", got)
+	}
+}
+
+func TestEnsureToolResultsCappedZeroMeansNoCap(t *testing.T) {
+	m := NewManager(&stubProvider{}, Settings{MaxToolResultBytes: 0})
+	msgs := []llm.Message{
+		{Role: "user", Content: "task"},
+		{Role: "tool", Content: strings.Repeat("x", 100000), ToolCallID: "c1"},
+	}
+	if m.EnsureToolResultsCapped(msgs) {
+		t.Fatal("expected no truncation with MaxToolResultBytes = 0")
+	}
+	if len(msgs[1].Content) != 100000 {
+		t.Fatalf("tool result was truncated to %d bytes, want untouched 100000", len(msgs[1].Content))
+	}
+}

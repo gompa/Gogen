@@ -223,7 +223,9 @@ func FormatContextDetail(stats TurnContext) string {
 		fmt.Fprintf(&b, "  (%d%%)", pct)
 	}
 	b.WriteString("\n")
-	if snap.CompactAt > 0 {
+	if snap.CompactDisabled {
+		fmt.Fprintf(&b, "  Compact:  off\n")
+	} else if snap.CompactAt > 0 {
 		fmt.Fprintf(&b, "  Compact:  auto at %s\n", formatTokenCount(snap.CompactAt))
 	}
 	fmt.Fprintf(&b, "  Messages: %d\n", snap.MessageCount)

@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gogen/internal/config"
 )
 
 func TestParseRulesOnly(t *testing.T) {
@@ -122,8 +124,8 @@ func TestSaveConfigRedactsSecrets(t *testing.T) {
 	if strings.Contains(text, "sk-secret") {
 		t.Fatalf("secret leaked: %q", text)
 	}
-	if !strings.Contains(text, "OPENAI_API_KEY") {
-		t.Fatalf("expected env comment: %q", text)
+	if strings.Contains(text, "openai_api_key") {
+		t.Fatalf("expected openai_api_key omitted without --save-config-secrets: %q", text)
 	}
 }
 
@@ -135,6 +137,73 @@ func TestSaveConfigWithoutAPIKey(t *testing.T) {
 	cfg := Merge(nil, FlagOverrides{})
 	if err := SaveConfig(cfgPath, mdPath, cfg, "", WriteOptions{}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The writer must never drop a 0 on the four context settings: each 0 is a
+// real setting (auto-compaction off, no recent messages kept, no truncation
+// cap, no reserved tokens), so regeneration must round-trip it.
+func TestSaveConfigPreservesExplicitZeros(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "zero.conf")
+	cfg := Merge(nil, FlagOverrides{})
+	cfg.CompactThreshold = 0
+	cfg.KeepRecentMessages = 0
+	cfg.MaxToolResultBytes = 0
+	cfg.CompactReserveTokens = 0
+	if err := SaveConfig(cfgPath, "", cfg, "", WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, key := range []string{
+		"compact_threshold: 0",
+		"keep_recent_messages: 0",
+		"max_tool_result_bytes: 0",
+		"compact_reserve_tokens: 0",
+	} {
+		if !strings.Contains(text, key) {
+			t.Fatalf("expected %q in generated config:\n%s", key, text)
+		}
+	}
+}
+
+// Pins the overall shape of generated configs: pure YAML (no --- marker),
+// curated key order, and mcp_servers rendered through the YAML encoder.
+func TestSaveConfigOutputShape(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "gogen.conf")
+	cfg := Merge(nil, FlagOverrides{})
+	cfg.OpenAIModel = "gpt-4o"
+	cfg.OpenAIURL = "https://api.openai.com/v1"
+	cfg.WorkingDir = "/home/user/proj"
+	cfg.MCPServers = []config.MCPServerConfig{{Name: "fetch", Command: "npx", Args: []string{"-y", "server"}}}
+	if err := SaveConfig(cfgPath, "", cfg, "", WriteOptions{IncludeSecrets: true}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if strings.HasPrefix(text, "---") {
+		t.Fatalf("expected pure YAML without front-matter marker:\n%s", text)
+	}
+	for _, want := range []string{
+		"openai_model: gpt-4o",
+		"openai_base_url:",
+		"working_dir: /home/user/proj",
+		"compact_threshold: 0.75",
+		"mcp_servers:",
+		"  - name: fetch",
+		"    command: npx",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected %q in output:\n%s", want, text)
+		}
 	}
 }
 
@@ -169,13 +238,47 @@ func TestSaveConfigPreserveReasoning(t *testing.T) {
 	}
 }
 
-func TestCommandAllowlistList(t *testing.T) {
-	pf, err := ParseContent("GOGEN.md", "---\ncommand_allowlist: [go, git, make]\n---\n")
+// List-form allowlists are rejected: the schema requires a comma-separated
+// string, and yaml.v3 cannot unmarshal a sequence into a string field.
+func TestCommandAllowlistListRejected(t *testing.T) {
+	_, err := ParseContent("GOGEN.md", "---\ncommand_allowlist: [go, git, make]\n---\n")
+	if err == nil {
+		t.Fatal("expected list-form command_allowlist to be rejected")
+	}
+}
+
+// Explicit zeros for the pointer-typed fields must survive parsing so the
+// merge layer can distinguish them from absent keys.
+func TestParseZeroValuedFieldsPreserved(t *testing.T) {
+	pf, err := ParseContent("GOGEN.md", "---\nkeep_recent_messages: 0\ncompact_threshold: 0\n---\n")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pf.Config.CommandAllowlist != "go,git,make" {
-		t.Fatalf("got %q", pf.Config.CommandAllowlist)
+	if pf.Config.KeepRecentMessages == nil || *pf.Config.KeepRecentMessages != 0 {
+		t.Fatalf("keep_recent_messages should be explicit 0, got %v", pf.Config.KeepRecentMessages)
+	}
+	if pf.Config.CompactThreshold == nil || *pf.Config.CompactThreshold != 0 {
+		t.Fatalf("compact_threshold should be explicit 0, got %v", pf.Config.CompactThreshold)
+	}
+}
+
+func TestParseAbsentPointerFieldsNil(t *testing.T) {
+	pf, err := ParseContent("GOGEN.md", "---\ncommand_safety: off\n---\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pf.Config.KeepRecentMessages != nil {
+		t.Fatalf("absent keep_recent_messages should be nil, got %d", *pf.Config.KeepRecentMessages)
+	}
+	if pf.Config.CompactThreshold != nil {
+		t.Fatalf("absent compact_threshold should be nil, got %f", *pf.Config.CompactThreshold)
+	}
+}
+
+func TestParseMCPServersRequiresNameAndCommand(t *testing.T) {
+	_, err := ParseContent("GOGEN.md", "---\nmcp_servers:\n  - command: npx\n---\n")
+	if err == nil {
+		t.Fatal("expected error for mcp server entry missing name")
 	}
 }
 

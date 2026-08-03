@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"gogen/internal/config"
+	"gopkg.in/yaml.v3"
 )
 
 // SaveConfig writes effective configuration to cfgPath as pure YAML
@@ -17,7 +18,10 @@ func SaveConfig(cfgPath, guidelinesPath string, cfg *config.Config, guidelines s
 		return fmt.Errorf("config is nil")
 	}
 
-	yamlBody := strings.TrimRight(buildFrontMatter(cfg, opts), "\n") + "\n"
+	yamlBody, err := buildConfigYAML(cfg, opts)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
 		return err
 	}
@@ -49,9 +53,10 @@ func SaveGlobalConfig(cfg *config.Config, opts WriteOptions) error {
 		return fmt.Errorf("config is nil")
 	}
 	path := GlobalConfigPath()
-	// Global config is stored as pure YAML (no front-matter --- markers).
-	// buildFrontMatter includes ---, so re-build without them.
-	yamlBody := strings.TrimRight(buildGlobalFrontMatter(cfg, opts), "\n") + "\n"
+	yamlBody, err := buildConfigYAML(cfg, opts)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -61,182 +66,89 @@ func SaveGlobalConfig(cfg *config.Config, opts WriteOptions) error {
 	return nil
 }
 
-// buildGlobalFrontMatter builds a YAML string without the --- delimiters.
-func buildGlobalFrontMatter(cfg *config.Config, opts WriteOptions) string {
-	var b strings.Builder
+// configYAML is the YAML projection of the effective config written by
+// --save-config. Field order defines output order.
+//
+// The four context settings (CompactThreshold, KeepRecentMessages,
+// MaxToolResultBytes, CompactReserveTokens) deliberately have no omitempty:
+// their zero value is a real setting (auto-compaction off, no recent messages
+// kept, no truncation cap, no reserved tokens), so an explicit 0 must survive
+// regeneration. All other fields follow the file convention that an empty or
+// zero value means "use the default", so they may be omitted when empty.
+type configYAML struct {
+	OpenAIAPIKey         string                   `yaml:"openai_api_key,omitempty"`
+	OpenAIModel          string                   `yaml:"openai_model"`
+	OpenAIBaseURL        string                   `yaml:"openai_base_url"`
+	WorkingDir           string                   `yaml:"working_dir"`
+	ContextLimit         int                      `yaml:"context_limit"`
+	CompactThreshold     float64                  `yaml:"compact_threshold"`
+	KeepRecentMessages   int                      `yaml:"keep_recent_messages"`
+	MaxToolResultBytes   int                      `yaml:"max_tool_result_bytes"`
+	CompactReserveTokens int                      `yaml:"compact_reserve_tokens"`
+	CommandSafety        string                   `yaml:"command_safety"`
+	CommandAllowlist     string                   `yaml:"command_allowlist,omitempty"`
+	DeleteApproval       string                   `yaml:"delete_approval"`
+	TreeSitter           string                   `yaml:"treesitter"`
+	TreeSitterLangs      string                   `yaml:"treesitter_langs,omitempty"`
+	TestCommand          string                   `yaml:"test_command,omitempty"`
+	LintCommand          string                   `yaml:"lint_command,omitempty"`
+	CLIVerbose           bool                     `yaml:"cli_verbose"`
+	DebugLog             string                   `yaml:"debug_log,omitempty"`
+	DebugSession         string                   `yaml:"debug_session,omitempty"`
+	MCP                  string                   `yaml:"mcp"`
+	PreserveReasoning    string                   `yaml:"preserve_reasoning,omitempty"`
+	MCPServers           []config.MCPServerConfig `yaml:"mcp_servers,omitempty"`
+}
+
+// buildConfigYAML renders the effective config as a YAML document. Secrets
+// (openai_api_key, MCP server env) are included only when opts.IncludeSecrets
+// is set; preserve_reasoning is omitted when it is the default "auto".
+func buildConfigYAML(cfg *config.Config, opts WriteOptions) (string, error) {
+	out := configYAML{
+		OpenAIModel:          cfg.OpenAIModel,
+		OpenAIBaseURL:        cfg.OpenAIURL,
+		WorkingDir:           cfg.WorkingDir,
+		ContextLimit:         cfg.ContextLimit,
+		CompactThreshold:     cfg.CompactThreshold,
+		KeepRecentMessages:   cfg.KeepRecentMessages,
+		MaxToolResultBytes:   cfg.MaxToolResultBytes,
+		CompactReserveTokens: cfg.CompactReserveTokens,
+		CommandSafety:        cfg.CommandSafetyMode,
+		CommandAllowlist:     cfg.CommandAllowlist,
+		DeleteApproval:       cfg.DeleteApproval,
+		TreeSitter:           cfg.TreeSitter,
+		TreeSitterLangs:      cfg.TreeSitterLangs,
+		TestCommand:          cfg.TestCommand,
+		LintCommand:          cfg.LintCommand,
+		CLIVerbose:           cfg.CLIVerbose,
+		DebugLog:             cfg.DebugLog,
+		DebugSession:         cfg.DebugSession,
+		MCP:                  cfg.MCP,
+		MCPServers:           cfg.MCPServers,
+	}
 	if opts.IncludeSecrets && cfg.OpenAIKey != "" {
-		writeYAMLString(&b, "openai_api_key", cfg.OpenAIKey)
+		out.OpenAIAPIKey = cfg.OpenAIKey
 	}
-	if cfg.OpenAIModel != "" {
-		writeYAMLString(&b, "openai_model", cfg.OpenAIModel)
+	if mode := strings.ToLower(strings.TrimSpace(cfg.PreserveReasoning)); mode != "" && mode != "auto" {
+		out.PreserveReasoning = mode
 	}
-	if cfg.OpenAIURL != "" {
-		writeYAMLString(&b, "openai_base_url", cfg.OpenAIURL)
-	}
-	writeYAMLString(&b, "working_dir", cfg.WorkingDir)
-	writeYAMLInt(&b, "context_limit", cfg.ContextLimit)
-	writeYAMLFloat(&b, "compact_threshold", cfg.CompactThreshold)
-	writeYAMLInt(&b, "keep_recent_messages", cfg.KeepRecentMessages)
-	writeYAMLInt(&b, "max_tool_result_bytes", cfg.MaxToolResultBytes)
-	writeYAMLInt(&b, "compact_reserve_tokens", cfg.CompactReserveTokens)
-	writeYAMLString(&b, "command_safety", cfg.CommandSafetyMode)
-	if cfg.CommandAllowlist != "" {
-		writeYAMLString(&b, "command_allowlist", cfg.CommandAllowlist)
-	}
-	writeYAMLString(&b, "delete_approval", cfg.DeleteApproval)
-	writeYAMLString(&b, "treesitter", cfg.TreeSitter)
-	if cfg.TreeSitterLangs != "" {
-		writeYAMLString(&b, "treesitter_langs", cfg.TreeSitterLangs)
-	}
-	if cfg.TestCommand != "" {
-		writeYAMLString(&b, "test_command", cfg.TestCommand)
-	}
-	if cfg.LintCommand != "" {
-		writeYAMLString(&b, "lint_command", cfg.LintCommand)
-	}
-	writeYAMLBool(&b, "cli_verbose", cfg.CLIVerbose)
-	if cfg.DebugLog != "" {
-		writeYAMLString(&b, "debug_log", cfg.DebugLog)
-	}
-	if cfg.DebugSession != "" {
-		writeYAMLString(&b, "debug_session", cfg.DebugSession)
-	}
-	writeYAMLString(&b, "mcp", cfg.MCP)
-	writePreserveReasoning(&b, cfg.PreserveReasoning)
-	if len(cfg.MCPServers) > 0 {
-		b.WriteString("mcp_servers:\n")
-		for _, s := range cfg.MCPServers {
-			b.WriteString(fmt.Sprintf("  - name: %q\n", s.Name))
-			b.WriteString(fmt.Sprintf("    command: %q\n", s.Command))
-			if len(s.Args) > 0 {
-				b.WriteString("    args:\n")
-				for _, arg := range s.Args {
-					b.WriteString(fmt.Sprintf("      - %q\n", arg))
-				}
-			}
-			if len(s.Env) > 0 {
-				if opts.IncludeSecrets {
-					b.WriteString("    env:\n")
-					for k, v := range s.Env {
-						b.WriteString(fmt.Sprintf("      %s: %q\n", k, v))
-					}
-				} else {
-					b.WriteString("    # env: omitted (use --save-config-secrets to persist)\n")
-				}
+	if !opts.IncludeSecrets && len(cfg.MCPServers) > 0 {
+		// Copy without env so secrets are never persisted. The slice shares
+		// its backing array with cfg, so a fresh copy is required.
+		out.MCPServers = make([]config.MCPServerConfig, len(cfg.MCPServers))
+		for i, s := range cfg.MCPServers {
+			out.MCPServers[i] = config.MCPServerConfig{
+				Name:    s.Name,
+				Command: s.Command,
+				Args:    append([]string(nil), s.Args...),
+				// Env intentionally nil: persisted only with --save-config-secrets.
 			}
 		}
 	}
-	return b.String()
-}
 
-func buildFrontMatter(cfg *config.Config, opts WriteOptions) string {
-	var b strings.Builder
-	b.WriteString("---\n")
-	if opts.IncludeSecrets && cfg.OpenAIKey != "" {
-		writeYAMLString(&b, "openai_api_key", cfg.OpenAIKey)
-	} else if cfg.OpenAIKey != "" {
-		b.WriteString("# openai_api_key: use OPENAI_API_KEY env var\n")
+	body, err := yaml.Marshal(out)
+	if err != nil {
+		return "", fmt.Errorf("marshal config YAML: %w", err)
 	}
-	writeYAMLString(&b, "openai_model", cfg.OpenAIModel)
-	writeYAMLString(&b, "openai_base_url", cfg.OpenAIURL)
-	writeYAMLString(&b, "working_dir", cfg.WorkingDir)
-	writeYAMLInt(&b, "context_limit", cfg.ContextLimit)
-	writeYAMLFloat(&b, "compact_threshold", cfg.CompactThreshold)
-	writeYAMLInt(&b, "keep_recent_messages", cfg.KeepRecentMessages)
-	writeYAMLInt(&b, "max_tool_result_bytes", cfg.MaxToolResultBytes)
-	writeYAMLInt(&b, "compact_reserve_tokens", cfg.CompactReserveTokens)
-	writeYAMLString(&b, "command_safety", cfg.CommandSafetyMode)
-	if cfg.CommandAllowlist != "" {
-		writeYAMLString(&b, "command_allowlist", cfg.CommandAllowlist)
-	}
-	writeYAMLString(&b, "delete_approval", cfg.DeleteApproval)
-	writeYAMLString(&b, "treesitter", cfg.TreeSitter)
-	if cfg.TreeSitterLangs != "" {
-		writeYAMLString(&b, "treesitter_langs", cfg.TreeSitterLangs)
-	}
-	if cfg.TestCommand != "" {
-		writeYAMLString(&b, "test_command", cfg.TestCommand)
-	}
-	if cfg.LintCommand != "" {
-		writeYAMLString(&b, "lint_command", cfg.LintCommand)
-	}
-	writeYAMLBool(&b, "cli_verbose", cfg.CLIVerbose)
-	if cfg.DebugLog != "" {
-		writeYAMLString(&b, "debug_log", cfg.DebugLog)
-	}
-	if cfg.DebugSession != "" {
-		writeYAMLString(&b, "debug_session", cfg.DebugSession)
-	}
-	writeYAMLString(&b, "mcp", cfg.MCP)
-	writePreserveReasoning(&b, cfg.PreserveReasoning)
-	if len(cfg.MCPServers) > 0 {
-		b.WriteString("mcp_servers:\n")
-		for _, s := range cfg.MCPServers {
-			b.WriteString(fmt.Sprintf("  - name: %q\n", s.Name))
-			b.WriteString(fmt.Sprintf("    command: %q\n", s.Command))
-			if len(s.Args) > 0 {
-				b.WriteString("    args:\n")
-				for _, arg := range s.Args {
-					b.WriteString(fmt.Sprintf("      - %q\n", arg))
-				}
-			}
-			if len(s.Env) > 0 {
-				if opts.IncludeSecrets {
-					b.WriteString("    env:\n")
-					for k, v := range s.Env {
-						b.WriteString(fmt.Sprintf("      %s: %q\n", k, v))
-					}
-				} else {
-					b.WriteString("    # env: omitted (use --save-config-secrets to persist)\n")
-				}
-			}
-		}
-	}
-	return b.String()
-}
-
-// writePreserveReasoning emits the key only when it differs from the default
-// ("auto"), so generated configs stay quiet unless the user overrode it.
-func writePreserveReasoning(b *strings.Builder, mode string) {
-	mode = strings.ToLower(strings.TrimSpace(mode))
-	if mode == "" || mode == "auto" {
-		return
-	}
-	writeYAMLString(b, "preserve_reasoning", mode)
-}
-
-func writeYAMLString(b *strings.Builder, key, val string) {
-	b.WriteString(key)
-	b.WriteString(": ")
-	b.WriteString(strconvQuote(val))
-	b.WriteByte('\n')
-}
-
-func writeYAMLInt(b *strings.Builder, key string, val int) {
-	fmt.Fprintf(b, "%s: %d\n", key, val)
-}
-
-func writeYAMLFloat(b *strings.Builder, key string, val float64) {
-	fmt.Fprintf(b, "%s: %g\n", key, val)
-}
-
-func writeYAMLBool(b *strings.Builder, key string, val bool) {
-	fmt.Fprintf(b, "%s: %t\n", key, val)
-}
-
-func strconvQuote(s string) string {
-	if s == "" {
-		return `""`
-	}
-	needsQuote := false
-	for _, r := range s {
-		if r == ':' || r == '#' || r == '\n' || r == '"' || r == '\'' {
-			needsQuote = true
-			break
-		}
-	}
-	if !needsQuote {
-		return s
-	}
-	return fmt.Sprintf("%q", s)
+	return string(body), nil
 }

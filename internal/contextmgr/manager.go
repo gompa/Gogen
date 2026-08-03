@@ -43,16 +43,21 @@ type Manager struct {
 }
 
 func NewManager(provider llm.LLMProvider, settings Settings) *Manager {
-	if settings.CompactThreshold <= 0 || settings.CompactThreshold > 1 {
+	// 0 is meaningful for these fields (see Settings docs): compact_threshold
+	// 0 disables auto-compaction, keep_recent_messages 0 keeps no recent
+	// messages on compaction, max_tool_result_bytes 0 removes the truncation
+	// cap, compact_reserve_tokens 0 reserves no tokens. Only negative values
+	// are invalid and fall back to defaults.
+	if settings.CompactThreshold < 0 || settings.CompactThreshold > 1 {
 		settings.CompactThreshold = DefaultSettings().CompactThreshold
 	}
-	if settings.KeepRecentMessages <= 0 {
+	if settings.KeepRecentMessages < 0 {
 		settings.KeepRecentMessages = DefaultSettings().KeepRecentMessages
 	}
-	if settings.MaxToolResultBytes <= 0 {
+	if settings.MaxToolResultBytes < 0 {
 		settings.MaxToolResultBytes = DefaultSettings().MaxToolResultBytes
 	}
-	if settings.CompactReserveTokens <= 0 {
+	if settings.CompactReserveTokens < 0 {
 		settings.CompactReserveTokens = DefaultSettings().CompactReserveTokens
 	}
 	manual := 0
@@ -151,6 +156,15 @@ func (m *Manager) KeepRecentMessages() int {
 	return m.Settings.KeepRecentMessages
 }
 
+// AutoCompactEnabled reports whether automatic compaction is enabled
+// (compact_threshold > 0). A threshold of 0 disables auto-compaction; manual
+// compaction via Compact/CompactHistory is unaffected.
+func (m *Manager) AutoCompactEnabled() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.Settings.CompactThreshold > 0
+}
+
 // SetContextLimit sets the context window size directly, bypassing provider
 // resolution. Used when restoring a session snapshot so the limit is available
 // synchronously before the async provider refresh completes.
@@ -183,14 +197,15 @@ func truncateToolResult(content string, max int) string {
 
 // ContextSnapshot summarizes context window usage for display.
 type ContextSnapshot struct {
-	Limit         int
-	Used          int
-	Stored        int
-	CompactAt     int
-	MessageCount  int
-	ToolTruncated bool
-	NearCompact   bool
-	Percent       float64
+	Limit           int
+	Used            int
+	Stored          int
+	CompactAt       int
+	MessageCount    int
+	ToolTruncated   bool
+	CompactDisabled bool // auto-compaction disabled (compact_threshold = 0)
+	NearCompact     bool
+	Percent         float64
 }
 
 // Snapshot estimates token usage for canonical history and the LLM view.
@@ -238,13 +253,14 @@ func (m *Manager) snapshot(canonical, llmView []llm.Message, stored int) Context
 // buildSnapshot creates a ContextSnapshot from computed values.
 func (m *Manager) buildSnapshot(limit, compactAt, stored, used, msgCount int, truncated bool) ContextSnapshot {
 	snap := ContextSnapshot{
-		Limit:         limit,
-		Used:          used,
-		Stored:        stored,
-		CompactAt:     compactAt,
-		MessageCount:  msgCount,
-		ToolTruncated: truncated,
-		NearCompact:   used >= compactAt,
+		Limit:           limit,
+		Used:            used,
+		Stored:          stored,
+		CompactAt:       compactAt,
+		MessageCount:    msgCount,
+		ToolTruncated:   truncated,
+		CompactDisabled: compactAt <= 0,
+		NearCompact:     compactAt > 0 && used >= compactAt,
 	}
 	if limit > 0 {
 		snap.Percent = float64(used) / float64(limit)
@@ -266,6 +282,9 @@ func (m *Manager) compactBudgetLocked() int {
 	if limit <= 0 {
 		limit = config.DefaultContextLimit
 	}
+	if m.Settings.CompactThreshold <= 0 {
+		return 0 // auto-compaction disabled
+	}
 	budget := int(float64(limit) * m.Settings.CompactThreshold)
 	budget -= m.Settings.CompactReserveTokens
 	if budget < 1000 {
@@ -281,6 +300,9 @@ func (m *Manager) ShouldCompact(messages []llm.Message) bool {
 	keep := m.Settings.KeepRecentMessages
 	budget := m.compactBudgetLocked()
 	m.mu.RUnlock()
+	if budget <= 0 {
+		return false // auto-compaction disabled
+	}
 	if len(messages) <= keep+1 {
 		return false
 	}
