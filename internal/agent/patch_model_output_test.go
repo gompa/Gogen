@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"path/filepath"
 	"testing"
 )
 
@@ -81,7 +82,7 @@ func TestParseUnifiedDiffModelPatchWithRepeatedEndMarkers(t *testing.T) {
 	if len(files) != 1 {
 		t.Fatalf("files=%d want 1", len(files))
 	}
-	if normalizePatchPath(files[0].newName) != "tmp/bidi_full.mjs" {
+	if filepath.ToSlash(normalizePatchPath(files[0].newName)) != "tmp/bidi_full.mjs" {
 		t.Fatalf("path=%q", files[0].newName)
 	}
 	hunks := files[0].hunks

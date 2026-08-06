@@ -369,7 +369,7 @@ func TestParseUnifiedDiffRepeatedEndPatchTrailer(t *testing.T) {
 	if len(files) != 1 {
 		t.Fatalf("files=%d want 1", len(files))
 	}
-	if normalizePatchPath(files[0].newName) != "internal/server/workingdir_test.go" {
+	if filepath.ToSlash(normalizePatchPath(files[0].newName)) != "internal/server/workingdir_test.go" {
 		t.Fatalf("path=%q", files[0].newName)
 	}
 	hunks := files[0].hunks
