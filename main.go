@@ -49,10 +49,10 @@ func parseCLIOptions() (cliFlags, string) {
 	flag.StringVar(&opts.dir, "dir", "", "Specify the working directory")
 	flag.StringVar(&opts.url, "url", "", "OpenAI API base URL (e.g. https://api.openai.com/v1)")
 	flag.BoolVar(&opts.global, "global", false, "Run in global mode (ignore project config, use ~/.config/gogen/)")
-	flag.BoolVar(&opts.saveConfig, "save-config", false, "Write effective config to .gogen/gogen.md and exit")
+	flag.BoolVar(&opts.saveConfig, "save-config", false, "Write effective config to .gogen/gogen.conf and guidelines to .gogen/gogen.md, then exit")
 	flag.BoolVar(&opts.saveConfigSecrets, "save-config-secrets", false, "Include openai_api_key when using --save-config")
 	flag.StringVar(&opts.prompt, "p", "", "Run a single prompt and exit (non-interactive)")
-	flag.StringVar(&opts.saveConfigPath, "save-config-path", "", "Output path for --save-config (default .gogen/gogen.md)")
+	flag.StringVar(&opts.saveConfigPath, "save-config-path", "", "Output path for --save-config config file (default .gogen/gogen.conf)")
 
 	flag.Parse()
 
@@ -321,8 +321,8 @@ func main() {
 		}
 
 		s := server.NewServer(a, cfg)
-		// Flush every registered session agent on shutdown (multi-session
-		// plan Phase 6). Both this sweep and the outer defer use the
+		// Flush every registered session agent on shutdown. Both this
+		// sweep and the outer defer use the
 		// non-forcing FlushPending: the sweep must persist unsaved state,
 		// but a forced write on a clean session re-stamps its Updated
 		// timestamp with ~now in registry order, which reshuffled the

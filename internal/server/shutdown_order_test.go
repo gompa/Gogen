@@ -48,7 +48,7 @@ func TestShutdownPreservesSessionOrdering(t *testing.T) {
 		t.Fatalf("precondition: LatestID = %s (err=%v), want %s", latest, err, s2ID)
 	}
 
-	// QUIT: the Phase 6 sweep plus main.go's outer deferred FlushPending.
+	// QUIT: the shutdown sweep plus main.go's outer deferred FlushPending.
 	s.ShutdownSessions()
 	a.FlushPending()
 

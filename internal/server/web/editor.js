@@ -22,8 +22,11 @@ self.MonacoEnvironment = {
 };
 
 export const GOGEN_UI = {
-  // Flip to false for inline (unified-style) DiffEditor rendering.
-  diffRenderSideBySide: true,
+  // Flip to false for inline (unified-style) DiffEditor rendering. Applies
+  // to the EDITOR pane's git-diff view only — chat tool-card diffs are
+  // always unified and use the separate "Chat diff viewer" setting.
+  // Persisted so the choice survives reloads.
+  diffRenderSideBySide: localStorage.getItem('gogen_diff_layout') !== 'inline',
   maxOpenTabs: 20,
 };
 
@@ -753,7 +756,7 @@ function ensureEditors() {
       label: 'Copy Path',
       contextMenuGroupId: '9_cutcopypaste',
       contextMenuOrder: 5,
-      run(ed) {
+      run(_ed) {
         if (!activePath || !navigator.clipboard) return;
         navigator.clipboard.writeText(activePath).catch(() => {});
       },
@@ -814,6 +817,16 @@ function isDirty(path) {
   const b = buffers.get(path);
   if (!b || !b.model) return false;
   return b.model.getAlternativeVersionId() !== b.savedVersionId;
+}
+
+// True when any open buffer has unsaved edits; drives the beforeunload
+// guard so closing/reloading the page never silently discards changes
+// (the close-tab modal only covers closing individual tabs).
+function anyDirtyBuffer() {
+  for (const path of buffers.keys()) {
+    if (isDirty(path)) return true;
+  }
+  return false;
 }
 
 function updatePathLabel() {
@@ -1539,8 +1552,15 @@ export function setupEditorUI() {
       if (e.target === kbOverlay) closeModal(kbOverlay);
     });
   }
+  // Sync the toolbar button label with the persisted layout (the HTML
+  // default says "Side-by-side" even when the saved preference is Inline).
+  {
+    const lbl = $('btn-diff-layout');
+    if (lbl) lbl.textContent = GOGEN_UI.diffRenderSideBySide ? 'Side-by-side' : 'Inline';
+  }
   $('btn-diff-layout')?.addEventListener('click', () => {
     GOGEN_UI.diffRenderSideBySide = !GOGEN_UI.diffRenderSideBySide;
+    localStorage.setItem('gogen_diff_layout', GOGEN_UI.diffRenderSideBySide ? 'side-by-side' : 'inline');
     if (diffEditor) {
       diffEditor.updateOptions({ renderSideBySide: GOGEN_UI.diffRenderSideBySide });
     }
@@ -1729,6 +1749,14 @@ export function setupEditorUI() {
   });
 
   updateUndoRedoButtons();
+
+  // Warn before the page unloads with unsaved buffers: reloading or closing
+  // the tab would otherwise discard edits silently.
+  window.addEventListener('beforeunload', (e) => {
+    if (!anyDirtyBuffer()) return;
+    e.preventDefault();
+    e.returnValue = '';
+  });
 }
 
 export { saveAll, saveActive };

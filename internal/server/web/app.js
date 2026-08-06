@@ -72,7 +72,7 @@
         // is single-slot, and overwriting the pending id would leave the
         // first session's turn waiting forever on a channel that is never
         // resolved. Each entry carries its sessionId so the response routes
-        // to the right session's runtime (E5).
+        // to the right session's runtime.
         let pendingDeleteApprovals = []; // {approvalId, sessionId, reason, paths}
         let messageRawStore = new WeakMap();
         // Last sessions payload from the server. The sidebar's single
@@ -81,8 +81,16 @@
         // round-trip per state flip.
         let lastSessions = null;
 
+        // Bounded toast stack: a burst of events (copy feedback, connection
+        // flips) must not pile an unbounded column over the composer. When
+        // the cap is hit the oldest toast is removed first.
+        const MAX_TOASTS = 8;
+
         function showToast(message, kind = 'info') {
             if (!toastHost || !message) return;
+            while (toastHost.childElementCount >= MAX_TOASTS) {
+                toastHost.firstElementChild?.remove();
+            }
             const el = document.createElement('div');
             el.className = `toast ${kind}`;
             el.textContent = message;
@@ -356,7 +364,7 @@
                     e.stopPropagation();
                     if (m.id === current) { closeModelPopover(); return; }
                     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-                    // set_model is per-session (D1): the sessionId scopes it
+                    // set_model is per-session: the sessionId scopes it
                     // to the requesting pane's provider only.
                     ws.send(JSON.stringify({ type: 'set_model', model: m.id, sessionId: activePane().id }));
                     closeModelPopover();
@@ -667,7 +675,6 @@
         }
 
         function applyServerConfig(data) {
-            console.log('[pricing] applyServerConfig', { model: data.model, inputPrice: data.inputPricePer1M, totalTurns: data.totalTurns });
             if (data.workingDir) {
                 dirInput.value = data.workingDir;
                 if (workingDirPath) workingDirPath.textContent = data.workingDir;
@@ -685,7 +692,6 @@
             updateGlobalMode(data.globalMode);
             // Sync pricing from server-provided fields (always present on config from cached lookups)
             if (data.inputPricePer1M) {
-                console.log('[pricing] SET from config message', data.inputPricePer1M);
                 currentModelPricing = {
                     input: data.inputPricePer1M,
                     output: data.outputPricePer1M || 0,
@@ -754,7 +760,7 @@
                 return;
             }
             inputArea.value = text;
-            sendBtn.onclick();
+            sendMessage();
         }
 
         function buildEmptyState() {
@@ -926,7 +932,7 @@
             });
         }
 
-        // ── Multi-pane sessions (Phase 5) ──
+        // ── Multi-pane sessions ──
         // The UI renders one transcript at a time — the ACTIVE pane. Every
         // open pane keeps its control state (turnActive, pending flags,
         // context data) in `panes`; the module-level state variables above
@@ -948,7 +954,7 @@
                 // Latched when this pane is attached to a session whose turn
                 // is RUNNING (mid-turn focus / reconnect): the attach history
                 // snapshot lacks the in-flight reply, so on turn_end we
-                // re-attach once to converge the transcript (Defect C).
+                // re-attach once to converge the transcript.
                 needsFreshHistory: false,
                 // Session id whose turn_end must be ignored: set when the
                 // user resumes another session while this pane's session has
@@ -1421,7 +1427,7 @@
             content.textContent = summary;
             body.appendChild(content);
 
-            // Task 16: Copy button on tool results
+            // Copy button on tool results
             if (full.trim()) {
                 const copyBtn = document.createElement('button');
                 copyBtn.className = 'tool-result-copy';
@@ -1787,7 +1793,7 @@
         /** Send a fork request.
          *  For history-replayed messages the server-side message index is used.
          *  For streaming messages (no histIdx) we pass -1 meaning "last assistant".
-         *  The fork opens a NEW pane with the fork's history (Phase 5); the
+         *  The fork opens a NEW pane with the fork's history; the
          *  source session is left untouched. */
         function forkSession(msgIdx) {
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -2239,7 +2245,6 @@
 
         // Refresh relative timestamps every 30 seconds
         setInterval(() => {
-            const now = Date.now();
             document.querySelectorAll('.message[data-created-at]').forEach(el => {
                 const t = el.querySelector('.message-time');
                 if (t) {
@@ -2253,8 +2258,6 @@
         function formatToolArgs(args) {
             if (!args || typeof args !== 'object') return '';
             const parts = [];
-            // Task 8: Make file paths clickable
-            const FILE_KEYS = ['file_path', 'path', 'source', 'destination', 'glob'];
             for (const [key, value] of Object.entries(args)) {
                 // Diffs are shown in Monaco; keep the header compact.
                 if (key === 'diff' && typeof value === 'string') {
@@ -2903,6 +2906,9 @@
         let userTermFocused = false;
         let terminalExpanded = false;
         let terminalHeight = TERM_DEFAULT_HEIGHT;
+        // True when xterm.js failed to load/init; the strip then shows the
+        // fallback hint instead of looking silently broken.
+        let terminalLoadFailed = false;
         try {
             const stored = JSON.parse(localStorage.getItem(TERM_STORE_KEY) || '{}');
             terminalExpanded = !!stored.expanded;
@@ -2987,7 +2993,7 @@
             });
         }
 
-        function terminalSetExpanded(expanded, opts = {}) {
+        function terminalSetExpanded(expanded) {
             terminalExpanded = expanded;
             terminalPanel.classList.toggle('expanded', expanded);
             if (expanded) {
@@ -3011,7 +3017,10 @@
         }
 
         function terminalUpdateHint() {
-            terminalHint.style.display = terminals.size > 0 ? 'none' : '';
+            // Only the genuine failure case gets the fallback message: an
+            // empty strip (no tabs yet, or all agent tabs closed) is normal
+            // and shows nothing.
+            terminalHint.style.display = (terminalLoadFailed && terminals.size === 0) ? '' : 'none';
         }
 
         // Creates a terminal tab and its xterm instance. opts:
@@ -3417,7 +3426,7 @@
 
         // ===== Terminal panel: expand/collapse + resize =====
         terminalChevron.addEventListener('click', () => {
-            terminalSetExpanded(!terminalExpanded, { focus: false });
+            terminalSetExpanded(!terminalExpanded);
         });
 
         let termDrag = null;
@@ -3459,7 +3468,7 @@
             const tabs = document.getElementById('top-tabs');
             terminalPanel.style.top = (tabs ? tabs.getBoundingClientRect().height : 41) + 'px';
             terminalTabBtn.classList.add('active');
-            terminalSetExpanded(true, { focus: true });
+            terminalSetExpanded(true);
             terminalUpdateBadge();
             terminalFitSoon();
         }
@@ -3538,6 +3547,7 @@
             // tear down any half-created terminal UI and keep going so
             // connect() below still runs.
             console.error('terminal init failed:', err);
+            terminalLoadFailed = true;
             document.querySelectorAll('#terminal-tabs .term-tab, #terminal-body .term-host')
                 .forEach((el) => el.remove());
             terminals.clear();
@@ -3570,7 +3580,7 @@
                     || ((fn) => setTimeout(fn, 200));
                 scheduleModels(() => ensureModelsLoaded());
 
-                // Re-attach every open pane (Phase 5): the server resends
+                // Re-attach every open pane: the server resends
                 // session_state + history + config + context per pane. The
                 // active pane's transcript rebuilds from its attach response;
                 // background panes just re-register (their transcript
@@ -3779,8 +3789,8 @@
                     updateTitle('idle');
                     setInputProgress(null);
                     pendingSessionResponse = false;
-                    // Defect C: a pane attached mid-turn never received the
-                    // in-flight reply (assistant messages are appended only
+                    // A pane attached mid-turn never received the in-flight
+                    // reply (assistant messages are appended only
                     // when a round completes). Now that the turn is done the
                     // full history is available — re-attach once so the
                     // transcript converges.
@@ -3896,7 +3906,7 @@
                     requestSessionList();
                 } else if (data.type === 'session_detached') {
                     // The runtime is gone: the registry evicted this session
-                    // (web_max_active_sessions cap, E11), or it was
+                    // (web_max_active_sessions cap), or it was
                     // explicitly closed (session_close) while this tab raced
                     // to attach. It is saved, not deleted: close the pane
                     // like a removal — the session stays in the saved-
@@ -4038,8 +4048,8 @@
                 } else if (data.type === 'history') {
                     // Full snapshot — replace the pane so reconnect / session
                     // restore never stacks duplicate transcripts. One guard:
-                    // the turn_end convergence refetch (Defect C) can race a
-                    // new turn the user started at the boundary — its snapshot
+                    // the turn_end convergence refetch can race a new turn
+                    // the user started at the boundary — its snapshot
                     // is OLDER than the live transcript, so skip the rebuild
                     // (a fresh attach latches needsFreshHistory via its
                     // session_state first; a stale refetch does not).
@@ -4187,7 +4197,7 @@
             };
         }
 
-        sendBtn.onclick = () => {
+        function sendMessage() {
             const text = inputArea.value.trim();
             if (!text) return;
             if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -4249,7 +4259,8 @@
             contextEstAdded = 0;
             ws.send(JSON.stringify({ type: 'message', content: text, sessionId: activePane().id }));
             inputArea.value = '';
-        };
+        }
+        sendBtn.onclick = sendMessage;
 
         cancelBtn.onclick = () => {
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -4263,7 +4274,7 @@
 
         inputArea.addEventListener('input', updateSlashSuggest);
 
-        /* Task 1: Textarea auto-resize is handled natively by CSS
+        /* Textarea auto-resize is handled natively by CSS
            `field-sizing: content` (see styles.css) — no JS size tracking.
            The browser grows/shrinks the box with its content and clamps it
            via min-height/max-height. Firefox 152+ / Chrome 123+ / Safari
@@ -4312,7 +4323,7 @@
             }
             if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
-                sendBtn.onclick();
+                sendMessage();
             }
             if (e.key === 'Escape' && turnActive) {
                 e.preventDefault();
@@ -4406,9 +4417,10 @@
                 const meta = document.createElement('div');
                 meta.className = 'session-row-meta';
                 const frags = [];
-                if (entry && entry.messageCount != null) frags.push(`${entry.messageCount} msgs`);
                 // Every pane state gets a uniform colored-dot indicator: the
-                // dot carries the state color and the label stays muted.
+                // dot carries the state color and the label stays muted. The
+                // status indicator is pushed first so it always renders ahead
+                // of the message count and relative time in the meta row.
                 //   active              → green   (this pane is focused)
                 //   responding          → amber   (a turn is running)
                 //   creating…           → gray    (session id not assigned yet)
@@ -4450,6 +4462,7 @@
                     group.appendChild(label);
                     frags.push(group);
                 }
+                if (entry && entry.messageCount != null) frags.push(`${entry.messageCount} msgs`);
                 const rel = relativeTime(s.updatedAt);
                 if (rel) {
                     // Tag the relative time so the 30s tick can refresh it in
@@ -4569,7 +4582,7 @@
                 showToast('Session change already in progress', 'info');
                 return;
             }
-            // The sidebar "New" button opens a NEW pane (D3); the previous
+            // The sidebar "New" button opens a NEW pane; the previous
             // pane stays open in the background. The new pane's session id
             // arrives in the config reply (re-key via the config handler).
             saveActivePaneState();
@@ -4683,30 +4696,77 @@
 
         function exportChat() {
             const lines = [];
+            const pane = activePane();
             const sessionId = (sessionInfoDiv.textContent || 'session').replace(/[^\w.-]+/g, '_');
+            const label = (pane && pane.label) || '';
             const date = new Date().toISOString().slice(0, 10);
-            lines.push(`# GoGen chat (${sessionId})`);
+            lines.push(`# GoGen chat${label ? ` — ${label}` : ''} (${sessionId})`);
+            lines.push(`_Exported ${new Date().toLocaleString()}_`);
             lines.push('');
-            for (const el of messagesDiv.querySelectorAll('.message')) {
+            for (const el of messagesDiv.querySelectorAll('.message, .tool-card')) {
                 if (el.classList.contains('system') || el.classList.contains('thinking') || el.classList.contains('thinking-block')) {
                     continue;
                 }
-                if (el.classList.contains('tool-card') || el.classList.contains('thought-card')) continue;
+                if (el.classList.contains('thought-card')) continue;
+                if (el.classList.contains('tool-card')) {
+                    // Tool call card: name, args, result, and (for patch_file /
+                    // show_diff) the raw diff text from the fallback <pre>.
+                    const nameEl = el.querySelector('.tool-name');
+                    const name = nameEl ? nameEl.textContent.trim() : 'tool';
+                    const statusEl = el.querySelector('.tool-status-bar');
+                    const status = statusEl ? statusEl.textContent.trim() : '';
+                    const argsText = (el.querySelector('.tool-args')?.textContent || '').trim();
+                    let resultText = (el.querySelector('.tool-result-body')?.textContent || '').trim();
+                    // The status bar is a child of the result body; drop its
+                    // label from the text so it is not duplicated.
+                    if (status && resultText.startsWith(status)) {
+                        resultText = resultText.slice(status.length).trim();
+                    }
+                    const copyLabel = el.querySelector('.tool-result-copy')?.textContent || '';
+                    if (copyLabel && resultText.startsWith(copyLabel)) {
+                        resultText = resultText.slice(copyLabel.length).trim();
+                    }
+                    const diffText = (el.querySelector('.monaco-tool-host .diff-fallback')?.textContent || '').trim();
+                    if (!argsText && !resultText && !diffText) continue;
+                    lines.push(`### tool: ${name}${status ? ` — ${status}` : ''}`);
+                    if (argsText) {
+                        lines.push('');
+                        lines.push('```');
+                        lines.push(argsText);
+                        lines.push('```');
+                    }
+                    if (diffText) {
+                        lines.push('');
+                        lines.push('```diff');
+                        lines.push(diffText);
+                        lines.push('```');
+                    }
+                    if (resultText) {
+                        lines.push('');
+                        lines.push(resultText);
+                    }
+                    lines.push('');
+                    continue;
+                }
                 const role = el.classList.contains('user') ? 'user'
                     : el.classList.contains('assistant') ? 'assistant' : null;
                 if (!role) continue;
                 const raw = messageRawStore.get(el);
                 const body = (raw != null ? raw : el.textContent || '').trim();
                 if (!body) continue;
-                lines.push(`## ${role}`);
+                const ts = el.dataset.createdAt ? new Date(el.dataset.createdAt) : null;
+                const stamp = (ts && !Number.isNaN(ts.getTime())) ? ` — ${ts.toLocaleString()}` : '';
+                lines.push(`## ${role}${stamp}`);
                 lines.push('');
                 lines.push(body);
                 lines.push('');
             }
+            const labelSlug = label.toLowerCase().replace(/[^\w.-]+/g, '_').replace(/^_+|_+$/g, '');
+            const base = labelSlug ? `${labelSlug}-${sessionId}` : sessionId;
             const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' });
             const a = document.createElement('a');
             a.href = URL.createObjectURL(blob);
-            a.download = `gogen-chat-${sessionId}-${date}.md`;
+            a.download = `gogen-chat-${base}-${date}.md`;
             a.click();
             URL.revokeObjectURL(a.href);
             showToast('Chat exported', 'success');
@@ -4848,7 +4908,7 @@
                 // between the strip and the expanded panel.
                 e.preventDefault();
                 if (terminalIsMobile()) terminalOpenMobile();
-                else terminalSetExpanded(!terminalExpanded, { focus: true });
+                else terminalSetExpanded(!terminalExpanded);
                 return;
             }
             if (e.key === 'Escape') {
@@ -4891,7 +4951,7 @@
             }
         });
 
-        // === Task 3: Scroll-to-bottom button ===
+        // === Scroll-to-bottom button ===
         const scrollBottomBtn = document.getElementById('scroll-bottom-btn');
         const NEAR_BOTTOM_PX = 32;
         // Re-pin is suppressed for this long after an unpin so a single small
@@ -5151,7 +5211,7 @@
             });
         }
 
-        // === Task 4: Collapsible sidebar toggle ===
+        // === Collapsible sidebar toggle ===
         const sidebarToggle = document.getElementById('sidebar-toggle');
         const sidebar = document.getElementById('sidebar');
         sidebarToggle.addEventListener('click', () => {
@@ -5229,9 +5289,9 @@
 
         initSidebarResize();
 
-        // === Task 9: Favicon (handled via link tag) ===
+        // === Favicon (handled via link tag) ===
 
-        // === Task 10: Page title updates ===
+        // === Page title updates ===
         const baseTitle = 'GoGen AI Agent';
         function updateTitle(status) {
             let title;
@@ -5245,11 +5305,6 @@
             // Avoid rewriting the title bar on every mutation burst.
             if (document.title !== title) document.title = title;
         }
-        const origSetConnState = setConnState;
-        // Patch setConnState to also update title
-        const _origSetConnState = window.setConnState;
-        // Override appendMessage to detect activity
-        const origAppendMessage = appendMessage;
         // We use MutationObserver on messages div to detect streaming.
         // Coalesce mutation bursts (innerHTML swaps, colorize attribute
         // writes) into one rAF pass and derive state from variables instead
@@ -5267,7 +5322,7 @@
         });
         titleObserver.observe(messagesDiv, { childList: true, subtree: true, attributes: true });
 
-        // === Task 11: Context tooltip ===
+        // === Context tooltip ===
         const contextTooltip = document.getElementById('context-tooltip');
         const fmtTokK = (n) => {
             if (!n || n <= 0) return '0';

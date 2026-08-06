@@ -29,7 +29,7 @@ func dialEditor(t *testing.T, ts *httptest.Server) *websocket.Conn {
 	return conn
 }
 
-// TestWSEditorEndpointFSRoundTrip exercises the Phase 1 transport split: the
+// TestWSEditorEndpointFSRoundTrip exercises the editor transport split: the
 // editor socket serves fs_list/fs_write with requestId correlation, ignores
 // chat-shaped messages, and keeps working afterwards.
 func TestWSEditorEndpointFSRoundTrip(t *testing.T) {

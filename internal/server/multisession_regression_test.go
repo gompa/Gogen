@@ -77,10 +77,10 @@ func TestConcurrentEnsureSessionRuntimeDedupes(t *testing.T) {
 
 // TestTeardownDetachesAllAttachedSessions verifies that closing a connection
 // removes it from every session it was attached to — the current pane AND any
-// background panes (D5). Pre-fix, only the current pane was detached; a
+// background panes. Pre-fix, only the current pane was detached; a
 // background pane kept the dead socket in its clients set until the next
 // broadcast failed, and a pending delete-approval would hang forever instead
-// of auto-denying (D10).
+// of auto-denying.
 func TestTeardownDetachesAllAttachedSessions(t *testing.T) {
 	dir := t.TempDir()
 	stub := newBlockingStub()
@@ -296,7 +296,7 @@ func TestMessageToEvictedPaneDropped(t *testing.T) {
 // without a sessionId act on the sender's own pane, not the server-global
 // default. The default is global and moves with any tab's session_attach/
 // session_new, so routing an id-less set_mode/cancel to it would let one
-// tab's toolbar action mutate (or cancel) ANOTHER tab's session (E33).
+// tab's toolbar action mutate (or cancel) ANOTHER tab's session.
 func TestIdlessOpsTargetPaneNotDefault(t *testing.T) {
 	s, a, _ := newLifecycleServer(t)
 	sidA := a.SessionID

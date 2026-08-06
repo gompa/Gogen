@@ -33,7 +33,7 @@ const (
 	// it cannot be resolved from the provider.
 	DefaultContextLimit = 128000
 	// DefaultWebMaxActiveSessions is the default cap on concurrently active
-	// web sessions (D6).
+	// web sessions.
 	DefaultWebMaxActiveSessions = 8
 )
 

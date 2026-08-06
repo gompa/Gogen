@@ -72,7 +72,7 @@ func (s *Server) handleFSWriteMessage(ws *wsConn, ctx context.Context, msg WSMes
 	reqID := msg.RequestID
 	path := msg.Path
 	// Editor writes serialize on the workspace filesystem lock (not the
-	// session turn lock, Phase 2): they wait only for the actual mutation
+	// session turn lock): they wait only for the actual mutation
 	// window of a running tool, never for the whole streaming turn.
 	s.ws.fsMu.Lock()
 	defer s.ws.fsMu.Unlock()

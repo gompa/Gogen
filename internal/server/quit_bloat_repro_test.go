@@ -1,8 +1,8 @@
 package server
 
 // Reproduction probe for the reported symptom: quitting the server bloats
-// the current session's history. Simulates the exact quit path (Phase 6:
-// ShutdownSessions + main.go's extra deferred FlushPending) and the restart
+// the current session's history. Simulates the exact quit path
+// (ShutdownSessions + main.go's extra deferred FlushPending) and the restart
 // path (restore from store + first turn), asserting the persisted message
 // count never grows beyond the in-memory count.
 
@@ -121,7 +121,7 @@ func TestQuitDoesNotPersistEmptySessions(t *testing.T) {
 		t.Fatal("setup: expected three distinct sessions")
 	}
 
-	// QUIT: the Phase 6 path plus main.go's outer deferred FlushPending.
+	// QUIT: the shutdown path plus main.go's outer deferred FlushPending.
 	s.ShutdownSessions()
 	a.FlushPending()
 

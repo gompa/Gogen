@@ -210,7 +210,7 @@ func TestTurnContinuesAfterDisconnect(t *testing.T) {
 
 // TestCancelFromNewConnectionStopsHeadlessTurn verifies that cancel is the
 // only way to stop a turn and works cross-connection: after the original tab
-// dies, a fresh connection's cancel stops the headless turn (E29).
+// dies, a fresh connection's cancel stops the headless turn.
 func TestCancelFromNewConnectionStopsHeadlessTurn(t *testing.T) {
 	dir := t.TempDir()
 	stub := newBlockingStub()
@@ -232,10 +232,10 @@ func TestCancelFromNewConnectionStopsHeadlessTurn(t *testing.T) {
 
 	conn2 := dialWS(t, srv, "/ws")
 	defer conn2.Close()
-	// The session_state must report the turn still running headless (E28).
+	// The session_state must report the turn still running headless.
 	state := readUntil(t, conn2, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
 	if !state.TurnActive {
-		t.Fatal("expected turnActive=true for the headless turn on re-attach (E28)")
+		t.Fatal("expected turnActive=true for the headless turn on re-attach")
 	}
 	// Cancel from the NEW connection stops it.
 	if err := conn2.WriteJSON(WSMessage{Type: "cancel"}); err != nil {

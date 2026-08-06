@@ -192,7 +192,7 @@ func TestFSApplyPatchRejectsDeleteOnly(t *testing.T) {
 	}
 }
 
-// TestFSApplyPatchWaitsForFSLock verifies Phase 2's workspace filesystem
+// TestFSApplyPatchWaitsForFSLock verifies the workspace filesystem
 // lock: an editor write issued while another mutation holds fsMu (a running
 // agent FS tool) waits instead of failing, then completes once the lock is
 // released — the streaming turn itself no longer blocks editor writes.

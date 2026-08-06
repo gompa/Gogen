@@ -1,4 +1,4 @@
-.PHONY: fmt tidy outdated update test test-debug vet staticcheck gocyclo vuln build-nocgo check
+.PHONY: fmt tidy outdated update test test-debug vet staticcheck gocyclo vuln build-nocgo lint-web check
 
 fmt:
 	@unformatted=$$(gofmt -l .); \
@@ -57,7 +57,13 @@ gocyclo:
 build-nocgo:
 	CGO_ENABLED=0 go build -o gogen-nocgo .
 
+# Lints the hand-maintained web UI JS (app.js, editor.js) with a zero-
+# dependency Node script (no npm, no eslint). Runs only when `node` is
+# installed; `make check` stays green on machines without node.
+lint-web:
+	./scripts/lint-web.sh
+
 # Local full check (sequential even under make -j).
 # Does not auto-update deps — use 'make update' for that.
 check:
-	$(MAKE) -j1 fmt tidy test test-debug vet staticcheck vuln build-nocgo
+	$(MAKE) -j1 fmt tidy test test-debug vet staticcheck vuln build-nocgo lint-web

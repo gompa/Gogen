@@ -55,7 +55,7 @@ func TestShutdownWithInFlightTurnsPreservesOrdering(t *testing.T) {
 		t.Fatal("setup: S2 must be the focused session")
 	}
 
-	// QUIT: the Phase 6 sweep. Both sessions are dirty (in-flight turns
+	// QUIT: the shutdown sweep. Both sessions are dirty (in-flight turns
 	// cancelled by the drain); the focused session (S2) must still be the
 	// most recently updated after the sweep. cancelInFlight waits for each
 	// turn's deferred flush, so the sweep is synchronous by the time it

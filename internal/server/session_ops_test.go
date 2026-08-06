@@ -49,7 +49,7 @@ func TestSessionNewRegistryOp(t *testing.T) {
 	if s.registry.first() != pane {
 		t.Fatal("new session is not the default after session_new")
 	}
-	// The old session's runtime stays alive and resume-able (E11).
+	// The old session's runtime stays alive and resume-able.
 	if _, ok := s.registry.get(origID); !ok {
 		t.Fatal("old session was evicted by session_new")
 	}
@@ -70,7 +70,7 @@ func TestSessionResumeDedupesAndLoads(t *testing.T) {
 		Messages:   []llm.Message{{Role: "user", Content: "saved"}},
 	})
 
-	// Resume the active default → dedupe (E9): no new runtime.
+	// Resume the active default → dedupe: no new runtime.
 	res, handled, err := s.runSessionCommand(context.Background(), nil, &pane, "resume "+origID)
 	if err != nil || !handled {
 		t.Fatalf("resume active: handled=%v err=%v", handled, err)
@@ -142,7 +142,7 @@ func TestSessionForkSourceUntouched(t *testing.T) {
 	if got := pane.agent.MessageCount(); got != srcCount {
 		t.Fatalf("forked message count = %d, want %d", got, srcCount)
 	}
-	// Source session untouched (E13): still registered, messages intact.
+	// Source session untouched: still registered, messages intact.
 	src, ok := s.registry.get(origID)
 	if !ok {
 		t.Fatal("source session was evicted by fork")
@@ -152,7 +152,7 @@ func TestSessionForkSourceUntouched(t *testing.T) {
 	}
 }
 
-// TestSessionAttachLoadsInactiveSession verifies Phase 5's session_attach:
+// TestSessionAttachLoadsInactiveSession verifies session_attach:
 // attaching a saved-but-inactive session loads it into the registry, switches
 // the connection's pane to it, and re-sends its state.
 func TestSessionAttachLoadsInactiveSession(t *testing.T) {
@@ -243,7 +243,7 @@ func TestSessionAttachUnknownSessionRemoved(t *testing.T) {
 	}
 }
 
-// TestShutdownSessionsFlushesAll verifies Phase 6 shutdown: every registered
+// TestShutdownSessionsFlushesAll verifies shutdown: every registered
 // session agent is flushed, so a multi-session web server exits without
 // losing in-memory state.
 func TestShutdownSessionsFlushesAll(t *testing.T) {
@@ -402,7 +402,7 @@ func TestSessionDeleteEvictsAndReplacesCurrent(t *testing.T) {
 // eviction candidate — stayed on the last session_new/resume/fork target.
 // That stale default could route an id-less pane's toolbar action to the
 // WRONG session and cancel its running turn via the cancel-then-lock
-// handlers (E33), and eviction (E11) could target a session the user just
+// handlers, and eviction could target a session the user just
 // opened while an untouched one stayed protected.
 func TestEnsureSessionRuntimeRegisteredSetsDefault(t *testing.T) {
 	s, a, _ := newLifecycleServer(t)
@@ -650,7 +650,7 @@ func TestForkInheritsSourceState(t *testing.T) {
 	if pane.agent.TodoManager.Empty() {
 		t.Fatal("fork lost the source's todos")
 	}
-	// The source is untouched (E13).
+	// The source is untouched.
 	src, ok := s.registry.get(a.SessionID)
 	if !ok {
 		t.Fatal("source session was evicted by fork")
@@ -730,7 +730,7 @@ func TestSessionDeleteBackgroundPaneDetaches(t *testing.T) {
 	}
 
 	// Typed /new switches the connection's pane to a fresh session; the old
-	// session stays attached as a background pane (D5).
+	// session stays attached as a background pane.
 	if err := conn.WriteJSON(WSMessage{Type: "message", Content: "/new", SessionID: sidA}); err != nil {
 		t.Fatalf("send /new: %v", err)
 	}

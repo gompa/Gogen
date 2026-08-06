@@ -1,10 +1,10 @@
 package server
 
-// Session lifecycle as registry operations (multi-session plan Phase 4).
+// Session lifecycle as registry operations.
 // session_new/resume/fork/delete create, restore, clone, and evict live
 // session runtimes instead of mutating one agent — the source session of a
-// fork is untouched (E13), resume dedupes against active sessions (E9), and
-// delete drains + evicts before removing the file (E10).
+// fork is untouched, resume dedupes against active sessions, and
+// delete drains + evicts before removing the file.
 
 import (
 	"context"
@@ -66,13 +66,13 @@ func (s *Server) ensureSessionRuntime(id string) (*sessionRuntime, error) {
 		// Attaching a session counts as activity even when it is already
 		// registered — the sidebar session list re-attaches on every focus. Move
 		// it to the front of the registration order so registry-cap eviction
-		// (E11) targets the least-recently-attached idle session, never the
+		// targets the least-recently-attached idle session, never the
 		// pane the client just opened, and messages without an explicit
 		// sessionId (an id-less pane's toolbar action, legacy clients) route
 		// to the session the user is actually on. Pre-fix, the early return
 		// skipped setDefault and the default stayed on the last session_new/
 		// resume/fork target — a stale default could cancel the WRONG pane's
-		// running turn via the cancel-then-lock handlers (E33).
+		// running turn via the cancel-then-lock handlers.
 		s.registry.setDefault(id)
 		return rt, nil
 	}
@@ -88,7 +88,7 @@ func (s *Server) ensureSessionRuntime(id string) (*sessionRuntime, error) {
 	s.registry.register(id, rt)
 	// A concurrent attach (or resume) of the same session may have
 	// registered a runtime between our get above and this register —
-	// register dedupes (E9) and would then be a no-op. Re-read the registry
+	// register dedupes and would then be a no-op. Re-read the registry
 	// so the caller never receives an UNREGISTERED orphan runtime: two live
 	// agents with the same SessionID would both persist to the same file
 	// (last writer wins), and the orphan would be invisible to
@@ -98,7 +98,7 @@ func (s *Server) ensureSessionRuntime(id string) (*sessionRuntime, error) {
 		rt = registered
 	}
 	// Attaching a session counts as activity: move it to the front of the
-	// registration order so registry-cap eviction (E11) targets the oldest
+	// registration order so registry-cap eviction targets the oldest
 	// idle sessions, never the one the client just opened.
 	s.registry.setDefault(id)
 	return rt, nil
@@ -107,7 +107,7 @@ func (s *Server) ensureSessionRuntime(id string) (*sessionRuntime, error) {
 // switchPane points the connection's current pane at rt and attaches the
 // socket to rt's session. It deliberately does NOT detach the previous pane:
 // attachment is client-managed via session_attach/session_detach, and a
-// background pane must keep receiving its session's events (D5). The client
+// background pane must keep receiving its session's events. The client
 // releases the old session's attachment with session_detach when a pane
 // re-keys (typed /new, /resume, fork) and with session_close when the user
 // closes a pane (✕ — the server cancels the turn and unregisters the
@@ -119,7 +119,7 @@ func (s *Server) switchPane(ws *wsConn, pane **sessionRuntime, rt *sessionRuntim
 }
 
 // pruneSessions invokes the store's explicit prune with the full active set
-// (E2): the registry is the sole pruner in web mode (auto-prune is disabled
+// the registry is the sole pruner in web mode (auto-prune is disabled
 // in NewServer), so a Save from one session can never delete another live
 // session's file. It is only called where the store actually grows (session
 // create / fork persist new files) or shrinks (session delete): attach and
@@ -216,7 +216,7 @@ func (s *Server) sessionResume(ctx context.Context, ws *wsConn, pane **sessionRu
 		rt = newSessionRuntime(a)
 		s.registry.register(id, rt)
 		// Dedupe against a concurrent attach/resume of the same session
-		// (E9): register may have been a no-op, in which case the pane must
+		// register may have been a no-op, in which case the pane must
 		// point at the REGISTERED runtime, not the freshly built orphan
 		// (two agents for one id → last-writer-wins persistence; the orphan
 		// is invisible to delete/prune/shutdown).
@@ -332,7 +332,7 @@ func (s *Server) sessionDelete(ctx context.Context, ws *wsConn, pane **sessionRu
 	if rt, registered = s.registry.get(id); registered {
 		// Drain the in-flight turn (≤ wsStreamDrainWait) and flush BEFORE
 		// deleting the file, so a late doPersist from the turn cannot
-		// resurrect the file after Store.Delete (E10). The runtime is NOT
+		// resurrect the file after Store.Delete. The runtime is NOT
 		// evicted yet: if the file delete fails, the session stays live and
 		// registered — the pane keeps working and the error reaches the
 		// client, instead of leaving the pane on an evicted runtime whose
@@ -415,7 +415,7 @@ func (s *Server) createBootstrapSession() *sessionRuntime {
 				s.registry.register(latest, rt)
 				// A concurrent connection may have bootstrapped the same
 				// session between our get and register — register dedupes
-				// (E9); re-read so the handshake never receives an
+				// re-read so the handshake never receives an
 				// unregistered orphan runtime.
 				if registered, ok := s.registry.get(latest); ok {
 					rt = registered

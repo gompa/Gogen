@@ -5,11 +5,11 @@ import (
 	"time"
 )
 
-// TestTwoSessionsStreamConcurrently drives two sessions on ONE connection
-// (the Phase 5 shape): a turn starts in the default session, the pane switches
+// TestTwoSessionsStreamConcurrently drives two sessions on ONE
+// connection: a turn starts in the default session, the pane switches
 // to a new session (session_new) which starts its own turn, and both streams
 // reach the connection tagged with their own sessionId — the background pane's
-// events keep flowing because attachment is client-managed (D5).
+// events keep flowing because attachment is client-managed.
 func TestTwoSessionsStreamConcurrently(t *testing.T) {
 	dir := t.TempDir()
 	stub := newBlockingStub()

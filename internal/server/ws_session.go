@@ -14,8 +14,8 @@ import (
 var approvalIDFallback atomic.Uint64
 
 // newApprovalID returns a random approval id. Delete approvals are keyed by
-// (sessionID, approvalID) on the session runtime (E5). The per-connection
-// wsSession was removed in Phase 3 when approvals moved into
+// (sessionID, approvalID) on the session runtime. The per-connection
+// wsSession was removed when approvals moved into
 // sessionRuntime.deleteApprover.
 func newApprovalID() string {
 	var b [8]byte

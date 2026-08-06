@@ -7,8 +7,8 @@ import (
 	"gogen/internal/agent"
 )
 
-// TestNewSessionCreatesAndReKeys drives the client's session_new flow end to
-// end (Phase 5): the server must reply with clear_chat + history + config
+// TestNewSessionCreatesAndReKeys drives the client's session_new flow
+// end to end: the server must reply with clear_chat + history + config
 // carrying the NEW session id, and the new session must be registered and
 // become the connection's pane (subsequent messages route to it).
 func TestNewSessionCreatesAndReKeys(t *testing.T) {
@@ -51,7 +51,7 @@ func TestNewSessionCreatesAndReKeys(t *testing.T) {
 	}
 }
 
-// TestTypedNewRoutesThroughRegistry drives the typed /new path (D3): a
+// TestTypedNewRoutesThroughRegistry drives the typed /new path: a
 // message whose content is "/new" must be handled as a registry session
 // change, replying with clear_chat + a config carrying the NEW session id.
 // This is the client flow that broke when pane routing dropped messages whose

@@ -1441,7 +1441,7 @@
             font-size: 0.75em;
         }
 
-        /* ===== Task 1: Textarea auto-resize (native) =====
+        /* ===== Textarea auto-resize (native) =====
            field-sizing: content makes the textarea grow/shrink with its text
            — no JS size tracking needed. min-height calc(1.4em + 18px) is the
            natural single-line height (line-height 1.4em + padding 16px +
@@ -1469,7 +1469,7 @@
             outline-offset: -1px;
         }
 
-        /* ===== Task 3: Scroll-to-bottom button ===== */
+        /* ===== Scroll-to-bottom button ===== */
         #scroll-bottom-btn {
             position: absolute;
             /* 80px clears the composer toolbar + input row; the terminal
@@ -1495,7 +1495,7 @@
         #scroll-bottom-btn:hover { color: var(--fg); background: var(--bg-active); }
         #scroll-bottom-btn.visible { display: block; }
 
-        /* ===== Task 4: Collapsible sidebar ===== */
+        /* ===== Collapsible sidebar ===== */
         #sidebar-toggle {
             display: none;
             position: absolute;
@@ -1527,7 +1527,7 @@
             #sidebar-toggle { display: block; }
         }
 
-        /* ===== Task 6: Custom close-tab modal ===== */
+        /* ===== Custom close-tab modal ===== */
         #close-tab-overlay, #session-delete-overlay {
             display: none;
             position: fixed;
@@ -1604,10 +1604,28 @@
             border: 1px solid var(--border);
             border-radius: 6px;
             padding: 20px;
+            max-height: 80vh;
+            overflow-y: auto;
             max-width: 360px;
             width: 90%;
             box-shadow: 0 8px 32px rgba(0,0,0,0.45);
             color: var(--fg);
+        }
+        .settings-group {
+            margin-bottom: 16px;
+        }
+        .settings-group:last-child {
+            margin-bottom: 0;
+        }
+        .settings-group-title {
+            margin: 0 0 10px;
+            padding-bottom: 4px;
+            font-size: 0.68em;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--accent);
+            border-bottom: 1px solid var(--border-subtle);
         }
         .settings-header {
             display: flex;
@@ -1639,7 +1657,7 @@
             justify-content: space-between;
             margin-bottom: 14px;
         }
-        #settings-dialog .setting-row:last-child { margin-bottom: 0; }
+        #settings-dialog .settings-group:last-child .setting-row:last-child { margin-bottom: 0; }
         #settings-dialog select {
             font-family: var(--mono);
             font-size: 0.85em;
@@ -1748,7 +1766,7 @@
             --user-bg: rgba(0, 102, 204, 0.1);
         }
 
-        /* ===== Task 13: Save-all loading ===== */
+        /* ===== Save-all loading ===== */
         #save-all-loading {
             display: none;
             font-size: 0.8em;
@@ -1757,7 +1775,7 @@
         }
         #save-all-loading.active { display: inline; }
 
-        /* ===== Task 16: Copy button on tool results ===== */
+        /* ===== Copy button on tool results ===== */
         .tool-result-copy {
             float: right;
             padding: 2px 8px;

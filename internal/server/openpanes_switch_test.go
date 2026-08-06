@@ -4,7 +4,7 @@ package server
 // sidebar session list while a turn is running on the ORIGINAL session
 // must not stop that turn. The client's pane switch is a plain
 // session_attach of the target pane (focusPane) — the old pane is NOT
-// detached and its turn keeps streaming to the connection (D5). This test
+// detached and its turn keeps streaming to the connection. This test
 // drives the exact message sequence the client sends when the user clicks
 // rows in the sidebar session list: A's turn is running, attach B, attach A
 // again, attach B again — A's turn must still complete with its own

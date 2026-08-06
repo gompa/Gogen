@@ -36,3 +36,6 @@
 *.swp
 *.swo
 *~
+
+# --- JS tooling (web UI lint) ---
+node_modules/

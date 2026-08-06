@@ -15,7 +15,7 @@ import (
 // TestStoreConcurrentSaveLoadDelete hammers the store from many goroutines
 // with distinct session IDs — the multi-session web server pattern. Before
 // the internal mutex, concurrent Save/AppendMessages/Load/Delete raced on
-// index.json read-modify-write and the createdCache map (E1). Run with -race.
+// index.json read-modify-write and the createdCache map. Run with -race.
 func TestStoreConcurrentSaveLoadDelete(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore(true)

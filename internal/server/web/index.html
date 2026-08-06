@@ -210,82 +210,91 @@
                 <h3>Settings</h3>
                 <button type="button" id="settings-close-btn" title="Close (Esc)" aria-label="Close settings">✕</button>
             </div>
-            <div class="setting-row">
-                <div>
-                    <label>Theme</label>
-                    <select id="theme-select" aria-label="Theme">
-                        <option value="auto">Auto (system)</option>
-                        <option value="dark">Dark</option>
-                        <option value="light">Light</option>
-                    </select>
+            <div class="settings-group">
+                <h4 class="settings-group-title">Editor</h4>
+                <div class="setting-row">
+                    <div>
+                        <label>Minimap</label>
+                        <select id="editor-minimap" aria-label="Minimap">
+                            <option value="off">Off</option>
+                            <option value="on">On</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="setting-row">
+                    <div>
+                        <label>Word wrap</label>
+                        <select id="editor-wordwrap" aria-label="Word wrap">
+                            <option value="on">On</option>
+                            <option value="off">Off</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="setting-row">
+                    <div>
+                        <label>Sticky scroll</label>
+                        <select id="editor-sticky" aria-label="Sticky scroll">
+                            <option value="on">On</option>
+                            <option value="off">Off</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="setting-row">
+                    <div>
+                        <label>Font size</label>
+                        <input type="number" id="editor-fontsize" min="8" max="32" step="1" aria-label="Font size">
+                    </div>
                 </div>
             </div>
-            <div class="setting-row">
-                <div>
-                    <label>Click file in chat</label>
-                    <select id="file-click-behavior" aria-label="File click behavior">
-                        <option value="open">Open (background)</option>
-                        <option value="open-switch">Open &amp; switch to editor</option>
-                    </select>
+            <div class="settings-group">
+                <h4 class="settings-group-title">Chat</h4>
+                <div class="setting-row">
+                    <div>
+                        <label>Click file in chat</label>
+                        <select id="file-click-behavior" aria-label="File click behavior">
+                            <option value="open">Open (background)</option>
+                            <option value="open-switch">Open &amp; switch to editor</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="setting-row">
+                    <div>
+                        <label>Chat diff viewer</label>
+                        <select id="chat-diff-viewer" aria-label="Chat diff viewer">
+                            <option value="tokenizer">Static (line numbers)</option>
+                            <option value="monaco">Monaco (full editor)</option>
+                        </select>
+                    </div>
                 </div>
             </div>
-            <div class="setting-row">
-                <div>
-                    <label>Chat diff viewer</label>
-                    <select id="chat-diff-viewer" aria-label="Chat diff viewer">
-                        <option value="tokenizer">Static (line numbers)</option>
-                        <option value="monaco">Monaco (full editor)</option>
-                    </select>
+            <div class="settings-group">
+                <h4 class="settings-group-title">Global</h4>
+                <div class="setting-row">
+                    <div>
+                        <label>Theme</label>
+                        <select id="theme-select" aria-label="Theme">
+                            <option value="auto">Auto (system)</option>
+                            <option value="dark">Dark</option>
+                            <option value="light">Light</option>
+                        </select>
+                    </div>
                 </div>
-            </div>
-            <div class="setting-row">
-                <div>
-                    <label>Minimap</label>
-                    <select id="editor-minimap" aria-label="Minimap">
-                        <option value="off">Off</option>
-                        <option value="on">On</option>
-                    </select>
+                <div class="setting-row" id="accent-setting-row">
+                    <div>
+                        <label>Accent color</label>
+                        <input type="color" id="accent-color-input" value="#569cd6" aria-label="Accent color">
+                        <button type="button" id="accent-reset-btn" class="settings-btn-secondary">Default</button>
+                    </div>
                 </div>
-            </div>
-            <div class="setting-row">
-                <div>
-                    <label>Word wrap</label>
-                    <select id="editor-wordwrap" aria-label="Word wrap">
-                        <option value="on">On</option>
-                        <option value="off">Off</option>
-                    </select>
-                </div>
-            </div>
-            <div class="setting-row">
-                <div>
-                    <label>Sticky scroll</label>
-                    <select id="editor-sticky" aria-label="Sticky scroll">
-                        <option value="on">On</option>
-                        <option value="off">Off</option>
-                    </select>
-                </div>
-            </div>
-            <div class="setting-row">
-                <div>
-                    <label>Font size</label>
-                    <input type="number" id="editor-fontsize" min="8" max="32" step="1" aria-label="Font size">
-                </div>
-            </div>
-            <div class="setting-row" id="accent-setting-row">
-                <div>
-                    <label>Accent color</label>
-                    <input type="color" id="accent-color-input" value="#569cd6" aria-label="Accent color">
-                    <button type="button" id="accent-reset-btn" class="settings-btn-secondary">Default</button>
-                </div>
-            </div>
-            <div class="setting-row">
-                <div>
-                    <label>Desktop notifications</label>
-                    <select id="notifications-select" aria-label="Desktop notifications">
-                        <option value="off">Off</option>
-                        <option value="background">When tab is hidden</option>
-                        <option value="always">Always</option>
-                    </select>
+                <div class="setting-row">
+                    <div>
+                        <label>Desktop notifications</label>
+                        <select id="notifications-select" aria-label="Desktop notifications">
+                            <option value="off">Off</option>
+                            <option value="background">When tab is hidden</option>
+                            <option value="always">Always</option>
+                        </select>
+                    </div>
                 </div>
             </div>
         </div>

@@ -150,7 +150,7 @@ func TestRegistryRegisterGetRemove(t *testing.T) {
 	}
 }
 
-// TestSessionTurnLocksArePerSession verifies the Phase 2 per-session turn
+// TestSessionTurnLocksArePerSession verifies the per-session turn
 // lock: holding one session's turnMu does not block another session's turn
 // (the old global turnMu serialized all sessions).
 func TestSessionTurnLocksArePerSession(t *testing.T) {
@@ -163,7 +163,7 @@ func TestSessionTurnLocksArePerSession(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		// Acquiring rt2's turn lock while rt1's is held must not block: turn
-		// locks are per-session (Phase 2). If the old global-turnMu behavior
+		// locks are per-session. If the old global-turnMu behavior
 		// regressed, the Lock above would block until rt1 releases its lock
 		// and the select below would time out. close(done) runs inside the
 		// critical section so the acquisition is proven before the release.
@@ -196,7 +196,7 @@ func TestWorkspaceNewSessionAgentFactory(t *testing.T) {
 		Model:         "m1",
 		ThinkingLevel: "high",
 		// The provider factory seeds the workspace default model + thinking
-		// level (D1), mirroring newWorkspaceFromAgent.
+		// level, mirroring newWorkspaceFromAgent.
 		ProviderFactory: func() llm.LLMProvider {
 			p := llm.NewMockProvider()
 			_ = p.SetModel("m1")

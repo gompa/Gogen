@@ -316,8 +316,8 @@ type SessionEntry struct {
 	Label        string `json:"label,omitempty"`
 	Oneshot      bool   `json:"oneshot,omitempty"`
 	Current      bool   `json:"current,omitempty"`
-	// Active marks sessions with a live in-memory runtime (multi-session
-	// plan Phase 4): the client can render "resume to continue" for them.
+	// Active marks sessions with a live in-memory runtime: the client
+	// can render "resume to continue" for them.
 	// Idle runtimes whose last client detached are orphan-evicted (they
 	// return to the saved list), so active here means genuinely live —
 	// open in another tab, or a headless turn still running.
@@ -450,13 +450,13 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 		a.SessionID = sesspkg.NewID()
 	}
 	reg.register(a.SessionID, newSessionRuntime(a))
-	// In web mode the registry is the sole pruner (Phase 4, E2): Save's
+	// In web mode the registry is the sole pruner: Save's
 	// internal auto-prune protects only one session and could delete another
 	// live session's file; the registry prunes with the full active set.
 	if ws.Store != nil {
 		ws.Store.SetAutoPrune(false)
 	}
-	// Wrap FS-mutating tools with the workspace filesystem lock (Phase 2):
+	// Wrap FS-mutating tools with the workspace filesystem lock:
 	// a streaming turn no longer blocks editor saves except during the actual
 	// mutation window of a tool.
 	a.SetToolHandlers(wrapToolHandlers(agent.BuiltinToolHandlers(), &ws.fsMu))
@@ -688,7 +688,7 @@ func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, rt *
 	resp.Mode = cfg.Mode
 	// Paint sessions/history before ContextStats tokenization (can be slow on
 	// large restored sessions / cold tiktoken init). clear_chat + history
-	// carry the sessionId so the client routes them to the right pane (Phase 5).
+	// carry the sessionId so the client routes them to the right pane.
 	_ = ws.writeJSON(resp)
 	if clearChat && err == nil {
 		_ = ws.writeJSON(WSMessage{Type: "clear_chat", SessionID: cfg.SessionID})
@@ -816,7 +816,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	msgLimiter := newWSMessageLimiter()
 
 	// The connection's pane: the session it is currently attached to and the
-	// default target for messages without a sessionId. Phase 4 lifecycle ops
+	// default target for messages without a sessionId. Lifecycle ops
 	// (session_new/resume/fork) switch the pane; teardown detaches from
 	// whatever the current pane is — WITHOUT cancelling any turn (the turn is
 	// owned by the runtime, so disconnecting never kills it, §4).
@@ -841,7 +841,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	// turn (the turn is owned by the runtime, so disconnecting never kills
 	// it, §4). A killed tab cannot send session_detach per pane, and a stale
 	// attachment would leak the dead socket and could leave a pending
-	// delete-approval hanging forever instead of auto-denying (D10).
+	// delete-approval hanging forever instead of auto-denying.
 	defer s.registry.detachAll(ws)
 
 	// Interactive user shell for this connection, killed on disconnect. The
@@ -873,7 +873,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			// Complete delete approvals here so they never sit behind a
 			// main-loop turnMu.Lock() (the stream holds turnMu while waiting
 			// for approval). Route by sessionId so each session's approvals
-			// resolve independently (E5).
+			// resolve independently.
 			if msg.Type == "delete_approval_response" {
 				if rt := s.resolveRuntime(msg.SessionID); rt != nil {
 					rt.completeApproval(msg.ApprovalID, msg.Approved)
@@ -891,7 +891,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 		// (pane := registry.first()) and is moved by ANY tab's
 		// session_attach/session_new (setDefault is global), so an id-less
 		// cancel/set_mode/session_detach would silently hit the WRONG
-		// session in a multi-tab setup (E33). The pane is the sender's
+		// session in a multi-tab setup. The pane is the sender's
 		// current session, which is what an id-less message means. On first
 		// load the pane IS the default, so legacy behavior is unchanged.
 		// (Approval responses are intercepted in the read goroutine above
@@ -959,7 +959,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			// Re-align the pane pointer to that id (like session_fork does)
 			// so a reconnect-stale pointer can never replace the WRONG pane's
 			// session. session_resume/session_delete are NOT re-aligned: their
-			// sessionId names the TARGET session, not the acting pane (E33).
+			// sessionId names the TARGET session, not the acting pane.
 			if msg.Type == "session_new" && msg.SessionID != "" {
 				if t := s.resolveRuntime(msg.SessionID); t != nil {
 					pane = t
@@ -1007,7 +1007,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			// cross-connection (scoped to the targeted session).
 			target.stream.cancelInFlight()
 		case "session_attach":
-			// Attach a pane (Phase 5): make it the connection's current pane
+			// Attach a pane: make it the connection's current pane
 			// and resend session_state + history + config + context. Sessions
 			// that are not currently active are loaded from the store, so the
 			// sidebar's "open session" works for saved sessions too.
@@ -1160,9 +1160,9 @@ func (s *Server) sendSessionState(ws *wsConn, rt *sessionRuntime) {
 // messages (fs_list/fs_read/fs_search/fs_write/fs_replace/fs_apply_patch,
 // git_status/git_file_diff) and ignores chat/session messages. The editor
 // socket is independent of any chat session, so a busy or streaming session
-// never blocks editor saves behind the chat read loop (multi-session plan,
-// Phase 1). Write messages serialize on the workspace filesystem lock
-// (fsMu, Phase 2) — they wait only for the actual mutation window of a
+// never blocks editor saves behind the chat read loop. Write messages
+// serialize on the workspace filesystem lock (fsMu) — they wait only
+// for the actual mutation window of a
 // running tool, never for the whole streaming turn.
 func (s *Server) HandleWSEditor(w http.ResponseWriter, r *http.Request) {
 	u, err := s.upgradeWS(w, r)
@@ -1257,9 +1257,9 @@ func (s *Server) handleWSSessionAction(ws *wsConn, ctx context.Context, pane **s
 		cmd = "fork " + forkArg
 	}
 
-	// Registry lifecycle ops (Phase 4): no turn lock needed — new/resume/
+	// Registry lifecycle ops: no turn lock needed — new/resume/
 	// fork leave the previous session running (continuation), delete drains
-	// its own target (E10).
+	// its own target.
 	result, _, err := s.runSessionCommand(ctx, ws, pane, cmd)
 	s.writeSessionCommandResult(ws, ctx, *pane, result, err)
 }
@@ -1296,10 +1296,10 @@ func (s *Server) handleWSSetModel(ws *wsConn, ctx context.Context, rt *sessionRu
 		_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", err)})
 		return
 	}
-	// Model is per-session (D1): SelectModel above applied to this pane's
+	// Model is per-session: SelectModel above applied to this pane's
 	// provider only. The workspace default (ws.Model) is fixed at startup and
 	// never mutated here, and no other session's provider is touched, so two
-	// panes can run different models concurrently (E6). The config echo goes
+	// panes can run different models concurrently. The config echo goes
 	// to this pane only (its own Mode/ThinkingLevel/Model).
 	// Tokenization + echo off the read loop: ContextStats on a large
 	// uncached session takes seconds, and the read loop serializes every
@@ -1377,7 +1377,7 @@ func (s *Server) handleWSConfig(ws *wsConn, ctx context.Context, pane **sessionR
 	}
 	// The working dir is workspace-global. Interrupt the pane's own turn
 	// (cancel-then-lock), then sync the change to EVERY session agent under
-	// its own turn lock in a fixed (sorted) order (E12) — SetWorkingDir /
+	// its own turn lock in a fixed (sorted) order — SetWorkingDir /
 	// AfterWorkingDirChange mutate persist fields that a mid-turn doPersist
 	// would race, so each must run under that session's turn lock.
 	rt := *pane
@@ -1392,7 +1392,7 @@ func (s *Server) handleWSConfig(ws *wsConn, ctx context.Context, pane **sessionR
 	// authoritative runtime value is ws.WorkingDir (set below) and the
 	// per-session agents' WorkingDir (applyWorkingDirToAll).
 	s.ws.SetWorkingDir(absDir)
-	// Apply to every session agent OFF the read loop (E12): a running turn
+	// Apply to every session agent OFF the read loop: a running turn
 	// holds its session's turnMu for its ENTIRE duration, so waiting for all
 	// of them here would freeze this connection's messages — pane switches,
 	// sends, cancels — for as long as the longest running turn. The dir is
@@ -1453,7 +1453,7 @@ func (s *Server) applyWorkingDirToAll(absDir string) (skipped []string) {
 		// and a blocking Lock here would hang the goroutine — and the
 		// working-dir change — on that one session forever. Only the
 		// requesting pane's turn was cancelled above; other sessions' turns
-		// are not interrupted (E29).
+		// are not interrupted.
 		if !rt.tryAcquireTurn(wsTurnAcquireWait) {
 			if !rt.tryAcquireTurn(wsStreamDrainWait) {
 				skipped = append(skipped, id)
@@ -1491,7 +1491,7 @@ func workingDirSkipMessage(absDir string, skipped []string) string {
 // a goroutine so the slow summarization does not block the WS read loop.
 func (s *Server) handleWSCompact(ws *wsConn, r *http.Request, rt *sessionRuntime) {
 	// Interrupt semantics are scoped to the connection that owns the current
-	// turn (E29): a second connection attached as a viewer must not kill a
+	// turn: a second connection attached as a viewer must not kill a
 	// turn it does not own — it waits and gets the busy rejection instead.
 	if rt.ownsTurn(ws) {
 		rt.stream.cancelInFlight()
@@ -1541,7 +1541,7 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 	rt := *pane
 	// Interrupt semantics apply only to the connection that owns the current
 	// turn; a second connection's message must not cancel a turn it does not
-	// own (E29) — it gets the busy rejection below.
+	// own — it gets the busy rejection below.
 	if rt.ownsTurn(ws) {
 		rt.stream.cancelInFlight()
 	}
@@ -1592,7 +1592,7 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 	if !rt.tryAcquireTurn(wsTurnAcquireWait) {
 		// Cancel may have timed out while a tool was still exiting; wait once
 		// more. Only re-cancel when this connection owns the turn — a second
-		// connection must not kill a turn it does not own (E29).
+		// connection must not kill a turn it does not own.
 		if rt.ownsTurn(ws) {
 			rt.stream.cancelInFlight()
 		}
@@ -1654,7 +1654,7 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 	}
 
 	// Session slash commands (/new, /resume, /sessions, /fork, resume del)
-	// route through the registry (Phase 4) instead of mutating the agent.
+	// route through the registry instead of mutating the agent.
 	sessResult, sessHandled, sessErr := s.runSessionCommand(r.Context(), ws, pane, msg.Content)
 	if sessHandled {
 		rt.turnMu.Unlock()

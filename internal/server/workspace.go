@@ -35,7 +35,7 @@ type Workspace struct {
 	// MCPRegistry is shared by all session agents (thread-safe, E20).
 	MCPRegistry agent.MCPToolRegistry
 
-	// Model is the workspace default model (D1): new providers are seeded
+	// Model is the workspace default model: new providers are seeded
 	// with it. set_model never mutates it — each pane's model lives on its
 	// own provider instance.
 	Model string
@@ -45,7 +45,7 @@ type Workspace struct {
 
 	// ProviderFactory creates a per-session provider. It must seed the
 	// provider with the workspace Model + ThinkingLevel so a new pane's
-	// first turn never fails requireModelSelected (D1).
+	// first turn never fails requireModelSelected.
 	ProviderFactory func() llm.LLMProvider
 
 	// Resolver is the shared models.dev resolver. One per workspace so N
@@ -195,7 +195,7 @@ func (ws *Workspace) NewSessionAgent(snap *agent.SessionSnapshot, id string) *ag
 			}
 		}
 	} else {
-		// Fresh session: seed the workspace default thinking level (D1) so a
+		// Fresh session: seed the workspace default thinking level so a
 		// new pane's first turn does not start at the "off" default.
 		if level, ok := agent.ParseThinkingLevel(ws.ThinkingLevel); ok {
 			a.SetThinkingLevel(level)

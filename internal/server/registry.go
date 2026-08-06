@@ -11,7 +11,7 @@ import (
 )
 
 // sessionRuntime is one live chat session in the web server: the agent, the
-// per-session turn lock, and — since Phase 3 — the turn machinery that used
+// per-session turn lock, and the turn machinery that used
 // to live per connection: the in-flight stream handles, the pending delete
 // approvals, and the set of attached client sockets (fan-out). A turn is
 // owned by the runtime, not by any connection: disconnecting the last client
@@ -22,7 +22,7 @@ type sessionRuntime struct {
 	turnMu sync.RWMutex // turns take Lock; config/history reads take RLock
 
 	// stream owns the in-flight stream cancel handles for this session
-	// (moved from per-connection, Phase 3).
+	// (moved from per-connection).
 	stream *wsConnStream
 
 	// approvals are pending delete-approval channels, keyed by approvalID
@@ -31,16 +31,16 @@ type sessionRuntime struct {
 	approvals  map[string]chan bool
 
 	// clients are the attached sockets; broadcast() fans events out to all
-	// of them (E29). A write failure detaches that socket, never cancels
-	// the turn (E26).
+	// of them. A write failure detaches that socket, never cancels
+	// the turn.
 	clientsMu sync.Mutex
 	clients   map[*wsConn]struct{}
 
 	// turnActive/startedAt back the session_state reply on attach so a
 	// reconnecting client can distinguish "turn running headless" from
-	// "idle" (E28). turnOwner is the connection that started the current
+	// "idle". turnOwner is the connection that started the current
 	// turn; only it may interrupt via the cancel-then-lock path — a second
-	// connection attached to the same session (E29) must not kill the turn
+	// connection attached to the same session must not kill the turn
 	// it does not own.
 	stateMu    sync.Mutex
 	turnActive bool
@@ -53,7 +53,7 @@ type sessionRuntime struct {
 	// acquire turnMu, so a handler that resolved the runtime just before the
 	// eviction cannot start a turn on a runtime that is no longer registered
 	// (invisible to cancel/prune/shutdown). Monotonic: an evicted runtime is
-	// never re-registered — resume/attach build a fresh one (E9).
+	// never re-registered — resume/attach build a fresh one.
 	evicted atomic.Bool
 
 	// registry is the owning sessionRegistry. Set by register(); used by
@@ -88,8 +88,8 @@ func (rt *sessionRuntime) attach(ws *wsConn) {
 }
 
 // detach removes a socket from the session. It never cancels the turn: the
-// turn belongs to the runtime, not the connection (Phase 3). When the last
-// attached client leaves, pending delete approvals are auto-denied (D10) so
+// turn belongs to the runtime, not the connection. When the last
+// attached client leaves, pending delete approvals are auto-denied so
 // an unattended turn cannot hang forever on a destructive prompt.
 func (rt *sessionRuntime) detach(ws *wsConn) {
 	if ws == nil {
@@ -120,7 +120,7 @@ func (rt *sessionRuntime) clientCount() int {
 }
 
 // broadcast writes a message to every attached socket. A socket whose write
-// fails is detached (write failure detaches, never cancels — Phase 3 §4);
+// fails is detached (write failure detaches, never cancels);
 // the stream goroutine's enqueue is bounded by the send-queue timeout, so a
 // dead socket cannot stall the turn.
 func (rt *sessionRuntime) broadcast(msg WSMessage) {
@@ -215,7 +215,7 @@ func (rt *sessionRuntime) completeApproval(id string, approved bool) {
 }
 
 // autoDenyPendingApprovals denies every pending approval on this session.
-// Used when the last attached client detaches (D10): the turn continues with
+// Used when the last attached client detaches: the turn continues with
 // the "not approved" tool result instead of hanging.
 func (rt *sessionRuntime) autoDenyPendingApprovals() {
 	rt.approvalMu.Lock()
@@ -437,7 +437,7 @@ func (r *sessionRegistry) closeRuntime(rt *sessionRuntime) {
 // turn — the "resume to continue" state nobody is viewing (a page refresh, a
 // closed tab, a re-keyed-away session, or a headless turn that just
 // finished). The session stays saved on disk. Mirrors the cap-eviction
-// pipeline (E11): flush before evict, remove from the registry, then notify
+// pipeline: flush before evict, remove from the registry, then notify
 // (session_detached) and detach any client that raced in between — see
 // evictRuntime for the ordering rationale.
 //
@@ -532,7 +532,7 @@ func (r *sessionRegistry) activeIDs() []string {
 // attached to: the current pane plus any background panes opened via
 // session_attach. A killed tab cannot send session_detach for each pane, so
 // connection teardown sweeps the registry (detach is idempotent and never
-// cancels a turn, Phase 3 §4). Without the sweep, a background pane's dead
+// cancels a turn). Without the sweep, a background pane's dead
 // socket would linger in its runtime's clients set until the next broadcast
 // failed — and if the connection died while that session awaited a delete
 // approval, the turn would hang forever instead of auto-denying (D10: the
@@ -589,9 +589,9 @@ func (s *Server) ShutdownSessions() {
 }
 
 // acquireTurnForHandler implements the cancel-then-lock pattern scoped to one
-// session (E33): it cancels the in-flight turn only when THIS connection owns
+// session: it cancels the in-flight turn only when THIS connection owns
 // it (interrupt semantics — typing a new message replaces your own turn). A
-// second connection attached to the same session (E29) never cancels a turn
+// second connection attached to the same session never cancels a turn
 // it does not own; it waits and gets the standard busy rejection.
 func (rt *sessionRuntime) acquireTurnForHandler(ws *wsConn) bool {
 	if rt.ownsTurn(ws) {

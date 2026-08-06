@@ -88,7 +88,7 @@ func TestSetModelDoesNotDeadlock(t *testing.T) {
 	_ = readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" })
 }
 
-// TestSetModelIsPerSession verifies the per-session model contract (D1):
+// TestSetModelIsPerSession verifies the per-session model contract:
 // set_model on one session applies only to that session's provider and
 // echoes config to that pane only — no cross-pane broadcast, and the
 // workspace default (ws.Model) is never mutated. Uses a mock provider whose
@@ -144,7 +144,7 @@ func TestSetModelIsPerSession(t *testing.T) {
 }
 
 // TestWorkspaceNewSessionAgentKeepsSavedModel pins the per-session resume
-// rule (D1): a resumed session keeps its SAVED model even when it differs
+// rule: a resumed session keeps its SAVED model even when it differs
 // from the workspace default, and the async ValidateRestoredModel must not
 // clear it (it is listed by the provider).
 func TestWorkspaceNewSessionAgentKeepsSavedModel(t *testing.T) {

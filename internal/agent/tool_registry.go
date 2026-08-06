@@ -32,7 +32,7 @@ func BuiltinToolHandlers() map[string]ToolHandler {
 // SetToolHandlers replaces the builtin tool registry. The web server uses
 // this to wrap FS-mutating tools with a workspace-level filesystem lock so
 // concurrent sessions serialize actual file mutations without serializing
-// whole turns (multi-session plan, Phase 2). Calling with nil restores the
+// whole turns. Calling with nil restores the
 // builtin handlers on the next executeTool.
 func (a *Agent) SetToolHandlers(handlers map[string]ToolHandler) {
 	a.toolMu.Lock()

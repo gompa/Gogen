@@ -285,7 +285,7 @@ func (a *Agent) FormatSessionListForUI() (string, []SessionInfo, error) {
 // visible message, and stripping tool calls from a tool-call-only fork point
 // drops the resulting empty message instead of leaving a ghost in the forked
 // history. The multi-session web server uses this to fork into a NEW agent
-// while leaving the source session untouched (E13).
+// while leaving the source session untouched.
 func ForkMessages(messages []llm.Message, args string) ([]llm.Message, error) {
 	if len(messages) == 0 {
 		return nil, fmt.Errorf("no messages to fork from")

@@ -7,7 +7,7 @@ GoGen is a self-hosted, terminal or web-based coding assistant that can explore,
 - **Repository Exploration** — Top-level layout summary, directory listing, glob patterns, and symbol outlines before diving into files
 - **File Operations** — Read, write, patch, replace, and delete files safely; `download_file` fetches remote source files/binaries into the workspace (SSRF-protected) for local exploration
 - **Code Search** — Regex and literal string search across your codebase (ripgrep with fallback)
-- **Symbol Extraction** — Lists functions, methods, classes, and types via [tree-sitter](https://tree-sitter.github.io/tree-sitter/) for 15 languages
+- **Symbol Extraction** — Lists functions, methods, classes, and types via [tree-sitter](https://tree-sitter.github.io/tree-sitter/) for 19 languages
 - **Safe Edits** — Prefers unified diffs (`patch_file`) over full file rewrites; syntax error detection after edits
 - **Command Execution** — Run shell commands with configurable safety modes (blocklist / allowlist / off)
 - **Human-in-the-Loop** — Requires explicit approval for destructive actions (file deletes)
@@ -21,11 +21,11 @@ GoGen is a self-hosted, terminal or web-based coding assistant that can explore,
 
 ## Supported Languages
 
-Tree-sitter is bundled for **20 languages** (syntax checking after edits):
+Tree-sitter is bundled for **26 languages** (syntax checking after edits):
 
-Go, Python, JavaScript, TypeScript, TSX, Rust, Java, C, C++, C#, PHP, Ruby, HTML, CSS, JSON, Bash, YAML, TOML, Lua, HCL
+Go, Python, JavaScript, TypeScript, TSX, Rust, Java, Kotlin, C, C++, C#, PHP, Ruby, Scala, SQL, HTML, CSS, JSON, Bash, YAML, TOML, Lua, HCL, Zig, Dockerfile, Make
 
-**Symbol extraction** (`list_definitions`) has dedicated queries for **15** of these: Go, Python, JavaScript, TypeScript, TSX, Rust, Java, C, C++, C#, PHP, Ruby, Bash, Lua, HCL. JSON, HTML, CSS, YAML, and TOML get syntax checks only.
+**Symbol extraction** (`list_definitions`) has dedicated queries for **19** of these: Go, Python, JavaScript, TypeScript, TSX, Rust, Java, Kotlin, C, C++, C#, PHP, Ruby, Scala, SQL, Bash, Lua, HCL, Zig. JSON, HTML, CSS, YAML, TOML, Dockerfile, and Make get syntax checks only.
 
 Tree-sitter requires **CGO** at build time (enabled by default on Linux). Set `CGO_ENABLED=0` to build without it — tree-sitter features are then stubbed out.
 
@@ -363,15 +363,20 @@ export GOGEN_PRESERVE_REASONING=on
 main.go
 └── internal/
     ├── agent/       — Core agent logic, tool execution, safety guards
-    ├── projectfile/ — GOGEN.md front matter parse/merge/write
+    ├── projectfile/ — .gogen/gogen.conf and .md file loading/merging/writing
     ├── mcp/         — MCP stdio client and tool registry
-    ├── session/     — Conversation persistence
+    ├── session/     — Conversation persistence (JSON snapshots on disk)
     ├── tui/         — Interactive terminal interface (Bubble Tea)
     ├── config/      — Environment-based configuration
-    ├── contextmgr/  — Conversation context management and auto-compaction
+    ├── contextmgr/  — Token-aware context window management and auto-compaction
     ├── llm/         — OpenAI API integration, model-aware token limits
     ├── server/      — WebSocket-based web server
-    └── treesitter/  — Source code parsing, symbol extraction, syntax checking
+    ├── treesitter/  — Source code parsing, symbol extraction, syntax checking
+    ├── ioutil/      — Atomic file writes and helpers
+    ├── streamutil/  — Token batching for streaming
+    ├── modelinfo/   — models.dev context limit resolver
+    ├── debuglog/    — Structured debug logging
+    └── profiling/   — CPU/memory profiling (debug builds)
 ```
 
 ### Agent Tools
@@ -380,22 +385,53 @@ The agent has access to the following tools:
 
 | Tool | Description |
 |------|-------------|
-| `repo_overview` | Summarize top-level directories, file counts, and root files |
-| `list_files` | List files and directories (optional `recursive=true`) |
+| `repo_overview` | Summarize repo layout: top-level dirs, file counts, root files |
+| `list_files` | List directory contents (optional `recursive`, `tracked_only`) |
 | `glob_files` | Find files by glob pattern |
-| `read_file` | Read a single file (optional `offset`/`limit` for large files) |
+| `read_file` | Read a single file (optional `offset`/`limit` ranges, regex `search`) |
 | `read_files` | Read multiple files at once |
-| `list_definitions` | Extract functions/methods/types from source (tree-sitter) |
-| `search_code` | Regex or string search across the codebase (optional `context_lines`) |
-| `find_references` | Find symbol references via word-boundary search |
-| `write_file` | Write content to a file |
-| `patch_file` | Apply a unified diff (preferred for edits; optional `dry_run`) |
-| `replace_in_file` | Replace a search string in a file |
-| `delete_file` | Delete a file (requires approval) |
+| `list_definitions` | List functions/types with line numbers (tree-sitter) |
+| `write_file` | Create a new file (refuses existing paths) |
 | `execute_command` | Run a shell command (with safety guardrails) |
-| `show_diff` | Show git diff for the working tree |
-| `git_log` | Show recent commit history (read-only; plan mode) |
-| `git_blame` | Show line attribution for a file (read-only; plan mode) |
+| `run_tests` | Run project tests (auto-detects test command from project markers) |
+| `run_lint` | Run project linter (auto-detects from project markers) |
+| `replace_in_file` | Replace a literal string in a file (optional `replace_all`) |
+| `delete_file` | Delete a file (requires approval) |
+| `move_file` | Rename/move a file (creates parent dirs) |
+| `patch_file` | Apply surgical unified diff(s) (preferred; `dry_run`, `fuzzy`) |
+| `show_diff` | Show git diff (working tree or path) |
+| `search_code` | Regex/literal search across the codebase (optional `context_lines`) |
+| `find_references` | Find symbol references (AST when supported, text fallback) |
+| `git_log` | Recent git commits (read-only; plan mode) |
+| `git_blame` | Git blame for a file range (read-only; plan mode) |
+| `git_status` | Git status (short, read-only) |
+| `git_commit` | Commit (requires staged files) |
+| `git_stage` | Stage files (empty = stage all) |
+| `git_branch` | List/create/switch branches |
+| `git_stash` | Stash changes (`pop=true` to restore) |
+| `git_stash_list` | List stash entries |
+| `git_show` | Show commit/range as diff (empty = HEAD) |
+| `copy_file` | Copy a file (creates parent dirs) |
+| `web_search` | Web search (DuckDuckGo Lite; no API key needed) |
+| `web_fetch` | Fetch a web page as Markdown (optional `selector`/`query` extraction) |
+| `download_file` | Download a raw file into the workspace (binary-safe, SSRF-protected) |
+| `find_file` | Find files by name (case-insensitive substring) |
+| `find_definition` | Cross-file go-to-definition (tree-sitter or text fallback) |
+| `rename_symbol` | Rename a symbol across files (AST or text fallback) |
+| `multi_edit` | Literal text replacement across multiple files (not regex) |
+| `call_graph` | Call relationships for a symbol |
+| `dependency_analysis` | Impact analysis for a symbol (dependents, risk) |
+| `todo_add` | Add a todo item |
+| `todo_list` | List todos with status |
+| `todo_done` | Mark a todo done by ID |
+| `todo_remove` | Remove a todo by ID |
+| `todo_clear_done` | Clear completed todos |
+| `session_rename` | Rename the current session |
+| `session_usage` | Show session token usage |
+| `context_pin_last` | Pin the last user message to survive compaction |
+| `context_pins` | List pinned messages |
+
+Additional tools arrive at runtime from connected MCP servers as `mcp_<server>_<tool>`.
 
 ## Safety
 
