@@ -174,7 +174,34 @@ func handleExecuteCommand(ctx context.Context, a *Agent, args map[string]interfa
 	if err != nil {
 		return "", err
 	}
+	background, err := boolArg(args, "background", false)
+	if err != nil {
+		return "", err
+	}
+	if background {
+		id, err := a.StartBackgroundCommand(command)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Started background job %s.\nCommand: %s\nPoll with background_job_status (job_id: %q) or cancel with background_job_cancel.", id, command, id), nil
+	}
 	return a.Executor.ExecuteCommand(ctx, command)
+}
+
+func handleBackgroundJobStatus(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
+	jobID, err := stringArg(args, "job_id")
+	if err != nil {
+		return "", err
+	}
+	return a.BackgroundJobStatus(jobID)
+}
+
+func handleBackgroundJobCancel(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
+	jobID, err := stringArg(args, "job_id")
+	if err != nil {
+		return "", err
+	}
+	return a.CancelBackgroundJob(jobID)
 }
 
 func handleReplaceInFile(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {

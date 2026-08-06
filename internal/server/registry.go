@@ -25,10 +25,18 @@ type sessionRuntime struct {
 	// (moved from per-connection).
 	stream *wsConnStream
 
-	// approvals are pending delete-approval channels, keyed by approvalID
-	// (per-session, so two sessions' approvals cannot collide, E5).
+	// approvals are pending delete-approval requests, keyed by approvalID
+	// (per-session, so two sessions' approvals cannot collide, E5). Each
+	// entry keeps the original broadcast payload (paths/reason) so a
+	// reconnecting client can be re-notified of the pending request (F2).
 	approvalMu sync.Mutex
-	approvals  map[string]chan bool
+	approvals  map[string]*pendingApproval
+
+	// approvalHold is how long pending delete approvals survive the last
+	// attached client detaching before they are auto-denied. Zero (the
+	// default) denies immediately on detach (D10); a positive value gives a
+	// reconnecting client a window to answer before the hold expires.
+	approvalHold time.Duration
 
 	// clients are the attached sockets; broadcast() fans events out to all
 	// of them. A write failure detaches that socket, never cancels
@@ -65,15 +73,34 @@ type sessionRuntime struct {
 	registry *sessionRegistry
 }
 
+// pendingApproval is one in-flight delete-approval request: the channel the
+// turn's deleteApprover waits on, plus the original broadcast payload so a
+// re-attaching client can be re-notified of the pending request.
+type pendingApproval struct {
+	ch     chan bool
+	paths  []string
+	reason string
+}
+
 // newSessionRuntime builds a runtime with the per-session turn machinery
 // initialized. The agent must be non-nil.
 func newSessionRuntime(a *agent.Agent) *sessionRuntime {
 	return &sessionRuntime{
 		agent:     a,
 		stream:    &wsConnStream{},
-		approvals: make(map[string]chan bool),
+		approvals: make(map[string]*pendingApproval),
 		clients:   make(map[*wsConn]struct{}),
 	}
+}
+
+// newSessionRuntimeWithHold builds a runtime whose pending delete approvals
+// are auto-denied `hold` after the last attached client detaches (instead of
+// immediately). Tests and non-server embeddings keep using newSessionRuntime
+// (hold = 0, immediate deny).
+func newSessionRuntimeWithHold(a *agent.Agent, hold time.Duration) *sessionRuntime {
+	rt := newSessionRuntime(a)
+	rt.approvalHold = hold
+	return rt
 }
 
 // attach registers a socket as a viewer of this session. Broadcasts reach all
@@ -85,6 +112,33 @@ func (rt *sessionRuntime) attach(ws *wsConn) {
 	rt.clientsMu.Lock()
 	rt.clients[ws] = struct{}{}
 	rt.clientsMu.Unlock()
+	// A reconnecting client missed the original delete_approval broadcast.
+	// Re-notify it of every pending approval (F2: the hold window is only
+	// actionable if the reconnected client knows the approval ids). The
+	// response routes by approvalId, so duplicate notifications are harmless.
+	rt.approvalMu.Lock()
+	pending := make([]struct {
+		id     string
+		paths  []string
+		reason string
+	}, 0, len(rt.approvals))
+	for id, pa := range rt.approvals {
+		pending = append(pending, struct {
+			id     string
+			paths  []string
+			reason string
+		}{id: id, paths: pa.paths, reason: pa.reason})
+	}
+	rt.approvalMu.Unlock()
+	for _, p := range pending {
+		_ = ws.writeJSON(WSMessage{
+			Type:       "delete_approval",
+			ApprovalID: p.id,
+			Paths:      p.paths,
+			Reason:     p.reason,
+			SessionID:  rt.agent.SessionID,
+		})
+	}
 }
 
 // detach removes a socket from the session. It never cancels the turn: the
@@ -103,13 +157,37 @@ func (rt *sessionRuntime) detach(ws *wsConn) {
 	empty := len(rt.clients) == 0
 	rt.clientsMu.Unlock()
 	if ok && empty {
-		rt.autoDenyPendingApprovals()
+		if rt.approvalHold > 0 {
+			// F2: give a reconnecting client a window to answer pending
+			// approvals. The timer is idempotent: if a client re-attaches and
+			// answers first, completeApproval consumes the channel and the
+			// eventual auto-deny finds nothing pending; if they re-attach but
+			// do not answer, the hold still expires into auto-deny so an
+			// unattended turn cannot hang forever.
+			rt.scheduleAutoDenyAfter(rt.approvalHold)
+		} else {
+			rt.autoDenyPendingApprovals()
+		}
 		// Last viewer left: an idle runtime is now an orphan — flush and
 		// unregister it so it reads as a plain saved session instead of a
 		// stale "resume to continue" row. A running turn keeps it
 		// registered; the turn-end hook evicts it when the turn completes.
 		rt.evictOrphanedIfPossible()
 	}
+}
+
+// scheduleAutoDenyAfter denies every pending approval after `after` unless a
+// client answered them first. See detach for the idempotency argument.
+func (rt *sessionRuntime) scheduleAutoDenyAfter(after time.Duration) {
+	rt.approvalMu.Lock()
+	if len(rt.approvals) == 0 {
+		rt.approvalMu.Unlock()
+		return
+	}
+	rt.approvalMu.Unlock()
+	time.AfterFunc(after, func() {
+		rt.autoDenyPendingApprovals()
+	})
 }
 
 // clientCount returns the number of attached sockets (for tests/shutdown).
@@ -208,7 +286,7 @@ func (rt *sessionRuntime) completeApproval(id string, approved bool) {
 		return
 	}
 	select {
-	case ch <- approved:
+	case ch.ch <- approved:
 	default:
 		// Waiter already left (cancel) or buffer full — don't block the reader.
 	}
@@ -222,7 +300,7 @@ func (rt *sessionRuntime) autoDenyPendingApprovals() {
 	for id, ch := range rt.approvals {
 		delete(rt.approvals, id)
 		select {
-		case ch <- false:
+		case ch.ch <- false:
 		default:
 		}
 	}
@@ -237,7 +315,7 @@ func (rt *sessionRuntime) deleteApprover() agent.DeleteApprover {
 		ch := make(chan bool, 1)
 
 		rt.approvalMu.Lock()
-		rt.approvals[id] = ch
+		rt.approvals[id] = &pendingApproval{ch: ch, paths: req.Paths, reason: req.Reason}
 		rt.approvalMu.Unlock()
 
 		defer func() {
@@ -406,6 +484,10 @@ func (r *sessionRegistry) register(id string, rt *sessionRuntime) []string {
 // retried by the next FlushSession/persistSession, exactly as before).
 func (r *sessionRegistry) evictRuntime(rt *sessionRuntime) {
 	rt.agent.FlushPending()
+	// The runtime is leaving memory: its background jobs (execute_command
+	// background=true) have no owner left to poll them, so kill them rather
+	// than leak orphan processes. Idempotent; turns are unaffected.
+	rt.agent.Close()
 	r.remove(rt.agent.SessionID)
 	rt.broadcast(WSMessage{Type: "session_detached", SessionID: rt.agent.SessionID})
 	// Sweep attachments after the notification: a socket that raced in (or
@@ -585,6 +667,8 @@ func (s *Server) ShutdownSessions() {
 		}
 		rt.stream.cancelInFlight()
 		rt.agent.FlushPending()
+		// Kill background jobs so no command outlives the process.
+		rt.agent.Close()
 	}
 }
 

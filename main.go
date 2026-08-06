@@ -190,6 +190,11 @@ func main() {
 		exec.PathBoundary = projectfile.GlobalPathBoundary()
 	}
 	a := agent.NewAgent(provider, exec, ctxMgr)
+	// Background jobs (execute_command background=true) are owned by the
+	// session and killed when it closes; this defer covers the TUI, CLI, and
+	// web default-session agents at process exit (web session agents are
+	// closed by ShutdownSessions). Idempotent.
+	defer a.Close()
 	a.GlobalMode = isGlobalMode
 	a.SetProjectContext(cfg.ProjectFilePath, cfg.ProjectGuidelines, cfg.TestCommand, cfg.LintCommand)
 	a.TodoManager = agent.NewTodoManager(cfg.WorkingDir)

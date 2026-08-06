@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 
 	"gogen/internal/llm"
@@ -45,34 +46,51 @@ Docs: verify claims against code (search for names you mention). Only document w
 exists; do not invent config, CLI flags, or features. Omit unimplemented/roadmap items.`
 }
 
-func withSystemPrompt(messages []llm.Message, workingDir string) []llm.Message {
+// buildSystemView returns messages with the system prompt prepended (or the
+// existing first system message enriched), folding the project profile,
+// project rules, and plan-mode suffixes into the system message content in a
+// SINGLE copy of the slice. The previous two-step pipeline
+// (withSystemPrompt + enrichSystemPrompt) copied the whole message slice once
+// per suffix; on long conversations that was 2-5 full shallow copies per turn
+// and per ContextStats probe. The produced view is byte-identical to the old
+// pipeline: the base system prompt, then the profile suffix, then the project
+// rules header, then the plan-mode suffix, all on the leading system message.
+func buildSystemView(messages []llm.Message, workingDir, projectFilePath, guidelines, projectProfile string, mode Mode) []llm.Message {
 	if len(messages) == 0 {
 		return messages
 	}
-	for _, msg := range messages {
-		if msg.Role == "system" {
-			return messages
-		}
-	}
-	prompt := SystemPrompt(workingDir)
-	out := make([]llm.Message, 0, len(messages)+1)
-	out = append(out, llm.Message{Role: "system", Content: prompt})
-	out = append(out, messages...)
-	return out
-}
-
-func enrichSystemPrompt(messages []llm.Message, workingDir, projectFilePath, guidelines, projectProfile string, mode Mode) []llm.Message {
-	out := messages
+	// Suffixes in the same order enrichSystemPrompt applied them.
+	var suffix strings.Builder
 	if projectProfile != "" {
-		out = appendToSystemPrompt(out, "\n\nProject profile (auto-detected):\n"+projectProfile)
+		suffix.WriteString("\n\nProject profile (auto-detected):\n" + projectProfile)
 	}
 	if guidelines != "" {
-		header := projectRulesHeader(projectFilePath, guidelines)
-		out = appendToSystemPrompt(out, header)
+		suffix.WriteString(projectRulesHeader(projectFilePath, guidelines))
 	}
 	if mode == ModePlan {
-		out = appendToSystemPrompt(out, planModePromptSuffix)
+		suffix.WriteString(planModePromptSuffix)
 	}
+
+	// History already carries a system message (unusual — canonical history
+	// is user/assistant/tool): keep the list and fold the suffixes into that
+	// first system message, matching the old pipeline exactly.
+	for i := range messages {
+		if messages[i].Role == "system" {
+			if suffix.Len() == 0 {
+				return messages
+			}
+			out := append([]llm.Message(nil), messages...)
+			out[i].Content += suffix.String()
+			return out
+		}
+	}
+
+	// No system message: prepend one with the full content in one copy.
+	content := SystemPrompt(workingDir)
+	content += suffix.String()
+	out := make([]llm.Message, 0, len(messages)+1)
+	out = append(out, llm.Message{Role: "system", Content: content})
+	out = append(out, messages...)
 	return out
 }
 
@@ -82,21 +100,6 @@ func projectRulesHeader(path, guidelines string) string {
 		name = "project file"
 	}
 	return "\n\nProject rules (" + name + "):\n" + guidelines
-}
-
-func appendToSystemPrompt(messages []llm.Message, suffix string) []llm.Message {
-	if suffix == "" {
-		return messages
-	}
-	out := make([]llm.Message, len(messages))
-	copy(out, messages)
-	for i, msg := range out {
-		if msg.Role == "system" {
-			out[i].Content = msg.Content + suffix
-			return out
-		}
-	}
-	return messages
 }
 
 const planModePromptSuffix = `

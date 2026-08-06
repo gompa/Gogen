@@ -83,6 +83,7 @@
                     <button type="button" id="ncb-dismiss-btn" title="Dismiss" aria-label="Dismiss">✕</button>
                 </div>
                 <div id="input-area">
+                    <div id="attachment-preview" hidden></div>
                     <div id="input-wrap">
                         <div id="slash-suggest" role="listbox" aria-label="Slash command suggestions"></div>
                         <textarea id="message-input" placeholder="Ask the agent… (type / for commands, Enter to send)" autofocus autocomplete="off" rows="1"></textarea>
@@ -91,6 +92,8 @@
                             <span class="progress-label"></span>
                         </div>
                     </div>
+                    <button type="button" id="attach-btn" title="Attach image (or paste an image into the input)" aria-label="Attach image">📎</button>
+                    <input type="file" id="image-upload" accept="image/*" multiple hidden>
                     <button id="send-btn">Send</button>
                     <button id="cancel-btn" disabled title="Cancel current turn">Cancel</button>
                 </div>

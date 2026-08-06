@@ -21,12 +21,13 @@ const maxSummarizeDepth = 8
 // effective value (tunable to 0 in tests that exercise tiny histories).
 const defaultMinMiddleTokens = 500
 
-// warnThreshold is the fraction of the context limit at which the
+// WarnThreshold is the fraction of the context limit at which the
 // near-compact warning (web banner, statusbar color) appears. It is
 // deliberately decoupled from the auto-compaction trigger (CompactThreshold)
 // so the UI warns before compaction fires, giving the user lead time to
-// compact manually. Matches the TUI statusbar's hardcoded 75% warning.
-const warnThreshold = 0.75
+// compact manually. The TUI statusbar and the web banner both read this
+// constant so the thresholds cannot drift apart.
+const WarnThreshold = 0.75
 
 // summaryInstruction is the user message appended to the summarization
 // request. The request carries the wire prefix (system/enrichment messages)
@@ -299,7 +300,7 @@ func (m *Manager) snapshot(canonical, llmView []llm.Message, stored int) Context
 
 	warnAt := 0
 	if compactAt > 0 {
-		warnAt = int(float64(limit) * warnThreshold)
+		warnAt = int(float64(limit) * WarnThreshold)
 		if warnAt > compactAt {
 			warnAt = compactAt // small windows: warn exactly when compaction would trigger
 		}
@@ -414,7 +415,12 @@ func (m *Manager) CompactPinned(ctx context.Context, viewPrefix, messages []llm.
 		return messages, copyIntSet(pinned), nil
 	}
 
-	headIdx := firstUserIndex(messages)
+	headIdx, ok := firstUserIndex(messages)
+	if !ok {
+		// No user message to preserve as the head; compacting would drop
+		// messages without anything to anchor the summary.
+		return messages, copyIntSet(pinned), nil
+	}
 	tailStart := adjustCompactTailStart(messages, len(messages)-keep)
 	tailStart = extendTailForPins(messages, headIdx, tailStart, pinned)
 	if tailStart <= headIdx+1 {
@@ -514,13 +520,17 @@ func copyIntSet(in map[int]struct{}) map[int]struct{} {
 	return out
 }
 
-func firstUserIndex(messages []llm.Message) int {
+// firstUserIndex returns the index of the first real user message (skipping
+// compaction summaries, which are stored as user-role messages prefixed with
+// summaryPrefix) and whether one exists. ok is false when the conversation
+// has no user message at all — callers must not compact in that case.
+func firstUserIndex(messages []llm.Message) (int, bool) {
 	for i, msg := range messages {
 		if msg.Role == "user" && !strings.HasPrefix(msg.Content, summaryPrefix) {
-			return i
+			return i, true
 		}
 	}
-	return 0
+	return 0, false
 }
 
 // summarizeMiddle produces a summary of the middle of the conversation.
@@ -539,8 +549,10 @@ func (m *Manager) summarizeMiddle(ctx context.Context, ctxPrefix, middle []llm.M
 	m.mu.RUnlock()
 
 	req := make([]llm.Message, 0, len(ctxPrefix)+len(middle)+1)
-	req = append(req, ctxPrefix...)
-	req = append(req, middle...)
+	// Summarization requests must not carry user images: the summary model
+	// may not support vision, and image bytes are irrelevant to a recap.
+	req = append(req, stripImages(ctxPrefix)...)
+	req = append(req, stripImages(middle)...)
 	// Trailing SYSTEM-role instruction: a task directive, not a chat turn
 	// (a trailing user message made models continue the conversation instead
 	// of summarizing). The conversation prefix stays byte-identical, so the
@@ -562,6 +574,21 @@ func (m *Manager) summarizeMiddle(ctx context.Context, ctxPrefix, middle []llm.M
 		"budget":         budget,
 	})
 	return m.summarizeMessagesDepth(ctx, middle, 0)
+}
+
+// stripImages returns a copy of msgs with every user message's images
+// removed, leaving all other fields (and the original slice) untouched.
+// Only the summarization request is affected: stripping images from the
+// request prefix breaks the byte-identical prompt-cache prefix only for
+// sessions that attach images; the main conversation requests keep their
+// images and their cache behavior.
+func stripImages(msgs []llm.Message) []llm.Message {
+	out := make([]llm.Message, len(msgs))
+	for i, m := range msgs {
+		m.Images = nil
+		out[i] = m
+	}
+	return out
 }
 
 // summaryRequestBudgetLocked is the token budget for the continuation-summary

@@ -50,6 +50,7 @@ type FileConfig struct {
 	SessionMaxCount      int              `yaml:"session_max_count"`
 	SessionMaxAgeDays    int              `yaml:"session_max_age_days"`
 	WebMaxActiveSessions int              `yaml:"web_max_active_sessions"`
+	WebApprovalHoldSecs  int              `yaml:"web_approval_hold_secs"`
 	CommandSandbox       string           `yaml:"command_sandbox"`
 	CommandTimeoutSecs   int              `yaml:"command_timeout_secs"`
 	PreserveReasoning    string           `yaml:"preserve_reasoning"`

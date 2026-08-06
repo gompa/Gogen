@@ -335,6 +335,7 @@ type HistoryToolCall struct {
 type HistoryEntry struct {
 	Role       string            `json:"role"`
 	Content    string            `json:"content,omitempty"`
+	Images     []llm.ImageInput  `json:"images,omitempty"`
 	Reasoning  string            `json:"reasoning,omitempty"`
 	Refusal    string            `json:"refusal,omitempty"`
 	ToolCalls  []HistoryToolCall `json:"toolCalls,omitempty"`
@@ -372,6 +373,9 @@ type WSMessage struct {
 	CachedTokens     int     `json:"cachedTokens,omitempty"`
 	CompactAt        int     `json:"compactAt,omitempty"`
 	MessageCount     int     `json:"messageCount,omitempty"`
+	// Images carries user-attached images (data URLs) on inbound "message"
+	// frames; the server validates and forwards them to the agent.
+	Images []llm.ImageInput `json:"images,omitempty"`
 	// NearCompact and WarnNearCompact intentionally have NO omitempty: a
 	// false value must reach the client or a previously shown near-compact
 	// banner never hides after a compaction.
@@ -449,7 +453,11 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 	if a.SessionID == "" {
 		a.SessionID = sesspkg.NewID()
 	}
-	reg.register(a.SessionID, newSessionRuntime(a))
+	hold := time.Duration(0)
+	if cfg != nil {
+		hold = cfg.ApprovalHold()
+	}
+	reg.register(a.SessionID, newSessionRuntimeWithHold(a, hold))
 	// In web mode the registry is the sole pruner: Save's
 	// internal auto-prune protects only one session and could delete another
 	// live session's file; the registry prunes with the full active set.
@@ -471,6 +479,16 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 		connLimiter:    newRateLimitState(defaultMaxWSConns),
 		upgradeLimiter: newIPLimiter(5, 10), // 5 upgrades/sec/IP, burst 10
 	}
+}
+
+// newSessionRuntimeFor builds a session runtime carrying the server's
+// configured approval-hold window (see web_approval_hold_secs / F2).
+func (s *Server) newSessionRuntimeFor(a *agent.Agent) *sessionRuntime {
+	hold := time.Duration(0)
+	if s.config != nil {
+		hold = s.config.ApprovalHold()
+	}
+	return newSessionRuntimeWithHold(a, hold)
 }
 
 func (s *Server) wsUpgrader() websocket.Upgrader {
@@ -598,9 +616,13 @@ func historyEntries(msgs []llm.Message) []HistoryEntry {
 		switch m.Role {
 		case "user":
 			if m.Content == "" {
-				continue
+				// Pure-image messages (no text) are still valid history: they
+				// carry their images. Only skip when there is nothing at all.
+				if len(m.Images) == 0 {
+					continue
+				}
 			}
-			out = append(out, HistoryEntry{Role: m.Role, Content: m.Content, Index: idx, CreatedAt: createdAt})
+			out = append(out, HistoryEntry{Role: m.Role, Content: m.Content, Images: m.Images, Index: idx, CreatedAt: createdAt})
 		case "assistant":
 			if m.Content == "" && len(m.ToolCalls) == 0 && m.Reasoning == "" && m.Refusal == "" {
 				continue
@@ -639,6 +661,49 @@ func historyEntries(msgs []llm.Message) []HistoryEntry {
 		}
 	}
 	return out
+}
+
+// Limits for user-attached images (vision input). These cap WebSocket frame
+// size and per-message model cost without being overly restrictive.
+const (
+	maxImagesPerMessage   = 4
+	maxImageDataURLBytes  = 5 * 1024 * 1024
+	imageDataURLPrefix    = "data:image/"
+	imageDataURLBase64Sep = ";base64,"
+)
+
+// validateImageInputs checks user-attached images and returns a clean copy
+// (nil when the message carried none). Empty inputs are rejected: a message
+// must not claim an image that carries no bytes, and the data URL must look
+// like a base64 image to keep the wire format honest.
+func validateImageInputs(images []llm.ImageInput) ([]llm.ImageInput, error) {
+	if len(images) == 0 {
+		return nil, nil
+	}
+	if len(images) > maxImagesPerMessage {
+		return nil, fmt.Errorf("too many images: %d (max %d per message)", len(images), maxImagesPerMessage)
+	}
+	out := make([]llm.ImageInput, 0, len(images))
+	for i, img := range images {
+		url := strings.TrimSpace(img.DataURL)
+		if url == "" {
+			return nil, fmt.Errorf("image %d has no data URL", i+1)
+		}
+		if len(url) > maxImageDataURLBytes {
+			return nil, fmt.Errorf("image %d exceeds %d bytes (data URL too large)", i+1, maxImageDataURLBytes)
+		}
+		if !strings.HasPrefix(url, imageDataURLPrefix) || !strings.Contains(url, imageDataURLBase64Sep) {
+			return nil, fmt.Errorf("image %d must be a base64 data URL (data:image/...;base64,...)", i+1)
+		}
+		detail := strings.ToLower(strings.TrimSpace(img.Detail))
+		switch detail {
+		case "", "auto", "low", "high":
+		default:
+			return nil, fmt.Errorf("image %d has invalid detail %q (use auto, low, or high)", i+1, img.Detail)
+		}
+		out = append(out, llm.ImageInput{DataURL: url, Detail: detail})
+	}
+	return out, nil
 }
 
 func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, rt *sessionRuntime, result agent.SessionCommandResult, err error) {
@@ -698,14 +763,21 @@ func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, rt *
 	if (clearChat && err == nil) || len(history) > 0 {
 		_ = ws.writeJSON(WSMessage{Type: "history", History: historyEntries(history), SessionID: cfg.SessionID})
 	}
-	stats := a.ContextStats(ctx)
-	accum := a.SnapshotUsageAccum()
-	applyContextStats(&cfg, stats, &accum)
-	fillModelPricing(a, &cfg)
-	ctxMsg := WSMessage{Type: "context"}
-	applyContextStats(&ctxMsg, stats, &accum)
-	_ = ws.writeJSON(ctxMsg)
-	_ = ws.writeJSON(cfg)
+	// Context stats (tokenization) can take seconds on a large uncached
+	// session; compute them off the read loop like every other handler so a
+	// slow probe cannot block this connection's messages (including cancel).
+	// The response/history above were already enqueued, so the send-queue
+	// FIFO keeps the ordering stable.
+	go func() {
+		stats := a.ContextStats(ctx)
+		accum := a.SnapshotUsageAccum()
+		applyContextStats(&cfg, stats, &accum)
+		fillModelPricing(a, &cfg)
+		ctxMsg := WSMessage{Type: "context"}
+		applyContextStats(&ctxMsg, stats, &accum)
+		_ = ws.writeJSON(ctxMsg)
+		_ = ws.writeJSON(cfg)
+	}()
 }
 
 // contextMsg builds a context stats message. Safe to call while holding the
@@ -1284,6 +1356,13 @@ func (s *Server) handleWSListModels(ws *wsConn, ctx context.Context, rt *session
 }
 
 func (s *Server) handleWSSetModel(ws *wsConn, ctx context.Context, rt *sessionRuntime, msg WSMessage) {
+	// SelectModel resolves the selector against the provider catalog, which
+	// performs network I/O on first use. Pre-fetch the catalog OUTSIDE the
+	// turn lock so a slow endpoint cannot stall the whole session (its
+	// turns and every other turnMu-taking handler); SelectModel under the
+	// lock then only touches the in-memory cache. If the pre-fetch fails,
+	// SelectModel surfaces the same error under the lock — no regression.
+	_, _ = rt.agent.ListModels(ctx)
 	if !rt.acquireTurnForHandler(ws) {
 		return
 	}
@@ -1539,6 +1618,13 @@ func (s *Server) handleWSCompact(ws *wsConn, r *http.Request, rt *sessionRuntime
 
 func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **sessionRuntime, msg WSMessage) {
 	rt := *pane
+	// Validate user-attached images first: a malformed image frame must be
+	// rejected without cancelling an in-flight turn or taking the turn lock.
+	images, err := validateImageInputs(msg.Images)
+	if err != nil {
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: " + err.Error()})
+		return
+	}
 	// Interrupt semantics apply only to the connection that owns the current
 	// turn; a second connection's message must not cancel a turn it does not
 	// own — it gets the busy rejection below.
@@ -1589,6 +1675,14 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 	// like the old global turnMu: tryAcquireTurn acquires it, each handled
 	// branch releases it before returning, and the unhandled fall-through
 	// hands it to rt.startTurn's goroutine, which defers the unlock.
+	//
+	// Selecting a model resolves the selector against the provider catalog,
+	// which performs network I/O on first use. Pre-fetch it before taking the
+	// turn lock so the /models <sel> branch below (HandleModelsCommand →
+	// SelectModel) only touches the in-memory cache.
+	if sel, isModels := agent.ParseModelsCommand(msg.Content); isModels && sel != "" {
+		_, _ = rt.agent.ListModels(r.Context())
+	}
 	if !rt.tryAcquireTurn(wsTurnAcquireWait) {
 		// Cancel may have timed out while a tool was still exiting; wait once
 		// more. Only re-cancel when this connection owns the turn — a second
@@ -1666,25 +1760,31 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 		out, _, modelErr := a.HandleModelsCommand(r.Context(), msg.Content)
 		cfg := agentConfigMsgBasic(a)
 		rt.turnMu.Unlock()
-		fillModelPricing(a, &cfg)
-		accum := a.SnapshotUsageAccum()
-		applyContextStats(&cfg, a.ContextStats(r.Context()), &accum)
-		resp := WSMessage{Type: "response", Content: out}
-		if modelErr != nil {
-			resp.Content = fmt.Sprintf("Error: %v", modelErr)
-		} else {
-			resp.Model = cfg.Model
-			resp.ContextLimit = cfg.ContextLimit
-			resp.UsedTokens = cfg.UsedTokens
-			resp.UsedSource = cfg.UsedSource
-			resp.UsedPercent = cfg.UsedPercent
-			_ = ws.writeJSON(cfg)
-		}
-		_ = ws.writeJSON(resp)
+		// Echo off the read loop (tokenization can take seconds on a large
+		// uncached session; the read loop serializes every message). Both
+		// cfg (success only) and resp are written from the goroutine so
+		// their relative order is preserved via the send-queue FIFO.
+		go func(out string, modelErr error, cfg WSMessage) {
+			fillModelPricing(a, &cfg)
+			accum := a.SnapshotUsageAccum()
+			applyContextStats(&cfg, a.ContextStats(r.Context()), &accum)
+			resp := WSMessage{Type: "response", Content: out}
+			if modelErr != nil {
+				resp.Content = fmt.Sprintf("Error: %v", modelErr)
+			} else {
+				resp.Model = cfg.Model
+				resp.ContextLimit = cfg.ContextLimit
+				resp.UsedTokens = cfg.UsedTokens
+				resp.UsedSource = cfg.UsedSource
+				resp.UsedPercent = cfg.UsedPercent
+				_ = ws.writeJSON(cfg)
+			}
+			_ = ws.writeJSON(resp)
+		}(out, modelErr, cfg)
 		return
 	}
 
-	rt.startTurn(ws, msg.Content)
+	rt.startTurn(ws, msg.Content, images)
 }
 
 // startTurn begins a streaming turn owned by the session runtime. The caller
@@ -1694,11 +1794,11 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 // cancelled the moment HandleWS returns and would silently abort the headless
 // turn (§4, third kill path). owner is the connection that started the turn
 // (the only one allowed to interrupt it via the cancel-then-lock path, E29).
-func (rt *sessionRuntime) startTurn(owner *wsConn, content string) {
+func (rt *sessionRuntime) startTurn(owner *wsConn, content string, images []llm.ImageInput) {
 	streamCtx, streamCancel := context.WithCancel(context.Background())
 	errCh := rt.stream.begin(streamCancel)
 	rt.setTurnActive(true, time.Now(), owner)
-	go func(content string, turnCtx context.Context, done chan error) {
+	go func(content string, images []llm.ImageInput, turnCtx context.Context, done chan error) {
 		// Defers run LIFO, so the cleanup executes in this order: turn_end
 		// broadcast → setTurnActive(false) → done → stream.end() →
 		// turnMu.Unlock().
@@ -1880,7 +1980,7 @@ func (rt *sessionRuntime) startTurn(owner *wsConn, content string) {
 			},
 		}
 
-		_, err := rt.agent.StreamProcessInput(ctx, content, handlers)
+		_, err := rt.agent.StreamProcessInputWithImages(ctx, content, images, handlers)
 		var persistErr error
 		var ctxMsg WSMessage
 		if err == nil {
@@ -1916,7 +2016,7 @@ func (rt *sessionRuntime) startTurn(owner *wsConn, content string) {
 		if ctxMsg.Type != "" {
 			write(ctxMsg)
 		}
-	}(content, streamCtx, errCh)
+	}(content, images, streamCtx, errCh)
 }
 
 func (s *Server) HandleStatic(w http.ResponseWriter, r *http.Request) {

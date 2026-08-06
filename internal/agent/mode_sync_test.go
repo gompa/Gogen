@@ -56,6 +56,8 @@ func TestBuiltinToolNamesMatchSchemasAndHandlers(t *testing.T) {
 		"multi_edit",
 		"call_graph",
 		"dependency_analysis",
+		"background_job_status",
+		"background_job_cancel",
 	}
 
 	schemas := BuiltinTools()

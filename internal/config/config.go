@@ -2,6 +2,7 @@ package config
 
 import (
 	"strings"
+	"time"
 )
 
 // Exported defaults for configurable settings. Other packages reference these
@@ -89,6 +90,10 @@ type Config struct {
 	// WebMaxActiveSessions caps concurrently active web sessions (registry
 	// eviction bound; 0 = DefaultWebMaxActiveSessions).
 	WebMaxActiveSessions int
+	// WebApprovalHoldSecs is how long a pending delete approval survives the
+	// last attached client detaching before it is auto-denied (0 = deny
+	// immediately on detach, the default).
+	WebApprovalHoldSecs int
 
 	SessionMaxCount   int // max saved sessions per working dir (0 = default 50)
 	SessionMaxAgeDays int // delete sessions older than N days (0 = default 30)
@@ -137,6 +142,7 @@ func Defaults() Config {
 		SessionMaxCount:      DefaultSessionMaxCount,
 		SessionMaxAgeDays:    DefaultSessionMaxAgeDays,
 		WebMaxActiveSessions: DefaultWebMaxActiveSessions,
+		WebApprovalHoldSecs:  0,
 		WebFetch:             "on",
 		WebSearch:            "on",
 		WebSearchBackend:     "",
@@ -147,6 +153,15 @@ func Defaults() Config {
 		CommandTimeoutSecs:   DefaultCommandTimeoutSecs,
 		PreserveReasoning:    "auto",
 	}
+}
+
+// ApprovalHold returns the configured approval-hold duration. Zero means
+// "deny pending approvals immediately when the last client detaches".
+func (c *Config) ApprovalHold() time.Duration {
+	if c == nil || c.WebApprovalHoldSecs <= 0 {
+		return 0
+	}
+	return time.Duration(c.WebApprovalHoldSecs) * time.Second
 }
 
 // configOn reports whether a config field is explicitly enabled.

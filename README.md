@@ -9,7 +9,8 @@ GoGen is a self-hosted, terminal or web-based coding assistant that can explore,
 - **Code Search** — Regex and literal string search across your codebase (ripgrep with fallback)
 - **Symbol Extraction** — Lists functions, methods, classes, and types via [tree-sitter](https://tree-sitter.github.io/tree-sitter/) for 19 languages
 - **Safe Edits** — Prefers unified diffs (`patch_file`) over full file rewrites; syntax error detection after edits
-- **Command Execution** — Run shell commands with configurable safety modes (blocklist / allowlist / off)
+- **Command Execution** — Run shell commands with configurable safety modes (blocklist / allowlist / off); `execute_command` can also run commands **in the background** (returns a job id pollable with `background_job_status` / cancellable with `background_job_cancel`)
+- **Vision Input** — Paste or attach images in the web UI; they are sent to vision-capable models as image content alongside your prompt
 - **Human-in-the-Loop** — Requires explicit approval for destructive actions (file deletes)
 - **Context Management** — Auto-compacts conversation history when nearing token limits to stay within model context windows
 - **Project Config** — Separate `.gogen/gogen.conf` (YAML) for settings and `.gogen/gogen.md` (or `GOGEN.md`) for guidelines. Precedence: **env > CLI flags > .conf > defaults**.
@@ -280,6 +281,7 @@ These can be set in `.gogen/gogen.conf` or as CLI flags. They are loaded from th
 | `GOGEN_WEB_TLS_CERT` | *(empty)* | Path to PEM certificate file for TLS |
 | `GOGEN_WEB_TLS_KEY` | *(empty)* | Path to PEM key file for TLS |
 | `GOGEN_WEB_MAX_ACTIVE_SESSIONS` | `8` | Cap on concurrently active sessions (panes); also `web_max_active_sessions` in `.gogen/gogen.conf` |
+| `GOGEN_WEB_APPROVAL_HOLD_SECS` | `0` | Keep pending delete approvals alive for N seconds after the last client detaches (a reconnecting client is re-notified and can answer); `0` auto-denies immediately on detach. Also `web_approval_hold_secs` in `.gogen/gogen.conf` |
 
 ### Web UI: panes and disconnect continuation
 

@@ -10,8 +10,8 @@ import (
 func TestPlanModeAllowedTools(t *testing.T) {
 	a := &Agent{Mode: ModePlan}
 	allowed := a.AllowedToolNames()
-	if len(allowed) != 24 {
-		t.Fatalf("expected 24 tools, got %d", len(allowed))
+	if len(allowed) != 26 {
+		t.Fatalf("expected 26 tools, got %d", len(allowed))
 	}
 	if _, ok := allowed["read_file"]; !ok {
 		t.Fatal("read_file should be allowed")
@@ -33,6 +33,12 @@ func TestPlanModeAllowedTools(t *testing.T) {
 	}
 	if _, ok := allowed["find_definition"]; !ok {
 		t.Fatal("find_definition should be allowed in plan mode")
+	}
+	if _, ok := allowed["call_graph"]; !ok {
+		t.Fatal("call_graph should be allowed in plan mode (read-only analysis)")
+	}
+	if _, ok := allowed["dependency_analysis"]; !ok {
+		t.Fatal("dependency_analysis should be allowed in plan mode (read-only analysis)")
 	}
 	if _, ok := allowed["todo_list"]; !ok {
 		t.Fatal("todo_list should be allowed in plan mode")

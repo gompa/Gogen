@@ -71,9 +71,19 @@ func (m *Manager) EstimateTokens(messages []llm.Message) int {
 
 func computeMessageTokens(msg llm.Message) int {
 	if n, ok := countTokensExact(msg); ok {
-		return n
+		return n + imageTokenEstimate(msg)
 	}
-	return estimateMessageTokensHeuristic(msg)
+	return estimateMessageTokensHeuristic(msg) + imageTokenEstimate(msg)
+}
+
+// imageTokenEstimate is a conservative flat per-image token estimate.
+// OpenAI bills vision input at 85 base tokens + 170 per 512x512 tile (high
+// detail); without decoding dimensions from the data URL, 1024 tokens per
+// image comfortably covers typical screenshots. Overestimating only makes
+// compaction run slightly earlier — underestimating would risk overflowing
+// the context window.
+func imageTokenEstimate(msg llm.Message) int {
+	return 1024 * len(msg.Images)
 }
 
 func countTokensExact(msg llm.Message) (int, bool) {

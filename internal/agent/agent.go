@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"reflect"
@@ -36,6 +37,13 @@ type Agent struct {
 	SessionLabel   string
 	SessionOneshot bool // true if this session was created by a single-prompt (-p) invocation
 	UsageAccum     UsageAccumulator
+
+	// bgMu guards bgJobs: shell commands started with execute_command
+	// background=true. Jobs outlive the turn that started them (they are
+	// owned by the session, not the turn) and are killed when the session
+	// closes (Close) or individually via background_job_cancel.
+	bgMu   sync.Mutex
+	bgJobs map[string]*BackgroundJob
 
 	// statsMu serializes the agent state that ContextStats/SnapshotMessages
 	// read without the session turnMu: Messages, the cached token counts
@@ -337,6 +345,7 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 	msgs := cloneMessages(a.Messages)
 	label := a.SessionLabel
 	countsEpoch := a.countsEpoch
+	tokenCounts := append([]int(nil), a.tokenCounts...)
 	// Mode/thinking/oneshot are written under statsMu (SetMode,
 	// SetThinkingLevel, RestoreSessionLocal), so read them under the same
 	// lock: doPersist also runs on the shutdown flush path with no turnMu,
@@ -391,11 +400,6 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 			Messages:       msgs,
 			ContextLimit:   a.ContextLimit(),
 		}
-		// Snapshot the cached counts under the stats lock: a concurrent
-		// ContextStats/turn may extend them while doPersist runs.
-		a.statsMu.RLock()
-		tokenCounts := append([]int(nil), a.tokenCounts...)
-		a.statsMu.RUnlock()
 		if len(tokenCounts) == len(msgs) {
 			snap.TokenCounts = tokenCounts
 		} else if a.Context != nil && !skipTokenCounts {
@@ -422,9 +426,16 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 		newMsgs := msgs[a.lastSavedMsgCount:]
 		var newCounts []int
 		if a.Context != nil && !skipTokenCounts {
-			newCounts = make([]int, len(newMsgs))
-			for i := range newMsgs {
-				newCounts[i] = contextmgr.ComputeMessageTokens(newMsgs[i])
+			if len(tokenCounts) >= count {
+				// extendTokenCounts ran above, so the in-memory cache already
+				// covers these messages; reuse it instead of re-tokenizing
+				// the same content a second time.
+				newCounts = append([]int(nil), tokenCounts[a.lastSavedMsgCount:count]...)
+			} else {
+				newCounts = make([]int, len(newMsgs))
+				for i := range newMsgs {
+					newCounts[i] = contextmgr.ComputeMessageTokens(newMsgs[i])
+				}
 			}
 		}
 		deltaSnap := SessionSnapshot{
@@ -819,8 +830,7 @@ func (a *Agent) prepareMessages(ctx context.Context, h *llm.StreamHandlers) []ll
 	// ArgsStabilized is persisted and we skip already-stable messages.
 	a.stabilizeToolArgs()
 
-	view = withSystemPrompt(view, a.WorkingDir)
-	view = enrichSystemPrompt(view, a.WorkingDir, a.ProjectFilePath, a.ProjectGuidelines, a.ensureProjectProfile(), a.Mode)
+	view = buildSystemView(view, a.WorkingDir, a.ProjectFilePath, a.ProjectGuidelines, a.ensureProjectProfile(), a.Mode)
 
 	a.recordViewForDrift(view)
 	return view
@@ -834,8 +844,7 @@ func (a *Agent) systemPromptPrefix() []llm.Message {
 	if len(a.Messages) == 0 {
 		return nil
 	}
-	view := withSystemPrompt(a.Messages, a.WorkingDir)
-	view = enrichSystemPrompt(view, a.WorkingDir, a.ProjectFilePath, a.ProjectGuidelines, a.ensureProjectProfile(), a.Mode)
+	view := buildSystemView(a.Messages, a.WorkingDir, a.ProjectFilePath, a.ProjectGuidelines, a.ensureProjectProfile(), a.Mode)
 	return view[:len(view)-len(a.Messages)]
 }
 
@@ -909,7 +918,18 @@ func (a *Agent) appendToolResult(tc llm.ToolCall, result string) {
 // StreamProcessInput streams tokens to the handlers as they arrive.
 // It returns the final accumulated response or an error.
 func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.StreamHandlers) (string, error) {
-	a.appendMessage(llm.Message{Role: "user", Content: input, CreatedAt: time.Now().Truncate(time.Millisecond)})
+	return a.StreamProcessInputWithImages(ctx, input, nil, h)
+}
+
+// StreamProcessInputWithImages is StreamProcessInput with optional
+// user-attached images (vision input). images is nil for text-only prompts.
+func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, images []llm.ImageInput, h *llm.StreamHandlers) (string, error) {
+	a.appendMessage(llm.Message{
+		Role:      "user",
+		Content:   input,
+		Images:    images,
+		CreatedAt: time.Now().Truncate(time.Millisecond),
+	})
 	// If the session doesn't have a label yet, derive one from the first user message.
 	if a.SessionLabelSnapshot() == "" {
 		a.setSessionLabel(llm.SessionLabel(a.Messages))
@@ -1015,59 +1035,71 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 			CreatedAt: time.Now().Truncate(time.Millisecond),
 		})
 
-		for i, tc := range result.ToolCalls {
-			if ctx.Err() != nil {
-				// Preserve a valid tool-call/result protocol for the next turn.
-				a.appendCanceledToolResults(result.ToolCalls[i:])
+		// Read-only tool batches (every call parallel-safe and none shadowed
+		// by an MCP tool) run concurrently, bounded by maxParallelTools;
+		// anything else runs strictly sequentially in model order so mutating
+		// tools stay serialized and results append in the model's call order.
+		if a.toolCallsParallelEligible(result.ToolCalls) {
+			if a.executeToolCallsParallel(ctx, h, result.ToolCalls) {
 				finishStreamUI(h)
 				a.FlushSession()
 				return "", ctx.Err()
 			}
-			if h.OnToolCall != nil {
-				h.OnToolCall(tc)
-			}
-			if h.OnToolExecute != nil {
-				h.OnToolExecute(tc.Name)
-			}
+		} else {
+			for i, tc := range result.ToolCalls {
+				if ctx.Err() != nil {
+					// Preserve a valid tool-call/result protocol for the next turn.
+					a.appendCanceledToolResults(result.ToolCalls[i:])
+					finishStreamUI(h)
+					a.FlushSession()
+					return "", ctx.Err()
+				}
+				if h.OnToolCall != nil {
+					h.OnToolCall(tc)
+				}
+				if h.OnToolExecute != nil {
+					h.OnToolExecute(tc.Name)
+				}
 
-			// Attach the live-output sink (if any) to this tool call's
-			// context so shell tools can stream chunks to the UI as the
-			// command runs. The sink is per-tool so each command gets its
-			// own identity (id/name) in the handler.
-			toolCtx := ctx
-			if h.OnToolOutput != nil {
-				toolCtx = ContextWithToolOutput(ctx, func(command, chunk string) {
-					h.OnToolOutput(tc.ID, tc.Name, command, chunk)
-				})
-			}
-			res, errTool := a.executeTool(toolCtx, tc)
-			if ctx.Err() != nil {
-				if errTool == nil {
-					res = "The operation was cancelled by the user."
-				} else if errTool == context.Canceled {
-					res = "The operation was cancelled by the user."
-				} else {
+				// Attach the live-output sink (if any) to this tool call's
+				// context so shell tools can stream chunks to the UI as the
+				// command runs. The sink is per-tool so each command gets its
+				// own identity (id/name) in the handler.
+				toolCtx := ctx
+				if h.OnToolOutput != nil {
+					toolCtx = ContextWithToolOutput(ctx, func(command, chunk string) {
+						h.OnToolOutput(tc.ID, tc.Name, command, chunk)
+					})
+				}
+				res, errTool := a.executeTool(toolCtx, tc)
+				if ctx.Err() != nil {
+					if errTool == nil {
+						res = "The operation was cancelled by the user."
+					} else if errTool == context.Canceled {
+						res = "The operation was cancelled by the user."
+					} else {
+						res = formatToolError(res, errTool)
+					}
+					if h.OnToolResult != nil {
+						h.OnToolResult(tc.ID, tc.Name, res, false)
+					}
+					a.appendToolResult(tc, res)
+					a.appendCanceledToolResults(result.ToolCalls[i+1:])
+					finishStreamUI(h)
+					a.FlushSession()
+					return "", ctx.Err()
+				}
+				success := errTool == nil
+				if errTool != nil {
 					res = formatToolError(res, errTool)
 				}
+
 				if h.OnToolResult != nil {
-					h.OnToolResult(tc.ID, tc.Name, res, false)
+					h.OnToolResult(tc.ID, tc.Name, res, success)
 				}
+
 				a.appendToolResult(tc, res)
-				a.appendCanceledToolResults(result.ToolCalls[i+1:])
-				finishStreamUI(h)
-				a.FlushSession()
-				return "", ctx.Err()
 			}
-			success := errTool == nil
-			if errTool != nil {
-				res = formatToolError(res, errTool)
-			}
-
-			if h.OnToolResult != nil {
-				h.OnToolResult(tc.ID, tc.Name, res, success)
-			}
-
-			a.appendToolResult(tc, res)
 		}
 		a.persistSession()
 	}
@@ -1080,43 +1112,145 @@ func (a *Agent) appendCanceledToolResults(toolCalls []llm.ToolCall) {
 	}
 }
 
+// toolCallsParallelEligible reports whether every tool call in the batch can
+// run concurrently within the turn: all are builtin read-only tools and none
+// is shadowed by an MCP tool of the same name (MCP side effects are unknown,
+// so MCP tools always stay sequential).
+func (a *Agent) toolCallsParallelEligible(toolCalls []llm.ToolCall) bool {
+	if len(toolCalls) < 2 {
+		return false
+	}
+	if a.MCPRegistry != nil {
+		if names := a.MCPRegistry.ToolNames(); names != nil {
+			for _, tc := range toolCalls {
+				if _, ok := names[tc.Name]; ok {
+					return false
+				}
+			}
+		}
+	}
+	for _, tc := range toolCalls {
+		if !parallelSafeTools[tc.Name] {
+			return false
+		}
+	}
+	return true
+}
+
+// executeToolCallsParallel runs every tool call concurrently, bounded by
+// maxParallelTools, then fires OnToolResult callbacks and appends results in
+// model order so the tool-call/result protocol stays valid (every tool_call
+// gets a matching tool result). It returns true when the turn was cancelled
+// during execution; in that case completed results are preserved and
+// interrupted calls read as cancelled.
+func (a *Agent) executeToolCallsParallel(ctx context.Context, h *llm.StreamHandlers, toolCalls []llm.ToolCall) bool {
+	type execResult struct {
+		res string
+		err error
+	}
+	results := make([]execResult, len(toolCalls))
+
+	if ctx.Err() != nil {
+		return true
+	}
+	for i := range toolCalls {
+		tc := toolCalls[i]
+		if h.OnToolCall != nil {
+			h.OnToolCall(tc)
+		}
+		if h.OnToolExecute != nil {
+			h.OnToolExecute(tc.Name)
+		}
+	}
+
+	sem := make(chan struct{}, maxParallelTools)
+	var wg sync.WaitGroup
+	for i := range toolCalls {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				results[i] = execResult{err: context.Canceled}
+				return
+			}
+			defer func() { <-sem }()
+			res, err := a.executeTool(ctx, toolCalls[i])
+			results[i] = execResult{res: res, err: err}
+		}(i)
+	}
+	wg.Wait()
+
+	cancelled := ctx.Err() != nil
+	for i, tc := range toolCalls {
+		res, errTool := results[i].res, results[i].err
+		if cancelled {
+			if errTool == nil {
+				res = "The operation was cancelled by the user."
+			} else if errors.Is(errTool, context.Canceled) {
+				res = "The operation was cancelled by the user."
+			} else {
+				res = formatToolError(res, errTool)
+			}
+			if h.OnToolResult != nil {
+				h.OnToolResult(tc.ID, tc.Name, res, false)
+			}
+			a.appendToolResult(tc, res)
+			continue
+		}
+		success := errTool == nil
+		if errTool != nil {
+			res = formatToolError(res, errTool)
+		}
+		if h.OnToolResult != nil {
+			h.OnToolResult(tc.ID, tc.Name, res, success)
+		}
+		a.appendToolResult(tc, res)
+	}
+	return cancelled
+}
+
 // RepairOrphanToolCalls appends cancelled tool-result placeholders for any
 // trailing assistant tool_calls that lack matching tool messages. Call on
 // cancel/shutdown so the next turn keeps a valid tool-call/result protocol.
 // Returns true when messages were modified.
+//
+// The scan is a single backward pass: seen tracks the tool-result IDs in the
+// contiguous run of tool messages immediately after the current position
+// (matching the previous per-message forward scan, which broke at the first
+// non-tool message). Any other message resets the run.
 func (a *Agent) RepairOrphanToolCalls() bool {
 	if a == nil || len(a.Messages) == 0 {
 		return false
 	}
 	modified := false
+	seen := make(map[string]struct{})
 	for i := len(a.Messages) - 1; i >= 0; i-- {
 		msg := a.Messages[i]
-		if msg.Role == "tool" {
-			continue
-		}
-		if msg.Role != "assistant" || len(msg.ToolCalls) == 0 {
-			continue
-		}
-		have := make(map[string]struct{})
-		for j := i + 1; j < len(a.Messages); j++ {
-			if a.Messages[j].Role != "tool" {
-				break
+		switch {
+		case msg.Role == "tool":
+			if id := msg.ToolCallID; id != "" {
+				seen[id] = struct{}{}
 			}
-			if id := a.Messages[j].ToolCallID; id != "" {
-				have[id] = struct{}{}
+		case msg.Role == "assistant" && len(msg.ToolCalls) > 0:
+			var missing []llm.ToolCall
+			for _, tc := range msg.ToolCalls {
+				if _, ok := seen[tc.ID]; !ok {
+					missing = append(missing, tc)
+				}
 			}
-		}
-		var missing []llm.ToolCall
-		for _, tc := range msg.ToolCalls {
-			if _, ok := have[tc.ID]; !ok {
-				missing = append(missing, tc)
+			if len(missing) > 0 {
+				a.appendCanceledToolResults(missing)
+				modified = true
 			}
+			// This assistant message is itself a non-tool message, so the
+			// tool-result run it just consumed does not apply to any earlier
+			// assistant tool-call message (the old forward scan broke on it).
+			seen = make(map[string]struct{})
+		default:
+			seen = make(map[string]struct{})
 		}
-		if len(missing) == 0 {
-			continue
-		}
-		a.appendCanceledToolResults(missing)
-		modified = true
 	}
 	return modified
 }

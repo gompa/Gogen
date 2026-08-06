@@ -258,20 +258,6 @@ func (a *Agent) FormatSessionListForUI() (string, []SessionInfo, error) {
 	return a.formatSessionList()
 }
 
-// ForkSession starts a new session that is a copy of the current conversation
-// up to (and including) a specific message. args can be:
-//   - "" or "last": fork from the last assistant message that produced output
-//     (ghosts — reasoning-only or fully-empty assistant turns — are skipped so
-//     forks can't land on truncated turns)
-//   - "<N>": fork from the Nth displayed message (0-indexed, counting only user+assistant)
-//   - "assistant <N>": fork from the Nth assistant message (0-indexed)
-//   - "created <RFC3339Nano>": fork from message with the given CreatedAt timestamp
-//
-// Invisible assistant messages (no content, no refusal, no tool calls) are
-// never used as a fork point: explicit index forks walk back to the nearest
-// visible message, and stripping tool calls from a tool-call-only fork point
-// drops the resulting empty message instead of leaving a ghost in the forked
-// history.
 // ForkMessages returns a copy of messages up to (and including) the fork
 // point selected by args, without mutating any agent. args can be:
 //   - "" or "last": fork from the last assistant message that produced output

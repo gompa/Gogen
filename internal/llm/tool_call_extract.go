@@ -8,7 +8,7 @@ import (
 )
 
 var (
-	// toolCallFunctionRegex matches <function>tool_name</function> or <function>tool_name</function>
+	// toolCallFunctionRegex matches <function>tool_name</function>
 	toolCallFunctionRegex = regexp.MustCompile(`(?i)<function>\s*(\w+)\s*</function>`)
 
 	// toolCallFunctionEqRegex matches <function=tool_name> (equals-sign format used by some models)
@@ -50,11 +50,10 @@ type byteRange struct{ start, end int }
 func extractToolCallsFromText(text string) []ToolCall {
 	var toolCalls []ToolCall
 
-	// First, try to find <tool_call> ... </tool_call> blocks
-	// FindAllStringSubmatch for content extraction.
-	blockMatches := toolCallBlockRegex.FindAllStringSubmatch(text, -1)
-	// FindAllStringIndex for byte-range tracking (to skip nested <invoke>).
-	blockLocs := toolCallBlockRegex.FindAllStringIndex(text, -1)
+	// First, try to find <tool_call> ... </tool_call> blocks.
+	// A single FindAllStringSubmatchIndex pass yields both the byte range of
+	// each block (for the <invoke> skip set) and the captured content.
+	blockLocs := toolCallBlockRegex.FindAllStringSubmatchIndex(text, -1)
 
 	// Track <tool_call> block byte ranges so we can skip <invoke>
 	// blocks that are already nested inside them.
@@ -64,11 +63,8 @@ func extractToolCallsFromText(text string) []ToolCall {
 			start: loc[0],
 			end:   loc[1],
 		})
-	}
-
-	for _, match := range blockMatches {
-		if len(match) >= 2 {
-			blockContent := match[1]
+		if len(loc) >= 4 && loc[2] >= 0 && loc[3] >= loc[2] {
+			blockContent := text[loc[2]:loc[3]]
 			calls := extractToolCallsFromBlock(blockContent)
 			toolCalls = append(toolCalls, calls...)
 		}

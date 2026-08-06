@@ -1,12 +1,18 @@
 package agent
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 )
+
+// errFindFileLimit signals that FindFile stopped the walk because it reached
+// the result limit. Kept as a sentinel (rather than an ad-hoc error string)
+// so callers can distinguish truncation from a real walk failure.
+var errFindFileLimit = errors.New("find_file: result limit reached")
 
 const (
 	findFileMaxResults = 50
@@ -54,12 +60,12 @@ func (e *Executor) FindFile(name string, subpath string, limit int) (string, err
 			}
 			matches = append(matches, rel)
 			if len(matches) >= limit {
-				return fmt.Errorf("limit reached")
+				return errFindFileLimit
 			}
 		}
 		return nil
 	})
-	if err != nil && err.Error() != "limit reached" {
+	if err != nil && !errors.Is(err, errFindFileLimit) {
 		return "", err
 	}
 

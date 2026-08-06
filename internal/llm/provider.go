@@ -110,10 +110,28 @@ type Message struct {
 	Refusal    string     // refusal text from the model (sent as refusal; not folded into Content)
 	ToolCalls  []ToolCall // set on assistant messages that invoke tools
 	ToolCallID string     // set on tool result messages
-	CreatedAt  time.Time  `json:"createdAt,omitempty"` // when the message was created (UTC), zero when not set
+	// Images holds user-supplied images (data URLs) attached to a user
+	// message, sent to vision-capable models as image_url content parts.
+	// Only user messages carry images.
+	Images    []ImageInput `json:"images,omitempty"`
+	CreatedAt time.Time    `json:"createdAt,omitempty"` // when the message was created (UTC), zero when not set
 
 	// ArgsStabilized is true when ToolCalls[j].Args has been marshalled
 	// into ArgsStr. Used to avoid re-stabilizing every message on every
 	// turn. Not serialized — restored messages start as stabilized.
 	ArgsStabilized bool `json:"-"`
+}
+
+// ImageInput is one user-supplied image attached to a user message,
+// transported as a data URL (e.g. "data:image/png;base64,..."). Detail
+// controls the vision detail level the provider receives: "auto", "low", or
+// "high"; empty means "auto".
+type ImageInput struct {
+	DataURL string `json:"dataUrl"`
+	Detail  string `json:"detail,omitempty"`
+}
+
+// HasImages reports whether the message carries one or more images.
+func (m Message) HasImages() bool {
+	return len(m.Images) > 0
 }

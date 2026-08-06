@@ -362,11 +362,6 @@ func (e *Executor) NewGitCmd(ctx context.Context, args ...string) (*exec.Cmd, er
 }
 
 func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, error) {
-	if e.Commands != nil {
-		if err := e.Commands.Check(command); err != nil {
-			return "", err
-		}
-	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -386,12 +381,10 @@ func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd, err := e.buildShellCommand(ctx, command)
+	cmd, err := e.BuildCommand(ctx, command)
 	if err != nil {
 		return "", err
 	}
-	configureCancelableCmd(cmd)
-	cmd.Dir = e.GetWorkingDir()
 
 	// Combined-output writer: accumulates the full output (returned to the
 	// caller exactly as before) while streaming each chunk to the optional
@@ -415,6 +408,27 @@ func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, 
 		return outStr, fmt.Errorf("execution error: %w", err)
 	}
 	return outStr, nil
+}
+
+// BuildCommand validates the command against the command guard and returns a
+// prepared *exec.Cmd for the given context: shell wrapper, sandbox wrapper
+// (bwrap), working directory, and process-group cancellation are configured
+// exactly as ExecuteCommand configures them. Background job execution uses
+// it so the guard and sandbox rules apply identically to foreground and
+// background commands.
+func (e *Executor) BuildCommand(ctx context.Context, command string) (*exec.Cmd, error) {
+	if e.Commands != nil {
+		if err := e.Commands.Check(command); err != nil {
+			return nil, err
+		}
+	}
+	cmd, err := e.buildShellCommand(ctx, command)
+	if err != nil {
+		return nil, err
+	}
+	configureCancelableCmd(cmd)
+	cmd.Dir = e.GetWorkingDir()
+	return cmd, nil
 }
 
 // commandOutputWriter accumulates a command's combined stdout+stderr and

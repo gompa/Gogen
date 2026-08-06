@@ -160,10 +160,10 @@ func NewStoreWithOptions(enabled bool, opts StoreOptions) *Store {
 // maxCreatedCacheEntries to prevent unbounded memory growth on long-running
 // processes. (Go map iteration is unordered, so the oldest must be found by
 // comparing timestamps rather than "first entry".)
+//
+// Callers must hold s.mu (all callers are Store methods that already guard
+// against a nil receiver).
 func (s *Store) setCreatedCache(id string, created time.Time) {
-	if s == nil {
-		return
-	}
 	if len(s.createdCache) >= maxCreatedCacheEntries {
 		var oldestID string
 		var oldest time.Time
@@ -180,14 +180,14 @@ func (s *Store) setCreatedCache(id string, created time.Time) {
 }
 
 func (s *Store) dir(workingDir string) string {
-	if s != nil && s.globalDir != "" {
+	if s.globalDir != "" {
 		return s.globalDir
 	}
 	return filepath.Join(workingDir, ".gogen", "sessions")
 }
 
 func (s *Store) path(workingDir, id string) string {
-	if s != nil && s.globalDir != "" {
+	if s.globalDir != "" {
 		// In global mode, sessions are stored flat in the global dir.
 		return filepath.Join(s.globalDir, id+".json")
 	}
@@ -196,7 +196,7 @@ func (s *Store) path(workingDir, id string) string {
 
 // deltaPath returns the path to the delta file for a session.
 func (s *Store) deltaPath(workingDir, id string) string {
-	if s != nil && s.globalDir != "" {
+	if s.globalDir != "" {
 		return filepath.Join(s.globalDir, id+".delta")
 	}
 	return filepath.Join(s.dir(workingDir), id+".delta")

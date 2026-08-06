@@ -488,6 +488,54 @@
             width: fit-content;
             max-width: 80%;
         }
+        .chat-image-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            padding-bottom: 6px;
+        }
+        .chat-image {
+            max-width: 240px;
+            max-height: 240px;
+            border-radius: 6px;
+            border: 1px solid var(--border-subtle);
+            display: block;
+        }
+        #attachment-preview {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            padding: 4px 0;
+        }
+        #attachment-preview[hidden] { display: none; }
+        .attachment-chip {
+            position: relative;
+            display: inline-flex;
+            border: 1px solid var(--border-subtle);
+            border-radius: 6px;
+            overflow: hidden;
+        }
+        .attachment-chip img {
+            width: 56px;
+            height: 56px;
+            object-fit: cover;
+            display: block;
+        }
+        .attachment-remove {
+            position: absolute;
+            top: 2px;
+            right: 2px;
+            width: 18px;
+            height: 18px;
+            line-height: 1;
+            padding: 0;
+            border-radius: 50%;
+            border: none;
+            background: rgba(0, 0, 0, 0.6);
+            color: #fff;
+            cursor: pointer;
+            font-size: 0.7em;
+        }
         .assistant {
             background: var(--bg-elevated);
             align-self: flex-start;

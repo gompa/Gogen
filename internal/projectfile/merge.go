@@ -49,6 +49,7 @@ func Merge(pf *ProjectFile, flags FlagOverrides) *config.Config {
 		SessionMaxCount:      mergeInt("GOGEN_SESSION_MAX_COUNT", file.SessionMaxCount, def.SessionMaxCount),
 		SessionMaxAgeDays:    mergeInt("GOGEN_SESSION_MAX_AGE_DAYS", file.SessionMaxAgeDays, def.SessionMaxAgeDays),
 		WebMaxActiveSessions: mergeInt("GOGEN_WEB_MAX_ACTIVE_SESSIONS", file.WebMaxActiveSessions, def.WebMaxActiveSessions),
+		WebApprovalHoldSecs:  mergeInt("GOGEN_WEB_APPROVAL_HOLD_SECS", file.WebApprovalHoldSecs, def.WebApprovalHoldSecs),
 		WebFetch:             mergeString("GOGEN_WEB_FETCH", file.WebFetch, def.WebFetch),
 		WebSearch:            mergeString("GOGEN_WEB_SEARCH", file.WebSearch, def.WebSearch),
 		WebSearchBackend:     mergeString("GOGEN_WEB_SEARCH_BACKEND", file.WebSearchBackend, def.WebSearchBackend),

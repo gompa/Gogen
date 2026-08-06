@@ -3,6 +3,8 @@ package tui
 import (
 	"strings"
 
+	"gogen/internal/contextmgr"
+
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 )
@@ -71,7 +73,7 @@ func (m *Model) renderStatusBar() string {
 		style := StatusBarDimStyle
 		if pct >= 90 {
 			style = StatusBarDangerStyle
-		} else if pct >= 75 || m.contextStats.Snapshot.NearCompact {
+		} else if float64(pct) >= contextmgr.WarnThreshold*100 || m.contextStats.Snapshot.NearCompact {
 			style = StatusBarWarningStyle
 		}
 		right = style.Render(m.contextLine)

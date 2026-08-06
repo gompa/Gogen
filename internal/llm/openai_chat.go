@@ -98,7 +98,38 @@ func (p *OpenAIProvider) messagesToChat(messages []Message) []openai.ChatComplet
 		case "system":
 			chatMessages = append(chatMessages, openai.SystemMessage(m.Content))
 		case "user":
-			chatMessages = append(chatMessages, openai.UserMessage(m.Content))
+			if !m.HasImages() {
+				chatMessages = append(chatMessages, openai.UserMessage(m.Content))
+				continue
+			}
+			// Vision input: build a multi-part content array (text + one
+			// image_url part per image). The text part is omitted entirely
+			// when the message has no text, mirroring how the provider
+			// expects a pure-image prompt.
+			parts := make([]openai.ChatCompletionContentPartUnionParam, 0, 1+len(m.Images))
+			if m.Content != "" {
+				parts = append(parts, openai.TextContentPart(m.Content))
+			}
+			for _, img := range m.Images {
+				if img.DataURL == "" {
+					continue
+				}
+				detail := img.Detail
+				if detail == "" {
+					detail = "auto"
+				}
+				parts = append(parts, openai.ImageContentPart(openai.ChatCompletionContentPartImageImageURLParam{
+					URL:    img.DataURL,
+					Detail: detail,
+				}))
+			}
+			if len(parts) == 0 {
+				// All images were empty; fall back to plain text so the
+				// request still sends something coherent.
+				chatMessages = append(chatMessages, openai.UserMessage(m.Content))
+				continue
+			}
+			chatMessages = append(chatMessages, openai.UserMessage(parts))
 		case "assistant":
 			// Always build an explicit assistant param so reasoning_content /
 			// refusal round-trip on the wire. Folding them into Content would

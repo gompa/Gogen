@@ -84,7 +84,7 @@ func (s *Server) ensureSessionRuntime(id string) (*sessionRuntime, error) {
 		return nil, err
 	}
 	a := s.ws.NewSessionAgent(&snap, id)
-	rt := newSessionRuntime(a)
+	rt := s.newSessionRuntimeFor(a)
 	s.registry.register(id, rt)
 	// A concurrent attach (or resume) of the same session may have
 	// registered a runtime between our get above and this register —
@@ -179,7 +179,7 @@ func (s *Server) createNewSession(ws *wsConn, pane **sessionRuntime) *sessionRun
 		// already carries the workspace default.
 		a.SetThinkingLevel(inheritLevel)
 	}
-	rt := newSessionRuntime(a)
+	rt := s.newSessionRuntimeFor(a)
 	evicted := s.registry.register(newID, rt)
 	s.registry.setDefault(newID)
 	s.switchPane(ws, pane, rt)
@@ -213,7 +213,7 @@ func (s *Server) sessionResume(ctx context.Context, ws *wsConn, pane **sessionRu
 			return agent.SessionCommandResult{}, true, err
 		}
 		a := s.ws.NewSessionAgent(&snap, id)
-		rt = newSessionRuntime(a)
+		rt = s.newSessionRuntimeFor(a)
 		s.registry.register(id, rt)
 		// Dedupe against a concurrent attach/resume of the same session
 		// register may have been a no-op, in which case the pane must
@@ -283,7 +283,7 @@ func (s *Server) sessionFork(ctx context.Context, ws *wsConn, pane **sessionRunt
 		Messages:      forkedMsgs,
 	}
 	a := s.ws.NewSessionAgent(&snap, newID)
-	rt := newSessionRuntime(a)
+	rt := s.newSessionRuntimeFor(a)
 	evicted := s.registry.register(newID, rt)
 	s.registry.setDefault(newID)
 	s.switchPane(ws, pane, rt)
@@ -411,7 +411,7 @@ func (s *Server) createBootstrapSession() *sessionRuntime {
 		if latest, err := s.ws.Store.LatestID(s.ws.GetWorkingDir()); err == nil && latest != "" {
 			if snap, err := s.ws.Store.LoadInWorkingDir(s.ws.GetWorkingDir(), latest); err == nil {
 				a := s.ws.NewSessionAgent(&snap, latest)
-				rt := newSessionRuntime(a)
+				rt := s.newSessionRuntimeFor(a)
 				s.registry.register(latest, rt)
 				// A concurrent connection may have bootstrapped the same
 				// session between our get and register — register dedupes
@@ -426,7 +426,7 @@ func (s *Server) createBootstrapSession() *sessionRuntime {
 		}
 	}
 	a := s.ws.NewSessionAgent(nil, session.NewID())
-	rt := newSessionRuntime(a)
+	rt := s.newSessionRuntimeFor(a)
 	s.registry.register(rt.agent.SessionID, rt)
 	s.registry.setDefault(rt.agent.SessionID)
 	return rt

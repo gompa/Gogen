@@ -118,7 +118,8 @@ var builtinToolDefs = []ToolDef{
 	{
 		Definition: toolDef("execute_command", "Run a shell command (destructive patterns blocked).",
 			toolSchema(map[string]interface{}{
-				"command": toolProp("string", "Command"),
+				"command":    toolProp("string", "Command"),
+				"background": toolProp("boolean", "Run in the background and return immediately with a job id; poll with background_job_status and cancel with background_job_cancel (default false)"),
 			}, "command")),
 		Handler: handleExecuteCommand,
 	},
@@ -413,6 +414,20 @@ var builtinToolDefs = []ToolDef{
 			}, "symbol")),
 		Handler: handleDependencyAnalysis,
 	},
+	{
+		Definition: toolDef("background_job_status", "Check a background job started with execute_command background=true. Reports running/finished state, exit code, and the tail of the job's output.",
+			toolSchema(map[string]interface{}{
+				"job_id": toolProp("string", "Job id returned by execute_command background=true"),
+			}, "job_id")),
+		Handler: handleBackgroundJobStatus,
+	},
+	{
+		Definition: toolDef("background_job_cancel", "Cancel a running background job (kills its process group). Jobs also die when their session closes.",
+			toolSchema(map[string]interface{}{
+				"job_id": toolProp("string", "Job id returned by execute_command background=true"),
+			}, "job_id")),
+		Handler: handleBackgroundJobCancel,
+	},
 }
 
 // BuiltinTools returns built-in tool definitions for the LLM, in registration
@@ -424,3 +439,41 @@ func BuiltinTools() []llm.Tool {
 	}
 	return tools
 }
+
+// parallelSafeTools are builtin tools safe to execute concurrently within a
+// single turn: read-only handlers with no workspace mutation, no session-
+// state mutation, and no shell execution, whose shared state is either
+// internally synchronized or only read. Running them concurrently cuts the
+// latency of multi-tool turns (several independent read_file/search_code
+// calls) without reordering mutating tools, which stay strictly sequential
+// in model order. MCP tools are never parallel-safe (their side effects are
+// unknown), and tool names shadowed by an MCP server are excluded too.
+var parallelSafeTools = map[string]bool{
+	"list_files":          true,
+	"repo_overview":       true,
+	"glob_files":          true,
+	"read_file":           true,
+	"read_files":          true,
+	"list_definitions":    true,
+	"search_code":         true,
+	"find_references":     true,
+	"git_log":             true,
+	"git_blame":           true,
+	"git_status":          true,
+	"git_stash_list":      true,
+	"git_show":            true,
+	"show_diff":           true,
+	"web_search":          true,
+	"web_fetch":           true,
+	"todo_list":           true,
+	"find_file":           true,
+	"find_definition":     true,
+	"session_usage":       true,
+	"context_pins":        true,
+	"call_graph":          true,
+	"dependency_analysis": true,
+}
+
+// maxParallelTools bounds how many tool calls run concurrently within one
+// turn (bounded by the tool batch size).
+const maxParallelTools = 4
