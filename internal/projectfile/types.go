@@ -49,6 +49,7 @@ type FileConfig struct {
 	WebTLSKeyFile        string           `yaml:"web_tls_key_file"`
 	SessionMaxCount      int              `yaml:"session_max_count"`
 	SessionMaxAgeDays    int              `yaml:"session_max_age_days"`
+	WebMaxActiveSessions int              `yaml:"web_max_active_sessions"`
 	CommandSandbox       string           `yaml:"command_sandbox"`
 	CommandTimeoutSecs   int              `yaml:"command_timeout_secs"`
 	PreserveReasoning    string           `yaml:"preserve_reasoning"`

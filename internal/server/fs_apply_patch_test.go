@@ -192,11 +192,14 @@ func TestFSApplyPatchRejectsDeleteOnly(t *testing.T) {
 	}
 }
 
-// TestFSApplyPatchBusyRejects verifies that the busy-path response uses the
-// request type convention ("fs_<op>_result") and reports the agent is busy.
-func TestFSApplyPatchBusyRejects(t *testing.T) {
+// TestFSApplyPatchWaitsForFSLock verifies Phase 2's workspace filesystem
+// lock: an editor write issued while another mutation holds fsMu (a running
+// agent FS tool) waits instead of failing, then completes once the lock is
+// released — the streaming turn itself no longer blocks editor writes.
+func TestFSApplyPatchWaitsForFSLock(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "greet.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+	target := filepath.Join(dir, "greet.go")
+	if err := os.WriteFile(target, []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -208,44 +211,28 @@ func TestFSApplyPatchBusyRejects(t *testing.T) {
 
 	diff := "--- a/greet.go\n+++ b/greet.go\n@@ -1,3 +1,4 @@\n package main\n \n+// greeting\n func main() {}\n"
 
-	// Hold the turn lock so tryAcquireTurn times out and the busy response is
-	// written instead of applying the patch.
-	s.turnMu.Lock()
-	defer s.turnMu.Unlock()
-
-	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			t.Errorf("upgrade: %v", err)
-			return
-		}
-		ws := newWSConn(conn)
-		s.handleFSWriteMessage(ws, context.Background(), WSMessage{
-			Type: "fs_apply_patch",
-			Diff: diff,
-		})
-	}))
-	defer ts.Close()
-
-	client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http"), nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
+	// An agent FS-mutating tool holds the workspace fsMu; the editor write
+	// issued concurrently must wait, not fail (nil ws: the response write is
+	// a silent no-op — the patch application is what we observe).
+	s.ws.fsMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.handleFSWriteMessage(nil, context.Background(), WSMessage{Type: "fs_apply_patch", Diff: diff})
+	}()
+	select {
+	case <-done:
+		t.Fatal("fs_apply_patch completed while the workspace fsMu was held")
+	case <-time.After(50 * time.Millisecond):
 	}
-	defer client.Close()
-	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
-
-	var resp WSMessage
-	if err := client.ReadJSON(&resp); err != nil {
-		t.Fatalf("read response: %v", err)
+	s.ws.fsMu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fs_apply_patch did not complete after fsMu release")
 	}
-	if resp.Type != "fs_apply_patch_result" {
-		t.Fatalf("type = %q, want fs_apply_patch_result", resp.Type)
-	}
-	if resp.Success {
-		t.Fatal("expected busy response to report failure")
-	}
-	if !strings.Contains(resp.Error, "agent is busy") {
-		t.Fatalf("unexpected error %q", resp.Error)
+	data, err := os.ReadFile(target)
+	if err != nil || !strings.Contains(string(data), "// greeting") {
+		t.Fatalf("patch not applied: %v, content=%q", err, data)
 	}
 }

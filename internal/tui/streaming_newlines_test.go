@@ -26,7 +26,7 @@ func newStreamTestModel() Model {
 // the incremental streaming path) contains a fully blank visual line that
 // is not part of the intended layout.
 func hasBlankRenderedLine(m *Model) bool {
-	for _, l := range strings.Split(m.wrappedContent, "\n") {
+	for _, l := range strings.Split(m.wrappedContentString(), "\n") {
 		if stripAnsi(l) == "" {
 			return true
 		}
@@ -64,7 +64,7 @@ func TestNoExtraNewlineBeforeToolCall(t *testing.T) {
 	m.handleStreamToolCall(0, "tc0", "read_file")
 
 	if hasBlankRenderedLine(&m) {
-		t.Fatalf("blank line present between assistant text and tool call\n%s", m.wrappedContent)
+		t.Fatalf("blank line present between assistant text and tool call\n%s", m.wrappedContentString())
 	}
 }
 
@@ -89,7 +89,7 @@ func TestNoExtraNewlineBetweenRounds(t *testing.T) {
 	m.handleStreamToken("Done.")
 
 	if hasBlankRenderedLine(&m) {
-		t.Fatalf("blank line present between rounds\n%s", m.wrappedContent)
+		t.Fatalf("blank line present between rounds\n%s", m.wrappedContentString())
 	}
 }
 
@@ -103,11 +103,11 @@ func TestNoExtraNewlineAcrossManyAppends(t *testing.T) {
 	m.appendChatLine("line three")
 
 	if hasBlankRenderedLine(&m) {
-		t.Fatalf("blank line present across appends\n%s", m.wrappedContent)
+		t.Fatalf("blank line present across appends\n%s", m.wrappedContentString())
 	}
 
 	want := "line one\nline two\nline three"
-	if stripAnsi(m.wrappedContent) != want {
-		t.Fatalf("wrappedContent = %q, want %q", m.wrappedContent, want)
+	if stripAnsi(m.wrappedContentString()) != want {
+		t.Fatalf("wrappedContent = %q, want %q", m.wrappedContentString(), want)
 	}
 }

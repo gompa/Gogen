@@ -18,6 +18,9 @@
             --error-bg: rgba(248, 81, 73, 0.18);
             --warn: #dcdcaa;
             --warn-bg: rgba(210, 153, 34, 0.18);
+            /* Session-state indicator dots (sidebar session list). */
+            --amber: #d29922;
+            --violet: #bc8cff;
             --user-bg: rgba(86, 156, 214, 0.15);
             --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
             --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
@@ -658,6 +661,19 @@
         button:hover:not(:disabled) { background: #404045; }
         #message-input { flex: 1; min-width: 0; width: 100%; }
         #working-dir-input { width: 100%; margin-bottom: 8px; }
+        #working-dir-path {
+            width: 100%;
+            margin-bottom: 8px;
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            background: var(--bg-input);
+            color: var(--fg-dim);
+            font-family: var(--mono);
+            font-size: 0.85em;
+            word-break: break-all;
+            box-sizing: border-box;
+        }
         .cursor::after { content: '|'; animation: blink 1s infinite; color: var(--accent); }
         @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
         .thinking { color: var(--fg-muted); font-style: italic; }
@@ -830,6 +846,27 @@
             border-top: 1px solid var(--border-subtle);
             background: var(--bg);
         }
+        .tool-live-output {
+            padding: 8px 12px;
+            font-family: var(--mono);
+            font-size: 0.85em;
+            white-space: pre-wrap;
+            word-break: break-word;
+            max-height: 240px;
+            overflow-y: auto;
+            background: var(--bg);
+            color: var(--fg);
+            border-top: 1px solid var(--border-subtle);
+        }
+        .tool-live-output.collapsed { display: none; }
+        .tool-live-output.done.success { border-left: 3px solid var(--success); }
+        .tool-live-output.done.error { border-left: 3px solid var(--error); color: #ff7b72; }
+        .tool-live-truncated {
+            padding: 4px 12px;
+            font-size: 0.8em;
+            color: var(--warn);
+            font-style: italic;
+        }
 
         #delete-approval-overlay {
             display: none;
@@ -923,6 +960,27 @@
             font-size: 0.85em;
             margin-top: 2px;
         }
+        /* Every pane state gets a uniform colored-dot indicator in the meta
+           row: the dot carries the state color and the label stays muted
+           (active=green, responding=amber, creating=gray, open=blue,
+           resume-to-continue=violet). */
+        .session-row-meta .session-state {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .session-state-dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--fg-dim);
+            flex-shrink: 0;
+        }
+        .session-state-dot.green { background: var(--success); }
+        .session-state-dot.amber { background: var(--amber); }
+        .session-state-dot.blue { background: var(--accent); }
+        .session-state-dot.violet { background: var(--violet); }
         .session-row-del {
             flex-shrink: 0;
             background: none;
@@ -1377,25 +1435,6 @@
             color: var(--accent);
         }
         .btn-link:hover { background: var(--bg-hover); }
-        .patch-apply-row {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            padding: 6px 12px 8px;
-            font-size: 0.8em;
-        }
-        .patch-apply-btn {
-            padding: 4px 12px;
-            font-size: 0.8em;
-            cursor: pointer;
-            background: transparent;
-            border: 1px solid var(--border);
-            color: var(--accent);
-            border-radius: 3px;
-        }
-        .patch-apply-btn:hover:not(:disabled) { background: var(--bg-hover); }
-        .patch-apply-btn:disabled { opacity: 0.5; cursor: default; }
-        .patch-apply-status { color: var(--fg-muted); }
         #btn-refresh-explorer {
             float: right;
             padding: 2px 8px;
@@ -1433,7 +1472,10 @@
         /* ===== Task 3: Scroll-to-bottom button ===== */
         #scroll-bottom-btn {
             position: absolute;
-            bottom: 80px;
+            /* 80px clears the composer toolbar + input row; the terminal
+               strip docks below the input row now, so add its live height
+               (kept in sync by app.js as --terminal-strip-h). */
+            bottom: calc(80px + var(--terminal-strip-h, 0px));
             left: 0;
             right: 0;
             width: fit-content;
@@ -1700,6 +1742,9 @@
             --error-bg: rgba(207, 34, 46, 0.12);
             --warn: #9a6700;
             --warn-bg: rgba(154, 103, 0, 0.12);
+            /* Session-state indicator dots (sidebar session list). */
+            --amber: #9a6700;
+            --violet: #8250df;
             --user-bg: rgba(0, 102, 204, 0.1);
         }
 
@@ -1844,7 +1889,10 @@
             border-color: #f44;
         }
 
-        /* ===== Terminal panel (docked at bottom; strip with chevron by default) ===== */
+        /* ===== Terminal panel (docked below the chat input bar; strip with
+             chevron by default) =====
+             Lives inside #chat-container, so it spans only the chat area (to
+             the right of the sidebar) instead of the full page width. */
         #terminal-panel {
             flex-shrink: 0;
             display: flex;

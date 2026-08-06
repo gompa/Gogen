@@ -15,9 +15,15 @@ import (
 // The TUI and server WebSocket both use the same batching logic with
 // different send formats; this shared type keeps them in sync.
 type TokenBatcher struct {
-	mu       sync.Mutex
-	send     func(think bool, text string)
-	segs     []seg
+	mu   sync.Mutex
+	send func(think bool, text string)
+	segs []seg
+	// flushMu serializes the grab-and-send phase of Flush. Flush can be
+	// invoked concurrently — the timer goroutine (time.AfterFunc) and a
+	// caller (OnStreamEnd / tool boundaries) — and without this lock the two
+	// drains would call send from two goroutines, letting a later flush's
+	// segments overtake an earlier one's on the wire.
+	flushMu  sync.Mutex
 	timer    *time.Timer
 	interval time.Duration
 	closed   bool
@@ -61,6 +67,8 @@ func (b *TokenBatcher) ThinkToken(text string) {
 // Flush emits all pending segments immediately. Safe to call concurrently
 // with StreamToken / ThinkToken. After Close, Flush is a no-op.
 func (b *TokenBatcher) Flush() {
+	b.flushMu.Lock()
+	defer b.flushMu.Unlock()
 	b.mu.Lock()
 	if b.closed {
 		b.mu.Unlock()
@@ -89,6 +97,9 @@ func (b *TokenBatcher) Close() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.segs = b.segs[:0]
+	// Mark closed; a concurrent Flush that already grabbed its segments (it
+	// holds flushMu, not b.mu) still delivers them — that is the desired
+	// "flush before close" ordering, not a post-close append.
 	b.closed = true
 	if b.timer != nil {
 		b.timer.Stop()

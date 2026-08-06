@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"gogen/internal/agent"
+	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
 )
@@ -58,14 +59,15 @@ func (p *probeStreamStub) SetThinkingLevel(string) {}
 
 // TestServerConfigProbeConcurrentWithTurn verifies the web server's config
 // probe path — agentConfigMsg (which calls ContextStats and reads usage
-// totals without agentMu/turnMu) and SnapshotMessages — is safe while a turn
+// totals without the turn lock) and SnapshotMessages — is safe while a turn
 // goroutine appends messages, accumulates usage, and stabilizes tool args.
 // Run with -race to catch regressions.
 func TestServerConfigProbeConcurrentWithTurn(t *testing.T) {
 	provider := &probeStreamStub{}
 	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{ContextLimit: 1000})
 	a := agent.NewAgent(provider, agent.NewExecutor(t.TempDir()), ctxMgr)
-	s := &Server{agent: a}
+	s := NewServer(a, &config.Config{})
+	rt := s.registry.first()
 
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
@@ -78,8 +80,8 @@ func TestServerConfigProbeConcurrentWithTurn(t *testing.T) {
 				case <-stop:
 					return
 				default:
-					_ = s.agentConfigMsg(context.Background())
-					_ = s.agent.SnapshotMessages()
+					_ = agentConfigMsg(context.Background(), rt)
+					_ = rt.agent.SnapshotMessages()
 				}
 			}
 		}()

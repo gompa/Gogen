@@ -128,10 +128,10 @@ func (m *Model) ensureWrappedLines() {
 	if !m.wrappedLinesDirty {
 		return
 	}
-	if m.wrappedContent == "" {
+	if content := m.wrappedContentString(); content == "" {
 		m.wrappedLines = nil
 	} else {
-		m.wrappedLines = strings.Split(stripANSI(m.wrappedContent), "\n")
+		m.wrappedLines = strings.Split(stripANSI(content), "\n")
 	}
 	m.wrappedLinesDirty = false
 }
@@ -143,10 +143,10 @@ func (m *Model) ensureStyledLines() {
 	if !m.styledLinesDirty {
 		return
 	}
-	if m.wrappedContent == "" {
+	if content := m.wrappedContentString(); content == "" {
 		m.styledLines = nil
 	} else {
-		m.styledLines = strings.Split(m.wrappedContent, "\n")
+		m.styledLines = strings.Split(content, "\n")
 	}
 	m.styledLinesDirty = false
 }

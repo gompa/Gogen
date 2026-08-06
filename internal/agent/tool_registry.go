@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"gogen/internal/llm"
@@ -28,6 +29,17 @@ func BuiltinToolHandlers() map[string]ToolHandler {
 	return handlers
 }
 
+// SetToolHandlers replaces the builtin tool registry. The web server uses
+// this to wrap FS-mutating tools with a workspace-level filesystem lock so
+// concurrent sessions serialize actual file mutations without serializing
+// whole turns (multi-session plan, Phase 2). Calling with nil restores the
+// builtin handlers on the next executeTool.
+func (a *Agent) SetToolHandlers(handlers map[string]ToolHandler) {
+	a.toolMu.Lock()
+	a.toolHandlers = handlers
+	a.toolMu.Unlock()
+}
+
 func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error) {
 	if tc.ArgsError != "" {
 		return "", fmt.Errorf("invalid tool arguments: %s", tc.ArgsError)
@@ -46,7 +58,9 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error
 			}
 		}
 	}
+	a.toolMu.RLock()
 	handlers := a.toolHandlers
+	a.toolMu.RUnlock()
 	if handlers == nil {
 		handlers = BuiltinToolHandlers()
 	}
@@ -54,7 +68,27 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error
 	if !ok {
 		return "", fmt.Errorf("unknown tool: %s", tc.Name)
 	}
-	return h(ctx, a, tc.Args)
+	res, err := h(ctx, a, tc.Args)
+	if tc.Name == "patch_file" {
+		// Only stale-diff failures (ErrPatchMismatch) count toward the
+		// streak: permission, I/O, and path-safety errors mean the diff may
+		// be fine and the environment is the problem, so the "regenerate the
+		// diff" hint would be misleading. Success and non-mismatch errors
+		// both reset.
+		if err != nil && errors.Is(err, ErrPatchMismatch) {
+			streak := a.patchFailStreak.Add(1)
+			if streak > 3 {
+				streak = 3 // keep the message from escalating forever
+			}
+			if streak >= 2 {
+				err = fmt.Errorf("patch_file failed %d times in a row: %w. Do not retry the same diff — it will keep failing. Re-read the target file(s) with read_file (or search_code) and regenerate the diff from their current content. If a small file keeps failing, use replace_in_file or write_file instead",
+					streak, err)
+			}
+		} else {
+			a.patchFailStreak.Store(0)
+		}
+	}
+	return res, err
 }
 
 func handleListFiles(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {

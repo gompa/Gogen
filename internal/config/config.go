@@ -32,6 +32,9 @@ const (
 	// DefaultContextLimit is the fallback context window size (tokens) when
 	// it cannot be resolved from the provider.
 	DefaultContextLimit = 128000
+	// DefaultWebMaxActiveSessions is the default cap on concurrently active
+	// web sessions (D6).
+	DefaultWebMaxActiveSessions = 8
 )
 
 // MCPServerConfig describes one MCP stdio server entry. Tags cover both the
@@ -83,6 +86,9 @@ type Config struct {
 	WebAuthToken      string // required for non-loopback binds; also GOGEN_WEB_TOKEN
 	WebTLSCertFile    string // PEM cert for TLS (required with key for non-loopback)
 	WebTLSKeyFile     string // PEM key for TLS
+	// WebMaxActiveSessions caps concurrently active web sessions (registry
+	// eviction bound; 0 = DefaultWebMaxActiveSessions).
+	WebMaxActiveSessions int
 
 	SessionMaxCount   int // max saved sessions per working dir (0 = default 50)
 	SessionMaxAgeDays int // delete sessions older than N days (0 = default 30)
@@ -130,6 +136,7 @@ func Defaults() Config {
 		WebTLSKeyFile:        "",
 		SessionMaxCount:      DefaultSessionMaxCount,
 		SessionMaxAgeDays:    DefaultSessionMaxAgeDays,
+		WebMaxActiveSessions: DefaultWebMaxActiveSessions,
 		WebFetch:             "on",
 		WebSearch:            "on",
 		WebSearchBackend:     "",

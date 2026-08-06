@@ -78,6 +78,13 @@ func (p *OpenAIProvider) applyChatCompletionExtras(ctx context.Context, params *
 // applyThinkingLevel sets the reasoning_effort field on chat completion params
 // when a non-empty thinking level is configured. Empty level means omit the
 // parameter entirely (no thinking/reasoning requested from the API).
+//
+// Gogen exposes more levels (off/minimal/low/medium/high/xhigh/max) than the
+// reasoning_effort values most models accept. The widely-supported set is
+// low/medium/high (o1/o3/o4-mini and most OpenAI-compatible endpoints); only
+// newer GPT-5.x-class models add minimal/xhigh/max. To stay compatible with
+// the majority of models, the extra levels are folded onto the common set:
+// minimal → low, xhigh/max → high.
 func (p *OpenAIProvider) applyThinkingLevel(_ context.Context, params *openai.ChatCompletionNewParams) {
 	if p == nil || params == nil {
 		return
@@ -88,10 +95,8 @@ func (p *OpenAIProvider) applyThinkingLevel(_ context.Context, params *openai.Ch
 	if level == "" || level == "off" {
 		return
 	}
-	// Map Gogen thinking levels to OpenAI reasoning_effort.
-	// OpenAI supports: low, medium, high.
 	switch level {
-	case "low", "minimal":
+	case "minimal", "low":
 		params.ReasoningEffort = shared.ReasoningEffortLow
 	case "medium":
 		params.ReasoningEffort = shared.ReasoningEffortMedium

@@ -118,10 +118,6 @@ export function closeModal(overlay, opts = {}) {
   }
 }
 
-export function setWebSocket(ws) {
-  wsRef = ws;
-}
-
 export function handleServerMessage(data) {
   if (!data || !data.requestId || !pendingReqs.has(data.requestId)) return false;
   const p = pendingReqs.get(data.requestId);
@@ -129,6 +125,63 @@ export function handleServerMessage(data) {
   if (data.error) p.reject(new Error(data.error));
   else p.resolve(data);
   return true;
+}
+
+// ── Editor WebSocket (/ws/editor) ──
+// The editor runs on its own socket, separate from the chat socket, so
+// editor requests (fs/git) never queue behind chat turns and a streaming
+// session cannot stall editor saves. The socket reconnects itself and
+// repaints the explorer on (re)connect.
+
+let editorReconnectTimer = null;
+
+function editorSocketURL() {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${window.location.host}/ws/editor`;
+}
+
+/**
+ * Open (or reopen) the editor WebSocket. Safe to call repeatedly; each call
+ * replaces the previous socket's handlers. On (re)connect the file tree and
+ * git status are refreshed so a dropped socket never leaves a stale explorer.
+ */
+export function connectEditorSocket() {
+  clearTimeout(editorReconnectTimer);
+  editorReconnectTimer = null;
+  const ws = new WebSocket(editorSocketURL());
+  wsRef = ws;
+
+  ws.onopen = () => {
+    // Repaint the explorer so a reconnect (or first load) reflects the
+    // server's current tree/git state. Best-effort: Monaco may not be
+    // initialized yet, but the tree is plain DOM and does not need it.
+    refreshExplorer().catch(() => {});
+  };
+
+  ws.onmessage = (event) => {
+    let data;
+    try {
+      data = JSON.parse(event.data);
+    } catch (err) {
+      console.error('Failed to parse editor message:', err);
+      return;
+    }
+    handleServerMessage(data);
+  };
+
+  ws.onclose = () => {
+    wsRef = null;
+    // Reject any in-flight requests so callers fail fast instead of hanging.
+    for (const [, p] of pendingReqs) {
+      p.reject(new Error('editor connection lost'));
+    }
+    pendingReqs.clear();
+    editorReconnectTimer = setTimeout(connectEditorSocket, 3000);
+  };
+
+  ws.onerror = () => {
+    // onclose follows; nothing else to do here.
+  };
 }
 
 function wsRequest(type, payload = {}) {
@@ -141,21 +194,6 @@ function wsRequest(type, payload = {}) {
     pendingReqs.set(requestId, { resolve, reject });
     wsRef.send(JSON.stringify({ type, requestId, ...payload }));
   });
-}
-
-/**
- * Apply a unified diff to the working tree via the server's patch engine
- * (exact-context match). Resolves with the server response, or with
- * `{ error }` when the apply failed (context mismatch, agent busy, ...).
- */
-export async function applyPatchFromDiff(diff) {
-  try {
-    return await wsRequest('fs_apply_patch', { diff });
-  } catch (err) {
-    // wsRequest rejects whenever the server sets `error`; resolve with the
-    // error payload instead so callers can read it without a try/catch.
-    return { error: err.message };
-  }
 }
 
 export async function initMonaco() {

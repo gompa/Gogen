@@ -33,7 +33,7 @@ func extraFieldShouldDisplay(key string) bool {
 		strings.Contains(lower, "thought")
 }
 
-func (a extraFieldAccums) addFromDelta(delta openai.ChatCompletionChunkChoiceDelta, onThinking func(string), fullReasoning *string) {
+func (a extraFieldAccums) addFromDelta(delta openai.ChatCompletionChunkChoiceDelta, onThinking func(string), fullReasoning *strings.Builder) {
 	emit := a.thinkingEmitter(onThinking, fullReasoning)
 	extraCount := 0
 	for key, field := range delta.JSON.ExtraFields {
@@ -54,7 +54,7 @@ func (a extraFieldAccums) addFromDelta(delta openai.ChatCompletionChunkChoiceDel
 // Some providers emit the same text under multiple keys (e.g. reasoning_content
 // and reasoning) in one chunk; emitting each copy produces the interleaved
 // "Now I have aNow I have a" duplication seen in the TUI.
-func (a extraFieldAccums) thinkingEmitter(onThinking func(string), fullReasoning *string) func(key, piece string) {
+func (a extraFieldAccums) thinkingEmitter(onThinking func(string), fullReasoning *strings.Builder) func(key, piece string) {
 	var seen map[string]struct{}
 	return func(key, piece string) {
 		if !extraFieldShouldDisplay(key) || piece == "" {
@@ -68,7 +68,7 @@ func (a extraFieldAccums) thinkingEmitter(onThinking func(string), fullReasoning
 		}
 		seen[piece] = struct{}{}
 		if fullReasoning != nil {
-			*fullReasoning += piece
+			fullReasoning.WriteString(piece)
 		}
 		if onThinking != nil {
 			onThinking(piece)

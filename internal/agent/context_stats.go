@@ -55,8 +55,8 @@ func (a *Agent) clearTurnUsage() {
 // (Messages, cached token counts, API usage baseline, project profile) is
 // snapshotted under Agent.statsMu before tokenization, which happens without
 // holding any server lock. Tokenization is slow, so avoid holding
-// Server.agentMu/turnMu across the call where practical; the /context WS path
-// still runs it under turnMu, which is safe (see internal/server/agent_sync.go).
+// Server.turnMu across the call where practical; the web /context
+// path still runs it under turnMu, which is safe.
 //
 // When an API baseline is available, Snapshot.Used reflects the API's exact
 // prompt_tokens for the messages that were in the last request, plus local
@@ -78,7 +78,7 @@ func (a *Agent) ContextStats(ctx context.Context) TurnContext {
 	// baseline, project profile) under the lock, then release before
 	// tokenizing. A concurrent turn goroutine may append messages, extend the
 	// cached counts, or record new API usage while ContextStats runs (web
-	// readers do not hold agentMu/turnMu). The message clone is deep so
+	// readers do not hold turnMu). The message clone is deep so
 	// tokenization cannot race in-place stabilization on the live array.
 	a.statsMu.RLock()
 	msgs := cloneMessages(a.Messages)
@@ -87,13 +87,19 @@ func (a *Agent) ContextStats(ctx context.Context) TurnContext {
 	lastUsage := a.lastTurnUsage
 	baselinePromptTokens, baselineMsgCount := a.apiBaselinePromptTokens, a.apiBaselineMsgCount
 	projectProfile := a.projectProfile
+	// WorkingDir/Mode are written under statsMu (SetWorkingDir, SetMode), so
+	// read them under the same lock: ContextStats runs without the turn lock
+	// (web probes) and must not race a concurrent working-dir change or
+	// mode switch (data race on a.WorkingDir / a.Mode).
+	workingDir := a.WorkingDir
+	mode := a.Mode
 	a.statsMu.RUnlock()
 
 	view := msgs
 	if a.Context != nil {
-		view = withSystemPrompt(msgs, a.WorkingDir)
+		view = withSystemPrompt(msgs, workingDir)
 		// Use cached profile only — do not run DetectProjectProfile here.
-		view = enrichSystemPrompt(view, a.WorkingDir, a.ProjectFilePath, a.ProjectGuidelines, projectProfile, a.Mode)
+		view = enrichSystemPrompt(view, workingDir, a.ProjectFilePath, a.ProjectGuidelines, projectProfile, mode)
 	}
 
 	var snap contextmgr.ContextSnapshot

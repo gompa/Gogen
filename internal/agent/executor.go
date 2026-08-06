@@ -260,7 +260,12 @@ func (e *Executor) readWithLineRange(secure string, offset, limit int, lineNumbe
 			if len(selected) >= effectiveLimit {
 				continue
 			}
-		} else if offset == 0 && len(selected) >= readFileMaxLines {
+		} else if len(selected) >= readFileMaxLines {
+			// No explicit limit: cap at readFileMaxLines regardless of the
+			// offset, so "read from line 500 with no limit" cannot return an
+			// unbounded (multi-MB) result — the "Lines X-Y of Z" header below
+			// tells the caller the read was truncated. The old `offset == 0`
+			// guard let offset reads run to EOF.
 			continue
 		}
 		selected = append(selected, scanner.Text())

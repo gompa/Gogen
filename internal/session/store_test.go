@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -67,6 +68,90 @@ func TestLatestIDUsesUpdatedNotMtime(t *testing.T) {
 	}
 	if got != "newer" {
 		t.Fatalf("LatestID=%q want %q (should use Updated, not mtime)", got, "newer")
+	}
+}
+
+func TestGlobalModeListCacheCoherentAcrossWorkingDirs(t *testing.T) {
+	// In global mode every working dir shares one session dir. The in-memory
+	// list cache must be keyed by that shared dir, or a Delete issued via one
+	// working dir would leave the other working dir's cached listing stale for
+	// the TTL window (and a Save would appear "missing" from it).
+	globalDir := t.TempDir()
+	wdA := filepath.Join(t.TempDir(), "projA")
+	wdB := filepath.Join(t.TempDir(), "projB")
+	if err := os.MkdirAll(wdA, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(wdB, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(true)
+	store.SetGlobalDir(globalDir)
+
+	id := "global-session"
+	if err := store.Save(id, agent.SessionSnapshot{
+		WorkingDir: wdA,
+		Messages:   []llm.Message{{Role: "user", Content: "hi"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// List via B to populate the (shared) cache, then delete via B and make
+	// sure a List via A does not resurrect the deleted session from the cache.
+	if _, err := store.List(wdB); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Delete(wdB, id); err != nil {
+		t.Fatal(err)
+	}
+	listA, err := store.List(wdA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range listA {
+		if s.ID == id {
+			t.Fatalf("List(%s) still returns deleted session %s from the cache", wdA, id)
+		}
+	}
+
+	// And a Save issued via A must be visible to a List via B.
+	id2 := "second-session"
+	if err := store.Save(id2, agent.SessionSnapshot{
+		WorkingDir: wdB,
+		Messages:   []llm.Message{{Role: "user", Content: "hi2"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	listB, err := store.List(wdA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, s := range listB {
+		if s.ID == id2 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("List(%s) does not show session %s saved via %s", wdA, id2, wdB)
+	}
+}
+
+func TestSetCreatedCacheEvictsOldest(t *testing.T) {
+	store := NewStore(true)
+	base := time.Now().UTC()
+	for i := 0; i < maxCreatedCacheEntries+10; i++ {
+		store.setCreatedCache("id"+fmt.Sprintf("%d", i), base.Add(time.Duration(i)*time.Second))
+	}
+	if len(store.createdCache) != maxCreatedCacheEntries {
+		t.Fatalf("cache size=%d want %d", len(store.createdCache), maxCreatedCacheEntries)
+	}
+	// The evicted entries must be the OLDEST ones (smallest timestamps).
+	for i := 0; i < 10; i++ {
+		if _, ok := store.createdCache["id"+fmt.Sprintf("%d", i)]; ok {
+			t.Fatalf("expected oldest entry id%d to be evicted", i)
+		}
 	}
 }
 

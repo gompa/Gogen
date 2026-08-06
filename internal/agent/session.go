@@ -95,6 +95,12 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 	// merges any existing delta file from a previous process lifetime.
 	a.resetSaveTracking()
 	a.setSessionLabel(snap.Label)
+	// Mode/thinking are read by config snapshots under statsMu (see
+	// ModeAndThinkingLevel), so the restore publishes them under the same
+	// lock — a concurrent attach's config snapshot would otherwise tear the
+	// plain field reads. SessionOneshot is read by doPersist under statsMu,
+	// so it is published under the same lock.
+	a.statsMu.Lock()
 	a.SessionOneshot = snap.Oneshot
 	if m, ok := ParseMode(snap.Mode); ok {
 		a.Mode = m
@@ -104,6 +110,49 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 			a.ThinkingLevel = l
 		}
 	}
+	a.statsMu.Unlock()
+	// The provider owns a separate reasoning-effort state (in web mode every
+	// session gets a fresh provider seeded with the workspace default). Publish
+	// the restored level to it so non-turn calls (e.g. /compact summarization
+	// via GenerateResponse) and the first turn agree with the restored session
+	// instead of the provider's stale seed. StreamProcessInput re-syncs every
+	// turn as a safety net.
+	if a.Provider != nil {
+		a.Provider.SetThinkingLevel(string(a.ThinkingLevel))
+	}
+	// Seed the metadata fingerprint from the restored snapshot so the first
+	// post-restore save compares against what was actually restored (the
+	// save is a full one regardless — resetSaveTracking above — but this
+	// keeps lastMeta truthful for the saves after that). lastMeta is
+	// read/written by doPersist under persistMu, so the seed publishes under
+	// the same lock. Seeded after the field applies above so a concurrent
+	// doPersist never compares new metadata against a stale seed.
+	a.persistMu.Lock()
+	// Normalize the seed exactly as the fields above were normalized, so the
+	// first post-restore doPersist compares like for like: an old snapshot
+	// persisted "max" restores the field as "high", and TodoManager.Replace
+	// (run earlier in this restore) normalizes NextID — seeding the raw
+	// values would make lastMeta differ from the restored state until the
+	// first full save rewrites it. (Cosmetic: that save is full anyway via
+	// resetSaveTracking, but the seed should be truthful for the saves
+	// after it.)
+	seedMode, seedThinking := snap.Mode, snap.ThinkingLevel
+	if m, ok := ParseMode(snap.Mode); ok {
+		seedMode = m.String()
+	}
+	if l, ok := ParseThinkingLevel(snap.ThinkingLevel); ok {
+		seedThinking = string(l)
+	}
+	a.lastMeta = persistMeta{
+		label:    snap.Label,
+		mode:     seedMode,
+		model:    snap.Model,
+		thinking: seedThinking,
+		oneshot:  snap.Oneshot,
+		profile:  snap.ProjectProfile,
+		todos:    todoSnapshot(a.TodoManager),
+	}
+	a.persistMu.Unlock()
 	if snap.Model != "" {
 		_ = a.Provider.SetModel(snap.Model)
 	}
@@ -172,7 +221,7 @@ func sameWorkingDir(snapDir, currentDir string) bool {
 }
 
 // setSessionLabel stores the session label under statsMu: web probes read it
-// without agentMu/turnMu (agentConfigMsgBasic, contextMsg) while the turn
+// without turnMu (agentConfigMsgBasic, contextMsg) while the turn
 // goroutine may derive it from the first user message.
 func (a *Agent) setSessionLabel(label string) {
 	a.statsMu.Lock()

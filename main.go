@@ -287,7 +287,7 @@ func main() {
 	signal.Reset(syscall.SIGINT, syscall.SIGTERM)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
-	defer a.FlushSession()
+	defer a.FlushPending()
 
 	if opts.prompt != "" {
 		go initMCP()
@@ -321,6 +321,16 @@ func main() {
 		}
 
 		s := server.NewServer(a, cfg)
+		// Flush every registered session agent on shutdown (multi-session
+		// plan Phase 6). Both this sweep and the outer defer use the
+		// non-forcing FlushPending: the sweep must persist unsaved state,
+		// but a forced write on a clean session re-stamps its Updated
+		// timestamp with ~now in registry order, which reshuffled the
+		// saved-session list on every restart and demoted the session that
+		// was active at shutdown. The outer defer still covers the default
+		// session idempotently and the TUI/CLI paths (flushAndQuit already
+		// forces the TUI write; a dirty session is still written here).
+		defer s.ShutdownSessions()
 
 		// Build a user-friendly URL for the startup message.
 		// Replace 0.0.0.0 with 127.0.0.1 so the link works when clicked.

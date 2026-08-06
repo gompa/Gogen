@@ -29,7 +29,7 @@ type SessionCommandResult struct {
 // HandleSessionCommand processes /new, /resume, and sessions commands.
 // newSessionID is required for /new (call session.NewID() from the caller).
 func (a *Agent) HandleSessionCommand(ctx context.Context, input, newSessionID string) (SessionCommandResult, bool, error) {
-	cmd, args := parseSessionCommand(input)
+	cmd, args := ParseSessionCommand(input)
 	switch cmd {
 	case "new":
 		out, err := a.startNewSession(newSessionID)
@@ -55,8 +55,10 @@ func (a *Agent) HandleSessionCommand(ctx context.Context, input, newSessionID st
 	return SessionCommandResult{}, false, nil
 }
 
-// parseSessionCommand splits input into (command, args), stripping a leading "/".
-func parseSessionCommand(input string) (cmd, args string) {
+// ParseSessionCommand splits input into (command, args), stripping a leading
+// "/". Shared by the agent (TUI) and the multi-session web server so both
+// parse slash commands identically.
+func ParseSessionCommand(input string) (cmd, args string) {
 	trimmed := strings.TrimSpace(input)
 	trimmed = strings.TrimPrefix(trimmed, "/")
 	parts := strings.SplitN(trimmed, " ", 2)
@@ -78,7 +80,9 @@ func (a *Agent) ResetSessionState() {
 	a.resetSaveTracking()
 	a.clearViewDriftSnapshot()
 	a.setSessionLabel("")
+	a.statsMu.Lock()
 	a.SessionOneshot = false
+	a.statsMu.Unlock()
 	if a.PinManager != nil {
 		a.PinManager.ClearPins()
 	}
@@ -144,7 +148,7 @@ func (a *Agent) resumeSessionByID(ctx context.Context, id string) (string, error
 	}
 	// Flush the current session only if it has unsaved changes, so we don't
 	// write a fresh timestamp on a session that was merely loaded.
-	if a.sessionDirty {
+	if a.sessionDirty.Load() {
 		a.FlushSession()
 	}
 	if strings.TrimSpace(id) == "" {
@@ -268,12 +272,23 @@ func (a *Agent) FormatSessionListForUI() (string, []SessionInfo, error) {
 // visible message, and stripping tool calls from a tool-call-only fork point
 // drops the resulting empty message instead of leaving a ghost in the forked
 // history.
-func (a *Agent) ForkSession(ctx context.Context, args, newSessionID string) error {
-	if strings.TrimSpace(newSessionID) == "" {
-		return fmt.Errorf("session id is required")
-	}
-	if len(a.Messages) == 0 {
-		return fmt.Errorf("no messages to fork from")
+// ForkMessages returns a copy of messages up to (and including) the fork
+// point selected by args, without mutating any agent. args can be:
+//   - "" or "last": fork from the last assistant message that produced output
+//     (ghosts — reasoning-only or fully-empty assistant turns — are skipped)
+//   - "<N>": fork from the Nth message (0-indexed raw index)
+//   - "assistant <N>": fork from the Nth assistant message (0-indexed)
+//   - "created <RFC3339Nano>": fork from message with the given CreatedAt
+//
+// Invisible assistant messages (no content, no refusal, no tool calls) are
+// never used as a fork point: explicit index forks walk back to the nearest
+// visible message, and stripping tool calls from a tool-call-only fork point
+// drops the resulting empty message instead of leaving a ghost in the forked
+// history. The multi-session web server uses this to fork into a NEW agent
+// while leaving the source session untouched (E13).
+func ForkMessages(messages []llm.Message, args string) ([]llm.Message, error) {
+	if len(messages) == 0 {
+		return nil, fmt.Errorf("no messages to fork from")
 	}
 
 	// isInvisibleAssistant reports whether an assistant message carries no
@@ -291,22 +306,22 @@ func (a *Agent) ForkSession(ctx context.Context, args, newSessionID string) erro
 	switch {
 	case args == "" || args == "last":
 		// Fork from the last assistant message
-		for i := len(a.Messages) - 1; i >= 0; i-- {
-			if a.Messages[i].Role == "assistant" && !isInvisibleAssistant(a.Messages[i]) {
+		for i := len(messages) - 1; i >= 0; i-- {
+			if messages[i].Role == "assistant" && !isInvisibleAssistant(messages[i]) {
 				idx = i
 				break
 			}
 		}
 		if idx < 0 {
-			return fmt.Errorf("no assistant message found to fork from")
+			return nil, fmt.Errorf("no assistant message found to fork from")
 		}
 	case strings.HasPrefix(args, "created "):
 		ts := strings.TrimSpace(strings.TrimPrefix(args, "created "))
 		createdAt, err := time.Parse(time.RFC3339Nano, ts)
 		if err != nil {
-			return fmt.Errorf("invalid timestamp %q: %v", ts, err)
+			return nil, fmt.Errorf("invalid timestamp %q: %v", ts, err)
 		}
-		for i, m := range a.Messages {
+		for i, m := range messages {
 			diff := m.CreatedAt.Sub(createdAt)
 			if diff < 0 {
 				diff = -diff
@@ -317,15 +332,15 @@ func (a *Agent) ForkSession(ctx context.Context, args, newSessionID string) erro
 			}
 		}
 		if idx < 0 {
-			return fmt.Errorf("message with timestamp %q not found", ts)
+			return nil, fmt.Errorf("message with timestamp %q not found", ts)
 		}
 	case strings.HasPrefix(args, "assistant "):
 		n, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(args, "assistant ")))
 		if err != nil {
-			return fmt.Errorf("usage: fork [assistant <N>] — invalid number: %v", err)
+			return nil, fmt.Errorf("usage: fork [assistant <N>] — invalid number: %v", err)
 		}
 		count := 0
-		for i, m := range a.Messages {
+		for i, m := range messages {
 			if m.Role == "assistant" {
 				if count == n {
 					idx = i
@@ -335,13 +350,13 @@ func (a *Agent) ForkSession(ctx context.Context, args, newSessionID string) erro
 			}
 		}
 		if idx < 0 {
-			return fmt.Errorf("assistant message %d not found (only %d assistant messages)", n, count)
+			return nil, fmt.Errorf("assistant message %d not found (only %d assistant messages)", n, count)
 		}
 	default:
 		// Raw index into the Messages array (matches histIdx from the client).
 		n, err := strconv.Atoi(args)
-		if err != nil || n < 0 || n >= len(a.Messages) {
-			return fmt.Errorf("usage: fork [<N> | last | assistant <N> | created <timestamp>] — invalid index %q", args)
+		if err != nil || n < 0 || n >= len(messages) {
+			return nil, fmt.Errorf("usage: fork [<N> | last | assistant <N> | created <timestamp>] — invalid index %q", args)
 		}
 		idx = n
 	}
@@ -349,22 +364,15 @@ func (a *Agent) ForkSession(ctx context.Context, args, newSessionID string) erro
 	// Never fork from an invisible assistant message (a truncated
 	// reasoning-only turn or a fully-empty ghost): walk back to the nearest
 	// visible message so the forked session ends on a meaningful turn.
-	for idx > 0 && isInvisibleAssistant(a.Messages[idx]) {
+	for idx > 0 && isInvisibleAssistant(messages[idx]) {
 		idx--
 	}
-	if isInvisibleAssistant(a.Messages[idx]) {
-		return fmt.Errorf("no visible message found to fork from")
+	if isInvisibleAssistant(messages[idx]) {
+		return nil, fmt.Errorf("no visible message found to fork from")
 	}
-
-	// Save current session (the original branch)
-	if a.SessionStore != nil {
-		a.FlushSession()
-	}
-
-	oldSessionID := a.SessionID
 
 	// Copy messages up to and including the fork point.
-	forkedMsgs := append([]llm.Message(nil), a.Messages[:idx+1]...)
+	forkedMsgs := append([]llm.Message(nil), messages[:idx+1]...)
 
 	// If the fork point is an assistant message with tool calls, strip the
 	// tool calls from it so the forked session doesn't have orphaned
@@ -379,9 +387,37 @@ func (a *Agent) ForkSession(ctx context.Context, args, newSessionID string) erro
 			forkedMsgs = forkedMsgs[:len(forkedMsgs)-1]
 		}
 		if len(forkedMsgs) == 0 {
-			return fmt.Errorf("cannot fork from an empty assistant message")
+			return nil, fmt.Errorf("cannot fork from an empty assistant message")
 		}
 	}
+
+	return forkedMsgs, nil
+}
+
+// ForkSession forks the current conversation into a NEW session: the current
+// session is saved first, then the agent's messages are replaced with the
+// prefix up to the fork point selected by args (see ForkMessages for the
+// accepted forms), and the new session is persisted under newSessionID
+// (required; call session.NewID() from the caller).
+func (a *Agent) ForkSession(ctx context.Context, args, newSessionID string) error {
+	if strings.TrimSpace(newSessionID) == "" {
+		return fmt.Errorf("session id is required")
+	}
+	if len(a.Messages) == 0 {
+		return fmt.Errorf("no messages to fork from")
+	}
+
+	forkedMsgs, err := ForkMessages(a.Messages, args)
+	if err != nil {
+		return err
+	}
+
+	// Save current session (the original branch)
+	if a.SessionStore != nil {
+		a.FlushSession()
+	}
+
+	oldSessionID := a.SessionID
 
 	// Start new session with the truncated history
 	a.SessionID = newSessionID
@@ -393,7 +429,9 @@ func (a *Agent) ForkSession(ctx context.Context, args, newSessionID string) erro
 	a.resetSaveTracking()
 	a.clearViewDriftSnapshot()
 	a.setSessionLabel("")
+	a.statsMu.Lock()
 	a.SessionOneshot = false
+	a.statsMu.Unlock()
 	if a.PinManager != nil {
 		a.PinManager.ClearPins()
 	}

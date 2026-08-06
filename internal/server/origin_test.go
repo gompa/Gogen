@@ -19,6 +19,8 @@ func TestCheckWSOrigin(t *testing.T) {
 		{"localhost", "http://localhost:8080", "127.0.0.1:8080", true},
 		{"127.0.0.1", "http://127.0.0.1:8080", "127.0.0.1:8080", true},
 		{"same host", "http://192.168.1.5:8080", "192.168.1.5:8080", true},
+		{"empty origin ipv6 loopback", "", "[::1]:8080", true},
+		{"ipv6 origin", "http://[::1]:8080", "[::1]:8080", true},
 		{"evil", "https://evil.example", "127.0.0.1:8080", false},
 	}
 	for _, tc := range cases {
@@ -84,5 +86,11 @@ func TestParseAllowedOriginsCustom(t *testing.T) {
 	}
 	if _, ok := allowed["staging.local"]; !ok {
 		t.Fatal("expected staging.local")
+	}
+	// host:port entries must normalize to the bare hostname — checkWSOrigin
+	// compares Hostname() (no port), so storing the port would never match.
+	allowed = parseAllowedOrigins("example.com:8080")
+	if _, ok := allowed["example.com"]; !ok {
+		t.Fatal("expected example.com (port stripped)")
 	}
 }

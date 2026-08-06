@@ -1,6 +1,5 @@
         import {
-            setWebSocket,
-            handleServerMessage,
+            connectEditorSocket,
             setupEditorUI,
             refreshExplorer,
             disposeChatEditors,
@@ -22,7 +21,6 @@
             openFileAtLine,
             setMonacoTheme,
             applyEditorPrefs,
-            applyPatchFromDiff,
             openModal,
             closeModal,
         } from '/editor.js';
@@ -38,10 +36,14 @@
         const slashSuggest = document.getElementById('slash-suggest');
         const dirInput = document.getElementById('working-dir-input');
         const setDirBtn = document.getElementById('set-dir-btn');
+        const workingDirDisplay = document.getElementById('working-dir-display');
+        const workingDirPath = document.getElementById('working-dir-path');
+        const workingDirConfig = document.getElementById('working-dir-config');
         const connIndicator = document.getElementById('conn-indicator');
         const sessionInfoDiv = document.getElementById('session-info');
         const sessionListDiv = document.getElementById('session-list');
         let currentMode = 'act';
+        let isGlobalMode = false;
         const inputProgress = document.getElementById('input-progress');
         const globalModeBadge = document.getElementById('global-mode-badge');
         const deleteOverlay = document.getElementById('delete-approval-overlay');
@@ -65,8 +67,19 @@
         const tbModeBtn = document.getElementById('tb-mode-btn');
         const tbContextBadge = document.getElementById('tb-context-badge');
 
-        let pendingDeleteApprovalId = null;
+        // Pending delete approvals, queued so a second session's approval
+        // request (e.g. a background pane) cannot orphan the first: the modal
+        // is single-slot, and overwriting the pending id would leave the
+        // first session's turn waiting forever on a channel that is never
+        // resolved. Each entry carries its sessionId so the response routes
+        // to the right session's runtime (E5).
+        let pendingDeleteApprovals = []; // {approvalId, sessionId, reason, paths}
         let messageRawStore = new WeakMap();
+        // Last sessions payload from the server. The sidebar's single
+        // session list is re-rendered from this cache whenever pane state
+        // (active focus, busy/responding, label) changes, avoiding a
+        // round-trip per state flip.
+        let lastSessions = null;
 
         function showToast(message, kind = 'info') {
             if (!toastHost || !message) return;
@@ -98,7 +111,7 @@
             { name: '/plan', description: 'Switch to plan (read-only) mode' },
             { name: '/act', description: 'Switch to act mode' },
             { name: '/mode', description: 'Show current mode' },
-            { name: '/think', description: 'Set thinking/reasoning level (off/low/medium/high/max)' },
+            { name: '/think', description: 'Set thinking/reasoning level (off/low/medium/high)' },
             { name: '/models', description: 'List or switch models' },
             { name: '/context', description: 'Context usage details' },
             { name: '/new', description: 'Start a new session' },
@@ -193,22 +206,28 @@
 
         function respondDeleteApproval(approved) {
             deleteOverlay.removeEventListener('keydown', deleteApprovalEsc);
-            if (!pendingDeleteApprovalId || !ws || ws.readyState !== WebSocket.OPEN) {
-                pendingDeleteApprovalId = null;
+            if (!pendingDeleteApprovals.length || !ws || ws.readyState !== WebSocket.OPEN) {
+                pendingDeleteApprovals = [];
                 inputArea.disabled = false;
                 sendBtn.disabled = false;
                 closeModal(deleteOverlay);
                 return;
             }
+            const current = pendingDeleteApprovals.shift();
             ws.send(JSON.stringify({
                 type: 'delete_approval_response',
-                approvalId: pendingDeleteApprovalId,
-                approved: approved
+                approvalId: current.approvalId,
+                approved: approved,
+                sessionId: current.sessionId || undefined
             }));
-            pendingDeleteApprovalId = null;
-            inputArea.disabled = false;
-            sendBtn.disabled = false;
-            closeModal(deleteOverlay);
+            if (pendingDeleteApprovals.length) {
+                // More approvals queued — show the next one.
+                renderDeleteApproval(pendingDeleteApprovals[0]);
+            } else {
+                inputArea.disabled = false;
+                sendBtn.disabled = false;
+                closeModal(deleteOverlay);
+            }
         }
 
         function deleteApprovalEsc(e) {
@@ -221,10 +240,25 @@
         deleteAllowBtn.onclick = () => respondDeleteApproval(true);
         deleteDenyBtn.onclick = () => respondDeleteApproval(false);
 
-        function showDeleteApproval(data) {
-            pendingDeleteApprovalId = data.approvalId;
+        function renderDeleteApproval(data) {
             deleteReason.textContent = data.reason ? `Requested by: ${data.reason}` : 'The agent wants to delete files.';
             deletePaths.textContent = (data.paths || []).map(p => `- ${p}`).join('\n');
+        }
+
+        function showDeleteApproval(data) {
+            const first = pendingDeleteApprovals.length === 0;
+            pendingDeleteApprovals.push({
+                approvalId: data.approvalId,
+                sessionId: data.sessionId || null,
+                reason: data.reason,
+                paths: data.paths || [],
+            });
+            if (!first) {
+                // The modal already shows an earlier approval; this one is
+                // queued and renders when the current one resolves.
+                return;
+            }
+            renderDeleteApproval(pendingDeleteApprovals[0]);
             inputArea.disabled = true;
             sendBtn.disabled = true;
             openModal(deleteOverlay);
@@ -322,7 +356,9 @@
                     e.stopPropagation();
                     if (m.id === current) { closeModelPopover(); return; }
                     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-                    ws.send(JSON.stringify({ type: 'set_model', model: m.id }));
+                    // set_model is per-session (D1): the sessionId scopes it
+                    // to the requesting pane's provider only.
+                    ws.send(JSON.stringify({ type: 'set_model', model: m.id, sessionId: activePane().id }));
                     closeModelPopover();
                 });
                 tbModelList.appendChild(row);
@@ -330,7 +366,7 @@
         }
 
         // ── Toolbar: thinking level chips ──
-        const THINKING_LABELS = { off: 'Off', minimal: 'Mi', low: 'L', medium: 'M', high: 'H', xhigh: 'XH', max: 'Max' };
+        const THINKING_LABELS = { off: 'Off', low: 'L', medium: 'M', high: 'H' };
 
         function renderThinkingChips(level) {
             if (!tbThinkingGrid) return;
@@ -345,7 +381,7 @@
                     e.stopPropagation();
                     if (key === level) return;
                     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-                    ws.send(JSON.stringify({ type: 'set_thinking_level', thinkingLevel: key }));
+                    ws.send(JSON.stringify({ type: 'set_thinking_level', thinkingLevel: key, sessionId: activePane().id }));
                 });
                 tbThinkingGrid.appendChild(chip);
             }
@@ -382,7 +418,7 @@
                 const mode = row.dataset.mode;
                 if (mode === currentMode) { closeModePopover(); return; }
                 if (!ws || ws.readyState !== WebSocket.OPEN) return;
-                ws.send(JSON.stringify({ type: 'set_mode', mode }));
+                ws.send(JSON.stringify({ type: 'set_mode', mode, sessionId: activePane().id }));
                 closeModePopover();
             });
         });
@@ -504,7 +540,15 @@
         }
 
         function updateGlobalMode(isGlobal) {
-            if (globalModeBadge) globalModeBadge.classList.toggle('visible', !!isGlobal);
+            // The server omits globalMode when false (JSON omitempty), so
+            // absence always means project mode.
+            isGlobalMode = !!isGlobal;
+            if (globalModeBadge) globalModeBadge.classList.toggle('visible', isGlobalMode);
+            // The working directory can only be changed in global mode:
+            // project mode shows a read-only path, global mode shows the
+            // editable control (the server also rejects the change).
+            if (workingDirDisplay) workingDirDisplay.style.display = isGlobalMode ? 'none' : '';
+            if (workingDirConfig) workingDirConfig.style.display = isGlobalMode ? '' : 'none';
         }
 
         function formatTokenCount(n) {
@@ -585,7 +629,7 @@
             }
             if (compacting) return;
             compacting = true;
-            ws.send(JSON.stringify({ type: 'compact' }));
+            ws.send(JSON.stringify({ type: 'compact', sessionId: activePane().id }));
             // Persistent progress, not a 3s toast: it stays until the server
             // reports the compact result (see the 'response' handler).
             setInputProgress('compacting', 'Compacting context…');
@@ -624,7 +668,10 @@
 
         function applyServerConfig(data) {
             console.log('[pricing] applyServerConfig', { model: data.model, inputPrice: data.inputPricePer1M, totalTurns: data.totalTurns });
-            if (data.workingDir) dirInput.value = data.workingDir;
+            if (data.workingDir) {
+                dirInput.value = data.workingDir;
+                if (workingDirPath) workingDirPath.textContent = data.workingDir;
+            }
             updateModelInfo(data.model);
             // Keep the popover model list in sync with the active model after a switch
             if (data.model && availableModels.length > 0) {
@@ -684,7 +731,9 @@
             pendingToolCards = {};
             historyToolCallArgs = {};
             toolsStartedThisTurn = false;
-            setTurnActive(false);
+            // noMirror: clearChat is also used mid-pane-switch (clear → load),
+            // where the new pane's turnActive must survive the reset.
+            setTurnActive(false, { silent: true, noMirror: true });
             setInputProgress(null);
             scrollBottomBtn.classList.remove('visible');
             maybeShowEmptyState();
@@ -811,7 +860,9 @@
         let msgIdxCounter = 0;
 
         let _prevTurnActive = false;
-        function setTurnActive(active) {
+        function setTurnActive(active, opts) {
+            const silent = !!(opts && opts.silent);
+            const noMirror = !!(opts && opts.noMirror);
             const wasActive = _prevTurnActive;
             turnActive = !!active;
             if (cancelBtn) cancelBtn.disabled = !turnActive;
@@ -821,11 +872,27 @@
             if (!active) {
                 toolsStartedThisTurn = false;
             }
+            // Keep the active pane object's mirror current (badges,
+            // afterHistory's "resuming…" restore). clearChat passes noMirror
+            // so its reset does not clobber the pane's state mid-switch.
+            if (!noMirror) {
+                const p = activePane();
+                if (p) p.turnActive = turnActive;
+            }
+            // Live-refresh the sidebar session row when the active pane's
+            // turn state flips, so the amber responding indicator appears the
+            // moment a turn starts (previously the row only re-rendered on a
+            // pane switch, a turn end, or a background-pane message — the
+            // active pane's row went stale until the user switched sessions).
+            if (!noMirror && wasActive !== turnActive) {
+                refreshSidebarSessions();
+            }
             // Turn-end notification on any active→inactive transition, except
             // user-initiated stops that immediately start a new turn
-            // (send-while-busy / resend are tracked via suppressTurnEnds).
+            // (send-while-busy / resend are tracked via suppressTurnEnds) and
+            // silent state restores (pane focus, session_state replay).
             _prevTurnActive = turnActive;
-            if (wasActive && !turnActive && suppressTurnEnds === 0) {
+            if (wasActive && !turnActive && suppressTurnEnds === 0 && !silent) {
                 sendNotification('GoGen', 'Agent finished responding.', 'gogen-turn-end');
             }
         }
@@ -857,6 +924,414 @@
                 });
                 updateContextInfo(data);
             });
+        }
+
+        // ── Multi-pane sessions (Phase 5) ──
+        // The UI renders one transcript at a time — the ACTIVE pane. Every
+        // open pane keeps its control state (turnActive, pending flags,
+        // context data) in `panes`; the module-level state variables above
+        // are mirrors of the active pane. Switching panes saves the mirrors,
+        // swaps which pane is active, then re-attaches so the server resends
+        // session_state/history/config/context for the focused session — the
+        // transcript is re-derived from the server (the accepted §4 caveat:
+        // a mid-turn pane shows the completed history, then live events).
+        const panes = new Map(); // paneKey -> pane
+        let nextPaneKey = 0;
+        let activePaneKey = 0;
+
+        function makePane() {
+            const pane = {
+                key: nextPaneKey++,
+                id: null, // session id (null until known)
+                label: '',
+                turnActive: false,
+                // Latched when this pane is attached to a session whose turn
+                // is RUNNING (mid-turn focus / reconnect): the attach history
+                // snapshot lacks the in-flight reply, so on turn_end we
+                // re-attach once to converge the transcript (Defect C).
+                needsFreshHistory: false,
+                // Session id whose turn_end must be ignored: set when the
+                // user resumes another session while this pane's session has
+                // a running turn. The old session keeps running headless
+                // (resume does not cancel it), so its turn_end must not clear
+                // the pending flag or block the resumed session's
+                // convergence. Cleared when the reply re-keys the pane.
+                ignoreTurnEndsFor: null,
+                suppressTurnEnds: 0,
+                pendingSessionResponse: false,
+                pendingResendContent: null,
+                resendAwaitingHistory: false,
+                compacting: false,
+                lastContextData: null,
+                contextBaseUsed: 0,
+                contextLimit: 0,
+                contextEstAdded: 0,
+                mode: 'act',
+                thinkingLevel: 'off',
+                model: '',
+                _notifiedBusy: false,
+            };
+            panes.set(pane.key, pane);
+            // The new pane becomes the ACTIVE pane at every call site; put
+            // it at the front of the open-pane list so the sidebar shows
+            // the newest session at the top.
+            movePaneToFront(pane);
+            refreshSidebarSessions();
+            return pane;
+        }
+
+        // Move a pane to the FRONT of the panes map so the sidebar renders
+        // open panes most-recently-used first. JS Maps re-insert a deleted
+        // key at the END, so a front-move rebuilds the map with the target
+        // pane first and the rest in existing order.
+        function movePaneToFront(pane) {
+            if (!pane || panes.keys().next().value === pane.key) return;
+            const reordered = new Map();
+            reordered.set(pane.key, pane);
+            for (const [k, p] of panes) {
+                if (k !== pane.key) reordered.set(k, p);
+            }
+            panes.clear();
+            for (const [k, p] of reordered) panes.set(k, p);
+        }
+
+        function activePane() {
+            return panes.get(activePaneKey);
+        }
+
+        function findPaneBySession(id) {
+            if (!id) return null;
+            for (const pane of panes.values()) {
+                if (pane.id === id) return pane;
+            }
+            return null;
+        }
+
+        // Route a session-scoped server message to the pane it belongs to.
+        // Returns null when the message is for a session the client does not
+        // have open (the connection is only attached to open panes, so this
+        // is rare — e.g. the server's default-session handshake after a
+        // reconnect where the default session is not an open pane).
+        function paneForMessage(data) {
+            const sid = data.sessionId;
+            if (sid) {
+                const act = activePane();
+                const activeInFlight = !!(act && pendingSessionResponse);
+                // A session command's reply (response with a sessionAction,
+                // e.g. clear_chat for /new, /resume, /fork) carries the NEW
+                // session id before the pane has adopted it — the response
+                // handler re-keys the pane so the follow-up clear_chat/
+                // history/config route correctly.
+                // Route it to the pane that initiated the change: normally
+                // the active pane (its mirror lives in the module-level
+                // pendingSessionResponse), but the user may have switched
+                // panes while the reply was in flight — the initiator's flag
+                // lives on the pane object, which the module mirror no longer
+                // reflects after a switch. (Two simultaneous in-flight
+                // changes across panes can still interleave ambiguously —
+                // each change is one round-trip, so this is a sub-second
+                // race.)
+                // The initiator is checked BEFORE a pane that already holds
+                // the reply's session id: the latter is a different pane
+                // (e.g. "resume latest" resolving to a session open
+                // elsewhere) and must not steal the reply from the pane that
+                // initiated the change, or that pane's in-flight flag would
+                // stay stuck forever.
+                if (data.type === 'response' && data.sessionAction) {
+                    if (activeInFlight) return act;
+                    for (const pane of panes.values()) {
+                        if (pane !== act && pane.pendingSessionResponse) return pane;
+                    }
+                    return act;
+                }
+                const p = findPaneBySession(sid);
+                if (p) return p;
+                // The server sends history before config in a session change,
+                // so the pane's id is stale until config adopts the new one.
+                // While a session change is in flight, unknown ids belong to
+                // the pane with the pending change (the follow-ups also
+                // include the session_state resume now sends before its
+                // reply).
+                if (activeInFlight) return act;
+                for (const pane of panes.values()) {
+                    if (pane !== act && pane.pendingSessionResponse) return pane;
+                }
+                if (act && act.id === null) return act;
+                return null;
+            }
+            return activePane();
+        }
+
+        function saveActivePaneState() {
+            const pane = activePane();
+            if (!pane) return;
+            pane.turnActive = turnActive;
+            pane.suppressTurnEnds = suppressTurnEnds;
+            pane.pendingSessionResponse = pendingSessionResponse;
+            pane.pendingResendContent = pendingResendContent;
+            pane.resendAwaitingHistory = resendAwaitingHistory;
+            pane.compacting = compacting;
+            pane.lastContextData = lastContextData;
+            pane.contextBaseUsed = contextBaseUsed;
+            pane.contextLimit = contextLimit;
+            pane.contextEstAdded = contextEstAdded;
+        }
+
+        function loadActivePaneState() {
+            const pane = activePane();
+            if (!pane) return;
+            turnActive = !!pane.turnActive;
+            suppressTurnEnds = pane.suppressTurnEnds;
+            pendingSessionResponse = pane.pendingSessionResponse;
+            pendingResendContent = pane.pendingResendContent;
+            resendAwaitingHistory = pane.resendAwaitingHistory;
+            compacting = pane.compacting;
+            lastContextData = pane.lastContextData;
+            contextBaseUsed = pane.contextBaseUsed;
+            contextLimit = pane.contextLimit;
+            contextEstAdded = pane.contextEstAdded;
+            _prevTurnActive = turnActive;
+            if (cancelBtn) cancelBtn.disabled = !turnActive;
+            document.getElementById('input-area').classList.toggle('turn-active', turnActive);
+            if (!turnActive) toolsStartedThisTurn = false;
+        }
+
+        // Apply a session-scoped message to a background pane without touching
+        // the DOM: turn/badge state, context data, and config mirrors. The
+        // transcript is re-derived from the server when the pane is focused.
+        function handleBackgroundMessage(pane, data) {
+            const beforeTurn = pane.turnActive;
+            const beforeLabel = pane.label;
+            const beforeId = pane.id;
+            switch (data.type) {
+                case 'thinking':
+                case 'waiting':
+                case 'thinking_token':
+                case 'stream':
+                case 'stream_end':
+                case 'tool_call_start':
+                case 'tool_call_delta':
+                case 'tool_call':
+                case 'tool_execute':
+                case 'tool_result':
+                case 'term_opened':
+                case 'term_output':
+                case 'term_exit':
+                    pane.turnActive = true;
+                    break;
+                case 'cancelled':
+                    pane.turnActive = false;
+                    // No decrement here: the active pane's cancelled handler
+                    // also ignores the message (it returns early), and the
+                    // paired turn_end below is the single decrement point for
+                    // a cancel cycle. Decrementing on BOTH left the pane's
+                    // counter at -1 when the pane went background between the
+                    // cancel and the terminal messages, disabling suppression
+                    // for the pane's next cancel (send-while-busy / resend).
+                    break;
+                case 'turn_end':
+                    pane.turnActive = false;
+                    if (pane.suppressTurnEnds > 0) pane.suppressTurnEnds--;
+                    break;
+                case 'session_state':
+                    pane.turnActive = !!data.turnActive;
+                    // Keep the convergence latch in sync with the active
+                    // pane's handler: an idle attach means the snapshot is
+                    // complete, a busy attach needs the turn-end refetch.
+                    pane.needsFreshHistory = !!pane.turnActive;
+                    break;
+                case 'context':
+                    pane.lastContextData = data || pane.lastContextData;
+                    if (data.sessionLabel) pane.label = data.sessionLabel;
+                    if (data.usedSource !== 'estimated') {
+                        pane.contextBaseUsed = data.usedTokens || 0;
+                        pane.contextLimit = data.contextLimit || 0;
+                        pane.contextEstAdded = 0;
+                    }
+                    break;
+                case 'config':
+                    pane.mode = data.mode || pane.mode;
+                    pane.thinkingLevel = data.thinkingLevel || pane.thinkingLevel;
+                    pane.model = data.model || pane.model;
+                    if (data.sessionLabel) pane.label = data.sessionLabel;
+                    // A resend whose reply sequence (response → clear_chat →
+                    // history → config) completed while this pane was in the
+                    // background: the active pane's config handler never ran,
+                    // so the pending message was never flushed. The response
+                    // case above already adopted the new session id, so send
+                    // the message on the wire now — the transcript re-derives
+                    // on focus and the server's history snapshot then contains
+                    // both the message and its reply. No DOM work here: a
+                    // background pane's transcript is rebuilt on focus.
+                    if (pane.resendAwaitingHistory) {
+                        const text = pane.pendingResendContent;
+                        pane.resendAwaitingHistory = false;
+                        pane.pendingResendContent = null;
+                        if (text && ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({ type: 'message', content: text, sessionId: pane.id }));
+                        }
+                    }
+                    break;
+                case 'clear_chat':
+                    // Background panes have no DOM; the re-attach on focus
+                    // rebuilds the transcript. Just clear stale flags.
+                    pane.pendingSessionResponse = false;
+                    break;
+                case 'response':
+                    pane.pendingSessionResponse = false;
+                    pane.ignoreTurnEndsFor = null;
+                    // An error reply to the pane's own session change (e.g. a
+                    // fork/new from a resend that failed) must cancel a
+                    // pending resend like the active pane's Error branch does;
+                    // otherwise the config flush below would send the pending
+                    // message to the old session anyway.
+                    if (String(data.content || '').startsWith('Error:')) {
+                        pane.pendingResendContent = null;
+                        pane.resendAwaitingHistory = false;
+                    }
+                    // A session command's reply (typed /new, /resume, /fork)
+                    // with a sessionAction carries the NEW session id. When
+                    // this pane initiated the change but is now a background
+                    // pane (the user switched away while the reply was in
+                    // flight), still adopt the id and release the old
+                    // session's attachment — the transcript re-derives on
+                    // focus. Refuse to adopt an id another pane already
+                    // holds, and never detach a session another pane still
+                    // has open (that would orphan the other pane's event
+                    // stream).
+                    if (data.sessionAction && data.sessionId && pane.id !== data.sessionId) {
+                        const other = findPaneBySession(data.sessionId);
+                        if (!other || other === pane) {
+                            const oldId = pane.id;
+                            pane.id = data.sessionId;
+                            if (oldId && !findPaneBySession(oldId) && ws && ws.readyState === WebSocket.OPEN) {
+                                ws.send(JSON.stringify({ type: 'session_detach', sessionId: oldId }));
+                            }
+                        }
+                    }
+                    break;
+                case 'history':
+                    // Ignored — the transcript re-derives on focus.
+                    break;
+                case 'delete_approval':
+                    // A background pane's turn needs an approval: surface the
+                    // modal (it pauses input anyway) with the session tagged
+                    // so the response routes correctly.
+                    showDeleteApproval(data);
+                    break;
+                default:
+                    break;
+            }
+            if (pane.turnActive && !pane._notifiedBusy) {
+                pane._notifiedBusy = true;
+                sendNotification('GoGen', `Pane ${pane.label || pane.id || 'session'} is responding.`, 'gogen-pane-busy');
+            } else if (!pane.turnActive) {
+                pane._notifiedBusy = false;
+            }
+            // Re-render the sidebar session rows only when something the
+            // list shows actually changed (label / id / busy state) — stream
+            // chunks for a background pane would otherwise rebuild the list
+            // on every token.
+            if (pane.turnActive !== beforeTurn || pane.label !== beforeLabel || pane.id !== beforeId) {
+                refreshSidebarSessions();
+            }
+        }
+
+        // Make a pane the active/visible one. The transcript is cleared and
+        // re-attached so the server resends the pane's state.
+        function focusPane(key) {
+            if (key === activePaneKey) return;
+            const pane = panes.get(key);
+            if (!pane) return;
+            // Focusing counts as activity: the sidebar shows the focused
+            // pane at the top (most recently used first).
+            movePaneToFront(pane);
+            saveActivePaneState();
+            activePaneKey = key;
+            // clearChat resets module-level DOM state; load the pane's state
+            // AFTER it so the restored flags survive.
+            clearChat();
+            loadActivePaneState();
+            // Mode/thinking/model are per-session; restore the toolbar to
+            // this pane's last-known values.
+            if (pane.mode) updateModeInfo(pane.mode);
+            if (pane.thinkingLevel) renderThinkingChips(pane.thinkingLevel);
+            if (pane.model) updateModelInfo(pane.model);
+            if (sessionInfoDiv) sessionInfoDiv.textContent = pane.id || '';
+            refreshSidebarSessions();
+            if (pane.id && ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'session_attach', sessionId: pane.id }));
+            }
+        }
+
+        // Close a pane: the session is explicitly closed — the server
+        // cancels any in-flight turn and unregisters the runtime (the
+        // session stays saved server-side) — then remove it from the UI.
+        // Reopening it later reloads it from the saved list.
+        function closePane(key) {
+            const pane = panes.get(key);
+            if (!pane) return;
+            if (pane.id && ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'session_close', sessionId: pane.id }));
+            }
+            panes.delete(key);
+            if (activePaneKey === key) {
+                if (panes.size === 0) {
+                    const p = makePane();
+                    activePaneKey = p.key;
+                    clearChat();
+                    loadActivePaneState();
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        pendingSessionResponse = true;
+                        ws.send(JSON.stringify({ type: 'session_new' }));
+                    }
+                } else {
+                    focusPane(panes.keys().next().value);
+                }
+            } else {
+                refreshSidebarSessions();
+            }
+            // The closed session is saved, not deleted: refresh the list so
+            // the closed session's row reappears (and, if the active pane
+            // was closed, the new active pane is marked).
+            requestSessionList();
+        }
+
+        // Open (or focus) a session as the active pane — used by the sidebar
+        // saved-sessions list. The session is attached (loaded from the store
+        // when not currently active) and the transcript re-derives from the
+        // server's attach response.
+        function openSessionPane(id) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                showToast('Not connected', 'error');
+                return;
+            }
+            if (!id) return;
+            if (resendAwaitingHistory) {
+                showToast('Resend already in progress', 'info');
+                return;
+            }
+            const existing = findPaneBySession(id);
+            if (existing) {
+                focusPane(existing.key);
+                return;
+            }
+            saveActivePaneState();
+            const pane = makePane();
+            pane.id = id;
+            activePaneKey = pane.key;
+            // makePane refreshed the sidebar while the id was still unknown.
+            // Refresh again so the new active row is marked "current": the
+            // attach reply's config echo carries the SAME id, so the config
+            // handler would not re-render (id unchanged) and the row would
+            // stay stale until the next pane switch.
+            refreshSidebarSessions();
+            clearChat();
+            loadActivePaneState();
+            if (sessionInfoDiv) sessionInfoDiv.textContent = id;
+            pendingSessionResponse = false;
+            ws.send(JSON.stringify({ type: 'session_attach', sessionId: id }));
+            requestSessionList();
         }
 
         // Collapse only when output is genuinely large (DOM / scroll cost).
@@ -1283,8 +1758,21 @@
                 if (el.textContent !== text) el.textContent = text;
             }
         }
-        setInterval(refreshMessageTimestamps, 30000);
-        document.addEventListener('visibilitychange', refreshMessageTimestamps);
+        // Same staleness class for the sidebar session rows: their relative
+        // times are computed at render time, so re-derive them in place on
+        // the same cadence without re-rendering the list.
+        function refreshSessionRowTimes() {
+            if (document.hidden || !sessionListDiv) return;
+            const now = Date.now();
+            for (const el of sessionListDiv.querySelectorAll('.session-row-time')) {
+                const upd = el.dataset.updated;
+                if (!upd) continue;
+                const text = relativeTime(upd, now);
+                if (el.textContent !== text) el.textContent = text;
+            }
+        }
+        setInterval(() => { refreshMessageTimestamps(); refreshSessionRowTimes(); }, 30000);
+        document.addEventListener('visibilitychange', () => { refreshMessageTimestamps(); refreshSessionRowTimes(); });
 
         function addTimestampToMsg(msgDiv, date) {
             if (msgDiv.querySelector('.message-time')) return; // already added
@@ -1298,7 +1786,9 @@
 
         /** Send a fork request.
          *  For history-replayed messages the server-side message index is used.
-         *  For streaming messages (no histIdx) we pass -1 meaning "last assistant". */
+         *  For streaming messages (no histIdx) we pass -1 meaning "last assistant".
+         *  The fork opens a NEW pane with the fork's history (Phase 5); the
+         *  source session is left untouched. */
         function forkSession(msgIdx) {
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
             if (resendAwaitingHistory) {
@@ -1309,17 +1799,22 @@
                 showToast('Session change already in progress', 'info');
                 return;
             }
-            // Server cancels any in-flight turn to acquire the session lock;
-            // suppress its turn_end so it can't clear our pending flag early.
-            cancelActiveTurn();
-            ws.send(JSON.stringify({ type: 'session_fork', messageIndex: msgIdx }));
+            const srcId = activePane().id;
+            // Open a new pane; the source pane stays open in the background.
+            saveActivePaneState();
+            const pane = makePane();
+            activePaneKey = pane.key;
+            clearChat();
+            loadActivePaneState();
             pendingSessionResponse = true;
+            ws.send(JSON.stringify({ type: 'session_fork', messageIndex: msgIdx, sessionId: srcId }));
         }
 
         function cancelActiveTurn() {
             if (!turnActive || !ws || ws.readyState !== WebSocket.OPEN) return;
+            if (!activePane() || !activePane().id) return;
             suppressTurnEnds++;
-            ws.send(JSON.stringify({ type: 'cancel' }));
+            ws.send(JSON.stringify({ type: 'cancel', sessionId: activePane().id }));
             setTurnActive(false);
             abortInFlightUI(null);
         }
@@ -1342,10 +1837,13 @@
             resendAwaitingHistory = true;
             pendingSessionResponse = true;
             enableFollow();
+            // D3: typed /new and the resend flow REPLACE the pane's session
+            // (the config reply re-keys this pane to the new session id).
+            const sid = activePane().id;
             if (histIdx === 0) {
-                ws.send(JSON.stringify({ type: 'session_new' }));
+                ws.send(JSON.stringify({ type: 'session_new', sessionId: sid }));
             } else {
-                ws.send(JSON.stringify({ type: 'session_fork', messageIndex: histIdx - 1 }));
+                ws.send(JSON.stringify({ type: 'session_fork', messageIndex: histIdx - 1, sessionId: sid }));
             }
         }
 
@@ -1353,6 +1851,8 @@
             if (!resendAwaitingHistory) return;
             const text = pendingResendContent;
             clearPendingResend();
+            // The resent turn streams live in this pane — no convergence refetch needed.
+            if (activePane()) activePane().needsFreshHistory = false;
             if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
             const el = appendMessage('user', text);
             if (el) el.dataset.pendingAck = '1';
@@ -1360,7 +1860,7 @@
             pendingToolCards = {};
             toolsStartedThisTurn = false;
             contextEstAdded = 0;
-            ws.send(JSON.stringify({ type: 'message', content: text }));
+            ws.send(JSON.stringify({ type: 'message', content: text, sessionId: activePane().id }));
             setTurnActive(true);
             enableFollow();
         }
@@ -1883,6 +2383,8 @@
                 if (body) body.classList.toggle('collapsed', collapsed);
                 if (argsStream) argsStream.classList.toggle('collapsed', collapsed);
                 if (monacoHost) monacoHost.style.display = collapsed ? 'none' : 'block';
+                const live = card.querySelector('.tool-live-output');
+                if (live) live.classList.toggle('collapsed', collapsed);
                 // Toggling changes content height below the fold; keep the
                 // scroll system in sync (re-pin if following, refresh the
                 // jump-button if detached).
@@ -1963,6 +2465,52 @@
             return cardInfo;
         }
 
+        // Cap for the live-output region on tool cards: mirrors the server's
+        // tool-result cap (128 KB) so an unbounded `yes`-style command cannot
+        // balloon the transcript DOM. The terminal dock still shows the full
+        // log (its own scrollback cap).
+        const TOOL_CARD_LIVE_OUTPUT_LIMIT = 128 * 1024;
+
+        // Attaches the live-output region to a tool card (once). Shell tools
+        // (execute_command, run_tests, run_lint) stream their stdout/stderr
+        // here as the command runs — the same chunks that feed the terminal
+        // dock — so the chat card shows the output live instead of only the
+        // final tool_result at the end.
+        function ensureToolCardLiveOutput(cardInfo) {
+            if (!cardInfo) return null;
+            if (cardInfo.liveOutput) return cardInfo.liveOutput;
+            const live = document.createElement('div');
+            live.className = 'tool-live-output';
+            // Insert above the "executing..." row so the log reads top-down
+            // with the status line beneath it.
+            const waiting = cardInfo.card.querySelector('.tool-waiting');
+            if (waiting) cardInfo.card.insertBefore(live, waiting);
+            else cardInfo.card.appendChild(live);
+            cardInfo.liveOutput = live;
+            cardInfo.liveOutputText = '';
+            cardInfo.liveOutputTruncated = false;
+            return live;
+        }
+
+        // Appends a chunk of streamed tool output to the card's live region,
+        // capping the accumulated text so a huge command cannot balloon the
+        // transcript (the terminal dock keeps the full log).
+        function appendToolCardLiveOutput(cardInfo, chunk) {
+            if (!cardInfo || !chunk) return;
+            const live = ensureToolCardLiveOutput(cardInfo);
+            if (cardInfo.liveOutputTruncated) return;
+            if (cardInfo.liveOutputText.length + chunk.length > TOOL_CARD_LIVE_OUTPUT_LIMIT) {
+                cardInfo.liveOutputText += '\n… output truncated in card (see terminal tab for the full log)';
+                cardInfo.liveOutputTruncated = true;
+            } else {
+                cardInfo.liveOutputText += chunk;
+            }
+            live.textContent = cardInfo.liveOutputText;
+            // Keep the newest output in view, like a terminal.
+            live.scrollTop = live.scrollHeight;
+            scheduleRepinIfPinned();
+        }
+
         // The chat diff viewer is either a static line-numbered <pre>
         // (default) or a full Monaco editor — a user setting
         // (gogen_chat_diff_viewer). Reads localStorage directly so it works
@@ -1996,7 +2544,6 @@
                 else cardInfo.card.appendChild(host);
             }
             updateDiffFallback(cardInfo.monacoHost, cardInfo.pendingDiff || '');
-            ensurePatchApplyRow(cardInfo);
 
             if (diffViewerMode() === 'tokenizer') {
                 // Static path: the fallback <pre> IS the viewer (line-numbered
@@ -2030,65 +2577,6 @@
                     cardInfo.monacoMounting = null;
                 });
             await cardInfo.monacoMounting;
-        }
-
-        /**
-         * Add an "Apply patch" button to a patch_file tool card. It re-sends
-         * the displayed diff to the server's patch engine (exact match), which
-         * is useful when the agent ran a dry-run or the apply failed. When the
-         * patch is already applied, the server reports the context mismatch.
-         */
-        function ensurePatchApplyRow(cardInfo) {
-            if (!cardInfo || cardInfo.applyRow || !cardInfo.card) return;
-            // Only patch_file cards carry a diff that makes sense to re-apply;
-            // show_diff cards display the current unstaged diff, which is
-            // already in the working tree (re-applying would always fail).
-            if (cardInfo.toolName !== 'patch_file') return;
-            const row = document.createElement('div');
-            row.className = 'patch-apply-row';
-            const btn = document.createElement('button');
-            btn.type = 'button';
-            btn.className = 'patch-apply-btn';
-            btn.textContent = 'Apply patch';
-            btn.title = 'Apply this diff to the working tree (exact match; no-op if already applied)';
-            const status = document.createElement('span');
-            status.className = 'patch-apply-status';
-            row.appendChild(btn);
-            row.appendChild(status);
-            if (cardInfo.monacoHost && cardInfo.monacoHost.nextSibling) {
-                cardInfo.card.insertBefore(row, cardInfo.monacoHost.nextSibling);
-            } else {
-                cardInfo.card.appendChild(row);
-            }
-            cardInfo.applyRow = row;
-            cardInfo.applyBtn = btn;
-            cardInfo.applyStatus = status;
-
-            btn.addEventListener('click', async () => {
-                const diff = cardInfo.pendingDiff || '';
-                if (!diff.trim()) {
-                    status.textContent = 'Diff not ready yet.';
-                    return;
-                }
-                btn.disabled = true;
-                status.textContent = 'Applying…';
-                try {
-                    const data = await applyPatchFromDiff(diff);
-                    if (data.error) {
-                        status.textContent = 'Apply failed.';
-                        showToast(`Apply failed: ${data.error}`, 'error');
-                    } else {
-                        status.textContent = 'Applied.';
-                        showToast('Patch applied', 'success');
-                        refreshGitStatus();
-                    }
-                } catch (err) {
-                    status.textContent = 'Apply failed.';
-                    showToast(`Apply failed: ${err.message}`, 'error');
-                } finally {
-                    btn.disabled = false;
-                }
-            });
         }
 
         function startStreamingToolCard(index, name) {
@@ -2185,7 +2673,7 @@
                 if (name === 'patch_file') {
                     // Ensure the patch (from args) is visible; result is usually a short summary.
                     if (pending) {
-                        await ensurePatchViewer(cardInfo, pending);
+                        ensurePatchViewer(cardInfo, pending).catch(() => {});
                     }
                     if (result) {
                         appendExpandableResult(body, result, success, truncated);
@@ -2200,12 +2688,19 @@
                         body.appendChild(cardInfo.monacoHost);
                     }
                     card.appendChild(body);
-                    await ensurePatchViewer(cardInfo, result || '');
+                    ensurePatchViewer(cardInfo, result || '').catch(() => {});
                 } else if (name === 'read_file') {
                     const path = readFilePathFromArgs(cardInfo.args);
                     appendExpandableResult(body, result, success, truncated, {
                         language: languageFromPath(path),
                     });
+                    card.appendChild(body);
+                } else if (cardInfo.liveOutput && cardInfo.liveOutputText) {
+                    // The output already streamed into the card while the
+                    // command ran; appending the final result again would
+                    // duplicate it. Keep the streamed log as the result body
+                    // (plus a copy affordance / truncation note).
+                    appendStreamedResultBody(body, cardInfo);
                     card.appendChild(body);
                 } else {
                     appendExpandableResult(body, result, success, truncated);
@@ -2215,6 +2710,28 @@
                 // Always re-sync the scroll position after the card update,
                 // even if a viewer mount failed or rejected.
                 smartScroll();
+            }
+        }
+
+        // Builds the result body for a shell tool card whose output already
+        // streamed in live (tool-live-output): the status bar was appended by
+        // the caller, and here we add a copy affordance for the streamed text
+        // plus a truncation note when the card cap was hit (the terminal dock
+        // still holds the full log).
+        function appendStreamedResultBody(body, cardInfo) {
+            const liveText = cardInfo.liveOutputText;
+            const copyBtn = document.createElement('button');
+            copyBtn.className = 'tool-result-copy';
+            copyBtn.textContent = 'Copy';
+            copyBtn.onclick = () => {
+                navigator.clipboard.writeText(liveText).then(() => showToast('Copied', 'success')).catch(() => showToast('Copy failed', 'error'));
+            };
+            body.appendChild(copyBtn);
+            if (cardInfo.liveOutputTruncated) {
+                const note = document.createElement('div');
+                note.className = 'tool-live-truncated';
+                note.textContent = 'Output truncated in card; open the terminal tab for the full log.';
+                body.appendChild(note);
             }
         }
 
@@ -2311,7 +2828,15 @@
                                     cardInfo.waiting.remove();
                                     cardInfo.waiting = null;
                                 }
-                                await ensurePatchViewer(cardInfo, tc.args.diff);
+                                // NOT awaited: the replay loop must stay
+                                // synchronous. ensurePatchViewer renders the
+                                // static fallback immediately and mounts the
+                                // Monaco diff editor in the background; an
+                                // await here would yield to the event loop
+                                // mid-rebuild, letting live stream events and
+                                // other panes' messages interleave with the
+                                // transcript (garbled or "never loads").
+                                ensurePatchViewer(cardInfo, tc.args.diff).catch(() => {});
                             }
                             if (tc.id) pendingToolCards[tc.id] = cardInfo;
                         }
@@ -2329,7 +2854,7 @@
                     }
                     if (id) delete pendingToolCards[id];
                     const success = !String(h.content || '').trim().startsWith('Error:');
-                    await updateToolCardWithResult(cardInfo, h.content || '', success, false, cardInfo.toolName);
+                    updateToolCardWithResult(cardInfo, h.content || '', success, false, cardInfo.toolName);
                 }
             }
             replayInProgress = false;
@@ -2402,6 +2927,18 @@
             } catch (_) {}
         }
 
+        // The strip docks below the chat input bar, so the scroll-to-bottom
+        // button must clear it to hover over the messages area. Publish the
+        // strip's live height as --terminal-strip-h (read by #scroll-bottom-btn
+        // in styles.css). While the chat pane is hidden (editor pane active,
+        // or mobile) the height is 0 and the button returns to its base
+        // offset; a ResizeObserver keeps the variable fresh on pane switches.
+        function terminalRefreshStripVar() {
+            document.documentElement.style.setProperty(
+                '--terminal-strip-h', terminalPanel.offsetHeight + 'px'
+            );
+        }
+
         function terminalIsMobile() {
             return window.matchMedia('(max-width: 767px)').matches;
         }
@@ -2419,6 +2956,9 @@
             // Only fit when the terminal body is actually laid out; hidden or
             // zero-sized containers make xterm report bogus dimensions.
             if (!terminalPanel.classList.contains('expanded')) return;
+            // The strip now lives inside the chat pane; when another pane is
+            // active the panel is display:none and xterm would measure 0.
+            if (!terminalPanel.getClientRects().length) return;
             const t = terminals.get(terminalActiveId);
             if (!t || !t.fit) return;
             try {
@@ -2462,6 +3002,7 @@
             }
             terminalChevron.textContent = expanded ? '▾' : '▴';
             terminalSaveState();
+            terminalRefreshStripVar();
             if (expanded) {
                 terminalFitSoon();
             } else if (terminalIsMobile()) {
@@ -2675,6 +3216,8 @@
             // While the panel is collapsed the terminal has no layout; a resize
             // here would report a bogus 1-row x 2-col size to the shell.
             if (!terminalPanel.classList.contains('expanded')) return;
+            // Same for a panel hidden behind an inactive pane (editor view).
+            if (!terminalPanel.getClientRects().length) return;
             try {
                 const dims = t.fit.proposeDimensions();
                 if (dims && dims.cols > 0 && dims.rows > 0 && ws && ws.readyState === WebSocket.OPEN) {
@@ -2894,6 +3437,7 @@
             );
             terminalHeight = h;
             terminalPanel.style.height = h + 'px';
+            terminalRefreshStripVar();
         });
         document.addEventListener('mouseup', () => {
             if (!termDrag) return;
@@ -2948,6 +3492,12 @@
             terminalEnsureUserTab();
             terminalUpdateHint();
             terminalUpdateBadge();
+            terminalRefreshStripVar();
+            if (typeof ResizeObserver !== 'undefined') {
+                // Keep --terminal-strip-h in sync on any strip resize
+                // (expand/collapse, drag, pane switches hiding/showing it).
+                new ResizeObserver(() => terminalRefreshStripVar()).observe(terminalPanel);
+            }
             const mq = window.matchMedia('(max-width: 767px)');
             const onMQChange = () => {
                 if (mq.matches) {
@@ -2964,6 +3514,7 @@
                         terminalPanel.style.height = terminalHeight + 'px';
                     }
                 }
+                terminalRefreshStripVar();
                 terminalFitSoon();
             };
             if (typeof mq.addEventListener === 'function') mq.addEventListener('change', onMQChange);
@@ -2976,6 +3527,7 @@
                     terminalHeight = Math.min(terminalHeight, terminalMaxHeight());
                     terminalPanel.style.height = terminalHeight + 'px';
                 }
+                terminalRefreshStripVar();
                 terminalFitSoon();
             });
         }
@@ -2998,7 +3550,6 @@
         function connect() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
-            setWebSocket(ws);
 
             ws.onopen = () => {
                 clearTimeout(reconnectTimer);
@@ -3019,6 +3570,44 @@
                     || ((fn) => setTimeout(fn, 200));
                 scheduleModels(() => ensureModelsLoaded());
 
+                // Re-attach every open pane (Phase 5): the server resends
+                // session_state + history + config + context per pane. The
+                // active pane's transcript rebuilds from its attach response;
+                // background panes just re-register (their transcript
+                // re-derives when focused). Panes with no session yet (first
+                // load) get their state from the connect handshake.
+                //
+                // The server re-points its per-connection "current pane" at
+                // EVERY attach, so the ACTIVE pane is attached LAST:
+                // otherwise the pointer would land on the last-inserted pane
+                // and messages typed in the active pane would route to the
+                // wrong session until the next attach.
+                const activeP = activePane();
+                for (const pane of panes.values()) {
+                    if (pane.id && pane !== activeP) {
+                        ws.send(JSON.stringify({ type: 'session_attach', sessionId: pane.id }));
+                    }
+                }
+                if (activeP && activeP.id) {
+                    ws.send(JSON.stringify({ type: 'session_attach', sessionId: activeP.id }));
+                }
+                // Panes whose session creation never completed before the
+                // disconnect have no id yet: re-issue session_new so they
+                // get a real session instead of sitting at "creating…"
+                // forever (or being adopted onto the handshake's default
+                // session). Only on a RECONNECT — on first load the initial
+                // pane (also id-less) must adopt the server's default session
+                // from the connect handshake, not create a fresh one.
+                if (wasDisconnected) {
+                    for (const pane of panes.values()) {
+                        if (!pane.id) {
+                            pane.pendingSessionResponse = true;
+                            if (pane === activeP) pendingSessionResponse = true;
+                            ws.send(JSON.stringify({ type: 'session_new' }));
+                        }
+                    }
+                }
+
                 // Notify on reconnection after a disconnect
                 if (wasDisconnected) {
                     wasDisconnected = false;
@@ -3034,8 +3623,19 @@
                     console.error('Failed to parse server message:', err, 'raw:', event.data.slice(0, 200));
                     return;
                 }
-                if (handleServerMessage(data)) return;
-
+                // Editor responses (requestId-keyed) arrive on the separate
+                // /ws/editor socket handled by editor.js; the chat socket
+                // only ever carries chat/session/terminal messages.
+                // Multi-pane routing: connection-scoped messages (no
+                // sessionId) and messages for the active pane run the normal
+                // handler below; background-pane messages update that pane's
+                // state only (the transcript re-derives when focused).
+                const msgPane = paneForMessage(data);
+                if (!msgPane) return; // stale message for a closed session
+                if (msgPane !== activePane()) {
+                    handleBackgroundMessage(msgPane, data);
+                    return;
+                }
                 if (data.type === 'compacting') {
                     // Auto-compaction inside a normal turn (or the manual
                     // /compact command): keep a live indicator until the next
@@ -3117,13 +3717,31 @@
                     }
                 } else if (data.type === 'term_opened') {
                     terminalOpen(data.termId, data.tool || '', data.content || '');
+                    // Mirror the command echo into the pending tool card so
+                    // shell output streams into the chat, not just the
+                    // (collapsed-by-default) terminal dock.
+                    const cardInfo = pendingToolCards[data.termId];
+                    if (cardInfo && data.content) {
+                        // Echo the command like the terminal tab does, on its
+                        // own line ("$ ..." then the streaming output).
+                        appendToolCardLiveOutput(cardInfo, data.content + '\n');
+                    }
                 } else if (data.type === 'term_output') {
                     terminalWrite(data.termId, data.content || '');
+                    const cardInfo = pendingToolCards[data.termId];
+                    if (cardInfo) {
+                        appendToolCardLiveOutput(cardInfo, data.content || '');
+                    }
                 } else if (data.type === 'term_exit') {
                     // Success is omitted when false, so only an explicit true
                     // marks the tab as ok; anything else is a failure.
                     terminalExit(data.termId, data.success === true);
                     terminalFitSoon();
+                    const cardInfo = pendingToolCards[data.termId];
+                    if (cardInfo && cardInfo.liveOutput) {
+                        cardInfo.liveOutput.classList.add('done');
+                        cardInfo.liveOutput.classList.add(data.success === true ? 'success' : 'error');
+                    }
                 } else if (data.type === 'user_term_opened') {
                     terminalUserOpened(data.content || 'shell', data.workingDir || '');
                 } else if (data.type === 'user_term_output') {
@@ -3137,6 +3755,7 @@
                     abortInFlightUI(data.content || 'Cancelled.');
                     setTurnActive(false);
                     setInputProgress(null);
+                    refreshSidebarSessions();
                 } else if (data.type === 'turn_end') {
                     // Ignore turn_end from a turn we cancelled to start a resend/send.
                     // Otherwise it clears pendingSessionResponse / turnActive mid-flow.
@@ -3144,13 +3763,52 @@
                         suppressTurnEnds--;
                         return;
                     }
+                    // A turn we deliberately left behind when resuming another
+                    // session: the old session keeps running headless (resume
+                    // does not cancel it), so its turn_end must not clear the
+                    // pending flag or block the resumed session's convergence.
+                    // (Before the reply re-keys the pane, the old session is
+                    // still this pane's id; after the re-key, paneForMessage
+                    // drops the old id entirely.)
+                    const pane = activePane();
+                    if (pane && pane.ignoreTurnEndsFor && data.sessionId === pane.ignoreTurnEndsFor) {
+                        pane.ignoreTurnEndsFor = null;
+                        return;
+                    }
                     setTurnActive(false);
                     updateTitle('idle');
                     setInputProgress(null);
                     pendingSessionResponse = false;
+                    // Defect C: a pane attached mid-turn never received the
+                    // in-flight reply (assistant messages are appended only
+                    // when a round completes). Now that the turn is done the
+                    // full history is available — re-attach once so the
+                    // transcript converges.
+                    const tp = pane;
+                    if (tp && tp.needsFreshHistory) {
+                        tp.needsFreshHistory = false;
+                        if (tp.id && ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({ type: 'session_attach', sessionId: tp.id }));
+                        }
+                    }
+                    refreshSidebarSessions();
+                    // The turn just finished: fetch a fresh sessions payload
+                    // instead of re-rendering the cached one, so the sidebar's
+                    // saved-section order and per-row relative times reflect
+                    // the completed turn's new Updated timestamp (the cache is
+                    // only refreshed on explicit list_sessions round-trips).
+                    requestSessionList();
                 } else if (data.type === 'clear_chat') {
                     clearChat();
-                    pendingSessionResponse = true;
+                    // Do NOT re-arm pendingSessionResponse here: the response
+                    // handler already re-keyed the pane to the new session id
+                    // and cleared the flag, so the follow-up history/config
+                    // route by session id without the fallback. Re-arming left
+                    // the flag stuck true until the next turn_end / reconnect,
+                    // which permanently blocked resumeSession()/deleteSession()
+                    // ("Session change already in progress") and made
+                    // paneForMessage route stale messages to the active pane
+                    // (which then wrongly re-keyed it).
                 } else if (data.type === 'user_acked') {
                     // Server assigned the Messages index for the user turn just started.
                     // Index is in content so 0 is not dropped by JSON omitempty.
@@ -3163,15 +3821,160 @@
                         ensureUserResendActions(el);
                     }
                 } else if (data.type === 'sessions') {
-                    finalizeThinking();
-                    endStream();
                     // Structured list only — never dump slash help text into chat.
+                    // Deliberately do NOT finalize/endStream here: the sessions
+                    // payload is sidebar metadata that can arrive while the
+                    // active pane's turn is still streaming (e.g. closing a
+                    // background pane's ✕ calls requestSessionList mid-turn).
+                    // Finalizing would split the in-flight reply into a second
+                    // assistant bubble and stamp a fork button on a partial one.
                     renderSessionList(data.sessions || []);
-                    if (data.sessionId) sessionInfoDiv.textContent = data.sessionId;
                     if (data.contextLimit || data.usedTokens) { updateContextInfo(data); }
+                } else if (data.type === 'session_state') {
+                    // Attach reply: tells us whether a headless turn is
+                    // running so we can render "resuming…". It also carries
+                    // the session id: adopt it when the pane does not have
+                    // one yet, so the pane is usable immediately (routing,
+                    // send guard, sidebar "open" row) even while a running
+                    // turn keeps the config echo — which normally adopts the
+                    // id — pending until the turn ends.
+                    const pane = activePane();
+                    if (data.sessionId && pane.id === null) {
+                        pane.id = data.sessionId;
+                    }
+                    pane.turnActive = !!data.turnActive;
+                    setTurnActive(pane.turnActive, { silent: true });
+                    if (pane.turnActive) {
+                        setInputProgress('thinking', 'Resuming\u2026');
+                        // Attached to a running turn: the history snapshot
+                        // cannot contain the in-flight reply, so latch the
+                        // turn-end refetch that converges the transcript.
+                        pane.needsFreshHistory = true;
+                    } else {
+                        // Idle attach: the history snapshot is complete — no
+                        // convergence refetch needed. Also clears a latch
+                        // left over from an earlier busy attach whose turn_end
+                        // was already consumed (e.g. focus after the turn
+                        // ended).
+                        pane.needsFreshHistory = false;
+                    }
+                    // Reflect the busy/resuming state in the sidebar session
+                    // row (same staleness class: the row shows turn state).
+                    refreshSidebarSessions();
+                } else if (data.type === 'session_removed') {
+                    // The session no longer exists (deleted elsewhere, or an
+                    // attach failed after a restart with pruning). Close its
+                    // pane. For the ACTIVE pane: when THIS connection
+                    // initiated the delete, the server re-keys the pane via
+                    // the follow-up config (pendingSessionResponse is set);
+                    // when ANOTHER connection deleted it, no follow-up comes
+                    // — start a fresh session so the pane is not orphaned on
+                    // a deleted runtime (messages would route to a stale
+                    // agent and silently re-persist the deleted file).
+                    const pane = findPaneBySession(data.sessionId);
+                    if (pane === activePane() && !pendingSessionResponse) {
+                        // Drop the stale pane FIRST (mirrors session_detached):
+                        // leaving it in the map rendered a ghost sidebar row for
+                        // the deleted session, and clicking it re-attached the
+                        // deleted id — the server replied session_removed again,
+                        // spawning another fresh session (and another ghost) per
+                        // click. Its state is discarded with the session, so no
+                        // saveActivePaneState is needed.
+                        panes.delete(pane.key);
+                        const p = makePane();
+                        activePaneKey = p.key;
+                        clearChat();
+                        loadActivePaneState();
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            pendingSessionResponse = true;
+                            ws.send(JSON.stringify({ type: 'session_new' }));
+                        }
+                    } else if (pane && pane !== activePane()) {
+                        panes.delete(pane.key);
+                        refreshSidebarSessions();
+                    }
+                    requestSessionList();
+                } else if (data.type === 'session_detached') {
+                    // The runtime is gone: the registry evicted this session
+                    // (web_max_active_sessions cap, E11), or it was
+                    // explicitly closed (session_close) while this tab raced
+                    // to attach. It is saved, not deleted: close the pane
+                    // like a removal — the session stays in the saved-
+                    // sessions list and can be reopened (re-attach reloads
+                    // it from the store). Closing avoids sending messages to
+                    // a runtime that is no longer registered.
+                    const pane = findPaneBySession(data.sessionId);
+                    if (pane) {
+                        panes.delete(pane.key);
+                        if (activePaneKey === pane.key) {
+                            if (panes.size === 0) {
+                                const p = makePane();
+                                activePaneKey = p.key;
+                                clearChat();
+                                loadActivePaneState();
+                                if (ws && ws.readyState === WebSocket.OPEN) {
+                                    pendingSessionResponse = true;
+                                    ws.send(JSON.stringify({ type: 'session_new' }));
+                                }
+                            } else {
+                                focusPane(panes.keys().next().value);
+                            }
+                        } else {
+                            refreshSidebarSessions();
+                        }
+                    }
+                    requestSessionList();
                 } else if (data.type === 'response') {
                     finalizeThinking();
                     endStream();
+                    // A session command (typed /new, /resume, /fork, resend)
+                    // replies with the NEW session id on the response message
+                    // — the first message of the change, before clear_chat/
+                    // history/config arrive. Adopt it here so those follow-up
+                    // messages route to this pane (its id is otherwise still
+                    // the old session, and paneForMessage would drop them).
+                    // Sidebar-new and resend already set pendingSessionResponse
+                    // and go through this same path.
+                    const rp = activePane();
+                    let rekeySkipped = false;
+                    if (rp && data.sessionId && rp.id !== data.sessionId) {
+                        // A session change (typed /new, /resume, /fork,
+                        // resend, delete-of-current) is the only legitimate
+                        // reason to adopt a different id here — every such
+                        // reply carries a sessionAction. A plain response
+                        // with a different id (e.g. a delete whose reply was
+                        // tagged with a stale server-side pane) must not
+                        // hijack this pane onto another session. Also refuse
+                        // to adopt an id another pane already holds (e.g.
+                        // "resume latest" resolving to a session open
+                        // elsewhere): that would create a duplicate pane for
+                        // one session and desync one of the two.
+                        const other = findPaneBySession(data.sessionId);
+                        if ((rp.id === null || data.sessionAction) && (!other || other === rp)) {
+                            const oldId = rp.id;
+                            rp.id = data.sessionId;
+                            refreshSidebarSessions();
+                            // Release the old session's attachment only when
+                            // no other pane still has it open: detaching a
+                            // session a background pane still shows would
+                            // orphan that pane's event stream.
+                            if (oldId && !findPaneBySession(oldId) && ws && ws.readyState === WebSocket.OPEN) {
+                                ws.send(JSON.stringify({ type: 'session_detach', sessionId: oldId }));
+                            }
+                        } else {
+                            rekeySkipped = true;
+                        }
+                    }
+                    // Whether the change succeeded or failed, the pane is (or
+                    // stays) on a known session: from here its own turn_end
+                    // must be processed normally. (On success the old
+                    // session's id no longer routes here; on failure it is
+                    // still this pane's session and its turn_end matters.)
+                    // needsFreshHistory is deliberately NOT reset here — the
+                    // session_state sent before the reply owns the latch, and
+                    // a resumed session may be mid-turn and needs the
+                    // turn-end convergence refetch.
+                    rp.ignoreTurnEndsFor = null;
                     if (compacting) {
                         // Terminal event for the manual /compact command:
                         // clear the persistent indicator and surface the
@@ -3189,10 +3992,17 @@
                     } else if (pendingSessionResponse) {
                         pendingSessionResponse = false;
                         nearCompactDismissed = false; // new session: allow the banner again
-                        if (data.sessionId) sessionInfoDiv.textContent = data.sessionId;
+                        // Only track the session id when the pane actually
+                        // adopted it (a skipped re-key keeps the old id).
+                        if (data.sessionId && rp.id === data.sessionId) sessionInfoDiv.textContent = data.sessionId;
                         updateContextInfo(data);
                         const msg = (data.content || '').split('\n')[0] || 'Session updated';
-                        if (String(data.content || '').startsWith('Error:')) {
+                        if (rekeySkipped) {
+                            // The reply named a session another pane already
+                            // owns: this pane stays on its current session.
+                            showToast('Session already open in another pane', 'info');
+                            requestSessionList();
+                        } else if (String(data.content || '').startsWith('Error:')) {
                             clearPendingResend();
                             showToast(data.content, 'error');
                             appendMessage('system', data.content);
@@ -3227,38 +4037,113 @@
                     }
                 } else if (data.type === 'history') {
                     // Full snapshot — replace the pane so reconnect / session
-                    // restore never stacks duplicate transcripts.
-                    clearChat();
-                    const afterHistory = () => {
-                        if (resendAwaitingHistory) flushPendingResend();
-                    };
-                    if (data.history && data.history.length) {
-                        replayHistory(data.history).then(afterHistory).catch((err) => {
-                            console.warn('history replay failed', err);
-                            // Ensure the replay scroll-suppression flag is off
-                            // so the fallback re-append below scrolls normally.
-                            replayInProgress = false;
-                            disarmReplayWatchdog();
-                            flushDeferredResultColorize();
-                            for (const h of data.history) {
-                                if (h.role === 'user' || h.role === 'assistant') {
-                                    if (h.content) {
-                                        appendMessageAtTime(
-                                            h.role,
-                                            h.content,
-                                            h.createdAt ? new Date(h.createdAt) : new Date(),
-                                            h.index
-                                        );
+                    // restore never stacks duplicate transcripts. One guard:
+                    // the turn_end convergence refetch (Defect C) can race a
+                    // new turn the user started at the boundary — its snapshot
+                    // is OLDER than the live transcript, so skip the rebuild
+                    // (a fresh attach latches needsFreshHistory via its
+                    // session_state first; a stale refetch does not).
+                    const histPane = activePane();
+                    if (histPane.needsFreshHistory || !turnActive) {
+                        // Mid-turn attach: the snapshot is INCOMPLETE — it
+                        // lacks the in-flight reply — and live events for
+                        // that reply may already be rendering. The attach's
+                        // history is sent from an async goroutine after a
+                        // deep-cloned snapshot (SnapshotMessages under
+                        // statsMu); for a large session it can arrive AFTER
+                        // the first stream batches, so the DOM already shows
+                        // the reply's beginning. Rebuilding from the
+                        // snapshot would WIPE that visible reply — the turn
+                        // seems to stop until the turn_end refetch. Keep the
+                        // live content instead; the turn_end convergence
+                        // refetch paints the full transcript.
+                        if (histPane.needsFreshHistory
+                            && (currentStreamDiv
+                                || currentThinkingDiv
+                                || Object.keys(streamingToolCards).length > 0)) {
+                            return;
+                        }
+                        clearChat();
+                        const afterHistory = () => {
+                            // A headless turn may be running (session_state said
+                            // turnActive): restore the busy indicator now that the
+                            // transcript is rebuilt (clearChat reset it).
+                            const pane = activePane();
+                            if (pane && pane.turnActive) {
+                                setTurnActive(true, { silent: true });
+                                setInputProgress('thinking', 'Resuming\u2026');
+                            }
+                            // NOTE: the resend message is flushed from the config
+                            // handler, which adopts the new session id first (the
+                            // server sends history before config).
+                        };
+                        if (data.history && data.history.length) {
+                            replayHistory(data.history).then(afterHistory).catch((err) => {
+                                console.warn('history replay failed', err);
+                                // Ensure the replay scroll-suppression flag is off
+                                // so the fallback re-append below scrolls normally.
+                                replayInProgress = false;
+                                disarmReplayWatchdog();
+                                flushDeferredResultColorize();
+                                for (const h of data.history) {
+                                    if (h.role === 'user' || h.role === 'assistant') {
+                                        if (h.content) {
+                                            appendMessageAtTime(
+                                                h.role,
+                                                h.content,
+                                                h.createdAt ? new Date(h.createdAt) : new Date(),
+                                                h.index
+                                            );
+                                        }
                                     }
                                 }
-                            }
+                                afterHistory();
+                            });
+                        } else {
                             afterHistory();
-                        });
-                    } else {
-                        afterHistory();
+                        }
                     }
                 } else if (data.type === 'config') {
+                    // The pane's session identity may have changed (new /
+                    // resume / fork / attach): adopt the new id and keep the
+                    // per-session toolbar mirrors current.
+                    const pane = activePane();
+                    const oldId = pane.id;
+                    if (data.sessionId && pane.id !== data.sessionId) {
+                        // Re-key ONLY when the pane has no id yet (startup /
+                        // fresh pane) or a session change is genuinely in
+                        // flight (typed /new, /resume, /fork, resend). A
+                        // stale full config from a pane we left/closed (its
+                        // ContextStats tokenization lags a running turn) must
+                        // not flip the active pane's id — paneForMessage
+                        // would then drop every message for the session the
+                        // user switched to ("can't switch to the responding
+                        // session").
+                        if (pane.id === null || pendingSessionResponse) {
+                            pane.id = data.sessionId;
+                            pane.needsFreshHistory = false; // new session: no mid-turn gap from the old one
+                            refreshSidebarSessions();
+                            // The pane's session changed (typed /new, /resume,
+                            // fork, resend): release the old session's
+                            // attachment — the server keeps panes attached
+                            // until explicitly detached, and the old session
+                            // is no longer open. Only when no other pane
+                            // still has the old session open (detaching it
+                            // would orphan that pane's event stream).
+                            if (oldId && !findPaneBySession(oldId) && ws && ws.readyState === WebSocket.OPEN) {
+                                ws.send(JSON.stringify({ type: 'session_detach', sessionId: oldId }));
+                            }
+                        }
+                    }
+                    pane.mode = data.mode || pane.mode;
+                    pane.thinkingLevel = data.thinkingLevel || pane.thinkingLevel;
+                    pane.model = data.model || pane.model;
+                    if (data.sessionLabel) pane.label = data.sessionLabel;
                     applyServerConfig(data);
+                    // The resend message must carry the (possibly new) session
+                    // id, which config just adopted — flushing from history
+                    // would use the stale pre-fork id.
+                    if (resendAwaitingHistory) flushPendingResend();
                 } else if (data.type === 'context') {
                     updateContextInfo(data);
                     updateCurrentSessionLabel(data.sessionLabel);
@@ -3277,6 +4162,22 @@
                 pendingSessionResponse = false;
                 compacting = false;
                 setTurnActive(false);
+                // Reset per-pane in-flight state; the re-attach on reconnect
+                // re-syncs each pane from the server (session_state).
+                for (const pane of panes.values()) {
+                    pane.turnActive = false;
+                    pane.needsFreshHistory = false;
+                    // A resume that never completed (connection dropped
+                    // before the reply) must not leave a stale ignore flag:
+                    // after reconnect this pane's own turn_end must count.
+                    pane.ignoreTurnEndsFor = null;
+                    pane.suppressTurnEnds = 0;
+                    pane.pendingSessionResponse = false;
+                    pane.pendingResendContent = null;
+                    pane.resendAwaitingHistory = false;
+                    pane.compacting = false;
+                    pane._notifiedBusy = false;
+                }
                 terminalInterruptAll();
                 setInputProgress(null);
                 clearTimeout(reconnectTimer);
@@ -3293,28 +4194,68 @@
                 appendMessage('system', 'Not connected — wait for reconnection.');
                 return;
             }
+            if (!activePane() || !activePane().id) {
+                showToast('Session not ready yet — try again in a moment', 'info');
+                return;
+            }
             if (resendAwaitingHistory) {
                 showToast('Resend already in progress', 'info');
                 return;
             }
+            // A typed /resume of a session already open in another pane
+            // would create a duplicate pane for one session (the re-key
+            // reply and the follow-up detach would desync one of the two
+            // panes). Block it like the sidebar does (openSessionPane
+            // focuses the existing pane). "resume del" targets a session
+            // for deletion and "resume latest" resolves server-side, so
+            // both pass through.
+            if (/^\/resume(?:\s|$)/.test(text.trim())) {
+                const target = text.trim().replace(/^\/resume\s+/, '').trim();
+                if (target && target !== 'del' && !target.startsWith('del ')) {
+                    const other = findPaneBySession(target);
+                    if (other && other !== activePane()) {
+                        inputArea.value = '';
+                        showToast('Session already open in another pane — switched to it', 'info');
+                        focusPane(other.key);
+                        return;
+                    }
+                }
+            }
             // Sending while busy cancels the current turn (same as TUI interrupt + new prompt).
             cancelActiveTurn();
+            // A turn started from the focused pane is fully live-rendered —
+            // no turn_end convergence refetch needed.
+            if (activePane()) activePane().needsFreshHistory = false;
             hideSlashSuggest();
             enableFollow();
+            // Typed session commands (/new, /resume, /fork) re-key the pane:
+            // mark the change in flight so the response handler treats the
+            // reply as a session change (toast + list refresh) instead of an
+            // assistant message, matching the sidebar flow.
+            if (/^\/(new|resume|fork)(\s|$)/.test(text.trim())) {
+                pendingSessionResponse = true;
+                // These commands re-key this pane away from its current
+                // session; the old session's turn (if running) keeps going
+                // headless, so ignore its turn_end — it must not clear the
+                // pending flag mid-change (mirrors resumeSession).
+                const p = activePane();
+                if (p && p.id) p.ignoreTurnEndsFor = p.id;
+            }
             const el = appendMessage('user', text);
             if (el) el.dataset.pendingAck = '1';
             streamingToolCards = {};
             pendingToolCards = {};
             toolsStartedThisTurn = false;
             contextEstAdded = 0;
-            ws.send(JSON.stringify({ type: 'message', content: text }));
+            ws.send(JSON.stringify({ type: 'message', content: text, sessionId: activePane().id }));
             inputArea.value = '';
         };
 
         cancelBtn.onclick = () => {
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
             if (!turnActive) return;
-            ws.send(JSON.stringify({ type: 'cancel' }));
+            if (!activePane() || !activePane().id) return;
+            ws.send(JSON.stringify({ type: 'cancel', sessionId: activePane().id }));
             // Tear down immediately; server also emits cancelled + turn_end.
             abortInFlightUI(null);
             setTurnActive(false);
@@ -3380,13 +4321,19 @@
         };
 
         setDirBtn.onclick = () => {
+            if (!isGlobalMode) {
+                showToast('Working directory can only be changed in global mode', 'error');
+                return;
+            }
             const dir = dirInput.value;
             if (!dir) return;
             if (!ws || ws.readyState !== WebSocket.OPEN) {
                 showToast('Not connected', 'error');
                 return;
             }
-            ws.send(JSON.stringify({ type: 'config', workingDir: dir }));
+            // The working dir is workspace-global; the sessionId scopes the
+            // cancel-then-lock to the requesting pane.
+            ws.send(JSON.stringify({ type: 'config', workingDir: dir, sessionId: activePane().id }));
             showToast('Working directory updated', 'success');
             setTimeout(() => requestSessionList(), 100);
         };
@@ -3398,69 +4345,211 @@
 
         function renderSessionList(sessions) {
             if (!sessionListDiv) return;
+            // Cache the payload so pane-state changes (focus, busy, label)
+            // can re-render the list without a server round-trip.
+            lastSessions = sessions || [];
             sessionListDiv.innerHTML = '';
-            if (!sessions || !sessions.length) {
+            const list = lastSessions;
+            // One unified list: open panes (client state) plus the server's
+            // saved-session payload. Open panes are merged in FIRST so an
+            // open session's row ALWAYS exists — even before the server's
+            // store lists it (fresh session, list lag) — and shows the LIVE
+            // pane label (kept current by config/context echoes). Open
+            // panes render most-recently-used first (movePaneToFront keeps
+            // the map in that order), then saved sessions in server order.
+            const act = activePane();
+            const rows = [];
+            const openIds = new Set();
+            for (const pane of panes.values()) {
+                const entry = pane.id ? (list.find((s) => s.id === pane.id) || null) : null;
+                if (pane.id) openIds.add(pane.id);
+                rows.push({ pane, entry });
+            }
+            for (const s of list) {
+                if (!openIds.has(s.id)) rows.push({ pane: null, entry: s });
+            }
+            if (!rows.length) {
                 const empty = document.createElement('div');
                 empty.className = 'session-list-empty';
-                empty.textContent = 'No saved sessions';
+                empty.textContent = 'No sessions';
                 sessionListDiv.appendChild(empty);
                 return;
             }
-            for (const s of sessions) {
+            for (const r of rows) {
+                const pane = r.pane;
+                const entry = r.entry;
+                const s = entry || {
+                    id: pane ? pane.id : '',
+                    label: pane ? pane.label : '',
+                    messageCount: null,
+                    active: true,
+                    updatedAt: '',
+                };
+                const isActivePane = !!pane && pane === act;
+                // A fresh session has an id but no label yet — show the
+                // "New session" placeholder as its title until the first
+                // turn derives a real label. The raw id stays available in
+                // the row tooltip and in dataset.sessionId (delete/attach).
+                const paneTitle = pane ? (pane.label || (entry && entry.label) || '') : '';
+                const label = pane
+                    ? (paneTitle || 'New session…')
+                    : (s.label || s.id || '(unknown)');
                 const row = document.createElement('div');
-                row.className = 'session-row' + (s.current ? ' current' : '');
-                row.title = s.label || s.id;
+                row.className = 'session-row' + (isActivePane ? ' current' : '') + (pane && pane.turnActive ? ' busy' : '');
+                row.dataset.sessionId = pane ? pane.id : (entry ? entry.id : '');
+                row.title = !paneTitle && pane && pane.id ? `${label} (${pane.id})` : label;
                 const content = document.createElement('div');
                 content.className = 'session-row-content';
                 const title = document.createElement('div');
                 title.className = 'session-row-title';
-                title.textContent = s.label || s.id || '(unknown)';
+                title.textContent = label;
                 const meta = document.createElement('div');
                 meta.className = 'session-row-meta';
-                const parts = [];
-                if (s.messageCount != null) parts.push(`${s.messageCount} msgs`);
+                const frags = [];
+                if (entry && entry.messageCount != null) frags.push(`${entry.messageCount} msgs`);
+                // Every pane state gets a uniform colored-dot indicator: the
+                // dot carries the state color and the label stays muted.
+                //   active              → green   (this pane is focused)
+                //   responding          → amber   (a turn is running)
+                //   creating…           → gray    (session id not assigned yet)
+                //   open                → blue    (background pane in this tab)
+                //   resume to continue  → violet  (live elsewhere / headless)
+                let stateLabel = '';
+                let stateClass = '';
+                if (pane && pane.turnActive) {
+                    stateLabel = 'responding';
+                    stateClass = 'amber';
+                } else if (pane && !pane.id) {
+                    stateLabel = 'creating…';
+                    stateClass = 'gray';
+                } else if (isActivePane) {
+                    stateLabel = 'active';
+                    stateClass = 'green';
+                } else if (pane && pane.id) {
+                    // Open as a background pane in this tab — clicking the
+                    // row focuses it.
+                    stateLabel = 'open';
+                    stateClass = 'blue';
+                } else if (s.active) {
+                    // Live in-memory runtime elsewhere (another tab, or a
+                    // headless turn running): reopening attaches to it.
+                    stateLabel = 'resume to continue';
+                    stateClass = 'violet';
+                }
+                if (stateLabel) {
+                    const group = document.createElement('span');
+                    group.className = 'session-state';
+                    const dot = document.createElement('span');
+                    dot.className = 'session-state-dot ' + stateClass;
+                    dot.title = stateLabel;
+                    dot.setAttribute('aria-label', stateLabel);
+                    const label = document.createElement('span');
+                    label.className = 'session-state-label';
+                    label.textContent = stateLabel;
+                    group.appendChild(dot);
+                    group.appendChild(label);
+                    frags.push(group);
+                }
                 const rel = relativeTime(s.updatedAt);
-                if (rel) parts.push(rel);
-                if (s.current) parts.push('current');
-                meta.textContent = parts.join(' · ');
+                if (rel) {
+                    // Tag the relative time so the 30s tick can refresh it in
+                    // place (session rows are otherwise re-rendered only on
+                    // pane-state changes or new sessions payloads, leaving the
+                    // "3m ago" labels to go stale).
+                    const t = document.createElement('span');
+                    t.className = 'session-row-time';
+                    t.dataset.updated = s.updatedAt || '';
+                    t.textContent = rel;
+                    frags.push(t);
+                }
+                for (let i = 0; i < frags.length; i++) {
+                    if (i > 0) meta.appendChild(document.createTextNode(' · '));
+                    if (typeof frags[i] === 'string') {
+                        meta.appendChild(document.createTextNode(frags[i]));
+                    } else {
+                        meta.appendChild(frags[i]);
+                    }
+                }
                 content.appendChild(title);
                 content.appendChild(meta);
                 content.onclick = () => {
-                    if (s.current) {
-                        showToast('Already on this session', 'info');
-                        return;
+                    if (pane) {
+                        // Open pane rows focus the pane (no-op when already
+                        // active).
+                        focusPane(pane.key);
+                    } else {
+                        // Saved rows attach the session as a new pane.
+                        openSessionPane(s.id);
                     }
-                    resumeSession(s.id);
                 };
                 row.appendChild(content);
-                // Delete button (hidden by default, shown on row hover)
-                const delBtn = document.createElement('button');
-                delBtn.className = 'session-row-del';
-                delBtn.textContent = '✕';
-                delBtn.title = 'Delete this session';
-                delBtn.onclick = (e) => {
-                    e.stopPropagation();
-                    deleteSession(s.id, s.label);
-                };
-                row.appendChild(delBtn);
+                // Close/delete button (hidden by default, shown on row
+                // hover): an OPEN session's ✕ closes the pane — the session
+                // is detached (it stays saved and its row reappears as a
+                // saved session); a saved session's ✕ deletes it.
+                const closeBtn = document.createElement('button');
+                closeBtn.className = 'session-row-del';
+                closeBtn.textContent = '✕';
+                if (pane) {
+                    closeBtn.title = 'Close session (stays saved)';
+                    closeBtn.onclick = (e) => {
+                        e.stopPropagation();
+                        closePane(pane.key);
+                    };
+                } else {
+                    closeBtn.title = 'Delete this session';
+                    closeBtn.onclick = (e) => {
+                        e.stopPropagation();
+                        deleteSession(s.id, s.label);
+                    };
+                }
+                row.appendChild(closeBtn);
                 sessionListDiv.appendChild(row);
             }
         }
 
         /**
-         * Update the current session row's title in the sidebar without
-         * re-rendering the entire list.
+         * Update the current session's row title in the sidebar without
+         * re-rendering the entire list. The current session lives in the
+         * unified session list (the active pane's row).
          */
         function updateCurrentSessionLabel(label) {
             if (!label || !sessionListDiv) return;
-            const currentRow = sessionListDiv.querySelector('.session-row.current');
-            if (!currentRow) return;
-            const titleEl = currentRow.querySelector('.session-row-title');
-            if (!titleEl) return;
+            const pane = activePane();
+            if (pane) pane.label = label;
+            if (!pane || !pane.id) return;
+            // Keep the cached server entry in sync so a later re-render
+            // keeps the new label even before the server echoes it.
+            if (lastSessions) {
+                const entry = lastSessions.find((s) => s.id === pane.id);
+                if (entry) entry.label = label;
+            }
+            const row = findSessionRow(pane.id);
+            if (!row) return;
+            const titleEl = row.querySelector('.session-row-title');
             if (titleEl.textContent === label) return; // already up-to-date
             titleEl.textContent = label;
-            // Also update the row's tooltip with the label.
-            currentRow.title = label;
+            row.title = label;
+        }
+
+        function findSessionRow(id) {
+            if (!sessionListDiv || !id) return null;
+            for (const row of sessionListDiv.querySelectorAll('.session-row')) {
+                if (row.dataset.sessionId === id) return row;
+            }
+            return null;
+        }
+
+        // Re-render the sidebar session list from the cached payload. Used
+        // when pane state the list shows (focus, busy/responding, label)
+        // changes without a server round-trip; falls back to asking the
+        // server when no payload has arrived yet.
+        function refreshSidebarSessions() {
+            if (lastSessions) {
+                renderSessionList(lastSessions);
+            } else {
+                requestSessionList();
+            }
         }
 
         function newSession() {
@@ -3473,12 +4562,21 @@
                 return;
             }
             if (pendingSessionResponse) {
+                // Two session changes on one connection would interleave:
+                // both replies land in this pane and their clear_chat/
+                // history/config follow-ups can repaint the wrong
+                // transcript. Match deleteSession/resumeSession and wait.
                 showToast('Session change already in progress', 'info');
                 return;
             }
-            // Server cancels any in-flight turn to acquire the session lock;
-            // suppress its turn_end so it can't clear our pending flag early.
-            cancelActiveTurn();
+            // The sidebar "New" button opens a NEW pane (D3); the previous
+            // pane stays open in the background. The new pane's session id
+            // arrives in the config reply (re-key via the config handler).
+            saveActivePaneState();
+            const pane = makePane();
+            activePaneKey = pane.key;
+            clearChat();
+            loadActivePaneState();
             pendingSessionResponse = true;
             ws.send(JSON.stringify({ type: 'session_new' }));
         }
@@ -3500,9 +4598,11 @@
             const displayName = label || id;
             const confirmed = await showSessionDeleteModal(displayName);
             if (!confirmed) return;
-            // Server cancels any in-flight turn to acquire the session lock;
-            // suppress its turn_end so it can't clear our pending flag early.
-            cancelActiveTurn();
+            // Deleting the active pane's session interrupts its turn; a
+            // background session's delete leaves the active turn running.
+            if (activePane() && activePane().id === id) {
+                cancelActiveTurn();
+            }
             pendingSessionResponse = true;
             ws.send(JSON.stringify({ type: 'session_delete', sessionId: id }));
         }
@@ -3553,9 +4653,15 @@
                 showToast('Session change already in progress', 'info');
                 return;
             }
-            // Server cancels any in-flight turn to acquire the session lock;
-            // suppress its turn_end so it can't clear our pending flag early.
-            cancelActiveTurn();
+            // The old session's turn keeps running headless (continuation
+            // design — /new behaves the same): resume only re-keys this
+            // pane, it does NOT cancel the turn. Record the old session id
+            // so its turn_end (which may arrive before the reply re-keys the
+            // pane) cannot clear our pending flag mid-resume or block the
+            // resumed session's convergence; once the reply re-keys the
+            // pane, the old session's events are dropped by paneForMessage.
+            const p = activePane();
+            if (p && p.id) p.ignoreTurnEndsFor = p.id;
             pendingSessionResponse = true;
             ws.send(JSON.stringify({ type: 'session_resume', sessionId: id }));
         }
@@ -3611,7 +4717,7 @@
             { id: 'resume-latest', label: 'Resume latest session', hint: '', run: () => resumeSession('latest') },
             { id: 'refresh-sessions', label: 'Refresh sessions', hint: '', run: () => requestSessionList() },
             { id: 'toggle-mode', label: 'Toggle Act / Plan mode', hint: '', run: () => {
-                ws?.send(JSON.stringify({ type: 'set_mode', mode: currentMode === 'plan' ? 'act' : 'plan' }));
+                ws?.send(JSON.stringify({ type: 'set_mode', mode: currentMode === 'plan' ? 'act' : 'plan', sessionId: activePane().id }));
             }},
             { id: 'pane-chat', label: 'Switch to Chat', hint: '', run: () => switchMainPane('chat') },
             { id: 'pane-editor', label: 'Switch to Editor', hint: '', run: () => switchMainPane('editor') },
@@ -3626,7 +4732,7 @@
                 startCompact();
             }},
             { id: 'context-detail', label: 'Show context usage', hint: '', run: () => {
-                if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'message', content: '/context' }));
+                if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'message', content: '/context', sessionId: activePane().id }));
             }},
             { id: 'list-models', label: 'List / switch models', hint: '', run: () => {
                 if (ws?.readyState === WebSocket.OPEN) {
@@ -4417,6 +5523,14 @@
             sendNotification('GoGen — Approval needed', `File delete requested: ${paths}`, 'gogen-delete-approval');
         };
 
+        // Create the initial pane (the server's default session). Its session
+        // id arrives in the connect handshake's config and is adopted by the
+        // config handler.
+        const initialPane = makePane();
+        activePaneKey = initialPane.key;
         setTurnActive(false);
         setConnState('disconnected');
         connect();
+        // The editor runs on its own /ws/editor socket; open it once here.
+        // It manages its own reconnection and explorer refresh.
+        connectEditorSocket();

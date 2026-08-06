@@ -71,15 +71,11 @@ func (s *Server) handleFSReadMessage(ws *wsConn, ctx context.Context, msg WSMess
 func (s *Server) handleFSWriteMessage(ws *wsConn, ctx context.Context, msg WSMessage) {
 	reqID := msg.RequestID
 	path := msg.Path
-	if !s.tryAcquireTurn(wsTurnAcquireWait) {
-		// Result type follows the request convention ("fs_<op>_result"), so
-		// new write message types get correct busy responses automatically.
-		resp := WSMessage{Type: msg.Type + "_result", Path: path, RequestID: reqID, Pattern: msg.Pattern}
-		resp.Error = "agent is busy with another client"
-		_ = ws.writeJSON(resp)
-		return
-	}
-	defer s.turnMu.Unlock()
+	// Editor writes serialize on the workspace filesystem lock (not the
+	// session turn lock, Phase 2): they wait only for the actual mutation
+	// window of a running tool, never for the whole streaming turn.
+	s.ws.fsMu.Lock()
+	defer s.ws.fsMu.Unlock()
 
 	switch msg.Type {
 	case "fs_write":
@@ -106,7 +102,7 @@ func (s *Server) handleFSWriteMessage(ws *wsConn, ctx context.Context, msg WSMes
 		// the agent's patch engine (exact-context match, no fuzzy relocation).
 		// Delete-only patches require approval and are rejected here; use the
 		// agent for those.
-		report, err := s.agent.Executor.PatchFile(ctx, msg.Diff, false, false)
+		report, err := s.ws.Exec.PatchFile(ctx, msg.Diff, false, false)
 		resp := WSMessage{Type: "fs_apply_patch_result", RequestID: reqID}
 		if err != nil {
 			resp.Error = err.Error()

@@ -61,6 +61,27 @@ func (v *Viewport) SetContent(s string) {
 	}
 }
 
+// Lines returns the viewport's current line slice. The caller may reuse the
+// backing array (e.g. splice in place) and must publish the result via
+// SetContentLines before the viewport renders again.
+func (v *Viewport) Lines() []string {
+	return v.lines
+}
+
+// SetContentLines replaces the viewport content with pre-split lines and a
+// pre-computed maximum line width, avoiding the O(N) scan and re-split of
+// SetContent/SetContentMax. The caller is responsible for ensuring maxWidth
+// is >= the actual longest line width. The slice is stored as-is; callers
+// that reuse the backing array must not hold stale subslices across updates.
+func (v *Viewport) SetContentLines(lines []string, maxWidth int) {
+	v.lines = lines
+	v.longestLineWidth = maxWidth
+
+	if v.YOffset > len(v.lines)-1 {
+		v.GotoBottom()
+	}
+}
+
 // SetContentMax replaces the viewport content using a pre-computed maximum
 // line width, avoiding an O(N) scan.  The caller is responsible for ensuring
 // maxWidth is >= the actual longest line width.

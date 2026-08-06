@@ -33,15 +33,10 @@ func TestMergeBoolAcceptsOnOffVariants(t *testing.T) {
 	}
 }
 
-func TestMergeIntAndFloatFallBackToDefaultOnInvalidEnv(t *testing.T) {
+func TestMergeIntFallBackToDefaultOnInvalidEnv(t *testing.T) {
 	t.Setenv("GOGEN_TEST_INT", "abc")
 	if got := mergeInt("GOGEN_TEST_INT", 0, 42); got != 42 {
 		t.Errorf("mergeInt invalid env = %d, want default 42", got)
-	}
-
-	t.Setenv("GOGEN_TEST_FLOAT", "nope")
-	if got := mergeFloat("GOGEN_TEST_FLOAT", 0, 1.5); got != 1.5 {
-		t.Errorf("mergeFloat invalid env = %f, want default 1.5", got)
 	}
 }
 

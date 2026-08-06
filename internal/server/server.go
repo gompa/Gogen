@@ -14,9 +14,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"gogen/internal/agent"
@@ -140,46 +140,17 @@ func drainStreamErr(ch chan error) bool {
 	}
 }
 
-// tryAcquireTurn waits briefly for turnMu (e.g. after cancelling our own stream).
-// Returns false if another client still holds the agent.
-func (s *Server) tryAcquireTurn(wait time.Duration) bool {
-	deadline := time.Now().Add(wait)
-	for {
-		if s.turnMu.TryLock() {
-			return true
-		}
-		if time.Now().After(deadline) {
-			return false
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
-// acquireTurnForHandler cancels any in-flight stream on this connection, then
-// tries to acquire the global agent turn lock. On failure it writes the
-// standard "busy" error and returns false.
-func (s *Server) acquireTurnForHandler(ws *wsConn, stream *wsConnStream) bool {
-	stream.cancelInFlight()
-	if !s.tryAcquireTurn(wsTurnAcquireWait) {
-		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
-		return false
-	}
-	return true
-}
-
 // spawnUserTerminal starts the interactive user shell for a WebSocket
 // connection (if none is alive) and reports its lifecycle over the socket:
 // user_term_opened once the shell is up, user_term_exit when it exits. Output
 // is streamed as user_term_output chunks from the PTY read goroutine. The
-// shell runs in the agent's current working directory at spawn time.
+// shell runs in the workspace's current working directory at spawn time (the
+// executor has its own mutex, so no turn lock is needed).
 func (s *Server) spawnUserTerminal(ws *wsConn, holder *userTermHolder) {
 	if holder.get() != nil {
 		return
 	}
-	var wd string
-	s.lockAgentRead(func() {
-		wd = s.agent.Executor.GetWorkingDir()
-	})
+	wd := s.ws.Exec.GetWorkingDir()
 	ut, err := startUserTerminal(wd, func(chunk string) {
 		_ = ws.writeJSON(WSMessage{Type: "user_term_output", Content: chunk})
 	})
@@ -187,7 +158,14 @@ func (s *Server) spawnUserTerminal(ws *wsConn, holder *userTermHolder) {
 		_ = ws.writeJSON(WSMessage{Type: "user_term_exit", Content: "failed to start shell: " + err.Error(), Code: -1})
 		return
 	}
-	holder.set(ut)
+	// Claim the holder atomically. Two concurrent requests (user_term_request
+	// while an earlier spawn is in flight) would otherwise both spawn and the
+	// loser would leak a pty; trySet fails only when a terminal is already
+	// held, and the loser is closed here.
+	if !holder.trySet(ut) {
+		_ = ut.Close()
+		return
+	}
 	_ = ws.writeJSON(WSMessage{Type: "user_term_opened", Content: ut.Title(), WorkingDir: wd})
 	go func() {
 		<-ut.Done()
@@ -306,10 +284,11 @@ func (w *wsConn) enqueueJSON(v WSMessage) error {
 }
 
 type Server struct {
-	agent          *agent.Agent
+	// ws is the shared workspace (executor, store, config, provider factory,
+	// fsMu). registry owns the live sessions (multi-session plan §2).
+	ws             *Workspace
+	registry       *sessionRegistry
 	config         *config.Config
-	agentMu        sync.RWMutex // protects Agent reads/writes; see agent_sync.go
-	turnMu         sync.Mutex   // serializes agent-mutating work across WS clients
 	allowedOrigins map[string]struct{}
 	authToken      string
 	tlsCertFile    string
@@ -337,6 +316,12 @@ type SessionEntry struct {
 	Label        string `json:"label,omitempty"`
 	Oneshot      bool   `json:"oneshot,omitempty"`
 	Current      bool   `json:"current,omitempty"`
+	// Active marks sessions with a live in-memory runtime (multi-session
+	// plan Phase 4): the client can render "resume to continue" for them.
+	// Idle runtimes whose last client detached are orphan-evicted (they
+	// return to the saved list), so active here means genuinely live —
+	// open in another tab, or a headless turn still running.
+	Active bool `json:"active,omitempty"`
 	// Label is now the full first user message — CSS text-overflow: ellipsis
 	// handles dynamic truncation on the client side.
 }
@@ -395,24 +380,28 @@ type WSMessage struct {
 	UsedPercent     float64 `json:"usedPercent,omitempty"`
 	ToolTruncated   bool    `json:"toolTruncated,omitempty"`
 	// Accumulated session usage
-	TotalPromptTokens     int            `json:"totalPromptTokens,omitempty"`
-	TotalCompletionTokens int            `json:"totalCompletionTokens,omitempty"`
-	TotalCachedTokens     int            `json:"totalCachedTokens,omitempty"`
-	TotalTurns            int            `json:"totalTurns,omitempty"`
-	Models                []ModelEntry   `json:"models,omitempty"`
-	ApprovalID            string         `json:"approvalId,omitempty"`
-	Approved              bool           `json:"approved,omitempty"`
-	Paths                 []string       `json:"paths,omitempty"`
-	Reason                string         `json:"reason,omitempty"`
-	Mode                  string         `json:"mode,omitempty"`
-	ThinkingLevel         string         `json:"thinkingLevel,omitempty"`
-	GlobalMode            bool           `json:"globalMode,omitempty"`
-	SessionID             string         `json:"sessionId,omitempty"`
-	SessionAction         string         `json:"sessionAction,omitempty"`
-	SessionLabel          string         `json:"sessionLabel,omitempty"`
-	MessageIndex          int            `json:"messageIndex,omitempty"`
-	Sessions              []SessionEntry `json:"sessions,omitempty"`
-	History               []HistoryEntry `json:"history,omitempty"`
+	TotalPromptTokens     int          `json:"totalPromptTokens,omitempty"`
+	TotalCompletionTokens int          `json:"totalCompletionTokens,omitempty"`
+	TotalCachedTokens     int          `json:"totalCachedTokens,omitempty"`
+	TotalTurns            int          `json:"totalTurns,omitempty"`
+	Models                []ModelEntry `json:"models,omitempty"`
+	ApprovalID            string       `json:"approvalId,omitempty"`
+	Approved              bool         `json:"approved,omitempty"`
+	Paths                 []string     `json:"paths,omitempty"`
+	Reason                string       `json:"reason,omitempty"`
+	Mode                  string       `json:"mode,omitempty"`
+	ThinkingLevel         string       `json:"thinkingLevel,omitempty"`
+	GlobalMode            bool         `json:"globalMode,omitempty"`
+	SessionID             string       `json:"sessionId,omitempty"`
+	SessionAction         string       `json:"sessionAction,omitempty"`
+	SessionLabel          string       `json:"sessionLabel,omitempty"`
+	// TurnActive/StartedAt describe a session's in-flight turn; sent in
+	// session_state replies so a reconnecting client can render "resuming…".
+	TurnActive   bool           `json:"turnActive,omitempty"`
+	StartedAt    string         `json:"startedAt,omitempty"`
+	MessageIndex int            `json:"messageIndex,omitempty"`
+	Sessions     []SessionEntry `json:"sessions,omitempty"`
+	History      []HistoryEntry `json:"history,omitempty"`
 	// Filesystem / git editor APIs
 	Path        string              `json:"path,omitempty"`
 	Pattern     string              `json:"pattern,omitempty"`
@@ -451,8 +440,29 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 	if tlsKey == "" {
 		tlsKey = strings.TrimSpace(os.Getenv("GOGEN_WEB_TLS_KEY"))
 	}
+	ws := newWorkspaceFromAgent(a, cfg)
+	maxActive := 0
+	if cfg != nil {
+		maxActive = cfg.WebMaxActiveSessions
+	}
+	reg := newSessionRegistry(maxActive)
+	if a.SessionID == "" {
+		a.SessionID = sesspkg.NewID()
+	}
+	reg.register(a.SessionID, newSessionRuntime(a))
+	// In web mode the registry is the sole pruner (Phase 4, E2): Save's
+	// internal auto-prune protects only one session and could delete another
+	// live session's file; the registry prunes with the full active set.
+	if ws.Store != nil {
+		ws.Store.SetAutoPrune(false)
+	}
+	// Wrap FS-mutating tools with the workspace filesystem lock (Phase 2):
+	// a streaming turn no longer blocks editor saves except during the actual
+	// mutation window of a tool.
+	a.SetToolHandlers(wrapToolHandlers(agent.BuiltinToolHandlers(), &ws.fsMu))
 	return &Server{
-		agent:          a,
+		ws:             ws,
+		registry:       reg,
 		config:         cfg,
 		allowedOrigins: allowed,
 		authToken:      token,
@@ -506,39 +516,43 @@ func applyContextStats(msg *WSMessage, stats agent.TurnContext, accum *agent.Usa
 	}
 }
 
-// agentConfigMsgBasic returns config fields that are cheap to read.
-// Caller must hold agentMu (R or W). Do not call ContextStats while holding
-// agentMu — tokenize after unlocking via applyContextStats.
-func (s *Server) agentConfigMsgBasic() WSMessage {
+// agentConfigMsgBasic returns config fields that are cheap to read for the
+// given session agent. Every field is internally synchronized (executor,
+// provider, statsMu for mode/thinking/label), so it is safe WITHOUT the
+// session's turnMu — the attach handshake must never block on a running
+// turn, which holds turnMu for its entire duration. Do not call ContextStats
+// while holding turnMu — tokenize after unlocking via applyContextStats.
+func agentConfigMsgBasic(a *agent.Agent) WSMessage {
+	mode, thinking := a.ModeAndThinkingLevel()
 	return WSMessage{
 		Type:          "config",
-		WorkingDir:    s.agent.Executor.GetWorkingDir(),
-		Model:         s.agent.CurrentModel(),
-		Mode:          s.agent.Mode.String(),
-		ThinkingLevel: string(s.agent.ThinkingLevel),
-		GlobalMode:    s.agent.GlobalMode,
-		SessionID:     s.agent.SessionID,
-		SessionLabel:  s.agent.SessionLabelSnapshot(),
+		WorkingDir:    a.Executor.GetWorkingDir(),
+		Model:         a.CurrentModel(),
+		Mode:          mode.String(),
+		ThinkingLevel: string(thinking),
+		GlobalMode:    a.GlobalMode,
+		SessionID:     a.SessionID,
+		SessionLabel:  a.SessionLabelSnapshot(),
 	}
 }
 
-// agentConfigMsg is a locked basic snapshot plus ContextStats applied outside
-// agentMu. Prefer this when the caller does not already hold agentMu.
-func (s *Server) agentConfigMsg(ctx context.Context) WSMessage {
-	var msg WSMessage
-	s.lockAgentRead(func() {
-		msg = s.agentConfigMsgBasic()
-	})
-	s.fillModelPricing(ctx, &msg)
-	accum := s.agent.SnapshotUsageAccum()
-	applyContextStats(&msg, s.agent.ContextStats(ctx), &accum)
+// agentConfigMsg is an internally-synchronized basic snapshot plus
+// ContextStats applied outside any lock (ContextStats snapshots under its own
+// statsMu). No turnMu is taken — callers may hold it (session command echoes)
+// or not (the attach handshake, which must never block on a running turn).
+func agentConfigMsg(ctx context.Context, rt *sessionRuntime) WSMessage {
+	a := rt.agent
+	msg := agentConfigMsgBasic(a)
+	fillModelPricing(a, &msg)
+	accum := a.SnapshotUsageAccum()
+	applyContextStats(&msg, a.ContextStats(ctx), &accum)
 	return msg
 }
 
 // fillModelPricing looks up pricing for the current model from the models.dev
 // registry cache (never blocks — pure map lookup).
-func (s *Server) fillModelPricing(_ context.Context, msg *WSMessage) {
-	if p, ok := s.agent.Provider.(*llm.OpenAIProvider); ok && msg.Model != "" {
+func fillModelPricing(a *agent.Agent, msg *WSMessage) {
+	if p, ok := a.Provider.(*llm.OpenAIProvider); ok && msg.Model != "" {
 		if in, out, cached, ok := p.ModelPricing(msg.Model); ok {
 			msg.InputPricePer1M = in
 			msg.OutputPricePer1M = out
@@ -547,7 +561,7 @@ func (s *Server) fillModelPricing(_ context.Context, msg *WSMessage) {
 	}
 }
 
-func sessionEntries(list []agent.SessionInfo, currentID string) []SessionEntry {
+func sessionEntries(list []agent.SessionInfo, currentID string, active map[string]bool) []SessionEntry {
 	out := make([]SessionEntry, len(list))
 	for i, s := range list {
 		out[i] = SessionEntry{
@@ -557,7 +571,18 @@ func sessionEntries(list []agent.SessionInfo, currentID string) []SessionEntry {
 			Label:        s.Label,
 			Oneshot:      s.Oneshot,
 			Current:      s.ID == currentID,
+			Active:       active[s.ID],
 		}
+	}
+	return out
+}
+
+// activeSet returns the set of registered session ids.
+func (r *sessionRegistry) activeSet() map[string]bool {
+	ids := r.activeIDs()
+	out := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		out[id] = true
 	}
 	return out
 }
@@ -616,7 +641,8 @@ func historyEntries(msgs []llm.Message) []HistoryEntry {
 	return out
 }
 
-func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, result agent.SessionCommandResult, err error) {
+func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, rt *sessionRuntime, result agent.SessionCommandResult, err error) {
+	a := rt.agent
 	resp := WSMessage{Type: "response"}
 	clearChat := false
 	if err != nil {
@@ -626,55 +652,72 @@ func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, resu
 		if result.Action == agent.SessionActionClearChat {
 			resp.SessionAction = string(result.Action)
 			clearChat = true
-			_ = ws.writeJSON(WSMessage{Type: "clear_chat"})
 		}
 	}
 
 	var cfg WSMessage
 	var history []llm.Message
 	needHistory := clearChat && err == nil && len(result.History) == 0
-	s.lockAgentRead(func() {
-		if err == nil && len(result.Sessions) > 0 {
-			resp.Type = "sessions"
-			resp.Sessions = sessionEntries(result.Sessions, s.agent.SessionID)
-		}
-		cfg = s.agentConfigMsgBasic()
-		if len(result.History) > 0 {
-			history = append([]llm.Message(nil), result.History...)
-		}
-	})
+	// No turnMu here: everything below is already-computed or internally
+	// synchronized (sessionEntries reads the registry under its own lock;
+	// the config snapshot is lock-free; result.History came from the
+	// command). A resume of a session with a RUNNING turn must deliver its
+	// reply immediately — the turn holds turnMu for its entire duration,
+	// and blocking here is exactly the "can't switch to the responding
+	// session until it's done" symptom.
+	if err == nil && len(result.Sessions) > 0 {
+		resp.Type = "sessions"
+		resp.Sessions = sessionEntries(result.Sessions, a.SessionID, s.registry.activeSet())
+	}
+	cfg = agentConfigMsgBasic(a)
+	if len(result.History) > 0 {
+		history = append([]llm.Message(nil), result.History...)
+	}
 	if needHistory {
 		// /new (and any clear with empty History) — still emit history so
 		// clients can reliably run post-session follow-ups (e.g. resend).
-		history = s.agent.SnapshotMessages()
+		history = a.SnapshotMessages()
 	}
-	resp.SessionID = cfg.SessionID
+	// The sessions payload is connection-scoped sidebar state; leave its
+	// SessionID empty so the client routes it to the active pane instead of
+	// tying it to one session (which could drop it after a reconnect or a
+	// cross-tab default change).
+	if resp.Type != "sessions" {
+		resp.SessionID = cfg.SessionID
+	}
 	resp.Mode = cfg.Mode
 	// Paint sessions/history before ContextStats tokenization (can be slow on
-	// large restored sessions / cold tiktoken init).
+	// large restored sessions / cold tiktoken init). clear_chat + history
+	// carry the sessionId so the client routes them to the right pane (Phase 5).
 	_ = ws.writeJSON(resp)
 	if clearChat && err == nil {
-		_ = ws.writeJSON(WSMessage{Type: "history", History: historyEntries(history)})
-	} else if len(history) > 0 {
-		_ = ws.writeJSON(WSMessage{Type: "history", History: historyEntries(history)})
+		_ = ws.writeJSON(WSMessage{Type: "clear_chat", SessionID: cfg.SessionID})
 	}
-	stats := s.agent.ContextStats(ctx)
-	accum := s.agent.SnapshotUsageAccum()
+	// Always emit history on a clear (even empty) so clients can reliably
+	// run post-session follow-ups (e.g. resend).
+	if (clearChat && err == nil) || len(history) > 0 {
+		_ = ws.writeJSON(WSMessage{Type: "history", History: historyEntries(history), SessionID: cfg.SessionID})
+	}
+	stats := a.ContextStats(ctx)
+	accum := a.SnapshotUsageAccum()
 	applyContextStats(&cfg, stats, &accum)
-	s.fillModelPricing(ctx, &cfg)
+	fillModelPricing(a, &cfg)
 	ctxMsg := WSMessage{Type: "context"}
 	applyContextStats(&ctxMsg, stats, &accum)
 	_ = ws.writeJSON(ctxMsg)
 	_ = ws.writeJSON(cfg)
 }
 
-// contextMsg builds a context stats message. Must not be called while holding
-// agentMu — ContextStats tokenizes the full history view.
-func (s *Server) contextMsg(ctx context.Context) WSMessage {
-	msg := WSMessage{Type: "context"}
-	accum := s.agent.SnapshotUsageAccum()
-	applyContextStats(&msg, s.agent.ContextStats(ctx), &accum)
-	msg.SessionLabel = s.agent.SessionLabelSnapshot()
+// contextMsg builds a context stats message. Safe to call while holding the
+// session's turnMu (ContextStats snapshots under its own statsMu; the turn
+// goroutine calls it during a turn), but it can be slow — ContextStats
+// tokenizes the full history view — so callers on the WS read loop that are
+// NOT holding the lock should keep it that way.
+func contextMsg(ctx context.Context, a *agent.Agent) WSMessage {
+	msg := WSMessage{Type: "context", SessionID: a.SessionID}
+	accum := a.SnapshotUsageAccum()
+	applyContextStats(&msg, a.ContextStats(ctx), &accum)
+	msg.SessionLabel = a.SessionLabelSnapshot()
 	return msg
 }
 
@@ -693,35 +736,53 @@ func (s *Server) modelEntries(models []llm.ModelInfo) []ModelEntry {
 	return out
 }
 
-func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
+// upgradedWS bundles the result of a shared WebSocket handshake: the raw
+// connection (for ReadJSON in the read loop), the wrapped wsConn (for
+// writes), and the cleanup the handler must defer.
+type upgradedWS struct {
+	conn    *websocket.Conn
+	ws      *wsConn
+	cleanup func()
+}
+
+// errWSUpgrade is returned by upgradeWS after the HTTP error response has
+// already been written, so handlers can simply return.
+var errWSUpgrade = errors.New("websocket upgrade failed")
+
+// upgradeWS performs the handshake shared by the chat and editor endpoints:
+// auth check, upgrade + connection rate limiting (both sockets of one tab
+// count against the same global connection limiter), origin check, protocol
+// upgrade, connection tracking (for shutdown force-close), read-deadline and
+// pong setup, and wrapping in the write-queue wsConn. The returned cleanup
+// tears the socket down in the same order HandleWS used: closeSend (lets the
+// writer drain its queue) → unregister → raw close → release the connection
+// slot. Callers must defer the cleanup.
+func (s *Server) upgradeWS(w http.ResponseWriter, r *http.Request) (*upgradedWS, error) {
 	if !s.checkAuth(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
+		return nil, errWSUpgrade
 	}
 	if s.upgradeLimiter != nil && !s.upgradeLimiter.allow(clientIP(r)) {
 		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
-		return
+		return nil, errWSUpgrade
 	}
+	release := func() {}
 	if s.connLimiter != nil && !s.connLimiter.acquireConn() {
 		http.Error(w, "too many connections", http.StatusServiceUnavailable)
-		return
+		return nil, errWSUpgrade
 	}
-	if s.connLimiter != nil {
-		defer s.connLimiter.releaseConn()
-	}
+	release = s.connLimiter.releaseConn
 	upg := s.wsUpgrader()
 	conn, err := upg.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("upgrade error: %v", err)
-		return
+		release()
+		return nil, errWSUpgrade
 	}
-	defer conn.Close()
-
 	s.registerWSConn(conn)
-	defer s.unregisterWSConn(conn)
 	// Pong handler extends the read deadline whenever the browser replies to
 	// our pings. If the client stops responding (tab closed, network gone),
-	// the read deadline elapses, ReadJSON fails, and HandleWS tears down —
+	// the read deadline elapses, ReadJSON fails, and the handler tears down —
 	// which closes the write side too. This is what surfaces half-open
 	// connections that would otherwise freeze the UI silently.
 	if err := conn.SetReadDeadline(time.Now().Add(wsReadTimeout)); err != nil {
@@ -735,12 +796,53 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	})
 
 	ws := newWSConn(conn)
-	defer ws.closeSend()
-	session := newWSSession(ws)
+	cleanup := func() {
+		ws.closeSend()
+		s.unregisterWSConn(conn)
+		_ = conn.Close()
+		release()
+	}
+	return &upgradedWS{conn: conn, ws: ws, cleanup: cleanup}, nil
+}
+
+func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
+	u, err := s.upgradeWS(w, r)
+	if err != nil {
+		return
+	}
+	defer u.cleanup()
+	conn := u.conn
+	ws := u.ws
 	msgLimiter := newWSMessageLimiter()
 
-	stream := &wsConnStream{}
-	defer stream.close()
+	// The connection's pane: the session it is currently attached to and the
+	// default target for messages without a sessionId. Phase 4 lifecycle ops
+	// (session_new/resume/fork) switch the pane; teardown detaches from
+	// whatever the current pane is — WITHOUT cancelling any turn (the turn is
+	// owned by the runtime, so disconnecting never kills it, §4).
+	pane := s.registry.first()
+	if pane == nil {
+		// The registry can be empty: every runtime was evicted — the last
+		// pane was explicitly closed (session_close) or the last client
+		// detached from an idle session (orphan eviction). Bootstrap a
+		// default session (latest saved, or a fresh one) so the connection
+		// and any legacy id-less message have a target.
+		pane = s.createBootstrapSession()
+	}
+	if pane == nil {
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: no session available"})
+		return
+	}
+
+	// Attach this connection as a viewer of the session.
+	s.attachSession(ws, r, pane)
+	// Teardown detaches the connection from EVERY session it is attached to
+	// (the current pane plus any background panes) — WITHOUT cancelling any
+	// turn (the turn is owned by the runtime, so disconnecting never kills
+	// it, §4). A killed tab cannot send session_detach per pane, and a stale
+	// attachment would leak the dead socket and could leave a pending
+	// delete-approval hanging forever instead of auto-denying (D10).
+	defer s.registry.detachAll(ws)
 
 	// Interactive user shell for this connection, killed on disconnect. The
 	// shell itself is spawned after the config/history handshake below so
@@ -750,21 +852,6 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 		if ut := userTermHolder.get(); ut != nil {
 			ut.Close()
 		}
-	}()
-
-	s.agentMu.RLock()
-	cfgMsg := s.agentConfigMsgBasic()
-	s.agentMu.RUnlock()
-	msgs := s.agent.SnapshotMessages()
-	_ = ws.writeJSON(cfgMsg)
-	if len(msgs) > 0 {
-		_ = ws.writeJSON(WSMessage{Type: "history", History: historyEntries(msgs)})
-	}
-
-	// Send full config with context stats and pricing asynchronously so the
-	// client can start painting history immediately. Tokenization runs without agentMu.
-	go func() {
-		_ = ws.writeJSON(s.agentConfigMsg(r.Context()))
 	}()
 
 	// Spawn the user shell after the handshake so a pty failure (sandboxed
@@ -783,10 +870,320 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: rate limit exceeded"})
 				continue
 			}
-			// Complete delete approvals here so they never sit behind a main-loop
-			// turnMu.Lock() (stream holds turnMu while waiting for approval).
+			// Complete delete approvals here so they never sit behind a
+			// main-loop turnMu.Lock() (the stream holds turnMu while waiting
+			// for approval). Route by sessionId so each session's approvals
+			// resolve independently (E5).
 			if msg.Type == "delete_approval_response" {
-				session.completeApproval(msg.ApprovalID, msg.Approved)
+				if rt := s.resolveRuntime(msg.SessionID); rt != nil {
+					rt.completeApproval(msg.ApprovalID, msg.Approved)
+				}
+				continue
+			}
+			incoming <- msg
+		}
+	}()
+
+	for msg := range incoming {
+		// Session-scoped messages WITHOUT an explicit sessionId act on this
+		// connection's own pane, not the server-global default. The default
+		// is only the bootstrap fallback for the initial attach
+		// (pane := registry.first()) and is moved by ANY tab's
+		// session_attach/session_new (setDefault is global), so an id-less
+		// cancel/set_mode/session_detach would silently hit the WRONG
+		// session in a multi-tab setup (E33). The pane is the sender's
+		// current session, which is what an id-less message means. On first
+		// load the pane IS the default, so legacy behavior is unchanged.
+		// (Approval responses are intercepted in the read goroutine above
+		// and keep default routing — an empty id there is a malformed
+		// client, and the goroutine must not touch the shared pane.)
+		target := s.resolveRuntime(msg.SessionID)
+		if msg.SessionID == "" {
+			// The pane pointer can reference a runtime that left the
+			// registry while this connection was open — its session was
+			// deleted by another tab (session_delete detaches every
+			// attached client), or it was cap/orphan-evicted while the
+			// pane was open. Routing an id-less message to the evicted
+			// runtime would silently drop it (the handlers' evicted
+			// guard), so fall back to the default session when one is
+			// live. When the registry is EMPTY (this connection closed
+			// its only pane via session_close / session_delete and has
+			// not re-keyed yet), deliberately do NOT bootstrap: the
+			// latest saved session is the one the user just closed, and
+			// createBootstrapSession would resurrect it as an active
+			// runtime (the sessions payload would show it "active" again
+			// and session_close's eviction would appear undone). The
+			// stale pane stays in place and the handlers' evicted guard
+			// drops the message safely; the client re-keys (session_new /
+			// session_attach) and the next explicit-id message re-aligns
+			// the pane.
+			if pane == nil || pane.evicted.Load() {
+				if d := s.registry.first(); d != nil {
+					pane = d
+				}
+			}
+			target = pane
+		}
+		switch msg.Type {
+		case "session_fork":
+			// The fork source is the pane named by sessionId (edit-resend
+			// forks its own pane's session). Re-align the connection's pane
+			// with the explicit id so a reconnect-stale pointer cannot fork
+			// the wrong session, and drop the request when the source
+			// session is gone entirely (never fork a different session).
+			if msg.SessionID != "" {
+				t := s.resolveRuntime(msg.SessionID)
+				if t == nil {
+					if pane != nil && pane.agent.SessionID == msg.SessionID {
+						t = pane
+					} else {
+						continue
+					}
+				}
+				pane = t
+			}
+			s.handleWSSessionAction(ws, r.Context(), &pane, msg)
+		case "fs_list", "fs_read", "fs_search", "git_status", "git_file_diff":
+			s.handleFSReadMessage(ws, r.Context(), msg)
+		case "fs_write", "fs_replace", "fs_apply_patch":
+			s.handleFSWriteMessage(ws, r.Context(), msg)
+		case "list_sessions":
+			if target == nil {
+				target = s.registry.first()
+			}
+			s.handleWSListSessions(ws, target)
+		case "session_new", "session_resume", "session_delete":
+			// session_new creates for the connection's CURRENT pane, but the
+			// client's edit-resend path scopes it with the acting pane's id
+			// (beginResend: histIdx == 0 sends session_new with sessionId).
+			// Re-align the pane pointer to that id (like session_fork does)
+			// so a reconnect-stale pointer can never replace the WRONG pane's
+			// session. session_resume/session_delete are NOT re-aligned: their
+			// sessionId names the TARGET session, not the acting pane (E33).
+			if msg.Type == "session_new" && msg.SessionID != "" {
+				if t := s.resolveRuntime(msg.SessionID); t != nil {
+					pane = t
+				}
+			}
+			s.handleWSSessionAction(ws, r.Context(), &pane, msg)
+		case "list_models":
+			if target == nil {
+				target = s.registry.first()
+			}
+			s.handleWSListModels(ws, r.Context(), target)
+		case "set_model":
+			if target == nil {
+				break
+			}
+			s.handleWSSetModel(ws, r.Context(), target, msg)
+		case "set_mode":
+			if target == nil {
+				break
+			}
+			s.handleWSSetMode(ws, r.Context(), target, msg)
+		case "set_thinking_level":
+			if target == nil {
+				break
+			}
+			s.handleWSSetThinkingLevel(ws, r.Context(), target, msg)
+		case "config":
+			// The client scopes config with the sessionId of the pane it is
+			// acting on, but the server routes it via the connection's
+			// current pane. After a reconnect the re-attach loop leaves that
+			// pointer on the LAST attached pane, which can differ from the
+			// client's active pane — re-align it with the explicit id so the
+			// working-dir change interrupts the right session's turn.
+			// session_delete/session_detach are NOT re-aligned here: their
+			// sessionId names the TARGET session, not the acting pane.
+			if msg.SessionID != "" && target != nil {
+				pane = target
+			}
+			s.handleWSConfig(ws, r.Context(), &pane, msg)
+		case "cancel":
+			if target == nil {
+				break
+			}
+			// Cancel is the ONLY way to stop a turn, and it works
+			// cross-connection (scoped to the targeted session).
+			target.stream.cancelInFlight()
+		case "session_attach":
+			// Attach a pane (Phase 5): make it the connection's current pane
+			// and resend session_state + history + config + context. Sessions
+			// that are not currently active are loaded from the store, so the
+			// sidebar's "open session" works for saved sessions too.
+			rt2, err := s.ensureSessionRuntime(msg.SessionID)
+			if err != nil {
+				// The session no longer exists (deleted elsewhere / server
+				// restarted with pruning): tell the client to drop the pane.
+				_ = ws.writeJSON(WSMessage{Type: "session_removed", SessionID: msg.SessionID, Content: err.Error()})
+			} else {
+				s.switchPane(ws, &pane, rt2)
+				s.attachSession(ws, r, rt2)
+			}
+		case "session_detach":
+			// The client declared the pane closed; detach without cancelling
+			// any running turn.
+			if target == nil {
+				break
+			}
+			target.detach(ws)
+		case "session_close":
+			// The client pressed ✕ on an open pane: the session is
+			// explicitly closed. Detach, then — when no other socket is
+			// still attached (another tab may be watching the same session
+			// and must not have its turn cancelled or its runtime evicted)
+			// — cancel the in-flight turn, flush, and unregister. The
+			// session stays saved on disk and reopens from the store like
+			// any other saved session (ensureSessionRuntime). If the detach
+			// already orphan-evicted an idle runtime, closeRuntime is a
+			// no-op (evicted flag).
+			if target == nil {
+				break
+			}
+			target.detach(ws)
+			if target.clientCount() == 0 {
+				s.registry.closeRuntime(target)
+			}
+		case "user_term_input":
+			if ut := userTermHolder.get(); ut != nil {
+				_ = ut.Write([]byte(msg.Content))
+			}
+		case "user_term_resize":
+			if ut := userTermHolder.get(); ut != nil && msg.Cols > 0 && msg.Rows > 0 {
+				_ = ut.Resize(uint16(msg.Cols), uint16(msg.Rows))
+			}
+		case "user_term_request":
+			s.spawnUserTerminal(ws, userTermHolder)
+		case "compact":
+			if target == nil {
+				break
+			}
+			s.handleWSCompact(ws, r, target)
+		case "message":
+			// The client scopes every message with the sessionId of the pane
+			// it was typed in, but the server routes messages via the
+			// connection's current pane. After a reconnect the re-attach
+			// loop leaves that pointer on the LAST attached pane, which may
+			// not be the pane the client is using — so route by the explicit
+			// id (the pane pointer remains the fallback for legacy empty
+			// ids). An id that no longer resolves is either an in-flight
+			// eviction of THIS very session (continue on the same runtime)
+			// or a stale pane — in the latter case drop the message rather
+			// than deliver it to a different session.
+			if msg.SessionID != "" {
+				if target == nil {
+					if pane != nil && pane.agent.SessionID == msg.SessionID {
+						target = pane
+					} else {
+						continue
+					}
+				}
+				pane = target
+			}
+			s.handleWSUserMessage(ws, r, &pane, msg)
+		}
+	}
+}
+
+// resolveRuntime returns the session runtime for id. An EMPTY id targets the
+// default (first registered) session — legacy messages without a sessionId.
+// An id that is not registered (the session was evicted by the active-cap or
+// deleted) must NOT fall back to the default: session-scoped operations
+// (cancel, session_detach, session_close, set_model/mode/thinking, compact,
+// approvals) would otherwise silently hit the WRONG session — e.g. a pane
+// closed after eviction sending session_detach for the evicted id would
+// detach the default session from the connection, and a cancel for an
+// evicted session would kill the default session's turn. Unknown non-empty
+// ids return nil; callers treat that as a stale operation and ignore it.
+func (s *Server) resolveRuntime(id string) *sessionRuntime {
+	if id == "" {
+		return s.registry.first()
+	}
+	rt, ok := s.registry.get(id)
+	if !ok {
+		return nil
+	}
+	return rt
+}
+
+// attachSession registers a socket as a viewer of the session and sends the
+// attach payload: session_state first (turnActive for "resuming…" rendering,
+// E28), then — asynchronously, because a running turn holds the session turn
+// lock and the handshake must never block on it — the cheap config snapshot,
+// the persisted history, and the full config with context stats (mirrors the
+// connect handshake; N panes do not serialize N tokenizations). A reconnect
+// mid-turn therefore gets session_state immediately, the live stream events,
+// and the completed history when the turn ends.
+func (s *Server) attachSession(ws *wsConn, r *http.Request, rt *sessionRuntime) {
+	rt.attach(ws)
+	s.sendSessionState(ws, rt)
+	go func() {
+		// Snapshot and send history FIRST, without the turn lock. A running
+		// turn holds turnMu for its ENTIRE duration (startTurn defers the
+		// unlock), so taking turnMu.RLock here would leave a mid-turn page
+		// open / reconnect with an empty transcript until the turn finishes
+		// — minutes for a long agent run, or indefinitely for a stuck turn.
+		// SnapshotMessages deep-clones under its own statsMu (its documented
+		// contract: web history snapshots never hold turnMu), so the
+		// transcript is consistent with the live stream and paints at once.
+		msgs := rt.agent.SnapshotMessages()
+		if len(msgs) > 0 {
+			_ = ws.writeJSON(WSMessage{Type: "history", History: historyEntries(msgs), SessionID: rt.agent.SessionID})
+		}
+		// Config echo: no turnMu — every field is internally synchronized
+		// (agentConfigMsgBasic), so a mid-turn attach gets the session's
+		// identity/toolbar state immediately instead of when the turn ends.
+		// Only the context-stats badge may lag (tokenization of a freshly
+		// restored session runs in agentConfigMsg below).
+		_ = ws.writeJSON(agentConfigMsgBasic(rt.agent))
+		_ = ws.writeJSON(agentConfigMsg(r.Context(), rt))
+	}()
+}
+
+// sendSessionState writes the session_state message describing the session's
+// in-flight turn so a reconnecting client can render "resuming…".
+func (s *Server) sendSessionState(ws *wsConn, rt *sessionRuntime) {
+	active, started := rt.turnState()
+	msg := WSMessage{
+		Type:       "session_state",
+		SessionID:  rt.agent.SessionID,
+		TurnActive: active,
+	}
+	if !started.IsZero() {
+		msg.StartedAt = started.UTC().Format(time.RFC3339Nano)
+	}
+	_ = ws.writeJSON(msg)
+}
+
+// HandleWSEditor serves the editor WebSocket endpoint (/ws/editor). It is the
+// workspace-scoped counterpart of HandleWS: it handles only filesystem and git
+// messages (fs_list/fs_read/fs_search/fs_write/fs_replace/fs_apply_patch,
+// git_status/git_file_diff) and ignores chat/session messages. The editor
+// socket is independent of any chat session, so a busy or streaming session
+// never blocks editor saves behind the chat read loop (multi-session plan,
+// Phase 1). Write messages serialize on the workspace filesystem lock
+// (fsMu, Phase 2) — they wait only for the actual mutation window of a
+// running tool, never for the whole streaming turn.
+func (s *Server) HandleWSEditor(w http.ResponseWriter, r *http.Request) {
+	u, err := s.upgradeWS(w, r)
+	if err != nil {
+		return
+	}
+	defer u.cleanup()
+	conn := u.conn
+	ws := u.ws
+	msgLimiter := newWSMessageLimiter()
+
+	incoming := make(chan WSMessage, 8)
+	go func() {
+		for {
+			var msg WSMessage
+			if err := conn.ReadJSON(&msg); err != nil {
+				close(incoming)
+				return
+			}
+			if !msgLimiter.Allow() {
+				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: rate limit exceeded"})
 				continue
 			}
 			incoming <- msg
@@ -799,82 +1196,59 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			s.handleFSReadMessage(ws, r.Context(), msg)
 		case "fs_write", "fs_replace", "fs_apply_patch":
 			s.handleFSWriteMessage(ws, r.Context(), msg)
-		case "list_sessions":
-			s.handleWSListSessions(ws)
-		case "session_new", "session_resume", "session_delete", "session_fork":
-			s.handleWSSessionAction(ws, r.Context(), stream, msg)
-		case "list_models":
-			s.handleWSListModels(ws, r.Context())
-		case "set_model":
-			s.handleWSSetModel(ws, r.Context(), stream, msg)
-		case "set_mode":
-			s.handleWSSetMode(ws, r.Context(), stream, msg)
-		case "set_thinking_level":
-			s.handleWSSetThinkingLevel(ws, r.Context(), stream, msg)
-		case "config":
-			s.handleWSConfig(ws, r.Context(), stream, msg)
-		case "cancel":
-			stream.cancelInFlight()
-		case "user_term_input":
-			if ut := userTermHolder.get(); ut != nil {
-				_ = ut.Write([]byte(msg.Content))
-			}
-		case "user_term_resize":
-			if ut := userTermHolder.get(); ut != nil && msg.Cols > 0 && msg.Rows > 0 {
-				_ = ut.Resize(uint16(msg.Cols), uint16(msg.Rows))
-			}
-		case "user_term_request":
-			s.spawnUserTerminal(ws, userTermHolder)
-		case "compact":
-			s.handleWSCompact(ws, r, stream)
-		case "message":
-			s.handleWSUserMessage(ws, r, stream, session, msg)
+		default:
+			// Non-editor messages (chat, sessions, terminal) are not
+			// supported on this socket; ignore them.
 		}
 	}
 }
 
-func (s *Server) handleWSListSessions(ws *wsConn) {
+func (s *Server) handleWSListSessions(ws *wsConn, rt *sessionRuntime) {
 	// Listing hits the session store on disk (metadata index read, label
 	// migration file reads, legacy full-scan fallback). Run it off the WS
 	// read loop like handleWSListModels, so a slow store cannot block chat,
 	// FS, or editor messages behind the sidebar.
 	go func() {
-		_, sessions, listErr := s.agent.FormatSessionListForUI()
+		_, sessions, listErr := rt.agent.FormatSessionListForUI()
 		if listErr != nil {
 			_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", listErr)})
 			return
 		}
 		// Read the current session id after listing so the "current" marker
 		// is as fresh as possible.
-		var sessionID string
-		s.lockAgentRead(func() {
-			sessionID = s.agent.SessionID
-		})
+		// SessionID is immutable in web mode (set at agent construction;
+		// session ops create new agents rather than mutating live ones), so no
+		// turnMu is needed — a running turn holds it for its entire duration
+		// and would otherwise delay the sidebar list behind the responding
+		// session.
+		sessionID := rt.agent.SessionID
+		// The reply deliberately carries NO SessionID: the sessions payload
+		// is connection-scoped sidebar state (the full saved list), not a
+		// message for one session. Tagging it with the current session id
+		// made the client route (and possibly drop) it when that id was not
+		// the active pane — e.g. after another tab moved the global default.
 		_ = ws.writeJSON(WSMessage{
-			Type:      "sessions",
-			Sessions:  sessionEntries(sessions, sessionID),
-			SessionID: sessionID,
+			Type:     "sessions",
+			Sessions: sessionEntries(sessions, sessionID, s.registry.activeSet()),
 		})
 	}()
 }
 
-func (s *Server) handleWSSessionAction(ws *wsConn, ctx context.Context, stream *wsConnStream, msg WSMessage) {
-	if !s.acquireTurnForHandler(ws, stream) {
-		return
-	}
-	if (msg.Type == "session_resume" || msg.Type == "session_delete") && strings.TrimSpace(msg.SessionID) == "" {
-		s.turnMu.Unlock()
-		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: sessionId is required"})
-		return
-	}
+func (s *Server) handleWSSessionAction(ws *wsConn, ctx context.Context, pane **sessionRuntime, msg WSMessage) {
 	var cmd string
 	switch msg.Type {
 	case "session_new":
 		cmd = "/new"
-	case "session_resume":
-		cmd = "resume " + strings.TrimSpace(msg.SessionID)
-	case "session_delete":
-		cmd = "resume del " + strings.TrimSpace(msg.SessionID)
+	case "session_resume", "session_delete":
+		if strings.TrimSpace(msg.SessionID) == "" {
+			_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: sessionId is required"})
+			return
+		}
+		if msg.Type == "session_resume" {
+			cmd = "resume " + strings.TrimSpace(msg.SessionID)
+		} else {
+			cmd = "resume del " + strings.TrimSpace(msg.SessionID)
+		}
 	case "session_fork":
 		forkArg := fmt.Sprintf("%d", msg.MessageIndex)
 		if msg.MessageIndex < 0 {
@@ -883,22 +1257,24 @@ func (s *Server) handleWSSessionAction(ws *wsConn, ctx context.Context, stream *
 		cmd = "fork " + forkArg
 	}
 
-	result, _, err := s.agent.HandleSessionCommand(ctx, cmd, sesspkg.NewID())
-	s.turnMu.Unlock()
-	s.writeSessionCommandResult(ws, ctx, result, err)
+	// Registry lifecycle ops (Phase 4): no turn lock needed — new/resume/
+	// fork leave the previous session running (continuation), delete drains
+	// its own target (E10).
+	result, _, err := s.runSessionCommand(ctx, ws, pane, cmd)
+	s.writeSessionCommandResult(ws, ctx, *pane, result, err)
 }
 
-func (s *Server) handleWSListModels(ws *wsConn, ctx context.Context) {
+func (s *Server) handleWSListModels(ws *wsConn, ctx context.Context, rt *sessionRuntime) {
 	go func() {
-		models, err := s.agent.ListModels(ctx)
+		models, err := rt.agent.ListModels(ctx)
 		if err != nil {
 			_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", err)})
 			return
 		}
-		var current string
-		s.lockAgentRead(func() {
-			current = s.agent.CurrentModel()
-		})
+		// CurrentModel reads under the provider's own modelsMu (the same
+		// contract agentConfigMsgBasic relies on), so no turnMu is needed —
+		// a running turn never delays the model catalog reply.
+		current := rt.agent.CurrentModel()
 		_ = ws.writeJSON(WSMessage{
 			Type:   "models",
 			Model:  current,
@@ -907,56 +1283,88 @@ func (s *Server) handleWSListModels(ws *wsConn, ctx context.Context) {
 	}()
 }
 
-func (s *Server) handleWSSetModel(ws *wsConn, ctx context.Context, stream *wsConnStream, msg WSMessage) {
-	if !s.acquireTurnForHandler(ws, stream) {
+func (s *Server) handleWSSetModel(ws *wsConn, ctx context.Context, rt *sessionRuntime, msg WSMessage) {
+	if !rt.acquireTurnForHandler(ws) {
 		return
 	}
-	err := s.agent.SelectModel(ctx, msg.Model)
-	cfg := s.agentConfigMsg(ctx)
-	s.turnMu.Unlock()
+	a := rt.agent
+	err := a.SelectModel(ctx, msg.Model)
+	cfg := agentConfigMsgBasic(a)
+	fillModelPricing(a, &cfg)
+	rt.turnMu.Unlock()
 	if err != nil {
 		_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", err)})
 		return
 	}
-	_ = ws.writeJSON(cfg)
+	// Model is per-session (D1): SelectModel above applied to this pane's
+	// provider only. The workspace default (ws.Model) is fixed at startup and
+	// never mutated here, and no other session's provider is touched, so two
+	// panes can run different models concurrently (E6). The config echo goes
+	// to this pane only (its own Mode/ThinkingLevel/Model).
+	// Tokenization + echo off the read loop: ContextStats on a large
+	// uncached session takes seconds, and the read loop serializes every
+	// message (including pane switches).
+	go func() {
+		accum := a.SnapshotUsageAccum()
+		applyContextStats(&cfg, a.ContextStats(ctx), &accum)
+		_ = ws.writeJSON(cfg)
+	}()
 }
 
-func (s *Server) handleWSSetMode(ws *wsConn, ctx context.Context, stream *wsConnStream, msg WSMessage) {
-	if !s.acquireTurnForHandler(ws, stream) {
+func (s *Server) handleWSSetMode(ws *wsConn, ctx context.Context, rt *sessionRuntime, msg WSMessage) {
+	if !rt.acquireTurnForHandler(ws) {
 		return
 	}
+	a := rt.agent
 	modeSet := false
 	var cfg WSMessage
-	s.lockAgentWrite(func() {
-		if m, ok := agent.ParseMode(msg.Mode); ok {
-			s.agent.SetMode(m)
-			modeSet = true
-			cfg = s.agentConfigMsgBasic()
-		}
-	})
-	s.turnMu.Unlock()
+	if m, ok := agent.ParseMode(msg.Mode); ok {
+		a.SetMode(m)
+		modeSet = true
+		cfg = agentConfigMsgBasic(a)
+	}
+	rt.turnMu.Unlock()
 	if modeSet {
-		accum := s.agent.SnapshotUsageAccum()
-		applyContextStats(&cfg, s.agent.ContextStats(ctx), &accum)
-		_ = ws.writeJSON(cfg)
+		// Echo off the read loop (tokenization can take seconds on a large
+		// uncached session; the read loop serializes every message).
+		go func() {
+			accum := a.SnapshotUsageAccum()
+			applyContextStats(&cfg, a.ContextStats(ctx), &accum)
+			_ = ws.writeJSON(cfg)
+		}()
 	}
 }
 
-func (s *Server) handleWSSetThinkingLevel(ws *wsConn, ctx context.Context, stream *wsConnStream, msg WSMessage) {
-	if !s.acquireTurnForHandler(ws, stream) {
+func (s *Server) handleWSSetThinkingLevel(ws *wsConn, ctx context.Context, rt *sessionRuntime, msg WSMessage) {
+	if !rt.acquireTurnForHandler(ws) {
 		return
 	}
-	s.lockAgentWrite(func() {
-		if level, ok := agent.ParseThinkingLevel(msg.ThinkingLevel); ok {
-			s.agent.SetThinkingLevel(level)
-		}
-	})
-	cfg := s.agentConfigMsg(ctx)
-	s.turnMu.Unlock()
-	_ = ws.writeJSON(cfg)
+	a := rt.agent
+	if level, ok := agent.ParseThinkingLevel(msg.ThinkingLevel); ok {
+		a.SetThinkingLevel(level)
+	}
+	cfg := agentConfigMsgBasic(a)
+	rt.turnMu.Unlock()
+	fillModelPricing(a, &cfg)
+	// Echo off the read loop (tokenization can take seconds on a large
+	// uncached session; the read loop serializes every message).
+	go func() {
+		accum := a.SnapshotUsageAccum()
+		applyContextStats(&cfg, a.ContextStats(ctx), &accum)
+		_ = ws.writeJSON(cfg)
+	}()
 }
 
-func (s *Server) handleWSConfig(ws *wsConn, ctx context.Context, stream *wsConnStream, msg WSMessage) {
+func (s *Server) handleWSConfig(ws *wsConn, ctx context.Context, pane **sessionRuntime, msg WSMessage) {
+	// Changing the working directory is only allowed in global mode: in
+	// project mode the server is scoped to one project directory and
+	// sessions persist under it, so re-pointing the workspace would orphan
+	// sessions and escape the project boundary. The TUI's /dir command is a
+	// separate path (not web mode) and is unaffected.
+	if !s.ws.GlobalMode {
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: changing the working directory is only allowed in global mode (start gogen with --global)"})
+		return
+	}
 	absDir, err := filepath.Abs(msg.WorkingDir)
 	if err != nil {
 		_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: invalid path: %v", err)})
@@ -967,60 +1375,183 @@ func (s *Server) handleWSConfig(ws *wsConn, ctx context.Context, stream *wsConnS
 		_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: directory does not exist: %s", absDir)})
 		return
 	}
-	if !s.acquireTurnForHandler(ws, stream) {
-		return
+	// The working dir is workspace-global. Interrupt the pane's own turn
+	// (cancel-then-lock), then sync the change to EVERY session agent under
+	// its own turn lock in a fixed (sorted) order (E12) — SetWorkingDir /
+	// AfterWorkingDirChange mutate persist fields that a mid-turn doPersist
+	// would race, so each must run under that session's turn lock.
+	rt := *pane
+	if rt.ownsTurn(ws) {
+		rt.stream.cancelInFlight()
 	}
-	var cfg WSMessage
-	s.lockAgentWrite(func() {
-		s.agent.SetWorkingDir(absDir)
-		s.config.WorkingDir = absDir
-		cfg = s.agentConfigMsgBasic()
-	})
-	s.agent.AfterWorkingDirChange()
-	s.turnMu.Unlock()
-	accum := s.agent.SnapshotUsageAccum()
-	applyContextStats(&cfg, s.agent.ContextStats(ctx), &accum)
-	_ = ws.writeJSON(WSMessage{Type: "config", WorkingDir: absDir, Model: cfg.Model, ContextLimit: cfg.ContextLimit, UsedTokens: cfg.UsedTokens, UsedSource: cfg.UsedSource, UsedPercent: cfg.UsedPercent, CompactAt: cfg.CompactAt, MessageCount: cfg.MessageCount, NearCompact: cfg.NearCompact, WarnNearCompact: cfg.WarnNearCompact, ToolTruncated: cfg.ToolTruncated, Mode: cfg.Mode})
+	// Deliberately do NOT mirror the change into s.config.WorkingDir: the
+	// server never re-reads that field after construction (SaveConfig is
+	// reachable only from the --save-config CLI flag and the TUI, both
+	// outside web mode), and writing it here would be an unsynchronized
+	// write to a struct other goroutines read for unrelated fields. The
+	// authoritative runtime value is ws.WorkingDir (set below) and the
+	// per-session agents' WorkingDir (applyWorkingDirToAll).
+	s.ws.SetWorkingDir(absDir)
+	// Apply to every session agent OFF the read loop (E12): a running turn
+	// holds its session's turnMu for its ENTIRE duration, so waiting for all
+	// of them here would freeze this connection's messages — pane switches,
+	// sends, cancels — for as long as the longest running turn. The dir is
+	// workspace-global; each agent's SetWorkingDir is atomic under its own
+	// turnMu, so messages issued while the change is in flight simply see
+	// the pre-change dir until their session is updated.
+	go func(paneRT *sessionRuntime) {
+		skipped := s.applyWorkingDirToAll(absDir)
+		a := paneRT.agent
+		if !paneRT.turnMu.TryRLock() {
+			// The pane's own turn is still stuck (the sweep skipped it): the
+			// config echo would hang on the lock. Send the skip report and
+			// let the next config request or the turn end re-sync the client.
+			if len(skipped) > 0 {
+				_ = ws.writeJSON(WSMessage{Type: "response", Content: workingDirSkipMessage(absDir, skipped)})
+			}
+			return
+		}
+		cfg := agentConfigMsgBasic(a)
+		paneRT.turnMu.RUnlock()
+		accum := a.SnapshotUsageAccum()
+		applyContextStats(&cfg, a.ContextStats(ctx), &accum)
+		_ = ws.writeJSON(WSMessage{Type: "config", WorkingDir: absDir, Model: cfg.Model, ContextLimit: cfg.ContextLimit, UsedTokens: cfg.UsedTokens, UsedSource: cfg.UsedSource, UsedPercent: cfg.UsedPercent, CompactAt: cfg.CompactAt, MessageCount: cfg.MessageCount, NearCompact: cfg.NearCompact, WarnNearCompact: cfg.WarnNearCompact, ToolTruncated: cfg.ToolTruncated, Mode: cfg.Mode, GlobalMode: cfg.GlobalMode})
+		if len(skipped) > 0 {
+			_ = ws.writeJSON(WSMessage{Type: "response", Content: workingDirSkipMessage(absDir, skipped)})
+		}
+	}(*pane)
+}
+
+// applyWorkingDirToAll syncs a workspace working-dir change to every session
+// agent. Each agent's SetWorkingDir + AfterWorkingDirChange run under its own
+// turn lock, acquired one at a time in sorted id order (never nested, so no
+// lock-order deadlock; a running turn must finish or be cancelled before its
+// session's lock is taken). Sessions that cannot be quiesced within the
+// standard drain budget are skipped and returned so the caller can report
+// them; they keep the pre-change directory until their turn finishes and the
+// change is re-issued.
+func (s *Server) applyWorkingDirToAll(absDir string) (skipped []string) {
+	ids := s.registry.activeIDs()
+	sort.Strings(ids)
+	// A working-dir change relocates every session's persisted state into the
+	// new directory: each agent's SetWorkingDir + AfterWorkingDirChange below
+	// forces a full save there, which would stamp Updated=now on every open
+	// session — the saved-session list would rank them all as "just updated"
+	// even though none was interacted with. Capture each session's current
+	// persisted Updated (from its pre-change directory — each agent's
+	// WorkingDir still points there until the sweep) and restore it into the
+	// new directory's index right after the flush. Best-effort: sessions with
+	// no persisted state (never-saved /new panes) or a failed restore keep
+	// the fresh stamp, matching the pre-fix behavior.
+	for _, id := range ids {
+		rt, ok := s.registry.get(id)
+		if !ok {
+			continue
+		}
+		// Bounded wait instead of a blocking Lock: a running (possibly
+		// stuck) turn holds its session's turnMu for its ENTIRE duration,
+		// and a blocking Lock here would hang the goroutine — and the
+		// working-dir change — on that one session forever. Only the
+		// requesting pane's turn was cancelled above; other sessions' turns
+		// are not interrupted (E29).
+		if !rt.tryAcquireTurn(wsTurnAcquireWait) {
+			if !rt.tryAcquireTurn(wsStreamDrainWait) {
+				skipped = append(skipped, id)
+				continue
+			}
+		}
+		var prevUpdated time.Time
+		if s.ws.Store != nil {
+			prevUpdated = s.ws.Store.UpdatedAt(rt.agent.WorkingDir, id)
+		}
+		rt.agent.SetWorkingDir(absDir)
+		rt.agent.AfterWorkingDirChange()
+		if s.ws.Store != nil && !prevUpdated.IsZero() {
+			_ = s.ws.Store.SetUpdatedAt(absDir, id, prevUpdated)
+		}
+		rt.turnMu.Unlock()
+	}
+	return skipped
+}
+
+// workingDirSkipMessage reports a partially-applied working-dir change: the
+// listed sessions were busy (running turns that were not interrupted) and
+// still use the old directory.
+func workingDirSkipMessage(absDir string, skipped []string) string {
+	return fmt.Sprintf("Working directory set to %s; %d session(s) were busy and still use the old directory (re-issue the change once their turns finish): %s",
+		absDir, len(skipped), strings.Join(skipped, ", "))
 }
 
 // handleWSCompact runs the manual compaction command (/compact) for a web
 // client. Unlike a regular message it never reaches the LLM as a prompt: it
-// cancels any in-flight turn, acquires the agent turn lock, emits a
+// cancels any in-flight turn, acquires the session turn lock, emits a
 // "compacting" event so the client can show a persistent progress indicator,
 // runs CompactHistory (which may take a while — it summarizes the middle via
 // the provider), then reports the result and refreshed context stats. Runs in
 // a goroutine so the slow summarization does not block the WS read loop.
-func (s *Server) handleWSCompact(ws *wsConn, r *http.Request, stream *wsConnStream) {
-	stream.cancelInFlight()
-	if !s.tryAcquireTurn(wsTurnAcquireWait) {
+func (s *Server) handleWSCompact(ws *wsConn, r *http.Request, rt *sessionRuntime) {
+	// Interrupt semantics are scoped to the connection that owns the current
+	// turn (E29): a second connection attached as a viewer must not kill a
+	// turn it does not own — it waits and gets the busy rejection instead.
+	if rt.ownsTurn(ws) {
+		rt.stream.cancelInFlight()
+	}
+	if !rt.tryAcquireTurn(wsTurnAcquireWait) {
 		// Cancel may have timed out while a tool was still exiting; wait once more.
-		stream.cancelInFlight()
-		if !s.tryAcquireTurn(wsStreamDrainWait) {
+		if rt.ownsTurn(ws) {
+			rt.stream.cancelInFlight()
+		}
+		if !rt.tryAcquireTurn(wsStreamDrainWait) {
 			_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
 			return
 		}
 	}
+	// Same eviction guard as handleWSUserMessage/acquireTurnForHandler: the
+	// session may have left the registry while we waited for the lock; a
+	// compact on an evicted runtime would be invisible to shutdown.
+	if rt.evicted.Load() {
+		rt.turnMu.Unlock()
+		return
+	}
+	// Mark the session as "busy" for the compaction duration so a
+	// reconnecting client's session_state shows "resuming…" instead of
+	// "idle" while the summarization runs, and so session listings/other
+	// connections see an in-flight turn (mirrors startTurn). The owner is
+	// this connection; its cancel can interrupt nothing here (no LLM stream
+	// is running), but the state must be cleared BEFORE the lock is released
+	// so the next turn never sees a stale turnActive/turnOwner.
+	rt.setTurnActive(true, time.Now(), ws)
 	go func() {
-		defer s.turnMu.Unlock()
-		_ = ws.writeJSON(WSMessage{Type: "compacting"})
-		if err := s.agent.CompactHistory(r.Context()); err != nil {
-			_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: " + err.Error()})
+		// Orphan check runs LAST (after turnMu.Unlock): if the only client
+		// left mid-compact, the idle runtime goes back to the saved list.
+		defer rt.evictOrphanedIfPossible()
+		defer rt.setTurnActive(false, time.Time{}, nil)
+		defer rt.turnMu.Unlock()
+		_ = ws.writeJSON(WSMessage{Type: "compacting", SessionID: rt.agent.SessionID})
+		if err := rt.agent.CompactHistory(r.Context()); err != nil {
+			_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: " + err.Error(), SessionID: rt.agent.SessionID})
 		} else {
-			_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("History compacted (%d messages remaining).", s.agent.MessageCount())})
+			_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("History compacted (%d messages remaining).", rt.agent.MessageCount()), SessionID: rt.agent.SessionID})
 		}
-		_ = ws.writeJSON(s.contextMsg(r.Context()))
+		_ = ws.writeJSON(contextMsg(r.Context(), rt.agent))
 	}()
 }
 
-func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, stream *wsConnStream, session *wsSession, msg WSMessage) {
-	stream.cancelInFlight()
+func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **sessionRuntime, msg WSMessage) {
+	rt := *pane
+	// Interrupt semantics apply only to the connection that owns the current
+	// turn; a second connection's message must not cancel a turn it does not
+	// own (E29) — it gets the busy rejection below.
+	if rt.ownsTurn(ws) {
+		rt.stream.cancelInFlight()
+	}
 
 	// A literal /compact typed into the composer (or sent by older clients)
 	// routes to the real compact command instead of reaching the LLM as a
 	// prompt. /compact is registered TUI-only, but the web banner and command
 	// palette rely on this path.
 	if strings.TrimSpace(msg.Content) == "/compact" {
-		s.handleWSCompact(ws, r, stream)
+		s.handleWSCompact(ws, r, rt)
 		return
 	}
 
@@ -1031,18 +1562,19 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, stream *wsConn
 
 	if sel, isModels := agent.ParseModelsCommand(msg.Content); isModels && sel == "" {
 		go func(content string) {
-			out, _, err := s.agent.HandleModelsCommand(r.Context(), content)
+			a := rt.agent
+			out, _, err := a.HandleModelsCommand(r.Context(), content)
 			resp := WSMessage{Type: "response", Content: out}
 			if err != nil {
 				resp.Content = fmt.Sprintf("Error: %v", err)
 				_ = ws.writeJSON(resp)
 				return
 			}
-			if models, listErr := s.agent.ListModels(r.Context()); listErr == nil && len(models) > 1 {
+			if models, listErr := a.ListModels(r.Context()); listErr == nil && len(models) > 1 {
 				resp.Type = "models"
 				resp.Models = s.modelEntries(models)
 			}
-			cfg := s.agentConfigMsg(r.Context())
+			cfg := agentConfigMsg(r.Context(), rt)
 			resp.Model = cfg.Model
 			resp.ContextLimit = cfg.ContextLimit
 			resp.UsedTokens = cfg.UsedTokens
@@ -1053,72 +1585,90 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, stream *wsConn
 		return
 	}
 
-	if !s.tryAcquireTurn(wsTurnAcquireWait) {
-		// Cancel may have timed out while a tool was still exiting; wait once more.
-		stream.cancelInFlight()
-		if !s.tryAcquireTurn(wsStreamDrainWait) {
+	// The turn lock is held across the whole command dispatch below, exactly
+	// like the old global turnMu: tryAcquireTurn acquires it, each handled
+	// branch releases it before returning, and the unhandled fall-through
+	// hands it to rt.startTurn's goroutine, which defers the unlock.
+	if !rt.tryAcquireTurn(wsTurnAcquireWait) {
+		// Cancel may have timed out while a tool was still exiting; wait once
+		// more. Only re-cancel when this connection owns the turn — a second
+		// connection must not kill a turn it does not own (E29).
+		if rt.ownsTurn(ws) {
+			rt.stream.cancelInFlight()
+		}
+		if !rt.tryAcquireTurn(wsStreamDrainWait) {
 			_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
 			return
 		}
 	}
 
-	var modeOut string
-	var modeHandled bool
-	var modeCfg WSMessage
-	s.lockAgentWrite(func() {
-		modeOut, modeHandled = s.agent.HandleModeCommand(msg.Content)
-		if modeHandled {
-			modeCfg = s.agentConfigMsgBasic()
-		}
-	})
+	// The session may have been evicted (registry cap / delete) after this
+	// connection resolved it (e.g. a stale id-less pane). Starting a turn on
+	// an evicted runtime would be invisible to cancel/prune/shutdown. The
+	// flag is set while the eviction holds turnMu, so the check under the
+	// lock is race-free (see acquireTurnForHandler). Drop silently — the
+	// client already got session_detached and closed the pane.
+	if rt.evicted.Load() {
+		rt.turnMu.Unlock()
+		return
+	}
+
+	a := rt.agent
+	modeOut, modeHandled := a.HandleModeCommand(msg.Content)
 	if modeHandled {
-		s.turnMu.Unlock()
-		accum := s.agent.SnapshotUsageAccum()
-		applyContextStats(&modeCfg, s.agent.ContextStats(r.Context()), &accum)
-		_ = ws.writeJSON(modeCfg)
-		_ = ws.writeJSON(WSMessage{Type: "response", Content: modeOut})
+		modeCfg := agentConfigMsgBasic(a)
+		rt.turnMu.Unlock()
+		// Tokenization + echo off the read loop (large uncached sessions
+		// take seconds; the read loop serializes every message).
+		go func(cfg WSMessage, out string) {
+			accum := a.SnapshotUsageAccum()
+			applyContextStats(&cfg, a.ContextStats(r.Context()), &accum)
+			_ = ws.writeJSON(cfg)
+			_ = ws.writeJSON(WSMessage{Type: "response", Content: out})
+		}(modeCfg, modeOut)
 		return
 	}
 
-	var thinkOut string
-	var thinkHandled bool
-	s.lockAgentWrite(func() {
-		thinkOut, thinkHandled = s.agent.HandleThinkingCommand(msg.Content)
-	})
+	thinkOut, thinkHandled := a.HandleThinkingCommand(msg.Content)
 	if thinkHandled {
-		s.turnMu.Unlock()
-		cfg := s.agentConfigMsg(r.Context())
-		cfg.ThinkingLevel = string(s.agent.ThinkingLevel)
-		_ = ws.writeJSON(cfg)
-		_ = ws.writeJSON(WSMessage{Type: "response", Content: thinkOut})
+		rt.turnMu.Unlock()
+		go func(out string) {
+			cfg := agentConfigMsg(r.Context(), rt)
+			_, thinking := a.ModeAndThinkingLevel()
+			cfg.ThinkingLevel = string(thinking)
+			_ = ws.writeJSON(cfg)
+			_ = ws.writeJSON(WSMessage{Type: "response", Content: out})
+		}(thinkOut)
 		return
 	}
 
-	var ctxOut string
-	var ctxHandled bool
-	ctxOut, ctxHandled = s.agent.HandleContextCommand(r.Context(), msg.Content)
+	ctxOut, ctxHandled := a.HandleContextCommand(r.Context(), msg.Content)
 	if ctxHandled {
-		s.turnMu.Unlock()
-		ctxMsg := s.contextMsg(r.Context())
-		_ = ws.writeJSON(ctxMsg)
-		_ = ws.writeJSON(WSMessage{Type: "response", Content: ctxOut})
+		rt.turnMu.Unlock()
+		go func(out string) {
+			ctxMsg := contextMsg(r.Context(), a)
+			_ = ws.writeJSON(ctxMsg)
+			_ = ws.writeJSON(WSMessage{Type: "response", Content: out})
+		}(ctxOut)
 		return
 	}
 
-	var sessResult agent.SessionCommandResult
-	var sessHandled bool
-	var sessErr error
-	sessResult, sessHandled, sessErr = s.agent.HandleSessionCommand(r.Context(), msg.Content, sesspkg.NewID())
+	// Session slash commands (/new, /resume, /sessions, /fork, resume del)
+	// route through the registry (Phase 4) instead of mutating the agent.
+	sessResult, sessHandled, sessErr := s.runSessionCommand(r.Context(), ws, pane, msg.Content)
 	if sessHandled {
-		s.turnMu.Unlock()
-		s.writeSessionCommandResult(ws, r.Context(), sessResult, sessErr)
+		rt.turnMu.Unlock()
+		s.writeSessionCommandResult(ws, r.Context(), *pane, sessResult, sessErr)
 		return
 	}
 
 	if sel, isModels := agent.ParseModelsCommand(msg.Content); isModels && sel != "" {
-		out, _, modelErr := s.agent.HandleModelsCommand(r.Context(), msg.Content)
-		cfg := s.agentConfigMsg(r.Context())
-		s.turnMu.Unlock()
+		out, _, modelErr := a.HandleModelsCommand(r.Context(), msg.Content)
+		cfg := agentConfigMsgBasic(a)
+		rt.turnMu.Unlock()
+		fillModelPricing(a, &cfg)
+		accum := a.SnapshotUsageAccum()
+		applyContextStats(&cfg, a.ContextStats(r.Context()), &accum)
 		resp := WSMessage{Type: "response", Content: out}
 		if modelErr != nil {
 			resp.Content = fmt.Sprintf("Error: %v", modelErr)
@@ -1134,35 +1684,57 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, stream *wsConn
 		return
 	}
 
-	s.startAsyncStreamingTurn(ws, r, stream, session, msg.Content)
+	rt.startTurn(ws, msg.Content)
 }
 
-func (s *Server) startAsyncStreamingTurn(ws *wsConn, r *http.Request, stream *wsConnStream, session *wsSession, content string) {
-	streamCtx, streamCancel := context.WithCancel(r.Context())
-	llmCtx, llmCancel := context.WithCancel(streamCtx)
-	errCh := stream.begin(streamCancel, llmCancel)
-	go func(content string, llmCtx context.Context, done chan error) {
-		defer stream.end()
+// startTurn begins a streaming turn owned by the session runtime. The caller
+// (the connection read loop) must already hold rt.turnMu; the goroutine
+// defers the unlock. The turn context derives from context.Background() plus
+// the runtime's own cancel handles — NOT the HTTP request context, which is
+// cancelled the moment HandleWS returns and would silently abort the headless
+// turn (§4, third kill path). owner is the connection that started the turn
+// (the only one allowed to interrupt it via the cancel-then-lock path, E29).
+func (rt *sessionRuntime) startTurn(owner *wsConn, content string) {
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	errCh := rt.stream.begin(streamCancel)
+	rt.setTurnActive(true, time.Now(), owner)
+	go func(content string, turnCtx context.Context, done chan error) {
+		// Defers run LIFO, so the cleanup executes in this order: turn_end
+		// broadcast → setTurnActive(false) → done → stream.end() →
+		// turnMu.Unlock().
+		// The turn state must be cleared BEFORE the lock is released: a new
+		// turn can only start once the lock is free, and it must never see
+		// (or clobber) a stale turnActive/turnOwner from the turn it
+		// replaced. turn_end is broadcast while the lock is still held so a
+		// new turn's first events can never interleave ahead of it.
+		// stream.end() must also run before the lock is released: it clears
+		// the runtime's shared stream handles, and the next turn's begin()
+		// runs as soon as the lock is free. If end() ran after unlock, a
+		// fast consecutive turn would have its freshly registered cancel
+		// handles wiped by the previous turn's end() — losing the ability
+		// to cancel the new turn.
+		// The orphan check runs LAST (after turnMu.Unlock): a headless turn
+		// that finishes with zero attached clients leaves an idle runtime
+		// nobody is viewing — evict it so it reads as a plain saved session.
+		defer rt.evictOrphanedIfPossible()
+		defer rt.turnMu.Unlock()
+		defer rt.stream.end()
 		defer func() { done <- nil }()
-		defer s.turnMu.Unlock()
-		defer func() {
-			_ = ws.writeJSON(WSMessage{Type: "turn_end"})
-		}()
-		ctx := agent.ContextWithDeleteApprover(llmCtx, session.deleteApprover())
-		var writeFailed atomic.Bool
-		failWrite := sync.Once{}
+		defer rt.setTurnActive(false, time.Time{}, nil)
+		defer rt.broadcast(WSMessage{Type: "turn_end", SessionID: rt.agent.SessionID})
+		ctx := agent.ContextWithDeleteApprover(turnCtx, rt.deleteApprover())
+		// write fans out to every attached socket and tags the source
+		// sessionId. A write failure detaches that socket (broadcast does it);
+		// it NEVER cancels the LLM call — the turn belongs to the session and
+		// keeps running headless (§4).
 		write := func(v WSMessage) {
 			if ctx.Err() != nil {
 				return
 			}
-			if err := ws.writeJSON(v); err != nil {
-				writeFailed.Store(true)
-				failWrite.Do(func() {
-					llmCancel()
-					_ = ws.conn.Close()
-				})
-				return
+			if v.SessionID == "" {
+				v.SessionID = rt.agent.SessionID
 			}
+			rt.broadcast(v)
 		}
 		tokens := streamutil.NewTokenBatcher(func(think bool, text string) {
 			if think {
@@ -1191,7 +1763,7 @@ func (s *Server) startAsyncStreamingTurn(ws *wsConn, r *http.Request, stream *ws
 				// that StreamProcessInput just appended (for edit/resend).
 				// Index goes in Content because WSMessage.Index has omitempty
 				// and the first message is index 0.
-				userIdx := s.agent.MessageCount() - 1
+				userIdx := rt.agent.MessageCount() - 1
 				if userIdx >= 0 {
 					write(WSMessage{Type: "user_acked", Content: fmt.Sprintf("%d", userIdx)})
 				}
@@ -1199,14 +1771,14 @@ func (s *Server) startAsyncStreamingTurn(ws *wsConn, r *http.Request, stream *ws
 				if ctx.Err() != nil {
 					return
 				}
-				write(s.contextMsg(ctx))
+				write(contextMsg(ctx, rt.agent))
 			},
 			OnRoundStart: func() {
 				write(WSMessage{Type: "thinking"})
 				if ctx.Err() != nil {
 					return
 				}
-				write(s.contextMsg(ctx))
+				write(contextMsg(ctx, rt.agent))
 			},
 			OnStreamOpened: func() {
 				write(WSMessage{Type: "waiting"})
@@ -1308,21 +1880,26 @@ func (s *Server) startAsyncStreamingTurn(ws *wsConn, r *http.Request, stream *ws
 			},
 		}
 
-		_, err := s.agent.StreamProcessInput(ctx, content, handlers)
+		_, err := rt.agent.StreamProcessInput(ctx, content, handlers)
 		var persistErr error
 		var ctxMsg WSMessage
 		if err == nil {
-			s.lockAgentWrite(func() {
-				persistErr = s.agent.ConsumePersistError()
-			})
-			ctxMsg = s.contextMsg(r.Context())
+			// No turnMu re-acquire here: this goroutine already holds the
+			// session turn lock (handed off by handleWSUserMessage) for the
+			// whole turn. ConsumePersistError is internally synchronized
+			// (persistMu), so it is safe even when a shutdown/delete/eviction
+			// flush runs concurrently without turnMu.
+			persistErr = rt.agent.ConsumePersistError()
+			// context.Background() rather than the (dead) request context:
+			// the turn outlives the connection (§4).
+			ctxMsg = contextMsg(context.Background(), rt.agent)
 		}
 		if err != nil {
 			if ctx.Err() != nil {
 				tokens.Flush()
-				if !writeFailed.Load() {
-					_ = ws.writeJSON(WSMessage{Type: "cancelled", Content: "Cancelled."})
-				}
+				// Broadcast directly (not via write, which early-returns on a
+				// cancelled ctx) so the cancellation reaches attached clients.
+				rt.broadcast(WSMessage{Type: "cancelled", Content: "Cancelled.", SessionID: rt.agent.SessionID})
 				return
 			}
 			tokens.Flush()
@@ -1339,7 +1916,7 @@ func (s *Server) startAsyncStreamingTurn(ws *wsConn, r *http.Request, stream *ws
 		if ctxMsg.Type != "" {
 			write(ctxMsg)
 		}
-	}(content, llmCtx, errCh)
+	}(content, streamCtx, errCh)
 }
 
 func (s *Server) HandleStatic(w http.ResponseWriter, r *http.Request) {
@@ -1371,13 +1948,31 @@ func (s *Server) HandleStatic(w http.ResponseWriter, r *http.Request) {
 
 	// Serve embedded assets under /monaco/... (and future static paths).
 	rel := strings.TrimPrefix(path, "/")
-	if strings.Contains(rel, "..") {
+	if hasPathTraversal(rel) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
 	name := "web/" + rel
 	ct := contentTypeForExt(filepath.Ext(name))
-	s.serveEmbedded(w, r, name, ct, "public, max-age=86400", false)
+	// no-cache: the UI assets are embedded in the binary and change with every
+	// rebuild; a 24h max-age kept browsers serving stale app.js (the "rebuilt
+	// but the fix isn't showing" class of bugs). The ETag below still yields
+	// 304s when the bytes are unchanged, so reloads stay cheap.
+	s.serveEmbedded(w, r, name, ct, "no-cache", false)
+}
+
+// hasPathTraversal reports whether any path element is ".." (a traversal
+// attempt). A substring check would also reject legitimate asset names that
+// contain ".." (e.g. "foo..bar.js"); only exact ".." elements escape the
+// embedded tree. The embed.FS lookup itself rejects ".." elements too, so
+// this is defense-in-depth with a clearer 404.
+func hasPathTraversal(p string) bool {
+	for _, part := range strings.Split(filepath.ToSlash(p), "/") {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // serveEmbedded serves an embedded asset from the static asset cache, reading
@@ -1503,6 +2098,7 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", s.HandleWS)
+	mux.HandleFunc("/ws/editor", s.HandleWSEditor)
 	mux.HandleFunc("/", s.HandleStatic)
 	srv := &http.Server{Addr: addr, Handler: mux}
 

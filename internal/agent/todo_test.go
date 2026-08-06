@@ -3,9 +3,11 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"gogen/internal/llm"
@@ -122,5 +124,51 @@ func TestImportLegacyFileOnce(t *testing.T) {
 	tm2 := NewTodoManager(dir)
 	if tm2.ImportLegacyFile() {
 		t.Fatal("legacy should not import again")
+	}
+}
+
+func TestTodoManagerConcurrentAccess(t *testing.T) {
+	// TodoManager must be safe to snapshot (flush paths hold no turn lock:
+	// ShutdownSessions after a drain timeout, sessionDelete with a stuck
+	// turn) while a turn mutates todos. Run this under -race to verify.
+	m := NewTodoManager(t.TempDir())
+	var wg sync.WaitGroup
+
+	// Mutators: todo tools on the "turn" goroutine.
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				text := fmt.Sprintf("task %d-%d", g, i)
+				_, _ = m.AddTodo(text)
+				if i%10 == 0 {
+					_ = m.Snapshot()
+					_ = m.ListTodos()
+				}
+				if i%25 == 0 {
+					_, _ = m.ClearDoneTodos()
+					_, _ = m.DoneTodo(1)
+				}
+			}
+		}(g)
+	}
+
+	// Readers: doPersist-style snapshots and legacy-file saves.
+	for g := 0; g < 2; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				_ = m.Snapshot()
+				_ = m.Empty()
+				_ = m.saveLegacy()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if m.Empty() {
+		t.Fatalf("expected todos to survive concurrent access")
 	}
 }

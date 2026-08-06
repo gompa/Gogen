@@ -48,6 +48,7 @@ func Merge(pf *ProjectFile, flags FlagOverrides) *config.Config {
 		WebTLSKeyFile:        mergeString("GOGEN_WEB_TLS_KEY", file.WebTLSKeyFile, def.WebTLSKeyFile),
 		SessionMaxCount:      mergeInt("GOGEN_SESSION_MAX_COUNT", file.SessionMaxCount, def.SessionMaxCount),
 		SessionMaxAgeDays:    mergeInt("GOGEN_SESSION_MAX_AGE_DAYS", file.SessionMaxAgeDays, def.SessionMaxAgeDays),
+		WebMaxActiveSessions: mergeInt("GOGEN_WEB_MAX_ACTIVE_SESSIONS", file.WebMaxActiveSessions, def.WebMaxActiveSessions),
 		WebFetch:             mergeString("GOGEN_WEB_FETCH", file.WebFetch, def.WebFetch),
 		WebSearch:            mergeString("GOGEN_WEB_SEARCH", file.WebSearch, def.WebSearch),
 		WebSearchBackend:     mergeString("GOGEN_WEB_SEARCH_BACKEND", file.WebSearchBackend, def.WebSearchBackend),
@@ -199,18 +200,6 @@ func mergeIntOpt(envKey string, fileVal *int, def int) int {
 	}
 	if fileVal != nil {
 		return *fileVal
-	}
-	return def
-}
-
-// mergeFloat returns the env value when set, the file value when non-zero,
-// or the default.
-func mergeFloat(envKey string, fileVal, def float64) float64 {
-	if v, ok := envFloat(envKey, def); ok {
-		return v
-	}
-	if fileVal != 0 {
-		return fileVal
 	}
 	return def
 }

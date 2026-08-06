@@ -76,6 +76,14 @@ type Model struct {
 	maxWrappedWidth  int      // cached max line width (incremental, avoids O(N) scan)
 	styledLines      []string // wrappedContent split by "\n" (cached for selection render)
 	styledLinesDirty bool     // true when styledLines needs recomputation
+	// Incremental wrapping state: prefixLines holds the viewport lines for
+	// chatLines[:len-1] so streaming updates splice only the last line's wrap
+	// instead of re-splitting the whole conversation. wrappedContentDirty
+	// defers the wrappedPrefix+lastWrapped concatenation until a consumer
+	// (selection rendering) actually needs the full string.
+	prefixLines         []string
+	lastWrapped         string
+	wrappedContentDirty bool
 
 	// Streaming accumulation
 	streamAssistantBuf  strings.Builder
@@ -332,36 +340,69 @@ func (m *Model) wrapLine(line string) []string {
 	return parts
 }
 
-// buildFromPrefix computes wrappedContent from wrappedPrefix + the last chat
-// line.  All incremental updaters call this instead of the full re-wrap path.
+// buildFromPrefix rebuilds the viewport from wrappedPrefix + the last chat
+// line. All incremental updaters call this instead of the full re-wrap path.
 //
 // During streaming, this is the hot path called on every token batch (~32 ms).
-// We compute the max line width incrementally: only the last line changes, so
-// we measure its width and update the cached max.  SetContentMax uses the
-// pre-computed width, skipping the O(N) ansi.StringWidth scan of the full
-// conversation that the stock bubbles viewport performs.
+// Only the last chat line changes, so we re-wrap just that line and splice it
+// onto the cached prefixLines (viewport lines for chatLines[:len-1]) instead
+// of re-splitting the entire wrapped content into lines on every flush — the
+// old SetContentMax path was O(conversation) per token batch. The max line
+// width is likewise maintained incrementally (only the new last line is
+// measured), skipping the O(N) ansi.StringWidth scan of the full conversation
+// that the stock bubbles viewport performs. The full wrappedContent string is
+// materialized lazily via wrappedContentString() for consumers that need it
+// (selection rendering); streaming itself only needs the split lines.
 func (m *Model) buildFromPrefix() {
 	if len(m.chatLines) == 0 {
 		m.wrappedContent = ""
 		m.wrappedLines = nil
 		m.wrappedLinesDirty = false
 		m.maxWrappedWidth = 0
-	} else {
-		lastParts := m.wrapLine(m.chatLines[len(m.chatLines)-1])
-		lastWrapped := strings.Join(lastParts, "\n")
-		m.wrappedContent = m.wrappedPrefix + lastWrapped
-		m.wrappedLinesDirty = true
-		// Incremental max width: only scan the newly wrapped last line.
-		for _, p := range lastParts {
-			if w := ansi.StringWidth(p); w > m.maxWrappedWidth {
-				m.maxWrappedWidth = w
-			}
+		m.lastWrapped = ""
+		m.wrappedContentDirty = false
+		m.prefixLines = nil
+		m.clearSelection()
+		m.viewport.SetContentMax("", 0)
+		// styledLines is computed lazily in ensureStyledLines().
+		m.styledLinesDirty = true
+		return
+	}
+	lastParts := m.wrapLine(m.chatLines[len(m.chatLines)-1])
+	lastWrapped := strings.Join(lastParts, "\n")
+	m.lastWrapped = lastWrapped
+	m.wrappedContentDirty = true
+	m.wrappedLinesDirty = true
+	// Incremental max width: only scan the newly wrapped last line.
+	for _, p := range lastParts {
+		if w := ansi.StringWidth(p); w > m.maxWrappedWidth {
+			m.maxWrappedWidth = w
 		}
 	}
+	// Splice the freshly wrapped last line onto the cached prefix lines.
+	lastLines := strings.Split(lastWrapped, "\n")
+	vp := m.viewport.Lines()
+	vp = vp[:0]
+	vp = append(vp, m.prefixLines...)
+	vp = append(vp, lastLines...)
+	m.viewport.SetContentLines(vp, m.maxWrappedWidth)
 	m.clearSelection()
-	m.viewport.SetContentMax(m.wrappedContent, m.maxWrappedWidth)
 	// styledLines is computed lazily in ensureStyledLines().
 	m.styledLinesDirty = true
+}
+
+// wrappedContentString returns the full wrapped chat content, materializing
+// the lazily-maintained wrappedPrefix+lastWrapped concatenation on first
+// access. Selection rendering and tests are the only consumers; streaming
+// updates avoid building (and re-splitting) the full string on every token
+// batch. The cached value is byte-identical to what buildFromPrefix used to
+// compute eagerly.
+func (m *Model) wrappedContentString() string {
+	if m.wrappedContentDirty {
+		m.wrappedContent = m.wrappedPrefix + m.lastWrapped
+		m.wrappedContentDirty = false
+	}
+	return m.wrappedContent
 }
 
 // setViewportContent performs a full re-wrap of all chatLines and rebuilds
@@ -372,8 +413,10 @@ func (m *Model) setViewportContent() {
 		return
 	}
 	var wrappedParts []string
+	var lastParts []string
 	for _, line := range m.chatLines {
-		wrappedParts = append(wrappedParts, m.wrapLine(line)...)
+		lastParts = m.wrapLine(line)
+		wrappedParts = append(wrappedParts, lastParts...)
 	}
 	m.wrappedContent = strings.Join(wrappedParts, "\n")
 	m.wrappedLinesDirty = true // lazily compute on next selection access
@@ -397,9 +440,15 @@ func (m *Model) setViewportContent() {
 			prefixParts = append(prefixParts, m.wrapLine(line)...)
 		}
 		m.wrappedPrefix = strings.Join(prefixParts, "\n") + "\n"
+		m.prefixLines = prefixParts
 	} else {
 		m.wrappedPrefix = ""
+		m.prefixLines = nil
 	}
+	// The full content was materialized above; keep the incremental state
+	// consistent so the next buildFromPrefix splices onto the right prefix.
+	m.lastWrapped = strings.Join(lastParts, "\n")
+	m.wrappedContentDirty = false
 }
 
 func (m *Model) Init() tea.Cmd {
@@ -684,16 +733,12 @@ func (m *Model) appendChatLine(line string) {
 	// the *new* last line needs re-wrapping on subsequent updates.
 	if len(m.chatLines) > 0 {
 		parts := m.wrapLine(m.chatLines[len(m.chatLines)-1])
-		if m.wrappedPrefix == "" {
-			// First line: prefix is empty, so the wrapped line becomes the
-			// seed; the trailing "\n" below separates it from the new line.
-			m.wrappedPrefix = strings.Join(parts, "\n")
-		} else {
-			// wrappedPrefix already ends with "\n"; appending the wrapped
-			// line directly keeps a single separator (no blank line).
-			m.wrappedPrefix += strings.Join(parts, "\n")
-		}
-		m.wrappedPrefix += "\n"
+		wrapped := strings.Join(parts, "\n")
+		// wrappedPrefix already ends with "\n" (or is empty on the first
+		// line); appending the wrapped line keeps a single separator.
+		m.wrappedPrefix += wrapped + "\n"
+		// Keep the incremental viewport prefix in sync (see buildFromPrefix).
+		m.prefixLines = append(m.prefixLines, strings.Split(wrapped, "\n")...)
 	}
 	m.chatLines = append(m.chatLines, line)
 	m.buildFromPrefix()
@@ -883,11 +928,9 @@ func (m *Model) handleStreamToolArgs(index int, id string, delta string) {
 			}
 			m.streamToolDiffCount[index] = newCount
 
-			if lineIdx == len(m.chatLines)-1 {
-				m.buildFromPrefix()
-			} else {
-				m.setViewportContent()
-			}
+			// Diff lines were appended directly to chatLines (not via
+			// appendChatLine), so the incremental prefix is stale: full rebuild.
+			m.setViewportContent()
 			m.viewport.GotoBottom()
 		}
 		// Don't try to parse JSON for the args line; diff values are huge and
@@ -973,9 +1016,7 @@ func (m *Model) handleStreamToolCallFinal(index int, tc llm.ToolCall) {
 			// If we already rendered diff lines progressively, close the border
 			// and mark so the result handler skips the block render.
 			if m.streamToolDiffCount[index] > 0 {
-				m.chatLines = append(m.chatLines, DiffMetaStyle.Render("  ╰───────"))
-				m.buildFromPrefix()
-				m.viewport.GotoBottom()
+				m.appendChatLine(DiffMetaStyle.Render("  ╰───────"))
 				m.toolDiffShown[tc.ID] = true
 			}
 		}
@@ -1068,12 +1109,9 @@ func (m *Model) appendChatLines(lines []string) {
 	for _, line := range lines {
 		if len(m.chatLines) > 0 {
 			parts := m.wrapLine(m.chatLines[len(m.chatLines)-1])
-			if m.wrappedPrefix == "" {
-				m.wrappedPrefix = strings.Join(parts, "\n")
-			} else {
-				m.wrappedPrefix += strings.Join(parts, "\n")
-			}
-			m.wrappedPrefix += "\n"
+			wrapped := strings.Join(parts, "\n")
+			m.wrappedPrefix += wrapped + "\n"
+			m.prefixLines = append(m.prefixLines, strings.Split(wrapped, "\n")...)
 		}
 		m.chatLines = append(m.chatLines, line)
 	}

@@ -108,7 +108,7 @@ func languageFromPath(path string) string {
 }
 
 func (s *Server) fsList(path string) ([]FSEntry, error) {
-	exec := s.agent.Executor
+	exec := s.ws.Exec
 	if path == "" {
 		path = "."
 	}
@@ -148,7 +148,7 @@ func (s *Server) fsList(path string) ([]FSEntry, error) {
 }
 
 func (s *Server) fsRead(path string) (content, language string, err error) {
-	data, err := s.agent.Executor.ReadFileRawBytes(path)
+	data, err := s.ws.Exec.ReadFileRawBytes(path)
 	if err != nil {
 		return "", "", err
 	}
@@ -159,28 +159,28 @@ func (s *Server) fsRead(path string) (content, language string, err error) {
 }
 
 func (s *Server) fsSearch(ctx context.Context, pattern, path, glob string) ([]agent.SearchMatch, bool, error) {
-	if s.agent == nil || s.agent.Executor == nil {
+	if s.ws == nil || s.ws.Exec == nil {
 		return nil, false, fmt.Errorf("executor unavailable")
 	}
-	return s.agent.Executor.SearchCodeMatches(ctx, pattern, path, glob)
+	return s.ws.Exec.SearchCodeMatches(ctx, pattern, path, glob)
 }
 
 func (s *Server) fsWrite(path, content string) error {
-	return s.agent.Executor.OverwriteFile(path, content)
+	return s.ws.Exec.OverwriteFile(path, content)
 }
 
 // fsReplace performs a regex search-and-replace across files matching the given
 // pattern (same semantics as fs_search / SearchCode). It walks the tree rather
 // than relying on the capped search result set, so replace-all is complete.
 func (s *Server) fsReplace(ctx context.Context, search, replacement, subpath, glob string) (replaced int, fileCount int, err error) {
-	if s.agent == nil || s.agent.Executor == nil {
+	if s.ws == nil || s.ws.Exec == nil {
 		return 0, 0, fmt.Errorf("executor unavailable")
 	}
-	return s.agent.Executor.ReplaceInTree(ctx, search, replacement, subpath, glob)
+	return s.ws.Exec.ReplaceInTree(ctx, search, replacement, subpath, glob)
 }
 
 func (s *Server) gitStatusEntries(ctx context.Context) ([]GitStatusEntry, error) {
-	exec := s.agent.Executor
+	exec := s.ws.Exec
 	cmd, err := exec.NewGitCmd(ctx, "status", "--porcelain", "-uall")
 	if err != nil {
 		return nil, err
@@ -253,7 +253,7 @@ func (s *Server) gitFileDiff(ctx context.Context, path string) (original, modifi
 		return "", "", "", fmt.Errorf("path is required")
 	}
 	language = languageFromPath(path)
-	exec := s.agent.Executor
+	exec := s.ws.Exec
 	if _, err := exec.SecurePath(path); err != nil {
 		return "", "", "", err
 	}

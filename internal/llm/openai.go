@@ -103,6 +103,15 @@ func (p *OpenAIProvider) cachedModelsLocked() ([]openai.Model, bool) {
 }
 
 func NewOpenAIProvider(apiKey string, model string, baseURL string, workingDir string) *OpenAIProvider {
+	return NewOpenAIProviderWithResolver(apiKey, model, baseURL, workingDir, nil)
+}
+
+// NewOpenAIProviderWithResolver is NewOpenAIProvider with an optional shared
+// models.dev resolver. The multi-session web server passes one resolver per
+// workspace so N per-session providers do not issue N parallel catalog
+// fetches or race N atomic writes to the same .gogen/models.json cache file.
+// A nil resolver builds a private one (single-session/TUI behavior).
+func NewOpenAIProviderWithResolver(apiKey string, model string, baseURL string, workingDir string, resolver *modelinfo.Resolver) *OpenAIProvider {
 	streamOpts := []option.RequestOption{
 		option.WithHTTPClient(newSSEHTTPClient()),
 	}
@@ -117,13 +126,16 @@ func NewOpenAIProvider(apiKey string, model string, baseURL string, workingDir s
 		streamOpts = append(streamOpts, option.WithBaseURL(baseURL))
 		catalogOpts = append(catalogOpts, option.WithBaseURL(baseURL))
 	}
+	if resolver == nil {
+		resolver = modelinfo.NewResolver(modelinfo.CachePath(workingDir))
+	}
 	p := &OpenAIProvider{
 		client:      openai.NewClient(streamOpts...),
 		model:       model,
 		baseURL:     baseURL,
 		apiKey:      apiKey,
 		modelClient: make(map[string]*openai.Client),
-		modelInfo:   modelinfo.NewResolver(modelinfo.CachePath(workingDir)),
+		modelInfo:   resolver,
 	}
 	p.modelInfo.Warm() // non-blocking; populate cache before first limit lookup
 	if isOpencodeURL(baseURL) {

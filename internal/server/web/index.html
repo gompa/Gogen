@@ -20,18 +20,25 @@
     <div id="main-panes">
         <div id="chat-pane" class="pane active">
             <div id="sidebar">
-                <h3>Configuration</h3>
+                <!-- Working directory: read-only display in project mode,
+                     editable input + button only in global mode (app.js
+                     toggles the two blocks on the server's globalMode). -->
                 <label>Working Directory:</label>
-                <input type="text" id="working-dir-input" placeholder="/path/to/dir">
-                <button id="set-dir-btn">Set Working Directory</button>
+                <div id="working-dir-display">
+                    <div id="working-dir-path" class="wd-path" title="Current working directory (read-only in project mode)"></div>
+                </div>
+                <div id="working-dir-config" style="display:none">
+                    <input type="text" id="working-dir-input" placeholder="/path/to/dir">
+                    <button id="set-dir-btn">Set Working Directory</button>
+                </div>
                 <hr>
                 <!-- Current session id (kept hidden; read by chat export) -->
                 <div id="session-info" style="display:none"></div>
                 <div id="session-actions">
-                    <button type="button" id="session-new-btn" title="Start a new session">New</button>
+                    <button type="button" id="session-new-btn" title="Open a new session pane">New</button>
                     <button type="button" id="export-chat-btn" title="Export chat as markdown">Export</button>
                 </div>
-                <div id="session-list" aria-label="Saved sessions"></div>
+                <div id="session-list" aria-label="Sessions"></div>
             </div>
             <div class="sidebar-resize-handle" data-target="sidebar" title="Drag to resize sidebar"></div>
             <div id="chat-container">
@@ -87,6 +94,20 @@
                     <button id="send-btn">Send</button>
                     <button id="cancel-btn" disabled title="Cancel current turn">Cancel</button>
                 </div>
+                <!-- Terminal strip: docked below the input bar at the bottom
+                     of the chat pane, scoped to the chat pane so it stays to
+                     the right of the sidebar instead of spanning the page. -->
+                <div id="terminal-panel" aria-label="Terminal">
+                    <div id="terminal-resize-handle" title="Drag to resize terminal"></div>
+                    <div id="terminal-tabbar">
+                        <button type="button" id="terminal-chevron" title="Collapse or expand terminal (Ctrl+`)">▴</button>
+                        <div id="terminal-tabs"></div>
+                        <button type="button" id="terminal-more" title="All terminals" hidden>»</button>
+                        <span id="terminal-hint">Terminal unavailable (xterm.js failed to load)</span>
+                        <div id="terminal-more-menu" hidden></div>
+                    </div>
+                    <div id="terminal-body"></div>
+                </div>
             </div>
         </div>
         <div id="editor-pane" class="pane">
@@ -140,17 +161,6 @@
                 </div>
             </div>
         </div>
-    </div>
-    <div id="terminal-panel" aria-label="Terminal">
-        <div id="terminal-resize-handle" title="Drag to resize terminal"></div>
-        <div id="terminal-tabbar">
-            <button type="button" id="terminal-chevron" title="Collapse or expand terminal (Ctrl+`)">▴</button>
-            <div id="terminal-tabs"></div>
-            <button type="button" id="terminal-more" title="All terminals" hidden>»</button>
-            <span id="terminal-hint">Terminal unavailable (xterm.js failed to load)</span>
-            <div id="terminal-more-menu" hidden></div>
-        </div>
-        <div id="terminal-body"></div>
     </div>
     <div id="delete-approval-overlay">
         <div id="delete-approval-dialog" role="dialog" aria-labelledby="delete-approval-title">

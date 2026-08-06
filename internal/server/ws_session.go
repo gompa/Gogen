@@ -1,80 +1,26 @@
 package server
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"sync"
-
-	"gogen/internal/agent"
+	"sync/atomic"
+	"time"
 )
 
-type wsSession struct {
-	ws         *wsConn
-	approvals  map[string]chan bool
-	approvalMu sync.Mutex
-}
+// approvalIDFallback disambiguates approval ids when crypto/rand fails
+// (monotonic counter + timestamp instead of a constant string, which would
+// have collided every approval onto one id).
+var approvalIDFallback atomic.Uint64
 
-func newWSSession(ws *wsConn) *wsSession {
-	return &wsSession{
-		ws:        ws,
-		approvals: make(map[string]chan bool),
-	}
-}
-
+// newApprovalID returns a random approval id. Delete approvals are keyed by
+// (sessionID, approvalID) on the session runtime (E5). The per-connection
+// wsSession was removed in Phase 3 when approvals moved into
+// sessionRuntime.deleteApprover.
 func newApprovalID() string {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		return fmt.Sprintf("approval-%d", len(b))
+		return fmt.Sprintf("approval-%d-%d", time.Now().UnixNano(), approvalIDFallback.Add(1))
 	}
 	return hex.EncodeToString(b[:])
-}
-
-func (s *wsSession) completeApproval(id string, approved bool) {
-	s.approvalMu.Lock()
-	ch := s.approvals[id]
-	delete(s.approvals, id)
-	s.approvalMu.Unlock()
-	if ch == nil {
-		return
-	}
-	select {
-	case ch <- approved:
-	default:
-		// Waiter already left (cancel) or buffer full — don't block the reader.
-	}
-}
-
-func (s *wsSession) deleteApprover() agent.DeleteApprover {
-	return func(ctx context.Context, req agent.DeleteRequest) (bool, error) {
-		id := newApprovalID()
-		ch := make(chan bool, 1)
-
-		s.approvalMu.Lock()
-		s.approvals[id] = ch
-		s.approvalMu.Unlock()
-
-		defer func() {
-			s.approvalMu.Lock()
-			delete(s.approvals, id)
-			s.approvalMu.Unlock()
-		}()
-
-		if err := s.ws.writeJSON(WSMessage{
-			Type:       "delete_approval",
-			ApprovalID: id,
-			Paths:      req.Paths,
-			Reason:     req.Reason,
-		}); err != nil {
-			return false, err
-		}
-
-		select {
-		case approved := <-ch:
-			return approved, nil
-		case <-ctx.Done():
-			return false, ctx.Err()
-		}
-	}
 }

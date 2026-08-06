@@ -31,6 +31,47 @@ func TestReadFileRangeOffsetLimit(t *testing.T) {
 	}
 }
 
+// TestReadFileRangeOffsetWithoutLimitCapsAtMaxLines pins the read cap: an
+// offset read with no limit must stop at readFileMaxLines (10k), not run to
+// EOF — the old `offset == 0` guard let "read from line N with no limit"
+// return an unbounded result for huge files.
+func TestReadFileRangeOffsetWithoutLimitCapsAtMaxLines(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "big.txt")
+	var b strings.Builder
+	const total = readFileMaxLines + 500
+	for i := 0; i < total; i++ {
+		fmt.Fprintf(&b, "line-%04d\n", i)
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := NewExecutor(dir)
+	out, err := exec.ReadFileRange("big.txt", 100, 0, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The header must show a truncated range (end < total), and the body must
+	// contain the offset start plus exactly the capped number of lines.
+	if !strings.Contains(out, "Lines 100-10099 of 10500") {
+		t.Fatalf("expected truncated range header, got %q", firstLine(out))
+	}
+	if !strings.Contains(out, "line-0099") || !strings.Contains(out, "line-10098") {
+		t.Fatalf("expected lines 100..10099 in the body")
+	}
+	if strings.Contains(out, "line-10099") {
+		t.Fatalf("read past the cap: body contains line 10099")
+	}
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
 func TestReadFileRangeLineNumbers(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "lines.txt")

@@ -34,7 +34,7 @@ func ensureStreamCallbacks(h *StreamHandlers) *StreamHandlers {
 type streamAccumulator struct {
 	fullContent      strings.Builder
 	fullRefusal      strings.Builder
-	fullReasoning    string
+	fullReasoning    strings.Builder
 	lastFinishReason string
 	streamUsage      *Usage
 	tcAccums         []tcAccum
@@ -160,8 +160,8 @@ func (a *streamAccumulator) buildResult() (*StreamResult, error) {
 		})
 	}
 
-	if len(toolCalls) == 0 && (a.fullReasoning != "" || a.fullContent.Len() > 0) {
-		extractedCalls := extractToolCallsFromText(a.fullReasoning + a.fullContent.String())
+	if len(toolCalls) == 0 && (a.fullReasoning.Len() > 0 || a.fullContent.Len() > 0) {
+		extractedCalls := extractToolCallsFromText(a.fullReasoning.String() + a.fullContent.String())
 		if len(extractedCalls) > 0 {
 			toolCalls = extractedCalls
 		}
@@ -169,7 +169,7 @@ func (a *streamAccumulator) buildResult() (*StreamResult, error) {
 
 	content := a.fullContent.String()
 
-	if a.lastFinishReason == "" && (content != "" || a.fullRefusal.Len() > 0 || a.fullReasoning != "" || len(a.tcAccums) > 0) {
+	if a.lastFinishReason == "" && (content != "" || a.fullRefusal.Len() > 0 || a.fullReasoning.Len() > 0 || len(a.tcAccums) > 0) {
 		if len(a.tcAccums) > 0 {
 			a.lastFinishReason = "tool_calls"
 		} else {
@@ -177,13 +177,13 @@ func (a *streamAccumulator) buildResult() (*StreamResult, error) {
 		}
 	}
 
-	if a.lastFinishReason == "" && content == "" && a.fullRefusal.Len() == 0 && a.fullReasoning == "" && len(toolCalls) == 0 {
+	if a.lastFinishReason == "" && content == "" && a.fullRefusal.Len() == 0 && a.fullReasoning.Len() == 0 && len(toolCalls) == 0 {
 		return nil, fmt.Errorf("stream ended without finish_reason")
 	}
 
 	return &StreamResult{
 		Content:   content,
-		Reasoning: a.fullReasoning,
+		Reasoning: a.fullReasoning.String(),
 		Refusal:   a.fullRefusal.String(),
 		ToolCalls: toolCalls,
 		Usage:     a.streamUsage,

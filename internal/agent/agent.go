@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gogen/internal/config"
@@ -36,13 +38,13 @@ type Agent struct {
 	UsageAccum     UsageAccumulator
 
 	// statsMu serializes the agent state that ContextStats/SnapshotMessages
-	// read without agentMu or turnMu: Messages, the cached token counts
+	// read without the session turnMu: Messages, the cached token counts
 	// (tokenCounts), the API-usage baseline (lastTurnUsage,
 	// apiBaseline*), projectProfile, UsageAccum, and SessionLabel. Every
 	// mutation of these fields from any goroutine must take statsMu. Leaf
-	// lock: while holding it, never call out to code that takes turnMu or
-	// agentMu. The reverse order does occur — server paths call
-	// SessionLabelSnapshot/ContextStats while holding agentMu/turnMu — so
+	// lock: while holding it, never call out to code that takes turnMu.
+	// The reverse order does occur — server paths call
+	// SessionLabelSnapshot/ContextStats while holding turnMu — so
 	// statsMu critical sections must stay short and never block on I/O or
 	// other locks.
 	statsMu sync.RWMutex
@@ -54,15 +56,41 @@ type Agent struct {
 	apiBaselinePromptTokens, apiBaselineMsgCount int
 	lastPersistErr                               error
 	// sessionDirty tracks whether in-memory state differs from disk.
-	// TUI: single owner goroutine. Web server: Server.agentMu + turnMu serialize
-	// access across WebSocket clients (see internal/server).
-	sessionDirty    bool
+	// TUI: single owner goroutine. Web server: the per-session turnMu
+	// serializes access across WebSocket clients (see internal/server), but the quit
+	// flush (ShutdownSessions) and a running turn's flushes can both mark and
+	// clear it concurrently — hence atomic (benign races on a plain bool were
+	// still data races under -race).
+	sessionDirty    atomic.Bool
 	lastPersistTime time.Time // timestamp of last actual disk write
 	// lastSavedMsgCount tracks how many messages were included in the last
 	// full snapshot save. Used by doPersist to decide between full and
 	// incremental delta saves, avoiding full JSON serialization every 5s.
 	lastSavedMsgCount int
 	lastFullSaveTime  time.Time // when the last full snapshot was written
+
+	// persistMu serializes doPersist executions. The turn goroutine (holding
+	// turnMu) and the shutdown/delete/eviction flush paths (no turnMu) can
+	// call FlushSession concurrently — e.g. ShutdownSessions flushes after
+	// the 2s drain times out while the turn is still running. Without this
+	// lock two doPersists would interleave their message snapshots, counter
+	// reads, and store writes, leaving a torn (snapshot, delta, index)
+	// combination on disk that LoadInWorkingDir then drops or double-merges
+	// — the "quit during a running turn loses history" bug. Serializing the
+	// whole write keeps every pair consistent: the later writer re-reads the
+	// counters the earlier one updated. Leaf lock: never held while
+	// acquiring turnMu, and no code calls FlushSession/persistSession
+	// while holding it (doPersist takes statsMu inside it, so statsMu holders
+	// must not flush — they don't).
+	persistMu sync.Mutex
+
+	// lastMeta is the session metadata written by the last full snapshot
+	// save. doPersist forces a full save (instead of an incremental delta)
+	// when any of these changed since the last full snapshot: incremental
+	// deltas only carry messages, so label/mode/model/thinking/oneshot/
+	// profile/todo changes would otherwise be silently lost if the process
+	// quit (or crashed) before the next full save.
+	lastMeta persistMeta
 
 	// DebugCompareMessages enables view-fingerprint comparison across turns
 	// and session restores (GOGEN_DEBUG_COMPARE_MESSAGES). Only effective in
@@ -100,7 +128,30 @@ type Agent struct {
 	LintCommand       string
 	projectProfile    string
 	MCPRegistry       MCPToolRegistry
-	toolHandlers      map[string]ToolHandler
+	// toolMu guards toolHandlers. SetToolHandlers is called at construction
+	// (server startup / per-session agent factory) before any turn runs, but
+	// executeTool reads the map on every tool call, so the swap is published
+	// under the lock to keep the read/write race-free by construction.
+	toolMu       sync.RWMutex
+	toolHandlers map[string]ToolHandler
+
+	// patchFailStreak counts consecutive patch_file failures so the agent loop
+	// can steer the model away from retrying the same stale diff indefinitely.
+	patchFailStreak atomic.Int32
+}
+
+// persistMeta is the set of session fields that only the full snapshot path
+// persists (incremental deltas carry messages plus a label that loads
+// ignore). Comparing the current values against the last full save detects
+// changes that must force a full save — see lastMeta.
+type persistMeta struct {
+	label    string
+	mode     string
+	model    string
+	thinking string
+	oneshot  bool
+	profile  string
+	todos    *TodoList
 }
 
 func NewAgent(provider llm.LLMProvider, executor *Executor, ctxMgr *contextmgr.Manager) *Agent {
@@ -195,12 +246,17 @@ func (a *Agent) llmTools() []llm.Tool {
 // persistMinInterval.  For final boundaries (turn complete, errors,
 // context cancellation) use flushSession instead.
 func (a *Agent) persistSession() {
-	a.sessionDirty = true
+	a.sessionDirty.Store(true)
 	if a.SessionStore == nil || a.SessionID == "" {
 		return
 	}
 	// Skip if debounced — no point computing hash or doing I/O.
-	if !a.lastPersistTime.IsZero() && time.Since(a.lastPersistTime) < persistMinInterval {
+	// The debounce read must not race a concurrent doPersist's write of
+	// lastPersistTime, so it runs under persistMu (best-effort timing).
+	a.persistMu.Lock()
+	debounced := !a.lastPersistTime.IsZero() && time.Since(a.lastPersistTime) < persistMinInterval
+	a.persistMu.Unlock()
+	if debounced {
 		return
 	}
 	a.doPersist(false)
@@ -211,7 +267,25 @@ func (a *Agent) persistSession() {
 // Skips full re-tokenization so Ctrl+C / --web shutdown stays snappy on large
 // sessions; restored counts are reused when still valid.
 func (a *Agent) FlushSession() {
-	a.sessionDirty = true
+	a.sessionDirty.Store(true)
+	if a.SessionStore == nil || a.SessionID == "" {
+		return
+	}
+	a.doPersist(true)
+}
+
+// FlushPending writes any unsaved state to disk but, unlike FlushSession,
+// does NOT mark the session dirty — a clean session is left untouched
+// (doPersist's dirty-flag check makes it a no-op). The shutdown sweep uses
+// this instead of FlushSession: forcing a write on every clean session
+// re-stamped each one's Updated timestamp with ~now in sweep order (the
+// focused session first, so it received the OLDEST stamp), which destroyed
+// the recency ordering List/LatestID rely on after a restart — the
+// saved-session list reshuffled and the session active at shutdown was
+// demoted instead of restored as current. Dirty sessions (an unsaved turn,
+// pending metadata change) still write exactly as before, so no state is at
+// risk.
+func (a *Agent) FlushPending() {
 	if a.SessionStore == nil || a.SessionID == "" {
 		return
 	}
@@ -229,7 +303,22 @@ func (a *Agent) FlushSession() {
 // full snapshot — making the delta file self-contained and crash-safe.
 // When skipTokenCounts is true (FlushSession), avoid cl100k re-tokenization.
 func (a *Agent) doPersist(skipTokenCounts bool) {
-	if !a.sessionDirty {
+	a.persistMu.Lock()
+	defer a.persistMu.Unlock()
+	// Consume the dirty flag up front instead of checking it here and
+	// clearing it at the end. Two flushes can be pending concurrently — the
+	// turn's persistSession (holding turnMu) and the shutdown/delete/eviction
+	// flush paths (no turnMu, e.g. ShutdownSessions after the 2s drain times
+	// out) — and a write that snapshots EARLIER state must not clear the flag
+	// set by a caller whose state it did not include. With Load-then-Store,
+	// the earlier writer's trailing Store(false) wiped the later caller's
+	// mark, so the later (possibly final, pre-exit) doPersist saw
+	// dirty==false and returned without writing — the "quit during a running
+	// turn still loses the last messages" bug. Swapping the flag at the start
+	// (under persistMu) makes the writer consume exactly the mutations
+	// published before it snapshotted; anything marked during the write
+	// stays set and is picked up by the next flush.
+	if !a.sessionDirty.Swap(false) {
 		return
 	}
 	if a.SessionStore == nil || a.SessionID == "" {
@@ -240,7 +329,7 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 	a.extendTokenCounts()
 
 	// Snapshot the conversation and label under statsMu: web probes read
-	// them without turnMu/agentMu, so doPersist must not touch the live
+	// them without turnMu, so doPersist must not touch the live
 	// fields outside the lock. The clone is deep (ToolCalls included) so
 	// the snapshot cannot race a concurrent in-place stabilization, and it
 	// is safe to tokenize and serialize after releasing the lock.
@@ -248,9 +337,28 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 	msgs := cloneMessages(a.Messages)
 	label := a.SessionLabel
 	countsEpoch := a.countsEpoch
+	// Mode/thinking/oneshot are written under statsMu (SetMode,
+	// SetThinkingLevel, RestoreSessionLocal), so read them under the same
+	// lock: doPersist also runs on the shutdown flush path with no turnMu,
+	// and an unlocked read there would race a concurrent SetMode or
+	// SetThinkingLevel from a still-running turn's command handler.
+	mode := a.Mode.String()
+	thinking := string(a.ThinkingLevel)
+	oneshot := a.SessionOneshot
+	workingDir := a.WorkingDir
 	a.statsMu.RUnlock()
 	count := len(msgs)
 	profile := a.ensureProjectProfile()
+	model := a.CurrentModel()
+	curMeta := persistMeta{
+		label:    label,
+		mode:     mode,
+		model:    model,
+		thinking: thinking,
+		oneshot:  oneshot,
+		profile:  profile,
+		todos:    todoSnapshot(a.TodoManager),
+	}
 
 	// Safety: if the message list was truncated since last save (e.g.
 	// compaction, error rollback), force a full snapshot.
@@ -261,20 +369,25 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 	// Decide: full snapshot or incremental delta?
 	// Full snapshot on first save, when more than 5 new messages have
 	// arrived, or when it's been >30s since the last full snapshot.
+	// Also when non-message metadata (label, mode, model, thinking level,
+	// oneshot, project profile, todos) changed since the last full snapshot:
+	// incremental deltas do not carry those fields, so a quit before the
+	// next full save would silently drop the change.
 	needsFullSave := a.lastSavedMsgCount == 0 ||
 		count-a.lastSavedMsgCount > 5 ||
-		time.Since(a.lastFullSaveTime) > 30*time.Second
+		time.Since(a.lastFullSaveTime) > 30*time.Second ||
+		!reflect.DeepEqual(curMeta, a.lastMeta)
 
 	if needsFullSave {
 		snap := SessionSnapshot{
-			WorkingDir:     a.WorkingDir,
-			Model:          a.CurrentModel(),
-			Mode:           a.Mode.String(),
-			ThinkingLevel:  string(a.ThinkingLevel),
-			Oneshot:        a.SessionOneshot,
+			WorkingDir:     workingDir,
+			Model:          model,
+			Mode:           mode,
+			ThinkingLevel:  thinking,
+			Oneshot:        oneshot,
 			Label:          label,
 			ProjectProfile: profile,
-			Todos:          todoSnapshot(a.TodoManager),
+			Todos:          curMeta.todos,
 			Messages:       msgs,
 			ContextLimit:   a.ContextLimit(),
 		}
@@ -303,6 +416,7 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 		}
 		a.lastSavedMsgCount = count
 		a.lastFullSaveTime = time.Now()
+		a.lastMeta = curMeta
 	} else {
 		// Incremental: only serialise new messages since the last full save.
 		newMsgs := msgs[a.lastSavedMsgCount:]
@@ -314,8 +428,8 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 			}
 		}
 		deltaSnap := SessionSnapshot{
-			WorkingDir:  a.WorkingDir,
-			Oneshot:     a.SessionOneshot,
+			WorkingDir:  workingDir,
+			Oneshot:     oneshot,
 			Label:       label,
 			Messages:    newMsgs,
 			TokenCounts: newCounts,
@@ -338,13 +452,18 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 
 	a.lastPersistErr = nil
 	a.lastPersistTime = time.Now()
-	a.sessionDirty = false
 }
 
 // resetSaveTracking resets the incremental-save counters so the next
 // doPersist writes a full snapshot. Call after any operation that
 // truncates or replaces a.Messages (compaction, session restore, etc.).
 func (a *Agent) resetSaveTracking() {
+	// Serialize against a concurrent doPersist so the counters cannot change
+	// mid-write: without this a shutdown flush could clone messages, then the
+	// turn's truncate+reset lands, and the flush writes the pre-truncate
+	// state as the final one.
+	a.persistMu.Lock()
+	defer a.persistMu.Unlock()
 	a.lastSavedMsgCount = 0
 	a.lastFullSaveTime = time.Time{}
 }
@@ -355,7 +474,7 @@ func (a *Agent) resetSaveTracking() {
 // consistent for concurrent readers. This is the only way Messages grows
 // during a turn. Thread-safe: ContextStats and SnapshotMessages snapshot
 // Messages + counts under statsMu while the turn goroutine appends. Leaf
-// lock: never acquire turnMu/agentMu under it.
+// lock: never acquire turnMu under it.
 func (a *Agent) appendMessage(m llm.Message) {
 	a.statsMu.Lock()
 	a.Messages = append(a.Messages, m)
@@ -407,9 +526,10 @@ func (a *Agent) truncateMessages(n int) {
 	a.statsMu.Unlock()
 }
 
-// SnapshotMessages returns a deep copy of the current conversation messages
-// (including ToolCalls). Safe to call concurrently with a running turn; used
-// by the web server for history snapshots without holding agentMu.
+// SnapshotMessages returns a copy of the current conversation messages that
+// is safe to read after the lock is released: unstabilized ToolCalls are
+// deep-copied, stabilized ones are shared (see cloneMessages). Used by the
+// web server for history snapshots without holding the turn lock.
 func (a *Agent) SnapshotMessages() []llm.Message {
 	a.statsMu.RLock()
 	msgs := cloneMessages(a.Messages)
@@ -425,13 +545,23 @@ func (a *Agent) MessageCount() int {
 	return n
 }
 
-// cloneMessages deep-copies a message slice (including the ToolCalls slices)
-// so the result can be read after statsMu is released without racing the turn
-// goroutine's in-place stabilization (stabilizeToolArgs rewrites ToolCall
-// ArgsStr under statsMu). Callers must hold statsMu (R or W).
+// cloneMessages copies a message slice so the result can be read after
+// statsMu is released without racing the turn goroutine's in-place
+// stabilization (stabilizeToolArgs rewrites ToolCall ArgsStr under statsMu).
+// Only unstabilized messages need their ToolCalls deep-copied: stabilization
+// is the sole writer of ToolCall fields, it skips messages already marked
+// ArgsStabilized, and the wire serializer (messagesToChat) only pins ArgsStr
+// for calls whose ArgsStr is still empty/invalid — which stabilization has
+// already made valid and trimmed. A message with ArgsStabilized=true therefore
+// has ToolCalls that are never mutated again, so sharing their slice is as
+// safe as copying it and avoids O(total tool calls) allocation on every
+// ContextStats probe / persist snapshot. Callers must hold statsMu (R or W).
 func cloneMessages(msgs []llm.Message) []llm.Message {
 	out := append([]llm.Message(nil), msgs...)
 	for i := range out {
+		if out[i].ArgsStabilized {
+			continue
+		}
 		if len(out[i].ToolCalls) > 0 {
 			out[i].ToolCalls = append([]llm.ToolCall(nil), out[i].ToolCalls...)
 		}
@@ -458,7 +588,13 @@ func (a *Agent) ensureProjectProfile() string {
 	if p := a.cachedProjectProfile(); p != "" {
 		return p
 	}
-	profile := DetectProjectProfile(a.WorkingDir, a.TestCommand, a.LintCommand)
+	// WorkingDir is published under statsMu (SetWorkingDir), and this runs on
+	// the shutdown/eviction flush paths with no turnMu, so read it under the
+	// lock instead of racing a concurrent working-dir change.
+	a.statsMu.RLock()
+	wd := a.WorkingDir
+	a.statsMu.RUnlock()
+	profile := DetectProjectProfile(wd, a.TestCommand, a.LintCommand)
 	a.statsMu.Lock()
 	if a.projectProfile == "" {
 		a.projectProfile = profile
@@ -516,7 +652,13 @@ func (a *Agent) shouldCompactUsingCounts() bool {
 }
 
 // ConsumePersistError returns and clears the last session save failure, if any.
+// Serialized with doPersist via persistMu: doPersist writes lastPersistErr
+// under persistMu, and in web mode a no-turnMu flush path (ShutdownSessions,
+// sessionDelete, registry eviction) can run concurrently with the turn end
+// that consumes the error here.
 func (a *Agent) ConsumePersistError() error {
+	a.persistMu.Lock()
+	defer a.persistMu.Unlock()
 	err := a.lastPersistErr
 	a.lastPersistErr = nil
 	return err
@@ -524,10 +666,14 @@ func (a *Agent) ConsumePersistError() error {
 
 // SetWorkingDir updates in-memory working directory fields (agent, executor,
 // todos). It does not touch disk or the models.dev cache — call
-// AfterWorkingDirChange for that, and never while holding server agentMu.
+// AfterWorkingDirChange for that.
 func (a *Agent) SetWorkingDir(dir string) {
-	a.WorkingDir = dir
+	// WorkingDir is read by ContextStats and doPersist without the turn lock
+	// (web probes, shutdown/eviction flushes), so the publish goes under
+	// statsMu together with the projectProfile reset — a plain field write
+	// here raced those unlocked readers (data race on a.WorkingDir).
 	a.statsMu.Lock()
+	a.WorkingDir = dir
 	a.projectProfile = ""
 	a.statsMu.Unlock()
 	if a.Executor != nil {
@@ -539,8 +685,9 @@ func (a *Agent) SetWorkingDir(dir string) {
 }
 
 // AfterWorkingDirChange persists the session and retargets the models.dev
-// cache for the new project dir. Must not run under server agentMu — both
-// steps do disk (and possibly background network) I/O.
+// cache for the new project dir. Both steps do disk (and possibly background
+// network) I/O. The web server calls it under the session's turnMu so it is
+// serialized with a concurrent doPersist from a running turn.
 func (a *Agent) AfterWorkingDirChange() {
 	cacheDir := a.WorkingDir
 	if a.GlobalMode {
@@ -549,6 +696,14 @@ func (a *Agent) AfterWorkingDirChange() {
 	if p, ok := a.Provider.(*llm.OpenAIProvider); ok {
 		p.SetModelInfoCacheDir(cacheDir)
 	}
+	// The session's persisted location follows the working dir
+	// (Store.Save/AppendMessages key by snap.WorkingDir). After a dir
+	// change the last full snapshot lives in the OLD directory, so an
+	// incremental delta here would be written to the NEW directory without
+	// its base snapshot — the session becomes unloadable there until the
+	// next full save (which may never come if the process quits first).
+	// Force a full snapshot into the new directory instead.
+	a.resetSaveTracking()
 	a.FlushSession()
 }
 
@@ -764,6 +919,10 @@ func (a *Agent) StreamProcessInput(ctx context.Context, input string, h *llm.Str
 
 	if err := a.requireModelSelected(ctx); err != nil {
 		a.truncateMessages(1)
+		// The just-appended user message is being dropped: re-derive the
+		// label from what remains, so a session whose only message failed
+		// does not keep a stale title (its message no longer exists).
+		a.setSessionLabel(llm.SessionLabel(a.Messages))
 		a.resetSaveTracking()
 		a.FlushSession()
 		return "", err

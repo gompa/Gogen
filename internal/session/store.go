@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -34,6 +35,7 @@ type file struct {
 	WorkingDir     string          `json:"workingDir"`
 	Model          string          `json:"model"`
 	Mode           string          `json:"mode"`
+	ThinkingLevel  string          `json:"thinkingLevel,omitempty"`
 	Label          string          `json:"label,omitempty"`
 	ProjectProfile string          `json:"projectProfile,omitempty"`
 	Todos          *agent.TodoList `json:"todos,omitempty"`
@@ -59,6 +61,7 @@ type deltaFile struct {
 // sessionIndexEntry is a lightweight entry in the session index file.
 type sessionIndexEntry struct {
 	ID           string    `json:"id"`
+	Created      time.Time `json:"created,omitempty"`
 	Updated      time.Time `json:"updated"`
 	Oneshot      bool      `json:"oneshot,omitempty"`
 	MessageCount int       `json:"messageCount"`
@@ -72,16 +75,20 @@ type sessionIndex struct {
 
 // Store persists sessions under .gogen/sessions/.
 //
-// Save/Load/Delete operations are externally serialized by the caller (turnMu
-// in the web server). List may be called concurrently from the WS read loop,
-// so the in-memory list cache is protected by a mutex. The metadata index
-// file is protected by the same mutex to avoid concurrent reads/writes.
+// All public operations (Save, AppendMessages, LoadInWorkingDir, Delete,
+// TouchSession, LatestID, List, Prune) are serialized internally by mu so
+// multiple goroutines (multi-session web server, TUI persist goroutine) can
+// write concurrently without corrupting index.json or createdCache. List may
+// be called concurrently and is safe under mu; the in-memory list cache keeps
+// its own lock so hot reads do not serialize on the store mutex.
 type Store struct {
+	mu           sync.Mutex
 	enabled      bool
 	maxCount     int
 	maxAgeDays   int
 	createdCache map[string]time.Time // sessionID → Created timestamp (avoids re-read)
 	saveCount    int                  // counter for periodic pruning
+	autoPrune    bool                 // internal prune on Save; disabled when a registry owns pruning
 	globalDir    string               // non-empty: override per-project .gogen/sessions/ dir
 }
 
@@ -115,8 +122,24 @@ func NewStore(enabled bool) *Store {
 // storage instead of the per-project .gogen/sessions/. Used in global mode.
 func (s *Store) SetGlobalDir(dir string) {
 	if s != nil {
+		s.mu.Lock()
 		s.globalDir = dir
+		s.mu.Unlock()
 	}
+}
+
+// SetAutoPrune toggles the internal prune that Save performs every few
+// writes. The TUI keeps it enabled (single active session — pruning around
+// the current session is correct). The multi-session web server disables it
+// and becomes the sole pruner via Prune, so a Save from one active session
+// can never delete another live session's file. Default is enabled.
+func (s *Store) SetAutoPrune(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.autoPrune = enabled
+	s.mu.Unlock()
 }
 
 // NewStoreWithOptions creates a session store with custom retention.
@@ -129,21 +152,28 @@ func NewStoreWithOptions(enabled bool, opts StoreOptions) *Store {
 	if maxAge <= 0 {
 		maxAge = config.DefaultSessionMaxAgeDays
 	}
-	return &Store{enabled: enabled, maxCount: maxCount, maxAgeDays: maxAge, createdCache: make(map[string]time.Time)}
+	return &Store{enabled: enabled, maxCount: maxCount, maxAgeDays: maxAge, createdCache: make(map[string]time.Time), autoPrune: true}
 }
 
 // setCreatedCache adds an entry to the created-timestamp cache, evicting the
-// oldest entry if the cache exceeds maxCreatedCacheEntries to prevent
-// unbounded memory growth on long-running processes.
+// entry with the oldest Created timestamp if the cache exceeds
+// maxCreatedCacheEntries to prevent unbounded memory growth on long-running
+// processes. (Go map iteration is unordered, so the oldest must be found by
+// comparing timestamps rather than "first entry".)
 func (s *Store) setCreatedCache(id string, created time.Time) {
 	if s == nil {
 		return
 	}
 	if len(s.createdCache) >= maxCreatedCacheEntries {
-		// Evict the first (oldest) entry.
-		for k := range s.createdCache {
-			delete(s.createdCache, k)
-			break
+		var oldestID string
+		var oldest time.Time
+		for k, v := range s.createdCache {
+			if oldestID == "" || v.Before(oldest) {
+				oldestID, oldest = k, v
+			}
+		}
+		if oldestID != "" {
+			delete(s.createdCache, oldestID)
 		}
 	}
 	s.createdCache[id] = created
@@ -177,6 +207,8 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 	if s == nil || !s.enabled || id == "" {
 		return nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := validateSessionID(id); err != nil {
 		return err
 	}
@@ -188,15 +220,60 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 	if err := ensureUnderSessionsDir(snap.WorkingDir, path, s.globalDir); err != nil {
 		return err
 	}
+	// Skip persisting a session that has never had content and has no
+	// on-disk state yet: /new panes that are never used are flushed on
+	// server quit (ShutdownSessions flushes every registered runtime), and
+	// writing a 0-message file + index entry for each one would bloat the
+	// saved-session list with empty sessions after every restart (the
+	// sidebar renders every index entry, "0 msgs" included). A session that
+	// WAS saved before and was rolled back to empty must still update its
+	// file — the old content was deliberately dropped — so the skip applies
+	// only when neither the snapshot nor a pending delta exists on disk. A
+	// label is the one exception: it can only be set deliberately
+	// (RenameSession / the session_rename tool), so an empty session that
+	// was explicitly named must be persisted — otherwise the rename is
+	// silently dropped. (Oneshot single-prompt sessions are NOT an
+	// exception: their pre-prompt flush must stay skipped or every `-p` run
+	// would leave a "0 msgs" entry behind.)
+	if len(snap.Messages) == 0 && snap.Label == "" {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			if _, err := os.Stat(s.deltaPath(snap.WorkingDir, id)); os.IsNotExist(err) {
+				return nil
+			}
+		}
+	}
 	created := time.Now().UTC()
 	if cached, ok := s.createdCache[id]; ok {
 		created = cached
-	} else if data, err := os.ReadFile(path); err == nil {
+	} else {
 		// Cache miss (e.g. first save after process restart before Load):
-		// preserve Created from the existing file instead of resetting it.
-		var prev file
-		if err := json.Unmarshal(data, &prev); err == nil && !prev.Created.IsZero() {
-			created = prev.Created
+		// preserve Created instead of resetting it. Prefer the metadata
+		// index — Created is immutable per session id and is written there
+		// on every save, so the common restart case avoids re-reading (and
+		// re-unmarshalling) the potentially large session file. Fall back to
+		// a minimal field-only decode of the file for legacy indexes that
+		// predate the created field (index-loss recovery); the minimal
+		// target skips allocating the previous session's messages just to
+		// recover one timestamp.
+		found := false
+		if idx := s.readIndex(snap.WorkingDir); idx != nil {
+			for _, e := range idx.Entries {
+				if e.ID == id && !e.Created.IsZero() {
+					created = e.Created
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			if data, err := os.ReadFile(path); err == nil {
+				var prevMeta struct {
+					Created time.Time `json:"created"`
+				}
+				if err := json.Unmarshal(data, &prevMeta); err == nil && !prevMeta.Created.IsZero() {
+					created = prevMeta.Created
+				}
+			}
 		}
 	}
 	out := file{
@@ -207,6 +284,7 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 		WorkingDir:     snap.WorkingDir,
 		Model:          snap.Model,
 		Mode:           snap.Mode,
+		ThinkingLevel:  snap.ThinkingLevel,
 		Label:          snap.Label,
 		ProjectProfile: snap.ProjectProfile,
 		Todos:          snap.Todos,
@@ -233,12 +311,12 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 	s.setCreatedCache(id, created)
 	s.saveCount++
 	// Prune every 3 saves to avoid repeated directory scans on every write.
-	if s.saveCount%3 == 0 {
+	if s.autoPrune && s.saveCount%3 == 0 {
 		s.prune(snap.WorkingDir, id)
 	}
 	// Update index and invalidate in-memory cache.
 	label := sessionLabel(snap.Messages, snap.Label)
-	s.updateIndex(snap.WorkingDir, id, out.Updated, len(snap.Messages), label, snap.Oneshot)
+	s.updateIndex(snap.WorkingDir, id, out.Created, out.Updated, len(snap.Messages), label, snap.Oneshot)
 	return nil
 }
 
@@ -248,6 +326,8 @@ func (s *Store) TouchSession(workingDir, id string) error {
 	if s == nil || !s.enabled || id == "" {
 		return nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := validateSessionID(id); err != nil {
 		return err
 	}
@@ -262,11 +342,66 @@ func (s *Store) TouchSession(workingDir, id string) error {
 	return s.touchIndex(workingDir, id, now)
 }
 
+// UpdatedAt returns the session's persisted Updated timestamp for workingDir:
+// the metadata index entry when present, falling back to the session file's
+// updated field (index-loss recovery). Returns the zero time when the session
+// has no persisted state in that directory (a never-saved /new pane).
+func (s *Store) UpdatedAt(workingDir, id string) time.Time {
+	if s == nil || !s.enabled || id == "" || workingDir == "" {
+		return time.Time{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := validateSessionID(id); err != nil {
+		return time.Time{}
+	}
+	if idx := s.readIndex(workingDir); idx != nil {
+		for _, e := range idx.Entries {
+			if e.ID == id {
+				return e.Updated
+			}
+		}
+	}
+	path := s.path(workingDir, id)
+	if err := ensureUnderSessionsDir(workingDir, path, s.globalDir); err != nil {
+		return time.Time{}
+	}
+	if data, err := os.ReadFile(path); err == nil {
+		var f file
+		if json.Unmarshal(data, &f) == nil {
+			// Delta-aware fallback (see sessionUpdatedAt): a delta written
+			// after the last full save means the file field is stale.
+			return s.sessionUpdatedAt(workingDir, id, f.Updated)
+		}
+	}
+	return time.Time{}
+}
+
+// SetUpdatedAt rewrites the session's Updated timestamp in the metadata index
+// (index file only — the session file's updated field is left as-is, the same
+// accepted divergence AppendMessages/TouchSession have). Used to preserve a
+// session's recency ranking across a working-directory change, where the
+// relocation flush would otherwise stamp Updated=now on a session the user
+// did not touch. No-op when the session has no index entry in workingDir.
+func (s *Store) SetUpdatedAt(workingDir, id string, updated time.Time) error {
+	if s == nil || !s.enabled || id == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
+	return s.touchIndex(workingDir, id, updated)
+}
+
 // LoadInWorkingDir loads a session from a working directory.
 func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, error) {
 	if s == nil || !s.enabled {
 		return agent.SessionSnapshot{}, fmt.Errorf("session persistence disabled")
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := validateSessionID(id); err != nil {
 		return agent.SessionSnapshot{}, err
 	}
@@ -282,7 +417,7 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 	if err := json.Unmarshal(data, &f); err != nil {
 		return agent.SessionSnapshot{}, err
 	}
-	if s != nil && !f.Created.IsZero() {
+	if !f.Created.IsZero() {
 		s.setCreatedCache(id, f.Created)
 	}
 
@@ -295,30 +430,74 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 	// messages were deliberately dropped).
 	snap, deltaErr := s.loadDelta(workingDir, id)
 	if deltaErr == nil && snap.Messages != nil {
-		merge := false
+		// mergeFrom is the index into snap.Messages where the merge starts:
+		// 0 merges the whole delta, k>0 merges only the delta tail (the
+		// snapshot already absorbed the delta's first k messages), and -1
+		// drops the delta entirely.
+		mergeFrom := -1
 		switch {
 		case snap.BaseCount == 0:
-			// Legacy delta written before baseCount was recorded: the
-			// historic behavior was to merge unconditionally.
-			merge = true
+			// Legacy delta written before baseCount was recorded. Merging
+			// unconditionally (the historic behavior) double-appends when a
+			// later full save already included the delta's messages — the
+			// crash window Save has between the snapshot write and the delta
+			// unlink, which baseCount deltas survive but legacy deltas do
+			// not. The snapshot's Updated timestamp versus the delta file's
+			// mtime disambiguates: a snapshot saved AFTER the delta was
+			// written already contains its messages. When the timestamps
+			// are ambiguous (coarse filesystems), prefer merging — the
+			// historic behavior — rather than risk dropping real messages.
+			if fi, err := os.Stat(s.deltaPath(workingDir, id)); err == nil && f.Updated.After(fi.ModTime()) {
+				_ = s.clearDeltaFile(workingDir, id)
+			} else {
+				mergeFrom = 0
+			}
 		case len(f.Messages) == snap.BaseCount:
 			// Snapshot is exactly the base the delta was written against:
 			// the delta extends it.
-			merge = true
+			mergeFrom = 0
 		case len(f.Messages) >= snap.BaseCount+len(snap.Messages):
 			// Snapshot already contains the delta's messages (a full save
 			// wrote the snapshot but crashed before removing the delta).
 			_ = s.clearDeltaFile(workingDir, id)
+		case len(f.Messages) > snap.BaseCount:
+			// Snapshot is LONGER than the delta's base but shorter than
+			// base+delta. This is the two-writer race shape: a concurrent
+			// full save (another process, or an attach whose restore flush
+			// landed while the registered agent still appends deltas against
+			// its older base) absorbed a PREFIX of the delta into the
+			// snapshot. When the snapshot's extra messages are exactly the
+			// delta's leading messages, the delta's TAIL is real history
+			// that exists nowhere else — merge just the tail instead of
+			// dropping the delta (which previously lost those messages). A
+			// content mismatch means the snapshot diverged (another writer
+			// truncated/rolled back) — keep the snapshot and drop the delta,
+			// the same conservative choice as the truncation case below.
+			overlap := len(f.Messages) - snap.BaseCount
+			if deltaPrefixMatches(f.Messages[snap.BaseCount:], snap.Messages[:overlap]) {
+				mergeFrom = overlap
+			} else {
+				_ = s.clearDeltaFile(workingDir, id)
+			}
 		default:
 			// Snapshot is shorter than the delta's base: the conversation
 			// was truncated (compaction/rollback) and re-saved, so the
 			// delta's messages were deliberately dropped.
 			_ = s.clearDeltaFile(workingDir, id)
 		}
-		if merge {
-			f.Messages = append(f.Messages, snap.Messages...)
-			if len(snap.TokenCounts) > 0 {
-				f.TokenCounts = append(f.TokenCounts, snap.TokenCounts...)
+		if mergeFrom >= 0 {
+			if mergeFrom > 0 {
+				// The snapshot already contains the delta's first
+				// mergeFrom messages; append only the tail.
+				f.Messages = append(f.Messages, snap.Messages[mergeFrom:]...)
+				if len(snap.TokenCounts) > 0 {
+					f.TokenCounts = append(f.TokenCounts, snap.TokenCounts[mergeFrom:]...)
+				}
+			} else {
+				f.Messages = append(f.Messages, snap.Messages...)
+				if len(snap.TokenCounts) > 0 {
+					f.TokenCounts = append(f.TokenCounts, snap.TokenCounts...)
+				}
 			}
 		}
 	}
@@ -327,6 +506,7 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 		WorkingDir:     f.WorkingDir,
 		Model:          f.Model,
 		Mode:           f.Mode,
+		ThinkingLevel:  f.ThinkingLevel,
 		Oneshot:        f.Oneshot,
 		Label:          f.Label,
 		ProjectProfile: f.ProjectProfile,
@@ -349,6 +529,8 @@ func (s *Store) AppendMessages(id string, snap agent.SessionSnapshot, totalMsgCo
 	if s == nil || !s.enabled || id == "" {
 		return nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := validateSessionID(id); err != nil {
 		return err
 	}
@@ -403,6 +585,71 @@ func (s *Store) loadDelta(workingDir, id string) (deltaFile, error) {
 	return df, nil
 }
 
+// deltaPrefixMatches reports whether the snapshot's trailing messages (the
+// portion beyond the delta's base) are the same messages as the delta's
+// leading messages — i.e., the snapshot already absorbed a prefix of the
+// delta (a concurrent full save raced the delta; see LoadInWorkingDir's
+// mergeFrom branch). Only the persisted content is compared: transient
+// fields that are not round-tripped identically (the stream Index and
+// ArgsStabilized) are ignored.
+func deltaPrefixMatches(snapshotTail, deltaPrefix []llm.Message) bool {
+	if len(snapshotTail) != len(deltaPrefix) {
+		return false
+	}
+	for i := range snapshotTail {
+		if !sameMessageContent(snapshotTail[i], deltaPrefix[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// sameMessageContent compares two messages by their persisted fields. Used
+// by deltaPrefixMatches to decide whether a snapshot absorbed a delta's
+// prefix; tool-call Args maps are compared structurally because their JSON
+// round-trip order can differ.
+func sameMessageContent(a, b llm.Message) bool {
+	if a.Role != b.Role || a.Content != b.Content ||
+		a.Reasoning != b.Reasoning || a.Refusal != b.Refusal ||
+		a.ToolCallID != b.ToolCallID {
+		return false
+	}
+	if !a.CreatedAt.Equal(b.CreatedAt) {
+		return false
+	}
+	if len(a.ToolCalls) != len(b.ToolCalls) {
+		return false
+	}
+	for i := range a.ToolCalls {
+		ta, tb := a.ToolCalls[i], b.ToolCalls[i]
+		if ta.ID != tb.ID || ta.Name != tb.Name || ta.ArgsStr != tb.ArgsStr {
+			return false
+		}
+		if !reflect.DeepEqual(ta.Args, tb.Args) {
+			return false
+		}
+	}
+	return true
+}
+
+// sessionUpdatedAt returns the effective persisted update time for a session
+// file: the file's updated field, or the delta file's mtime when that is
+// newer. Incremental saves (AppendMessages) and TouchSession update the
+// metadata index and the file mtimes but deliberately do NOT rewrite the
+// session file's updated field, so the no-index fallback scans must consult
+// the delta's mtime to keep delta-only updates in their recency order.
+// Correct in both directions: after a full save that superseded a delta, the
+// file's updated is newer than the (surviving, crash-left) delta's mtime, so
+// the max picks the file field. Callers must hold s.mu.
+func (s *Store) sessionUpdatedAt(workingDir, id string, fileUpdated time.Time) time.Time {
+	if fi, err := os.Stat(s.deltaPath(workingDir, id)); err == nil {
+		if mt := fi.ModTime().UTC(); mt.After(fileUpdated) {
+			return mt
+		}
+	}
+	return fileUpdated
+}
+
 // clearDeltaFile removes the delta file for a session.
 func (s *Store) clearDeltaFile(workingDir, id string) error {
 	return os.Remove(s.deltaPath(workingDir, id))
@@ -416,16 +663,29 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 	if s == nil || !s.enabled {
 		return nil, nil
 	}
+	// The cache is keyed by the EFFECTIVE store directory, not the working
+	// dir: in global mode (SetGlobalDir) every working dir shares one session
+	// dir, so keying by workingDir would both duplicate entries and — worse —
+	// let a Save/Delete for one working dir leave another working dir's cached
+	// listing of the same sessions stale for the TTL window.
+	cacheKey := s.dir(workingDir)
 
 	// Check in-memory cache first (1-second TTL).
 	listCacheMu.RLock()
-	if ce, ok := listCache[workingDir]; ok && time.Since(ce.time) < time.Second {
+	if ce, ok := listCache[cacheKey]; ok && time.Since(ce.time) < time.Second {
 		out := make([]agent.SessionInfo, len(ce.info))
 		copy(out, ce.info)
 		listCacheMu.RUnlock()
 		return out, nil
 	}
 	listCacheMu.RUnlock()
+
+	// The index read/scan/write below must be serialized with Save/Delete/
+	// Prune (read-modify-write of index.json). The list cache itself was
+	// checked above without the store mutex — concurrent List calls stay
+	// parallel on the hot cache path.
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	// Try the metadata index file.
 	idx := s.readIndex(workingDir)
@@ -462,7 +722,7 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 			}
 		}
 		listCacheMu.Lock()
-		listCache[workingDir] = listCacheEntry{info: out, time: time.Now()}
+		listCache[cacheKey] = listCacheEntry{info: out, time: time.Now()}
 		listCacheMu.Unlock()
 		return out, nil
 	}
@@ -498,19 +758,22 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 		if err := json.Unmarshal(data, &f); err != nil {
 			continue
 		}
+		// Use the delta-aware effective timestamp (AppendMessages bumps only
+		// the index and mtimes, not the file's updated field).
+		updated := s.sessionUpdatedAt(workingDir, id, f.Updated)
 		lbl := sessionLabel(f.Messages, f.Label)
 		items = append(items, item{
 			info: agent.SessionInfo{
 				ID:           id,
 				Oneshot:      f.Oneshot,
-				UpdatedAt:    f.Updated.UTC().Format(time.RFC3339Nano),
+				UpdatedAt:    updated.UTC().Format(time.RFC3339Nano),
 				MessageCount: len(f.Messages),
 				Label:        lbl,
 			},
-			updated: f.Updated,
+			updated: updated,
 		})
 		idx.Entries = append(idx.Entries, sessionIndexEntry{
-			ID: id, Updated: f.Updated, Oneshot: f.Oneshot, MessageCount: len(f.Messages), Label: lbl,
+			ID: id, Updated: updated, Oneshot: f.Oneshot, MessageCount: len(f.Messages), Label: lbl,
 		})
 	}
 	// Persist the index for next time (best-effort).
@@ -526,7 +789,7 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 
 	// Populate in-memory cache.
 	listCacheMu.Lock()
-	listCache[workingDir] = listCacheEntry{info: out, time: time.Now()}
+	listCache[cacheKey] = listCacheEntry{info: out, time: time.Now()}
 	listCacheMu.Unlock()
 
 	return out, nil
@@ -537,6 +800,8 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 // restored files cannot displace the true latest. Only the updated timestamp
 // is decoded — messages and other fields are skipped for a cheap scan.
 func (s *Store) LatestID(workingDir string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	// Fast path: use the metadata index file (avoids reading every session file).
 	idx := s.readIndex(workingDir)
 	if idx != nil && len(idx.Entries) > 0 {
@@ -579,9 +844,12 @@ func (s *Store) LatestID(workingDir string) (string, error) {
 		if err := json.Unmarshal(data, &meta); err != nil || meta.Updated.IsZero() {
 			continue
 		}
-		if meta.Updated.After(latestUpdated) {
-			latestUpdated = meta.Updated
-			latestID = strings.TrimSuffix(e.Name(), ".json")
+		// Delta-aware timestamp (see sessionUpdatedAt): delta-only updates
+		// would otherwise under-rank next to full-save timestamps.
+		id := strings.TrimSuffix(e.Name(), ".json")
+		if updated := s.sessionUpdatedAt(workingDir, id, meta.Updated); updated.After(latestUpdated) {
+			latestUpdated = updated
+			latestID = id
 		}
 	}
 	return latestID, nil
@@ -592,6 +860,8 @@ func (s *Store) Delete(workingDir, id string) error {
 	if s == nil || !s.enabled {
 		return fmt.Errorf("session persistence disabled")
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := validateSessionID(id); err != nil {
 		return err
 	}
@@ -601,7 +871,23 @@ func (s *Store) Delete(workingDir, id string) error {
 	}
 	if err := os.Remove(path); err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("session not found: %s", id)
+			// The session may exist only in memory: a /new pane that was
+			// never used is not persisted on quit (see Save's empty-session
+			// skip), yet the user can still delete it (sidebar ✕ / resume
+			// del). Deleting it is a success — there is no persisted state
+			// to remove — so clean up any leftover delta/index entry and
+			// return nil instead of "session not found".
+			if err := s.clearDeltaFile(workingDir, id); err != nil && !os.IsNotExist(err) {
+				log.Printf("warning: failed to remove delta for session %s: %v", id, err)
+			}
+			// Mirror the found-path cleanup: a stale Created cache entry would
+			// otherwise be re-used by a later Save of a new session with the
+			// same id (in-memory-only sessions are created and deleted without
+			// ever touching disk).
+			delete(s.createdCache, id)
+			s.removeFromIndex(workingDir, id)
+			s.invalidateListCache(workingDir)
+			return nil
 		}
 		return err
 	}
@@ -727,7 +1013,11 @@ func (s *Store) writeIndex(workingDir string, idx *sessionIndex) error {
 }
 
 // updateIndex adds or updates an entry in the session metadata index.
-func (s *Store) updateIndex(workingDir, id string, updated time.Time, msgCount int, label string, oneshot bool) {
+// created is written alongside updated so a later cache-miss Save (e.g. after
+// a process restart) can recover the immutable Created timestamp from the
+// index instead of re-reading the session file. Existing entries keep their
+// Created when created is zero (defensive: Save always passes non-zero).
+func (s *Store) updateIndex(workingDir, id string, created, updated time.Time, msgCount int, label string, oneshot bool) {
 	if s == nil || !s.enabled {
 		return
 	}
@@ -738,6 +1028,9 @@ func (s *Store) updateIndex(workingDir, id string, updated time.Time, msgCount i
 	found := false
 	for i, e := range idx.Entries {
 		if e.ID == id {
+			if !created.IsZero() {
+				idx.Entries[i].Created = created
+			}
 			idx.Entries[i].Updated = updated
 			idx.Entries[i].Oneshot = oneshot
 			idx.Entries[i].MessageCount = msgCount
@@ -748,7 +1041,7 @@ func (s *Store) updateIndex(workingDir, id string, updated time.Time, msgCount i
 	}
 	if !found {
 		idx.Entries = append(idx.Entries, sessionIndexEntry{
-			ID: id, Updated: updated, Oneshot: oneshot, MessageCount: msgCount, Label: label,
+			ID: id, Created: created, Updated: updated, Oneshot: oneshot, MessageCount: msgCount, Label: label,
 		})
 	}
 	_ = s.writeIndex(workingDir, idx)
@@ -866,16 +1159,29 @@ func (s *Store) removeFromIndexBatch(workingDir string, ids []string) {
 
 // invalidateListCache clears the in-memory list cache for a working directory.
 func (s *Store) invalidateListCache(workingDir string) {
+	// Keyed by the effective store dir (see List) so global-mode invalidations
+	// hit every working dir that shares the store.
 	listCacheMu.Lock()
-	delete(listCache, workingDir)
+	delete(listCache, s.dir(workingDir))
 	listCacheMu.Unlock()
 }
 
-func sessionLabel(messages []llm.Message, _ string) string {
-	// Always regenerate the label from messages — CSS text-overflow: ellipsis
-	// handles dynamic truncation. The stored label (if any) was truncated at
-	// 50 chars by an older version and is no longer desirable.
-	return llm.SessionLabel(messages)
+func sessionLabel(messages []llm.Message, stored string) string {
+	derived := llm.SessionLabel(messages)
+	// The stored label is authoritative UNLESS it is a legacy 50-char
+	// truncation of the derived label. An older version truncated labels
+	// when persisting, so a stored label that is exactly the legacy length
+	// and a prefix of the full message is stale and must be migrated to the
+	// untruncated text. Any other stored label is either already full or a
+	// deliberate rename (RenameSession / the session_rename tool) and must
+	// NOT be regenerated: the web sidebar shows the live (renamed) label
+	// while the session is open, and would otherwise fall back to the first
+	// user message the moment the session is closed (the saved-session row
+	// reads this index entry).
+	if stored != "" && (len(stored) != legacyLabelMaxLen || !strings.HasPrefix(derived, stored)) {
+		return stored
+	}
+	return derived
 }
 
 // NewID generates a new session id.
@@ -887,13 +1193,32 @@ func NewID() string {
 	return fmt.Sprintf("%x", b)
 }
 
-// prune deletes expired and excess sessions, always retaining keepID
-// (the current session). Uses the Updated field from the session index or
-// session JSON, not file mtime, to be consistent with LatestID.
-// Deletions are batched so the index is rewritten only once.
-func (s *Store) prune(workingDir, keepID string) {
+// Prune deletes expired and excess sessions while retaining every keepID
+// (all active in-memory sessions). Callers that manage multiple live sessions
+// (the multi-session web registry) must pass the full active ID set; the
+// internal auto-prune in Save is disabled for them via SetAutoPrune(false).
+// Uses the Updated field from the session index or session JSON, not file
+// mtime, to be consistent with LatestID. Deletions are batched so the index
+// is rewritten only once. Serialized by the store mutex.
+func (s *Store) Prune(workingDir string, keepIDs ...string) {
 	if s == nil || !s.enabled {
 		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.prune(workingDir, keepIDs...)
+}
+
+// prune is the lock-free implementation of Prune. Callers must hold s.mu.
+func (s *Store) prune(workingDir string, keepIDs ...string) {
+	if s == nil || !s.enabled {
+		return
+	}
+	keep := make(map[string]struct{}, len(keepIDs))
+	for _, id := range keepIDs {
+		if id != "" {
+			keep[id] = struct{}{}
+		}
 	}
 
 	type item struct {
@@ -929,7 +1254,8 @@ func (s *Store) prune(workingDir, keepID string) {
 			if err := json.Unmarshal(data, &meta); err != nil || meta.Updated.IsZero() {
 				continue
 			}
-			items = append(items, item{id: id, updated: meta.Updated.UTC()})
+			// Delta-aware timestamp (see sessionUpdatedAt).
+			items = append(items, item{id: id, updated: s.sessionUpdatedAt(workingDir, id, meta.Updated).UTC()})
 		}
 	}
 	if len(items) == 0 {
@@ -938,17 +1264,14 @@ func (s *Store) prune(workingDir, keepID string) {
 	sort.Slice(items, func(i, j int) bool { return items[i].updated.After(items[j].updated) })
 
 	cutoff := time.Now().UTC().AddDate(0, 0, -s.maxAgeDays)
-	otherBudget := s.maxCount
-	if keepID != "" {
-		otherBudget--
-		if otherBudget < 0 {
-			otherBudget = 0
-		}
+	otherBudget := s.maxCount - len(keep)
+	if otherBudget < 0 {
+		otherBudget = 0
 	}
 	var toDelete []string
 	others := 0
 	for _, it := range items {
-		if it.id == keepID {
+		if _, ok := keep[it.id]; ok {
 			continue
 		}
 		expired := it.updated.Before(cutoff)

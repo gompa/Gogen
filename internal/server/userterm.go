@@ -180,10 +180,21 @@ func (h *userTermHolder) get() *UserTerminal {
 	return h.ut
 }
 
-func (h *userTermHolder) set(ut *UserTerminal) {
+// trySet stores ut as the connection's terminal, failing when a terminal is
+// already held (live or dead). It serializes spawns so two concurrent
+// user_term_request messages cannot both spawn a shell — without it, the
+// holder's get-then-set in spawnUserTerminal had a TOCTOU window in which
+// the second spawn leaked a pty (its read goroutine kept writing to the
+// socket after the holder was overwritten). The caller closes ut when this
+// returns false.
+func (h *userTermHolder) trySet(ut *UserTerminal) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.ut != nil {
+		return false
+	}
 	h.ut = ut
+	return true
 }
 
 // clear removes ut from the holder if it is still the current terminal,

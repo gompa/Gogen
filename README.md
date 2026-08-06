@@ -279,6 +279,49 @@ These can be set in `.gogen/gogen.conf` or as CLI flags. They are loaded from th
 | `GOGEN_WEB_ALLOWED_ORIGINS` | *(empty)* | Comma-separated host allowlist for WebSocket CORS; empty uses localhost defaults |
 | `GOGEN_WEB_TLS_CERT` | *(empty)* | Path to PEM certificate file for TLS |
 | `GOGEN_WEB_TLS_KEY` | *(empty)* | Path to PEM key file for TLS |
+| `GOGEN_WEB_MAX_ACTIVE_SESSIONS` | `8` | Cap on concurrently active sessions (panes); also `web_max_active_sessions` in `.gogen/gogen.conf` |
+
+### Web UI: panes and disconnect continuation
+
+The web UI supports **multiple chat panes** on one page. Each pane is an
+independent session with its own history, mode, thinking level, model, and
+in-flight turn — they share one workspace (working directory, filesystem).
+Changing the model in one pane never affects another pane, and a pane's model
+is remembered when you resume the session later.
+Because the panes share one workspace, the working directory is a single
+server-wide setting: it can only be changed in global mode (`gogen --global`).
+In project mode the workspace is fixed to the project directory, and the
+working-directory input is hidden.
+
+- The sidebar lists **Open panes** on top (the sessions you have open right
+  now) and **saved sessions** below.
+  - **New** (sidebar button) opens a *new* pane with a fresh session. The
+    previous pane stays open in the background and keeps streaming.
+  - Clicking an open pane focuses it; **✕** closes the pane: any in-flight
+    turn is cancelled and the session's live runtime is released, but the
+    session stays saved and can be resumed later from the saved list (it
+    reloads from disk like any other saved session).
+  - Clicking a saved session opens it as a pane (loaded from disk when it is
+    not already open). Deleting a session (✕ on a saved row, with
+    confirmation) removes it permanently.
+  - Typed `/new`, `/resume <id>`, `/fork N` replace the *current* pane's
+    session (muscle memory preserved).
+- **Background panes keep running**: a turn in a non-focused pane continues
+  server-side, shows the amber responding indicator in the sidebar, and
+  notifies once when it starts. Focus the pane to see it.
+- **Disconnect ≠ cancel**: closing the tab or losing the connection does not
+  stop the current turn — it completes server-side and is saved. When you
+  reconnect, each open pane re-attaches automatically and shows
+  "Resuming…" while a still-running turn finishes; completed turns appear in
+  the history. The **Cancel** button (or `Esc` while streaming) is the only
+  way to stop a turn, and it works even from a fresh connection.
+- **Idle sessions release themselves**: a session whose last tab closes while
+  no turn is running is dropped from memory (it stays saved) and returns to
+  the saved list. The violet "resume to continue" indicator only appears for
+  sessions that are genuinely live — open in another tab, or with a turn
+  still running server-side (it disappears when that turn finishes).
+- The editor runs on its own socket, so saving a file is never blocked by a
+  streaming turn (only by the brief moment a tool actually writes).
 
 ### Web tools (web_fetch / web_search)
 

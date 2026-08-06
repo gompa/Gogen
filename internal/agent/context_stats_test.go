@@ -145,7 +145,7 @@ func TestRecordTurnUsageIgnoresNil(t *testing.T) {
 // TestContextStatsConcurrentWithTurn verifies ContextStats is safe to call
 // while a turn goroutine appends messages, extends the cached token counts,
 // records API usage, and stabilizes tool args in place. The web server calls
-// ContextStats and SnapshotMessages without agentMu/turnMu during a stream
+// ContextStats and SnapshotMessages without turnMu during a stream
 // (connect-time and /models goroutines), so the shared state must be
 // synchronized independently of the turn lock. Run with -race (make test)
 // to catch regressions.

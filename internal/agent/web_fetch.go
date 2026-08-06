@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -320,8 +321,16 @@ func doFetch(ctx context.Context, req fetchRequest) ([]byte, string, string, boo
 	return body, contentType, resp.Request.URL.String(), truncated, nil
 }
 
+// isInternalIP reports whether ip is a private/internal address that the
+// fetch/dial layers must never connect to. Shared by dialContextPublicOnly
+// (skip internal addresses, dial only verified public ones) and isPrivateHost
+// (a host is internal when ALL of its addresses are).
+func isInternalIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() || ip.IsMulticast()
+}
+
 func dialContextPublicOnly(ctx context.Context, network, addr string) (net.Conn, error) {
-	host, _, err := net.SplitHostPort(addr)
+	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -329,16 +338,43 @@ func dialContextPublicOnly(ctx context.Context, network, addr string) (net.Conn,
 	if err != nil {
 		return nil, err
 	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no addresses resolved for %s", host)
+	}
+	// Filter to the VERIFIED public addresses. A dual-stack / split-horizon
+	// host can legitimately resolve to a mix of public and private (or ULA)
+	// addresses — rejecting the whole host on the first private hit broke
+	// such sites even though a public address exists. The security property
+	// is preserved: only addresses checked here (and found public) are ever
+	// dialed, so a DNS-rebinding resolver cannot smuggle a private address
+	// past the check (we dial the checked IPs, not the hostname).
+	var publicIPs []net.IPAddr
 	for _, ipAddr := range ips {
 		ip := ipAddr.IP
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() || ip.IsMulticast() {
-			return nil, fmt.Errorf("requests to private/internal hosts are blocked: %s", ip)
+		if isInternalIP(ip) {
+			continue
 		}
+		publicIPs = append(publicIPs, ipAddr)
 	}
-	// Dial the original host:port so TLS SNI and HTTP/2 connection reuse keep
-	// working. IP allowlisting above rejects private targets before dial.
+	if len(publicIPs) == 0 {
+		return nil, fmt.Errorf("requests to private/internal hosts are blocked: %s resolves only to private addresses", host)
+	}
+	// Dial the VERIFIED public IPs directly instead of the hostname (see the
+	// comment above on DNS rebinding). TLS SNI and certificate validation are
+	// driven by the URL host (http.Transport), not by the dialed address, so
+	// dialing an IP is transparent to HTTPS; iterating every verified IP
+	// preserves multi-A/AAAA failover that dialing the hostname would
+	// otherwise get from the OS resolver.
 	d := net.Dialer{Timeout: webFetchTimeout}
-	return d.DialContext(ctx, network, addr)
+	var dialErrs []error
+	for _, ipAddr := range publicIPs {
+		conn, err := d.DialContext(ctx, network, net.JoinHostPort(ipAddr.IP.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		dialErrs = append(dialErrs, err)
+	}
+	return nil, errors.Join(dialErrs...)
 }
 
 func isPrivateHost(host string) bool {
@@ -357,11 +393,14 @@ func isPrivateHost(host string) bool {
 		return true // can't resolve, be safe
 	}
 	for _, ip := range ips {
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
-			return true
+		// Any public address makes the host reachable publicly; the dial
+		// layer then only connects to the verified public addresses. A host
+		// whose addresses are ALL internal (or unresolvable) is blocked.
+		if !isInternalIP(ip) {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 // WebFetchOptions configures a web_fetch call. Selector and Query are the

@@ -2,12 +2,14 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 type patchFile struct {
@@ -20,6 +22,8 @@ type patchHunk struct {
 	oldStart int
 	oldLines []string
 	newLines []string
+	oldCount int // declared line counts from the hunk header
+	newCount int
 }
 
 type patchPlan struct {
@@ -31,27 +35,63 @@ type patchPlan struct {
 	hunkShifts []string // non-nil when fuzzy mode relocated hunks
 }
 
+// ErrPatchMismatch marks patch failures caused by stale or malformed diff
+// context: hunk context mismatches, ambiguous fuzzy relocations, malformed
+// diff syntax (bad headers/hunk lines), an empty patch, or a diff whose
+// headers cannot be resolved. The agent's patch_file retry-streak hint
+// (executeTool) counts only these toward "failed N times in a row", so
+// permission, I/O, and path-safety failures never trigger stale-diff advice.
+var ErrPatchMismatch = errors.New("patch context mismatch")
+
+// patchMismatchError wraps an error so errors.Is(err, ErrPatchMismatch)
+// succeeds while Error() preserves the original message verbatim — no
+// "patch context mismatch:" prefix — keeping model- and test-visible text
+// unchanged.
+type patchMismatchError struct{ err error }
+
+func (e *patchMismatchError) Error() string { return e.err.Error() }
+func (e *patchMismatchError) Unwrap() error { return e.err }
+
+// Is reports the wrapper as ErrPatchMismatch so errors.Is(err,
+// ErrPatchMismatch) matches any error wrapped by wrapPatchMismatch (the
+// sentinel itself is never in the Unwrap chain — Unwrap yields the original
+// error so its message text is preserved verbatim).
+func (e *patchMismatchError) Is(target error) bool { return target == ErrPatchMismatch }
+
+// wrapPatchMismatch marks err as a patch-context failure. Nil and already-
+// marked errors pass through unchanged.
+func wrapPatchMismatch(err error) error {
+	if err == nil || errors.Is(err, ErrPatchMismatch) {
+		return err
+	}
+	return &patchMismatchError{err: err}
+}
+
 // PatchFile applies a unified diff to files under the working directory.
 // When dryRun is true, patches are validated but not written.
 // When fuzzy is true, hunks may be relocated when exact context no longer matches.
 func (e *Executor) PatchFile(ctx context.Context, diff string, dryRun, fuzzy bool) (string, error) {
 	files, err := parseUnifiedDiff(diff)
 	if err != nil {
-		return "", err
+		return "", wrapPatchMismatch(err)
 	}
 	if len(files) == 0 {
-		return "", fmt.Errorf("no patches found in diff")
+		return "", wrapPatchMismatch(fmt.Errorf("no patches found in diff"))
 	}
 
 	var plans []patchPlan
 	var okFiles []string
 	var failFiles []string
+	mismatchSeen := false
 	seenTargets := make(map[string]struct{})
 
 	for _, pf := range files {
 		plan, label, err := e.planPatch(pf, fuzzy)
 		if err != nil {
 			failFiles = append(failFiles, fmt.Sprintf("%s: %v", label, err))
+			if errors.Is(err, ErrPatchMismatch) {
+				mismatchSeen = true
+			}
 			continue
 		}
 		if _, dup := seenTargets[plan.secure]; dup {
@@ -65,7 +105,14 @@ func (e *Executor) PatchFile(ctx context.Context, diff string, dryRun, fuzzy boo
 
 	if len(failFiles) > 0 {
 		msg := formatPatchReport(okFiles, failFiles, dryRun)
-		return msg, fmt.Errorf("patch failed for %d file(s)", len(failFiles))
+		err := fmt.Errorf("patch failed for %d file(s)", len(failFiles))
+		if mismatchSeen {
+			// At least one failing file was a context/format failure: mark
+			// the aggregate so the retry-streak hint treats it as stale-diff
+			// advice rather than an I/O or permission problem.
+			err = wrapPatchMismatch(err)
+		}
+		return msg, err
 	}
 
 	if dryRun {
@@ -142,6 +189,7 @@ func appendShifts(msg string, plans []patchPlan) string {
 		return msg
 	}
 	var b strings.Builder
+	fmt.Fprintf(&b, "Warning: %d hunk(s) were relocated by fuzzy matching — verify the changes before continuing.\n\n", len(shifts))
 	b.WriteString(msg)
 	b.WriteString("\n\nFuzzy-matching shifts (hunks relocated from original positions):\n")
 	for _, s := range shifts {
@@ -183,13 +231,15 @@ func formatPatchReport(ok, fail []string, dryRun bool) string {
 }
 
 func (e *Executor) planPatch(pf patchFile, fuzzy bool) (patchPlan, string, error) {
+	// The +++ header names the target. When it is missing (models sometimes
+	// drop it) or it is /dev/null (delete), fall back to the --- header.
 	target := pf.newName
-	if target == "/dev/null" {
+	if target == "" || target == "/dev/null" {
 		target = pf.oldName
 	}
 	target = normalizePatchPath(target)
 	if target == "" {
-		return patchPlan{}, "", fmt.Errorf("could not determine target file from diff headers")
+		return patchPlan{}, "", wrapPatchMismatch(fmt.Errorf("could not determine target file from diff headers"))
 	}
 
 	secure, err := e.SecurePath(target)
@@ -203,12 +253,12 @@ func (e *Executor) planPatch(pf patchFile, fuzzy bool) (patchPlan, string, error
 
 	isCreate := pf.oldName == "/dev/null"
 	if !isCreate && len(pf.hunks) == 0 {
-		return patchPlan{}, target, fmt.Errorf("no hunks found (check @@ headers use the form '@@ -start,count +start,count @@' with a space after @@)")
+		return patchPlan{}, target, wrapPatchMismatch(fmt.Errorf("no hunks found (check @@ headers use the form '@@ -start,count +start,count @@' with a space after @@)"))
 	}
 
 	if isCreate {
 		if _, err := os.Stat(secure); err == nil {
-			return patchPlan{}, target, fmt.Errorf("file already exists; use a modify patch (--- a/%s) instead of creating from /dev/null", target)
+			return patchPlan{}, target, wrapPatchMismatch(fmt.Errorf("file already exists; use a modify patch (--- a/%s) instead of creating from /dev/null", target))
 		} else if !os.IsNotExist(err) {
 			return patchPlan{}, target, err
 		}
@@ -225,7 +275,9 @@ func (e *Executor) planPatch(pf patchFile, fuzzy bool) (patchPlan, string, error
 
 	updated, shifts, err := applyPatchHunks(original, pf.hunks, fuzzy)
 	if err != nil {
-		return patchPlan{}, target, err
+		// applyPatchHunks failures are context mismatches, ambiguous fuzzy
+		// relocations, or stale line numbers — all stale-diff failures.
+		return patchPlan{}, target, wrapPatchMismatch(err)
 	}
 
 	label := target + " (validated)"
@@ -297,6 +349,7 @@ func parseUnifiedDiff(diff string) ([]patchFile, error) {
 	if len(lines) > 0 && lines[len(lines)-1] == "" {
 		lines = lines[:len(lines)-1]
 	}
+	boundaryAhead := computeBoundaryAhead(lines)
 	var files []patchFile
 	var current *patchFile
 	var hunk *patchHunk
@@ -310,6 +363,16 @@ func parseUnifiedDiff(diff string) ([]patchFile, error) {
 	flushFile := func() {
 		flushHunk()
 		if current != nil {
+			// A file section with no hunks and no /dev/null target is
+			// malformed. Models sometimes repeat the ---/+++ header before
+			// the real hunk section (a duplicate header); failing the whole
+			// patch on such a section is spurious. Drop it and keep parsing —
+			// a lone header-only section yields "no patches found" below
+			// (still loud), and real hunks in a later section still apply.
+			if current.newName != "/dev/null" && len(current.hunks) == 0 {
+				current = nil
+				return
+			}
 			files = append(files, *current)
 			current = nil
 		}
@@ -332,12 +395,24 @@ func parseUnifiedDiff(diff string) ([]patchFile, error) {
 			strings.HasPrefix(line, "rename to ")) {
 			continue
 		}
-		if strings.HasPrefix(line, "--- ") {
+		// "--- "/"+++ " are file headers ONLY outside a hunk (or after a
+		// hunk that has consumed its declared line counts). A hunk's own
+		// removed/added lines can themselves start with "-- "/"++ " — e.g.
+		// deleting a SQL comment line "-- foo" yields the wire line
+		// "--- foo" — and an unconditional header check would flush the
+		// current hunk and silently corrupt the patch. git resolves the
+		// same ambiguity with section state; we use the hunk's declared
+		// counts as the tie-breaker (>= because LLM counts are frequently
+		// imprecise). A hunk whose declared counts EXCEED its emitted lines
+		// never completes; when the next file's header pair follows with no
+		// blank separator, isHeaderPairAhead hands control back to header
+		// mode instead of absorbing "--- a/b.txt" as a removed line.
+		if strings.HasPrefix(line, "--- ") && (hunk == nil || hunkComplete(hunk) || isHeaderPairAhead(lines, i)) {
 			flushFile()
 			current = &patchFile{oldName: strings.TrimSpace(strings.TrimPrefix(line, "--- "))}
 			continue
 		}
-		if strings.HasPrefix(line, "+++ ") {
+		if strings.HasPrefix(line, "+++ ") && (hunk == nil || hunkComplete(hunk)) {
 			if current == nil {
 				return nil, fmt.Errorf("malformed diff: +++ before ---")
 			}
@@ -356,6 +431,28 @@ func parseUnifiedDiff(diff string) ([]patchFile, error) {
 			hunk = &parsed
 			continue
 		}
+		// A model-added delimiter (e.g. "*** End Patch", "***endpatch",
+		// "*** End of file", a bare "***", or a closing code fence) marks the
+		// end of the patch. Flush the pending hunk/file and stop parsing, so
+		// repeated markers or stray text after the marker are ignored instead
+		// of being absorbed as hunk content or failing with "malformed hunk
+		// line". The check runs BEFORE the hunk==nil guard so the marker ends
+		// the patch even when no hunk is open (e.g. wedged between a +++
+		// header and its hunk, or after a hunk was flushed by a blank
+		// separator) — without it, sections after the marker would still be
+		// parsed as new files. Prefixed lines such as "+*** note" still parse
+		// as added lines because they start with a hunk prefix, not "***".
+		// Context-format range headers ("*** 16,20 ***", diff -c) are NOT
+		// delimiters: they signal the model switched diff formats and must
+		// keep failing loudly. A delimiter before the first file header (e.g.
+		// "*** Start Patch") is a preamble and is skipped.
+		if isPatchDelimiterMarker(line) || isBareCodeFence(line) {
+			if current != nil {
+				flushFile()
+				return files, nil
+			}
+			continue
+		}
 		if hunk == nil {
 			continue
 		}
@@ -367,7 +464,7 @@ func parseUnifiedDiff(diff string) ([]patchFile, error) {
 		// often emit a bare blank line instead — dropping those corrupts patches.
 		// Exception: blanks that only separate file sections must not become context.
 		if len(line) == 0 {
-			if isPatchFileBoundaryAhead(lines, i+1) {
+			if boundaryAhead[i+1] {
 				flushHunk()
 				continue
 			}
@@ -392,17 +489,109 @@ func parseUnifiedDiff(diff string) ([]patchFile, error) {
 	return files, nil
 }
 
-// isPatchFileBoundaryAhead reports whether the next non-empty line starts a new
-// file section (or only trailing blanks remain). Used so blank separators between
-// files are not absorbed as empty hunk context.
-func isPatchFileBoundaryAhead(lines []string, from int) bool {
-	for j := from; j < len(lines); j++ {
-		if lines[j] == "" {
-			continue
+// hunkComplete reports whether the hunk has already consumed its declared
+// line counts (>=, not ==: LLM-generated counts are frequently off by one
+// or more, and treating a nearly-full hunk as done beats swallowing the next
+// file's header as a hunk body line).
+func hunkComplete(h *patchHunk) bool {
+	return h != nil &&
+		len(h.oldLines) >= h.oldCount &&
+		len(h.newLines) >= h.newCount
+}
+
+// isHeaderPairAhead reports whether the next non-empty line after lines[i]
+// is a "+++ " header whose own next non-empty line starts a new hunk or
+// file section ("@@", "--- ", "diff --git "). It lets an incomplete hunk
+// (declared counts exceeding its emitted lines — LLM under-counting) hand
+// the parser back to file-header mode when a real next-file section follows
+// WITHOUT a blank separator, instead of absorbing "--- a/b.txt" as a removed
+// hunk line (which merged the two files' hunks into one).
+//
+// The lookahead deliberately requires the third line: a deleted "-- X" line
+// immediately followed by an added "++ Y" line (wire "--- X" / "+++ Y") must
+// stay hunk content unless a section marker follows. EOF is NOT accepted as
+// that marker: a "--- X\n+++ Y" pair at the end of the diff is more likely a
+// content pair in an incomplete hunk, and keeping it as content makes apply
+// fail loudly instead of applying a partial hunk.
+func isHeaderPairAhead(lines []string, i int) bool {
+	j := i + 1
+	for j < len(lines) && lines[j] == "" {
+		j++
+	}
+	if j >= len(lines) || !strings.HasPrefix(lines[j], "+++ ") {
+		return false
+	}
+	k := j + 1
+	for k < len(lines) && lines[k] == "" {
+		k++
+	}
+	if k >= len(lines) {
+		return false
+	}
+	return strings.HasPrefix(lines[k], "@@") ||
+		strings.HasPrefix(lines[k], "--- ") ||
+		strings.HasPrefix(lines[k], "diff --git ")
+}
+
+// isPatchDelimiterMarker reports whether line is a model-added patch
+// delimiter such as "*** End Patch", "***endpatch", "*** Start Patch" or a
+// bare "***". Only letter/space text after the stars counts as a delimiter:
+// context-format range headers (e.g. "*** 16,20 ***" / "*** 104,110 ****")
+// contain digits and are NOT delimiters — swallowing them would silently
+// drop real diff structure and replace a clear error with a confusing one.
+func isPatchDelimiterMarker(line string) bool {
+	if !strings.HasPrefix(line, "***") {
+		return false
+	}
+	rest := strings.TrimSpace(strings.TrimRight(line[3:], "*"))
+	if rest == "" {
+		return true
+	}
+	for _, r := range rest {
+		if !unicode.IsLetter(r) && r != ' ' {
+			return false
 		}
-		return strings.HasPrefix(lines[j], "--- ") || strings.HasPrefix(lines[j], "diff --git ")
 	}
 	return true
+}
+
+// isBareCodeFence reports whether line is a bare markdown code fence
+// ("```"), which models sometimes append to close a diff. The line must
+// START with the backticks — a space-prefixed " ```" is a real hunk context
+// line and must be kept. Fences with a language tag ("```go") are not
+// treated as closers either.
+func isBareCodeFence(line string) bool {
+	if !strings.HasPrefix(line, "```") {
+		return false
+	}
+	return strings.TrimSpace(line) == "```"
+}
+
+// computeBoundaryAhead precomputes, for every index i, whether the next
+// non-empty line at or after i starts a new file section (or only trailing
+// blanks remain). It is built in one backward pass so the parser's blank-line
+// handling is O(1) per blank line instead of re-scanning forward for each one
+// (a quadratic loop on blank-heavy generated diffs).
+func computeBoundaryAhead(lines []string) []bool {
+	boundary := make([]bool, len(lines)+1)
+	// Past the end of the diff only trailing blanks remain, so a blank line
+	// at the very end (i == len(lines)-1, checked via boundary[i+1]) must
+	// terminate the hunk. Without this the LAST blank would be absorbed as an
+	// empty context line while a run of two or more trailing blanks flushes
+	// the hunk — an off-by-one that made patches ending in a single extra
+	// blank line fail spuriously (or inject a stray blank at EOF when the
+	// file itself ended with a blank line).
+	boundary[len(lines)] = true
+	nextBoundary := true // past the end: only trailing blanks remain
+	for i := len(lines) - 1; i >= 0; i-- {
+		if lines[i] == "" {
+			boundary[i] = nextBoundary
+			continue
+		}
+		nextBoundary = strings.HasPrefix(lines[i], "--- ") || strings.HasPrefix(lines[i], "diff --git ")
+		boundary[i] = nextBoundary
+	}
+	return boundary
 }
 
 func parseHunkHeader(line string) (patchHunk, error) {
@@ -419,32 +608,50 @@ func parseHunkHeader(line string) (patchHunk, error) {
 	if oldPart == parts[0] || newPart == parts[1] {
 		return patchHunk{}, fmt.Errorf("invalid hunk header: %q", line)
 	}
-	oldStart, err := parseDiffLineCount(oldPart)
+	oldStart, oldCount, err := parseDiffLineRange(oldPart)
 	if err != nil {
 		return patchHunk{}, err
 	}
-	if _, err := parseDiffLineCount(newPart); err != nil {
+	newStart, newCount, err := parseDiffLineRange(newPart)
+	if err != nil {
 		return patchHunk{}, err
 	}
-	return patchHunk{oldStart: oldStart}, nil
+	_ = newStart // only oldStart is used for positioning; counts drive hunkComplete
+	return patchHunk{oldStart: oldStart, oldCount: oldCount, newCount: newCount}, nil
 }
 
-func parseDiffLineCount(part string) (int, error) {
+// parseDiffLineRange parses a hunk header range ("1" or "1,4") into
+// (start, count). A missing count means 1; a missing start also means 1
+// (both per unified-diff semantics).
+func parseDiffLineRange(part string) (start, count int, err error) {
 	if part == "" {
-		return 1, nil
+		return 1, 1, nil
 	}
 	num := part
+	count = 1
 	if idx := strings.IndexByte(part, ','); idx >= 0 {
 		num = part[:idx]
+		c, cErr := strconv.Atoi(part[idx+1:])
+		if cErr != nil || c < 0 {
+			return 0, 0, fmt.Errorf("invalid hunk line count %q", part)
+		}
+		count = c
 	}
 	n, err := strconv.Atoi(num)
 	if err != nil {
-		return 0, fmt.Errorf("invalid hunk line number %q", part)
+		return 0, 0, fmt.Errorf("invalid hunk line number %q", part)
 	}
 	if n < 0 {
-		return 0, fmt.Errorf("invalid hunk line number %q: must be non-negative", part)
+		return 0, 0, fmt.Errorf("invalid hunk line number %q: must be non-negative", part)
 	}
-	return n, nil
+	return n, count, nil
+}
+
+// parseDiffLineCount returns only the start line of a hunk header range.
+// Kept for tests and callers that only need the start position.
+func parseDiffLineCount(part string) (int, error) {
+	start, _, err := parseDiffLineRange(part)
+	return start, err
 }
 
 func applyPatchHunks(original []string, hunks []patchHunk, fuzzy bool) (outLines []string, hunkShifts []string, err error) {
@@ -489,16 +696,24 @@ func applyPatchHunks(original []string, hunks []patchHunk, fuzzy bool) (outLines
 		} else if hint < len(out) {
 			actual = out[hint:]
 		}
-		matched := findHunkMatch(out, h.oldLines, hint, fuzzy)
+		matched, ambiguous := findHunkMatch(out, h.oldLines, hint, fuzzy)
 		if matched < 0 {
+			if ambiguous {
+				return nil, nil, fmt.Errorf("hunk %d/%d context is ambiguous: fuzzy matching found multiple candidate locations; re-read the file and regenerate the diff with more surrounding context",
+					hi+1, len(hunks))
+			}
 			return nil, nil, formatHunkMismatch(hi+1, len(hunks), hint+1, actual, h.oldLines, fuzzy)
 		}
 		// Track hunk relocation when fuzzy matching found the hunk at a
-		// different position than the diff headers indicated.
-		if shift := matched - hint; shift != 0 {
-			expectedLine := h.oldStart + lineDelta
+		// different position than the diff headers indicated. The shift is
+		// measured against the un-clamped header position (oldStart), not the
+		// clamped hint: when the header line number is stale and points past
+		// EOF, hint is clamped to len(out) and reporting the clamp would show
+		// a bogus "found at line" that matches neither the header nor the
+		// actual match location.
+		if shift := matched - (h.oldStart - 1 + lineDelta); shift != 0 {
 			hunkShifts = append(hunkShifts, fmt.Sprintf("hunk %d shifted by %+d lines (expected around line %d, found at line %d)",
-				hi+1, shift, expectedLine, expectedLine+shift))
+				hi+1, shift, h.oldStart+lineDelta, matched+1))
 		}
 		start = matched
 		end := start + n
@@ -516,30 +731,44 @@ func applyPatchHunks(original []string, hunks []patchHunk, fuzzy bool) (outLines
 }
 
 // findHunkMatch locates oldLines within lines. Returns the start index, or -1
-// if no match is found. When fuzzy is true, relocation and whitespace-tolerant
-// matching are attempted before giving up.
-func findHunkMatch(lines, oldLines []string, hint int, fuzzy bool) int {
+// if no match is found. ambiguous is true when fuzzy relocation was refused
+// because the hunk matched multiple positions. When fuzzy is true, relocation
+// and whitespace-tolerant matching are attempted before giving up.
+func findHunkMatch(lines, oldLines []string, hint int, fuzzy bool) (matched int, ambiguous bool) {
 	n := len(oldLines)
 	end := hint + n
 	if end <= len(lines) && linesEqual(lines[hint:end], oldLines) {
-		return hint
+		return hint, false
 	}
 	if !fuzzy {
-		return -1
+		return -1, false
 	}
-	// Try exact relocation.
-	if alt, ok := findHunkLocation(lines, oldLines, hint); ok {
-		return alt
-	}
-	// Try whitespace-tolerant match at the current position.
+	// Try a whitespace-tolerant match at the hinted position before
+	// relocating. The hunk header line number anchors where the hunk belongs;
+	// when the anchored text only differs by trailing whitespace (a common
+	// LLM artifact), it is a stronger signal than an exact match somewhere
+	// else in the file — relocating to the distant copy would silently edit
+	// the wrong block.
 	if end <= len(lines) && linesEqualFuzzy(lines[hint:end], oldLines) {
-		return hint
+		return hint, false
 	}
-	// Try relocation with whitespace-tolerant matching.
-	if alt, ok := findHunkLocationFuzzy(lines, oldLines, hint); ok {
-		return alt
+	// Try exact relocation (nearest candidate; the hunk header line number is
+	// authoritative and the text matches exactly).
+	if alt, ok := findHunkLocation(lines, oldLines, hint); ok {
+		return alt, false
 	}
-	return -1
+	// Try relocation with whitespace-tolerant matching. Only apply it when the
+	// hunk matches a single position — ambiguous matches would guess at the
+	// target block and can silently corrupt the file, so fail loudly instead
+	// and let the agent re-read and regenerate with more context.
+	best, count, ok := findHunkLocationWith(lines, oldLines, hint, linesEqualFuzzy)
+	if ok {
+		if count == 1 {
+			return best, false
+		}
+		return -1, true
+	}
+	return -1, false
 }
 
 func formatHunkMismatch(hunkNum, hunkTotal, line int, actual, expected []string, fuzzy bool) error {
@@ -564,39 +793,34 @@ func formatHunkMismatch(hunkNum, hunkTotal, line int, actual, expected []string,
 	return fmt.Errorf("%s", msg)
 }
 
-// findHunkLocationWith locates oldLines within lines using the given comparison function.
-// Returns the best match index (closest to hint) and true, or 0 and false if no match.
-func findHunkLocationWith(lines, oldLines []string, hint int, cmp func([]string, []string) bool) (int, bool) {
+// findHunkLocationWith locates oldLines within lines using the given comparison
+// function. Returns the best match index (closest to hint), the number of
+// matching positions, and whether any match was found. The best match is
+// tracked in O(1) memory while scanning once.
+func findHunkLocationWith(lines, oldLines []string, hint int, cmp func([]string, []string) bool) (int, int, bool) {
 	n := len(oldLines)
 	if n == 0 {
-		return hint, true
+		return hint, 1, true
 	}
-	var matches []int
+	best, bestDist, count := -1, 0, 0
 	for i := 0; i <= len(lines)-n; i++ {
-		if cmp(lines[i:i+n], oldLines) {
-			matches = append(matches, i)
+		if !cmp(lines[i:i+n], oldLines) {
+			continue
+		}
+		count++
+		if d := absInt(i - hint); best == -1 || d < bestDist {
+			best, bestDist = i, d
 		}
 	}
-	switch len(matches) {
-	case 0:
-		return 0, false
-	case 1:
-		return matches[0], true
-	default:
-		best := matches[0]
-		bestDist := absInt(matches[0] - hint)
-		for _, m := range matches[1:] {
-			if d := absInt(m - hint); d < bestDist {
-				best = m
-				bestDist = d
-			}
-		}
-		return best, true
+	if count == 0 {
+		return 0, 0, false
 	}
+	return best, count, true
 }
 
 func findHunkLocation(lines, oldLines []string, hint int) (int, bool) {
-	return findHunkLocationWith(lines, oldLines, hint, linesEqual)
+	best, _, ok := findHunkLocationWith(lines, oldLines, hint, linesEqual)
+	return best, ok
 }
 
 func absInt(n int) int {
@@ -619,12 +843,6 @@ func linesEqualFuzzy(a, b []string) bool {
 		}
 	}
 	return true
-}
-
-// findHunkLocationFuzzy is like findHunkLocation but uses
-// whitespace-tolerant line comparison.
-func findHunkLocationFuzzy(lines, oldLines []string, hint int) (int, bool) {
-	return findHunkLocationWith(lines, oldLines, hint, linesEqualFuzzy)
 }
 
 func linesEqual(a, b []string) bool {

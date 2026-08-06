@@ -7,16 +7,16 @@ import (
 
 // ThinkingLevel controls how much reasoning/thinking the model performs.
 // The zero value ("off") means no thinking parameter is sent to the API.
+// Only levels that map to a distinct reasoning_effort value on the wire are
+// exposed (off/low/medium/high); the older minimal/xhigh/max names are still
+// accepted as parse aliases and fold onto low/high (see thinkingLevels).
 type ThinkingLevel string
 
 const (
-	ThinkingOff     ThinkingLevel = "off"
-	ThinkingMinimal ThinkingLevel = "minimal"
-	ThinkingLow     ThinkingLevel = "low"
-	ThinkingMedium  ThinkingLevel = "medium"
-	ThinkingHigh    ThinkingLevel = "high"
-	ThinkingXHigh   ThinkingLevel = "xhigh"
-	ThinkingMax     ThinkingLevel = "max"
+	ThinkingOff    ThinkingLevel = "off"
+	ThinkingLow    ThinkingLevel = "low"
+	ThinkingMedium ThinkingLevel = "medium"
+	ThinkingHigh   ThinkingLevel = "high"
 )
 
 // thinkingInfo holds display and parsing metadata for a thinking level.
@@ -27,6 +27,16 @@ type thinkingInfo struct {
 	aliases    []string // parse aliases (lowercase)
 }
 
+// thinkingLevelOrder is the canonical level ordering (weakest → strongest),
+// used by ValidThinkingLevels so listings (help text, /think error messages)
+// are deterministic instead of map-iteration order.
+var thinkingLevelOrder = []ThinkingLevel{
+	ThinkingOff,
+	ThinkingLow,
+	ThinkingMedium,
+	ThinkingHigh,
+}
+
 // thinkingLevels is the single source of truth for all level metadata.
 var thinkingLevels = map[ThinkingLevel]thinkingInfo{
 	ThinkingOff: {
@@ -35,17 +45,11 @@ var thinkingLevels = map[ThinkingLevel]thinkingInfo{
 		details:    "No reasoning",
 		aliases:    []string{"off", "0"},
 	},
-	ThinkingMinimal: {
-		label:      "Minimal",
-		shortLabel: "Mi",
-		details:    "Very brief reasoning",
-		aliases:    []string{"minimal", "min"},
-	},
 	ThinkingLow: {
 		label:      "Low",
 		shortLabel: "L",
 		details:    "Light reasoning",
-		aliases:    []string{"low"},
+		aliases:    []string{"low", "minimal", "min"},
 	},
 	ThinkingMedium: {
 		label:      "Medium",
@@ -57,28 +61,17 @@ var thinkingLevels = map[ThinkingLevel]thinkingInfo{
 		label:      "High",
 		shortLabel: "H",
 		details:    "Deep reasoning",
-		aliases:    []string{"high"},
-	},
-	ThinkingXHigh: {
-		label:      "Extra high",
-		shortLabel: "XH",
-		details:    "Extra-deep reasoning",
-		aliases:    []string{"xhigh", "x-high"},
-	},
-	ThinkingMax: {
-		label:      "Maximum",
-		shortLabel: "Max",
-		details:    "Maximum reasoning",
-		aliases:    []string{"max"},
+		// "xhigh"/"max" are kept as parse aliases for sessions that
+		// persisted them before the fold; they normalize to "high".
+		aliases: []string{"high", "xhigh", "x-high", "max"},
 	},
 }
 
-// ValidThinkingLevels returns all supported thinking levels.
+// ValidThinkingLevels returns all supported thinking levels in canonical
+// (weakest → strongest) order.
 func ValidThinkingLevels() []ThinkingLevel {
-	all := make([]ThinkingLevel, 0, len(thinkingLevels))
-	for level := range thinkingLevels {
-		all = append(all, level)
-	}
+	all := make([]ThinkingLevel, len(thinkingLevelOrder))
+	copy(all, thinkingLevelOrder)
 	return all
 }
 
@@ -119,9 +112,19 @@ func (l ThinkingLevel) Details() string {
 	return ""
 }
 
-// SetThinkingLevel sets the agent's thinking level and persists the session.
+// SetThinkingLevel sets the agent's thinking level, syncs the provider's
+// reasoning-effort state so the two can never diverge, and persists the
+// session. The level field itself is written under statsMu (see
+// Agent.ModeAndThinkingLevel — config snapshots read it without the turn
+// lock, so a mid-turn attach never blocks); the provider sync runs outside
+// the lock.
 func (a *Agent) SetThinkingLevel(l ThinkingLevel) {
+	a.statsMu.Lock()
 	a.ThinkingLevel = l
+	a.statsMu.Unlock()
+	if a.Provider != nil {
+		a.Provider.SetThinkingLevel(string(l))
+	}
 	a.FlushSession()
 }
 

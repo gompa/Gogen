@@ -87,8 +87,23 @@ func (m Mode) AllowsTool(name string) bool {
 }
 
 func (a *Agent) SetMode(m Mode) {
+	// Written under statsMu so config snapshots (agentConfigMsgBasic) can
+	// read the mode WITHOUT the session turn lock — the web attach handshake
+	// must never block on a running turn, which holds turnMu for its entire
+	// duration.
+	a.statsMu.Lock()
 	a.Mode = m
+	a.statsMu.Unlock()
 	a.FlushSession()
+}
+
+// ModeAndThinkingLevel returns the current mode and thinking level under
+// statsMu. Safe to call without holding turnMu; used by the web server's
+// config snapshot so a mid-turn attach never blocks on the turn lock.
+func (a *Agent) ModeAndThinkingLevel() (Mode, ThinkingLevel) {
+	a.statsMu.RLock()
+	defer a.statsMu.RUnlock()
+	return a.Mode, a.ThinkingLevel
 }
 
 func (a *Agent) checkPlanMode(toolName string) error {

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -32,6 +33,12 @@ type TodoList struct {
 // TodoManager handles in-memory todo operations for the current session.
 // Persistence is via SessionSnapshot (or a legacy file when sessions are disabled).
 type TodoManager struct {
+	// mu guards todos and workingDir. Mutations happen on the turn goroutine
+	// (todo tools run inside turns), but snapshots also run on flush paths
+	// that hold no turn lock (ShutdownSessions after a drain timeout,
+	// sessionDelete with a stuck turn, doPersist) — a plain field access
+	// raced those readers (data race under -race).
+	mu         sync.RWMutex
 	workingDir string
 	todos      *TodoList
 }
@@ -46,7 +53,12 @@ func NewTodoManager(workingDir string) *TodoManager {
 
 // Snapshot returns a deep copy of the current todo list for session persistence.
 func (m *TodoManager) Snapshot() *TodoList {
-	if m == nil || m.todos == nil {
+	if m == nil {
+		return &TodoList{Items: []TodoItem{}, NextID: 1}
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.todos == nil {
 		return &TodoList{Items: []TodoItem{}, NextID: 1}
 	}
 	out := &TodoList{
@@ -64,8 +76,10 @@ func (m *TodoManager) Replace(list *TodoList) {
 	if m == nil {
 		return
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if list == nil {
-		m.Clear()
+		m.todos = &TodoList{Items: []TodoItem{}, NextID: 1}
 		return
 	}
 	next := list.NextID
@@ -83,12 +97,19 @@ func (m *TodoManager) Clear() {
 	if m == nil {
 		return
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.todos = &TodoList{Items: []TodoItem{}, NextID: 1}
 }
 
 // Empty reports whether there are no todo items.
 func (m *TodoManager) Empty() bool {
-	return m == nil || m.todos == nil || len(m.todos.Items) == 0
+	if m == nil {
+		return true
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.todos == nil || len(m.todos.Items) == 0
 }
 
 // SetWorkingDir updates the directory used for legacy file fallback.
@@ -96,6 +117,8 @@ func (m *TodoManager) SetWorkingDir(dir string) {
 	if m == nil {
 		return
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.workingDir = dir
 }
 
@@ -118,18 +141,23 @@ func (m *TodoManager) ImportLegacyFile() bool {
 		_ = os.Remove(path)
 		return false
 	}
-	m.Replace(&todos)
 	bak := path + ".migrated"
 	if err := os.Rename(path, bak); err != nil {
 		// Still imported into memory; best-effort remove so we do not keep
 		// re-reading a stuck legacy file on every start.
 		_ = os.Remove(path)
 	}
+	m.Replace(&todos)
 	return true
 }
 
 func (m *TodoManager) saveLegacy() error {
-	if m == nil || m.workingDir == "" {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.workingDir == "" {
 		return nil
 	}
 	path := filepath.Join(m.workingDir, todoFilePath)
@@ -150,6 +178,8 @@ func (m *TodoManager) AddTodo(text string) (string, error) {
 	if text == "" {
 		return "", fmt.Errorf("todo text is required")
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if len(m.todos.Items) >= maxTodos {
 		return "", fmt.Errorf("too many todos (max %d); complete or remove some first", maxTodos)
 	}
@@ -166,6 +196,8 @@ func (m *TodoManager) AddTodo(text string) (string, error) {
 
 // DoneTodo marks a todo as completed.
 func (m *TodoManager) DoneTodo(id int) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for i, item := range m.todos.Items {
 		if item.ID == id {
 			if item.Status == "done" {
@@ -181,6 +213,8 @@ func (m *TodoManager) DoneTodo(id int) (string, error) {
 
 // RemoveTodo removes a todo item entirely.
 func (m *TodoManager) RemoveTodo(id int) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for i, item := range m.todos.Items {
 		if item.ID == id {
 			m.todos.Items = append(m.todos.Items[:i], m.todos.Items[i+1:]...)
@@ -192,6 +226,8 @@ func (m *TodoManager) RemoveTodo(id int) (string, error) {
 
 // ListTodos returns a formatted list of all todos.
 func (m *TodoManager) ListTodos() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if len(m.todos.Items) == 0 {
 		return "No todos"
 	}
@@ -214,6 +250,8 @@ func (m *TodoManager) ListTodos() string {
 
 // ClearDoneTodos removes all completed todos.
 func (m *TodoManager) ClearDoneTodos() (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	remaining := make([]TodoItem, 0, len(m.todos.Items))
 	cleared := 0
 	for _, item := range m.todos.Items {
