@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"gogen/internal/treesitter"
@@ -60,47 +59,10 @@ func (e *Executor) walkSymbolReferences(ctx context.Context, searchRoot, relPref
 		return nil
 	}
 
-	return filepath.WalkDir(searchRoot, func(path string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return nil
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if d.IsDir() {
-			if path != searchRoot && shouldSkipSearchEntry(d.Name(), true) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if shouldSkipSearchEntry(d.Name(), false) {
-			return nil
-		}
+	return walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true}, func(path, rel string, d os.DirEntry) error {
 		if !treesitter.ReferenceSearchSupported(path) {
 			return nil
 		}
-
-		// Compute relative path with prefix
-		rel, err := filepath.Rel(searchRoot, path)
-		if err != nil {
-			return nil
-		}
-		rel = filepath.ToSlash(rel)
-		if relPrefix != "" {
-			rel = filepath.ToSlash(filepath.Join(relPrefix, rel))
-		}
-
-		// Apply glob filter
-		if glob != "" && !matchGlobPattern(glob, rel) {
-			return nil
-		}
-
-		// Check file size and binary status
-		info, err := d.Info()
-		if !searchableWalkFile(path, info, err) {
-			return nil
-		}
-
 		// Read file and find references
 		content, err := os.ReadFile(path)
 		if err != nil {
@@ -108,9 +70,6 @@ func (e *Executor) walkSymbolReferences(ctx context.Context, searchRoot, relPref
 		}
 		refs, err := treesitter.FindSymbolReferences(path, content, symbol)
 		if err != nil {
-			if errors.Is(err, treesitter.ErrDisabled) || errors.Is(err, treesitter.ErrUnsupported) {
-				return nil
-			}
 			return nil
 		}
 		if len(refs) == 0 {
@@ -133,44 +92,7 @@ func (e *Executor) walkSymbolReferencesText(ctx context.Context, searchRoot, rel
 		return err
 	}
 
-	return filepath.WalkDir(searchRoot, func(path string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return nil
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if d.IsDir() {
-			if path != searchRoot && shouldSkipSearchEntry(d.Name(), true) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if shouldSkipSearchEntry(d.Name(), false) {
-			return nil
-		}
-
-		// Check file size and binary status
-		info, err := d.Info()
-		if !searchableWalkFile(path, info, err) {
-			return nil
-		}
-
-		// Compute relative path with prefix
-		rel, err := filepath.Rel(searchRoot, path)
-		if err != nil {
-			return nil
-		}
-		rel = filepath.ToSlash(rel)
-		if relPrefix != "" {
-			rel = filepath.ToSlash(filepath.Join(relPrefix, rel))
-		}
-
-		// Apply glob filter
-		if glob != "" && !matchGlobPattern(glob, rel) {
-			return nil
-		}
-
+	return walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true}, func(path, rel string, d os.DirEntry) error {
 		// Read file and find matches
 		content, err := os.ReadFile(path)
 		if err != nil {

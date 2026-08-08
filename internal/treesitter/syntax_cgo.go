@@ -5,6 +5,7 @@ package treesitter
 import (
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"unsafe"
@@ -38,9 +39,11 @@ import (
 )
 
 type langSpec struct {
-	name  string
-	exts  []string
-	ptrFn func() unsafe.Pointer
+	name      string
+	exts      []string
+	ptrFn     func() unsafe.Pointer
+	defsQuery string // embed path under queries/, "" = no definition query
+	refsQuery string // inline query text, "" = no reference query
 }
 
 var (
@@ -48,36 +51,79 @@ var (
 	extToLang    map[string]string
 	langSpecs    map[string]langSpec
 	langCache    sync.Map // string -> *tree_sitter.Language
+
+	// queryCache caches compiled queries per language and kind ("defs" or
+	// "refs") so each query is compiled once per process. Both the
+	// definition-query and reference-query paths funnel through compileQuery.
+	queryCache sync.Map // "<kind>:<lang>" -> *tree_sitter.Query
 )
 
 func bundledSpecs() []langSpec {
 	return []langSpec{
-		{name: "go", exts: []string{"go"}, ptrFn: tree_sitter_go.Language},
-		{name: "python", exts: []string{"py", "pyi"}, ptrFn: tree_sitter_python.Language},
-		{name: "javascript", exts: []string{"js", "mjs", "cjs"}, ptrFn: tree_sitter_javascript.Language},
-		{name: "typescript", exts: []string{"ts", "mts", "cts"}, ptrFn: tree_sitter_typescript.LanguageTypescript},
-		{name: "tsx", exts: []string{"tsx"}, ptrFn: tree_sitter_typescript.LanguageTSX},
+		{name: "go", exts: []string{"go"}, ptrFn: tree_sitter_go.Language,
+			defsQuery: "queries/go.scm",
+			refsQuery: "(identifier) @ref\n(field_identifier) @ref\n(type_identifier) @ref"},
+		{name: "python", exts: []string{"py", "pyi"}, ptrFn: tree_sitter_python.Language,
+			defsQuery: "queries/python.scm",
+			refsQuery: "(identifier) @ref"},
+		{name: "javascript", exts: []string{"js", "mjs", "cjs"}, ptrFn: tree_sitter_javascript.Language,
+			defsQuery: "queries/javascript.scm",
+			refsQuery: "(identifier) @ref\n(property_identifier) @ref\n(shorthand_property_identifier) @ref"},
+		{name: "typescript", exts: []string{"ts", "mts", "cts"}, ptrFn: tree_sitter_typescript.LanguageTypescript,
+			defsQuery: "queries/typescript.scm",
+			refsQuery: "(identifier) @ref\n(property_identifier) @ref\n(shorthand_property_identifier) @ref\n(type_identifier) @ref"},
+		{name: "tsx", exts: []string{"tsx"}, ptrFn: tree_sitter_typescript.LanguageTSX,
+			defsQuery: "queries/tsx.scm",
+			refsQuery: "(identifier) @ref\n(property_identifier) @ref\n(shorthand_property_identifier) @ref\n(type_identifier) @ref"},
 		{name: "json", exts: []string{"json"}, ptrFn: tree_sitter_json.Language},
-		{name: "rust", exts: []string{"rs"}, ptrFn: tree_sitter_rust.Language},
-		{name: "java", exts: []string{"java"}, ptrFn: tree_sitter_java.Language},
-		{name: "kotlin", exts: []string{"kt", "kts"}, ptrFn: tree_sitter_kotlin.Language},
-		{name: "c", exts: []string{"c", "h"}, ptrFn: tree_sitter_c.Language},
-		{name: "cpp", exts: []string{"cpp", "cc", "cxx", "hpp", "hh", "hxx"}, ptrFn: tree_sitter_cpp.Language},
-		{name: "csharp", exts: []string{"cs"}, ptrFn: tree_sitter_c_sharp.Language},
-		{name: "php", exts: []string{"php", "phtml"}, ptrFn: tree_sitter_php.LanguagePHP},
-		{name: "ruby", exts: []string{"rb", "rake"}, ptrFn: tree_sitter_ruby.Language},
-		{name: "scala", exts: []string{"scala"}, ptrFn: tree_sitter_scala.Language},
-		{name: "sql", exts: []string{"sql"}, ptrFn: tree_sitter_sql.Language},
+		{name: "rust", exts: []string{"rs"}, ptrFn: tree_sitter_rust.Language,
+			defsQuery: "queries/rust.scm",
+			refsQuery: "(identifier) @ref\n(field_identifier) @ref\n(type_identifier) @ref"},
+		{name: "java", exts: []string{"java"}, ptrFn: tree_sitter_java.Language,
+			defsQuery: "queries/java.scm",
+			refsQuery: "(identifier) @ref"},
+		{name: "kotlin", exts: []string{"kt", "kts"}, ptrFn: tree_sitter_kotlin.Language,
+			defsQuery: "queries/kotlin.scm",
+			refsQuery: "(identifier) @ref"},
+		{name: "c", exts: []string{"c", "h"}, ptrFn: tree_sitter_c.Language,
+			defsQuery: "queries/c.scm",
+			refsQuery: "(identifier) @ref\n(field_identifier) @ref\n(type_identifier) @ref"},
+		{name: "cpp", exts: []string{"cpp", "cc", "cxx", "hpp", "hh", "hxx"}, ptrFn: tree_sitter_cpp.Language,
+			defsQuery: "queries/cpp.scm",
+			refsQuery: "(identifier) @ref\n(field_identifier) @ref\n(type_identifier) @ref"},
+		{name: "csharp", exts: []string{"cs"}, ptrFn: tree_sitter_c_sharp.Language,
+			defsQuery: "queries/csharp.scm",
+			refsQuery: "(identifier) @ref"},
+		{name: "php", exts: []string{"php", "phtml"}, ptrFn: tree_sitter_php.LanguagePHP,
+			defsQuery: "queries/php.scm",
+			refsQuery: "(name) @ref\n(variable_name) @ref"},
+		{name: "ruby", exts: []string{"rb", "rake"}, ptrFn: tree_sitter_ruby.Language,
+			defsQuery: "queries/ruby.scm",
+			refsQuery: "(identifier) @ref\n(constant) @ref"},
+		{name: "scala", exts: []string{"scala"}, ptrFn: tree_sitter_scala.Language,
+			defsQuery: "queries/scala.scm",
+			refsQuery: "(identifier) @ref"},
+		{name: "sql", exts: []string{"sql"}, ptrFn: tree_sitter_sql.Language,
+			defsQuery: "queries/sql.scm",
+			refsQuery: "(object_reference) @ref"},
 		{name: "html", exts: []string{"html", "htm"}, ptrFn: tree_sitter_html.Language},
 		{name: "css", exts: []string{"css"}, ptrFn: tree_sitter_css.Language},
-		{name: "bash", exts: []string{"sh", "bash"}, ptrFn: tree_sitter_bash.Language},
+		{name: "bash", exts: []string{"sh", "bash"}, ptrFn: tree_sitter_bash.Language,
+			defsQuery: "queries/bash.scm",
+			refsQuery: "(word) @ref"},
 		{name: "dockerfile", exts: nil, ptrFn: tree_sitter_dockerfile.Language},
 		{name: "yaml", exts: []string{"yaml", "yml"}, ptrFn: tree_sitter_yaml.Language},
 		{name: "toml", exts: []string{"toml"}, ptrFn: tree_sitter_toml.Language},
-		{name: "zig", exts: []string{"zig"}, ptrFn: tree_sitter_zig.Language},
-		{name: "lua", exts: []string{"lua"}, ptrFn: tree_sitter_lua.Language},
+		{name: "zig", exts: []string{"zig"}, ptrFn: tree_sitter_zig.Language,
+			defsQuery: "queries/zig.scm",
+			refsQuery: "(identifier) @ref"},
+		{name: "lua", exts: []string{"lua"}, ptrFn: tree_sitter_lua.Language,
+			defsQuery: "queries/lua.scm",
+			refsQuery: "(identifier) @ref"},
 		{name: "make", exts: []string{"mk"}, ptrFn: tree_sitter_make.Language},
-		{name: "hcl", exts: []string{"hcl", "tf"}, ptrFn: tree_sitter_hcl.Language},
+		{name: "hcl", exts: []string{"hcl", "tf"}, ptrFn: tree_sitter_hcl.Language,
+			defsQuery: "queries/hcl.scm",
+			refsQuery: "(identifier) @ref"},
 	}
 }
 
@@ -117,6 +163,44 @@ func languageFor(name string) *tree_sitter.Language {
 	lang := tree_sitter.NewLanguage(spec.ptrFn())
 	langCache.Store(name, lang)
 	return lang
+}
+
+// compileQuery compiles src for langName and caches the *tree_sitter.Query
+// under kind ("defs" or "refs") so each query is compiled once per process.
+// Both the definition-query and reference-query paths funnel through here,
+// keeping the compile+cache policy in one place.
+func compileQuery(langName, kind, src string) (*tree_sitter.Query, error) {
+	registryOnce.Do(initRegistry)
+	key := kind + ":" + langName
+	if v, ok := queryCache.Load(key); ok {
+		return v.(*tree_sitter.Query), nil
+	}
+	lang := languageFor(langName)
+	if lang == nil {
+		return nil, ErrUnsupported
+	}
+	q, err := tree_sitter.NewQuery(lang, src)
+	if err != nil {
+		return nil, fmt.Errorf("compile %s query for %s: %w", kind, langName, err)
+	}
+	queryCache.Store(key, q)
+	return q, nil
+}
+
+// DefinitionQueryLanguages returns the canonical names of bundled languages
+// that have a definition query, sorted for stable output. Agent error
+// messages generate their "supported languages" list from this instead of a
+// hand-maintained literal.
+func DefinitionQueryLanguages() []string {
+	registryOnce.Do(initRegistry)
+	names := make([]string, 0, len(langSpecs))
+	for name, spec := range langSpecs {
+		if spec.defsQuery != "" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 func langNameForPath(path string) (string, bool) {

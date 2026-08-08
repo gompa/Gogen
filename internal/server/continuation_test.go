@@ -31,6 +31,9 @@ type blockingStub struct {
 	entered    int // total number of calls that reached the blocking section
 	releases   map[int]chan struct{}
 	firstTools []llm.ToolCall
+	// model is the provider-reported model attached to every StreamResult
+	// (empty by default, matching providers that do not report one).
+	model string
 }
 
 func newBlockingStub() *blockingStub {
@@ -70,7 +73,7 @@ func (s *blockingStub) waitBlocked(n int) {
 }
 
 func (s *blockingStub) GenerateResponse(_ context.Context, _ []llm.Message, _ map[string]struct{}, _ []llm.Tool) (llm.Response, error) {
-	return llm.Response{Content: "done"}, nil
+	return llm.Response{Content: "done", Model: s.model}, nil
 }
 
 func (s *blockingStub) GenerateResponseStream(ctx context.Context, _ []llm.Message, _ map[string]struct{}, _ []llm.Tool, h *llm.StreamHandlers) (*llm.StreamResult, error) {
@@ -93,12 +96,12 @@ func (s *blockingStub) GenerateResponseStream(ctx context.Context, _ []llm.Messa
 		return nil, ctx.Err()
 	}
 	if call == 1 && len(s.firstTools) > 0 {
-		return &llm.StreamResult{ToolCalls: s.firstTools}, nil
+		return &llm.StreamResult{ToolCalls: s.firstTools, Model: s.model}, nil
 	}
 	if call == 1 {
-		return &llm.StreamResult{Content: "headless-done"}, nil
+		return &llm.StreamResult{Content: "headless-done", Model: s.model}, nil
 	}
-	return &llm.StreamResult{Content: "done"}, nil
+	return &llm.StreamResult{Content: "done", Model: s.model}, nil
 }
 
 func (s *blockingStub) ModelContextLimit(_ context.Context) (int, error) { return 1000, nil }

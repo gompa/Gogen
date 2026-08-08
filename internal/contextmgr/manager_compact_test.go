@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"gogen/internal/llm"
 )
@@ -128,6 +129,61 @@ func TestCompactKeepsToolCallPairInTail(t *testing.T) {
 	}
 	if out[3].Role != "tool" || out[3].ToolCallID != "c1" {
 		t.Fatalf("expected tool result preserved in tail, got %+v", out[3])
+	}
+}
+
+// TestCompactPreservesMetadataFields verifies compaction preserves the
+// persisted fields cloneMessage must not drop: attached images (vision
+// input), CreatedAt timestamps, and the provider-reported Model on assistant
+// messages. Pre-fix these were silently stripped from the preserved head and
+// tail, so vision context vanished after the first compaction and assistant
+// model chips disappeared from preserved bubbles.
+func TestCompactPreservesMetadataFields(t *testing.T) {
+	provider := &stubProvider{summary: "summary"}
+	m := NewManager(provider, Settings{CompactKeepRecentMessages: 2})
+	m.minMiddleTokens = 0 // tiny messages: skip the minimum-middle guard
+	created := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+	msgs := []llm.Message{
+		{
+			Role:      "user",
+			Content:   "first with image",
+			Images:    []llm.ImageInput{{DataURL: "data:image/png;base64,AAAA", Detail: "high"}},
+			CreatedAt: created,
+		},
+		{Role: "assistant", Content: "a1"},
+		{Role: "user", Content: "middle"},
+		{Role: "assistant", Content: "a2", Model: "glm-4.6", CreatedAt: created.Add(time.Hour)},
+		{Role: "user", Content: "tail"},
+	}
+	out, err := m.Compact(context.Background(), msgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Head: the first user message keeps its image and timestamp.
+	if len(out[0].Images) != 1 || out[0].Images[0].DataURL != "data:image/png;base64,AAAA" {
+		t.Fatalf("head image lost: %+v", out[0].Images)
+	}
+	if out[0].Images[0].Detail != "high" {
+		t.Fatalf("head image detail lost: %+v", out[0].Images[0])
+	}
+	if !out[0].CreatedAt.Equal(created) {
+		t.Fatalf("head CreatedAt lost: %v", out[0].CreatedAt)
+	}
+	// Tail: the preserved assistant message keeps its model + timestamp.
+	found := false
+	for _, msg := range out {
+		if msg.Role == "assistant" && msg.Content == "a2" {
+			found = true
+			if msg.Model != "glm-4.6" {
+				t.Fatalf("tail assistant Model lost: %q", msg.Model)
+			}
+			if !msg.CreatedAt.Equal(created.Add(time.Hour)) {
+				t.Fatalf("tail assistant CreatedAt lost: %v", msg.CreatedAt)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("tail assistant message missing from compacted history")
 	}
 }
 

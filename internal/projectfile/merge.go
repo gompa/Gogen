@@ -184,10 +184,7 @@ func mergeInt(envKey string, fileVal, def int) int {
 	if v, ok := envInt(envKey, def); ok {
 		return v
 	}
-	if fileVal != 0 {
-		return fileVal
-	}
-	return def
+	return config.Effective(fileVal, def)
 }
 
 // mergeIntOpt is like mergeInt for pointer fields: a non-nil pointer (an

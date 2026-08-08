@@ -1858,6 +1858,19 @@
             color: var(--fg-muted);
         }
 
+        /* ===== Reply-model chip (Settings → Chat → "Show reply model") =====
+         * Sits under the timestamp at the bubble's bottom-right, mirroring
+         * the .message-time footer. */
+        .msg-model {
+            display: block;
+            text-align: right;
+            font-size: 0.7em;
+            color: var(--fg-dim);
+            margin-top: 2px;
+            line-height: 1;
+            user-select: none;
+        }
+
         /* ===== Fork button on assistant messages ===== */
         .message.assistant {
             position: relative;

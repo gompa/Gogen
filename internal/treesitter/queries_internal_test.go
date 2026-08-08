@@ -11,16 +11,40 @@ import "testing"
 // impossible one — which makes the whole query fail to compile and
 // breaks ListDefinitions for that language entirely.
 func TestDefinitionQueriesCompile(t *testing.T) {
-	queryOnce.Do(initQueries)
 	registryOnce.Do(initRegistry)
-	for lang := range queryByLang {
-		lang := lang
-		t.Run(lang, func(t *testing.T) {
-			if languageFor(lang) == nil {
-				t.Fatalf("no language registered for %q", lang)
+	for name, spec := range langSpecs {
+		if spec.defsQuery == "" {
+			continue
+		}
+		name := name
+		t.Run("defs/"+name, func(t *testing.T) {
+			if languageFor(name) == nil {
+				t.Fatalf("no language registered for %q", name)
 			}
-			if _, err := queryForLang(lang); err != nil {
-				t.Fatalf("compile query for %s: %v", lang, err)
+			if _, err := queryForLang(name); err != nil {
+				t.Fatalf("compile query for %s: %v", name, err)
+			}
+		})
+	}
+}
+
+// TestReferenceQueriesCompile ensures every bundled inline reference query
+// compiles for its target language. The refs queries live in the same
+// registry as the defs queries, but a typo or a grammar node rename can still
+// break an individual language's reference search.
+func TestReferenceQueriesCompile(t *testing.T) {
+	registryOnce.Do(initRegistry)
+	for name, spec := range langSpecs {
+		if spec.refsQuery == "" {
+			continue
+		}
+		name := name
+		t.Run("refs/"+name, func(t *testing.T) {
+			if languageFor(name) == nil {
+				t.Fatalf("no language registered for %q", name)
+			}
+			if _, err := refsQueryForLang(name); err != nil {
+				t.Fatalf("compile refs query for %s: %v", name, err)
 			}
 		})
 	}

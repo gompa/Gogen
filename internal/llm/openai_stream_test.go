@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -295,5 +296,312 @@ data: {"choices":[{"index":0,"delta":{}}]}
 	}
 	if tc.Args["path"] != "a.go" {
 		t.Fatalf("args = %#v", tc.Args)
+	}
+}
+
+// TestGenerateResponseStreamCapturesReportedModel verifies the model ID the
+// provider reports on the stream chunks (router endpoints such as OpenCode
+// Zen resolve aliases server-side) is surfaced on the StreamResult.
+func TestGenerateResponseStreamCapturesReportedModel(t *testing.T) {
+	t.Parallel()
+	const sse = `data: {"model":"glm-4.6","choices":[{"delta":{"content":"answer"}}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(sse))
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(srv)
+	result, err := p.GenerateResponseStream(
+		t.Context(),
+		[]Message{{Role: "user", Content: "hi"}},
+		nil,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Model != "glm-4.6" {
+		t.Fatalf("result.Model = %q, want %q", result.Model, "glm-4.6")
+	}
+	if result.Content != "answer" {
+		t.Fatalf("result.Content = %q", result.Content)
+	}
+}
+
+// TestGenerateResponseStreamNoReportedModelIsEmpty verifies a stream whose
+// chunks carry no model field yields an empty StreamResult.Model.
+func TestGenerateResponseStreamNoReportedModelIsEmpty(t *testing.T) {
+	t.Parallel()
+	const sse = `data: {"choices":[{"delta":{"content":"answer"}}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(sse))
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(srv)
+	result, err := p.GenerateResponseStream(
+		t.Context(),
+		[]Message{{Role: "user", Content: "hi"}},
+		nil,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Model != "" {
+		t.Fatalf("result.Model = %q, want empty", result.Model)
+	}
+}
+
+// TestStreamFallbackDefersRoundEndCallbacks pins the single-source-of-truth
+// contract for round-end callbacks: when a failed stream is recovered via the
+// non-streaming fallback, the LLM layer must NOT fire OnStreamEnd /
+// OnRecoverPartialStream — the agent loop fires them exactly once when it
+// finalizes the round. Firing them here too (the pre-fix behavior) delivered
+// duplicate stream_end frames to the web client and duplicate
+// streamRoundEndMsg events to the TUI on every stream failure.
+func TestStreamFallbackDefersRoundEndCallbacks(t *testing.T) {
+	t.Parallel()
+	var streamed bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), `"stream":true`) {
+			streamed = true
+			w.Header().Set("Content-Type", "text/event-stream")
+			// One valid chunk, then malformed SSE data: the stream errors
+			// mid-way, forcing the non-streaming fallback.
+			_, _ = w.Write([]byte(`data: {"choices":[{"delta":{"content":"partial "}}]}` + "\n\n" +
+				`data: this is not json` + "\n\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"recovered answer"}}]}`))
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(srv)
+	var ends, recovers int
+	result, err := p.GenerateResponseStream(
+		t.Context(),
+		[]Message{{Role: "user", Content: "hi"}},
+		nil,
+		nil,
+		&StreamHandlers{
+			OnToken:                func(string) {},
+			OnStreamEnd:            func() { ends++ },
+			OnRecoverPartialStream: func() { recovers++ },
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !streamed {
+		t.Fatal("test setup: stream request never reached the server")
+	}
+	if ends != 0 || recovers != 0 {
+		t.Fatalf("fallback fired round-end callbacks (OnStreamEnd=%d, OnRecoverPartialStream=%d); the agent loop owns these", ends, recovers)
+	}
+	if result.Content != "recovered answer" {
+		t.Fatalf("fallback content = %q, want %q", result.Content, "recovered answer")
+	}
+	if !result.PartialStream {
+		t.Fatal("PartialStream must be true: the failed stream produced partial content")
+	}
+}
+
+// TestStreamFallbackTrimsAlreadyStreamedPrefix verifies the fallback does not
+// re-render text the client already saw from the failed stream: when the
+// recovered response starts with exactly the streamed prefix, only the suffix
+// is emitted via OnToken, while the persisted StreamResult keeps the complete
+// recovery.
+func TestStreamFallbackTrimsAlreadyStreamedPrefix(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), `"stream":true`) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			// One valid chunk, then malformed SSE: the stream errors mid-way,
+			// forcing the non-streaming fallback.
+			_, _ = w.Write([]byte(`data: {"choices":[{"delta":{"content":"partial "}}]}` + "\n\n" +
+				`data: this is not json` + "\n\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"partial recovered answer"}}]}`))
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(srv)
+	var tokens []string
+	result, err := p.GenerateResponseStream(
+		t.Context(),
+		[]Message{{Role: "user", Content: "hi"}},
+		nil,
+		nil,
+		&StreamHandlers{OnToken: func(token string) { tokens = append(tokens, token) }},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The streamed prefix fires OnToken once, and the fallback re-renders
+	// only the suffix beyond it — the recovered text must not be emitted in
+	// full on top of what the client already rendered.
+	if len(tokens) != 2 || tokens[0] != "partial " || tokens[1] != "recovered answer" {
+		t.Fatalf("OnToken fired %v, want [partial  recovered answer] (streamed prefix + trimmed suffix only)", tokens)
+	}
+	if result.Content != "partial recovered answer" {
+		t.Fatalf("result.Content = %q, want %q (persisted result stays complete)", result.Content, "partial recovered answer")
+	}
+}
+
+// TestStreamFallbackNoDuplicateWhenRecoveredEqualsStreamed verifies that when
+// the recovered response is byte-identical to what the stream already
+// emitted, nothing is re-rendered (there is nothing new to show).
+func TestStreamFallbackNoDuplicateWhenRecoveredEqualsStreamed(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), `"stream":true`) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte(`data: {"choices":[{"delta":{"content":"exact answer"}}]}` + "\n\n" +
+				`data: this is not json` + "\n\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"exact answer"}}]}`))
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(srv)
+	var tokens []string
+	result, err := p.GenerateResponseStream(
+		t.Context(),
+		[]Message{{Role: "user", Content: "hi"}},
+		nil,
+		nil,
+		&StreamHandlers{OnToken: func(token string) { tokens = append(tokens, token) }},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tokens) != 1 || tokens[0] != "exact answer" {
+		t.Fatalf("OnToken fired %v, want only the streamed [exact answer] (fallback must emit nothing new)", tokens)
+	}
+	if result.Content != "exact answer" {
+		t.Fatalf("result.Content = %q", result.Content)
+	}
+}
+
+// TestTrimRecoveredText pins the suffix-only trimming contract: only an exact
+// byte prefix is dropped; divergent re-generations are emitted in full.
+func TestTrimRecoveredText(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		streamed  string
+		recovered string
+		want      string
+	}{
+		{"empty streamed", "", "answer", "answer"},
+		{"empty recovered", "partial", "", ""},
+		{"both empty", "", "", ""},
+		{"exact prefix", "partial ", "partial recovered answer", "recovered answer"},
+		{"identical", "exact", "exact", ""},
+		{"divergent", "abc", "abx", "abx"},
+		{"recovered shorter than streamed", "hello world", "hello", "hello"},
+		{"utf8 prefix", "日", "日本語", "本語"},
+		{"utf8 not a byte prefix", "本", "日本語", "日本語"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := trimRecoveredText(tc.streamed, tc.recovered); got != tc.want {
+				t.Fatalf("trimRecoveredText(%q, %q) = %q, want %q", tc.streamed, tc.recovered, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStreamFallbackKeepsStreamedModel verifies the fallback StreamResult
+// keeps the model ID the failed stream reported when the non-streaming
+// response omits the model field.
+func TestStreamFallbackKeepsStreamedModel(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), `"stream":true`) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte(`data: {"model":"glm-4.6","choices":[{"delta":{"content":"partial "}}]}` + "\n\n" +
+				`data: this is not json` + "\n\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// No "model" field: the fallback must fall back to the streamed model.
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"recovered answer"}}]}`))
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(srv)
+	result, err := p.GenerateResponseStream(
+		t.Context(),
+		[]Message{{Role: "user", Content: "hi"}},
+		nil,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Model != "glm-4.6" {
+		t.Fatalf("result.Model = %q, want %q", result.Model, "glm-4.6")
+	}
+}
+
+// TestGenerateResponseStreamUsageAfterManyNoOps verifies the post-finish
+// drain keeps consuming chunks until the usage chunk arrives, so a provider
+// that sends many no-op chunks between finish_reason and the final usage
+// chunk does not lose usage (the old 8-chunk drain bound dropped it).
+func TestGenerateResponseStreamUsageAfterManyNoOps(t *testing.T) {
+	t.Parallel()
+	var sse strings.Builder
+	sse.WriteString(`data: {"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}` + "\n\n")
+	for i := 0; i < 10; i++ {
+		sse.WriteString("data: {}\n\n")
+	}
+	sse.WriteString(`data: {"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}` + "\n\n")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(sse.String()))
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(srv)
+	result, err := p.GenerateResponseStream(
+		t.Context(),
+		[]Message{{Role: "user", Content: "hi"}},
+		nil,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Usage == nil {
+		t.Fatal("result.Usage is nil: the usage chunk arriving after 10 no-op chunks was lost in the drain")
+	}
+	if result.Usage.PromptTokens != 10 || result.Usage.CompletionTokens != 5 || result.Usage.TotalTokens != 15 {
+		t.Fatalf("result.Usage = %#v, want prompt=10 completion=5 total=15", result.Usage)
 	}
 }

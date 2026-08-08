@@ -66,79 +66,67 @@ func shouldSkipSearchEntry(name string, isDir bool) bool {
 // SearchCodeMatches returns structured matches (context_lines=0) for UI find-in-files.
 // truncated is true when the result set hit search caps.
 func (e *Executor) SearchCodeMatches(ctx context.Context, pattern, subpath, glob string) (matches []SearchMatch, truncated bool, err error) {
-	out, err := e.SearchCode(ctx, pattern, subpath, glob, 0)
+	if err := validateSearchArgs(pattern, glob); err != nil {
+		return nil, false, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, searchTimeout)
+	defer cancel()
+
+	searchRoot, relPrefix, glob, err := e.resolveSearchScope(subpath, glob)
 	if err != nil {
 		return nil, false, err
 	}
-	currentFile := ""
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if strings.HasPrefix(line, "…") || strings.Contains(line, "truncated") {
-			truncated = true
-			continue
-		}
-		if strings.HasPrefix(line, "No matches") || strings.HasPrefix(line, "(") {
-			continue
-		}
+	matches, truncated, _, err = e.searchStructured(ctx, searchRoot, relPrefix, pattern, glob)
+	return matches, truncated, err
+}
 
-		// Try match line first: "lineNum:content" in compact format.
-		if num, content, ok := parseCompactMatchLine(line); ok {
-			if currentFile != "" {
-				matches = append(matches, SearchMatch{Path: currentFile, Line: num, Text: content})
+// validateSearchArgs checks pattern and glob for the common search entry
+// points (SearchCode, SearchCodeMatches).
+func validateSearchArgs(pattern, glob string) error {
+	if pattern == "" {
+		return fmt.Errorf("pattern is required")
+	}
+	if err := rejectLeadingDashArg("pattern", pattern); err != nil {
+		return err
+	}
+	if glob != "" {
+		if err := rejectLeadingDashArg("glob", glob); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// resolveSearchScope applies the single-file subpath shortcut (searching a
+// file scopes the root to its directory and the glob to its basename) and
+// returns the search root plus the workspace-relative prefix.
+func (e *Executor) resolveSearchScope(subpath, glob string) (searchRoot, relPrefix, effectiveGlob string, err error) {
+	effectiveGlob = glob
+	if strings.TrimSpace(subpath) != "" {
+		secure, err := e.SecurePath(subpath)
+		if err == nil {
+			info, err := os.Stat(secure)
+			if err == nil && !info.IsDir() {
+				// Use the file's directory as the search root and the
+				// filename as an implicit glob (unless one is already set).
+				if effectiveGlob == "" {
+					effectiveGlob = filepath.Base(secure)
+				}
+				subpath = filepath.Dir(secure)
 			}
-			continue
-		}
-
-		// Otherwise treat as a filename line setting the current file context.
-		if file, ok := parseSearchFileLine(line); ok {
-			currentFile = file
 		}
 	}
-	return matches, truncated, nil
-}
-
-// parseSearchFileLine checks if line is a standalone filename (no ':digit:' pattern).
-func parseSearchFileLine(line string) (string, bool) {
-	// A file line has no ':' followed by digits followed by ':'.
-	if _, _, ok := splitSearchLine(line); ok {
-		return "", false // It's a structured line, not a bare filename.
-	}
-	// Bare filename lines don't contain ':digit:' patterns.
-	return line, true
-}
-
-// parseCompactMatchLine parses "line:content" from compact format.
-func parseCompactMatchLine(line string) (num int, content string, ok bool) {
-	// Compact format: "lineNum:content" where lineNum is at the start.
-	i := 0
-	for i < len(line) && line[i] >= '0' && line[i] <= '9' {
-		i++
-	}
-	if i == 0 || i >= len(line) || line[i] != ':' {
-		return 0, "", false
-	}
-	n, convErr := strconv.Atoi(line[:i])
-	if convErr != nil || n < 1 {
-		return 0, "", false
-	}
-	return n, line[i+1:], true
+	searchRoot, relPrefix, err = e.searchRoot(subpath)
+	return searchRoot, relPrefix, effectiveGlob, err
 }
 
 // SearchCode finds pattern matches using system rg when available, otherwise a Go fallback.
 func (e *Executor) SearchCode(ctx context.Context, pattern, subpath, glob string, contextLines int) (string, error) {
-	if pattern == "" {
-		return "", fmt.Errorf("pattern is required")
-	}
-	if err := rejectLeadingDashArg("pattern", pattern); err != nil {
+	if err := validateSearchArgs(pattern, glob); err != nil {
 		return "", err
-	}
-	if glob != "" {
-		if err := rejectLeadingDashArg("glob", glob); err != nil {
-			return "", err
-		}
 	}
 	if contextLines < 0 {
 		return "", fmt.Errorf("context_lines must be non-negative")
@@ -152,25 +140,32 @@ func (e *Executor) SearchCode(ctx context.Context, pattern, subpath, glob string
 	ctx, cancel := context.WithTimeout(ctx, searchTimeout)
 	defer cancel()
 
-	// If subpath points to a file, scope the search to that file.
-	if strings.TrimSpace(subpath) != "" {
-		secure, err := e.SecurePath(subpath)
-		if err == nil {
-			info, err := os.Stat(secure)
-			if err == nil && !info.IsDir() {
-				// Use the file's directory as the search root and the
-				// filename as an implicit glob (unless one is already set).
-				if glob == "" {
-					glob = filepath.Base(secure)
-				}
-				subpath = filepath.Dir(secure)
-			}
-		}
-	}
-
-	searchRoot, relPrefix, err := e.searchRoot(subpath)
+	searchRoot, relPrefix, glob, err := e.resolveSearchScope(subpath, glob)
 	if err != nil {
 		return "", err
+	}
+
+	// Context-free searches go through the structured path shared with
+	// SearchCodeMatches; context-lines mode keeps the raw-output formatter.
+	if contextLines == 0 {
+		matches, truncated, engine, sErr := e.searchStructured(ctx, searchRoot, relPrefix, pattern, glob)
+		if sErr != nil {
+			return "", sErr
+		}
+		if len(matches) == 0 {
+			if engine == "go" {
+				return "No matches found (go fallback; install ripgrep for faster search)", nil
+			}
+			return "No matches found", nil
+		}
+		out := formatSearchMatches(matches)
+		if engine == "go" {
+			out += "\n(search: go fallback; install ripgrep for faster search)"
+		}
+		if truncated {
+			out += fmt.Sprintf("\n… truncated (showing first %d matches)", len(matches))
+		}
+		return out, nil
 	}
 
 	if _, err := exec.LookPath("rg"); err == nil {
@@ -246,41 +241,7 @@ func (e *Executor) ReplaceInTree(ctx context.Context, pattern, replacement, subp
 	}
 	glob = strings.TrimSpace(glob)
 
-	err = filepath.WalkDir(searchRoot, func(path string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return nil
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		name := d.Name()
-		if d.IsDir() {
-			if shouldSkipSearchEntry(name, true) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if shouldSkipSearchEntry(name, false) {
-			return nil
-		}
-		info, infoErr := d.Info()
-		if !searchableWalkFile(path, info, infoErr) {
-			return nil
-		}
-
-		rel, relErr := filepath.Rel(searchRoot, path)
-		if relErr != nil {
-			return nil
-		}
-		if relPrefix != "" {
-			rel = filepath.ToSlash(filepath.Join(relPrefix, rel))
-		} else {
-			rel = filepath.ToSlash(rel)
-		}
-		if glob != "" && !matchGlobPattern(glob, rel) {
-			return nil
-		}
-
+	err = walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true}, func(path, rel string, d os.DirEntry) error {
 		n, writeErr := e.replaceInFilePath(path, rel, re, replacement)
 		if writeErr != nil {
 			return writeErr
@@ -387,6 +348,101 @@ func (e *Executor) searchWithRipgrep(ctx context.Context, searchRoot, relPrefix,
 	return formatSearchOutput("rg", relPrefix, text), nil
 }
 
+// searchWithRipgrepMatches runs ripgrep and returns structured matches
+// (context_lines=0 semantics). Nil matches mean "no matches found"; an error
+// means the caller should fall back to the Go walker.
+func (e *Executor) searchWithRipgrepMatches(ctx context.Context, searchRoot, relPrefix, pattern, glob string) ([]SearchMatch, error) {
+	args := []string{
+		"-n",
+		"--no-heading",
+		"--color=never",
+		"--max-count", fmt.Sprintf("%d", searchMaxMatches),
+		"--max-columns", "500",
+	}
+	if glob != "" {
+		args = append(args, "--glob", glob)
+	}
+	// "--" prevents patterns like --pre=… from being treated as rg flags.
+	args = append(args, "--", pattern, ".")
+
+	cmd := exec.CommandContext(ctx, "rg", args...)
+	cmd.Dir = searchRoot
+	out, err := cmd.CombinedOutput()
+	text := strings.TrimSpace(string(out))
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && text == "" {
+			return nil, nil // no matches
+		}
+		if text != "" {
+			return parseRgMatches(text, relPrefix), nil
+		}
+		return nil, fmt.Errorf("rg failed: %w", err)
+	}
+	if text == "" {
+		return nil, nil
+	}
+	return parseRgMatches(text, relPrefix), nil
+}
+
+// parseRgMatches converts rg's "path:line:content" output into structured
+// matches, applying relPrefix to each path.
+func parseRgMatches(text, relPrefix string) []SearchMatch {
+	var matches []SearchMatch
+	for _, line := range strings.Split(text, "\n") {
+		path, lineNum, content, ok := splitSearchMatchLine(line)
+		if !ok {
+			continue
+		}
+		if relPrefix != "" {
+			path = filepath.ToSlash(filepath.Join(relPrefix, path))
+		}
+		matches = append(matches, SearchMatch{Path: path, Line: lineNum, Text: content})
+	}
+	return matches
+}
+
+// splitSearchMatchLine splits rg output "path:line:content" into its parts.
+// The separator is ':' — context-free output has no '-' separators.
+func splitSearchMatchLine(line string) (path string, lineNum int, content string, ok bool) {
+	for i := 0; i < len(line); i++ {
+		if line[i] != ':' {
+			continue
+		}
+		j := i + 1
+		for j < len(line) && line[j] >= '0' && line[j] <= '9' {
+			j++
+		}
+		if j > i+1 && j < len(line) && line[j] == ':' {
+			n, err := strconv.Atoi(line[i+1 : j])
+			if err != nil {
+				return "", 0, "", false
+			}
+			return line[:i], n, line[j+1:], true
+		}
+	}
+	return "", 0, "", false
+}
+
+// searchStructured runs the search through ripgrep when available, else the
+// Go fallback, and returns structured matches (context_lines=0 semantics).
+// engine is "rg" or "go" so callers can reproduce the per-engine output
+// footer SearchCode shows.
+func (e *Executor) searchStructured(ctx context.Context, searchRoot, relPrefix, pattern, glob string) (matches []SearchMatch, truncated bool, engine string, err error) {
+	if _, err := exec.LookPath("rg"); err == nil {
+		ms, rgErr := e.searchWithRipgrepMatches(ctx, searchRoot, relPrefix, pattern, glob)
+		if rgErr == nil {
+			return ms, false, "rg", nil
+		}
+		// Real rg failure — fall back to the Go walker (matches SearchCode).
+	}
+	ms, truncated, err := e.searchWithGoMatches(ctx, searchRoot, relPrefix, pattern, glob)
+	return ms, truncated, "go", err
+}
+
 func prefixRelPaths(body, relPrefix string) string {
 	var b strings.Builder
 	for _, line := range strings.Split(body, "\n") {
@@ -417,41 +473,7 @@ func (e *Executor) searchWithGo(ctx context.Context, searchRoot, relPrefix, patt
 	var size int
 	truncated := false
 
-	err = filepath.WalkDir(searchRoot, func(path string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return nil
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		name := d.Name()
-		if d.IsDir() {
-			if shouldSkipSearchEntry(name, true) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if shouldSkipSearchEntry(name, false) {
-			return nil
-		}
-		info, err := d.Info()
-		if !searchableWalkFile(path, info, err) {
-			return nil
-		}
-
-		rel, err := filepath.Rel(searchRoot, path)
-		if err != nil {
-			return nil
-		}
-		if relPrefix != "" {
-			rel = filepath.ToSlash(filepath.Join(relPrefix, rel))
-		} else {
-			rel = filepath.ToSlash(rel)
-		}
-		if glob != "" && !matchGlobPattern(glob, rel) {
-			return nil
-		}
-
+	err = walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true}, func(path, rel string, d os.DirEntry) error {
 		limit := searchMaxMatches - len(matches)
 		if limit <= 0 {
 			return nil
@@ -487,6 +509,97 @@ func (e *Executor) searchWithGo(ctx context.Context, searchRoot, relPrefix, patt
 	return out, nil
 }
 
+// searchWithGoMatches runs the Go fallback walker and returns structured
+// matches (context_lines=0 semantics) plus the truncation flag. Paths are
+// already workspace-relative with relPrefix applied by walkTree.
+func (e *Executor) searchWithGoMatches(ctx context.Context, searchRoot, relPrefix, pattern, glob string) ([]SearchMatch, bool, error) {
+	re, err := compileSearchPattern(pattern)
+	if err != nil {
+		return nil, false, err
+	}
+	glob = strings.TrimSpace(glob)
+
+	var matches []SearchMatch
+	var size int
+	truncated := false
+
+	err = walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true}, func(path, rel string, d os.DirEntry) error {
+		limit := searchMaxMatches - len(matches)
+		if limit <= 0 {
+			return nil
+		}
+		fileMatches, err := scanFileMatches(path, rel, re, limit)
+		if err != nil {
+			return nil
+		}
+		for _, m := range fileMatches {
+			if len(matches) >= searchMaxMatches {
+				truncated = true
+				return nil
+			}
+			// Same byte accounting as the formatted "path:line:content" line.
+			lineLen := len(m.Path) + 1 + len(strconv.Itoa(m.Line)) + 1 + len(m.Text)
+			if size+lineLen+1 > searchMaxOutputBytes {
+				truncated = true
+				return nil
+			}
+			matches = append(matches, m)
+			size += lineLen + 1
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return matches, truncated, nil
+}
+
+// scanFileMatches reads the file once in a single streaming pass and returns
+// structured matches (no context lines).
+func scanFileMatches(path, relPath string, re *regexp.Regexp, matchLimit int) ([]SearchMatch, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), searchMaxFileBytes)
+
+	var out []SearchMatch
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		if re.MatchString(scanner.Text()) {
+			out = append(out, SearchMatch{Path: relPath, Line: lineNum, Text: scanner.Text()})
+			if len(out) >= matchLimit {
+				break
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// formatSearchMatches renders structured matches in the same compact layout
+// SearchCode shows: a file header line followed by "line:content" lines,
+// grouped by file in match order. Paths are already workspace-relative.
+func formatSearchMatches(matches []SearchMatch) string {
+	var b strings.Builder
+	prevFile := ""
+	for _, m := range matches {
+		if m.Path != prevFile {
+			b.WriteString(m.Path)
+			b.WriteByte('\n')
+			prevFile = m.Path
+		}
+		fmt.Fprintf(&b, "%d:%s\n", m.Line, m.Text)
+	}
+	return strings.TrimSuffix(b.String(), "\n")
+}
+
 func compileSearchPattern(pattern string) (*regexp.Regexp, error) {
 	re, err := regexp.Compile(pattern)
 	if err != nil {
@@ -499,8 +612,8 @@ func compileSearchPattern(pattern string) (*regexp.Regexp, error) {
 }
 
 // scanFileSinglePass reads the file once, finds matches, and emits results
-// with context lines. Uses a single streaming pass when contextLines == 0
-// to avoid storing all lines in memory.
+// with context lines (contextLines > 0). The context-free case is handled by
+// scanFileMatches.
 func scanFileSinglePass(path, relPath string, re *regexp.Regexp, contextLines, matchLimit int) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -510,28 +623,6 @@ func scanFileSinglePass(path, relPath string, re *regexp.Regexp, contextLines, m
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), searchMaxFileBytes)
-
-	// Fast path: no context needed — emit matches as we scan, no line storage.
-	if contextLines <= 0 {
-		var out []string
-		lineNum := 0
-		for scanner.Scan() {
-			lineNum++
-			if re.MatchString(scanner.Text()) {
-				out = append(out, fmt.Sprintf("%s:%d:%s", relPath, lineNum, scanner.Text()))
-				if len(out) >= matchLimit {
-					break
-				}
-			}
-		}
-		if err := scanner.Err(); err != nil {
-			return nil, err
-		}
-		if len(out) == 0 {
-			return nil, nil
-		}
-		return out, nil
-	}
 
 	// Context-lines path: store lines to support before/after context.
 	var lines []string

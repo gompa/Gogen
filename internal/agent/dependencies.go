@@ -67,7 +67,7 @@ func (e *Executor) DependencyAnalysis(ctx context.Context, symbol, subpath strin
 }
 
 func (e *Executor) dependencyAnalysisWithAST(ctx context.Context, searchRoot, relPrefix, symbol string) (*DependencyResult, error) {
-	result := &DependencyResult{Symbol: symbol}
+	result := &DependencyResult{Symbol: symbol, Method: "ast"}
 
 	err := e.walkSymbolReferences(ctx, searchRoot, relPrefix, "", symbol,
 		func(filePath string, refs []treesitter.Reference, content []byte) error {
@@ -88,7 +88,7 @@ func (e *Executor) dependencyAnalysisWithAST(ctx context.Context, searchRoot, re
 }
 
 func (e *Executor) dependencyAnalysisWithText(ctx context.Context, searchRoot, relPrefix, symbol string) (*DependencyResult, error) {
-	result := &DependencyResult{Symbol: symbol}
+	result := &DependencyResult{Symbol: symbol, Method: "text"}
 
 	// Use shared text-based search helper
 	pattern := `\b` + regexp.QuoteMeta(symbol) + `\b`

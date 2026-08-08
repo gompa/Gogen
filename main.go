@@ -222,8 +222,7 @@ func main() {
 	if sessionEnabled {
 		if latest, err := store.LatestID(cfg.WorkingDir); err == nil && latest != "" {
 			if snap, err := store.LoadInWorkingDir(cfg.WorkingDir, latest); err == nil {
-				a.RestoreSessionLocal(snap, latest)
-				a.SessionID = latest
+				a.RestoreSession(snap, latest)
 				restoredModel = snap.Model
 				fmt.Fprintf(os.Stderr, "Session %s (%d msgs)\n", latest, len(a.Messages))
 			}

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"gogen/internal/llm"
 )
@@ -91,6 +92,72 @@ func TestEnsureContextLimitDoesNotHoldLockDuringProviderIO(t *testing.T) {
 	}
 	if got := m.ContextLimit(); got != 64000 {
 		t.Fatalf("ContextLimit=%d, want 64000", got)
+	}
+}
+
+// TestTruncateRuneSafe verifies the byte cap never splits a UTF-8 rune and
+// every boundary cut yields valid UTF-8.
+func TestTruncateRuneSafe(t *testing.T) {
+	const s = "日本語テキスト" // 7 runes × 3 bytes = 21 bytes
+	for max := 1; max <= len(s); max++ {
+		got := TruncateRuneSafe(s, max)
+		if len(got) > max {
+			t.Fatalf("max %d: result length %d exceeds max", max, len(got))
+		}
+		if !utf8.ValidString(got) {
+			t.Fatalf("max %d: result %q is not valid UTF-8", max, got)
+		}
+	}
+	// Exact rune-boundary cuts: 日=3 bytes, 本=3 bytes, ...
+	for _, tc := range []struct {
+		max  int
+		want string
+	}{
+		{3, "日"},
+		{5, "日"}, // byte 5 lands inside 本 (bytes 3-5); backs off to 3
+		{6, "日本"},
+		{9, "日本語"},
+		{21, s},
+	} {
+		if got := TruncateRuneSafe(s, tc.max); got != tc.want {
+			t.Errorf("max %d: got %q, want %q", tc.max, got, tc.want)
+		}
+	}
+	// No-op cases.
+	if got := TruncateRuneSafe("abc", 3); got != "abc" {
+		t.Errorf("max == len: got %q", got)
+	}
+	if got := TruncateRuneSafe("abc", 10); got != "abc" {
+		t.Errorf("max > len: got %q", got)
+	}
+	if got := TruncateRuneSafe("abc", 0); got != "abc" {
+		t.Errorf("max 0 (no cap): got %q", got)
+	}
+}
+
+// TestTruncateToolResultRuneSafe verifies the context-window truncation keeps
+// valid UTF-8 when the cut would otherwise split a multi-byte rune.
+func TestTruncateToolResultRuneSafe(t *testing.T) {
+	m := NewManager(&stubProvider{}, Settings{MaxToolResultBytes: 8})
+	got := m.TruncateToolResult("日本語のテキスト結果が長すぎる")
+	if !strings.Contains(got, "truncated") {
+		t.Fatal("expected truncation marker")
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncated tool result is not valid UTF-8: %q", got)
+	}
+}
+
+// TestEnsureToolResultsCappedRuneSafe verifies the sticky capping rewrite also
+// produces valid UTF-8 for multi-byte tool output.
+func TestEnsureToolResultsCappedRuneSafe(t *testing.T) {
+	m := NewManager(&stubProvider{}, Settings{MaxToolResultBytes: 8})
+	msgs := []llm.Message{{Role: "tool", Content: "日本語のテキスト結果が長すぎる", ToolCallID: "c1"}}
+	if !m.EnsureToolResultsCapped(msgs) {
+		t.Fatal("expected truncation")
+	}
+	if !utf8.ValidString(msgs[0].Content) {
+		t.Fatalf("capped tool result is not valid UTF-8: %q", msgs[0].Content)
 	}
 }
 

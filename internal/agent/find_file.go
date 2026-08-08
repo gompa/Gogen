@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -35,29 +34,9 @@ func (e *Executor) FindFile(name string, subpath string, limit int) (string, err
 	}
 
 	var matches []string
-	err = filepath.WalkDir(searchRoot, func(walkPath string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return nil
-		}
-		if d.IsDir() {
-			if walkPath != searchRoot && shouldSkipSearchEntry(d.Name(), true) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if shouldSkipSearchEntry(d.Name(), false) {
-			return nil
-		}
+	err = walkTree(nil, searchRoot, relPrefix, walkOpts{}, func(path, rel string, d os.DirEntry) error {
 		base := d.Name()
 		if strings.Contains(strings.ToLower(base), strings.ToLower(name)) {
-			rel, err := filepath.Rel(searchRoot, walkPath)
-			if err != nil {
-				return nil
-			}
-			rel = filepath.ToSlash(rel)
-			if relPrefix != "" {
-				rel = filepath.ToSlash(filepath.Join(relPrefix, rel))
-			}
 			matches = append(matches, rel)
 			if len(matches) >= limit {
 				return errFindFileLimit

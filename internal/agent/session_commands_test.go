@@ -273,11 +273,11 @@ func TestPersistSessionRecordsError(t *testing.T) {
 
 func TestRestoreSessionKeepsProjectProfileSameDir(t *testing.T) {
 	a := &Agent{WorkingDir: "/tmp/project", projectProfile: "stale"}
-	a.RestoreSession(context.Background(), SessionSnapshot{
+	a.RestoreSession(SessionSnapshot{
 		WorkingDir:     "/tmp/project",
 		ProjectProfile: "Working directory: /tmp/project\nTop-level directories: cmd/, internal/\n",
 		Messages:       []llm.Message{{Role: "user", Content: "hi"}},
-	})
+	}, a.SessionID)
 	if a.projectProfile != "Working directory: /tmp/project\nTop-level directories: cmd/, internal/\n" {
 		t.Fatalf("projectProfile=%q", a.projectProfile)
 	}
@@ -285,11 +285,11 @@ func TestRestoreSessionKeepsProjectProfileSameDir(t *testing.T) {
 
 func TestRestoreSessionClearsProjectProfileDifferentDir(t *testing.T) {
 	a := &Agent{WorkingDir: "/tmp/other", projectProfile: "stale"}
-	a.RestoreSession(context.Background(), SessionSnapshot{
+	a.RestoreSession(SessionSnapshot{
 		WorkingDir:     "/tmp/project",
 		ProjectProfile: "Working directory: /tmp/project\n",
 		Messages:       []llm.Message{{Role: "user", Content: "hi"}},
-	})
+	}, a.SessionID)
 	if a.projectProfile != "" {
 		t.Fatalf("expected empty projectProfile, got %q", a.projectProfile)
 	}
@@ -297,10 +297,10 @@ func TestRestoreSessionClearsProjectProfileDifferentDir(t *testing.T) {
 
 func TestRestoreSessionClearsProjectProfileWhenMissing(t *testing.T) {
 	a := &Agent{WorkingDir: "/tmp/project", projectProfile: "stale"}
-	a.RestoreSession(context.Background(), SessionSnapshot{
+	a.RestoreSession(SessionSnapshot{
 		WorkingDir: "/tmp/project",
 		Messages:   []llm.Message{{Role: "user", Content: "hi"}},
-	})
+	}, a.SessionID)
 	if a.projectProfile != "" {
 		t.Fatalf("expected empty projectProfile, got %q", a.projectProfile)
 	}
@@ -317,11 +317,11 @@ func TestRestoreSessionClearsPinsAndUsage(t *testing.T) {
 		UsageAccum:    UsageAccumulator{TotalPromptTokens: 500, TotalCompletionTokens: 50, TotalCachedTokens: 200, TotalTurns: 3},
 		Messages:      []llm.Message{{Role: "user", Content: "old"}},
 	}
-	a.RestoreSession(context.Background(), SessionSnapshot{
+	a.RestoreSession(SessionSnapshot{
 		WorkingDir:     "/tmp/project",
 		ProjectProfile: "profile",
 		Messages:       []llm.Message{{Role: "user", Content: "restored"}},
-	})
+	}, a.SessionID)
 	if len(a.PinManager.PinnedIndices()) != 0 {
 		t.Fatalf("pins not cleared: %v", a.PinManager.PinnedIndices())
 	}

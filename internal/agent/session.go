@@ -199,11 +199,14 @@ func (a *Agent) ValidateRestoredModel(ctx context.Context, model string) {
 	}
 }
 
-// RestoreSession loads messages, mode, and model from a snapshot, then
-// validates the model against the provider (network).
-func (a *Agent) RestoreSession(ctx context.Context, snap SessionSnapshot) {
-	a.RestoreSessionLocal(snap, a.SessionID)
-	a.ValidateRestoredModel(ctx, snap.Model)
+// RestoreSession loads messages, mode, and model from a snapshot and makes id
+// the agent's current session. It is the shared restore core used by
+// main.go's startup restore, resumeSessionByID, and the session agent
+// factory; model validation stays with the caller (async, so the UI is not
+// blocked on provider ListModels).
+func (a *Agent) RestoreSession(snap SessionSnapshot, id string) {
+	a.RestoreSessionLocal(snap, id)
+	a.SessionID = id
 }
 
 // sameWorkingDir reports whether two working-directory paths refer to the same location.

@@ -35,6 +35,12 @@ const (
 	propsProbeTimeout = 1500 * time.Millisecond
 )
 
+// modelsFetchBackoff gates re-fetching after a failed catalog fetch: a dead
+// OpenCode endpoint costs one bounded attempt per window instead of one per
+// chat request. A var (not const) so tests can shrink it, mirroring how
+// modelsCacheTTL governs cache staleness.
+var modelsFetchBackoff = 30 * time.Second
+
 // propsHTTPClient is a plain short-timeout client for capability probes.
 // Intentionally not the SSE client (idle read deadlines are stream-oriented).
 var propsHTTPClient = &http.Client{Timeout: propsProbeTimeout}
@@ -64,7 +70,10 @@ type OpenAIProvider struct {
 	modelsMu       sync.RWMutex
 	modelsCache    []openai.Model
 	modelsCachedAt time.Time // zero means no successful cache entry
-	modelsFetch    *modelsFetch
+	// modelsFetchFailedAt is set when a catalog fetch fails; clientForModel
+	// skips re-fetching until modelsFetchBackoff has elapsed.
+	modelsFetchFailedAt time.Time
+	modelsFetch         *modelsFetch
 
 	// propsCaps caches llama.cpp GET /props chat_template_caps. Invalidated
 	// on SetModel because router/multi-model hosts may change the template.

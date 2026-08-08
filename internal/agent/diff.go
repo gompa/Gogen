@@ -21,13 +21,10 @@ func (e *Executor) ShowDiff(ctx context.Context, path string, staged bool) (stri
 		args = append(args, "--", path)
 	}
 
-	cmd, cmdErr := e.NewGitCmd(ctx, args...)
-	if cmdErr != nil {
-		return "", cmdErr
-	}
-	out, err := cmd.CombinedOutput()
-	text := strings.TrimSpace(string(out))
+	text, err := e.runGitCommand(ctx, args)
 	if err != nil {
+		// git diff exits 1 when there are no differences (or --check
+		// whitespace findings) — that is not a failure.
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
 			if text == "" {
@@ -35,14 +32,13 @@ func (e *Executor) ShowDiff(ctx context.Context, path string, staged bool) (stri
 			}
 			return text, nil
 		}
-		if ctx.Err() != nil {
-			return "", ctx.Err()
+		// Preserve git's stderr (e.g. "fatal: not a git repository") when
+		// the command produced output; otherwise the wrapped error already
+		// names the failing subcommand.
+		if text != "" {
+			return "", fmt.Errorf("git diff failed: %s", text)
 		}
-		msg := strings.TrimSpace(string(out))
-		if msg == "" {
-			msg = err.Error()
-		}
-		return "", fmt.Errorf("git diff failed: %s", msg)
+		return "", err
 	}
 	if text == "" {
 		return "No differences found", nil

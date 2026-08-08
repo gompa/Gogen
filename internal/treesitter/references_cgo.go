@@ -4,83 +4,20 @@ package treesitter
 
 import (
 	"fmt"
-	"sync"
 
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
 )
 
-var (
-	refsQueryOnce  sync.Once
-	refsQueryCache sync.Map // lang -> *tree_sitter.Query
-)
-
-func refsQueryText(langName string) string {
-	q, ok := refsQueries[langName]
-	if !ok {
-		return ""
-	}
-	return q
-}
-
-var refsQueries = map[string]string{
-	"go": `(identifier) @ref
-(field_identifier) @ref
-(type_identifier) @ref`,
-	"python": `(identifier) @ref`,
-	"javascript": `(identifier) @ref
-(property_identifier) @ref
-(shorthand_property_identifier) @ref`,
-	"typescript": `(identifier) @ref
-(property_identifier) @ref
-(shorthand_property_identifier) @ref
-(type_identifier) @ref`,
-	"tsx": `(identifier) @ref
-(property_identifier) @ref
-(shorthand_property_identifier) @ref
-(type_identifier) @ref`,
-	"rust": `(identifier) @ref
-(field_identifier) @ref
-(type_identifier) @ref`,
-	"java": `(identifier) @ref`,
-	"c": `(identifier) @ref
-(field_identifier) @ref
-(type_identifier) @ref`,
-	"cpp": `(identifier) @ref
-(field_identifier) @ref
-(type_identifier) @ref`,
-	"csharp": `(identifier) @ref`,
-	"php": `(name) @ref
-(variable_name) @ref`,
-	"ruby": `(identifier) @ref
-(constant) @ref`,
-	"bash":   `(word) @ref`,
-	"lua":    `(identifier) @ref`,
-	"hcl":    `(identifier) @ref`,
-	"kotlin": `(identifier) @ref`,
-	"scala":  `(identifier) @ref`,
-	"sql":    `(object_reference) @ref`,
-	"zig":    `(identifier) @ref`,
-}
-
+// refsQueryForLang returns the compiled reference query for langName, sourced
+// from the registry's inline refsQuery text and compiled through the shared
+// query cache (compileQuery).
 func refsQueryForLang(langName string) (*tree_sitter.Query, error) {
-	refsQueryOnce.Do(func() {})
-	if v, ok := refsQueryCache.Load(langName); ok {
-		return v.(*tree_sitter.Query), nil
-	}
-	src := refsQueryText(langName)
-	if src == "" {
+	registryOnce.Do(initRegistry)
+	spec, ok := langSpecs[langName]
+	if !ok || spec.refsQuery == "" {
 		return nil, ErrUnsupported
 	}
-	lang := languageFor(langName)
-	if lang == nil {
-		return nil, ErrUnsupported
-	}
-	q, err := tree_sitter.NewQuery(lang, src)
-	if err != nil {
-		return nil, fmt.Errorf("compile refs query for %s: %w", langName, err)
-	}
-	refsQueryCache.Store(langName, q)
-	return q, nil
+	return compileQuery(langName, "refs", spec.refsQuery)
 }
 
 const maxReferencesPerFile = 200
@@ -151,5 +88,6 @@ func ReferenceSearchSupported(path string) bool {
 	if !ok {
 		return false
 	}
-	return refsQueryText(lang) != ""
+	spec, ok := langSpecs[lang]
+	return ok && spec.refsQuery != ""
 }

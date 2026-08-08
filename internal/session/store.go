@@ -1,7 +1,6 @@
 package session
 
 import (
-	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -17,6 +16,7 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/ioutil"
 	"gogen/internal/llm"
+	"gogen/internal/randhex"
 )
 
 const version = 1
@@ -139,14 +139,8 @@ func (s *Store) SetAutoPrune(enabled bool) {
 
 // NewStoreWithOptions creates a session store with custom retention.
 func NewStoreWithOptions(enabled bool, opts StoreOptions) *Store {
-	maxCount := opts.MaxCount
-	if maxCount <= 0 {
-		maxCount = config.DefaultSessionMaxCount
-	}
-	maxAge := opts.MaxAgeDays
-	if maxAge <= 0 {
-		maxAge = config.DefaultSessionMaxAgeDays
-	}
+	maxCount := config.Effective(opts.MaxCount, config.DefaultSessionMaxCount)
+	maxAge := config.Effective(opts.MaxAgeDays, config.DefaultSessionMaxAgeDays)
 	return &Store{enabled: enabled, maxCount: maxCount, maxAgeDays: maxAge, createdCache: make(map[string]time.Time), autoPrune: true}
 }
 
@@ -606,11 +600,21 @@ func deltaPrefixMatches(snapshotTail, deltaPrefix []llm.Message) bool {
 func sameMessageContent(a, b llm.Message) bool {
 	if a.Role != b.Role || a.Content != b.Content ||
 		a.Reasoning != b.Reasoning || a.Refusal != b.Refusal ||
-		a.ToolCallID != b.ToolCallID {
+		a.ToolCallID != b.ToolCallID || a.Model != b.Model {
 		return false
 	}
 	if !a.CreatedAt.Equal(b.CreatedAt) {
 		return false
+	}
+	// Images (vision input) are persisted with json:"images,omitempty"; the
+	// element-wise compare keeps the persisted-content contract complete.
+	if len(a.Images) != len(b.Images) {
+		return false
+	}
+	for i := range a.Images {
+		if a.Images[i] != b.Images[i] {
+			return false
+		}
 	}
 	if len(a.ToolCalls) != len(b.ToolCalls) {
 		return false
@@ -1176,11 +1180,7 @@ func sessionLabel(messages []llm.Message, stored string) string {
 
 // NewID generates a new session id.
 func NewID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return fmt.Sprintf("%d", time.Now().UnixNano())
-	}
-	return fmt.Sprintf("%x", b)
+	return randhex.ID(16, "")
 }
 
 // Prune deletes expired and excess sessions while retaining every keepID

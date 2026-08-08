@@ -2,12 +2,19 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
 
 	"gogen/internal/treesitter"
 )
+
+// errReferenceLimit stops the AST reference walk once searchMaxMatches
+// matches have been collected. Typed sentinel so FindReferences can
+// distinguish truncation from a real walk failure with errors.Is instead of
+// comparing error text.
+var errReferenceLimit = errors.New("reference search: result limit reached")
 
 // FindReferences locates usages of a symbol via tree-sitter when available, otherwise word-boundary search.
 func (e *Executor) FindReferences(ctx context.Context, symbol, subpath, glob string) (string, error) {
@@ -30,13 +37,23 @@ func (e *Executor) FindReferences(ctx context.Context, symbol, subpath, glob str
 				astFiles++
 				astMatches = append(astMatches, treesitter.FormatReferenceMatches(filePath, refs)...)
 				if len(astMatches) >= searchMaxMatches {
-					return fmt.Errorf("limit reached")
+					return errReferenceLimit
 				}
 				return nil
 			})
-		if err != nil && err.Error() != "limit reached" {
+		if err != nil && !errors.Is(err, errReferenceLimit) {
 			return "", err
 		}
+	}
+
+	var b strings.Builder
+	// The AST pass already produced results — report them and skip the
+	// redundant second tree walk. The text pass only runs as a fallback when
+	// AST found nothing (unsupported language or no matches).
+	if len(astMatches) > 0 {
+		fmt.Fprintf(&b, "References for %q (%d via AST in %d files):\n", symbol, len(astMatches), astFiles)
+		b.WriteString(strings.Join(astMatches, "\n"))
+		return b.String(), nil
 	}
 
 	// Text search fallback
@@ -46,25 +63,8 @@ func (e *Executor) FindReferences(ctx context.Context, symbol, subpath, glob str
 		return "", err
 	}
 
-	// Format output
-	var b strings.Builder
-	if len(astMatches) > 0 {
-		fmt.Fprintf(&b, "References for %q (%d via AST in %d files", symbol, len(astMatches), astFiles)
-		if !strings.HasPrefix(textOut, "No matches found") {
-			b.WriteString("; also see text search below")
-		}
-		b.WriteString("):\n")
-		b.WriteString(strings.Join(astMatches, "\n"))
-	} else if strings.HasPrefix(textOut, "No matches found") {
+	if strings.HasPrefix(textOut, "No matches found") {
 		return fmt.Sprintf("No references found for %q", symbol), nil
-	} else {
-		b.WriteString("References for " + symbol + " (text search):\n")
-		b.WriteString(textOut)
 	}
-
-	if !strings.HasPrefix(textOut, "No matches found") && len(astMatches) > 0 {
-		b.WriteString("\n\nText search (all files):\n")
-		b.WriteString(textOut)
-	}
-	return b.String(), nil
+	return "References for " + symbol + " (text search):\n" + textOut, nil
 }

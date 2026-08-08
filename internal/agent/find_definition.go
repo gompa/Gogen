@@ -2,10 +2,8 @@ package agent
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -99,43 +97,10 @@ func (e *Executor) findDefinitionAST(ctx context.Context, searchRoot, relPrefix,
 	}
 
 	var defs []string
-	err := filepath.WalkDir(searchRoot, func(path string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return nil
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if d.IsDir() {
-			if path != searchRoot && shouldSkipSearchEntry(d.Name(), true) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if shouldSkipSearchEntry(d.Name(), false) {
-			return nil
-		}
+	err := walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true}, func(path, rel string, d os.DirEntry) error {
 		if !treesitter.ReferenceSearchSupported(path) {
 			return nil
 		}
-
-		rel, err := filepath.Rel(searchRoot, path)
-		if err != nil {
-			return nil
-		}
-		rel = filepath.ToSlash(rel)
-		if relPrefix != "" {
-			rel = filepath.ToSlash(filepath.Join(relPrefix, rel))
-		}
-		if glob != "" && !matchGlobPattern(glob, rel) {
-			return nil
-		}
-
-		info, err := d.Info()
-		if !searchableWalkFile(path, info, err) {
-			return nil
-		}
-
 		content, err := os.ReadFile(path)
 		if err != nil {
 			return nil
@@ -143,9 +108,6 @@ func (e *Executor) findDefinitionAST(ctx context.Context, searchRoot, relPrefix,
 
 		defList, err := treesitter.ListDefinitions(path, content)
 		if err != nil {
-			if errors.Is(err, treesitter.ErrDisabled) || errors.Is(err, treesitter.ErrUnsupported) {
-				return nil
-			}
 			return nil
 		}
 		for _, def := range defList {

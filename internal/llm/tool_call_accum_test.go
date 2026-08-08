@@ -212,22 +212,27 @@ func TestMergeToolCallDeltaFinalizesOncePerAccumulator(t *testing.T) {
 	}
 }
 
-// TestBraceDepth covers the cheap structural pre-check used to decide when
-// the expensive json.Unmarshal validity check is worth running.
-func TestBraceDepth(t *testing.T) {
+// TestCompleteJSONObject covers the cheap structural pre-check used to decide
+// when the expensive json.Unmarshal validity check is worth running. The
+// check is string-aware: braces inside quoted strings (including escaped
+// quotes) must not count toward nesting depth.
+func TestCompleteJSONObject(t *testing.T) {
 	t.Parallel()
-	cases := map[string]int{
-		"":        0,
-		`{`:       1,
-		`}`:       -1,
-		`{}`:      0,
-		`{"a":1}`: 0,
-		`{"a":`:   1,
-		`{}}`:     -1,
+	cases := map[string]bool{
+		"":           false,
+		`{`:          false,
+		`}`:          false,
+		`{}`:         true,
+		`{"a":1}`:    true,
+		`{"a":`:      false,
+		`{}}`:        false,
+		`{"a":"}"}`:  true, // brace inside a string must not confuse the scan
+		`{"a":1}{"b`: false,
+		`{"a":"\""}`: true, // escaped quote inside a string
 	}
 	for s, want := range cases {
-		if got := braceDepth(s); got != want {
-			t.Fatalf("braceDepth(%q) = %d, want %d", s, got, want)
+		if got := completeJSONObject(s); got != want {
+			t.Fatalf("completeJSONObject(%q) = %v, want %v", s, got, want)
 		}
 	}
 }

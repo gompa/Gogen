@@ -16,36 +16,20 @@ const (
 // ErrPlanModeBlocked is returned when a tool is disabled in plan mode.
 var ErrPlanModeBlocked = fmt.Errorf("plan mode blocked tool")
 
-// planModeAllowedTools is the intentional read-mostly subset for plan mode.
-// Mutating tools from BuiltinTools() are excluded by omission.
-var planModeAllowedTools = map[string]struct{}{
-	"repo_overview":    {},
-	"list_files":       {},
-	"glob_files":       {},
-	"read_file":        {},
-	"read_files":       {},
-	"list_definitions": {},
-	"search_code":      {},
-	"find_references":  {},
-	"show_diff":        {},
-	"git_log":          {},
-	"git_blame":        {},
-	"git_status":       {},
-	// git_branch omitted: create/switch mutate the repo; list via execute outside plan.
-	"git_stash_list":      {},
-	"git_show":            {},
-	"web_search":          {},
-	"web_fetch":           {},
-	"find_file":           {},
-	"find_definition":     {},
-	"call_graph":          {},
-	"dependency_analysis": {},
-	"todo_add":            {},
-	"todo_list":           {},
-	"session_rename":      {},
-	"session_usage":       {},
-	"context_pin_last":    {},
-	"context_pins":        {},
+// planModeAllowedTools is the intentional read-mostly subset for plan mode,
+// derived from the PlanAllowed flag on each builtin tool's ToolDef so the
+// registry stays the single source of truth. Mutating tools from
+// BuiltinTools() are excluded by omission (no PlanAllowed flag).
+var planModeAllowedTools = derivePlanModeAllowedTools()
+
+func derivePlanModeAllowedTools() map[string]struct{} {
+	out := make(map[string]struct{}, len(builtinToolDefs))
+	for _, d := range builtinToolDefs {
+		if d.PlanAllowed {
+			out[d.Definition.Name] = struct{}{}
+		}
+	}
+	return out
 }
 
 // builtinToolNames is derived from BuiltinTools() so schema and allowlists stay in sync.

@@ -3,6 +3,7 @@ package agent
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"gogen/internal/treesitter"
 )
@@ -19,7 +20,7 @@ func (e *Executor) ListDefinitions(path string) (string, error) {
 			return "", fmt.Errorf("list_definitions requires tree-sitter (GOGEN_TREESITTER is off)")
 		}
 		if errors.Is(err, treesitter.ErrUnsupported) {
-			return "", fmt.Errorf("no definition query for %q (supported: go, python, js/ts, rust, java, c/c++, c#, php, ruby, bash, lua, hcl)", path)
+			return "", fmt.Errorf("no definition query for %q (supported: %s)", path, strings.Join(treesitter.DefinitionQueryLanguages(), ", "))
 		}
 		return "", err
 	}

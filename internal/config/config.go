@@ -38,6 +38,25 @@ const (
 	DefaultWebMaxActiveSessions = 8
 )
 
+// Effective returns v when v > 0, else def. It is the single "0 = unset, use
+// the default" resolution rule for integer config values, so the policy is
+// documented here once instead of drifting across call sites.
+//
+// NOTE on explicit zeros: this rule applies only where 0 is not a meaningful
+// setting (session retention counts, ...). Some settings deliberately treat 0
+// as meaningful and deliberately do NOT go through Effective:
+//   - contextmgr.Settings: compact_threshold 0 disables auto-compaction,
+//     max_tool_result_bytes 0 removes the truncation cap, compact_reserve_tokens
+//     0 reserves nothing — only negative values fall back to defaults;
+//   - projectfile.mergeIntOpt distinguishes an explicit file 0 from an absent
+//     key via a non-nil pointer.
+func Effective(v, def int) int {
+	if v > 0 {
+		return v
+	}
+	return def
+}
+
 // MCPServerConfig describes one MCP stdio server entry. Tags cover both the
 // JSON env-var form (GOGEN_MCP_SERVERS) and the YAML project-file form.
 type MCPServerConfig struct {

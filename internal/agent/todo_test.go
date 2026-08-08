@@ -64,14 +64,14 @@ func TestRestoreSessionReplacesTodos(t *testing.T) {
 		TodoManager: NewTodoManager("/tmp/project"),
 	}
 	_, _ = a.TodoManager.AddTodo("stale")
-	a.RestoreSession(context.Background(), SessionSnapshot{
+	a.RestoreSession(SessionSnapshot{
 		WorkingDir: "/tmp/project",
 		Todos: &TodoList{
 			Items:  []TodoItem{{ID: 2, Text: "restored", Status: "pending"}},
 			NextID: 3,
 		},
 		Messages: []llm.Message{{Role: "user", Content: "hi"}},
-	})
+	}, a.SessionID)
 	got := a.TodoManager.ListTodos()
 	if !strings.Contains(got, "restored") || strings.Contains(got, "stale") {
 		t.Fatalf("todos=%q", got)
@@ -84,10 +84,10 @@ func TestRestoreSessionClearsTodosWhenMissing(t *testing.T) {
 		TodoManager: NewTodoManager("/tmp/project"),
 	}
 	_, _ = a.TodoManager.AddTodo("leak")
-	a.RestoreSession(context.Background(), SessionSnapshot{
+	a.RestoreSession(SessionSnapshot{
 		WorkingDir: "/tmp/project",
 		Messages:   []llm.Message{{Role: "user", Content: "hi"}},
-	})
+	}, a.SessionID)
 	if !a.TodoManager.Empty() {
 		t.Fatalf("expected empty todos, got %s", a.TodoManager.ListTodos())
 	}

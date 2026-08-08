@@ -101,16 +101,18 @@ func (ws *Workspace) SetWorkingDir(dir string) {
 // are deliberately NOT classified here: git mutations are serialized by the
 // executor/git itself, and execute_command must not block editor saves for
 // its whole runtime (multi-session plan §2.4).
-var fsMutatingTools = map[string]bool{
-	"write_file":      true,
-	"replace_in_file": true,
-	"patch_file":      true,
-	"multi_edit":      true,
-	"rename_symbol":   true,
-	"move_file":       true,
-	"copy_file":       true,
-	"delete_file":     true,
-}
+//
+// The set is derived from the MutatesFS flag in the agent tool registry
+// (agent.FSMutatingToolNames), so a mutating tool is locked by declaration in
+// its ToolDef — no second hand-maintained map to drift.
+var fsMutatingTools = func() map[string]bool {
+	names := agent.FSMutatingToolNames()
+	out := make(map[string]bool, len(names))
+	for _, name := range names {
+		out[name] = true
+	}
+	return out
+}()
 
 // wrapToolHandlers returns a copy of handlers in which every FS-mutating tool
 // acquires fsMu for the duration of its execution. Non-mutating handlers are
@@ -170,7 +172,7 @@ func (ws *Workspace) NewSessionAgent(snap *agent.SessionSnapshot, id string) *ag
 	a.SetMCPRegistry(ws.MCPRegistry)
 	a.SetToolHandlers(wrapToolHandlers(agent.BuiltinToolHandlers(), &ws.fsMu))
 	if snap != nil {
-		a.RestoreSessionLocal(*snap, id)
+		a.RestoreSession(*snap, id)
 		// D1: model is per-session — a resumed session keeps its saved model
 		// (RestoreSessionLocal already calls Provider.SetModel(snap.Model));
 		// never overwrite it with the workspace default. Validate the saved

@@ -111,28 +111,20 @@ func (a *tcAccum) maybeFinalizeArgs() {
 	if s == "" || s[0] != '{' || s[len(s)-1] != '}' {
 		return
 	}
-	if braceDepth(s) == 0 {
+	if completeJSONObject(s) {
 		a.argsFinalized = toolArgsFullyReceived(a.ArgsStr)
 	}
 }
 
-// braceDepth returns the net brace nesting depth of s. Depth goes negative
-// when a closing brace appears before any opening one. Returns -1 in that
-// case so the caller treats it as unbalanced (and skips validation).
-func braceDepth(s string) int {
-	depth := 0
-	for i := 0; i < len(s); i++ {
-		switch s[i] {
-		case '{':
-			depth++
-		case '}':
-			depth--
-			if depth < 0 {
-				return -1
-			}
-		}
-	}
-	return depth
+// completeJSONObject reports whether s is a single JSON object spanning the
+// whole buffer: it starts with '{' and the string-aware scanner (which skips
+// quoted strings, honoring escapes) finds the matching '}' exactly at the
+// end. Unlike a naive brace-depth count, braces inside strings do not confuse
+// it. Used by maybeFinalizeArgs as the cheap pre-check before the
+// authoritative json.Unmarshal validation.
+func completeJSONObject(s string) bool {
+	_, end := extractJSONObject(s, 0)
+	return end == len(s)
 }
 
 // mergeToolArgsDelta combines streamed argument fragments.

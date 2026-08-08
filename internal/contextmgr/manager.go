@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"gogen/internal/config"
 	"gogen/internal/debuglog"
@@ -94,17 +95,18 @@ func NewManager(provider llm.LLMProvider, settings Settings) *Manager {
 	// messages on compaction, max_tool_result_bytes 0 removes the truncation
 	// cap, compact_reserve_tokens 0 reserves no tokens. Only negative values
 	// are invalid and fall back to defaults.
+	def := DefaultSettings()
 	if settings.CompactThreshold < 0 || settings.CompactThreshold > 1 {
-		settings.CompactThreshold = DefaultSettings().CompactThreshold
+		settings.CompactThreshold = def.CompactThreshold
 	}
 	if settings.CompactKeepRecentMessages < 0 {
-		settings.CompactKeepRecentMessages = DefaultSettings().CompactKeepRecentMessages
+		settings.CompactKeepRecentMessages = def.CompactKeepRecentMessages
 	}
 	if settings.MaxToolResultBytes < 0 {
-		settings.MaxToolResultBytes = DefaultSettings().MaxToolResultBytes
+		settings.MaxToolResultBytes = def.MaxToolResultBytes
 	}
 	if settings.CompactReserveTokens < 0 {
-		settings.CompactReserveTokens = DefaultSettings().CompactReserveTokens
+		settings.CompactReserveTokens = def.CompactReserveTokens
 	}
 	manual := 0
 	if settings.ContextLimit > 0 {
@@ -232,6 +234,22 @@ func (m *Manager) TruncateToolResult(content string) string {
 	return truncateToolResult(content, max)
 }
 
+// TruncateRuneSafe cuts s to at most max bytes without splitting a UTF-8
+// rune: it backs off over continuation bytes until it lands on a rune
+// boundary. s is assumed valid UTF-8 (tool results that pass through JSON
+// decoding always are); for invalid input the result is never worse than a
+// raw byte cut. Shared by the context window capper and the web server's
+// per-frame tool-result cap so both produce valid UTF-8 output.
+func TruncateRuneSafe(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
+}
+
 func truncateToolResult(content string, max int) string {
 	if max <= 0 || len(content) <= max {
 		return content
@@ -239,7 +257,7 @@ func truncateToolResult(content string, max int) string {
 	if strings.Contains(content, toolResultTruncationMarker) {
 		return content
 	}
-	return content[:max] + fmt.Sprintf("\n… truncated (%d chars total)", len(content))
+	return TruncateRuneSafe(content, max) + fmt.Sprintf("\n… truncated (%d chars total)", len(content))
 }
 
 // ContextSnapshot summarizes context window usage for display.
@@ -774,7 +792,7 @@ func writeMessageForSummary(b *strings.Builder, msg llm.Message, maxToolBytes in
 	case "tool":
 		content := msg.Content
 		if maxToolBytes > 0 && len(content) > maxToolBytes {
-			content = content[:maxToolBytes] + fmt.Sprintf(" …(%d chars total)", len(msg.Content))
+			content = TruncateRuneSafe(content, maxToolBytes) + fmt.Sprintf(" …(%d chars total)", len(msg.Content))
 		}
 		label := msg.ToolCallID
 		if name := toolNames[msg.ToolCallID]; name != "" {
@@ -784,6 +802,11 @@ func writeMessageForSummary(b *strings.Builder, msg llm.Message, maxToolBytes in
 	}
 }
 
+// cloneMessage deep-copies the persisted parts of a message so compaction can
+// preserve them verbatim. Images (vision input), CreatedAt, and Model are
+// value fields that must survive: stripping them from the preserved head/tail
+// would silently drop image context after the first compaction and wipe
+// assistant model attribution (web UI chips) from preserved bubbles.
 func cloneMessage(msg llm.Message) llm.Message {
 	out := llm.Message{
 		Role:       msg.Role,
@@ -791,6 +814,12 @@ func cloneMessage(msg llm.Message) llm.Message {
 		Reasoning:  msg.Reasoning,
 		Refusal:    msg.Refusal,
 		ToolCallID: msg.ToolCallID,
+		CreatedAt:  msg.CreatedAt,
+		Model:      msg.Model,
+	}
+	if len(msg.Images) > 0 {
+		out.Images = make([]llm.ImageInput, len(msg.Images))
+		copy(out.Images, msg.Images)
 	}
 	if len(msg.ToolCalls) > 0 {
 		out.ToolCalls = make([]llm.ToolCall, len(msg.ToolCalls))

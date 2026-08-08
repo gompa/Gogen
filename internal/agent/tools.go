@@ -11,6 +11,24 @@ import (
 type ToolDef struct {
 	Definition llm.Tool
 	Handler    ToolHandler
+
+	// ReadOnly marks handlers safe to execute concurrently within a single
+	// turn: no workspace mutation, no session-state mutation, and no shell
+	// execution, whose shared state is either internally synchronized or
+	// only read. ReadOnly implies PlanAllowed.
+	ReadOnly bool
+
+	// PlanAllowed marks the tool as available in plan mode. Read-only tools
+	// set both flags; the few session-local mutations allowed in plan mode
+	// (todo_add, session_rename, context_pin_last) set PlanAllowed without
+	// ReadOnly.
+	PlanAllowed bool
+
+	// MutatesFS marks tools that write to the working tree. The server wraps
+	// these handlers with the workspace fsMu so editor saves and agent file
+	// mutations stay serialized. MutatesFS tools are never ReadOnly and
+	// never PlanAllowed.
+	MutatesFS bool
 }
 
 // toolProp creates a property definition for a tool parameter.
@@ -65,21 +83,27 @@ var builtinToolDefs = []ToolDef{
 				"recursive":    toolProp("boolean", "Walk tree recursively (max 500)"),
 				"tracked_only": toolProp("boolean", "Only git-tracked files"),
 			}, "path")),
-		Handler: handleListFiles,
+		Handler:     handleListFiles,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("repo_overview", "Summarize repo layout: top-level directories, file counts, root files. Use first when exploring.",
 			toolSchema(map[string]interface{}{})),
-		Handler: handleRepoOverview,
+		Handler:     handleRepoOverview,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 	{
-		Definition: toolDef("glob_files", "Find files by glob pattern (e.g. *.go, **/*.md).",
+		Definition: toolDef("glob_files", "Find files by glob pattern (e.g. *.go, **/*.md). Matches dotfiles too (e.g. *.env); hidden directories are pruned — pass one as the path argument to search inside it.",
 			toolSchema(map[string]interface{}{
 				"pattern":      toolProp("string", "Glob pattern"),
 				"path":         toolProp("string", "Optional subdirectory"),
 				"tracked_only": toolProp("boolean", "Only git-tracked files"),
 			}, "pattern")),
-		Handler: handleGlobFiles,
+		Handler:     handleGlobFiles,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("read_file", "Read file content. Use offset/limit for ranges. Search=regex jump.",
@@ -91,21 +115,27 @@ var builtinToolDefs = []ToolDef{
 				"search":       toolProp("string", "Regex to jump to; offset/limit become context/window"),
 				"line_numbers": toolProp("boolean", "Prefix lines with numbers"),
 			})),
-		Handler: handleReadFile,
+		Handler:     handleReadFile,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("read_files", "Read multiple files (max 20, 512KB). Output: === path === headers.",
 			toolSchema(map[string]interface{}{
 				"paths": toolPropArray("string", "File paths"),
 			}, "paths")),
-		Handler: handleReadFiles,
+		Handler:     handleReadFiles,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("list_definitions", "List functions/types in a file with line numbers (requires tree-sitter; set GOGEN_TREESITTER=on). Use before editing.",
 			toolSchema(map[string]interface{}{
 				"path": toolProp("string", "Source file path"),
 			}, "path")),
-		Handler: handleListDefinitions,
+		Handler:     handleListDefinitions,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("write_file", "Create a NEW file only (parent dirs ok). Refuses existing paths — use patch_file/replace_in_file to edit; never delete+recreate.",
@@ -113,7 +143,8 @@ var builtinToolDefs = []ToolDef{
 				"path":    toolProp("string", "File path"),
 				"content": toolProp("string", "Content"),
 			}, "path", "content")),
-		Handler: handleWriteFile,
+		Handler:   handleWriteFile,
+		MutatesFS: true,
 	},
 	{
 		Definition: toolDef("execute_command", "Run a shell command (destructive patterns blocked).",
@@ -146,14 +177,16 @@ var builtinToolDefs = []ToolDef{
 				"replace":     toolProp("string", "Replacement"),
 				"replace_all": toolProp("boolean", "Replace all occurrences (default: first)"),
 			}, "path", "search", "replace")),
-		Handler: handleReplaceInFile,
+		Handler:   handleReplaceInFile,
+		MutatesFS: true,
 	},
 	{
 		Definition: toolDef("delete_file", "Delete a file (requires approval). Do not use to replace content — edit in place with patch_file/replace_in_file.",
 			toolSchema(map[string]interface{}{
 				"path": toolProp("string", "File path"),
 			}, "path")),
-		Handler: handleDeleteFile,
+		Handler:   handleDeleteFile,
+		MutatesFS: true,
 	},
 	{
 		Definition: toolDef("move_file", "Rename/move a file (creates parent dirs).",
@@ -161,7 +194,8 @@ var builtinToolDefs = []ToolDef{
 				"source":      toolProp("string", "Source path"),
 				"destination": toolProp("string", "Destination path"),
 			}, "source", "destination")),
-		Handler: handleMoveFile,
+		Handler:   handleMoveFile,
+		MutatesFS: true,
 	},
 	{
 		Definition: toolDef("patch_file", "Apply surgical unified diff(s). Prefer over rewrites. dry_run=preview, fuzzy=default (tolerant). Do not remove+re-add whole files.",
@@ -172,7 +206,8 @@ var builtinToolDefs = []ToolDef{
 				"dry_run": toolProp("boolean", "Preview without writing"),
 				"fuzzy":   toolProp("boolean", "Tolerate whitespace/shift drift (default true; leave on unless exact)"),
 			}, "diff")),
-		Handler: handlePatchFile,
+		Handler:   handlePatchFile,
+		MutatesFS: true,
 	},
 	{
 		Definition: toolDef("show_diff", "Show git diff (working tree or path).",
@@ -180,7 +215,9 @@ var builtinToolDefs = []ToolDef{
 				"path":   toolProp("string", "Optional file/dir path"),
 				"staged": toolProp("boolean", "Show staged changes only"),
 			})),
-		Handler: handleShowDiff,
+		Handler:     handleShowDiff,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("search_code", "Search codebase for regex/string. Returns file:line:content. Pair with list_definitions.",
@@ -190,7 +227,9 @@ var builtinToolDefs = []ToolDef{
 				"glob":          toolProp("string", "Glob filter (e.g. *.go)"),
 				"context_lines": toolProp("integer", "Context lines (max 20)"),
 			}, "pattern")),
-		Handler: handleSearchCode,
+		Handler:     handleSearchCode,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("find_references", "Find symbol references (AST when supported, text fallback).",
@@ -199,7 +238,9 @@ var builtinToolDefs = []ToolDef{
 				"path":   toolProp("string", "Optional subdirectory"),
 				"glob":   toolProp("string", "Optional glob filter"),
 			}, "symbol")),
-		Handler: handleFindReferences,
+		Handler:     handleFindReferences,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("git_log", "Recent git commits (read-only).",
@@ -207,7 +248,9 @@ var builtinToolDefs = []ToolDef{
 				"path":  toolProp("string", "Optional path to scope"),
 				"limit": toolProp("integer", "Max commits (default 20, max 100)"),
 			})),
-		Handler: handleGitLog,
+		Handler:     handleGitLog,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("git_blame", "Git blame for a file range (read-only).",
@@ -216,14 +259,18 @@ var builtinToolDefs = []ToolDef{
 				"start_line": toolProp("integer", "Start line (default 1)"),
 				"limit":      toolProp("integer", "Lines to blame (default 50, max 200)"),
 			}, "path")),
-		Handler: handleGitBlame,
+		Handler:     handleGitBlame,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("git_status", "Git status (short, read-only).",
 			toolSchema(map[string]interface{}{
 				"path": toolProp("string", "Optional path to scope"),
 			})),
-		Handler: handleGitStatus,
+		Handler:     handleGitStatus,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("web_search", "Web search (DuckDuckGo Lite; no API key needed).",
@@ -231,7 +278,9 @@ var builtinToolDefs = []ToolDef{
 				"query":       toolProp("string", "Query"),
 				"max_results": toolProp("integer", "Max results (default 10, max 20)"),
 			}, "query")),
-		Handler: handleWebSearch,
+		Handler:     handleWebSearch,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("web_fetch", "Fetch a web page: main article as Markdown, or the full page when no article exists; source/data files returned raw. selector: extract matching CSS elements. query: search within the result.",
@@ -242,7 +291,9 @@ var builtinToolDefs = []ToolDef{
 				"query":     toolProp("string", "Optional case-insensitive text search over the extracted content; returns matches with context lines"),
 				"context":   toolProp("integer", "Context lines per query match (default 3, max 10)"),
 			}, "url")),
-		Handler: handleWebFetch,
+		Handler:     handleWebFetch,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("download_file", "Download a file from a URL into the workspace (raw bytes, no HTML stripping; binary-safe). Use for large source files or binaries that would exceed web_fetch's text caps — then read/search the saved file with read_file offset/limit, search_code, list_definitions, or patch_file. HTTPS-only; private/internal hosts blocked.",
@@ -252,7 +303,8 @@ var builtinToolDefs = []ToolDef{
 				"max_bytes": toolProp("integer", "Max download size in bytes (default 52428800, max 209715200)"),
 				"overwrite": toolProp("boolean", "Overwrite an existing file (default false)"),
 			}, "url", "path")),
-		Handler: handleDownloadFile,
+		Handler:   handleDownloadFile,
+		MutatesFS: true,
 	},
 	{
 		Definition: toolDef("git_commit", "Commit (requires staged files).",
@@ -269,6 +321,9 @@ var builtinToolDefs = []ToolDef{
 		Handler: handleGitStage,
 	},
 	{
+		// git_branch: omitted from plan mode on purpose — create/switch
+		// mutate the repo; listing happens via execute_command outside plan
+		// mode. No PlanAllowed flag for that reason.
 		Definition: toolDef("git_branch", "List/create/switch branches.",
 			toolSchema(map[string]interface{}{
 				"name":   toolProp("string", "Name (omit to list)"),
@@ -287,14 +342,18 @@ var builtinToolDefs = []ToolDef{
 	{
 		Definition: toolDef("git_stash_list", "List stash entries.",
 			toolSchema(map[string]interface{}{})),
-		Handler: handleGitStashList,
+		Handler:     handleGitStashList,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("git_show", "Show commit/range as diff (empty=HEAD).",
 			toolSchema(map[string]interface{}{
 				"ref": toolProp("string", "Ref (hash, tag, range; empty=HEAD)"),
 			})),
-		Handler: handleGitShow,
+		Handler:     handleGitShow,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("copy_file", "Copy file (creates parent dirs).",
@@ -302,19 +361,23 @@ var builtinToolDefs = []ToolDef{
 				"source":      toolProp("string", "Source"),
 				"destination": toolProp("string", "Destination"),
 			}, "source", "destination")),
-		Handler: handleCopyFile,
+		Handler:   handleCopyFile,
+		MutatesFS: true,
 	},
 	{
 		Definition: toolDef("todo_add", "Add todo item.",
 			toolSchema(map[string]interface{}{
 				"text": toolProp("string", "Text"),
 			}, "text")),
-		Handler: handleTodoAdd,
+		Handler:     handleTodoAdd,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("todo_list", "List todos with status.",
 			toolSchema(map[string]interface{}{})),
-		Handler: handleTodoList,
+		Handler:     handleTodoList,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("todo_done", "Mark todo done by ID.",
@@ -342,7 +405,9 @@ var builtinToolDefs = []ToolDef{
 				"path":  toolProp("string", "Optional subdirectory"),
 				"limit": toolProp("integer", "Max results (default 50)"),
 			}, "name")),
-		Handler: handleFindFile,
+		Handler:     handleFindFile,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("find_definition", "Cross-file go-to-definition (tree-sitter or text fallback).",
@@ -351,29 +416,37 @@ var builtinToolDefs = []ToolDef{
 				"path":   toolProp("string", "Optional subdirectory"),
 				"glob":   toolProp("string", "Optional glob filter"),
 			}, "symbol")),
-		Handler: handleFindDefinition,
+		Handler:     handleFindDefinition,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("session_rename", "Rename current session.",
 			toolSchema(map[string]interface{}{
 				"label": toolProp("string", "Label"),
 			}, "label")),
-		Handler: handleSessionRename,
+		Handler:     handleSessionRename,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("session_usage", "Show session token usage.",
 			toolSchema(map[string]interface{}{})),
-		Handler: handleSessionUsage,
+		Handler:     handleSessionUsage,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("context_pin_last", "Pin last user message to survive compaction.",
 			toolSchema(map[string]interface{}{})),
-		Handler: handleContextPinLast,
+		Handler:     handleContextPinLast,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("context_pins", "List pinned messages.",
 			toolSchema(map[string]interface{}{})),
-		Handler: handleContextPins,
+		Handler:     handleContextPins,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("rename_symbol", "Rename symbol across files (AST or text fallback).",
@@ -384,7 +457,8 @@ var builtinToolDefs = []ToolDef{
 				"glob":     toolProp("string", "Optional glob filter"),
 				"dry_run":  toolProp("boolean", "Preview only"),
 			}, "old_name", "new_name")),
-		Handler: handleRenameSymbol,
+		Handler:   handleRenameSymbol,
+		MutatesFS: true,
 	},
 	{
 		Definition: toolDef("multi_edit", "Same literal text replacement across multiple files (not regex).",
@@ -394,7 +468,8 @@ var builtinToolDefs = []ToolDef{
 				"replace": toolProp("string", "Replacement text"),
 				"dry_run": toolProp("boolean", "Preview only"),
 			}, "pattern", "search", "replace")),
-		Handler: handleMultiEdit,
+		Handler:   handleMultiEdit,
+		MutatesFS: true,
 	},
 	{
 		Definition: toolDef("call_graph", "Call relationships for a symbol.",
@@ -404,7 +479,9 @@ var builtinToolDefs = []ToolDef{
 				"glob":      toolProp("string", "Optional glob filter"),
 				"direction": toolProp("string", "callers, callees, or both"),
 			}, "symbol")),
-		Handler: handleCallGraph,
+		Handler:     handleCallGraph,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("dependency_analysis", "Impact analysis for a symbol (dependents, risk).",
@@ -412,7 +489,9 @@ var builtinToolDefs = []ToolDef{
 				"symbol": toolProp("string", "Symbol"),
 				"path":   toolProp("string", "Optional subdirectory"),
 			}, "symbol")),
-		Handler: handleDependencyAnalysis,
+		Handler:     handleDependencyAnalysis,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("background_job_status", "Check a background job started with execute_command background=true. Reports running/finished state, exit code, and the tail of the job's output.",
@@ -440,38 +519,34 @@ func BuiltinTools() []llm.Tool {
 	return tools
 }
 
-// parallelSafeTools are builtin tools safe to execute concurrently within a
-// single turn: read-only handlers with no workspace mutation, no session-
-// state mutation, and no shell execution, whose shared state is either
-// internally synchronized or only read. Running them concurrently cuts the
-// latency of multi-tool turns (several independent read_file/search_code
-// calls) without reordering mutating tools, which stay strictly sequential
-// in model order. MCP tools are never parallel-safe (their side effects are
-// unknown), and tool names shadowed by an MCP server are excluded too.
-var parallelSafeTools = map[string]bool{
-	"list_files":          true,
-	"repo_overview":       true,
-	"glob_files":          true,
-	"read_file":           true,
-	"read_files":          true,
-	"list_definitions":    true,
-	"search_code":         true,
-	"find_references":     true,
-	"git_log":             true,
-	"git_blame":           true,
-	"git_status":          true,
-	"git_stash_list":      true,
-	"git_show":            true,
-	"show_diff":           true,
-	"web_search":          true,
-	"web_fetch":           true,
-	"todo_list":           true,
-	"find_file":           true,
-	"find_definition":     true,
-	"session_usage":       true,
-	"context_pins":        true,
-	"call_graph":          true,
-	"dependency_analysis": true,
+// parallelSafeTools is derived from the ReadOnly flag on builtinToolDefs, so
+// a tool is parallel-safe by declaration in its ToolDef instead of by
+// remembering to edit a second map. MCP tools are never parallel-safe (their
+// side effects are unknown), and tool names shadowed by an MCP server are
+// excluded at call time (toolCallsParallelEligible).
+var parallelSafeTools = deriveParallelSafeTools()
+
+func deriveParallelSafeTools() map[string]bool {
+	out := make(map[string]bool, len(builtinToolDefs))
+	for _, d := range builtinToolDefs {
+		if d.ReadOnly {
+			out[d.Definition.Name] = true
+		}
+	}
+	return out
+}
+
+// FSMutatingToolNames returns the names of builtin tools flagged MutatesFS —
+// the handlers the server wraps with the workspace fsMu. Exported so the
+// server derives its lock set from the registry instead of a second map.
+func FSMutatingToolNames() []string {
+	names := make([]string, 0, 8)
+	for _, d := range builtinToolDefs {
+		if d.MutatesFS {
+			names = append(names, d.Definition.Name)
+		}
+	}
+	return names
 }
 
 // maxParallelTools bounds how many tool calls run concurrently within one

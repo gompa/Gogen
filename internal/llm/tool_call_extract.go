@@ -148,15 +148,7 @@ func extractToolCallsFromBlock(blockContent string) []ToolCall {
 		seenEnd := make(map[int]struct{})
 		for _, loc := range jsonMatches {
 			startIdx := loc[0]
-			objStart := -1
-			for i := startIdx; i >= 0; i-- {
-				if blockContent[i] == '{' {
-					objStart = i
-					break
-				} else if blockContent[i] == '"' {
-					break
-				}
-			}
+			objStart := findJSONObjStart(blockContent, startIdx)
 			if objStart < 0 {
 				continue
 			}
@@ -437,14 +429,13 @@ func parseToolCallFromJSONString(jsonStr string) []ToolCall {
 			argsStr = string(argsJSON)
 		}
 	} else if argsStrVal, ok := arguments.(string); ok {
-		// try to parse string as JSON
-		var parsedArgs map[string]interface{}
-		if err := json.Unmarshal([]byte(argsStrVal), &parsedArgs); err == nil {
+		// try to parse string as JSON (same recovery as the streaming
+		// accumulator's parseToolCallArgs); fall back to wrapping as input
+		argsStr = argsStrVal
+		if parsedArgs, err := parseToolCallArgs(argsStrVal); err == nil && strings.TrimSpace(argsStrVal) != "" {
 			argsMap = parsedArgs
-			argsStr = argsStrVal
 		} else {
 			argsMap = map[string]interface{}{"input": argsStrVal}
-			argsStr = argsStrVal
 		}
 	} else if arguments != nil {
 		// fallback: marshal the arguments

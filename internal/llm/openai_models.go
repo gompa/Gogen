@@ -50,8 +50,27 @@ func (p *OpenAIProvider) listModels(ctx context.Context) ([]openai.Model, error)
 		p.modelsCache = models
 		p.modelsCachedAt = time.Now()
 		if routing != nil {
-			p.modelClient = routing
+			// Merge, don't replace: clientForModel caches fallback entries for
+			// models absent from the catalog (unknown/custom models resolved
+			// via models.dev or the primary client). A wholesale replacement
+			// would drop those entries and force a fresh lookup + inference on
+			// every request after each catalog refresh. Catalog entries win
+			// for IDs they cover; entries for models a future catalog removes
+			// linger until the model reappears (they only point at the
+			// endpoint that used to serve it, so this is a minor risk).
+			if p.modelClient == nil {
+				p.modelClient = routing
+			} else {
+				for id, c := range routing {
+					p.modelClient[id] = c
+				}
+			}
 		}
+		p.modelsFetchFailedAt = time.Time{}
+	} else {
+		// Record the failure so clientForModel's backoff gate skips re-probing
+		// a dead catalog on every chat request.
+		p.modelsFetchFailedAt = time.Now()
 	}
 	p.modelsFetch = nil
 	close(f.done)
@@ -60,6 +79,17 @@ func (p *OpenAIProvider) listModels(ctx context.Context) ([]openai.Model, error)
 		return nil, err
 	}
 	return append([]openai.Model(nil), models...), nil
+}
+
+// catalogFetchOnBackoff reports whether a failed catalog fetch is still in
+// its backoff window, so a dead OpenCode endpoint is not re-probed on every
+// chat request. A fetch that failed moments ago costs one bounded attempt
+// per modelsFetchBackoff window instead of one per request.
+func (p *OpenAIProvider) catalogFetchOnBackoff() bool {
+	p.modelsMu.RLock()
+	defer p.modelsMu.RUnlock()
+	return !p.modelsFetchFailedAt.IsZero() &&
+		time.Since(p.modelsFetchFailedAt) < modelsFetchBackoff
 }
 
 func waitModelsFetch(ctx context.Context, f *modelsFetch) ([]openai.Model, error) {
@@ -127,12 +157,29 @@ func (p *OpenAIProvider) fetchModels(ctx context.Context) ([]openai.Model, map[s
 
 		routing := make(map[string]*openai.Client, len(zenRes.routing)+len(goRes.routing))
 		models := make([]openai.Model, 0, len(zenRes.models)+len(goRes.models))
-		models = append(models, zenRes.models...)
-		for id, c := range zenRes.routing {
+		// Go takes precedence over Zen: for models listed on both endpoints
+		// keep the Go entry in both the merged list and the routing map, so
+		// what /models shows and where the request actually goes always
+		// agree. A Go-subscription model must never be sent to the Zen
+		// endpoint, which rejects it as unsupported.
+		seen := make(map[string]struct{}, len(goRes.models))
+		for _, m := range goRes.models {
+			models = append(models, m)
+			seen[m.ID] = struct{}{}
+		}
+		for _, m := range zenRes.models {
+			if _, dup := seen[m.ID]; dup {
+				continue
+			}
+			models = append(models, m)
+		}
+		for id, c := range goRes.routing {
 			routing[id] = c
 		}
-		models = append(models, goRes.models...)
-		for id, c := range goRes.routing {
+		for id, c := range zenRes.routing {
+			if _, goWins := routing[id]; goWins {
+				continue
+			}
 			routing[id] = c
 		}
 		var errs []error

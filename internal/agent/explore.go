@@ -19,21 +19,6 @@ const (
 	readFilesMaxTotalBytes = 512 * 1024
 )
 
-func relDisplayPath(searchRoot, absPath string, isDir bool) (string, error) {
-	rel, err := filepath.Rel(searchRoot, absPath)
-	if err != nil {
-		return "", err
-	}
-	rel = filepath.ToSlash(rel)
-	if rel == "." {
-		rel = ""
-	}
-	if isDir && rel != "" {
-		rel += "/"
-	}
-	return rel, nil
-}
-
 // cachedGitPath caches the result of exec.LookPath("git") so repeated calls
 // don't re-scan PATH.
 var cachedGitPath struct {
@@ -119,28 +104,9 @@ func (e *Executor) ListFiles(path string, recursive, trackedOnly bool) (string, 
 	}
 
 	var lines []string
-	err = filepath.WalkDir(searchRoot, func(walkPath string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return nil
-		}
-		if walkPath == searchRoot {
-			return nil
-		}
-		if shouldSkipSearchEntry(d.Name(), d.IsDir()) {
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		rel, err := relDisplayPath(searchRoot, walkPath, d.IsDir())
-		if err != nil {
-			return nil
-		}
-		if rel == "" {
-			return nil
-		}
-		if relPrefix != "" {
-			rel = workspaceRelPath(relPrefix, strings.TrimSuffix(rel, "/"), d.IsDir())
+	err = walkTree(nil, searchRoot, relPrefix, walkOpts{includeDirs: true}, func(path, rel string, d os.DirEntry) error {
+		if d.IsDir() {
+			rel += "/"
 		}
 		lines = append(lines, rel)
 		if len(lines) >= exploreMaxEntries {
@@ -253,27 +219,7 @@ func (e *Executor) GlobFiles(pattern, subpath string, trackedOnly bool) (string,
 	}
 
 	var matches []string
-	err = filepath.WalkDir(searchRoot, func(walkPath string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return nil
-		}
-		if d.IsDir() {
-			if walkPath != searchRoot && shouldSkipSearchEntry(d.Name(), true) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		rel, err := filepath.Rel(searchRoot, walkPath)
-		if err != nil {
-			return nil
-		}
-		rel = filepath.ToSlash(rel)
-		if relPrefix != "" {
-			rel = filepath.ToSlash(filepath.Join(relPrefix, rel))
-		}
-		if !matchGlobPattern(pattern, rel) {
-			return nil
-		}
+	err = walkTree(nil, searchRoot, relPrefix, walkOpts{glob: pattern, includeHidden: true}, func(path, rel string, d os.DirEntry) error {
 		matches = append(matches, rel)
 		if len(matches) >= exploreMaxEntries {
 			return errExploreTruncated

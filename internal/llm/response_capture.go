@@ -35,18 +35,17 @@ func extraFieldShouldDisplay(key string) bool {
 
 func (a extraFieldAccums) addFromDelta(delta openai.ChatCompletionChunkChoiceDelta, onThinking func(string), fullReasoning *strings.Builder) {
 	emit := a.thinkingEmitter(onThinking, fullReasoning)
-	extraCount := 0
+	// Every non-standard field a provider emits is surfaced in
+	// delta.JSON.ExtraFields — including null and type-mismatched values
+	// (apijson records those as !Valid() with the raw JSON still available).
+	// Nulls are skipped by ingestPiece; type-mismatched values (e.g. a
+	// provider sending reasoning as a JSON object) are still decodable by
+	// decodeJSONFieldText. Re-parsing delta.RawJSON() as a fallback is
+	// therefore redundant — it was a full json.Unmarshal of every chunk on
+	// standard OpenAI streams, where ExtraFields is empty and the parse only
+	// rediscovered the known fields it was written to skip.
 	for key, field := range delta.JSON.ExtraFields {
-		if !field.Valid() {
-			continue
-		}
-		extraCount++
 		a.ingestPiece(key, field.Raw(), emit)
-	}
-	// llama.cpp exposes reasoning via ExtraFields; re-parsing RawJSON every
-	// chunk was doubling work and stalling the stream loop on large sessions.
-	if extraCount == 0 {
-		ingestRawDeltaObject(delta.RawJSON(), a, emit, nil)
 	}
 }
 
@@ -73,27 +72,6 @@ func (a extraFieldAccums) thinkingEmitter(onThinking func(string), fullReasoning
 		if onThinking != nil {
 			onThinking(piece)
 		}
-	}
-}
-
-func ingestRawDeltaObject(raw string, a extraFieldAccums, emit func(key, piece string), skipKeys map[string]struct{}) {
-	if raw == "" {
-		return
-	}
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
-		return
-	}
-	for key, val := range obj {
-		if key == "role" || key == "tool_calls" || key == "content" || key == "refusal" {
-			continue
-		}
-		if skipKeys != nil {
-			if _, skip := skipKeys[key]; skip {
-				continue
-			}
-		}
-		a.ingestPiece(key, string(val), emit)
 	}
 }
 

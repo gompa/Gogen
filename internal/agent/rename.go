@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -62,24 +61,10 @@ func (e *Executor) RenameSymbol(ctx context.Context, oldName, newName, subpath, 
 func (e *Executor) renameWithAST(ctx context.Context, searchRoot, relPrefix, glob, oldName, newName string, dryRun bool) ([]FileChange, error) {
 	var changes []FileChange
 
-	err := filepath.WalkDir(searchRoot, func(path string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil || d.IsDir() || shouldSkipSearchEntry(d.Name(), d.IsDir()) {
-			return nil
-		}
-
+	err := walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true}, func(path, rel string, d os.DirEntry) error {
 		if !treesitter.ReferenceSearchSupported(path) {
 			return nil
 		}
-
-		// Apply glob filter if specified
-		if glob != "" {
-			rel, _ := filepath.Rel(searchRoot, path)
-			rel = filepath.ToSlash(rel)
-			if !matchGlobPattern(glob, rel) {
-				return nil
-			}
-		}
-
 		content, err := os.ReadFile(path)
 		if err != nil {
 			return nil
@@ -112,13 +97,12 @@ func (e *Executor) renameWithAST(ctx context.Context, searchRoot, relPrefix, glo
 			}
 		}
 
-		rel, _ := filepath.Rel(searchRoot, path)
 		var linesChanged []int
 		for line := range linesChangedSet {
 			linesChanged = append(linesChanged, line)
 		}
 		changes = append(changes, FileChange{
-			Path:         filepath.ToSlash(filepath.Join(relPrefix, rel)),
+			Path:         rel,
 			LinesChanged: linesChanged,
 			Count:        len(refs),
 		})
@@ -136,24 +120,7 @@ func (e *Executor) renameWithText(ctx context.Context, searchRoot, relPrefix, gl
 
 	var changes []FileChange
 
-	err := filepath.WalkDir(searchRoot, func(path string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil || d.IsDir() || shouldSkipSearchEntry(d.Name(), d.IsDir()) {
-			return nil
-		}
-
-		if isBinaryFile(path) {
-			return nil
-		}
-
-		// Apply glob filter if specified
-		if glob != "" {
-			rel, _ := filepath.Rel(searchRoot, path)
-			rel = filepath.ToSlash(rel)
-			if !matchGlobPattern(glob, rel) {
-				return nil
-			}
-		}
-
+	err := walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true}, func(path, rel string, d os.DirEntry) error {
 		content, err := os.ReadFile(path)
 		if err != nil {
 			return nil
@@ -184,9 +151,8 @@ func (e *Executor) renameWithText(ctx context.Context, searchRoot, relPrefix, gl
 			}
 		}
 
-		rel, _ := filepath.Rel(searchRoot, path)
 		changes = append(changes, FileChange{
-			Path:         filepath.ToSlash(filepath.Join(relPrefix, rel)),
+			Path:         rel,
 			LinesChanged: linesChanged,
 			Count:        len(matches),
 		})

@@ -15,9 +15,14 @@ import (
 
 // clientForModel returns the openai.Client that should serve the currently
 // selected model.  When modelClient has been populated by a ListModels call
-// the lookup is cheap; otherwise it does a one-time discovery probe against
-// both endpoints to populate the cache.
-func (p *OpenAIProvider) clientForModel() *openai.Client {
+// the lookup is cheap; otherwise it does a one-time catalog fetch to
+// populate the cache.
+//
+// OpenCode note: the gateways do not implement GET /models/{model}, so a
+// per-model probe can never tell the Zen endpoint from the Go endpoint —
+// discovery must build routing from the full /models lists instead. Go
+// models take precedence over Zen models (see fetchModels).
+func (p *OpenAIProvider) clientForModel(ctx context.Context) *openai.Client {
 	p.modelsMu.RLock()
 	if p.modelClient != nil {
 		if c, ok := p.modelClient[p.model]; ok {
@@ -28,32 +33,32 @@ func (p *OpenAIProvider) clientForModel() *openai.Client {
 	model := p.model
 	p.modelsMu.RUnlock()
 
-	// Discovery: probe Zen first, then Go (deterministic order).
-	// Do not hold modelsMu across network I/O. Bound probes so a hung
-	// OpenCode endpoint cannot stall the first chat request indefinitely.
-	probeCtx, probeCancel := context.WithTimeout(context.Background(), modelsCatalogTimeout)
-	defer probeCancel()
-	var chosen *openai.Client
+	// Catalog-based discovery (OpenCode only): a bounded listModels fetch
+	// populates modelClient with the exact model → endpoint mapping. The
+	// modelsCache TTL and the modelsFetch single-flight make repeat misses
+	// cheap, and the failure backoff (modelsFetchFailedAt) stops a dead
+	// endpoint from being re-probed on every request. Do not hold modelsMu
+	// across network I/O; bound the fetch so a hung OpenCode endpoint cannot
+	// stall the first chat request indefinitely. The caller's context is
+	// threaded through so Ctrl+C aborts an in-flight catalog fetch instead of
+	// waiting out the timeout.
 	if p.zenClient != nil {
-		catalog := p.zenCatalogClient
-		if catalog == nil {
-			catalog = p.zenClient
+		if !p.catalogFetchOnBackoff() {
+			fetchCtx, cancel := context.WithTimeout(ctx, modelsCatalogTimeout)
+			_, _ = p.listModels(fetchCtx)
+			cancel()
 		}
-		_, err := catalog.Models.Get(probeCtx, model)
-		if err == nil {
-			chosen = p.zenClient
+		p.modelsMu.RLock()
+		c, ok := p.modelClient[model]
+		p.modelsMu.RUnlock()
+		if ok {
+			return c
 		}
+		// Model is not listed on either endpoint — fall through to the
+		// deterministic fallback (models.dev, then primary client).
 	}
-	if chosen == nil && p.goClient != nil {
-		catalog := p.goCatalogClient
-		if catalog == nil {
-			catalog = p.goClient
-		}
-		_, err := catalog.Models.Get(probeCtx, model)
-		if err == nil {
-			chosen = p.goClient
-		}
-	}
+
+	chosen := p.inferOpenCodeEndpoint(model)
 	if chosen == nil {
 		chosen = &p.client
 	}
@@ -62,7 +67,7 @@ func (p *OpenAIProvider) clientForModel() *openai.Client {
 	if p.modelClient == nil {
 		p.modelClient = make(map[string]*openai.Client)
 	}
-	// Another goroutine may have filled this in while we were probing.
+	// Another goroutine may have filled this in while we were discovering.
 	if c, ok := p.modelClient[model]; ok {
 		p.modelsMu.Unlock()
 		return c
@@ -70,6 +75,25 @@ func (p *OpenAIProvider) clientForModel() *openai.Client {
 	p.modelClient[model] = chosen
 	p.modelsMu.Unlock()
 	return chosen
+}
+
+// inferOpenCodeEndpoint picks the client that should serve model on OpenCode
+// without a catalog fetch, using the models.dev registry (in-memory/disk
+// cached; never blocks on the network). Go takes precedence: a model listed
+// on both the Go and Zen catalogs routes to the Go endpoint. Returns nil when
+// nothing can be determined (cold registry, model unknown, or the provider is
+// not OpenCode), in which case the caller falls back to the primary client.
+func (p *OpenAIProvider) inferOpenCodeEndpoint(model string) *openai.Client {
+	if p.modelInfo == nil || model == "" || p.goClient == nil || p.zenClient == nil {
+		return nil
+	}
+	if _, _, err := p.modelInfo.Resolve(openCodeGoBaseURL, model); err == nil {
+		return p.goClient
+	}
+	if _, _, err := p.modelInfo.Resolve(openCodeZenBaseURL, model); err == nil {
+		return p.zenClient
+	}
+	return nil
 }
 
 func toolsToOpenAI(tools []Tool, allowed map[string]struct{}) []openai.ChatCompletionToolParam {
@@ -248,7 +272,7 @@ func (p *OpenAIProvider) GenerateResponse(ctx context.Context, messages []Messag
 	}
 	p.applyChatCompletionExtras(ctx, &params)
 	p.applyThinkingLevel(ctx, &params)
-	resp, err := p.clientForModel().Chat.Completions.New(ctx, params)
+	resp, err := p.clientForModel(ctx).Chat.Completions.New(ctx, params)
 
 	if err != nil {
 		return Response{}, fmt.Errorf("openai api error: %w", err)
@@ -293,6 +317,7 @@ func (p *OpenAIProvider) GenerateResponse(ctx context.Context, messages []Messag
 		Refusal:   msg.Refusal,
 		ToolCalls: toolCalls,
 		Usage:     usageFromOpenAI(resp.Usage),
+		Model:     resp.Model,
 	}, nil
 }
 
@@ -316,7 +341,7 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 	}
 	p.applyChatCompletionExtras(ctx, &params)
 	p.applyThinkingLevel(ctx, &params)
-	stream := p.clientForModel().Chat.Completions.NewStreaming(ctx, params)
+	stream := p.clientForModel(ctx).Chat.Completions.NewStreaming(ctx, params)
 	defer stream.Close()
 
 	// stream.Next() can block on the response body even after ctx cancel if
@@ -358,21 +383,40 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 // handleStreamFallback is called when a streaming error occurs. It attempts a
 // non-streaming fallback to recover partial results.
 func (p *OpenAIProvider) handleStreamFallback(ctx context.Context, messages []Message, allowedTools map[string]struct{}, tools []Tool, h *StreamHandlers, streamErr error, acc *streamAccumulator) (*StreamResult, error) {
-	// h came from GenerateResponseStream, which ran ensureStreamCallbacks,
-	// so every callback field is non-nil here.
-	h.OnStreamEnd()
-	h.OnRecoverPartialStream()
+	// Deliberately NOT firing OnStreamEnd / OnRecoverPartialStream here: the
+	// agent loop owns those and fires them exactly once when it finalizes the
+	// round (finishStreamUI on the content path, the tool-call branch + the
+	// PartialStream check on the tool path). Firing them here too would
+	// double-deliver stream_end frames / streamRoundEndMsg on every stream
+	// failure; the error path that runs when the fallback also fails already
+	// finalizes the round itself. h came from GenerateResponseStream, which
+	// ran ensureStreamCallbacks, so the callbacks used below are non-nil.
 	resp, fbErr := p.GenerateResponse(ctx, messages, allowedTools, tools)
 	if fbErr != nil {
 		return nil, fmt.Errorf("stream error: %w (non-streaming fallback also failed: %v)", streamErr, fbErr)
 	}
-	if resp.Reasoning != "" {
-		h.OnThinkingToken(resp.Reasoning)
+	// Re-render only the suffix beyond what the failed stream already
+	// emitted, so the live bubble does not show the recovered text twice (a
+	// retry of the same request typically re-generates the same opening, and
+	// the client already rendered the partial stream). The StreamResult below
+	// still carries the complete recovery for persistence — only the live
+	// re-render is trimmed.
+	reasoning := trimRecoveredText(acc.fullReasoning.String(), resp.Reasoning)
+	content := trimRecoveredText(acc.fullContent.String(), resp.Content)
+	refusal := trimRecoveredText(acc.fullRefusal.String(), resp.Refusal)
+	if reasoning != "" {
+		h.OnThinkingToken(reasoning)
 	}
-	if resp.Content != "" {
-		h.OnToken(resp.Content)
-	} else if resp.Refusal != "" {
-		h.OnToken(resp.Refusal)
+	if content != "" {
+		h.OnToken(content)
+	} else if refusal != "" {
+		h.OnToken(refusal)
+	}
+	// The non-streaming fallback may omit the model field; the failed stream
+	// already reported one (router endpoints resolve aliases server-side).
+	model := resp.Model
+	if model == "" {
+		model = acc.model
 	}
 	return &StreamResult{
 		Content:       resp.Content,
@@ -381,5 +425,27 @@ func (p *OpenAIProvider) handleStreamFallback(ctx context.Context, messages []Me
 		ToolCalls:     resp.ToolCalls,
 		Usage:         resp.Usage,
 		PartialStream: len(acc.tcAccums) > 0 || acc.fullContent.Len() > 0 || acc.fullRefusal.Len() > 0 || acc.extras.textLen() > 0,
+		Model:         model,
 	}, nil
+}
+
+// trimRecoveredText drops the portion of a recovered response the client
+// already saw streamed. It trims only when the streamed text is an exact
+// byte prefix of the recovered text; a divergent re-generation is emitted in
+// full so two different answers are never spliced into one bubble. Byte-wise
+// comparison is safe: both strings reached this point via JSON decoding, so
+// they are valid UTF-8 and a byte prefix of one is also a rune-aligned
+// prefix.
+func trimRecoveredText(streamed, recovered string) string {
+	if streamed == "" || recovered == "" {
+		return recovered
+	}
+	n := len(streamed)
+	if n > len(recovered) {
+		n = len(recovered)
+	}
+	if recovered[:n] != streamed {
+		return recovered // no exact-prefix overlap: status quo
+	}
+	return recovered[n:]
 }

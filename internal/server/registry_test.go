@@ -398,3 +398,27 @@ func TestSessionRuntimeDetachAllClients(t *testing.T) {
 		t.Fatalf("clients after second detachAllClients = %d, want 0", rt.clientCount())
 	}
 }
+
+// TestFSMutatingToolsConsistency guards the server's fsMu wrapper set against
+// drift from the agent tool registry. fsMutatingTools must equal the
+// registry's MutatesFS flag set exactly: a mutating tool that isn't flagged
+// (or a flag that isn't wrapped) would bypass the workspace filesystem lock.
+func TestFSMutatingToolsConsistency(t *testing.T) {
+	want := make(map[string]bool)
+	for _, name := range agent.FSMutatingToolNames() {
+		want[name] = true
+	}
+	if len(fsMutatingTools) != len(want) {
+		t.Fatalf("fsMutatingTools has %d entries, registry flags %d: %v vs %v", len(fsMutatingTools), len(want), fsMutatingTools, want)
+	}
+	for name := range want {
+		if !fsMutatingTools[name] {
+			t.Errorf("fsMutatingTools missing registry-flagged tool %q", name)
+		}
+	}
+	for name := range fsMutatingTools {
+		if !want[name] {
+			t.Errorf("fsMutatingTools wraps tool %q that the registry does not flag MutatesFS", name)
+		}
+	}
+}

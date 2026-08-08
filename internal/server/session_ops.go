@@ -36,13 +36,9 @@ func (s *Server) runSessionCommand(ctx context.Context, ws *wsConn, pane **sessi
 		}
 		return agent.SessionCommandResult{Output: out, Sessions: list}, true, nil
 	case "resume":
-		if args == "del" {
-			return agent.SessionCommandResult{}, true, fmt.Errorf("usage: resume del <id>")
-		}
-		if strings.HasPrefix(args, "del ") {
-			delID := strings.TrimSpace(strings.TrimPrefix(args, "del"))
-			if delID == "" {
-				return agent.SessionCommandResult{}, true, fmt.Errorf("usage: resume del <id>")
+		if delID, ok, err := agent.ParseResumeDelArg(args); ok || err != nil {
+			if err != nil {
+				return agent.SessionCommandResult{}, true, err
 			}
 			return s.sessionDelete(ctx, ws, pane, delID)
 		}
@@ -58,22 +54,35 @@ func (s *Server) runSessionCommand(ctx context.Context, ws *wsConn, pane **sessi
 // This is what session_attach uses so the sidebar can open saved sessions as
 // panes. Returns an error when the session does not exist on disk either.
 func (s *Server) ensureSessionRuntime(id string) (*sessionRuntime, error) {
+	rt, err := s.loadOrCreateRuntime(id)
+	if err != nil {
+		return nil, err
+	}
+	// Attaching a session counts as activity even when it is already
+	// registered — the sidebar session list re-attaches on every focus. Move
+	// it to the front of the registration order so registry-cap eviction
+	// targets the least-recently-attached idle session, never the
+	// pane the client just opened, and messages without an explicit
+	// sessionId (an id-less pane's toolbar action, legacy clients) route
+	// to the session the user is actually on. Pre-fix, the early return
+	// skipped setDefault and the default stayed on the last session_new/
+	// resume/fork target — a stale default could cancel the WRONG pane's
+	// running turn via the cancel-then-lock handlers.
+	s.registry.setDefault(id)
+	return rt, nil
+}
+
+// loadOrCreateRuntime returns the live runtime for id, loading the session
+// from the store (via the workspace factory) when it is not currently
+// active. The load/register/dedupe-recheck sequence is shared by
+// ensureSessionRuntime, sessionResume, and createBootstrapSession so the
+// three cannot drift.
+func (s *Server) loadOrCreateRuntime(id string) (*sessionRuntime, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return nil, fmt.Errorf("session id is required")
 	}
 	if rt, ok := s.registry.get(id); ok {
-		// Attaching a session counts as activity even when it is already
-		// registered — the sidebar session list re-attaches on every focus. Move
-		// it to the front of the registration order so registry-cap eviction
-		// targets the least-recently-attached idle session, never the
-		// pane the client just opened, and messages without an explicit
-		// sessionId (an id-less pane's toolbar action, legacy clients) route
-		// to the session the user is actually on. Pre-fix, the early return
-		// skipped setDefault and the default stayed on the last session_new/
-		// resume/fork target — a stale default could cancel the WRONG pane's
-		// running turn via the cancel-then-lock handlers.
-		s.registry.setDefault(id)
 		return rt, nil
 	}
 	if s.ws.Store == nil {
@@ -97,10 +106,6 @@ func (s *Server) ensureSessionRuntime(id string) (*sessionRuntime, error) {
 	if registered, ok := s.registry.get(id); ok {
 		rt = registered
 	}
-	// Attaching a session counts as activity: move it to the front of the
-	// registration order so registry-cap eviction targets the oldest
-	// idle sessions, never the one the client just opened.
-	s.registry.setDefault(id)
 	return rt, nil
 }
 
@@ -206,23 +211,9 @@ func (s *Server) sessionResume(ctx context.Context, ws *wsConn, pane **sessionRu
 	if id == "" {
 		return agent.SessionCommandResult{}, true, fmt.Errorf("session id is required")
 	}
-	rt, ok := s.registry.get(id)
-	if !ok {
-		snap, err := s.ws.Store.LoadInWorkingDir(s.ws.GetWorkingDir(), id)
-		if err != nil {
-			return agent.SessionCommandResult{}, true, err
-		}
-		a := s.ws.NewSessionAgent(&snap, id)
-		rt = s.newSessionRuntimeFor(a)
-		s.registry.register(id, rt)
-		// Dedupe against a concurrent attach/resume of the same session
-		// register may have been a no-op, in which case the pane must
-		// point at the REGISTERED runtime, not the freshly built orphan
-		// (two agents for one id → last-writer-wins persistence; the orphan
-		// is invisible to delete/prune/shutdown).
-		if registered, ok := s.registry.get(id); ok {
-			rt = registered
-		}
+	rt, err := s.loadOrCreateRuntime(id)
+	if err != nil {
+		return agent.SessionCommandResult{}, true, err
 	}
 	s.registry.setDefault(id)
 	s.switchPane(ws, pane, rt)
@@ -409,17 +400,7 @@ func (s *Server) sessionDelete(ctx context.Context, ws *wsConn, pane **sessionRu
 func (s *Server) createBootstrapSession() *sessionRuntime {
 	if s.ws.Store != nil {
 		if latest, err := s.ws.Store.LatestID(s.ws.GetWorkingDir()); err == nil && latest != "" {
-			if snap, err := s.ws.Store.LoadInWorkingDir(s.ws.GetWorkingDir(), latest); err == nil {
-				a := s.ws.NewSessionAgent(&snap, latest)
-				rt := s.newSessionRuntimeFor(a)
-				s.registry.register(latest, rt)
-				// A concurrent connection may have bootstrapped the same
-				// session between our get and register — register dedupes
-				// re-read so the handshake never receives an
-				// unregistered orphan runtime.
-				if registered, ok := s.registry.get(latest); ok {
-					rt = registered
-				}
+			if rt, err := s.loadOrCreateRuntime(latest); err == nil {
 				s.registry.setDefault(latest)
 				return rt
 			}

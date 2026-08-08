@@ -86,6 +86,54 @@ func TestGlobFiles(t *testing.T) {
 	}
 }
 
+// TestGlobFilesHiddenFiles pins glob_files' discovery semantics: as the
+// name-based discovery tool it must match dotfiles (e.g. .env via "*.env"),
+// while hidden directories stay pruned (reach them via the path argument).
+func TestGlobFilesHiddenFiles(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("SECRET=1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, ".github", "workflows"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".github", "workflows", "ci.yml"), []byte("name: ci\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := NewExecutor(dir)
+
+	// Dotfiles are visible to the name-based discovery tool.
+	out, err := exec.GlobFiles("*.env", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, ".env") {
+		t.Fatalf("expected .env to match *.env, got %q", out)
+	}
+
+	// Hidden directories are still pruned: *.yml must not reach .github/.
+	out, err = exec.GlobFiles("*.yml", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, ".github") || strings.Contains(out, "ci.yml") {
+		t.Fatalf("hidden dir should be pruned, got %q", out)
+	}
+
+	// ...but passing the hidden dir as the path argument reaches inside it.
+	out, err = exec.GlobFiles("*.yml", ".github", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, ".github/workflows/ci.yml") {
+		t.Fatalf("expected path-scoped glob into hidden dir, got %q", out)
+	}
+}
+
 // TestFilterByTrackedSet verifies the tracked_only filter contract: only paths
 // present in the tracked set survive, and a tree with no tracked matches yields
 // an empty result rather than silently falling back to the unfiltered list.

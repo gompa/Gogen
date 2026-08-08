@@ -841,6 +841,11 @@
         }
         let currentStreamDiv = null;
         let currentStreamRaw = '';
+        // Last assistant bubble created by startStream in the current round.
+        // Fallback for model_used when currentStreamDiv is null (the round's
+        // stream already ended); reset at each round start so a round that
+        // never produced a bubble cannot stamp a previous turn's reply.
+        let lastStreamDiv = null;
         const STREAM_RENDER_INTERVAL = 32; // ms between renders (~2 frames at 60fps)
         let streamRafPending = false;
         let streamLastRender = 0;
@@ -1806,6 +1811,40 @@
             timeEl.title = formatExactTime(date);
             msgDiv.appendChild(timeEl);
         }
+        // === Reply-model attribution (Settings → Chat → "Show reply model") ===
+        // The provider-reported model is kept in dataset.model regardless of
+        // the preference so toggling the setting later can show chips on
+        // already-rendered bubbles without refetching history.
+        function replyModelPref() {
+            return (localStorage.getItem('gogen_show_reply_model') || 'off') === 'on';
+        }
+
+        // Adds or removes the model chip on one assistant message element.
+        function applyReplyModelChip(msgDiv) {
+            if (!msgDiv || !msgDiv.dataset) return;
+            const model = msgDiv.dataset.model || '';
+            const chip = msgDiv.querySelector('.msg-model');
+            if (!model || !replyModelPref()) {
+                if (chip) chip.remove();
+                return;
+            }
+            if (chip) return; // already shown
+            const newChip = document.createElement('span');
+            newChip.className = 'msg-model';
+            newChip.textContent = '· ' + model;
+            newChip.title = 'Replied with ' + model;
+            // Appended last: sits below the timestamp at the bubble's
+            // bottom-right, mirroring the .message-time footer.
+            msgDiv.appendChild(newChip);
+        }
+
+        // Syncs chips on every already-rendered assistant bubble after the
+        // preference changes (this tab or another via the storage event).
+        function applyReplyModelChips() {
+            for (const el of document.querySelectorAll('.message.assistant[data-model]')) {
+                applyReplyModelChip(el);
+            }
+        }
         // ==============================
 
         /** Send a fork request.
@@ -1999,7 +2038,7 @@
             return appendMessageAtTime(role, text, date || new Date(), histIdx, images);
         }
 
-        function appendMessageAtTime(role, text, date, histIdx, images) {
+        function appendMessageAtTime(role, text, date, histIdx, images, model) {
             removeEmptyState();
             const msgDiv = document.createElement('div');
             msgDiv.className = `message ${role}`;
@@ -2037,6 +2076,10 @@
             msgDiv.dataset.createdAt = date.toISOString();
             addTimestampToMsg(msgDiv, date);
             if (role === 'assistant') {
+                // Remember the provider-reported model so the settings toggle
+                // can show/hide the chip on already-rendered bubbles.
+                if (model) msgDiv.dataset.model = model;
+                applyReplyModelChip(msgDiv);
                 const forkBtn = document.createElement('button');
                 forkBtn.className = 'fork-btn';
                 forkBtn.textContent = '⑂';
@@ -2094,6 +2137,7 @@
             messagesDiv.appendChild(msgDiv);
             smartScroll();
             currentStreamDiv = msgDiv;
+            lastStreamDiv = msgDiv;
             currentStreamRaw = '';
             streamContentPos = 0;
         }
@@ -2884,7 +2928,7 @@
                     // Render refusal text through the normal assistant bubble
                     // when there is no content (OpenAI-style refusals).
                     const assistantText = h.content || h.refusal;
-                    if (assistantText) appendMessageAtTime('assistant', assistantText, msgDate(h.createdAt), h.index);
+                    if (assistantText) appendMessageAtTime('assistant', assistantText, msgDate(h.createdAt), h.index, undefined, h.model);
                     if (Array.isArray(h.toolCalls)) {
                         for (const tc of h.toolCalls) {
                             historyToolCallArgs[tc.id] = tc.args || {};
@@ -3821,6 +3865,7 @@
                     // tool state so reasoning shows again, matching TUI.
                     toolsStartedThisTurn = false;
                     streamingToolCards = {};
+                    lastStreamDiv = null; // new round: forget any prior bubble
                     finalizeThinking();
                     setInputProgress('thinking', 'Thinking\u2026');
                 } else if (data.type === 'waiting') {
@@ -3839,6 +3884,17 @@
                 } else if (data.type === 'stream_end') {
                     finalizeThinking();
                     endStream();
+                } else if (data.type === 'model_used') {
+                    // Stamp the last (still-live) assistant bubble with the
+                    // provider-reported model. The server sends this before
+                    // stream_end; history replay attributes older messages.
+                    if (data.model) {
+                        const bubble = currentStreamDiv || lastStreamDiv;
+                        if (bubble) {
+                            bubble.dataset.model = data.model;
+                            applyReplyModelChip(bubble);
+                        }
+                    }
                 } else if (data.type === 'tool_call_start') {
                     setTurnActive(true);
                     setInputProgress('tool', 'Running ' + (data.tool || 'tool') + '\u2026');
@@ -4284,7 +4340,8 @@
                                             h.content,
                                             h.createdAt ? new Date(h.createdAt) : new Date(),
                                             h.index,
-                                            h.images
+                                            h.images,
+                                            h.model
                                         );
                                     }
                                 }
@@ -5764,6 +5821,26 @@
             if (e.key === 'gogen_notifications') {
                 const val = e.newValue || 'off';
                 if (notificationsSelect.value !== val) notificationsSelect.value = val;
+            }
+        });
+
+        // === Show reply model (Settings → Chat): per-bubble model chip ===
+        const showReplyModelSelect = document.getElementById('show-reply-model');
+        const savedShowReplyModel = localStorage.getItem('gogen_show_reply_model') || 'off';
+        if (showReplyModelSelect) {
+            showReplyModelSelect.value = savedShowReplyModel;
+            showReplyModelSelect.addEventListener('change', () => {
+                localStorage.setItem('gogen_show_reply_model', showReplyModelSelect.value);
+                applyReplyModelChips();
+            });
+        }
+        window.addEventListener('storage', (e) => {
+            if (e.key === 'gogen_show_reply_model') {
+                const val = e.newValue || 'off';
+                if (showReplyModelSelect && showReplyModelSelect.value !== val) {
+                    showReplyModelSelect.value = val;
+                }
+                applyReplyModelChips();
             }
         });
 

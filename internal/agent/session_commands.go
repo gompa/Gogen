@@ -91,15 +91,31 @@ func (a *Agent) ResetSessionState() {
 	}
 }
 
+// ParseResumeDelArg splits a "/resume del <id>" argument into the id to
+// delete. Returns (id, true, nil) for a valid "del <id>" form, (id, false,
+// nil) for any other argument (the caller treats it as a plain resume
+// target), and ("", false, err) for the malformed "del" / "del " forms. The
+// error is the canonical "usage: resume del <id>" so the agent (TUI) and the
+// web server surface identical messages.
+func ParseResumeDelArg(args string) (string, bool, error) {
+	if args == "del" {
+		return "", false, fmt.Errorf("usage: resume del <id>")
+	}
+	if !strings.HasPrefix(args, "del ") {
+		return "", false, nil
+	}
+	delID := strings.TrimSpace(strings.TrimPrefix(args, "del"))
+	if delID == "" {
+		return "", false, fmt.Errorf("usage: resume del <id>")
+	}
+	return delID, true, nil
+}
+
 // handleResumeArg routes "del", "latest", or session-ID sub-commands.
 func (a *Agent) handleResumeArg(ctx context.Context, args, newSessionID string) (SessionCommandResult, bool, error) {
-	if args == "del" {
-		return SessionCommandResult{}, true, fmt.Errorf("usage: resume del <id>")
-	}
-	if strings.HasPrefix(args, "del ") {
-		delID := strings.TrimSpace(strings.TrimPrefix(args, "del"))
-		if delID == "" {
-			return SessionCommandResult{}, true, fmt.Errorf("usage: resume del <id>")
+	if delID, ok, err := ParseResumeDelArg(args); ok || err != nil {
+		if err != nil {
+			return SessionCommandResult{}, true, err
 		}
 		out, action, err := a.deleteSessionByID(ctx, delID, newSessionID)
 		if err != nil {
@@ -162,8 +178,7 @@ func (a *Agent) resumeSessionByID(ctx context.Context, id string) (string, error
 	// validation / context-limit refresh runs in the background (same as
 	// process startup) and must not block the resume WS response.
 	model := snap.Model
-	a.RestoreSessionLocal(snap, id)
-	a.SessionID = id
+	a.RestoreSession(snap, id)
 	label := llm.SessionLabel(snap.Messages)
 	var out string
 	if label != "" {

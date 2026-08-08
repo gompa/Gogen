@@ -21,6 +21,7 @@ import (
 
 	"gogen/internal/agent"
 	"gogen/internal/config"
+	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
 	sesspkg "gogen/internal/session"
 	"gogen/internal/streamutil"
@@ -47,14 +48,14 @@ type staticAsset struct {
 // are immutable once stored, so readers can use the returned pointer freely
 // after the mutex is released.
 type staticAssetCache struct {
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	entries map[string]*staticAsset
 }
 
 // peek returns the cached asset for name without reading or compressing anything.
 func (c *staticAssetCache) peek(name string) (*staticAsset, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	a, ok := c.entries[name]
 	return a, ok
 }
@@ -333,11 +334,15 @@ type HistoryToolCall struct {
 }
 
 type HistoryEntry struct {
-	Role       string            `json:"role"`
-	Content    string            `json:"content,omitempty"`
-	Images     []llm.ImageInput  `json:"images,omitempty"`
-	Reasoning  string            `json:"reasoning,omitempty"`
-	Refusal    string            `json:"refusal,omitempty"`
+	Role      string           `json:"role"`
+	Content   string           `json:"content,omitempty"`
+	Images    []llm.ImageInput `json:"images,omitempty"`
+	Reasoning string           `json:"reasoning,omitempty"`
+	Refusal   string           `json:"refusal,omitempty"`
+	// Model is the model ID that produced the reply, as reported by the
+	// provider (may differ from the requested alias on router endpoints
+	// such as OpenCode Zen). Empty when not reported.
+	Model      string            `json:"model,omitempty"`
 	ToolCalls  []HistoryToolCall `json:"toolCalls,omitempty"`
 	ToolCallID string            `json:"toolCallId,omitempty"`
 	Index      int               `json:"index"`               // index in agent.Messages (0 is valid; do not omitempty)
@@ -648,6 +653,7 @@ func historyEntries(msgs []llm.Message) []HistoryEntry {
 				Content:   m.Content,
 				Reasoning: m.Reasoning,
 				Refusal:   m.Refusal,
+				Model:     m.Model,
 				Index:     idx,
 				CreatedAt: createdAt,
 			}
@@ -1933,6 +1939,19 @@ func (rt *sessionRuntime) startTurn(owner *wsConn, content string, images []llm.
 				rt.liveRoundEnd()
 				write(WSMessage{Type: "stream_end"})
 			},
+			OnReplyModel: func(model string) {
+				// Fired by the agent before each round's OnStreamEnd, so
+				// this frame must arrive before stream_end for the client
+				// to stamp the still-live assistant bubble (intermediate
+				// content+tool rounds included). Flush pending content
+				// tokens first so the client has created the bubble by the
+				// time model_used is processed.
+				if model == "" {
+					return
+				}
+				tokens.Flush()
+				write(WSMessage{Type: "model_used", Model: model})
+			},
 			OnToolCallStart: func(index int, id, name string) {
 				tokens.Flush()
 				rt.liveToolStart(index, id, name)
@@ -2012,7 +2031,9 @@ func (rt *sessionRuntime) startTurn(owner *wsConn, content string, images []llm.
 				const maxResult = 128 * 1024
 				origLen := len(result)
 				if origLen > maxResult {
-					result = result[:maxResult] + fmt.Sprintf("\n… truncated (%d bytes total)", origLen)
+					// Rune-safe cut: slicing at maxResult could split a UTF-8
+					// rune mid-sequence and render a broken character.
+					result = contextmgr.TruncateRuneSafe(result, maxResult) + fmt.Sprintf("\n… truncated (%d bytes total)", origLen)
 					truncated = true
 				}
 				write(WSMessage{
@@ -2058,7 +2079,8 @@ func (rt *sessionRuntime) startTurn(owner *wsConn, content string, images []llm.
 			write(WSMessage{Type: "response", Content: fmt.Sprintf("Warning: failed to save session: %v", persistErr)})
 		}
 		tokens.Flush()
-		write(WSMessage{Type: "stream_end"})
+		// No trailing stream_end here: every round already wrote one via the
+		// OnStreamEnd handler above, and turn_end marks the turn boundary.
 		if ctxMsg.Type != "" {
 			write(ctxMsg)
 		}

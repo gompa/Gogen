@@ -26,17 +26,35 @@ type Agent struct {
 	Executor *Executor
 
 	// Conversation state
-	Context     *contextmgr.Manager
-	Messages    []llm.Message
-	PinManager  *PinManager
+	Context *contextmgr.Manager
+	// Messages is owned by the turn goroutine for writes (append/compact/
+	// restore); lock-free readers (ContextStats, SnapshotMessages) read it
+	// under statsMu. See the statsMu comment below.
+	Messages []llm.Message
+	// PinManager is internally synchronized (methods take their own mutex);
+	// the reference itself is set at construction and never reassigned.
+	PinManager *PinManager
+	// TodoManager is internally synchronized (Snapshot/AddTodo/... take the
+	// manager's own mutex); the reference is set at construction and never
+	// reassigned. The web fork path reads it without the session turnMu on
+	// purpose (snapshot is lock-free w.r.t. turnMu — see sessionFork).
 	TodoManager *TodoManager
 
 	// Session persistence
-	SessionStore   SessionPersister
-	SessionID      string
+	SessionStore SessionPersister
+	// SessionID is guarded by the session turnMu: TUI runs on a single owner
+	// goroutine, and web lifecycle ops (new/resume/fork/delete) write it
+	// under the pane's turnMu or at construction (main.go startup restore,
+	// NewSessionAgent). Do not read it for a live session without holding
+	// turnMu.
+	SessionID string
+	// SessionLabel is guarded by statsMu (setSessionLabel /
+	// SessionLabelSnapshot): web probes read it without turnMu while the
+	// turn goroutine may derive it from the first user message.
 	SessionLabel   string
 	SessionOneshot bool // true if this session was created by a single-prompt (-p) invocation
-	UsageAccum     UsageAccumulator
+	// UsageAccum is guarded by statsMu (clearTurnUsage / snapshot reads).
+	UsageAccum UsageAccumulator
 
 	// bgMu guards bgJobs: shell commands started with execute_command
 	// background=true. Jobs outlive the turn that started them (they are
@@ -999,8 +1017,25 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 		a.UsageAccum.Add(result.Usage)
 		a.statsMu.Unlock()
 
+		// Attribute the round to the provider-reported model BEFORE the
+		// round is finalized: OnStreamEnd (inside finishStreamUI below)
+		// writes stream_end, which tells the client the bubble is done. The
+		// model must reach the client first so the live bubble can be
+		// stamped while it is still current. Fired for every round (not
+		// just the final one) so intermediate content+tool rounds get their
+		// chip live instead of only via history replay.
+		if h.OnReplyModel != nil {
+			h.OnReplyModel(result.Model)
+		}
+
 		if len(result.ToolCalls) == 0 {
 			finishStreamUI(h)
+			// Deliberately no OnRecoverPartialStream here, unlike the tool
+			// branch below: the callback exists to reset UI state after a
+			// stream error mid-tool-call, and no consumer is registered for
+			// content recovery (the TUI wires a no-op, the web server wires
+			// nothing). Round-end events stay single-fired — firing it here
+			// too would double-deliver on every recovered content turn.
 			// A result with no content, no refusal, and no tool calls is a
 			// truncated turn (e.g. finish_reason="length" after consuming the
 			// output budget on reasoning). Persisting it would leave a ghost
@@ -1016,6 +1051,7 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 				Reasoning: result.Reasoning,
 				Refusal:   result.Refusal,
 				CreatedAt: time.Now().Truncate(time.Millisecond),
+				Model:     result.Model,
 			})
 			a.FlushSession()
 			if result.Content != "" {
@@ -1045,6 +1081,7 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 			Refusal:   result.Refusal,
 			ToolCalls: result.ToolCalls,
 			CreatedAt: time.Now().Truncate(time.Millisecond),
+			Model:     result.Model,
 		})
 
 		// Read-only tool batches (every call parallel-safe and none shadowed

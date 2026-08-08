@@ -25,31 +25,11 @@ func (e *Executor) RepoOverview() (string, error) {
 	var rootFiles []string
 	total := 0
 
-	err = filepath.WalkDir(searchRoot, func(walkPath string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return nil
-		}
-		if walkPath == searchRoot {
-			return nil
-		}
-		name := d.Name()
-		if d.IsDir() {
-			if shouldSkipSearchEntry(name, true) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if shouldSkipSearchEntry(name, false) {
-			return nil
-		}
-		rel, err := filepath.Rel(searchRoot, walkPath)
-		if err != nil {
-			return nil
-		}
-		top := firstPathSegment(filepath.ToSlash(rel))
+	err = walkTree(nil, searchRoot, "", walkOpts{}, func(path, rel string, d os.DirEntry) error {
+		top := firstPathSegment(rel)
 		if top == "" {
 			// Root-level file
-			rootFiles = append(rootFiles, name)
+			rootFiles = append(rootFiles, d.Name())
 		} else {
 			dirCounts[top]++
 		}

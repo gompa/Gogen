@@ -7,6 +7,16 @@ import (
 	"github.com/openai/openai-go"
 )
 
+// streamDrainLimit bounds how many post-finish chunks the accumulator
+// consumes while waiting for the final usage chunk. Usage is captured as
+// soon as it arrives (processChunk ingests chunk.Usage before the
+// streamDone check), so a provider that sends many no-op chunks between
+// finish_reason and the usage chunk still gets its usage recorded. The bound
+// only protects against a provider that keeps the SSE stream open forever
+// without ever sending usage; once usage arrives the drain stops
+// immediately.
+const streamDrainLimit = 64
+
 // ensureStreamCallbacks fills nil callback fields in h with no-ops,
 // and returns a non-nil h. Safe for callers that always need an
 // OnToken or OnThinkingToken handler.
@@ -36,6 +46,7 @@ type streamAccumulator struct {
 	fullRefusal      strings.Builder
 	fullReasoning    strings.Builder
 	lastFinishReason string
+	model            string // model ID reported by the provider (from the first chunk that carries it)
 	streamUsage      *Usage
 	tcAccums         []tcAccum
 	tcIndexMap       map[int]int
@@ -55,9 +66,20 @@ func (a *streamAccumulator) processChunk(chunk openai.ChatCompletionChunk, onTok
 	if u := usageFromOpenAI(chunk.Usage); u != nil {
 		a.streamUsage = u
 	}
+	// Router/proxy endpoints (e.g. OpenCode Zen) resolve model aliases
+	// server-side and report the actual model on every chunk; keep the
+	// first non-empty value.
+	if a.model == "" && chunk.Model != "" {
+		a.model = chunk.Model
+	}
 	if a.streamDone {
+		if a.streamUsage != nil {
+			// The usage chunk is the only post-finish data that matters;
+			// nothing left to wait for.
+			return true
+		}
 		a.drainAfterDone++
-		return a.drainAfterDone >= 8
+		return a.drainAfterDone >= streamDrainLimit
 	}
 	if len(chunk.Choices) == 0 {
 		return false
@@ -181,5 +203,6 @@ func (a *streamAccumulator) buildResult() (*StreamResult, error) {
 		Refusal:   a.fullRefusal.String(),
 		ToolCalls: toolCalls,
 		Usage:     a.streamUsage,
+		Model:     a.model,
 	}, nil
 }

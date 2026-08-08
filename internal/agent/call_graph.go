@@ -144,7 +144,7 @@ func isCallSite(line, symbol string) bool {
 }
 
 func (e *Executor) callGraphWithAST(ctx context.Context, searchRoot, relPrefix, glob, symbol string) (*CallGraphResult, error) {
-	result := &CallGraphResult{Symbol: symbol}
+	result := &CallGraphResult{Symbol: symbol, Method: "ast"}
 
 	err := e.walkSymbolReferences(ctx, searchRoot, relPrefix, glob, symbol,
 		func(filePath string, refs []treesitter.Reference, content []byte) error {
@@ -191,7 +191,7 @@ func (e *Executor) callGraphWithAST(ctx context.Context, searchRoot, relPrefix, 
 }
 
 func (e *Executor) callGraphWithText(ctx context.Context, searchRoot, relPrefix, glob, symbol string) (*CallGraphResult, error) {
-	result := &CallGraphResult{Symbol: symbol}
+	result := &CallGraphResult{Symbol: symbol, Method: "text"}
 
 	// Search for call sites of the symbol → these are the Callers.
 	callPattern := `\b` + regexp.QuoteMeta(symbol) + `\s*\(`

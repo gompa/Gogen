@@ -14,59 +14,20 @@ import (
 //go:embed queries/*.scm
 var queryFS embed.FS
 
-var (
-	queryOnce   sync.Once
-	queryByLang map[string]string
-	queryCache  sync.Map // lang -> *tree_sitter.Query
-)
-
-func initQueries() {
-	queryByLang = map[string]string{
-		"go":         "queries/go.scm",
-		"python":     "queries/python.scm",
-		"javascript": "queries/javascript.scm",
-		"typescript": "queries/typescript.scm",
-		"tsx":        "queries/tsx.scm",
-		"rust":       "queries/rust.scm",
-		"java":       "queries/java.scm",
-		"c":          "queries/c.scm",
-		"cpp":        "queries/cpp.scm",
-		"csharp":     "queries/csharp.scm",
-		"php":        "queries/php.scm",
-		"ruby":       "queries/ruby.scm",
-		"bash":       "queries/bash.scm",
-		"lua":        "queries/lua.scm",
-		"hcl":        "queries/hcl.scm",
-		"kotlin":     "queries/kotlin.scm",
-		"scala":      "queries/scala.scm",
-		"sql":        "queries/sql.scm",
-		"zig":        "queries/zig.scm",
-	}
-}
-
+// queryForLang returns the compiled definition query for langName, sourced
+// from the registry's defsQuery embed path and compiled through the shared
+// query cache (compileQuery).
 func queryForLang(langName string) (*tree_sitter.Query, error) {
-	queryOnce.Do(initQueries)
-	if v, ok := queryCache.Load(langName); ok {
-		return v.(*tree_sitter.Query), nil
-	}
-	path, ok := queryByLang[langName]
-	if !ok {
+	registryOnce.Do(initRegistry)
+	spec, ok := langSpecs[langName]
+	if !ok || spec.defsQuery == "" {
 		return nil, ErrUnsupported
 	}
-	src, err := queryFS.ReadFile(path)
+	src, err := queryFS.ReadFile(spec.defsQuery)
 	if err != nil {
-		return nil, fmt.Errorf("read query %s: %w", path, err)
+		return nil, fmt.Errorf("read query %s: %w", spec.defsQuery, err)
 	}
-	lang := languageFor(langName)
-	if lang == nil {
-		return nil, ErrUnsupported
-	}
-	q, qerr := tree_sitter.NewQuery(lang, string(src))
-	if qerr != nil {
-		return nil, fmt.Errorf("compile query for %s: %w", langName, qerr)
-	}
-	queryCache.Store(langName, q)
-	return q, nil
+	return compileQuery(langName, "defs", string(src))
 }
 
 const maxDefinitions = 300

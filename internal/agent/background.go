@@ -3,14 +3,14 @@ package agent
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"os/exec"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"gogen/internal/randhex"
 )
 
 // BackgroundJob is one shell command running outside a turn. The turn that
@@ -44,11 +44,7 @@ type BackgroundJob struct {
 
 // newBackgroundJobID returns a random hex job id.
 func newBackgroundJobID() string {
-	var b [8]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return fmt.Sprintf("job-%d", time.Now().UnixNano())
-	}
-	return "job-" + hex.EncodeToString(b[:])
+	return randhex.ID(8, "job-")
 }
 
 // StartBackgroundCommand validates the command against the same command
