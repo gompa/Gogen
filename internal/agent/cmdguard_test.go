@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"gogen/internal/ioutil"
 )
 
 func TestCommandGuardBlocksDangerous(t *testing.T) {
@@ -48,7 +50,7 @@ func TestPatchFileRejectsMismatch(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/main.go"
 	content := "package main\n\nfunc main() {\n}\n"
-	if err := writeFileAtomic(path, []byte(content), 0o644); err != nil {
+	if err := ioutil.WriteFileAtomic(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
 

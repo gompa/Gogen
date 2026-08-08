@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	"gogen/internal/ioutil"
 )
 
 type patchFile struct {
@@ -151,7 +153,7 @@ func (e *Executor) PatchFile(ctx context.Context, diff string, dryRun, fuzzy boo
 			snapshots[plan.secure] = data
 		}
 
-		if err := writeFileAtomic(plan.secure, []byte(plan.updated), defaultFilePerm); err != nil {
+		if err := ioutil.WriteFileAtomic(plan.secure, []byte(plan.updated), defaultFilePerm); err != nil {
 			rollbackPatches(snapshots, created)
 			return "", err
 		}
@@ -205,7 +207,7 @@ func rollbackPatches(snapshots map[string][]byte, created []string) {
 		}
 	}
 	for path, data := range snapshots {
-		if err := writeFileAtomic(path, data, defaultFilePerm); err != nil {
+		if err := ioutil.WriteFileAtomic(path, data, defaultFilePerm); err != nil {
 			log.Printf("patch rollback: restore %s: %v", path, err)
 		}
 	}

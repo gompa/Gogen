@@ -121,11 +121,9 @@ func NewStore(enabled bool) *Store {
 // SetGlobalDir configures the store to use a fixed directory for session
 // storage instead of the per-project .gogen/sessions/. Used in global mode.
 func (s *Store) SetGlobalDir(dir string) {
-	if s != nil {
-		s.mu.Lock()
-		s.globalDir = dir
-		s.mu.Unlock()
-	}
+	s.mu.Lock()
+	s.globalDir = dir
+	s.mu.Unlock()
 }
 
 // SetAutoPrune toggles the internal prune that Save performs every few
@@ -134,9 +132,6 @@ func (s *Store) SetGlobalDir(dir string) {
 // and becomes the sole pruner via Prune, so a Save from one active session
 // can never delete another live session's file. Default is enabled.
 func (s *Store) SetAutoPrune(enabled bool) {
-	if s == nil {
-		return
-	}
 	s.mu.Lock()
 	s.autoPrune = enabled
 	s.mu.Unlock()
@@ -204,7 +199,7 @@ func (s *Store) deltaPath(workingDir, id string) string {
 
 // Save writes a session snapshot.
 func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
-	if s == nil || !s.enabled || id == "" {
+	if !s.enabled || id == "" {
 		return nil
 	}
 	s.mu.Lock()
@@ -297,7 +292,7 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 	if err != nil {
 		return err
 	}
-	if err := writeFileAtomic(path, data, 0o600); err != nil {
+	if err := ioutil.WriteFileAtomicNoSync(path, data, 0o600); err != nil {
 		return err
 	}
 	// The full snapshot now supersedes the delta. Remove it only after the
@@ -323,7 +318,7 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 // TouchSession updates only the session's timestamp metadata without
 // rewriting the full message payload. Uses file mtime plus the index file.
 func (s *Store) TouchSession(workingDir, id string) error {
-	if s == nil || !s.enabled || id == "" {
+	if !s.enabled || id == "" {
 		return nil
 	}
 	s.mu.Lock()
@@ -347,7 +342,7 @@ func (s *Store) TouchSession(workingDir, id string) error {
 // updated field (index-loss recovery). Returns the zero time when the session
 // has no persisted state in that directory (a never-saved /new pane).
 func (s *Store) UpdatedAt(workingDir, id string) time.Time {
-	if s == nil || !s.enabled || id == "" || workingDir == "" {
+	if !s.enabled || id == "" || workingDir == "" {
 		return time.Time{}
 	}
 	s.mu.Lock()
@@ -384,7 +379,7 @@ func (s *Store) UpdatedAt(workingDir, id string) time.Time {
 // relocation flush would otherwise stamp Updated=now on a session the user
 // did not touch. No-op when the session has no index entry in workingDir.
 func (s *Store) SetUpdatedAt(workingDir, id string, updated time.Time) error {
-	if s == nil || !s.enabled || id == "" {
+	if !s.enabled || id == "" {
 		return nil
 	}
 	s.mu.Lock()
@@ -397,7 +392,7 @@ func (s *Store) SetUpdatedAt(workingDir, id string, updated time.Time) error {
 
 // LoadInWorkingDir loads a session from a working directory.
 func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, error) {
-	if s == nil || !s.enabled {
+	if !s.enabled {
 		return agent.SessionSnapshot{}, fmt.Errorf("session persistence disabled")
 	}
 	s.mu.Lock()
@@ -526,7 +521,7 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 // BaseCount (totalMsgCount minus the delta length) records the message count
 // of the snapshot the delta extends, letting loads detect stale deltas.
 func (s *Store) AppendMessages(id string, snap agent.SessionSnapshot, totalMsgCount int) error {
-	if s == nil || !s.enabled || id == "" {
+	if !s.enabled || id == "" {
 		return nil
 	}
 	s.mu.Lock()
@@ -555,7 +550,7 @@ func (s *Store) AppendMessages(id string, snap agent.SessionSnapshot, totalMsgCo
 	if err != nil {
 		return err
 	}
-	if err := writeFileAtomic(path, data, 0o600); err != nil {
+	if err := ioutil.WriteFileAtomicNoSync(path, data, 0o600); err != nil {
 		return err
 	}
 
@@ -660,7 +655,7 @@ func (s *Store) clearDeltaFile(workingDir, id string) error {
 // full-file scan for legacy directories. Results are cached briefly in memory
 // to avoid repeated disk I/O on reconnects.
 func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
-	if s == nil || !s.enabled {
+	if !s.enabled {
 		return nil, nil
 	}
 	// The cache is keyed by the EFFECTIVE store directory, not the working
@@ -857,7 +852,7 @@ func (s *Store) LatestID(workingDir string) (string, error) {
 
 // Delete removes a saved session file.
 func (s *Store) Delete(workingDir, id string) error {
-	if s == nil || !s.enabled {
+	if !s.enabled {
 		return fmt.Errorf("session persistence disabled")
 	}
 	s.mu.Lock()
@@ -952,11 +947,6 @@ func ensureUnderSessionsDir(workingDir, path string, globalDirs ...string) error
 	return nil
 }
 
-// writeFileAtomic is a convenience wrapper around ioutil.WriteFileAtomicNoSync.
-func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
-	return ioutil.WriteFileAtomicNoSync(path, data, perm)
-}
-
 // indexFile returns the path to the metadata index for a working directory.
 func (s *Store) indexFile(workingDir string) string {
 	return filepath.Join(s.dir(workingDir), "index.json")
@@ -990,7 +980,7 @@ func (s *Store) loadRawLabel(workingDir, id string) string {
 	if len(f.Messages) == 0 {
 		return ""
 	}
-	return llm.FirstUserMessage(f.Messages)
+	return llm.SessionLabel(f.Messages)
 }
 
 // writeIndex writes the session metadata index atomically.
@@ -1009,7 +999,7 @@ func (s *Store) writeIndex(workingDir string, idx *sessionIndex) error {
 	if err := ensureUnderSessionsDir(workingDir, indexPath, s.globalDir); err != nil {
 		return err
 	}
-	return writeFileAtomic(indexPath, data, 0o600)
+	return ioutil.WriteFileAtomicNoSync(indexPath, data, 0o600)
 }
 
 // updateIndex adds or updates an entry in the session metadata index.
@@ -1018,7 +1008,7 @@ func (s *Store) writeIndex(workingDir string, idx *sessionIndex) error {
 // index instead of re-reading the session file. Existing entries keep their
 // Created when created is zero (defensive: Save always passes non-zero).
 func (s *Store) updateIndex(workingDir, id string, created, updated time.Time, msgCount int, label string, oneshot bool) {
-	if s == nil || !s.enabled {
+	if !s.enabled {
 		return
 	}
 	idx := s.readIndex(workingDir)
@@ -1050,7 +1040,7 @@ func (s *Store) updateIndex(workingDir, id string, created, updated time.Time, m
 
 // touchIndex updates only the timestamp for a session in the index.
 func (s *Store) touchIndex(workingDir, id string, updated time.Time) error {
-	if s == nil || !s.enabled {
+	if !s.enabled {
 		return nil
 	}
 	idx := s.readIndex(workingDir)
@@ -1083,7 +1073,7 @@ func (s *Store) touchIndex(workingDir, id string, updated time.Time) error {
 // missing from the index are skipped — the list fallback re-scans the
 // directory on the next miss.
 func (s *Store) updateIndexCount(workingDir, id string, updated time.Time, msgCount int) {
-	if s == nil || !s.enabled {
+	if !s.enabled {
 		return
 	}
 	idx := s.readIndex(workingDir)
@@ -1110,7 +1100,7 @@ func (s *Store) updateIndexCount(workingDir, id string, updated time.Time, msgCo
 
 // removeFromIndex deletes an entry from the session metadata index.
 func (s *Store) removeFromIndex(workingDir, id string) {
-	if s == nil || !s.enabled {
+	if !s.enabled {
 		return
 	}
 	idx := s.readIndex(workingDir)
@@ -1133,7 +1123,7 @@ func (s *Store) removeFromIndex(workingDir, id string) {
 // removeFromIndexBatch removes multiple entries from the session metadata index
 // in a single pass, rewriting the index file only once.
 func (s *Store) removeFromIndexBatch(workingDir string, ids []string) {
-	if s == nil || !s.enabled || len(ids) == 0 {
+	if !s.enabled || len(ids) == 0 {
 		return
 	}
 	idx := s.readIndex(workingDir)
@@ -1201,7 +1191,7 @@ func NewID() string {
 // mtime, to be consistent with LatestID. Deletions are batched so the index
 // is rewritten only once. Serialized by the store mutex.
 func (s *Store) Prune(workingDir string, keepIDs ...string) {
-	if s == nil || !s.enabled {
+	if !s.enabled {
 		return
 	}
 	s.mu.Lock()
@@ -1211,7 +1201,7 @@ func (s *Store) Prune(workingDir string, keepIDs ...string) {
 
 // prune is the lock-free implementation of Prune. Callers must hold s.mu.
 func (s *Store) prune(workingDir string, keepIDs ...string) {
-	if s == nil || !s.enabled {
+	if !s.enabled {
 		return
 	}
 	keep := make(map[string]struct{}, len(keepIDs))

@@ -172,11 +172,11 @@ func main() {
 	provider.SetPreserveReasoningMode(cfg.PreserveReasoning)
 
 	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{
-		ContextLimit:         cfg.ContextLimit,
-		CompactThreshold:     cfg.CompactThreshold,
-		KeepRecentMessages:   cfg.KeepRecentMessages,
-		MaxToolResultBytes:   cfg.MaxToolResultBytes,
-		CompactReserveTokens: cfg.CompactReserveTokens,
+		ContextLimit:              cfg.ContextLimit,
+		CompactThreshold:          cfg.CompactThreshold,
+		CompactKeepRecentMessages: cfg.CompactKeepRecentMessages,
+		MaxToolResultBytes:        cfg.MaxToolResultBytes,
+		CompactReserveTokens:      cfg.CompactReserveTokens,
 	})
 
 	exec := agent.NewExecutorWithGuard(cfg.WorkingDir, agent.NewCommandGuard(cfg.CommandSafetyMode, agent.ParseAllowlist(cfg.CommandAllowlist)))
@@ -187,7 +187,7 @@ func main() {
 	}
 	if isGlobalMode {
 		// In global mode, relax the path boundary to the user's home directory.
-		exec.PathBoundary = projectfile.GlobalPathBoundary()
+		exec.PathBoundary = projectfile.HomeDir()
 	}
 	a := agent.NewAgent(provider, exec, ctxMgr)
 	// Background jobs (execute_command background=true) are owned by the

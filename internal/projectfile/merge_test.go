@@ -84,27 +84,27 @@ func TestMergeFloatOptPreservesExplicitZero(t *testing.T) {
 // the runtime can honor them (auto-compaction off, no tail kept, no cap, no
 // reserve), while absent keys fall back to defaults.
 func TestMergePreservesExplicitZeros(t *testing.T) {
-	for _, env := range []string{"GOGEN_COMPACT_THRESHOLD", "GOGEN_KEEP_RECENT_MESSAGES", "GOGEN_MAX_TOOL_RESULT_BYTES", "GOGEN_COMPACT_RESERVE_TOKENS"} {
+	for _, env := range []string{"GOGEN_COMPACT_THRESHOLD", "GOGEN_COMPACT_KEEP_RECENT_MESSAGES", "GOGEN_MAX_TOOL_RESULT_BYTES", "GOGEN_COMPACT_RESERVE_TOKENS"} {
 		os.Unsetenv(env)
 	}
 	zero := 0
 	zeroF := 0.0
 	pf := &ProjectFile{Config: FileConfig{
-		CompactThreshold:     &zeroF,
-		KeepRecentMessages:   &zero,
-		MaxToolResultBytes:   &zero,
-		CompactReserveTokens: &zero,
+		CompactThreshold:          &zeroF,
+		CompactKeepRecentMessages: &zero,
+		MaxToolResultBytes:        &zero,
+		CompactReserveTokens:      &zero,
 	}}
 	cfg := Merge(pf, FlagOverrides{})
-	if cfg.CompactThreshold != 0 || cfg.KeepRecentMessages != 0 || cfg.MaxToolResultBytes != 0 || cfg.CompactReserveTokens != 0 {
+	if cfg.CompactThreshold != 0 || cfg.CompactKeepRecentMessages != 0 || cfg.MaxToolResultBytes != 0 || cfg.CompactReserveTokens != 0 {
 		t.Fatalf("explicit zeros not preserved through Merge: threshold=%v keep=%d max=%d reserve=%d",
-			cfg.CompactThreshold, cfg.KeepRecentMessages, cfg.MaxToolResultBytes, cfg.CompactReserveTokens)
+			cfg.CompactThreshold, cfg.CompactKeepRecentMessages, cfg.MaxToolResultBytes, cfg.CompactReserveTokens)
 	}
 
 	pfAbsent := &ProjectFile{Config: FileConfig{}}
 	cfgAbsent := Merge(pfAbsent, FlagOverrides{})
-	if cfgAbsent.CompactThreshold != 0.85 || cfgAbsent.KeepRecentMessages != 12 || cfgAbsent.MaxToolResultBytes != 262144 || cfgAbsent.CompactReserveTokens != 4000 {
+	if cfgAbsent.CompactThreshold != 0.85 || cfgAbsent.CompactKeepRecentMessages != 12 || cfgAbsent.MaxToolResultBytes != 262144 || cfgAbsent.CompactReserveTokens != 4000 {
 		t.Fatalf("absent keys should fall back to defaults: threshold=%v keep=%d max=%d reserve=%d",
-			cfgAbsent.CompactThreshold, cfgAbsent.KeepRecentMessages, cfgAbsent.MaxToolResultBytes, cfgAbsent.CompactReserveTokens)
+			cfgAbsent.CompactThreshold, cfgAbsent.CompactKeepRecentMessages, cfgAbsent.MaxToolResultBytes, cfgAbsent.CompactReserveTokens)
 	}
 }

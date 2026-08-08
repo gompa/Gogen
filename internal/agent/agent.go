@@ -342,7 +342,7 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 	// the snapshot cannot race a concurrent in-place stabilization, and it
 	// is safe to tokenize and serialize after releasing the lock.
 	a.statsMu.RLock()
-	msgs := cloneMessages(a.Messages)
+	msgs := cloneMessagesShallow(a.Messages)
 	label := a.SessionLabel
 	countsEpoch := a.countsEpoch
 	tokenCounts := append([]int(nil), a.tokenCounts...)
@@ -539,11 +539,11 @@ func (a *Agent) truncateMessages(n int) {
 
 // SnapshotMessages returns a copy of the current conversation messages that
 // is safe to read after the lock is released: unstabilized ToolCalls are
-// deep-copied, stabilized ones are shared (see cloneMessages). Used by the
+// deep-copied, stabilized ones are shared (see cloneMessagesShallow). Used by the
 // web server for history snapshots without holding the turn lock.
 func (a *Agent) SnapshotMessages() []llm.Message {
 	a.statsMu.RLock()
-	msgs := cloneMessages(a.Messages)
+	msgs := cloneMessagesShallow(a.Messages)
 	a.statsMu.RUnlock()
 	return msgs
 }
@@ -556,7 +556,19 @@ func (a *Agent) MessageCount() int {
 	return n
 }
 
-// cloneMessages copies a message slice so the result can be read after
+// HistoryEpoch returns a counter bumped whenever the conversation is replaced
+// wholesale (compaction, session restore, rollback, fork). History snapshots
+// stamp it so clients can tell a snapshot that predates a reshape (e.g. a
+// compaction that reset message indexes) from one that is merely older than
+// the transcript they already rendered. Thread-safe.
+func (a *Agent) HistoryEpoch() uint64 {
+	a.statsMu.RLock()
+	e := a.countsEpoch
+	a.statsMu.RUnlock()
+	return e
+}
+
+// cloneMessagesShallow copies a message slice so the result can be read after
 // statsMu is released without racing the turn goroutine's in-place
 // stabilization (stabilizeToolArgs rewrites ToolCall ArgsStr under statsMu).
 // Only unstabilized messages need their ToolCalls deep-copied: stabilization
@@ -567,7 +579,7 @@ func (a *Agent) MessageCount() int {
 // has ToolCalls that are never mutated again, so sharing their slice is as
 // safe as copying it and avoids O(total tool calls) allocation on every
 // ContextStats probe / persist snapshot. Callers must hold statsMu (R or W).
-func cloneMessages(msgs []llm.Message) []llm.Message {
+func cloneMessagesShallow(msgs []llm.Message) []llm.Message {
 	out := append([]llm.Message(nil), msgs...)
 	for i := range out {
 		if out[i].ArgsStabilized {
@@ -652,7 +664,7 @@ func (a *Agent) shouldCompactUsingCounts() bool {
 	if !a.Context.AutoCompactEnabled() {
 		return false
 	}
-	if len(msgs) <= a.Context.KeepRecentMessages()+1 {
+	if len(msgs) <= a.Context.CompactKeepRecentMessages()+1 {
 		return false
 	}
 	total := 0
@@ -872,7 +884,7 @@ func (a *Agent) CompactHistory(ctx context.Context) error {
 	if a.Context == nil {
 		return fmt.Errorf("context management is not configured")
 	}
-	if len(a.Messages) <= a.Context.Settings.KeepRecentMessages+1 {
+	if len(a.Messages) <= a.Context.Settings.CompactKeepRecentMessages+1 {
 		return fmt.Errorf("not enough history to compact (%d messages)", len(a.Messages))
 	}
 	compacted, newPins, err := a.Context.CompactPinned(ctx, a.systemPromptPrefix(), a.Messages, pinnedSet(a.PinManager))

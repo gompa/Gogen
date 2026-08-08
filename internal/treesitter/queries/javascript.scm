@@ -1,5 +1,4 @@
 (function_declaration name: (identifier) @name.function)
 (class_declaration name: (identifier) @name.class)
 (method_definition name: (property_identifier) @name.method)
-(method_definition name: (identifier) @name.method)
 (lexical_declaration (variable_declarator name: (identifier) @name.function value: [(arrow_function) (function_expression)]))

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"gogen/internal/ioutil"
 )
 
 const (
@@ -169,7 +171,7 @@ func (m *TodoManager) saveLegacy() error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(path, data, defaultFilePerm)
+	return ioutil.WriteFileAtomic(path, data, defaultFilePerm)
 }
 
 // AddTodo adds a new todo item.

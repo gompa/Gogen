@@ -81,7 +81,7 @@ func (a *Agent) ContextStats(ctx context.Context) TurnContext {
 	// readers do not hold turnMu). The message clone is deep so
 	// tokenization cannot race in-place stabilization on the live array.
 	a.statsMu.RLock()
-	msgs := cloneMessages(a.Messages)
+	msgs := cloneMessagesShallow(a.Messages)
 	counts := append([]int(nil), a.tokenCounts...)
 	countsEpoch := a.countsEpoch
 	lastUsage := a.lastTurnUsage

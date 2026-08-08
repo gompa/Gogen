@@ -5,8 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"gogen/internal/ioutil"
 )
 
 // defaultFilePerm is the default file permission used when creating or
@@ -79,11 +77,6 @@ func isWithinRoot(resolvedPath, resolvedRoot string) bool {
 		return false
 	}
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
-}
-
-// writeFileAtomic is a convenience wrapper around ioutil.WriteFileAtomic.
-func writeFileAtomic(path string, content []byte, perm os.FileMode) error {
-	return ioutil.WriteFileAtomic(path, content, perm)
 }
 
 func (e *Executor) SecurePath(path string) (string, error) {

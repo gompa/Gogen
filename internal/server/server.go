@@ -406,6 +406,22 @@ type WSMessage struct {
 	MessageIndex int            `json:"messageIndex,omitempty"`
 	Sessions     []SessionEntry `json:"sessions,omitempty"`
 	History      []HistoryEntry `json:"history,omitempty"`
+	// ContentPos / ThinkingPos / ArgsPos are cumulative character offsets
+	// within the current round's content / thinking / tool-args streams,
+	// stamped on stream / thinking_token / tool_call_delta frames. A client
+	// uses them to merge an attach rewind with live content exactly — never
+	// duplicating a chunk already inside the snapshot nor dropping one
+	// beyond it.
+	ContentPos  int `json:"contentPos,omitempty"`
+	ThinkingPos int `json:"thinkingPos,omitempty"`
+	ArgsPos     int `json:"argsPos,omitempty"`
+	// HistoryEpoch is a per-session counter bumped whenever the conversation
+	// is replaced wholesale (compaction/restore/rollback/fork), letting
+	// clients distinguish a stale snapshot from a reshaped history.
+	HistoryEpoch uint64 `json:"historyEpoch,omitempty"`
+	// Rewind carries the in-flight turn's partial output on a mid-turn
+	// attach/resume history payload (nil when nothing has streamed yet).
+	Rewind *liveRewindState `json:"rewind,omitempty"`
 	// Filesystem / git editor APIs
 	Path        string              `json:"path,omitempty"`
 	Pattern     string              `json:"pattern,omitempty"`
@@ -761,7 +777,15 @@ func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, rt *
 	// Always emit history on a clear (even empty) so clients can reliably
 	// run post-session follow-ups (e.g. resend).
 	if (clearChat && err == nil) || len(history) > 0 {
-		_ = ws.writeJSON(WSMessage{Type: "history", History: historyEntries(history), SessionID: cfg.SessionID})
+		_ = ws.writeJSON(WSMessage{
+			Type:         "history",
+			History:      historyEntries(history),
+			HistoryEpoch: rt.agent.HistoryEpoch(),
+			// Same as attach: a resumed session with a running turn carries
+			// its in-flight reply here.
+			Rewind:    rt.liveRewind(),
+			SessionID: cfg.SessionID,
+		})
 	}
 	// Context stats (tokenization) can take seconds on a large uncached
 	// session; compute them off the read loop like every other handler so a
@@ -1200,7 +1224,16 @@ func (s *Server) attachSession(ws *wsConn, r *http.Request, rt *sessionRuntime) 
 		// transcript is consistent with the live stream and paints at once.
 		msgs := rt.agent.SnapshotMessages()
 		if len(msgs) > 0 {
-			_ = ws.writeJSON(WSMessage{Type: "history", History: historyEntries(msgs), SessionID: rt.agent.SessionID})
+			_ = ws.writeJSON(WSMessage{
+				Type:         "history",
+				History:      historyEntries(msgs),
+				HistoryEpoch: rt.agent.HistoryEpoch(),
+				// The in-flight turn's partial output, so a mid-turn attach
+				// shows the current reply instead of "Resuming…" with no
+				// context until the turn ends.
+				Rewind:    rt.liveRewind(),
+				SessionID: rt.agent.SessionID,
+			})
 		}
 		// Config echo: no turnMu — every field is internally synchronized
 		// (agentConfigMsgBasic), so a mid-turn attach gets the session's
@@ -1838,9 +1871,9 @@ func (rt *sessionRuntime) startTurn(owner *wsConn, content string, images []llm.
 		}
 		tokens := streamutil.NewTokenBatcher(func(think bool, text string) {
 			if think {
-				write(WSMessage{Type: "thinking_token", Content: text})
+				write(WSMessage{Type: "thinking_token", Content: text, ThinkingPos: rt.liveThinkingSegmentEnd(text)})
 			} else {
-				write(WSMessage{Type: "stream", Content: text})
+				write(WSMessage{Type: "stream", Content: text, ContentPos: rt.liveContentSegmentEnd(text)})
 			}
 		}, wsTokenFlushInterval)
 
@@ -1859,6 +1892,8 @@ func (rt *sessionRuntime) startTurn(owner *wsConn, content string, images []llm.
 				write(WSMessage{Type: "compacting"})
 			},
 			OnStart: func() {
+				// Reset the live-turn buffer for the new turn.
+				rt.liveTurnBegin()
 				// Tell the client the server-side index of the user message
 				// that StreamProcessInput just appended (for edit/resend).
 				// Index goes in Content because WSMessage.Index has omitempty
@@ -1874,6 +1909,7 @@ func (rt *sessionRuntime) startTurn(owner *wsConn, content string, images []llm.
 				write(contextMsg(ctx, rt.agent))
 			},
 			OnRoundStart: func() {
+				rt.liveRoundBegin()
 				write(WSMessage{Type: "thinking"})
 				if ctx.Err() != nil {
 					return
@@ -1884,14 +1920,22 @@ func (rt *sessionRuntime) startTurn(owner *wsConn, content string, images []llm.
 				write(WSMessage{Type: "waiting"})
 			},
 			OnStreamActivity: func() {},
-			OnThinkingToken:  tokens.ThinkToken,
-			OnToken:          tokens.StreamToken,
+			OnThinkingToken: func(token string) {
+				rt.liveAppendThinking(token)
+				tokens.ThinkToken(token)
+			},
+			OnToken: func(token string) {
+				rt.liveAppendContent(token)
+				tokens.StreamToken(token)
+			},
 			OnStreamEnd: func() {
 				tokens.Flush()
+				rt.liveRoundEnd()
 				write(WSMessage{Type: "stream_end"})
 			},
 			OnToolCallStart: func(index int, id, name string) {
 				tokens.Flush()
+				rt.liveToolStart(index, id, name)
 				write(WSMessage{
 					Type:       "tool_call_start",
 					Tool:       name,
@@ -1901,12 +1945,14 @@ func (rt *sessionRuntime) startTurn(owner *wsConn, content string, images []llm.
 			},
 			OnToolCallArgsDelta: func(index int, id, name, argsDelta string) {
 				tokens.Flush()
+				argsPos := rt.liveToolArgsAppend(index, argsDelta)
 				write(WSMessage{
 					Type:       "tool_call_delta",
 					Tool:       name,
 					ToolCallID: id,
 					Index:      index,
 					ArgsDelta:  argsDelta,
+					ArgsPos:    argsPos,
 				})
 			},
 			OnToolCall: func(tc llm.ToolCall) {

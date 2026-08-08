@@ -60,21 +60,21 @@ Output only the recap text — no preamble, no markdown headings, no dialogue.`
 
 // Settings controls context window management.
 type Settings struct {
-	ContextLimit         int
-	CompactThreshold     float64
-	KeepRecentMessages   int
-	MaxToolResultBytes   int
-	CompactReserveTokens int
+	ContextLimit              int
+	CompactThreshold          float64
+	CompactKeepRecentMessages int
+	MaxToolResultBytes        int
+	CompactReserveTokens      int
 }
 
 // DefaultSettings returns defaults; ContextLimit 0 means resolve from the provider at runtime.
 func DefaultSettings() Settings {
 	return Settings{
-		ContextLimit:         0,
-		CompactThreshold:     config.DefaultCompactThreshold,
-		KeepRecentMessages:   config.DefaultKeepRecentMessages,
-		MaxToolResultBytes:   config.DefaultMaxToolResultBytes,
-		CompactReserveTokens: config.DefaultCompactReserveTokens,
+		ContextLimit:              0,
+		CompactThreshold:          config.DefaultCompactThreshold,
+		CompactKeepRecentMessages: config.DefaultCompactKeepRecentMessages,
+		MaxToolResultBytes:        config.DefaultMaxToolResultBytes,
+		CompactReserveTokens:      config.DefaultCompactReserveTokens,
 	}
 }
 
@@ -90,15 +90,15 @@ type Manager struct {
 
 func NewManager(provider llm.LLMProvider, settings Settings) *Manager {
 	// 0 is meaningful for these fields (see Settings docs): compact_threshold
-	// 0 disables auto-compaction, keep_recent_messages 0 keeps no recent
+	// 0 disables auto-compaction, compact_keep_recent_messages 0 keeps no recent
 	// messages on compaction, max_tool_result_bytes 0 removes the truncation
 	// cap, compact_reserve_tokens 0 reserves no tokens. Only negative values
 	// are invalid and fall back to defaults.
 	if settings.CompactThreshold < 0 || settings.CompactThreshold > 1 {
 		settings.CompactThreshold = DefaultSettings().CompactThreshold
 	}
-	if settings.KeepRecentMessages < 0 {
-		settings.KeepRecentMessages = DefaultSettings().KeepRecentMessages
+	if settings.CompactKeepRecentMessages < 0 {
+		settings.CompactKeepRecentMessages = DefaultSettings().CompactKeepRecentMessages
 	}
 	if settings.MaxToolResultBytes < 0 {
 		settings.MaxToolResultBytes = DefaultSettings().MaxToolResultBytes
@@ -195,12 +195,12 @@ func (m *Manager) CompactBudget() int {
 	return m.compactBudgetLocked()
 }
 
-// KeepRecentMessages returns how many recent messages are preserved during
-// compaction.
-func (m *Manager) KeepRecentMessages() int {
+// CompactKeepRecentMessages returns how many recent messages are preserved
+// verbatim during compaction.
+func (m *Manager) CompactKeepRecentMessages() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.Settings.KeepRecentMessages
+	return m.Settings.CompactKeepRecentMessages
 }
 
 // AutoCompactEnabled reports whether automatic compaction is enabled
@@ -356,7 +356,7 @@ func (m *Manager) compactBudgetLocked() int {
 // EstimateTokens computes fresh each call — safe to call every turn.
 func (m *Manager) ShouldCompact(messages []llm.Message) bool {
 	m.mu.RLock()
-	keep := m.Settings.KeepRecentMessages
+	keep := m.Settings.CompactKeepRecentMessages
 	budget := m.compactBudgetLocked()
 	m.mu.RUnlock()
 	if budget <= 0 {
@@ -395,7 +395,7 @@ func (m *Manager) EnsureToolResultsCapped(messages []llm.Message) bool {
 }
 
 // Compact replaces the middle of canonical history with an LLM-generated summary.
-// It preserves the first user message and the most recent KeepRecentMessages entries.
+// It preserves the first user message and the most recent CompactKeepRecentMessages entries.
 func (m *Manager) Compact(ctx context.Context, messages []llm.Message) ([]llm.Message, error) {
 	out, _, err := m.CompactPinned(ctx, nil, messages, nil)
 	return out, err
@@ -409,7 +409,7 @@ func (m *Manager) Compact(ctx context.Context, messages []llm.Message) ([]llm.Me
 // and the provider's prompt cache covers the bulk of the request.
 func (m *Manager) CompactPinned(ctx context.Context, viewPrefix, messages []llm.Message, pinned map[int]struct{}) ([]llm.Message, map[int]struct{}, error) {
 	m.mu.RLock()
-	keep := m.Settings.KeepRecentMessages
+	keep := m.Settings.CompactKeepRecentMessages
 	m.mu.RUnlock()
 	if len(messages) <= keep+1 {
 		return messages, copyIntSet(pinned), nil

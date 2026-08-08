@@ -15,9 +15,9 @@ const (
 	// cache-friendly prefix (see contextmgr.summarizeMiddle), so compacting
 	// later is cheap and the headroom is covered by the reserve.
 	DefaultCompactThreshold = 0.85
-	// DefaultKeepRecentMessages is the number of recent messages preserved
-	// during compaction.
-	DefaultKeepRecentMessages = 12
+	// DefaultCompactKeepRecentMessages is the number of recent messages
+	// preserved verbatim during compaction.
+	DefaultCompactKeepRecentMessages = 12
 	// DefaultMaxToolResultBytes is the cap for tool output before truncation
 	// (256 KB — matches web_fetch's default body cap).
 	DefaultMaxToolResultBytes = 262144
@@ -53,11 +53,11 @@ type Config struct {
 	OpenAIURL   string
 	WorkingDir  string
 
-	ContextLimit         int
-	CompactThreshold     float64
-	KeepRecentMessages   int
-	MaxToolResultBytes   int
-	CompactReserveTokens int
+	ContextLimit              int
+	CompactThreshold          float64
+	CompactKeepRecentMessages int
+	MaxToolResultBytes        int
+	CompactReserveTokens      int
 
 	CommandSafetyMode string // blocklist, allowlist, off
 	CommandAllowlist  string // comma-separated when allowlist mode
@@ -116,42 +116,42 @@ type Config struct {
 // Defaults returns built-in default configuration values.
 func Defaults() Config {
 	return Config{
-		OpenAIKey:            "",
-		OpenAIModel:          "",
-		OpenAIURL:            "",
-		WorkingDir:           ".",
-		ContextLimit:         0,
-		CompactThreshold:     DefaultCompactThreshold,
-		KeepRecentMessages:   DefaultKeepRecentMessages,
-		MaxToolResultBytes:   DefaultMaxToolResultBytes,
-		CompactReserveTokens: DefaultCompactReserveTokens,
-		CommandSafetyMode:    "blocklist",
-		CommandAllowlist:     "",
-		DeleteApproval:       "required",
-		TreeSitter:           "on",
-		TreeSitterLangs:      "",
-		CLIVerbose:           false,
-		DebugLog:             "",
-		DebugSession:         "",
-		MCP:                  "off",
-		DebugCompareMessages: false,
-		WebBind:              "127.0.0.1:8081",
-		WebAllowedOrigins:    "",
-		WebTLSCertFile:       "",
-		WebTLSKeyFile:        "",
-		SessionMaxCount:      DefaultSessionMaxCount,
-		SessionMaxAgeDays:    DefaultSessionMaxAgeDays,
-		WebMaxActiveSessions: DefaultWebMaxActiveSessions,
-		WebApprovalHoldSecs:  0,
-		WebFetch:             "on",
-		WebSearch:            "on",
-		WebSearchBackend:     "",
-		WebSearchAPIKey:      "",
-		WebAllowedDomains:    "",
-		WebFetchMode:         "https",
-		CommandSandbox:       "off",
-		CommandTimeoutSecs:   DefaultCommandTimeoutSecs,
-		PreserveReasoning:    "auto",
+		OpenAIKey:                 "",
+		OpenAIModel:               "",
+		OpenAIURL:                 "",
+		WorkingDir:                ".",
+		ContextLimit:              0,
+		CompactThreshold:          DefaultCompactThreshold,
+		CompactKeepRecentMessages: DefaultCompactKeepRecentMessages,
+		MaxToolResultBytes:        DefaultMaxToolResultBytes,
+		CompactReserveTokens:      DefaultCompactReserveTokens,
+		CommandSafetyMode:         "blocklist",
+		CommandAllowlist:          "",
+		DeleteApproval:            "required",
+		TreeSitter:                "on",
+		TreeSitterLangs:           "",
+		CLIVerbose:                false,
+		DebugLog:                  "",
+		DebugSession:              "",
+		MCP:                       "off",
+		DebugCompareMessages:      false,
+		WebBind:                   "127.0.0.1:8081",
+		WebAllowedOrigins:         "",
+		WebTLSCertFile:            "",
+		WebTLSKeyFile:             "",
+		SessionMaxCount:           DefaultSessionMaxCount,
+		SessionMaxAgeDays:         DefaultSessionMaxAgeDays,
+		WebMaxActiveSessions:      DefaultWebMaxActiveSessions,
+		WebApprovalHoldSecs:       0,
+		WebFetch:                  "on",
+		WebSearch:                 "on",
+		WebSearchBackend:          "",
+		WebSearchAPIKey:           "",
+		WebAllowedDomains:         "",
+		WebFetchMode:              "https",
+		CommandSandbox:            "off",
+		CommandTimeoutSecs:        DefaultCommandTimeoutSecs,
+		PreserveReasoning:         "auto",
 	}
 }
 

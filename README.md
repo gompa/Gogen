@@ -148,7 +148,7 @@ setting:
 | Key | `0` means |
 |-----|-----------|
 | `compact_threshold` | auto-compaction disabled (never compact automatically; manual `/compact` still works) |
-| `keep_recent_messages` | keep no recent messages when a compaction runs (only the first user message survives, rest summarized) |
+| `compact_keep_recent_messages` | keep nothing recent: only the first user message survives compaction, everything after it is summarized |
 | `max_tool_result_bytes` | no truncation cap on tool output |
 | `compact_reserve_tokens` | reserve no tokens for new messages after compaction |
 
@@ -202,7 +202,7 @@ Files without config (plain markdown) are treated as guidelines-only. The old co
 |----------|---------|-------------|
 | `GOGEN_CONTEXT_LIMIT` | `0` | Manual token limit override (`0` = resolve from model) |
 | `GOGEN_COMPACT_THRESHOLD` | `0.85` | Fraction of context limit that triggers auto-compaction (the UI warns earlier, at 75%) |
-| `GOGEN_KEEP_RECENT_MESSAGES` | `12` | Recent messages preserved during compaction |
+| `GOGEN_COMPACT_KEEP_RECENT_MESSAGES` | `12` | Most recent messages kept verbatim when a compaction runs (older middle history is summarized; `0` keeps only the first user message) |
 | `GOGEN_MAX_TOOL_RESULT_BYTES` | `262144` | Max bytes for tool output before truncation (matches web_fetch's 256 KB limit) |
 | `GOGEN_COMPACT_RESERVE_TOKENS` | `4000` | Tokens reserved for new messages after compaction |
 

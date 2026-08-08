@@ -148,7 +148,7 @@ func TestSaveConfigPreservesExplicitZeros(t *testing.T) {
 	cfgPath := filepath.Join(dir, "zero.conf")
 	cfg := Merge(nil, FlagOverrides{})
 	cfg.CompactThreshold = 0
-	cfg.KeepRecentMessages = 0
+	cfg.CompactKeepRecentMessages = 0
 	cfg.MaxToolResultBytes = 0
 	cfg.CompactReserveTokens = 0
 	if err := SaveConfig(cfgPath, "", cfg, "", WriteOptions{}); err != nil {
@@ -161,7 +161,7 @@ func TestSaveConfigPreservesExplicitZeros(t *testing.T) {
 	text := string(data)
 	for _, key := range []string{
 		"compact_threshold: 0",
-		"keep_recent_messages: 0",
+		"compact_keep_recent_messages: 0",
 		"max_tool_result_bytes: 0",
 		"compact_reserve_tokens: 0",
 	} {
@@ -250,12 +250,12 @@ func TestCommandAllowlistListRejected(t *testing.T) {
 // Explicit zeros for the pointer-typed fields must survive parsing so the
 // merge layer can distinguish them from absent keys.
 func TestParseZeroValuedFieldsPreserved(t *testing.T) {
-	pf, err := ParseContent("GOGEN.md", "---\nkeep_recent_messages: 0\ncompact_threshold: 0\n---\n")
+	pf, err := ParseContent("GOGEN.md", "---\ncompact_keep_recent_messages: 0\ncompact_threshold: 0\n---\n")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pf.Config.KeepRecentMessages == nil || *pf.Config.KeepRecentMessages != 0 {
-		t.Fatalf("keep_recent_messages should be explicit 0, got %v", pf.Config.KeepRecentMessages)
+	if pf.Config.CompactKeepRecentMessages == nil || *pf.Config.CompactKeepRecentMessages != 0 {
+		t.Fatalf("compact_keep_recent_messages should be explicit 0, got %v", pf.Config.CompactKeepRecentMessages)
 	}
 	if pf.Config.CompactThreshold == nil || *pf.Config.CompactThreshold != 0 {
 		t.Fatalf("compact_threshold should be explicit 0, got %v", pf.Config.CompactThreshold)
@@ -267,8 +267,8 @@ func TestParseAbsentPointerFieldsNil(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pf.Config.KeepRecentMessages != nil {
-		t.Fatalf("absent keep_recent_messages should be nil, got %d", *pf.Config.KeepRecentMessages)
+	if pf.Config.CompactKeepRecentMessages != nil {
+		t.Fatalf("absent compact_keep_recent_messages should be nil, got %d", *pf.Config.CompactKeepRecentMessages)
 	}
 	if pf.Config.CompactThreshold != nil {
 		t.Fatalf("absent compact_threshold should be nil, got %f", *pf.Config.CompactThreshold)

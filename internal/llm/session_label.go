@@ -5,13 +5,10 @@ import (
 )
 
 // SessionLabel returns a normalized preview of the first user message.
-// Truncation is left to the client (CSS text-overflow: ellipsis) so the
-// full text is available when the sidebar is wide enough.
-func SessionLabel(messages []Message) string { return FirstUserMessage(messages) }
-
-// FirstUserMessage returns the content of the first user message, untruncated,
-// with whitespace normalized (newlines → spaces, runs collapsed).
-func FirstUserMessage(messages []Message) string {
+// Whitespace is normalized (newlines → spaces, runs collapsed). Truncation is
+// left to the client (CSS text-overflow: ellipsis) so the full text is
+// available when the sidebar is wide enough.
+func SessionLabel(messages []Message) string {
 	for _, m := range messages {
 		if m.Role != "user" {
 			continue

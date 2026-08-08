@@ -10,7 +10,7 @@ import (
 
 func TestCompactPinnedPreservesPinnedMessage(t *testing.T) {
 	provider := &stubProvider{summary: "middle summary"}
-	m := NewManager(provider, Settings{KeepRecentMessages: 2, ContextLimit: 100000, CompactThreshold: 0.01})
+	m := NewManager(provider, Settings{CompactKeepRecentMessages: 2, ContextLimit: 100000, CompactThreshold: 0.01})
 	m.minMiddleTokens = 0 // tiny messages: skip the minimum-middle guard
 	msgs := []llm.Message{
 		{Role: "user", Content: "first"},

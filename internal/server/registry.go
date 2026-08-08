@@ -2,9 +2,12 @@ package server
 
 import (
 	"context"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf16"
 
 	"gogen/internal/agent"
 	"gogen/internal/config"
@@ -24,6 +27,11 @@ type sessionRuntime struct {
 	// stream owns the in-flight stream cancel handles for this session
 	// (moved from per-connection).
 	stream *wsConnStream
+
+	// liveMu guards live, the current round's in-flight LLM output buffer
+	// (see liveTurnState). Leaf lock: never held while acquiring turnMu.
+	liveMu sync.Mutex
+	live   liveTurnState
 
 	// approvals are pending delete-approval requests, keyed by approvalID
 	// (per-session, so two sessions' approvals cannot collide, E5). Each
@@ -101,6 +109,220 @@ func newSessionRuntimeWithHold(a *agent.Agent, hold time.Duration) *sessionRunti
 	rt := newSessionRuntime(a)
 	rt.approvalHold = hold
 	return rt
+}
+
+// liveTurnState accumulates the current round's in-flight LLM output so an
+// attach/resume mid-turn can include it in the history snapshot: the
+// assistant reply is only appended to a.Messages when a round completes, so
+// without this buffer a switch to a running session would show "Resuming…"
+// with no context until the turn ends. Content and thinking are accumulated
+// verbatim (the same strings the client receives) along with the streaming
+// tool calls. Every access goes through sessionRuntime.liveMu: the turn
+// goroutine appends, attach goroutines snapshot, and the token-batcher flush
+// reads the sent-position markers.
+//
+// The *Sent counters track how much of each stream has been flushed to the
+// wire (the batcher lags the buffer by up to one flush interval), so stream
+// frames can carry the exact end offset of their chunk. Combined with the
+// buffer lengths in the rewind payload, a client can merge an attach rewind
+// with live content exactly — never duplicating or dropping a character.
+type liveTurnState struct {
+	thinking      strings.Builder
+	thinkingSent  int
+	thinkingUnits int
+	content       strings.Builder
+	contentSent   int
+	contentUnits  int
+	toolNames     map[int]string
+	toolIDs       map[int]string
+	toolArgs      map[int]*strings.Builder
+	toolArgsUnits map[int]int
+}
+
+// liveToolCallState is one in-progress tool call carried in a rewind payload.
+type liveToolCallState struct {
+	Index   int    `json:"index"`
+	ID      string `json:"id,omitempty"`
+	Name    string `json:"name"`
+	Args    string `json:"args,omitempty"`
+	ArgsPos int    `json:"argsPos,omitempty"`
+}
+
+// liveRewindState is the in-flight turn's partial output, attached to the
+// history payload of a mid-turn attach/resume. The client renders it through
+// the normal stream machinery and continues the live stream after it, using
+// the positions to trim the boundary exactly.
+type liveRewindState struct {
+	Content     string              `json:"content,omitempty"`
+	ContentPos  int                 `json:"contentPos,omitempty"`
+	Thinking    string              `json:"thinking,omitempty"`
+	ThinkingPos int                 `json:"thinkingPos,omitempty"`
+	ToolCalls   []liveToolCallState `json:"toolCalls,omitempty"`
+}
+
+// liveTurnBegin resets the buffer for a new turn (OnStart).
+func (rt *sessionRuntime) liveTurnBegin() {
+	rt.liveMu.Lock()
+	rt.resetLiveLocked()
+	rt.liveMu.Unlock()
+}
+
+// liveRoundBegin resets the buffer for a new round (OnRoundStart).
+func (rt *sessionRuntime) liveRoundBegin() {
+	rt.liveMu.Lock()
+	rt.resetLiveLocked()
+	rt.liveMu.Unlock()
+}
+
+// liveRoundEnd clears the buffer (OnStreamEnd). The round's assistant
+// message is appended to a.Messages immediately after, so the buffer only
+// ever carries content a history snapshot would otherwise miss.
+func (rt *sessionRuntime) liveRoundEnd() {
+	rt.liveMu.Lock()
+	rt.resetLiveLocked()
+	rt.liveMu.Unlock()
+}
+
+func (rt *sessionRuntime) resetLiveLocked() {
+	rt.live.thinking.Reset()
+	rt.live.thinkingSent = 0
+	rt.live.thinkingUnits = 0
+	rt.live.content.Reset()
+	rt.live.contentSent = 0
+	rt.live.contentUnits = 0
+	rt.live.toolNames = nil
+	rt.live.toolIDs = nil
+	rt.live.toolArgs = nil
+	rt.live.toolArgsUnits = nil
+}
+
+// liveUTF16Len returns the number of UTF-16 code units in s — the unit the
+// browser's JS string length and slice operate in. Positions stamped on the
+// wire use this (not byte counts) so the client's rewind trim can slice
+// exactly, including multi-byte (emoji/CJK) content.
+func liveUTF16Len(s string) int {
+	n := 0
+	for _, r := range s {
+		if l := utf16.RuneLen(r); l > 0 {
+			n += l
+		} else {
+			n++
+		}
+	}
+	return n
+}
+
+// liveAppendContent records a streamed content token (OnToken).
+func (rt *sessionRuntime) liveAppendContent(text string) {
+	if text == "" {
+		return
+	}
+	rt.liveMu.Lock()
+	rt.live.content.WriteString(text)
+	rt.live.contentUnits += liveUTF16Len(text)
+	rt.liveMu.Unlock()
+}
+
+// liveAppendThinking records a streamed thinking token (OnThinkingToken).
+func (rt *sessionRuntime) liveAppendThinking(text string) {
+	if text == "" {
+		return
+	}
+	rt.liveMu.Lock()
+	rt.live.thinking.WriteString(text)
+	rt.live.thinkingUnits += liveUTF16Len(text)
+	rt.liveMu.Unlock()
+}
+
+// liveContentSegmentEnd advances the sent-content marker by one flushed
+// segment and returns the segment's end offset in the round's content
+// stream. Called from the token batcher's send callback per content segment.
+func (rt *sessionRuntime) liveContentSegmentEnd(text string) int {
+	rt.liveMu.Lock()
+	rt.live.contentSent += liveUTF16Len(text)
+	pos := rt.live.contentSent
+	rt.liveMu.Unlock()
+	return pos
+}
+
+// liveThinkingSegmentEnd is liveContentSegmentEnd for thinking segments.
+func (rt *sessionRuntime) liveThinkingSegmentEnd(text string) int {
+	rt.liveMu.Lock()
+	rt.live.thinkingSent += liveUTF16Len(text)
+	pos := rt.live.thinkingSent
+	rt.liveMu.Unlock()
+	return pos
+}
+
+// liveToolStart records the start of a streamed tool call (OnToolCallStart).
+func (rt *sessionRuntime) liveToolStart(index int, id, name string) {
+	rt.liveMu.Lock()
+	if rt.live.toolNames == nil {
+		rt.live.toolNames = make(map[int]string)
+		rt.live.toolIDs = make(map[int]string)
+		rt.live.toolArgs = make(map[int]*strings.Builder)
+	}
+	rt.live.toolNames[index] = name
+	rt.live.toolIDs[index] = id
+	rt.live.toolArgs[index] = &strings.Builder{}
+	if rt.live.toolArgsUnits == nil {
+		rt.live.toolArgsUnits = make(map[int]int)
+	}
+	rt.live.toolArgsUnits[index] = 0
+	rt.liveMu.Unlock()
+}
+
+// liveToolArgsAppend records one args delta for a streaming tool call
+// (OnToolCallArgsDelta) and returns the call's accumulated args length.
+func (rt *sessionRuntime) liveToolArgsAppend(index int, delta string) int {
+	rt.liveMu.Lock()
+	if rt.live.toolArgs == nil {
+		rt.live.toolArgs = make(map[int]*strings.Builder)
+		rt.live.toolArgsUnits = make(map[int]int)
+	} else if rt.live.toolArgsUnits == nil {
+		rt.live.toolArgsUnits = make(map[int]int)
+	}
+	b := rt.live.toolArgs[index]
+	if b == nil {
+		b = &strings.Builder{}
+		rt.live.toolArgs[index] = b
+		rt.live.toolArgsUnits[index] = 0
+	}
+	b.WriteString(delta)
+	rt.live.toolArgsUnits[index] += liveUTF16Len(delta)
+	pos := rt.live.toolArgsUnits[index]
+	rt.liveMu.Unlock()
+	return pos
+}
+
+// liveRewind snapshots the current round's in-flight output for an attach
+// history payload. Returns nil when nothing has streamed yet (or the turn is
+// between rounds — completed content lives in a.Messages already).
+func (rt *sessionRuntime) liveRewind() *liveRewindState {
+	rt.liveMu.Lock()
+	defer rt.liveMu.Unlock()
+	if rt.live.content.Len() == 0 && rt.live.thinking.Len() == 0 && len(rt.live.toolNames) == 0 {
+		return nil
+	}
+	rw := &liveRewindState{
+		Content:     rt.live.content.String(),
+		ContentPos:  rt.live.contentUnits,
+		Thinking:    rt.live.thinking.String(),
+		ThinkingPos: rt.live.thinkingUnits,
+	}
+	for idx, name := range rt.live.toolNames {
+		argsStr := ""
+		argsPos := 0
+		if b := rt.live.toolArgs[idx]; b != nil {
+			argsStr = b.String()
+			argsPos = rt.live.toolArgsUnits[idx]
+		}
+		rw.ToolCalls = append(rw.ToolCalls, liveToolCallState{
+			Index: idx, ID: rt.live.toolIDs[idx], Name: name, Args: argsStr, ArgsPos: argsPos,
+		})
+	}
+	sort.Slice(rw.ToolCalls, func(i, j int) bool { return rw.ToolCalls[i].Index < rw.ToolCalls[j].Index })
+	return rw
 }
 
 // attach registers a socket as a viewer of this session. Broadcasts reach all

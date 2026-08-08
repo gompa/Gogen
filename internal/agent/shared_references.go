@@ -97,10 +97,7 @@ func (e *Executor) walkSymbolReferences(ctx context.Context, searchRoot, relPref
 
 		// Check file size and binary status
 		info, err := d.Info()
-		if err != nil || info.Size() > searchMaxFileBytes {
-			return nil
-		}
-		if isBinaryFile(path) {
+		if !searchableWalkFile(path, info, err) {
 			return nil
 		}
 
@@ -155,10 +152,7 @@ func (e *Executor) walkSymbolReferencesText(ctx context.Context, searchRoot, rel
 
 		// Check file size and binary status
 		info, err := d.Info()
-		if err != nil || info.Size() > searchMaxFileBytes {
-			return nil
-		}
-		if isBinaryFile(path) {
+		if !searchableWalkFile(path, info, err) {
 			return nil
 		}
 

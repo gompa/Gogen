@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"gogen/internal/ioutil"
 )
 
 const (
@@ -99,7 +101,7 @@ func (e *Executor) DownloadFile(ctx context.Context, rawURL, targetPath string, 
 	if err := os.MkdirAll(dir, defaultDirPerm); err != nil {
 		return "", fmt.Errorf("create parent dir: %w", err)
 	}
-	if err := writeFileAtomic(secure, body, defaultFilePerm); err != nil {
+	if err := ioutil.WriteFileAtomic(secure, body, defaultFilePerm); err != nil {
 		return "", err
 	}
 

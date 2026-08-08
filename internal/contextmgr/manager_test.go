@@ -107,10 +107,10 @@ func TestTruncateToolResult(t *testing.T) {
 
 func TestShouldCompactRequiresEnoughMessages(t *testing.T) {
 	m := NewManager(&stubProvider{}, Settings{
-		ContextLimit:       1000,
-		CompactThreshold:   0.75,
-		KeepRecentMessages: 2,
-		MaxToolResultBytes: 8192,
+		ContextLimit:              1000,
+		CompactThreshold:          0.75,
+		CompactKeepRecentMessages: 2,
+		MaxToolResultBytes:        8192,
 	})
 	msgs := []llm.Message{
 		{Role: "user", Content: "hello"},
@@ -123,11 +123,11 @@ func TestShouldCompactRequiresEnoughMessages(t *testing.T) {
 
 func TestShouldCompactWhenOverBudget(t *testing.T) {
 	m := NewManager(&stubProvider{}, Settings{
-		ContextLimit:         200,
-		CompactThreshold:     0.75,
-		KeepRecentMessages:   2,
-		MaxToolResultBytes:   8192,
-		CompactReserveTokens: 20,
+		ContextLimit:              200,
+		CompactThreshold:          0.75,
+		CompactKeepRecentMessages: 2,
+		MaxToolResultBytes:        8192,
+		CompactReserveTokens:      20,
 	})
 	big := strings.Repeat("token ", 2000)
 	msgs := []llm.Message{
@@ -145,11 +145,11 @@ func TestShouldCompactWhenOverBudget(t *testing.T) {
 // the message list later grows past the compaction budget.
 func TestShouldCompactSeesGrowthAcrossCalls(t *testing.T) {
 	m := NewManager(&stubProvider{}, Settings{
-		ContextLimit:         8000,
-		CompactThreshold:     0.5,
-		KeepRecentMessages:   2,
-		MaxToolResultBytes:   8192,
-		CompactReserveTokens: 0,
+		ContextLimit:              8000,
+		CompactThreshold:          0.5,
+		CompactKeepRecentMessages: 2,
+		MaxToolResultBytes:        8192,
+		CompactReserveTokens:      0,
 	})
 	msgs := []llm.Message{{Role: "system", Content: "sys"}}
 	for i := 0; i < 6; i++ {
@@ -167,7 +167,7 @@ func TestShouldCompactSeesGrowthAcrossCalls(t *testing.T) {
 
 func TestCompactPreservesHeadAndTail(t *testing.T) {
 	provider := &stubProvider{summary: "did auth work"}
-	m := NewManager(provider, Settings{KeepRecentMessages: 2})
+	m := NewManager(provider, Settings{CompactKeepRecentMessages: 2})
 	m.minMiddleTokens = 0 // tiny messages: skip the minimum-middle guard
 	msgs := []llm.Message{
 		{Role: "user", Content: "fix auth"},
@@ -249,16 +249,16 @@ func TestSnapshot(t *testing.T) {
 // through NewManager untouched instead of being clamped to defaults.
 func TestNewManagerZeroValuesPreserved(t *testing.T) {
 	m := NewManager(&stubProvider{}, Settings{
-		CompactThreshold:     0,
-		KeepRecentMessages:   0,
-		MaxToolResultBytes:   0,
-		CompactReserveTokens: 0,
+		CompactThreshold:          0,
+		CompactKeepRecentMessages: 0,
+		MaxToolResultBytes:        0,
+		CompactReserveTokens:      0,
 	})
 	if m.Settings.CompactThreshold != 0 {
 		t.Errorf("CompactThreshold = %v, want 0", m.Settings.CompactThreshold)
 	}
-	if m.Settings.KeepRecentMessages != 0 {
-		t.Errorf("KeepRecentMessages = %d, want 0", m.Settings.KeepRecentMessages)
+	if m.Settings.CompactKeepRecentMessages != 0 {
+		t.Errorf("CompactKeepRecentMessages = %d, want 0", m.Settings.CompactKeepRecentMessages)
 	}
 	if m.Settings.MaxToolResultBytes != 0 {
 		t.Errorf("MaxToolResultBytes = %d, want 0", m.Settings.MaxToolResultBytes)
@@ -270,17 +270,17 @@ func TestNewManagerZeroValuesPreserved(t *testing.T) {
 
 func TestNewManagerNegativeValuesFallBackToDefaults(t *testing.T) {
 	m := NewManager(&stubProvider{}, Settings{
-		CompactThreshold:     -1,
-		KeepRecentMessages:   -2,
-		MaxToolResultBytes:   -3,
-		CompactReserveTokens: -4,
+		CompactThreshold:          -1,
+		CompactKeepRecentMessages: -2,
+		MaxToolResultBytes:        -3,
+		CompactReserveTokens:      -4,
 	})
 	d := DefaultSettings()
 	if m.Settings.CompactThreshold != d.CompactThreshold {
 		t.Errorf("CompactThreshold = %v, want default %v", m.Settings.CompactThreshold, d.CompactThreshold)
 	}
-	if m.Settings.KeepRecentMessages != d.KeepRecentMessages {
-		t.Errorf("KeepRecentMessages = %d, want default %d", m.Settings.KeepRecentMessages, d.KeepRecentMessages)
+	if m.Settings.CompactKeepRecentMessages != d.CompactKeepRecentMessages {
+		t.Errorf("CompactKeepRecentMessages = %d, want default %d", m.Settings.CompactKeepRecentMessages, d.CompactKeepRecentMessages)
 	}
 	if m.Settings.MaxToolResultBytes != d.MaxToolResultBytes {
 		t.Errorf("MaxToolResultBytes = %d, want default %d", m.Settings.MaxToolResultBytes, d.MaxToolResultBytes)
@@ -291,7 +291,7 @@ func TestNewManagerNegativeValuesFallBackToDefaults(t *testing.T) {
 }
 
 func TestAutoCompactDisabledAtZeroThreshold(t *testing.T) {
-	m := NewManager(&stubProvider{}, Settings{ContextLimit: 8000, CompactThreshold: 0, KeepRecentMessages: 2})
+	m := NewManager(&stubProvider{}, Settings{ContextLimit: 8000, CompactThreshold: 0, CompactKeepRecentMessages: 2})
 	if m.AutoCompactEnabled() {
 		t.Fatal("expected auto-compaction disabled at threshold 0")
 	}

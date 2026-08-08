@@ -21,10 +21,10 @@ import (
 func TestCompactPrimaryPathFitsAtDefaultTrigger(t *testing.T) {
 	provider := &recordingProvider{}
 	m := NewManager(provider, Settings{
-		ContextLimit:         20000,
-		CompactThreshold:     config.DefaultCompactThreshold,
-		CompactReserveTokens: config.DefaultCompactReserveTokens,
-		KeepRecentMessages:   config.DefaultKeepRecentMessages,
+		ContextLimit:              20000,
+		CompactThreshold:          config.DefaultCompactThreshold,
+		CompactReserveTokens:      config.DefaultCompactReserveTokens,
+		CompactKeepRecentMessages: config.DefaultCompactKeepRecentMessages,
 	})
 	viewPrefix := []llm.Message{{Role: "system", Content: "You are a coding agent."}}
 
@@ -39,7 +39,7 @@ func TestCompactPrimaryPathFitsAtDefaultTrigger(t *testing.T) {
 		)
 	}
 	// Messages beyond the keep window so the middle to summarize is non-empty.
-	for i := 0; i < config.DefaultKeepRecentMessages+2; i++ {
+	for i := 0; i < config.DefaultCompactKeepRecentMessages+2; i++ {
 		msgs = append(msgs, llm.Message{Role: "user", Content: "tail message"})
 	}
 

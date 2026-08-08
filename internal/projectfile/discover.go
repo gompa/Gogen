@@ -69,28 +69,16 @@ func DiscoverGuidelinesPath(workingDir string) (string, bool) {
 }
 
 // extractMarkdownBody returns the content after YAML front matter (--- … ---).
-// Uses the same closing-delimiter rules as ParseContent/findClosingDelimiter so
-// discovery and parsing agree (including files that end with --- and no trailing
-// newline). Returns "" if front matter is opened but not closed. Without front
-// matter, returns the content with trailing newlines stripped (same as ParseContent).
+// It shares splitFrontMatter with ParseContent so discovery and parsing always
+// agree (including files that end with --- and no trailing newline). Returns
+// "" if front matter is opened but malformed. Without front matter, returns
+// the content with trailing newlines stripped (same as ParseContent).
 func extractMarkdownBody(content string) string {
-	trimmed := strings.TrimRight(content, "\n")
-	if !strings.HasPrefix(trimmed, "---") {
-		return trimmed
-	}
-	rest := trimmed[3:]
-	if strings.HasPrefix(rest, "\n") {
-		rest = rest[1:]
-	} else if strings.HasPrefix(rest, "\r\n") {
-		rest = rest[2:]
-	} else {
-		return ""
-	}
-	closeAt, closeLen, err := findClosingDelimiter(rest)
+	_, body, _, err := splitFrontMatter(content)
 	if err != nil {
 		return ""
 	}
-	return strings.TrimLeft(rest[closeAt+closeLen:], "\n")
+	return body
 }
 
 // DefaultSavePath returns the canonical write paths for --save-config.
@@ -150,12 +138,6 @@ func HomeDir() string {
 		return "."
 	}
 	return home
-}
-
-// GlobalPathBoundary returns the default path boundary for global mode
-// (the user's home directory), or "." as a fallback.
-func GlobalPathBoundary() string {
-	return HomeDir()
 }
 
 // IsGlobalModeEnv checks whether GOGEN_MODE environment variable requests global mode.

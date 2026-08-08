@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"gogen/internal/config"
+	"gogen/internal/ioutil"
 )
 
 const (
@@ -330,7 +331,7 @@ func (e *Executor) WriteFile(path string, content string) error {
 	if !os.IsNotExist(err) {
 		return err
 	}
-	return writeFileAtomic(secure, []byte(content), defaultFilePerm)
+	return ioutil.WriteFileAtomic(secure, []byte(content), defaultFilePerm)
 }
 
 // OverwriteFile creates or overwrites a file under the working directory.
@@ -339,12 +340,12 @@ func (e *Executor) OverwriteFile(path string, content string) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(secure, []byte(content), defaultFilePerm)
+	return ioutil.WriteFileAtomic(secure, []byte(content), defaultFilePerm)
 }
 
-// newGitCmd creates a *exec.Cmd for running git subcommands.
+// NewGitCmd creates a *exec.Cmd for running git subcommands.
 // It handles nil ctx normalisation and PATH lookup automatically.
-func (e *Executor) newGitCmd(ctx context.Context, args ...string) (*exec.Cmd, error) {
+func (e *Executor) NewGitCmd(ctx context.Context, args ...string) (*exec.Cmd, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -354,11 +355,6 @@ func (e *Executor) newGitCmd(ctx context.Context, args ...string) (*exec.Cmd, er
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = e.GetWorkingDir()
 	return cmd, nil
-}
-
-// NewGitCmd is the exported form of newGitCmd for server/web helpers.
-func (e *Executor) NewGitCmd(ctx context.Context, args ...string) (*exec.Cmd, error) {
-	return e.newGitCmd(ctx, args...)
 }
 
 func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, error) {
@@ -533,7 +529,7 @@ func (e *Executor) ReplaceInFile(path string, search string, replace string, rep
 			return "", fmt.Errorf("search string not found in file")
 		}
 		newContent := strings.ReplaceAll(text, search, replace)
-		if err := writeFileAtomic(secure, []byte(newContent), defaultFilePerm); err != nil {
+		if err := ioutil.WriteFileAtomic(secure, []byte(newContent), defaultFilePerm); err != nil {
 			return "", err
 		}
 		msg := fmt.Sprintf("File updated successfully (%d occurrences replaced)", count)
@@ -545,7 +541,7 @@ func (e *Executor) ReplaceInFile(path string, search string, replace string, rep
 		return "", fmt.Errorf("search string not found in file")
 	}
 	newContent := text[:idx] + replace + text[idx+len(search):]
-	if err := writeFileAtomic(secure, []byte(newContent), defaultFilePerm); err != nil {
+	if err := ioutil.WriteFileAtomic(secure, []byte(newContent), defaultFilePerm); err != nil {
 		return "", err
 	}
 	msg := "File updated successfully (1 occurrence replaced)"

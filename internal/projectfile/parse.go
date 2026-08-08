@@ -1,6 +1,7 @@
 package projectfile
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -98,31 +99,19 @@ func parseYAMLConfig(yamlText string) (FileConfig, error) {
 // ParseContent parses project file content (front matter + body).
 func ParseContent(path, content string) (*ProjectFile, error) {
 	pf := &ProjectFile{Path: path}
-	trimmed := strings.TrimRight(content, "\n")
-	if trimmed == "" {
-		return pf, nil
-	}
-	if !strings.HasPrefix(trimmed, "---") {
-		pf.Guidelines = trimmed
-		return pf, nil
-	}
-	rest := trimmed[3:]
-	if strings.HasPrefix(rest, "\n") {
-		rest = rest[1:]
-	} else if strings.HasPrefix(rest, "\r\n") {
-		rest = rest[2:]
-	} else {
-		return nil, fmt.Errorf("%s: front matter must start with --- on line 1 followed by a newline", path)
-	}
-
-	closeAt, closeLen, err := findClosingDelimiter(rest)
+	yamlText, body, hasFM, err := splitFrontMatter(content)
 	if err != nil {
+		if errors.Is(err, errFrontMatterNoNewline) {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		// Unclosed front matter: findClosingDelimiter's error is returned
+		// without the path prefix, matching the historical message.
 		return nil, err
 	}
-
-	yamlText := rest[:closeAt]
-	body := strings.TrimLeft(rest[closeAt+closeLen:], "\n")
-
+	if !hasFM {
+		pf.Guidelines = body
+		return pf, nil
+	}
 	cfg, err := parseYAMLFrontMatter(yamlText)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
@@ -131,6 +120,37 @@ func ParseContent(path, content string) (*ProjectFile, error) {
 	pf.Config = cfg
 	pf.Guidelines = body
 	return pf, nil
+}
+
+// errFrontMatterNoNewline is returned by splitFrontMatter when the opening
+// --- is not followed by a newline. ParseContent wraps it with the file path
+// to match the historical error message.
+var errFrontMatterNoNewline = errors.New("front matter must start with --- on line 1 followed by a newline")
+
+// splitFrontMatter splits content into YAML front matter (yamlText) and body.
+// hasFM is false when the content has no front matter, in which case body is
+// the whole content with trailing newlines stripped. err is non-nil when a
+// front matter block is opened but malformed (missing newline after the
+// opening ---, or no closing --- delimiter).
+func splitFrontMatter(content string) (yamlText, body string, hasFM bool, err error) {
+	trimmed := strings.TrimRight(content, "\n")
+	if !strings.HasPrefix(trimmed, "---") {
+		return "", trimmed, false, nil
+	}
+	rest := trimmed[3:]
+	if strings.HasPrefix(rest, "\n") {
+		rest = rest[1:]
+	} else if strings.HasPrefix(rest, "\r\n") {
+		rest = rest[2:]
+	} else {
+		return "", "", true, errFrontMatterNoNewline
+	}
+
+	closeAt, closeLen, err := findClosingDelimiter(rest)
+	if err != nil {
+		return "", "", true, err
+	}
+	return rest[:closeAt], strings.TrimLeft(rest[closeAt+closeLen:], "\n"), true, nil
 }
 
 func findClosingDelimiter(s string) (index int, length int, err error) {

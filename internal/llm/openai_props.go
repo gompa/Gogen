@@ -21,17 +21,6 @@ func (p *OpenAIProvider) SetPreserveReasoningMode(mode string) {
 	p.preserveReasoningMode = normalizePreserveReasoningMode(mode)
 }
 
-// WarmPreserveReasoning eagerly probes the /props endpoint (in auto mode)
-// during startup so the result is cached before the first chat-completion
-// request, avoiding a 1.5 s inline timeout on the critical path.
-// Only the default ("auto") mode probes; "on" and "off" skip the probe.
-func (p *OpenAIProvider) WarmPreserveReasoning() {
-	if p == nil || normalizePreserveReasoningMode(p.preserveReasoningMode) != "auto" {
-		return
-	}
-	go p.templateSupportsPreserveReasoning(context.Background())
-}
-
 func normalizePreserveReasoningMode(mode string) string {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "on", "1", "true", "yes":

@@ -358,22 +358,20 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 // handleStreamFallback is called when a streaming error occurs. It attempts a
 // non-streaming fallback to recover partial results.
 func (p *OpenAIProvider) handleStreamFallback(ctx context.Context, messages []Message, allowedTools map[string]struct{}, tools []Tool, h *StreamHandlers, streamErr error, acc *streamAccumulator) (*StreamResult, error) {
-	if h.OnStreamEnd != nil {
-		h.OnStreamEnd()
-	}
-	if h.OnRecoverPartialStream != nil {
-		h.OnRecoverPartialStream()
-	}
+	// h came from GenerateResponseStream, which ran ensureStreamCallbacks,
+	// so every callback field is non-nil here.
+	h.OnStreamEnd()
+	h.OnRecoverPartialStream()
 	resp, fbErr := p.GenerateResponse(ctx, messages, allowedTools, tools)
 	if fbErr != nil {
 		return nil, fmt.Errorf("stream error: %w (non-streaming fallback also failed: %v)", streamErr, fbErr)
 	}
-	if resp.Reasoning != "" && h.OnThinkingToken != nil {
+	if resp.Reasoning != "" {
 		h.OnThinkingToken(resp.Reasoning)
 	}
-	if resp.Content != "" && h.OnToken != nil {
+	if resp.Content != "" {
 		h.OnToken(resp.Content)
-	} else if resp.Refusal != "" && h.OnToken != nil {
+	} else if resp.Refusal != "" {
 		h.OnToken(resp.Refusal)
 	}
 	return &StreamResult{

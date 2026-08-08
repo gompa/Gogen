@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"gogen/internal/ioutil"
 )
 
 // SearchMatch is one structured hit from SearchCodeMatches (no context lines).
@@ -262,10 +264,7 @@ func (e *Executor) ReplaceInTree(ctx context.Context, pattern, replacement, subp
 			return nil
 		}
 		info, infoErr := d.Info()
-		if infoErr != nil || info.Size() > searchMaxFileBytes {
-			return nil
-		}
-		if isBinaryFile(path) {
+		if !searchableWalkFile(path, info, infoErr) {
 			return nil
 		}
 
@@ -312,7 +311,7 @@ func (e *Executor) replaceInFilePath(absPath, relPath string, re *regexp.Regexp,
 	if newContent == content {
 		return 0, nil
 	}
-	if err := writeFileAtomic(absPath, []byte(newContent), defaultFilePerm); err != nil {
+	if err := ioutil.WriteFileAtomic(absPath, []byte(newContent), defaultFilePerm); err != nil {
 		return 0, fmt.Errorf("failed to write %s: %w", relPath, err)
 	}
 	return len(locs), nil
@@ -436,10 +435,7 @@ func (e *Executor) searchWithGo(ctx context.Context, searchRoot, relPrefix, patt
 			return nil
 		}
 		info, err := d.Info()
-		if err != nil || info.Size() > searchMaxFileBytes {
-			return nil
-		}
-		if isBinaryFile(path) {
+		if !searchableWalkFile(path, info, err) {
 			return nil
 		}
 
@@ -622,6 +618,16 @@ func isBinaryFile(path string) bool {
 		}
 	}
 	return false
+}
+
+// searchableWalkFile reports whether a walked file is worth reading: the
+// stat succeeded, the file is within the search size cap, and it is not
+// binary. Walkers silently skip files that fail this check.
+func searchableWalkFile(path string, info os.FileInfo, err error) bool {
+	if err != nil || info == nil || info.Size() > searchMaxFileBytes {
+		return false
+	}
+	return !isBinaryFile(path)
 }
 
 // compactSearchOutput rewrites lines of the form "filepath:line:content" or

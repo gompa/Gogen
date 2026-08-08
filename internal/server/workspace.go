@@ -141,11 +141,11 @@ func (ws *Workspace) NewSessionAgent(snap *agent.SessionSnapshot, id string) *ag
 	settings := contextmgr.DefaultSettings()
 	if ws.Config != nil {
 		settings = contextmgr.Settings{
-			ContextLimit:         ws.Config.ContextLimit,
-			CompactThreshold:     ws.Config.CompactThreshold,
-			KeepRecentMessages:   ws.Config.KeepRecentMessages,
-			MaxToolResultBytes:   ws.Config.MaxToolResultBytes,
-			CompactReserveTokens: ws.Config.CompactReserveTokens,
+			ContextLimit:              ws.Config.ContextLimit,
+			CompactThreshold:          ws.Config.CompactThreshold,
+			CompactKeepRecentMessages: ws.Config.CompactKeepRecentMessages,
+			MaxToolResultBytes:        ws.Config.MaxToolResultBytes,
+			CompactReserveTokens:      ws.Config.CompactReserveTokens,
 		}
 	}
 	provider := ws.ProviderFactory()

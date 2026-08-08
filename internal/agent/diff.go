@@ -21,7 +21,7 @@ func (e *Executor) ShowDiff(ctx context.Context, path string, staged bool) (stri
 		args = append(args, "--", path)
 	}
 
-	cmd, cmdErr := e.newGitCmd(ctx, args...)
+	cmd, cmdErr := e.NewGitCmd(ctx, args...)
 	if cmdErr != nil {
 		return "", cmdErr
 	}

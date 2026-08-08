@@ -1,4 +1,4 @@
 (function_definition declarator: (function_declarator declarator: (identifier) @name.function))
 (struct_specifier name: (type_identifier) @name.struct)
-(enum_specifier name: (identifier) @name.enum)
+(enum_specifier name: (type_identifier) @name.enum)
 (declaration (function_declarator declarator: (identifier) @name.function))

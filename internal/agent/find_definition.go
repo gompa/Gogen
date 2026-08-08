@@ -132,10 +132,7 @@ func (e *Executor) findDefinitionAST(ctx context.Context, searchRoot, relPrefix,
 		}
 
 		info, err := d.Info()
-		if err != nil || info.Size() > searchMaxFileBytes {
-			return nil
-		}
-		if isBinaryFile(path) {
+		if !searchableWalkFile(path, info, err) {
 			return nil
 		}
 

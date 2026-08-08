@@ -742,6 +742,9 @@
             pendingToolCards = {};
             historyToolCallArgs = {};
             toolsStartedThisTurn = false;
+            streamContentPos = 0;
+            thinkingContentPos = 0;
+            lastFinalizedThinking = null;
             // noMirror: clearChat is also used mid-pane-switch (clear → load),
             // where the new pane's turnActive must survive the reset.
             setTurnActive(false, { silent: true, noMirror: true });
@@ -851,6 +854,16 @@
         let toolCallCounter = 0;
         let turnActive = false;
         let toolsStartedThisTurn = false;
+        // Cumulative character offsets (server-stamped contentPos/thinkingPos)
+        // of the content/thinking the client has rendered in the current
+        // round. The rewind merge trims incoming chunks against these so a
+        // chunk already inside the attach snapshot is never re-appended
+        // (duplicate) and a chunk beyond it is never dropped (gap).
+        let streamContentPos = 0;
+        let thinkingContentPos = 0;
+        // Raw + position of the most recently finalized thinking block, kept
+        // across finalizeThinking so a rewind merge can still reach it.
+        let lastFinalizedThinking = null;
         let contextBaseUsed = 0;
         let contextLimit = 0;
         let contextEstAdded = 0;
@@ -2082,18 +2095,39 @@
             smartScroll();
             currentStreamDiv = msgDiv;
             currentStreamRaw = '';
+            streamContentPos = 0;
         }
 
-        function appendStreamToken(token) {
+        // Trim a received chunk against the position of what the client has
+        // already rendered: keep only [currentPos..endPos]. Positions are
+        // server-stamped cumulative character offsets in the same per-round
+        // buffer, so this is an exact merge — never a duplicate, never a gap.
+        // When endPos is absent (older server) the chunk is kept as-is.
+        function trimToEnd(text, endPos, currentPos) {
+            if (!text) return '';
+            if (endPos === undefined || endPos === null) return text;
+            const cur = currentPos || 0;
+            if (endPos <= cur) return '';
+            const start = endPos - text.length;
+            const cut = cur - start;
+            if (cut <= 0) return text;
+            return text.slice(cut);
+        }
+
+        function appendStreamToken(token, endPos) {
             if (!currentStreamDiv) return;
-            currentStreamRaw += token;
-            bumpContextEstimate(token);
+            const keep = trimToEnd(token, endPos, streamContentPos);
+            if (!keep) return;
+            currentStreamRaw += keep;
+            streamContentPos = Math.max(streamContentPos, endPos || 0);
+            bumpContextEstimate(keep);
             scheduleStreamRender();
         }
 
         function showThinking() {
             removeEmptyState();
             finalizeThinking();
+            thinkingContentPos = 0;
             const div = document.createElement('div');
             div.className = 'thought-card';
 
@@ -2130,15 +2164,18 @@
             currentThinkingSpan = body;
         }
 
-        function appendThinkingToken(token) {
+        function appendThinkingToken(token, endPos) {
             // Match TUI: ignore thinking after tool calls start in this round.
             // Cleared again on the next round's "thinking" (OnRoundStart).
             if (toolsStartedThisTurn) return;
+            const keep = trimToEnd(token, endPos, thinkingContentPos);
+            if (!keep) return;
             if (!currentThinkingSpan) {
                 showThinking();
             }
-            currentThinkingRaw += token;
-            bumpContextEstimate(token);
+            currentThinkingRaw += keep;
+            thinkingContentPos = Math.max(thinkingContentPos, endPos || 0);
+            bumpContextEstimate(keep);
             scheduleThinkingRender();
         }
 
@@ -2202,6 +2239,9 @@
             const div = currentThinkingDiv;
             const content = (currentThinkingRaw || '').trim();
             if (content) {
+                // Keep the finalized block (raw + position) so a rewind merge
+                // can still reach it after the buffers are cleared.
+                lastFinalizedThinking = { raw: currentThinkingRaw, pos: thinkingContentPos };
                 // Final full render: corrects any block-split artifacts from
                 // the incremental live stream (e.g. a list split at a blank
                 // line) so the collapsed card matches a single-shot render.
@@ -2210,6 +2250,7 @@
             currentThinkingDiv = null;
             currentThinkingSpan = null;
             currentThinkingRaw = '';
+            thinkingContentPos = 0;
             thinkingRafPending = false;
             if (!content) {
                 div.remove();
@@ -2607,6 +2648,7 @@
             endStream();
             toolsStartedThisTurn = true;
             const cardInfo = createToolCard(name, {}, { streaming: true, streamIndex: index });
+            cardInfo.argsPos = 0;
             streamingToolCards[index] = cardInfo;
             if (name === 'patch_file') {
                 ensurePatchViewer(cardInfo, '').catch(() => {});
@@ -2614,11 +2656,14 @@
             return cardInfo;
         }
 
-        function appendStreamingToolArgs(index, argsDelta) {
+        function appendStreamingToolArgs(index, argsDelta, endPos) {
             const cardInfo = streamingToolCards[index];
             if (!cardInfo) return;
-            cardInfo.rawArgs = (cardInfo.rawArgs || '') + (argsDelta || '');
-            bumpContextEstimate(argsDelta);
+            const keep = trimToEnd(argsDelta, endPos, cardInfo.argsPos || 0);
+            if (!keep) return;
+            cardInfo.rawArgs = (cardInfo.rawArgs || '') + keep;
+            cardInfo.argsPos = Math.max(cardInfo.argsPos || 0, endPos || 0);
+            bumpContextEstimate(keep);
 
             const tool = cardInfo.toolName;
             if (cardInfo.monacoHost) {
@@ -2894,6 +2939,103 @@
                     new CustomEvent('gogen-colorized', { bubbles: false })
                 );
             });
+        }
+
+        // ── Attach rewind merge ──
+        // A mid-turn attach's history payload carries the in-flight reply
+        // (the server's live-turn buffer) in `rewind`. It is rendered
+        // through the normal stream machinery below, then merged with any
+        // content the client already rendered live before the snapshot
+        // arrived. Both the rewind and the live-rendered content are
+        // contiguous slices of the same per-round buffer, so trimming
+        // against the server-stamped positions is exact: never a duplicate
+        // chunk, never a dropped one.
+
+        // Last server-side message index in a history payload (-1 when none).
+        function lastHistoryIndex(history) {
+            let max = -1;
+            for (const h of history || []) {
+                if (h.index !== undefined && h.index >= 0 && h.index > max) max = h.index;
+            }
+            return max;
+        }
+
+        // Newest server-side message index currently rendered in the DOM.
+        function newestDomHistIdx() {
+            let max = -1;
+            for (const el of messagesDiv.querySelectorAll('.message[data-hist-idx]')) {
+                const v = parseInt(el.dataset.histIdx, 10);
+                if (Number.isFinite(v) && v > max) max = v;
+            }
+            return max;
+        }
+
+        // Snapshot the live stream state so the rewind merge can splice the
+        // already-rendered tail exactly (positions are server-stamped).
+        function captureLiveStreamState() {
+            const toolCards = {};
+            for (const [index, card] of Object.entries(streamingToolCards)) {
+                toolCards[index] = { rawArgs: card.rawArgs || '', argsPos: card.argsPos || 0 };
+            }
+            return {
+                streamRaw: currentStreamRaw,
+                streamPos: streamContentPos,
+                thinkingRaw: currentThinkingRaw,
+                thinkingPos: thinkingContentPos,
+                thinkingFinalized: lastFinalizedThinking,
+                toolCards,
+            };
+        }
+
+        // Render the attach snapshot's in-flight turn through the normal
+        // streaming machinery, then merge any live-rendered tail. Returns
+        // true when anything was rendered (so the caller can skip the
+        // generic "Resuming…" indicator).
+        function renderRewindAndMerge(rewind, captured) {
+            if (!rewind) return false;
+            let rendered = false;
+            // Thinking: open a thought card from the rewind, then append any
+            // live-rendered thinking tail beyond the rewind's end.
+            if (rewind.thinking || captured.thinkingRaw) {
+                const basePos = rewind.thinkingPos || 0;
+                appendThinkingToken(rewind.thinking || '', basePos);
+                let capRaw = captured.thinkingRaw;
+                let capPos = captured.thinkingPos || 0;
+                if (!capRaw && captured.thinkingFinalized && captured.thinkingFinalized.raw) {
+                    capRaw = captured.thinkingFinalized.raw;
+                    capPos = captured.thinkingFinalized.pos || 0;
+                }
+                const tail = trimToEnd(capRaw, capPos, basePos);
+                if (tail) appendThinkingToken(tail, Math.max(basePos, capPos));
+                rendered = true;
+            }
+            // Content: start the assistant bubble, then append the tail.
+            if (rewind.content || captured.streamRaw) {
+                finalizeThinking();
+                startStream();
+                appendStreamToken(rewind.content || '', rewind.contentPos || 0);
+                const tail = trimToEnd(captured.streamRaw, captured.streamPos || 0, rewind.contentPos || 0);
+                if (tail) appendStreamToken(tail, Math.max(rewind.contentPos || 0, captured.streamPos || 0));
+                rendered = true;
+            }
+            // In-progress tool calls: waiting cards continued by live events.
+            if (rewind.toolCalls && rewind.toolCalls.length) {
+                for (const tc of rewind.toolCalls) {
+                    startStreamingToolCard(tc.index, tc.name || 'tool');
+                    if (tc.args) appendStreamingToolArgs(tc.index, tc.args, tc.argsPos);
+                    const cap = captured.toolCards && captured.toolCards[tc.index];
+                    if (cap && cap.rawArgs) {
+                        const tail = trimToEnd(cap.rawArgs, cap.argsPos || 0, tc.argsPos || 0);
+                        if (tail) appendStreamingToolArgs(tc.index, tail, Math.max(tc.argsPos || 0, cap.argsPos || 0));
+                    }
+                }
+                rendered = true;
+            }
+            // Progress phase reflects what was painted.
+            if (rewind.toolCalls && rewind.toolCalls.length) setInputProgress('tool', 'Running tool\u2026');
+            else if (rewind.content) setInputProgress('streaming', 'Streaming\u2026');
+            else if (rewind.thinking) setInputProgress('thinking', 'Thinking\u2026');
+            return rendered;
         }
 
         // ===== Terminal panel =====
@@ -3686,14 +3828,14 @@
                     setInputProgress('thinking', 'Waiting for model\u2026');
                 } else if (data.type === 'thinking_token') {
                     setTurnActive(true);
-                    appendThinkingToken(data.content || '');
+                    appendThinkingToken(data.content || '', data.thinkingPos);
                 } else if (data.type === 'stream') {
                     setTurnActive(true);
                     updateTitle('streaming');
                     setInputProgress('streaming', 'Streaming\u2026');
                     finalizeThinking();
                     if (!currentStreamDiv) startStream();
-                    appendStreamToken(data.content);
+                    appendStreamToken(data.content, data.contentPos);
                 } else if (data.type === 'stream_end') {
                     finalizeThinking();
                     endStream();
@@ -3708,7 +3850,7 @@
                     } else if (data.tool) {
                         streamingToolCards[data.index].toolName = data.tool;
                     }
-                    appendStreamingToolArgs(data.index, data.argsDelta || '');
+                    appendStreamingToolArgs(data.index, data.argsDelta || '', data.argsPos);
                 } else if (data.type === 'tool_call') {
                     finalizeThinking();
                     endStream();
@@ -4067,72 +4209,90 @@
                     }
                 } else if (data.type === 'history') {
                     // Full snapshot — replace the pane so reconnect / session
-                    // restore never stacks duplicate transcripts. One guard:
-                    // the turn_end convergence refetch can race a new turn
-                    // the user started at the boundary — its snapshot
-                    // is OLDER than the live transcript, so skip the rebuild
-                    // (a fresh attach latches needsFreshHistory via its
-                    // session_state first; a stale refetch does not).
+                    // restore never stacks duplicate transcripts.
                     const histPane = activePane();
-                    if (histPane.needsFreshHistory || !turnActive) {
-                        // Mid-turn attach: the snapshot is INCOMPLETE — it
-                        // lacks the in-flight reply — and live events for
-                        // that reply may already be rendering. The attach's
-                        // history is sent from an async goroutine after a
-                        // deep-cloned snapshot (SnapshotMessages under
-                        // statsMu); for a large session it can arrive AFTER
-                        // the first stream batches, so the DOM already shows
-                        // the reply's beginning. Rebuilding from the
-                        // snapshot would WIPE that visible reply — the turn
-                        // seems to stop until the turn_end refetch. Keep the
-                        // live content instead; the turn_end convergence
-                        // refetch paints the full transcript.
-                        if (histPane.needsFreshHistory
-                            && (currentStreamDiv
-                                || currentThinkingDiv
-                                || Object.keys(streamingToolCards).length > 0)) {
-                            return;
+                    const hasLiveInFlight = !!(currentStreamDiv || currentThinkingDiv
+                        || Object.keys(streamingToolCards).length > 0
+                        || Object.keys(pendingToolCards).length > 0);
+                    // A stale snapshot — the attach's deep clone finished
+                    // after the turn completed, landing after the turn_end
+                    // convergence refetch — must not wipe the rendered
+                    // transcript. Skip only when the snapshot is older than
+                    // the DOM (its last message index ≤ the newest rendered
+                    // one), the server's history was not reshaped since we
+                    // rendered (epoch match — compaction/rollback reset
+                    // indexes, making the comparison meaningless), and
+                    // nothing is still streaming (converge at turn_end).
+                    if (!histPane.needsFreshHistory && !hasLiveInFlight
+                        && histPane.histEpoch !== undefined
+                        && data.historyEpoch === histPane.histEpoch
+                        && lastHistoryIndex(data.history) >= 0
+                        && newestDomHistIdx() >= 0
+                        && lastHistoryIndex(data.history) <= newestDomHistIdx()) {
+                        return;
+                    }
+                    // Mid-turn attach with live content already rendering and
+                    // no rewind in the snapshot (older server): keep the live
+                    // content — the turn_end convergence refetch paints the
+                    // full transcript.
+                    if (histPane.needsFreshHistory && hasLiveInFlight && !data.rewind) {
+                        return;
+                    }
+                    // Capture the live stream state BEFORE clearing so the
+                    // rewind (the in-flight reply) can merge exactly with
+                    // whatever the client already rendered live — never
+                    // duplicating or dropping a character.
+                    const captured = captureLiveStreamState();
+                    let rewindRendered = false;
+                    clearChat();
+                    histPane.histEpoch = data.historyEpoch;
+                    const afterHistory = () => {
+                        // Render the in-flight partial (the server's live-turn
+                        // buffer) through the normal stream machinery, then
+                        // merge any content the client had already rendered
+                        // live. Runs on both the replay and the fallback path.
+                        if (data.rewind) {
+                            rewindRendered = renderRewindAndMerge(data.rewind, captured);
                         }
-                        clearChat();
-                        const afterHistory = () => {
-                            // A headless turn may be running (session_state said
-                            // turnActive): restore the busy indicator now that the
-                            // transcript is rebuilt (clearChat reset it).
-                            const pane = activePane();
-                            if (pane && pane.turnActive) {
-                                setTurnActive(true, { silent: true });
-                                setInputProgress('thinking', 'Resuming\u2026');
-                            }
-                            // NOTE: the resend message is flushed from the config
-                            // handler, which adopts the new session id first (the
-                            // server sends history before config).
-                        };
-                        if (data.history && data.history.length) {
-                            replayHistory(data.history).then(afterHistory).catch((err) => {
-                                console.warn('history replay failed', err);
-                                // Ensure the replay scroll-suppression flag is off
-                                // so the fallback re-append below scrolls normally.
-                                replayInProgress = false;
-                                disarmReplayWatchdog();
-                                flushDeferredResultColorize();
-                                for (const h of data.history) {
-                                    if (h.role === 'user' || h.role === 'assistant') {
-                                        if (h.content) {
-                                            appendMessageAtTime(
-                                                h.role,
-                                                h.content,
-                                                h.createdAt ? new Date(h.createdAt) : new Date(),
-                                                h.index,
-                                                h.images
-                                            );
-                                        }
+                        // A headless turn may be running (session_state said
+                        // turnActive): restore the busy indicator now that the
+                        // transcript is rebuilt (clearChat reset it). The
+                        // rewind render already set the phase when it painted
+                        // the in-flight reply.
+                        const pane = activePane();
+                        if (pane && pane.turnActive && !rewindRendered) {
+                            setTurnActive(true, { silent: true });
+                            setInputProgress('thinking', 'Resuming\u2026');
+                        }
+                        // NOTE: the resend message is flushed from the config
+                        // handler, which adopts the new session id first (the
+                        // server sends history before config).
+                    };
+                    if (data.history && data.history.length) {
+                        replayHistory(data.history).then(afterHistory).catch((err) => {
+                            console.warn('history replay failed', err);
+                            // Ensure the replay scroll-suppression flag is off
+                            // so the fallback re-append below scrolls normally.
+                            replayInProgress = false;
+                            disarmReplayWatchdog();
+                            flushDeferredResultColorize();
+                            for (const h of data.history) {
+                                if (h.role === 'user' || h.role === 'assistant') {
+                                    if (h.content) {
+                                        appendMessageAtTime(
+                                            h.role,
+                                            h.content,
+                                            h.createdAt ? new Date(h.createdAt) : new Date(),
+                                            h.index,
+                                            h.images
+                                        );
                                     }
                                 }
-                                afterHistory();
-                            });
-                        } else {
+                            }
                             afterHistory();
-                        }
+                        });
+                    } else {
+                        afterHistory();
                     }
                 } else if (data.type === 'config') {
                     // The pane's session identity may have changed (new /

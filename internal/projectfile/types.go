@@ -16,44 +16,44 @@ type MCPServerEntry struct {
 // All other fields are plain values where the zero value means "use the
 // default" (0, "", false).
 type FileConfig struct {
-	OpenAIAPIKey         string           `yaml:"openai_api_key"`
-	OpenAIModel          string           `yaml:"openai_model"`
-	OpenAIBaseURL        string           `yaml:"openai_base_url"`
-	WorkingDir           string           `yaml:"working_dir"`
-	ContextLimit         int              `yaml:"context_limit"`
-	CompactThreshold     *float64         `yaml:"compact_threshold"`      // 0 = auto-compaction disabled
-	KeepRecentMessages   *int             `yaml:"keep_recent_messages"`   // 0 = keep no recent messages on compaction
-	MaxToolResultBytes   *int             `yaml:"max_tool_result_bytes"`  // 0 = no truncation cap
-	CompactReserveTokens *int             `yaml:"compact_reserve_tokens"` // 0 = reserve no tokens
-	CommandSafety        string           `yaml:"command_safety"`
-	CommandAllowlist     string           `yaml:"command_allowlist"`
-	DeleteApproval       string           `yaml:"delete_approval"`
-	TreeSitter           string           `yaml:"treesitter"`
-	TreeSitterLangs      string           `yaml:"treesitter_langs"`
-	CLIVerbose           bool             `yaml:"cli_verbose"`
-	DebugLog             string           `yaml:"debug_log"`
-	DebugSession         string           `yaml:"debug_session"`
-	MCP                  string           `yaml:"mcp"`
-	DebugCompareMessages bool             `yaml:"debug_compare_messages"`
-	MCPServers           []MCPServerEntry `yaml:"mcp_servers"`
-	TestCommand          string           `yaml:"test_command"`
-	LintCommand          string           `yaml:"lint_command"`
-	WebFetch             string           `yaml:"web_fetch"`
-	WebSearch            string           `yaml:"web_search"`
-	WebSearchBackend     string           `yaml:"web_search_backend"`
-	WebSearchAPIKey      string           `yaml:"web_search_api_key"`
-	WebAllowedDomains    string           `yaml:"web_allowed_domains"`
-	WebFetchMode         string           `yaml:"web_fetch_mode"`
-	WebAuthToken         string           `yaml:"web_auth_token"`
-	WebTLSCertFile       string           `yaml:"web_tls_cert_file"`
-	WebTLSKeyFile        string           `yaml:"web_tls_key_file"`
-	SessionMaxCount      int              `yaml:"session_max_count"`
-	SessionMaxAgeDays    int              `yaml:"session_max_age_days"`
-	WebMaxActiveSessions int              `yaml:"web_max_active_sessions"`
-	WebApprovalHoldSecs  int              `yaml:"web_approval_hold_secs"`
-	CommandSandbox       string           `yaml:"command_sandbox"`
-	CommandTimeoutSecs   int              `yaml:"command_timeout_secs"`
-	PreserveReasoning    string           `yaml:"preserve_reasoning"`
+	OpenAIAPIKey              string           `yaml:"openai_api_key"`
+	OpenAIModel               string           `yaml:"openai_model"`
+	OpenAIBaseURL             string           `yaml:"openai_base_url"`
+	WorkingDir                string           `yaml:"working_dir"`
+	ContextLimit              int              `yaml:"context_limit"`
+	CompactThreshold          *float64         `yaml:"compact_threshold"`            // 0 = auto-compaction disabled
+	CompactKeepRecentMessages *int             `yaml:"compact_keep_recent_messages"` // 0 = keep no recent messages on compaction
+	MaxToolResultBytes        *int             `yaml:"max_tool_result_bytes"`        // 0 = no truncation cap
+	CompactReserveTokens      *int             `yaml:"compact_reserve_tokens"`       // 0 = reserve no tokens
+	CommandSafety             string           `yaml:"command_safety"`
+	CommandAllowlist          string           `yaml:"command_allowlist"`
+	DeleteApproval            string           `yaml:"delete_approval"`
+	TreeSitter                string           `yaml:"treesitter"`
+	TreeSitterLangs           string           `yaml:"treesitter_langs"`
+	CLIVerbose                bool             `yaml:"cli_verbose"`
+	DebugLog                  string           `yaml:"debug_log"`
+	DebugSession              string           `yaml:"debug_session"`
+	MCP                       string           `yaml:"mcp"`
+	DebugCompareMessages      bool             `yaml:"debug_compare_messages"`
+	MCPServers                []MCPServerEntry `yaml:"mcp_servers"`
+	TestCommand               string           `yaml:"test_command"`
+	LintCommand               string           `yaml:"lint_command"`
+	WebFetch                  string           `yaml:"web_fetch"`
+	WebSearch                 string           `yaml:"web_search"`
+	WebSearchBackend          string           `yaml:"web_search_backend"`
+	WebSearchAPIKey           string           `yaml:"web_search_api_key"`
+	WebAllowedDomains         string           `yaml:"web_allowed_domains"`
+	WebFetchMode              string           `yaml:"web_fetch_mode"`
+	WebAuthToken              string           `yaml:"web_auth_token"`
+	WebTLSCertFile            string           `yaml:"web_tls_cert_file"`
+	WebTLSKeyFile             string           `yaml:"web_tls_key_file"`
+	SessionMaxCount           int              `yaml:"session_max_count"`
+	SessionMaxAgeDays         int              `yaml:"session_max_age_days"`
+	WebMaxActiveSessions      int              `yaml:"web_max_active_sessions"`
+	WebApprovalHoldSecs       int              `yaml:"web_approval_hold_secs"`
+	CommandSandbox            string           `yaml:"command_sandbox"`
+	CommandTimeoutSecs        int              `yaml:"command_timeout_secs"`
+	PreserveReasoning         string           `yaml:"preserve_reasoning"`
 }
 
 // ProjectFile is a loaded combined config + guidelines file.

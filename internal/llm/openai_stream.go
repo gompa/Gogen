@@ -99,9 +99,6 @@ func (a *streamAccumulator) processChunk(chunk openai.ChatCompletionChunk, onTok
 				a.lastFinishReason = choice.FinishReason
 				a.streamDone = true
 			}
-		case "length", "content_filter":
-			a.lastFinishReason = choice.FinishReason
-			a.streamDone = true
 		default:
 			a.lastFinishReason = choice.FinishReason
 			a.streamDone = true
@@ -146,9 +143,6 @@ func (a *streamAccumulator) buildResult() (*StreamResult, error) {
 			} else {
 				args = parsed
 			}
-		}
-		if args == nil {
-			args = map[string]interface{}{}
 		}
 		toolCalls = append(toolCalls, ToolCall{
 			Index:     acc.Index,

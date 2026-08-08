@@ -22,7 +22,7 @@ func (p *recordingProvider) GenerateResponse(_ context.Context, msgs []llm.Messa
 
 func TestCompactSummaryRequestUsesConversationPrefix(t *testing.T) {
 	provider := &recordingProvider{}
-	m := NewManager(provider, Settings{KeepRecentMessages: 2, ContextLimit: 100000, CompactThreshold: 0.01})
+	m := NewManager(provider, Settings{CompactKeepRecentMessages: 2, ContextLimit: 100000, CompactThreshold: 0.01})
 	m.minMiddleTokens = 0 // tiny messages: skip the minimum-middle guard
 	viewPrefix := []llm.Message{{Role: "system", Content: "You are a coding agent."}}
 	msgs := []llm.Message{
@@ -109,7 +109,7 @@ func TestRenderMessagesForSummaryIncludesToolName(t *testing.T) {
 
 func TestCompactKeepsToolCallPairInTail(t *testing.T) {
 	provider := &stubProvider{summary: "summary"}
-	m := NewManager(provider, Settings{KeepRecentMessages: 3})
+	m := NewManager(provider, Settings{CompactKeepRecentMessages: 3})
 	m.minMiddleTokens = 0 // tiny messages: skip the minimum-middle guard
 	msgs := []llm.Message{
 		{Role: "user", Content: "fix auth"},
@@ -131,11 +131,11 @@ func TestCompactKeepsToolCallPairInTail(t *testing.T) {
 	}
 }
 
-// keep_recent_messages 0 is literal: compaction keeps only the first user
+// compact_keep_recent_messages 0 is literal: compaction keeps only the first user
 // message and summarizes everything else (no tail).
 func TestCompactKeepZeroKeepsOnlyHead(t *testing.T) {
 	provider := &stubProvider{summary: "summary"}
-	m := NewManager(provider, Settings{KeepRecentMessages: 0})
+	m := NewManager(provider, Settings{CompactKeepRecentMessages: 0})
 	m.minMiddleTokens = 0 // tiny messages: skip the minimum-middle guard
 	msgs := []llm.Message{
 		{Role: "user", Content: "task"},
@@ -163,7 +163,7 @@ func TestCompactKeepZeroKeepsOnlyHead(t *testing.T) {
 // auto-compaction proceeds normally (and would summarize everything but the
 // head, see TestCompactKeepZeroKeepsOnlyHead).
 func TestShouldCompactWithKeepZero(t *testing.T) {
-	m := NewManager(&stubProvider{}, Settings{KeepRecentMessages: 0, CompactThreshold: 0.5, ContextLimit: 8000})
+	m := NewManager(&stubProvider{}, Settings{CompactKeepRecentMessages: 0, CompactThreshold: 0.5, ContextLimit: 8000})
 	msgs := []llm.Message{
 		{Role: "user", Content: strings.Repeat("word ", 20000)},
 	}
@@ -201,7 +201,7 @@ func TestSnapshotAutoCompactEnabledByDefault(t *testing.T) {
 // history compacts fine once the guard is lifted.
 func TestCompactRefusesTinyMiddle(t *testing.T) {
 	provider := &recordingProvider{}
-	m := NewManager(provider, Settings{KeepRecentMessages: 2, ContextLimit: 100000, CompactThreshold: 0.01})
+	m := NewManager(provider, Settings{CompactKeepRecentMessages: 2, ContextLimit: 100000, CompactThreshold: 0.01})
 	msgs := []llm.Message{
 		{Role: "user", Content: "first"},
 		{Role: "assistant", Content: "a1"},
@@ -220,7 +220,7 @@ func TestCompactRefusesTinyMiddle(t *testing.T) {
 	}
 
 	// A middle above the default threshold is not refused.
-	big := NewManager(&recordingProvider{}, Settings{KeepRecentMessages: 2, ContextLimit: 100000, CompactThreshold: 0.01})
+	big := NewManager(&recordingProvider{}, Settings{CompactKeepRecentMessages: 2, ContextLimit: 100000, CompactThreshold: 0.01})
 	bigMsgs := append([]llm.Message{
 		{Role: "user", Content: "first"},
 		{Role: "user", Content: strings.Repeat("substantial middle content ", 120)}, // ~1.5k tokens

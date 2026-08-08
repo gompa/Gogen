@@ -286,12 +286,12 @@ func TestTokenCountsCacheIncremental(t *testing.T) {
 func TestShouldCompactUsingCountsMatchesDirect(t *testing.T) {
 	provider := &statsStubProvider{limit: 1000}
 	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{
-		ContextLimit:       1000,
-		KeepRecentMessages: 2,
+		ContextLimit:              1000,
+		CompactKeepRecentMessages: 2,
 	})
 	a := NewAgent(provider, &Executor{WorkingDir: "."}, ctxMgr)
 
-	// Enough messages to exceed KeepRecentMessages+1.
+	// Enough messages to exceed CompactKeepRecentMessages+1.
 	for i := 0; i < 12; i++ {
 		a.appendMessage(llm.Message{Role: "user", Content: strings.Repeat("x", 400)})
 		a.appendMessage(llm.Message{Role: "assistant", Content: strings.Repeat("y", 400)})
@@ -329,11 +329,11 @@ func TestHandleContextCommand(t *testing.T) {
 func TestCompactHistoryClearsLastTurnUsage(t *testing.T) {
 	provider := &statsStubProvider{limit: 1000}
 	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{
-		ContextLimit:       1000,
-		KeepRecentMessages: 2,
+		ContextLimit:              1000,
+		CompactKeepRecentMessages: 2,
 	})
 	a := NewAgent(provider, &Executor{WorkingDir: "."}, ctxMgr)
-	// Enough messages to exceed KeepRecentMessages+1 for compaction, sized so
+	// Enough messages to exceed CompactKeepRecentMessages+1 for compaction, sized so
 	// the summarized middle clears the minimum-middle guard.
 	for i := 0; i < 6; i++ {
 		a.Messages = append(a.Messages,
