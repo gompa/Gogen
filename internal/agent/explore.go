@@ -87,7 +87,8 @@ func resetGlobRegexCacheLocked() {
 // GlobFiles / search_code), so results can be passed straight to read_file.
 // When recursive is true, walks the tree (max 500 paths).
 // When trackedOnly is true, results are filtered to git-tracked files.
-func (e *Executor) ListFiles(path string, recursive, trackedOnly bool) (string, error) {
+// ctx is threaded into the tree walk so cancellation aborts large listings.
+func (e *Executor) ListFiles(ctx context.Context, path string, recursive, trackedOnly bool) (string, error) {
 	searchRoot, relPrefix, err := e.searchRoot(path)
 	if err != nil {
 		return "", err
@@ -109,7 +110,7 @@ func (e *Executor) ListFiles(path string, recursive, trackedOnly bool) (string, 
 	}
 
 	var lines []string
-	err = walkTree(nil, searchRoot, relPrefix, walkOpts{includeDirs: true}, func(path, rel string, d os.DirEntry) error {
+	err = walkTree(ctx, searchRoot, relPrefix, walkOpts{includeDirs: true}, func(path, rel string, d os.DirEntry) error {
 		if d.IsDir() {
 			rel += "/"
 		}
@@ -213,7 +214,8 @@ var errExploreTruncated = fmt.Errorf("explore truncated")
 
 // GlobFiles finds files matching a glob pattern under path (default .).
 // Patterns may match basenames (*.go) or relative paths (internal/*.go, **/*.md).
-func (e *Executor) GlobFiles(pattern, subpath string, trackedOnly bool) (string, error) {
+// ctx is threaded into the tree walk so cancellation aborts large globs.
+func (e *Executor) GlobFiles(ctx context.Context, pattern, subpath string, trackedOnly bool) (string, error) {
 	pattern = strings.TrimSpace(pattern)
 	if pattern == "" {
 		return "", fmt.Errorf("pattern is required")
@@ -224,7 +226,7 @@ func (e *Executor) GlobFiles(pattern, subpath string, trackedOnly bool) (string,
 	}
 
 	var matches []string
-	err = walkTree(nil, searchRoot, relPrefix, walkOpts{glob: pattern, includeHidden: true}, func(path, rel string, d os.DirEntry) error {
+	err = walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: pattern, includeHidden: true}, func(path, rel string, d os.DirEntry) error {
 		matches = append(matches, rel)
 		if len(matches) >= exploreMaxEntries {
 			return errExploreTruncated

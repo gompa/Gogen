@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,7 +15,8 @@ type dirCount struct {
 }
 
 // RepoOverview summarizes top-level layout and file counts (no global index).
-func (e *Executor) RepoOverview() (string, error) {
+// ctx is threaded into the tree walk so cancellation aborts the scan.
+func (e *Executor) RepoOverview(ctx context.Context) (string, error) {
 	searchRoot, _, err := e.searchRoot("")
 	if err != nil {
 		return "", err
@@ -25,7 +27,7 @@ func (e *Executor) RepoOverview() (string, error) {
 	var rootFiles []string
 	total := 0
 
-	err = walkTree(nil, searchRoot, "", walkOpts{}, func(path, rel string, d os.DirEntry) error {
+	err = walkTree(ctx, searchRoot, "", walkOpts{}, func(path, rel string, d os.DirEntry) error {
 		top := firstPathSegment(rel)
 		if top == "" {
 			// Root-level file

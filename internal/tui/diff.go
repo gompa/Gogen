@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 )
 
@@ -50,4 +51,32 @@ func isDiffContent(s string) bool {
 	hasHunk := strings.Contains(s, "@@ -")
 	hasHeader := strings.Contains(s, "--- ") || strings.Contains(s, "+++ ")
 	return hasHunk || hasHeader
+}
+
+// diffBlock renders a unified diff inside the shared "╭─ diff ─" /
+// "╰───────" frame used by both the live streaming and history render
+// paths. Returns nil when diff is empty or whitespace-only, so callers can
+// append the result unconditionally.
+func diffBlock(diff string) []string {
+	rendered := renderDiff(diff)
+	if rendered == "" {
+		return nil
+	}
+	lines := []string{DiffMetaStyle.Render("  ╭─ diff ─")}
+	lines = append(lines, strings.Split(rendered, "\n")...)
+	lines = append(lines, DiffMetaStyle.Render("  ╰───────"))
+	return lines
+}
+
+// toolResultStatusLine renders the "↳ name  ok|failed" header line for a
+// tool result, shared by the live streaming and history render paths.
+func toolResultStatusLine(name string, success bool) string {
+	status := "ok"
+	statusStyle := ToolResultOKStyle
+	if !success {
+		status = "failed"
+		statusStyle = ToolResultFailStyle
+	}
+	mark := ToolResultMarkStyle.Render("  ↳")
+	return fmt.Sprintf("%s %s  %s", mark, name, statusStyle.Render(status))
 }

@@ -441,14 +441,7 @@ func (m *Model) handleStreamToolResult(id string, name string, result string, su
 	// rebuilds once instead of on every appendChatLine call.
 	var newLines []string
 
-	status := "ok"
-	statusStyle := ToolResultOKStyle
-	if !success {
-		status = "failed"
-		statusStyle = ToolResultFailStyle
-	}
-	mark := ToolResultMarkStyle.Render("  ↳")
-	newLines = append(newLines, fmt.Sprintf("%s %s  %s", mark, name, statusStyle.Render(status)))
+	newLines = append(newLines, toolResultStatusLine(name, success))
 
 	// For patch_file: render the original diff with colors
 	showDiffResult := name == "show_diff" && isDiffContent(result)
@@ -466,20 +459,10 @@ func (m *Model) handleStreamToolResult(id string, name string, result string, su
 				newLines = append(newLines, DimStyle.Render(fmt.Sprintf("  %s", summary)))
 			}
 		} else if diff, ok := m.toolCallDiffs[id]; ok && diff != "" {
-			rendered := renderDiff(diff)
-			if rendered != "" {
-				newLines = append(newLines, DiffMetaStyle.Render("  ╭─ diff ─"))
-				newLines = append(newLines, strings.Split(rendered, "\n")...)
-				newLines = append(newLines, DiffMetaStyle.Render("  ╰───────"))
-			}
+			newLines = append(newLines, diffBlock(diff)...)
 		}
 	} else if showDiffResult {
-		rendered := renderDiff(result)
-		if rendered != "" {
-			newLines = append(newLines, DiffMetaStyle.Render("  ╭─ diff ─"))
-			newLines = append(newLines, strings.Split(rendered, "\n")...)
-			newLines = append(newLines, DiffMetaStyle.Render("  ╰───────"))
-		}
+		newLines = append(newLines, diffBlock(result)...)
 	} else if m.verbose {
 		for _, line := range strings.Split(result, "\n") {
 			newLines = append(newLines, ToolResultBodyStyle.Render("  │ "+line))

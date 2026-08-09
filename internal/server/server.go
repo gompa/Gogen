@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"embed"
 	"encoding/hex"
 	"errors"
@@ -15,8 +16,10 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gogen/internal/agent"
@@ -126,6 +129,70 @@ const (
 	wsStreamDrainWait = 2 * time.Second
 )
 
+// ── Debug-only transport instruments (live harness) ─────────────────────
+// The jsdom harness (tmp/live_stall_detach.js) cannot create real TCP
+// backpressure — its WebSocket drains instantly — so these env vars inject
+// the stall server-side. Every knob is off by default; with none set the
+// write path is byte-for-byte unchanged.
+//
+//	GOGEN_WS_SENDQ_SIZE         override wsSendQueueSize (default 4096). A
+//	                            tiny queue under a stalling writer overflows
+//	                            quickly, so enqueueJSON's 5s timeout fires
+//	                            and broadcast detaches the socket — the
+//	                            "stops mid-turn" candidate (DEBUG_PLAN.md C).
+//	GOGEN_WS_STALL_MS           sleep this long before every data write once
+//	                            stalling has begun (simulated slow client).
+//	GOGEN_WS_STALL_AFTER_MS     begin stalling only once the connection has
+//	                            been alive this long, so the harness can set
+//	                            up panes and turns at normal speed first.
+//	GOGEN_WS_STALL_FOR_MS       end stalling this long after it began, so
+//	                            the writer drains the queue and a re-attach
+//	                            can recover; 0/unset = stall for the
+//	                            connection's lifetime.
+//	GOGEN_WS_STALL_FIRST_CONN=1 stall only the first connection, so a
+//	                            reconnect (e.g. a stall ≥ wsWriteTimeout that
+//	                            kills the writer) is clean.
+type wsDebugConfig struct {
+	sendQSize  int
+	stall      time.Duration
+	stallAfter time.Duration
+	stallFor   time.Duration
+	firstConn  bool
+}
+
+var (
+	wsDebugOnce  sync.Once
+	wsDebugCfg   wsDebugConfig
+	wsDebugConns atomic.Uint64 // debug-only: connection ordinal for GOGEN_WS_STALL_FIRST_CONN
+)
+
+// wsDebugConfigLoad reads the GOGEN_WS_STALL_*/GOGEN_WS_SENDQ_SIZE env vars
+// once per process (they cannot change mid-run) and returns the config.
+func wsDebugConfigLoad() wsDebugConfig {
+	wsDebugOnce.Do(func() {
+		cfg := wsDebugConfig{}
+		if v := strings.TrimSpace(os.Getenv("GOGEN_WS_SENDQ_SIZE")); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				cfg.sendQSize = n
+			}
+		}
+		ms := func(name string) time.Duration {
+			if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+				if n, err := strconv.Atoi(v); err == nil && n > 0 {
+					return time.Duration(n) * time.Millisecond
+				}
+			}
+			return 0
+		}
+		cfg.stall = ms("GOGEN_WS_STALL_MS")
+		cfg.stallAfter = ms("GOGEN_WS_STALL_AFTER_MS")
+		cfg.stallFor = ms("GOGEN_WS_STALL_FOR_MS")
+		cfg.firstConn = strings.TrimSpace(os.Getenv("GOGEN_WS_STALL_FIRST_CONN")) == "1"
+		wsDebugCfg = cfg
+	})
+	return wsDebugCfg
+}
+
 // drainStreamErr waits for the stream goroutine to signal exit.
 // Returns true if the signal arrived, false on timeout (caller should keep ch).
 func drainStreamErr(ch chan error) bool {
@@ -180,9 +247,14 @@ func (s *Server) spawnUserTerminal(ws *wsConn, holder *userTermHolder) {
 }
 
 func newWSConn(conn *websocket.Conn) *wsConn {
+	cfg := wsDebugConfigLoad()
+	qsize := wsSendQueueSize
+	if cfg.sendQSize > 0 {
+		qsize = cfg.sendQSize // GOGEN_WS_SENDQ_SIZE: debug-only tiny queue
+	}
 	w := &wsConn{
 		conn:  conn,
-		sendQ: make(chan WSMessage, wsSendQueueSize),
+		sendQ: make(chan WSMessage, qsize),
 		quit:  make(chan struct{}),
 		done:  make(chan struct{}),
 	}
@@ -199,6 +271,23 @@ func (w *wsConn) writeLoop() {
 	defer close(w.done)
 	ticker := time.NewTicker(wsPingInterval)
 	defer ticker.Stop()
+	// Debug-only backpressure (tmp/live_stall_detach.js): sleep before each
+	// data write inside the [stallStart, stallEnd] window to simulate a
+	// client that cannot drain its socket. The write deadline is set BEFORE
+	// the sleep, so a stall ≥ wsWriteTimeout trips it and the writer dies
+	// (socket drop → browser reconnects), while a smaller stall merely makes
+	// the writer lag the stream and the send queue fills (detach via
+	// enqueueJSON's 5s timeout). Zero stall = the path is untouched.
+	cfg := wsDebugConfigLoad()
+	stallStart := time.Now().Add(cfg.stallAfter)
+	stallEnd := stallStart.Add(cfg.stallFor)
+	if cfg.stallFor == 0 {
+		stallEnd = stallStart.Add(24 * time.Hour) // unset = stall for the connection's lifetime
+	}
+	stallEnabled := cfg.stall > 0
+	if cfg.firstConn && wsDebugConns.Add(1) > 1 {
+		stallEnabled = false // only the first connection stalls; reconnects are clean
+	}
 	for {
 		select {
 		case <-w.quit:
@@ -209,6 +298,9 @@ func (w *wsConn) writeLoop() {
 				w.mu.Unlock()
 				log.Printf("websocket set write deadline: %v", err)
 				return
+			}
+			if stallEnabled && time.Now().After(stallStart) && time.Now().Before(stallEnd) {
+				time.Sleep(cfg.stall)
 			}
 			err := w.conn.WriteJSON(msg)
 			w.mu.Unlock()
@@ -316,7 +408,6 @@ type SessionEntry struct {
 	MessageCount int    `json:"messageCount,omitempty"`
 	Label        string `json:"label,omitempty"`
 	Oneshot      bool   `json:"oneshot,omitempty"`
-	Current      bool   `json:"current,omitempty"`
 	// Active marks sessions with a live in-memory runtime: the client
 	// can render "resume to continue" for them.
 	// Idle runtimes whose last client detached are orphan-evicted (they
@@ -404,10 +495,9 @@ type WSMessage struct {
 	SessionID             string       `json:"sessionId,omitempty"`
 	SessionAction         string       `json:"sessionAction,omitempty"`
 	SessionLabel          string       `json:"sessionLabel,omitempty"`
-	// TurnActive/StartedAt describe a session's in-flight turn; sent in
-	// session_state replies so a reconnecting client can render "resuming…".
+	// TurnActive describes a session's in-flight turn; sent in session_state
+	// replies so a reconnecting client can render "resuming…".
 	TurnActive   bool           `json:"turnActive,omitempty"`
-	StartedAt    string         `json:"startedAt,omitempty"`
 	MessageIndex int            `json:"messageIndex,omitempty"`
 	Sessions     []SessionEntry `json:"sessions,omitempty"`
 	History      []HistoryEntry `json:"history,omitempty"`
@@ -600,7 +690,7 @@ func fillModelPricing(a *agent.Agent, msg *WSMessage) {
 	}
 }
 
-func sessionEntries(list []agent.SessionInfo, currentID string, active map[string]bool) []SessionEntry {
+func sessionEntries(list []agent.SessionInfo, active map[string]bool) []SessionEntry {
 	out := make([]SessionEntry, len(list))
 	for i, s := range list {
 		out[i] = SessionEntry{
@@ -609,7 +699,6 @@ func sessionEntries(list []agent.SessionInfo, currentID string, active map[strin
 			MessageCount: s.MessageCount,
 			Label:        s.Label,
 			Oneshot:      s.Oneshot,
-			Current:      s.ID == currentID,
 			Active:       active[s.ID],
 		}
 	}
@@ -754,7 +843,7 @@ func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, rt *
 	// session until it's done" symptom.
 	if err == nil && len(result.Sessions) > 0 {
 		resp.Type = "sessions"
-		resp.Sessions = sessionEntries(result.Sessions, a.SessionID, s.registry.activeSet())
+		resp.Sessions = sessionEntries(result.Sessions, s.registry.activeSet())
 	}
 	cfg = agentConfigMsgBasic(a)
 	if len(result.History) > 0 {
@@ -1053,6 +1142,15 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			if target == nil {
 				target = s.registry.first()
 			}
+			if target == nil {
+				// Registry empty (every runtime evicted or closed): there is
+				// no session to query for the list. Drop the request like
+				// the other session-scoped handlers — handleWSListSessions
+				// dereferences rt.agent in a goroutine and a nil runtime
+				// would panic the whole process. The client re-requests
+				// after its next session_new / session_attach.
+				break
+			}
 			s.handleWSListSessions(ws, target)
 		case "session_new", "session_resume", "session_delete":
 			// session_new creates for the connection's CURRENT pane, but the
@@ -1071,6 +1169,13 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 		case "list_models":
 			if target == nil {
 				target = s.registry.first()
+			}
+			if target == nil {
+				// Registry empty: drop the request (handleWSListModels
+				// dereferences rt.agent in a goroutine and a nil runtime
+				// would panic the process). Matches the other
+				// session-scoped handlers.
+				break
 			}
 			s.handleWSListModels(ws, r.Context(), target)
 		case "set_model":
@@ -1254,16 +1359,12 @@ func (s *Server) attachSession(ws *wsConn, r *http.Request, rt *sessionRuntime) 
 // sendSessionState writes the session_state message describing the session's
 // in-flight turn so a reconnecting client can render "resuming…".
 func (s *Server) sendSessionState(ws *wsConn, rt *sessionRuntime) {
-	active, started := rt.turnState()
-	msg := WSMessage{
+	active, _ := rt.turnState()
+	_ = ws.writeJSON(WSMessage{
 		Type:       "session_state",
 		SessionID:  rt.agent.SessionID,
 		TurnActive: active,
-	}
-	if !started.IsZero() {
-		msg.StartedAt = started.UTC().Format(time.RFC3339Nano)
-	}
-	_ = ws.writeJSON(msg)
+	})
 }
 
 // HandleWSEditor serves the editor WebSocket endpoint (/ws/editor). It is the
@@ -1325,14 +1426,6 @@ func (s *Server) handleWSListSessions(ws *wsConn, rt *sessionRuntime) {
 			_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", listErr)})
 			return
 		}
-		// Read the current session id after listing so the "current" marker
-		// is as fresh as possible.
-		// SessionID is immutable in web mode (set at agent construction;
-		// session ops create new agents rather than mutating live ones), so no
-		// turnMu is needed — a running turn holds it for its entire duration
-		// and would otherwise delay the sidebar list behind the responding
-		// session.
-		sessionID := rt.agent.SessionID
 		// The reply deliberately carries NO SessionID: the sessions payload
 		// is connection-scoped sidebar state (the full saved list), not a
 		// message for one session. Tagging it with the current session id
@@ -1340,7 +1433,7 @@ func (s *Server) handleWSListSessions(ws *wsConn, rt *sessionRuntime) {
 		// the active pane — e.g. after another tab moved the global default.
 		_ = ws.writeJSON(WSMessage{
 			Type:     "sessions",
-			Sessions: sessionEntries(sessions, sessionID, s.registry.activeSet()),
+			Sessions: sessionEntries(sessions, s.registry.activeSet()),
 		})
 	}()
 }
@@ -2229,21 +2322,31 @@ func (s *Server) checkAuth(r *http.Request) bool {
 		return true
 	}
 	if c, err := r.Cookie(authCookieName); err == nil {
-		if strings.TrimSpace(c.Value) == s.authToken {
+		if tokenMatches(strings.TrimSpace(c.Value), s.authToken) {
 			return true
 		}
 	}
-	if tok := strings.TrimSpace(r.Header.Get("X-Gogen-Token")); tok != "" && tok == s.authToken {
+	if tok := strings.TrimSpace(r.Header.Get("X-Gogen-Token")); tokenMatches(tok, s.authToken) {
 		return true
 	}
 	auth := strings.TrimSpace(r.Header.Get("Authorization"))
 	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
 		tok := strings.TrimSpace(auth[7:])
-		if tok == s.authToken {
+		if tokenMatches(tok, s.authToken) {
 			return true
 		}
 	}
 	return false
+}
+
+// tokenMatches compares a candidate token against the expected one in
+// constant time so the auth check does not leak timing information about
+// the token value. An empty candidate never matches.
+func tokenMatches(candidate, expected string) bool {
+	if candidate == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(candidate), []byte(expected)) == 1
 }
 
 // Start serves the web UI until ctx is cancelled or the listener fails.

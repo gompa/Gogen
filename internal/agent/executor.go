@@ -427,6 +427,40 @@ func (e *Executor) BuildCommand(ctx context.Context, command string) (*exec.Cmd,
 	return cmd, nil
 }
 
+// outputBuffer is a mutex-guarded byte buffer shared by the command output
+// accumulators. exec copies stdout and stderr to the same writer from
+// separate goroutines, so every mutation is serialized.
+type outputBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+// append adds p to the buffer and, when max > 0, trims it to the last max
+// bytes afterwards (so long-running commands cannot grow memory without
+// bound). after, when non-nil, runs while the lock is still held so callers
+// can perform side effects (like forwarding a chunk to a live-output sink)
+// atomically with the buffer update, preserving write ordering.
+func (b *outputBuffer) append(p []byte, max int, after func()) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf.Write(p)
+	if max > 0 {
+		if overflow := b.buf.Len() - max; overflow > 0 {
+			b.buf.Next(overflow)
+		}
+	}
+	if after != nil {
+		after()
+	}
+}
+
+// string returns the accumulated output.
+func (b *outputBuffer) string() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // commandOutputWriter accumulates a command's combined stdout+stderr and
 // forwards each chunk to the optional sink as it arrives. Using a single
 // writer for both streams keeps the merged order as close as possible to
@@ -437,8 +471,7 @@ func (e *Executor) BuildCommand(ctx context.Context, command string) (*exec.Cmd,
 // chunk ordering. Sinks must therefore be fast and must not call back into
 // the executor.
 type commandOutputWriter struct {
-	mu      sync.Mutex
-	buf     bytes.Buffer
+	outputBuffer
 	command string
 	sink    ToolOutputSink
 }
@@ -451,21 +484,18 @@ func (w *commandOutputWriter) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.buf.Write(p)
-	if w.sink != nil {
-		w.sink(w.command, string(p))
-	}
+	w.append(p, 0, func() {
+		if w.sink != nil {
+			w.sink(w.command, string(p))
+		}
+	})
 	return len(p), nil
 }
 
 // String returns the accumulated output. Safe to call after Wait returns
 // (exec waits for the pipe-copy goroutines before Wait completes).
 func (w *commandOutputWriter) String() string {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.buf.String()
+	return w.string()
 }
 
 func (e *Executor) buildShellCommand(ctx context.Context, command string) (*exec.Cmd, error) {

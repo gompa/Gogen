@@ -44,14 +44,6 @@ var fetchURLValidator = validateFetchURL
 // webCfg holds all runtime web fetch/search configuration behind a single mutex.
 var webCfg webCfgState
 
-// envDefaults caches env-var lookups once at first access to avoid per-call syscalls.
-var envDefaults struct {
-	fetchOn       bool
-	searchOn      bool
-	fetchMode     string
-	fetchModeOnce sync.Once
-}
-
 // webCfgState holds all runtime web fetch/search configuration behind a single mutex.
 type webCfgState struct {
 	mu            sync.RWMutex
@@ -63,26 +55,34 @@ type webCfgState struct {
 	searchAPIKey  string
 }
 
-// envToggle is a thread-safe one-shot boolean env-var reader.
-// Each variable gets its own instance so they cache independently.
-type envToggle struct {
+// envOnce is a one-shot cache for an environment variable. The raw value is
+// read on first access to avoid per-call syscalls; the parsed result is
+// derived from that cached raw value on every call, so the per-variable
+// parsing stays cheap and each variable caches independently.
+type envOnce struct {
 	once sync.Once
-	val  bool
+	val  string
 }
 
-// get reads envVar on first call and caches the boolean result.
-func (t *envToggle) get(envVar string) bool {
-	t.once.Do(func() {
-		raw := strings.TrimSpace(os.Getenv(envVar))
-		t.val = strings.EqualFold(raw, "on") || strings.EqualFold(raw, "1") || strings.EqualFold(raw, "true")
-	})
-	return t.val
+// get returns the value of key, read from the environment on first use.
+func (e *envOnce) get(key string) string {
+	e.once.Do(func() { e.val = os.Getenv(key) })
+	return e.val
 }
 
-var fetchOnToggle, searchOnToggle envToggle
+var (
+	fetchOnEnv, searchOnEnv, fetchModeEnv, allowedDomainsEnv envOnce
+)
 
-func envFetchOn() bool  { return fetchOnToggle.get("GOGEN_WEB_FETCH") }
-func envSearchOn() bool { return searchOnToggle.get("GOGEN_WEB_SEARCH") }
+func envFetchOn() bool {
+	raw := strings.TrimSpace(fetchOnEnv.get("GOGEN_WEB_FETCH"))
+	return strings.EqualFold(raw, "on") || strings.EqualFold(raw, "1") || strings.EqualFold(raw, "true")
+}
+
+func envSearchOn() bool {
+	raw := strings.TrimSpace(searchOnEnv.get("GOGEN_WEB_SEARCH"))
+	return strings.EqualFold(raw, "on") || strings.EqualFold(raw, "1") || strings.EqualFold(raw, "true")
+}
 
 // normalizeFetchMode validates a web fetch mode ("https" or "all"). Unknown
 // values are clamped to "https" so a typo cannot silently permit plaintext
@@ -102,10 +102,7 @@ func normalizeFetchMode(mode string) string {
 
 // envFetchMode returns the web fetch mode from env. Cached after first read.
 func envFetchMode() string {
-	envDefaults.fetchModeOnce.Do(func() {
-		envDefaults.fetchMode = normalizeFetchMode(os.Getenv("GOGEN_WEB_FETCH_MODE"))
-	})
-	return envDefaults.fetchMode
+	return normalizeFetchMode(fetchModeEnv.get("GOGEN_WEB_FETCH_MODE"))
 }
 
 func (c *webCfgState) isFetchOn() bool {
@@ -170,14 +167,8 @@ func parseDomainList(raw string) []string {
 }
 
 // envAllowedDomains parses and caches GOGEN_WEB_ALLOWED_DOMAINS from env.
-var envAllowedDomainsVal []string
-var envAllowedDomainsOnce sync.Once
-
 func envAllowedDomains() []string {
-	envAllowedDomainsOnce.Do(func() {
-		envAllowedDomainsVal = parseDomainList(os.Getenv("GOGEN_WEB_ALLOWED_DOMAINS"))
-	})
-	return envAllowedDomainsVal
+	return parseDomainList(allowedDomainsEnv.get("GOGEN_WEB_ALLOWED_DOMAINS"))
 }
 
 func (c *webCfgState) searchBE() string {

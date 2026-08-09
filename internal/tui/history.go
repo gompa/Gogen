@@ -102,24 +102,13 @@ func renderToolResult(msg llm.Message, tcMap map[string]llm.ToolCall) []string {
 
 	// Detect success/failure heuristically from the stored message content.
 	success := !strings.HasPrefix(strings.TrimSpace(msg.Content), "Error:")
-	status := "ok"
-	statusStyle := ToolResultOKStyle
-	if !success {
-		status = "failed"
-		statusStyle = ToolResultFailStyle
-	}
 
-	mark := ToolResultMarkStyle.Render("  ↳")
-	lines = append(lines, fmt.Sprintf("%s %s  %s", mark, toolName, statusStyle.Render(status)))
+	lines = append(lines, toolResultStatusLine(toolName, success))
 
 	// show_diff: when the result looks like a unified diff, render it coloured
 	// and skip the summary (matches the live path).
 	if toolName == "show_diff" && isDiffContent(msg.Content) {
-		if rendered := renderDiff(msg.Content); rendered != "" {
-			lines = append(lines, DiffMetaStyle.Render("  ╭─ diff ─"))
-			lines = append(lines, strings.Split(rendered, "\n")...)
-			lines = append(lines, DiffMetaStyle.Render("  ╰───────"))
-		}
+		lines = append(lines, diffBlock(msg.Content)...)
 		return lines
 	}
 
@@ -127,11 +116,7 @@ func renderToolResult(msg llm.Message, tcMap map[string]llm.ToolCall) []string {
 	// available). Like the live path, skip the summary when a diff is shown.
 	if toolName == "patch_file" && hasTC {
 		if diff, ok := tc.Args["diff"].(string); ok && diff != "" {
-			if rendered := renderDiff(diff); rendered != "" {
-				lines = append(lines, DiffMetaStyle.Render("  ╭─ diff ─"))
-				lines = append(lines, strings.Split(rendered, "\n")...)
-				lines = append(lines, DiffMetaStyle.Render("  ╰───────"))
-			}
+			lines = append(lines, diffBlock(diff)...)
 			return lines
 		}
 	}
@@ -142,20 +127,42 @@ func renderToolResult(msg llm.Message, tcMap map[string]llm.ToolCall) []string {
 	return lines
 }
 
-// formatToolArgs formats tool call arguments for display.
-func formatToolArgs(args map[string]interface{}) string {
+// formatArgsMap renders tool-call arguments as "key=value" pairs joined by
+// spaces, truncating values longer than maxLen (in runes) with an ellipsis.
+// skip, when non-nil, omits keys for which it returns true. When no key
+// survives, returns "".
+func formatArgsMap(args map[string]interface{}, maxLen int, skip func(string) bool) string {
 	if len(args) == 0 {
 		return ""
 	}
 	var parts []string
 	for k, v := range args {
+		if skip != nil && skip(k) {
+			continue
+		}
 		val := fmt.Sprintf("%v", v)
-		if len(val) > 80 {
-			val = truncateRunes(val, 77) + "..."
+		if len(val) > maxLen {
+			val = truncateRunes(val, maxLen-3) + "..."
 		}
 		parts = append(parts, fmt.Sprintf("%s=%q", k, val))
 	}
 	return strings.Join(parts, " ")
+}
+
+// formatToolArgs formats tool call arguments for display.
+func formatToolArgs(args map[string]interface{}) string {
+	return formatArgsMap(args, 80, nil)
+}
+
+// formatArgsCompact renders inline JSON tool-call args like formatToolArgs,
+// skipping the diff key; values longer than maxLen are truncated. When no
+// keys survive, returns "".
+func formatArgsCompact(rawJSON string, maxLen int) string {
+	args, err := parseInlineJSONArgs(rawJSON)
+	if err != nil || len(args) == 0 {
+		return ""
+	}
+	return formatArgsMap(args, maxLen, func(k string) bool { return k == "diff" })
 }
 
 // extractDiffValue extracts the "diff" string value from raw (possibly incomplete)
@@ -208,25 +215,4 @@ func extractDiffValue(rawJSON string) (string, bool) {
 		}
 	}
 	return buf.String(), buf.Len() > 0
-}
-
-// formatArgsCompact formats args like formatToolArgs but skips any key whose
-// value exceeds maxLen. When no keys survive, returns "".
-func formatArgsCompact(rawJSON string, maxLen int) string {
-	args, err := parseInlineJSONArgs(rawJSON)
-	if err != nil || len(args) == 0 {
-		return ""
-	}
-	var parts []string
-	for k, v := range args {
-		if k == "diff" {
-			continue
-		}
-		val := fmt.Sprintf("%v", v)
-		if len(val) > maxLen {
-			val = truncateRunes(val, maxLen-3) + "..."
-		}
-		parts = append(parts, fmt.Sprintf("%s=%q", k, val))
-	}
-	return strings.Join(parts, " ")
 }

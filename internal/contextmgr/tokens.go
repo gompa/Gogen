@@ -63,10 +63,9 @@ func sortedToolArgKeys(args map[string]interface{}) []string {
 // (GPT-family). Falls back to a bytes/4 heuristic if the tokenizer is unavailable.
 // No caching; the tokenizer is fast enough for on-demand use.
 func (m *Manager) EstimateTokens(messages []llm.Message) int {
-	count := messageCounterFor()
 	total := 0
-	for i := range messages {
-		total += computeMessageTokens(messages[i], count) + imageTokenEstimate(messages[i])
+	for _, c := range m.TokenCounts(messages) {
+		total += c
 	}
 	return total
 }

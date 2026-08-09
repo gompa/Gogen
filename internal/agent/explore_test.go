@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,7 +23,7 @@ func TestListFilesRecursive(t *testing.T) {
 	}
 
 	exec := NewExecutor(dir)
-	out, err := exec.ListFiles(".", true, false)
+	out, err := exec.ListFiles(context.Background(), ".", true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +44,7 @@ func TestListFilesSubdirWorkspaceRelative(t *testing.T) {
 
 	exec := NewExecutor(dir)
 
-	out, err := exec.ListFiles("internal", true, false)
+	out, err := exec.ListFiles(context.Background(), "internal", true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +57,7 @@ func TestListFilesSubdirWorkspaceRelative(t *testing.T) {
 		}
 	}
 
-	out, err = exec.ListFiles("internal", false, false)
+	out, err = exec.ListFiles(context.Background(), "internal", false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +79,7 @@ func TestGlobFiles(t *testing.T) {
 	}
 
 	exec := NewExecutor(dir)
-	out, err := exec.GlobFiles("*.go", "", false)
+	out, err := exec.GlobFiles(context.Background(), "*.go", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +109,7 @@ func TestGlobFilesHiddenFiles(t *testing.T) {
 	exec := NewExecutor(dir)
 
 	// Dotfiles are visible to the name-based discovery tool.
-	out, err := exec.GlobFiles("*.env", "", false)
+	out, err := exec.GlobFiles(context.Background(), "*.env", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +118,7 @@ func TestGlobFilesHiddenFiles(t *testing.T) {
 	}
 
 	// Hidden directories are still pruned: *.yml must not reach .github/.
-	out, err = exec.GlobFiles("*.yml", "", false)
+	out, err = exec.GlobFiles(context.Background(), "*.yml", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +127,7 @@ func TestGlobFilesHiddenFiles(t *testing.T) {
 	}
 
 	// ...but passing the hidden dir as the path argument reaches inside it.
-	out, err = exec.GlobFiles("*.yml", ".github", false)
+	out, err = exec.GlobFiles(context.Background(), "*.yml", ".github", false)
 	if err != nil {
 		t.Fatal(err)
 	}

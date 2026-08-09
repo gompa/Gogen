@@ -214,7 +214,9 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 	// server quit (ShutdownSessions flushes every registered runtime), and
 	// writing a 0-message file + index entry for each one would bloat the
 	// saved-session list with empty sessions after every restart (the
-	// sidebar renders every index entry, "0 msgs" included). A session that
+	// sidebar renders a row per index entry; a 0-message row shows no
+	// count — messageCount is omitempty, so zero is absent from the
+	// payload). A session that
 	// WAS saved before and was rolled back to empty must still update its
 	// file — the old content was deliberately dropped — so the skip applies
 	// only when neither the snapshot nor a pending delta exists on disk. A
@@ -222,8 +224,8 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 	// (RenameSession / the session_rename tool), so an empty session that
 	// was explicitly named must be persisted — otherwise the rename is
 	// silently dropped. (Oneshot single-prompt sessions are NOT an
-	// exception: their pre-prompt flush must stay skipped or every `-p` run
-	// would leave a "0 msgs" entry behind.)
+	// exception: their pre-prompt flush must stay skipped or every `-p`
+	// run would leave an empty session entry behind.)
 	if len(snap.Messages) == 0 && snap.Label == "" {
 		if _, err := os.Stat(path); os.IsNotExist(err) {
 			if _, err := os.Stat(s.deltaPath(snap.WorkingDir, id)); os.IsNotExist(err) {
@@ -654,6 +656,65 @@ func (s *Store) clearDeltaFile(workingDir, id string) error {
 	return os.Remove(s.deltaPath(workingDir, id))
 }
 
+// sessionFiles returns the names of the .json session files in the store
+// directory for workingDir (excluding index.json). A missing directory
+// surfaces as an *os.PathError from os.ReadDir (os.IsNotExist).
+func (s *Store) sessionFiles(workingDir string) ([]string, error) {
+	entries, err := os.ReadDir(s.dir(workingDir))
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		// Skip the index file if somehow named .json
+		if e.Name() == "index.json" {
+			continue
+		}
+		names = append(names, e.Name())
+	}
+	return names, nil
+}
+
+// legacySession is one entry from a legacy (no-index) session directory scan.
+type legacySession struct {
+	id      string
+	updated time.Time
+}
+
+// legacySessionUpdated scans the session files in workingDir's store
+// directory (legacy layout without an index) and returns each session id
+// with its delta-aware updated timestamp. Sessions whose updated timestamp
+// cannot be decoded are omitted. A missing directory surfaces as an
+// *os.PathError (os.IsNotExist). Shared by LatestID and prune, whose legacy
+// fallbacks need exactly this data.
+func (s *Store) legacySessionUpdated(workingDir string) ([]legacySession, error) {
+	names, err := s.sessionFiles(workingDir)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]legacySession, 0, len(names))
+	for _, name := range names {
+		id := strings.TrimSuffix(name, ".json")
+		data, err := os.ReadFile(s.path(workingDir, id))
+		if err != nil {
+			continue
+		}
+		var meta struct {
+			Updated time.Time `json:"updated"`
+		}
+		if err := json.Unmarshal(data, &meta); err != nil || meta.Updated.IsZero() {
+			continue
+		}
+		// Delta-aware timestamp (see sessionUpdatedAt): delta-only updates
+		// would otherwise under-rank next to full-save timestamps.
+		out = append(out, legacySession{id: id, updated: s.sessionUpdatedAt(workingDir, id, meta.Updated)})
+	}
+	return out, nil
+}
+
 // List returns session info for a working directory, ordered by most recently
 // updated first. Uses the metadata index when available, falling back to a
 // full-file scan for legacy directories. Results are cached briefly in memory
@@ -728,7 +789,7 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 
 	// Fallback: legacy full-file scan (no index file).
 	idx = &sessionIndex{} // collect entries to build the index
-	entries, err := os.ReadDir(s.dir(workingDir))
+	names, err := s.sessionFiles(workingDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -740,15 +801,8 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 		updated time.Time
 	}
 	var items []item
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			continue
-		}
-		// Skip the index file if somehow named .json
-		if e.Name() == "index.json" {
-			continue
-		}
-		id := strings.TrimSuffix(e.Name(), ".json")
+	for _, name := range names {
+		id := strings.TrimSuffix(name, ".json")
 		data, err := os.ReadFile(s.path(workingDir, id))
 		if err != nil {
 			continue
@@ -818,8 +872,7 @@ func (s *Store) LatestID(workingDir string) (string, error) {
 	}
 
 	// Fallback: scan all session files (legacy directories without index).
-	dir := s.dir(workingDir)
-	entries, err := os.ReadDir(dir)
+	legacy, err := s.legacySessionUpdated(workingDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Already tried index above; nothing more to do.
@@ -829,26 +882,10 @@ func (s *Store) LatestID(workingDir string) (string, error) {
 	}
 	var latestID string
 	var latestUpdated time.Time
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
-		if err != nil {
-			continue
-		}
-		var meta struct {
-			Updated time.Time `json:"updated"`
-		}
-		if err := json.Unmarshal(data, &meta); err != nil || meta.Updated.IsZero() {
-			continue
-		}
-		// Delta-aware timestamp (see sessionUpdatedAt): delta-only updates
-		// would otherwise under-rank next to full-save timestamps.
-		id := strings.TrimSuffix(e.Name(), ".json")
-		if updated := s.sessionUpdatedAt(workingDir, id, meta.Updated); updated.After(latestUpdated) {
-			latestUpdated = updated
-			latestID = id
+	for _, l := range legacy {
+		if l.updated.After(latestUpdated) {
+			latestUpdated = l.updated
+			latestID = l.id
 		}
 	}
 	return latestID, nil
@@ -1006,62 +1043,24 @@ func (s *Store) writeIndex(workingDir string, idx *sessionIndex) error {
 	return ioutil.WriteFileAtomicNoSync(indexPath, data, 0o600)
 }
 
-// updateIndex adds or updates an entry in the session metadata index.
-// created is written alongside updated so a later cache-miss Save (e.g. after
-// a process restart) can recover the immutable Created timestamp from the
-// index instead of re-reading the session file. Existing entries keep their
-// Created when created is zero (defensive: Save always passes non-zero).
-func (s *Store) updateIndex(workingDir, id string, created, updated time.Time, msgCount int, label string, oneshot bool) {
+// mutateIndex reads the session metadata index, applies mutate, and writes it
+// back when mutate reports a change. When createIfMissing is false and no
+// index file exists, the mutation is a no-op; when true, a fresh empty index
+// is passed in so callers can seed the first entry. Write errors are returned
+// so callers that care (touchIndex) can propagate them; the other index
+// mutators swallow them, matching their historical behavior.
+func (s *Store) mutateIndex(workingDir string, createIfMissing bool, mutate func(idx *sessionIndex) bool) error {
 	if !s.enabled {
-		return
+		return nil
 	}
 	idx := s.readIndex(workingDir)
 	if idx == nil {
+		if !createIfMissing {
+			return nil
+		}
 		idx = &sessionIndex{}
 	}
-	found := false
-	for i, e := range idx.Entries {
-		if e.ID == id {
-			if !created.IsZero() {
-				idx.Entries[i].Created = created
-			}
-			idx.Entries[i].Updated = updated
-			idx.Entries[i].Oneshot = oneshot
-			idx.Entries[i].MessageCount = msgCount
-			idx.Entries[i].Label = label
-			found = true
-			break
-		}
-	}
-	if !found {
-		idx.Entries = append(idx.Entries, sessionIndexEntry{
-			ID: id, Created: created, Updated: updated, Oneshot: oneshot, MessageCount: msgCount, Label: label,
-		})
-	}
-	_ = s.writeIndex(workingDir, idx)
-	s.invalidateListCache(workingDir)
-}
-
-// touchIndex updates only the timestamp for a session in the index.
-func (s *Store) touchIndex(workingDir, id string, updated time.Time) error {
-	if !s.enabled {
-		return nil
-	}
-	idx := s.readIndex(workingDir)
-	if idx == nil {
-		// No index yet; nothing to touch.
-		return nil
-	}
-	found := false
-	for i, e := range idx.Entries {
-		if e.ID == id {
-			idx.Entries[i].Updated = updated
-			found = true
-			break
-		}
-	}
-	if !found {
-		// Entry not in index; skip. The list fallback will re-scan on next miss.
+	if !mutate(idx) {
 		return nil
 	}
 	if err := s.writeIndex(workingDir, idx); err != nil {
@@ -1071,84 +1070,108 @@ func (s *Store) touchIndex(workingDir, id string, updated time.Time) error {
 	return nil
 }
 
+// updateIndex adds or updates an entry in the session metadata index.
+// created is written alongside updated so a later cache-miss Save (e.g. after
+// a process restart) can recover the immutable Created timestamp from the
+// index instead of re-reading the session file. Existing entries keep their
+// Created when created is zero (defensive: Save always passes non-zero).
+func (s *Store) updateIndex(workingDir, id string, created, updated time.Time, msgCount int, label string, oneshot bool) {
+	s.mutateIndex(workingDir, true, func(idx *sessionIndex) bool {
+		found := false
+		for i, e := range idx.Entries {
+			if e.ID == id {
+				if !created.IsZero() {
+					idx.Entries[i].Created = created
+				}
+				idx.Entries[i].Updated = updated
+				idx.Entries[i].Oneshot = oneshot
+				idx.Entries[i].MessageCount = msgCount
+				idx.Entries[i].Label = label
+				found = true
+				break
+			}
+		}
+		if !found {
+			idx.Entries = append(idx.Entries, sessionIndexEntry{
+				ID: id, Created: created, Updated: updated, Oneshot: oneshot, MessageCount: msgCount, Label: label,
+			})
+		}
+		return true
+	})
+}
+
+// touchIndex updates only the timestamp for a session in the index.
+func (s *Store) touchIndex(workingDir, id string, updated time.Time) error {
+	return s.mutateIndex(workingDir, false, func(idx *sessionIndex) bool {
+		for i, e := range idx.Entries {
+			if e.ID == id {
+				idx.Entries[i].Updated = updated
+				return true
+			}
+		}
+		// Entry not in index; skip. The list fallback will re-scan on next miss.
+		return false
+	})
+}
+
 // updateIndexCount updates the timestamp and message count for a session in
 // the metadata index, preserving the label and oneshot flags. Used by
 // AppendMessages so listings stay accurate between full snapshots. Entries
 // missing from the index are skipped — the list fallback re-scans the
 // directory on the next miss.
 func (s *Store) updateIndexCount(workingDir, id string, updated time.Time, msgCount int) {
-	if !s.enabled {
-		return
-	}
-	idx := s.readIndex(workingDir)
-	if idx == nil {
-		return
-	}
-	found := false
-	for i, e := range idx.Entries {
-		if e.ID == id {
-			idx.Entries[i].Updated = updated
-			idx.Entries[i].MessageCount = msgCount
-			found = true
-			break
+	s.mutateIndex(workingDir, false, func(idx *sessionIndex) bool {
+		for i, e := range idx.Entries {
+			if e.ID == id {
+				idx.Entries[i].Updated = updated
+				idx.Entries[i].MessageCount = msgCount
+				return true
+			}
 		}
-	}
-	if !found {
-		return
-	}
-	if err := s.writeIndex(workingDir, idx); err != nil {
-		return
-	}
-	s.invalidateListCache(workingDir)
+		return false
+	})
 }
 
 // removeFromIndex deletes an entry from the session metadata index.
 func (s *Store) removeFromIndex(workingDir, id string) {
-	if !s.enabled {
-		return
-	}
-	idx := s.readIndex(workingDir)
-	if idx == nil {
-		return
-	}
-	filtered := idx.Entries[:0]
-	for _, e := range idx.Entries {
-		if e.ID != id {
-			filtered = append(filtered, e)
+	s.mutateIndex(workingDir, false, func(idx *sessionIndex) bool {
+		filtered := idx.Entries[:0]
+		for _, e := range idx.Entries {
+			if e.ID != id {
+				filtered = append(filtered, e)
+			}
 		}
-	}
-	if len(filtered) == len(idx.Entries) {
-		return // nothing removed
-	}
-	idx.Entries = filtered
-	_ = s.writeIndex(workingDir, idx)
+		if len(filtered) == len(idx.Entries) {
+			return false // nothing removed
+		}
+		idx.Entries = filtered
+		return true
+	})
 }
 
 // removeFromIndexBatch removes multiple entries from the session metadata index
 // in a single pass, rewriting the index file only once.
 func (s *Store) removeFromIndexBatch(workingDir string, ids []string) {
-	if !s.enabled || len(ids) == 0 {
+	if len(ids) == 0 {
 		return
 	}
-	idx := s.readIndex(workingDir)
-	if idx == nil {
-		return
-	}
-	del := make(map[string]struct{}, len(ids))
-	for _, id := range ids {
-		del[id] = struct{}{}
-	}
-	filtered := make([]sessionIndexEntry, 0, len(idx.Entries))
-	for _, e := range idx.Entries {
-		if _, ok := del[e.ID]; !ok {
-			filtered = append(filtered, e)
+	s.mutateIndex(workingDir, false, func(idx *sessionIndex) bool {
+		del := make(map[string]struct{}, len(ids))
+		for _, id := range ids {
+			del[id] = struct{}{}
 		}
-	}
-	if len(filtered) == len(idx.Entries) {
-		return
-	}
-	idx.Entries = filtered
-	_ = s.writeIndex(workingDir, idx)
+		filtered := make([]sessionIndexEntry, 0, len(idx.Entries))
+		for _, e := range idx.Entries {
+			if _, ok := del[e.ID]; !ok {
+				filtered = append(filtered, e)
+			}
+		}
+		if len(filtered) == len(idx.Entries) {
+			return false
+		}
+		idx.Entries = filtered
+		return true
+	})
 }
 
 // invalidateListCache clears the in-memory list cache for a working directory.
@@ -1225,27 +1248,12 @@ func (s *Store) prune(workingDir string, keepIDs ...string) {
 		}
 	} else {
 		// Fallback: read updated from each session JSON file.
-		entries, err := os.ReadDir(s.dir(workingDir))
+		legacy, err := s.legacySessionUpdated(workingDir)
 		if err != nil {
 			return
 		}
-		for _, e := range entries {
-			if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-				continue
-			}
-			id := strings.TrimSuffix(e.Name(), ".json")
-			data, err := os.ReadFile(s.path(workingDir, id))
-			if err != nil {
-				continue
-			}
-			var meta struct {
-				Updated time.Time `json:"updated"`
-			}
-			if err := json.Unmarshal(data, &meta); err != nil || meta.Updated.IsZero() {
-				continue
-			}
-			// Delta-aware timestamp (see sessionUpdatedAt).
-			items = append(items, item{id: id, updated: s.sessionUpdatedAt(workingDir, id, meta.Updated).UTC()})
+		for _, l := range legacy {
+			items = append(items, item{id: l.id, updated: l.updated.UTC()})
 		}
 	}
 	if len(items) == 0 {

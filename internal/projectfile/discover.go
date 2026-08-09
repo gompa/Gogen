@@ -23,9 +23,12 @@ var guidelineSearchPaths = []string{
 	".cursor/rules/gogen.md",
 }
 
-// DiscoverConfigPath returns the first config file (any format) under workingDir.
-func DiscoverConfigPath(workingDir string) (string, bool) {
-	for _, rel := range configSearchPaths {
+// discoverFirst returns the first existing, non-empty file among rels under
+// workingDir. prepare, when non-nil, transforms the raw content before the
+// empty check (e.g. stripping YAML front matter). Shared by
+// DiscoverConfigPath and DiscoverGuidelinesPath.
+func discoverFirst(workingDir string, rels []string, prepare func(string) string) (string, bool) {
+	for _, rel := range rels {
 		path := filepath.Join(workingDir, rel)
 		info, err := os.Stat(path)
 		if err != nil || info.IsDir() {
@@ -35,30 +38,9 @@ func DiscoverConfigPath(workingDir string) (string, bool) {
 		if err != nil {
 			continue
 		}
-		if strings.TrimSpace(string(data)) == "" {
-			continue
-		}
-		return path, true
-	}
-	return "", false
-}
-
-// DiscoverGuidelinesPath returns the first non-empty guidelines file under workingDir.
-func DiscoverGuidelinesPath(workingDir string) (string, bool) {
-	for _, rel := range guidelineSearchPaths {
-		path := filepath.Join(workingDir, rel)
-		info, err := os.Stat(path)
-		if err != nil || info.IsDir() {
-			continue
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		// .md files with front matter: skip the front matter, check if body exists.
 		body := string(data)
-		if strings.HasPrefix(strings.TrimRight(body, "\n"), "---") {
-			body = extractMarkdownBody(body)
+		if prepare != nil {
+			body = prepare(body)
 		}
 		if strings.TrimSpace(body) == "" {
 			continue
@@ -66,6 +48,22 @@ func DiscoverGuidelinesPath(workingDir string) (string, bool) {
 		return path, true
 	}
 	return "", false
+}
+
+// DiscoverConfigPath returns the first config file (any format) under workingDir.
+func DiscoverConfigPath(workingDir string) (string, bool) {
+	return discoverFirst(workingDir, configSearchPaths, nil)
+}
+
+// DiscoverGuidelinesPath returns the first non-empty guidelines file under workingDir.
+func DiscoverGuidelinesPath(workingDir string) (string, bool) {
+	return discoverFirst(workingDir, guidelineSearchPaths, func(body string) string {
+		// .md files with front matter: skip the front matter, check if body exists.
+		if strings.HasPrefix(strings.TrimRight(body, "\n"), "---") {
+			return extractMarkdownBody(body)
+		}
+		return body
+	})
 }
 
 // extractMarkdownBody returns the content after YAML front matter (--- … ---).

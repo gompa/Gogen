@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"gogen/internal/debuglog"
@@ -108,14 +109,12 @@ func isChmodUnsupported(err error) bool {
 }
 
 // containsAny reports whether s contains any of the given substrings.
+// Empty substrings never match (strings.Contains("", "") is true, so the
+// empty case is skipped explicitly to preserve the historical behavior).
 func containsAny(s string, substrs ...string) bool {
 	for _, sub := range substrs {
-		if len(sub) > 0 && len(s) >= len(sub) {
-			for i := 0; i <= len(s)-len(sub); i++ {
-				if s[i:i+len(sub)] == sub {
-					return true
-				}
-			}
+		if sub != "" && strings.Contains(s, sub) {
+			return true
 		}
 	}
 	return false

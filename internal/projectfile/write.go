@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"gogen/internal/config"
+	"gogen/internal/ioutil"
 	"gopkg.in/yaml.v3"
 )
 
@@ -25,8 +26,21 @@ func SaveConfig(cfgPath, guidelinesPath string, cfg *config.Config, guidelines s
 	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(cfgPath, []byte(yamlBody), 0o644); err != nil {
+	// A config that embeds a secret (--save-config-secrets) must not be
+	// world-readable: write it 0600. WriteFileAtomic preserves a pre-existing
+	// file mode on overwrite, so an earlier 0644 save would survive the
+	// rewrite; force the restrictive mode whenever a secret is persisted.
+	perm := os.FileMode(0o644)
+	if opts.IncludeSecrets {
+		perm = 0o600
+	}
+	if err := ioutil.WriteFileAtomic(cfgPath, []byte(yamlBody), perm); err != nil {
 		return err
+	}
+	if opts.IncludeSecrets {
+		if err := os.Chmod(cfgPath, 0o600); err != nil {
+			return fmt.Errorf("config: restrict permissions on %s: %w", cfgPath, err)
+		}
 	}
 
 	if guidelinesPath == "" {
@@ -40,7 +54,7 @@ func SaveConfig(cfgPath, guidelinesPath string, cfg *config.Config, guidelines s
 	if err := os.MkdirAll(filepath.Dir(guidelinesPath), 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(guidelinesPath, []byte(mdBody), 0o644); err != nil {
+	if err := ioutil.WriteFileAtomic(guidelinesPath, []byte(mdBody), 0o644); err != nil {
 		return err
 	}
 	return nil
@@ -60,8 +74,17 @@ func SaveGlobalConfig(cfg *config.Config, opts WriteOptions) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, []byte(yamlBody), 0o644); err != nil {
+	perm := os.FileMode(0o644)
+	if opts.IncludeSecrets {
+		perm = 0o600
+	}
+	if err := ioutil.WriteFileAtomic(path, []byte(yamlBody), perm); err != nil {
 		return err
+	}
+	if opts.IncludeSecrets {
+		if err := os.Chmod(path, 0o600); err != nil {
+			return fmt.Errorf("config: restrict permissions on %s: %w", path, err)
+		}
 	}
 	return nil
 }

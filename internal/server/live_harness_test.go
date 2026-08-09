@@ -6,6 +6,26 @@ package server
 // harness can drive the REAL app.js against the REAL server and observe the
 // sidebar session-list rows while a turn is running.
 //
+// Debug-only transport stall (candidate C, tmp/DEBUG_PLAN.md): the jsdom
+// harness cannot create real TCP backpressure, so the write path can be
+// stalled server-side via GOGEN_WS_SENDQ_SIZE / GOGEN_WS_STALL_MS /
+// GOGEN_WS_STALL_AFTER_MS / GOGEN_WS_STALL_FOR_MS / GOGEN_WS_STALL_FIRST_CONN
+// (see wsDebugConfigLoad in server.go). GOGEN_LIVE_CALL_MS overrides the
+// stub turn length. Example — queue-full detach → headless completion →
+// re-attach recovery (tmp/live_stall_detach.js):
+//
+//	GOGEN_LIVE_HARNESS=1 \
+//	GOGEN_WS_SENDQ_SIZE=2 GOGEN_WS_STALL_MS=6000 \
+//	GOGEN_WS_STALL_AFTER_MS=3000 GOGEN_WS_STALL_FOR_MS=7000 \
+//	GOGEN_LIVE_CALL_MS=25000 \
+//	go test ./internal/server -run TestLiveHarnessServer -v &
+//	sleep 3 && node tmp/live_stall_detach.js
+//
+// The stall must exceed enqueueJSON's 5s queue-full timeout: with the tiny
+// queue plus a 6s-per-write stall, the first blocked send times out, the
+// socket is detached, and the turn keeps running headless (see the script's
+// header for the full walkthrough).
+//
 // Run: go test ./internal/server -run TestLiveHarnessServer -v &
 // The port is written to /tmp/gogen-live-port.txt.
 
@@ -14,6 +34,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -94,7 +115,13 @@ func TestLiveHarnessServer(t *testing.T) {
 		t.Skip("set GOGEN_LIVE_HARNESS=1 to run the live harness server")
 	}
 	dir := t.TempDir()
-	stub := &liveStreamStub{callLen: 15 * time.Second}
+	callLen := 15 * time.Second
+	if v := os.Getenv("GOGEN_LIVE_CALL_MS"); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			callLen = time.Duration(ms) * time.Millisecond
+		}
+	}
+	stub := &liveStreamStub{callLen: callLen}
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(stub, contextmgr.Settings{ContextLimit: 1000})
 	a := agent.NewAgent(stub, exec, ctxMgr)

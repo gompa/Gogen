@@ -191,7 +191,7 @@ var builtinToolDefs = []ToolDef{
 	{
 		Definition: toolDef("patch_file", "Apply surgical unified diff(s). dry_run=preview, fuzzy=default.",
 			toolSchema(map[string]interface{}{
-				"diff": toolProp("string", "Unified diff: '--- a/x'/'+++ b/x' headers, '@@' hunks (context=space, removed=-, added=+). Multi-file: stack sections."),
+				"diff":    toolProp("string", "Unified diff: '--- a/x'/'+++ b/x' headers, '@@' hunks (context=space, removed=-, added=+). Multi-file: stack sections."),
 				"dry_run": toolProp("boolean", "Preview without writing"),
 				"fuzzy":   toolProp("boolean", "Tolerate whitespace/shift drift (default true; leave on)"),
 			}, "diff")),

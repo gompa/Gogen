@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -199,8 +198,7 @@ const defaultBackgroundOutputCap = 256 * 1024
 // grow memory without bound. Write may be called concurrently by exec's
 // pipe-copy goroutines, so the buffer is mutex-guarded.
 type boundedOutputWriter struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
+	outputBuffer
 	max int
 }
 
@@ -212,17 +210,10 @@ func (w *boundedOutputWriter) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.buf.Write(p)
-	if overflow := w.buf.Len() - w.max; overflow > 0 {
-		w.buf.Next(overflow)
-	}
+	w.append(p, w.max, nil)
 	return len(p), nil
 }
 
 func (w *boundedOutputWriter) String() string {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.buf.String()
+	return w.string()
 }

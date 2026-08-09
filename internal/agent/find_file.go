@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -19,7 +20,8 @@ const (
 
 // FindFile locates files by name (exact or case-insensitive substring match).
 // When limit is 0, defaults to findFileMaxResults.
-func (e *Executor) FindFile(name string, subpath string, limit int) (string, error) {
+// ctx is threaded into the tree walk so cancellation aborts the scan.
+func (e *Executor) FindFile(ctx context.Context, name string, subpath string, limit int) (string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return "", fmt.Errorf("name is required")
@@ -34,7 +36,7 @@ func (e *Executor) FindFile(name string, subpath string, limit int) (string, err
 	}
 
 	var matches []string
-	err = walkTree(nil, searchRoot, relPrefix, walkOpts{}, func(path, rel string, d os.DirEntry) error {
+	err = walkTree(ctx, searchRoot, relPrefix, walkOpts{}, func(path, rel string, d os.DirEntry) error {
 		base := d.Name()
 		if strings.Contains(strings.ToLower(base), strings.ToLower(name)) {
 			matches = append(matches, rel)

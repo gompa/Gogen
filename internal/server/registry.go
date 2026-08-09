@@ -52,10 +52,11 @@ type sessionRuntime struct {
 	clientsMu sync.Mutex
 	clients   map[*wsConn]struct{}
 
-	// turnActive/startedAt back the session_state reply on attach so a
-	// reconnecting client can distinguish "turn running headless" from
-	// "idle". turnOwner is the connection that started the current
-	// turn; only it may interrupt via the cancel-then-lock path — a second
+	// turnActive backs the session_state reply on attach so a reconnecting
+	// client can distinguish "turn running headless" from "idle"; startedAt
+	// records when the turn began (retained bookkeeping, not sent to the
+	// client). turnOwner is the connection that started the current turn;
+	// only it may interrupt via the cancel-then-lock path — a second
 	// connection attached to the same session must not kill the turn
 	// it does not own.
 	stateMu    sync.Mutex

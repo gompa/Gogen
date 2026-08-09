@@ -69,7 +69,7 @@ OPENAI_API_KEY=sk-... ./gogen /path/to/project
 OPENAI_API_KEY=sk-... ./gogen --web
 ```
 
-Non-loopback binds (e.g. `--host 0.0.0.0`) require a token:
+Non-loopback binds (e.g. `--host 0.0.0.0`) require a token (auto-generated and printed if `GOGEN_WEB_TOKEN` is not set):
 
 ```bash
 GOGEN_WEB_TOKEN=secret ./gogen --web --host 0.0.0.0
@@ -94,7 +94,7 @@ GOGEN_MODE=global ./gogen
 | `-p <prompt>` | Run a single prompt and exit (non-interactive) |
 | `--save-config` | Write effective config to `.gogen/gogen.conf` and guidelines to `.gogen/gogen.md` |
 | `--save-config-secrets` | Include `openai_api_key` when using `--save-config` |
-| `--save-config-path <file>` | Output path for `--save-config` config file (default `.gogen/gogen.conf`; use with `--global` to set global config path) |
+| `--save-config-path <file>` | Output path for `--save-config` config file (default `.gogen/gogen.conf`; project mode only — global mode always writes to `~/.config/gogen/config.yaml`) |
 
 The first positional argument is also treated as the working directory (overridden by `--dir`).
 
@@ -140,10 +140,11 @@ mcp_servers:
 
 Config values follow a strict schema (typed yaml.v3 decoding): unknown keys are
 ignored, and each key has one canonical spelling — `on`/`off` settings are
-strings, booleans are `true`/`false`, lists are comma-separated strings (e.g.
-`command_allowlist: "go,git"`), and integers are YAML integers. An empty or
-zero value means "use the default", with these exceptions where `0` is a real
-setting:
+strings, booleans are `true`/`false`, scalar list settings are comma-separated
+strings (e.g. `command_allowlist: "go,git"`, `treesitter_langs: "go,python"`),
+integers are YAML integers, and `mcp_servers` is a YAML list of objects
+(`name`, `command`, `args`, `env`). An empty or zero value means "use the
+default", with these exceptions where `0` is a real setting:
 
 | Key | `0` means |
 |-----|-----------|
@@ -153,7 +154,8 @@ setting:
 | `compact_reserve_tokens` | reserve no tokens for new messages after compaction |
 
 Negative values are invalid and fall back to defaults. `compact_threshold`
-must be in `(0, 1]` when set; values outside that range fall back to `0.85`.
+must be in `[0, 1]` when set (including the explicit `0` that disables
+auto-compaction); values outside that range fall back to `0.85`.
 Note that disabling auto-compaction means the full conversation is sent to the
 model each turn, so it will eventually exceed the model's context window.
 
@@ -244,7 +246,7 @@ After each agent turn, GoGen shows context usage in the CLI (dim line) and web U
 | `test_command` | Override the test command auto-detection (e.g. `"make test"`) |
 | `lint_command` | Override the lint command auto-detection (e.g. `"make vet"`) |
 
-These can be set in `.gogen/gogen.conf` or as CLI flags. They are loaded from the project file only (no environment variable equivalent).
+These can be set in `.gogen/gogen.conf` only — there is no CLI flag or environment variable equivalent.
 
 ### MCP
 
@@ -276,7 +278,7 @@ These can be set in `.gogen/gogen.conf` or as CLI flags. They are loaded from th
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GOGEN_WEB_BIND` | `127.0.0.1:8081` | Listen address for `--web` (e.g. `0.0.0.0:8080` to accept remote connections) |
-| `GOGEN_WEB_TOKEN` | *(empty)* | Required for non-loopback binds; also set via `--web --host` or `GOGEN_WEB_TOKEN` |
+| `GOGEN_WEB_TOKEN` | *(empty)* | Required for non-loopback binds; auto-generated and printed when `--web --host` is used without one |
 | `GOGEN_WEB_ALLOWED_ORIGINS` | *(empty)* | Comma-separated host allowlist for WebSocket CORS; empty uses localhost defaults |
 | `GOGEN_WEB_TLS_CERT` | *(empty)* | Path to PEM certificate file for TLS |
 | `GOGEN_WEB_TLS_KEY` | *(empty)* | Path to PEM key file for TLS |
@@ -375,6 +377,7 @@ main.go
     ├── server/      — WebSocket-based web server
     ├── treesitter/  — Source code parsing, symbol extraction, syntax checking
     ├── ioutil/      — Atomic file writes and helpers
+    ├── randhex/     — Random-hex ID generation (sessions, background jobs, approvals)
     ├── streamutil/  — Token batching for streaming
     ├── modelinfo/   — models.dev context limit resolver
     ├── debuglog/    — Structured debug logging

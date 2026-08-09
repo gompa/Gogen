@@ -91,28 +91,28 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error
 	return res, err
 }
 
-func handleListFiles(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleListFiles(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
 	path, err := stringArg(args, "path")
 	if err != nil {
 		return "", err
 	}
 	recursive, _ := boolArg(args, "recursive", false)
 	tracked, _ := boolArg(args, "tracked_only", false)
-	return a.Executor.ListFiles(path, recursive, tracked)
+	return a.Executor.ListFiles(ctx, path, recursive, tracked)
 }
 
-func handleGlobFiles(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleGlobFiles(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
 	pattern, err := stringArg(args, "pattern")
 	if err != nil {
 		return "", err
 	}
 	subpath, _ := stringArgOptional(args, "path")
 	tracked, _ := boolArg(args, "tracked_only", false)
-	return a.Executor.GlobFiles(pattern, subpath, tracked)
+	return a.Executor.GlobFiles(ctx, pattern, subpath, tracked)
 }
 
-func handleRepoOverview(_ context.Context, a *Agent, _ map[string]interface{}) (string, error) {
-	return a.Executor.RepoOverview()
+func handleRepoOverview(ctx context.Context, a *Agent, _ map[string]interface{}) (string, error) {
+	return a.Executor.RepoOverview(ctx)
 }
 
 func handleReadFile(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
@@ -460,14 +460,14 @@ func handleDownloadFile(ctx context.Context, a *Agent, args map[string]interface
 	return a.Executor.DownloadFile(ctx, rawURL, path, maxBytes, overwrite)
 }
 
-func handleFindFile(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleFindFile(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
 	name, err := stringArg(args, "name")
 	if err != nil {
 		return "", err
 	}
 	subpath, _ := stringArgOptional(args, "path")
 	limit, _ := intArgOptional(args, "limit")
-	return a.Executor.FindFile(name, subpath, limit)
+	return a.Executor.FindFile(ctx, name, subpath, limit)
 }
 
 func handleSessionRename(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {

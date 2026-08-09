@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,7 +33,7 @@ func TestRepoOverview(t *testing.T) {
 	}
 
 	exec := NewExecutor(dir)
-	out, err := exec.RepoOverview()
+	out, err := exec.RepoOverview(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +61,7 @@ func TestRepoOverviewSkipsGit(t *testing.T) {
 	}
 
 	exec := NewExecutor(dir)
-	out, err := exec.RepoOverview()
+	out, err := exec.RepoOverview(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
