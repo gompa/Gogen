@@ -23,15 +23,6 @@ func TestValidateGitRef(t *testing.T) {
 	}
 }
 
-func TestValidateGitBranchName(t *testing.T) {
-	if err := validateGitBranchName("--detach"); err == nil {
-		t.Fatal("expected reject")
-	}
-	if err := validateGitBranchName("feature/foo"); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestCommandGuardAllowlistBlocksMetacharacters(t *testing.T) {
 	g := NewCommandGuard("allowlist", []string{"go", "git"})
 	if err := g.Check("go test ./...; rm -rf ~"); err == nil {

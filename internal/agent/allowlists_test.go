@@ -18,7 +18,7 @@ import "testing"
 //
 // The reverse direction (plan-mode tools being parallel-safe) is NOT
 // asserted: plan mode deliberately permits a few session-local mutations
-// (todo_add, session_rename, context_pin_last) that must stay sequential.
+// (todo, session_rename, context_pin_last) that must stay sequential.
 func TestAllowlistConsistency(t *testing.T) {
 	defined := make(map[string]bool, len(builtinToolDefs))
 	for _, d := range builtinToolDefs {

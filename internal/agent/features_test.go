@@ -116,25 +116,6 @@ func TestDetectProjectProfileGo(t *testing.T) {
 	}
 }
 
-func TestDetectTestCommandOverride(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module x\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	got := DetectTestCommand(dir, "make check")
-	if got != "make check" {
-		t.Fatalf("got %q", got)
-	}
-}
-
-func TestBuildTestCommandReplacesGoEllipsis(t *testing.T) {
-	got := buildTestCommand("go test ./...", "./internal/agent", "-count=1")
-	want := "go test ./internal/agent -count=1"
-	if got != want {
-		t.Fatalf("got %q want %q", got, want)
-	}
-}
-
 func TestPatchFileCRLFLineEndings(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "main.go")

@@ -36,23 +36,3 @@ func validateGitRef(ref string) error {
 	}
 	return nil
 }
-
-// validGitBranchName matches common branch names; rejects option injection.
-var validGitBranchName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]*$`)
-
-func validateGitBranchName(name string) error {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return nil
-	}
-	if err := rejectLeadingDashArg("branch", name); err != nil {
-		return err
-	}
-	if strings.Contains(name, "..") {
-		return fmt.Errorf("invalid branch name %q", name)
-	}
-	if !validGitBranchName.MatchString(name) {
-		return fmt.Errorf("invalid branch name %q", name)
-	}
-	return nil
-}

@@ -14,37 +14,6 @@ const defaultFilePerm os.FileMode = 0o644
 // defaultDirPerm is the default directory permission for created parent dirs.
 const defaultDirPerm os.FileMode = 0o755
 
-// validateFileOp validates source/destination paths for CopyFile/MoveFile,
-// checks the source is a regular file, and creates the destination parent
-// directory. Both operations share this exact preamble.
-// It returns the resolved secure paths for both src and dst.
-func (e *Executor) validateFileOp(src, dst string) (srcSecure, dstSecure string, err error) {
-	if src == "" || dst == "" {
-		return "", "", fmt.Errorf("source and destination paths are required")
-	}
-	srcSecure, err = e.SecurePath(src)
-	if err != nil {
-		return "", "", err
-	}
-	dstSecure, err = e.SecurePath(dst)
-	if err != nil {
-		return "", "", err
-	}
-	info, err := os.Lstat(srcSecure)
-	if err != nil {
-		return "", "", err
-	}
-	if info.IsDir() {
-		return "", "", fmt.Errorf("source is a directory; operation only supports files")
-	}
-	// Ensure destination parent directory exists.
-	dstDir := filepath.Dir(dstSecure)
-	if err := os.MkdirAll(dstDir, defaultDirPerm); err != nil {
-		return "", "", err
-	}
-	return srcSecure, dstSecure, nil
-}
-
 // evalPath resolves symlinks for an existing path, or for the nearest existing
 // parent when creating a new file.
 func evalPath(path string) (string, error) {

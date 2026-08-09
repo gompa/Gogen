@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -86,7 +87,7 @@ func TestGlobFiles(t *testing.T) {
 	}
 }
 
-// TestGlobFilesHiddenFiles pins glob_files' discovery semantics: as the
+// TestGlobFilesHiddenFiles pins the glob tool's discovery semantics: as the
 // name-based discovery tool it must match dotfiles (e.g. .env via "*.env"),
 // while hidden directories stay pruned (reach them via the path argument).
 func TestGlobFilesHiddenFiles(t *testing.T) {
@@ -189,6 +190,61 @@ func TestReadFiles(t *testing.T) {
 	}
 	if !strings.Contains(out, "=== b.txt ===") || !strings.Contains(out, "beta") {
 		t.Fatalf("missing b.txt content: %q", out)
+	}
+}
+
+// TestReadFilesParallelOrder pins the parallel read_files behavior: all files
+// are present and headers appear in input order, so tool output stays
+// deterministic (prompt-cache stable) despite concurrent reads. A 12-file
+// batch exercises the bounded worker pool; run under -race to catch
+// concurrent result writes.
+func TestReadFilesParallelOrder(t *testing.T) {
+	dir := t.TempDir()
+	var names []string
+	for i := 0; i < 12; i++ {
+		name := fmt.Sprintf("f%02d.txt", i)
+		names = append(names, name)
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("content-"+name+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	exec := NewExecutor(dir)
+	out, err := exec.ReadFiles(names)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := -1
+	for _, name := range names {
+		idx := strings.Index(out, "=== "+name+" ===")
+		if idx < 0 {
+			t.Fatalf("missing header for %s in output", name)
+		}
+		if idx <= last {
+			t.Fatalf("headers out of order for %s", name)
+		}
+		last = idx
+		if !strings.Contains(out, "content-"+name) {
+			t.Fatalf("missing content for %s", name)
+		}
+	}
+}
+
+// TestReadFilesParallelError preserves sequential error semantics: the first
+// failing path (in input order) is reported, even though later paths may have
+// completed concurrently.
+func TestReadFilesParallelError(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exec := NewExecutor(dir)
+	_, err := exec.ReadFiles([]string{"a.txt", "missing.txt", "b.txt"})
+	if err == nil {
+		t.Fatal("expected error for missing file")
+	}
+	if !strings.Contains(err.Error(), "missing.txt") {
+		t.Fatalf("expected error to name missing file, got %v", err)
 	}
 }
 

@@ -23,8 +23,8 @@ var ErrNoResults = errors.New("no results found in AST or text search")
 
 // ASTFallback is a generic helper that tries AST-based search first,
 // then falls back to text-based search if AST returns no results.
-// This eliminates code duplication across rename, call_graph, dependencies,
-// and find_definition.
+// This eliminates code duplication across rename, call_graph, impact
+// analysis, and find_symbol.
 type ASTFallback[T any] struct {
 	ASTFunc   func() (T, error) // AST-based search function
 	TextFunc  func() (T, error) // Text-based fallback function
@@ -51,7 +51,7 @@ func (a *ASTFallback[T]) Run() (T, error) {
 
 // walkSymbolReferences is a shared helper that walks the filesystem, finds symbol references
 // using tree-sitter AST when available, and calls the visitor for each file with references.
-// This eliminates code duplication across find_references, call_graph, and dependency_analysis.
+// This eliminates code duplication across find_symbol and call_graph.
 func (e *Executor) walkSymbolReferences(ctx context.Context, searchRoot, relPrefix, glob, symbol string,
 	visitor func(filePath string, refs []treesitter.Reference, content []byte) error) error {
 

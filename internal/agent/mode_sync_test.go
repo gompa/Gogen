@@ -1,6 +1,9 @@
 package agent
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestBuiltinToolNamesMatchSchemasAndHandlers guards the single builtin tool
 // table: every entry has a name and a handler, the plan-mode allowlist only
@@ -13,51 +16,31 @@ func TestBuiltinToolNamesMatchSchemasAndHandlers(t *testing.T) {
 	goldenOrder := []string{
 		"list_files",
 		"repo_overview",
-		"glob_files",
+		"glob",
 		"read_file",
 		"read_files",
 		"list_definitions",
 		"write_file",
 		"execute_command",
-		"run_tests",
-		"run_lint",
 		"replace_in_file",
 		"delete_file",
-		"move_file",
 		"patch_file",
 		"show_diff",
 		"search_code",
-		"find_references",
-		"git_log",
-		"git_blame",
-		"git_status",
+		"find_symbol",
+		"git",
 		"web_search",
 		"web_fetch",
 		"download_file",
 		"git_commit",
 		"git_stage",
-		"git_branch",
-		"git_stash",
-		"git_stash_list",
-		"git_show",
-		"copy_file",
-		"todo_add",
-		"todo_list",
-		"todo_done",
-		"todo_remove",
-		"todo_clear_done",
+		"todo",
 		"find_file",
-		"find_definition",
 		"session_rename",
-		"session_usage",
 		"context_pin_last",
-		"context_pins",
 		"rename_symbol",
-		"multi_edit",
 		"call_graph",
-		"dependency_analysis",
-		"background_job_status",
-		"background_job_cancel",
+		"background_job",
 	}
 
 	schemas := BuiltinTools()
@@ -85,6 +68,41 @@ func TestBuiltinToolNamesMatchSchemasAndHandlers(t *testing.T) {
 	for name := range planModeAllowedTools {
 		if _, ok := schemaSet[name]; !ok {
 			t.Errorf("planModeAllowedTools has unknown tool %q", name)
+		}
+	}
+}
+
+// TestPlanModeSuffixDerivedFromRegistry pins the derivation of the plan-mode
+// suffix: the blocked-tool list must exactly match the tools the registry
+// marks as neither ReadOnly nor PlanAllowed, so the prompt can never drift
+// from the allowlist.
+func TestPlanModeSuffixDerivedFromRegistry(t *testing.T) {
+	if !strings.HasPrefix(planModePromptSuffix, "\n\nPlan mode is active.") {
+		t.Fatalf("plan-mode suffix changed shape: %q", planModePromptSuffix)
+	}
+	const marker = "Do not call "
+	start := strings.Index(planModePromptSuffix, marker)
+	end := strings.Index(planModePromptSuffix, " tools.")
+	if start < 0 || end < 0 || end <= start {
+		t.Fatalf("plan-mode suffix lost its blocked-tool list: %q", planModePromptSuffix)
+	}
+	listed := strings.Split(planModePromptSuffix[start+len(marker):end], ", ")
+	got := make(map[string]bool, len(listed))
+	for _, n := range listed {
+		got[n] = true
+	}
+	var want []string
+	for _, d := range builtinToolDefs {
+		if !d.ReadOnly && !d.PlanAllowed {
+			want = append(want, d.Definition.Name)
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("suffix lists %d blocked tools, registry has %d: %q", len(got), len(want), planModePromptSuffix)
+	}
+	for _, n := range want {
+		if !got[n] {
+			t.Errorf("suffix missing blocked tool %q", n)
 		}
 	}
 }

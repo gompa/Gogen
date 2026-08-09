@@ -16,11 +16,11 @@ import (
 // BackgroundJob is one shell command running outside a turn. The turn that
 // started it (execute_command background=true) returns immediately with the
 // job's id; the command keeps running until it exits on its own, is cancelled
-// (background_job_cancel), or its owning session is closed (Agent.Close kills
+// (background_job action=cancel), or its owning session is closed (Agent.Close kills
 // every job, so a closed web pane or a TUI quit never orphans a process).
 // Output is retained as a bounded tail so a long-running job cannot grow
 // memory without bound while it is polled. Finished jobs stay registered
-// until the session closes so background_job_status can report their exit
+// until the session closes so background_job action=status can report their exit
 // code and output after completion; Close removes everything.
 type BackgroundJob struct {
 	ID      string

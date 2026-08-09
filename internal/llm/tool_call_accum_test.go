@@ -70,11 +70,11 @@ func TestToolAccumsStreamComplete(t *testing.T) {
 		{"partial json", []tcAccum{{Name: "read_file", ArgsStr: `{"path":`}}, false},
 		{"two tools one partial", []tcAccum{
 			{Name: "read_file", ArgsStr: `{}`},
-			{Name: "glob_files", ArgsStr: `{"pattern":"`},
+			{Name: "glob", ArgsStr: `{"pattern":"`},
 		}, false},
 		{"two tools complete", []tcAccum{
 			{Name: "read_file", ArgsStr: `{}`},
-			{Name: "glob_files", ArgsStr: `{"pattern":"*.go"}`},
+			{Name: "glob", ArgsStr: `{"pattern":"*.go"}`},
 		}, true},
 	}
 	for _, tc := range cases {

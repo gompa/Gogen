@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"gogen/internal/treesitter"
@@ -36,6 +37,9 @@ func (r *DependencyResult) computeImpact() {
 
 // DependencyAnalysis analyzes the impact of changing a symbol.
 // Uses tree-sitter for supported languages, falls back to text search.
+// It powers the call_graph tool's "impact" direction: dependents (all
+// references, not just call sites), transitive blast radius, and a risk
+// score/recommendation.
 func (e *Executor) DependencyAnalysis(ctx context.Context, symbol, subpath string) (string, error) {
 	if symbol == "" {
 		return "", fmt.Errorf("symbol is required")
@@ -138,11 +142,14 @@ func (e *Executor) findIndirectDependents(ctx context.Context, directDependents 
 		}
 	}
 
-	// Convert to slice
+	// Convert to a sorted slice: map iteration order is randomized, and a
+	// deterministic order keeps repeated impact analyses byte-identical
+	// (prompt-cache stable across retries).
 	var result []string
 	for file := range indirect {
 		result = append(result, file)
 	}
+	sort.Strings(result)
 
 	return result
 }

@@ -31,6 +31,12 @@ func (e *Executor) CallGraph(ctx context.Context, symbol, subpath, glob string, 
 	if symbol == "" {
 		return "", fmt.Errorf("symbol is required")
 	}
+	// The "impact" direction serves the change-impact analysis that used to be
+	// a separate tool: dependents (all references, not just call sites),
+	// transitive blast radius, and a risk score/recommendation.
+	if direction == "impact" {
+		return e.DependencyAnalysis(ctx, symbol, subpath)
+	}
 
 	searchRoot, relPrefix, err := e.searchRoot(subpath)
 	if err != nil {

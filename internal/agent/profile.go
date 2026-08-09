@@ -61,7 +61,6 @@ func DetectProjectProfile(workingDir, testCmdOverride, lintCmdOverride string) s
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "Working directory: %s\n", filepath.ToSlash(abs))
 	if len(ecosystems) > 0 {
 		b.WriteString("Ecosystem markers: " + strings.Join(markers, ", ") + "\n")
 		b.WriteString("Detected stacks: " + strings.Join(ecosystems, ", ") + "\n")
@@ -110,24 +109,4 @@ func topLevelLayout(workingDir string) string {
 		dirs = append(dirs, "…")
 	}
 	return "Top-level directories: " + strings.Join(dirs, ", ") + "\n"
-}
-
-// DetectTestCommand returns the test command from override or ecosystem markers.
-func DetectTestCommand(workingDir, override string) string {
-	if cmd := strings.TrimSpace(override); cmd != "" {
-		return cmd
-	}
-	abs, err := filepath.Abs(workingDir)
-	if err != nil {
-		abs = workingDir
-	}
-	for _, m := range ecosystemMarkers {
-		if m.testCmd == "" {
-			continue
-		}
-		if _, err := os.Stat(filepath.Join(abs, m.file)); err == nil {
-			return m.testCmd
-		}
-	}
-	return ""
 }

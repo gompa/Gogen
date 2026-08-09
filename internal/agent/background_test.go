@@ -71,7 +71,8 @@ func TestBackgroundCommandGuardApplies(t *testing.T) {
 	}
 }
 
-// TestBackgroundJobCancel verifies background_job_cancel kills a running job
+// TestBackgroundJobCancel verifies CancelBackgroundJob (background_job
+// action=cancel) kills a running job
 // and the status reports it as cancelled.
 func TestBackgroundJobCancel(t *testing.T) {
 	exec := NewExecutor(t.TempDir())

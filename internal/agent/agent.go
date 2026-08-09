@@ -59,7 +59,7 @@ type Agent struct {
 	// bgMu guards bgJobs: shell commands started with execute_command
 	// background=true. Jobs outlive the turn that started them (they are
 	// owned by the session, not the turn) and are killed when the session
-	// closes (Close) or individually via background_job_cancel.
+	// closes (Close) or individually via background_job (action=cancel).
 	bgMu   sync.Mutex
 	bgJobs map[string]*BackgroundJob
 
@@ -249,13 +249,6 @@ func (a *Agent) pinLastUser() error {
 	}
 	a.PinManager.PinLastUser(a.Messages)
 	return nil
-}
-
-func (a *Agent) listPins() string {
-	if a.PinManager == nil {
-		return "Pin manager is not initialized"
-	}
-	return a.PinManager.ListPins(a.Messages)
 }
 
 func (a *Agent) llmTools() []llm.Tool {

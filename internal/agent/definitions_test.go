@@ -67,3 +67,42 @@ func TestExecutorListDefinitionsLargeFile(t *testing.T) {
 		t.Fatalf("expected RealFunc in definitions, got:\n%s", out)
 	}
 }
+
+// TestExecutorListDefinitionsTextFallback verifies that list_definitions
+// degrades to a line-based text outline when tree-sitter is disabled, instead
+// of erroring. It must work in every build (cgo or not) and must not echo
+// comment lines.
+func TestExecutorListDefinitionsTextFallback(t *testing.T) {
+	t.Setenv("GOGEN_TREESITTER", "off")
+
+	dir := t.TempDir()
+	src := `package sample
+
+func Hello() {}
+
+// a comment, not a definition
+type Widget struct{}
+
+func (s *Server) Handle() {}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := agent.NewExecutor(dir)
+	out, err := exec.ListDefinitions("sample.go")
+	if err != nil {
+		t.Fatalf("text fallback should not error: %v", err)
+	}
+	if !strings.Contains(out, "text outline") {
+		t.Fatalf("expected text-outline marker, got:\n%s", out)
+	}
+	for _, want := range []string{"Hello", "Widget", "Handle"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected %q in outline, got:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "comment") {
+		t.Fatalf("comment line leaked into outline:\n%s", out)
+	}
+}

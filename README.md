@@ -9,7 +9,7 @@ GoGen is a self-hosted, terminal or web-based coding assistant that can explore,
 - **Code Search** — Regex and literal string search across your codebase (ripgrep with fallback)
 - **Symbol Extraction** — Lists functions, methods, classes, and types via [tree-sitter](https://tree-sitter.github.io/tree-sitter/) for 19 languages
 - **Safe Edits** — Prefers unified diffs (`patch_file`) over full file rewrites; syntax error detection after edits
-- **Command Execution** — Run shell commands with configurable safety modes (blocklist / allowlist / off); `execute_command` can also run commands **in the background** (returns a job id pollable with `background_job_status` / cancellable with `background_job_cancel`)
+- **Command Execution** — Run shell commands with configurable safety modes (blocklist / allowlist / off); `execute_command` can also run commands **in the background** (returns a job id pollable/cancellable via `background_job` with `action=status` / `action=cancel`)
 - **Vision Input** — Paste or attach images in the web UI; they are sent to vision-capable models as image content alongside your prompt
 - **Human-in-the-Loop** — Requires explicit approval for destructive actions (file deletes)
 - **Context Management** — Auto-compacts conversation history when nearing token limits to stay within model context windows
@@ -389,49 +389,32 @@ The agent has access to the following tools:
 |------|-------------|
 | `repo_overview` | Summarize repo layout: top-level dirs, file counts, root files |
 | `list_files` | List directory contents (optional `recursive`, `tracked_only`) |
-| `glob_files` | Find files by glob pattern |
+| `glob` | Find files by glob pattern |
 | `read_file` | Read a single file (optional `offset`/`limit` ranges, regex `search`) |
 | `read_files` | Read multiple files at once |
-| `list_definitions` | List functions/types with line numbers (tree-sitter) |
+| `list_definitions` | List functions/types with line numbers (tree-sitter AST, text fallback) |
 | `write_file` | Create a new file (refuses existing paths) |
 | `execute_command` | Run a shell command (with safety guardrails) |
-| `run_tests` | Run project tests (auto-detects test command from project markers) |
-| `run_lint` | Run project linter (auto-detects from project markers) |
 | `replace_in_file` | Replace a literal string in a file (optional `replace_all`) |
 | `delete_file` | Delete a file (requires approval) |
-| `move_file` | Rename/move a file (creates parent dirs) |
 | `patch_file` | Apply surgical unified diff(s) (preferred; `dry_run`, `fuzzy`) |
 | `show_diff` | Show git diff (working tree or path) |
 | `search_code` | Regex/literal search across the codebase (optional `context_lines`) |
-| `find_references` | Find symbol references (AST when supported, text fallback) |
-| `git_log` | Recent git commits (read-only; plan mode) |
-| `git_blame` | Git blame for a file range (read-only; plan mode) |
-| `git_status` | Git status (short, read-only) |
+| `find_symbol` | Locate a symbol: `kind=def` (definition) or `refs` (references) |
+| `git` | Git history/status/diff: `action=log`, `status`, `show` (read-only; plan mode) |
 | `git_commit` | Commit (requires staged files) |
 | `git_stage` | Stage files (empty = stage all) |
-| `git_branch` | List/create/switch branches |
-| `git_stash` | Stash changes (`pop=true` to restore) |
-| `git_stash_list` | List stash entries |
-| `git_show` | Show commit/range as diff (empty = HEAD) |
-| `copy_file` | Copy a file (creates parent dirs) |
 | `web_search` | Web search (DuckDuckGo Lite; no API key needed) |
 | `web_fetch` | Fetch a web page as Markdown (optional `selector`/`query` extraction) |
 | `download_file` | Download a raw file into the workspace (binary-safe, SSRF-protected) |
 | `find_file` | Find files by name (case-insensitive substring) |
-| `find_definition` | Cross-file go-to-definition (tree-sitter or text fallback) |
 | `rename_symbol` | Rename a symbol across files (AST or text fallback) |
-| `multi_edit` | Literal text replacement across multiple files (not regex) |
-| `call_graph` | Call relationships for a symbol |
-| `dependency_analysis` | Impact analysis for a symbol (dependents, risk) |
-| `todo_add` | Add a todo item |
-| `todo_list` | List todos with status |
-| `todo_done` | Mark a todo done by ID |
-| `todo_remove` | Remove a todo by ID |
-| `todo_clear_done` | Clear completed todos |
+| `call_graph` | Call relationships / impact analysis for a symbol (`direction=impact`) |
+| `todo` | Manage todo items: add/list/done/remove/clear |
 | `session_rename` | Rename the current session |
-| `session_usage` | Show session token usage |
 | `context_pin_last` | Pin the last user message to survive compaction |
-| `context_pins` | List pinned messages |
+
+`background_job` (status/cancel for `execute_command background=true`) is available at runtime; `execute_command`'s `background` parameter documents it.
 
 Additional tools arrive at runtime from connected MCP servers as `mcp_<server>_<tool>`.
 

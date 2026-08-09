@@ -4,7 +4,7 @@ import "context"
 
 // ToolOutputSink receives live chunks of a shell command's combined
 // stdout/stderr as the command runs, together with the exact command string
-// that was executed (including any wrapper built by run_tests / run_lint).
+// that was executed.
 //
 // The sink is invoked from the goroutine that copies the child process's
 // pipes, so implementations must be safe for concurrent use and should
@@ -14,8 +14,8 @@ type ToolOutputSink func(command string, chunk string)
 type toolOutputSinkKey struct{}
 
 // ContextWithToolOutput returns a copy of ctx carrying sink. Tools that
-// shell out (execute_command, run_tests, run_lint) deliver live output
-// chunks to the sink via Executor.ExecuteCommand.
+// shell out (execute_command) deliver live output chunks to the sink via
+// Executor.ExecuteCommand.
 func ContextWithToolOutput(ctx context.Context, sink ToolOutputSink) context.Context {
 	return context.WithValue(ctx, toolOutputSinkKey{}, sink)
 }

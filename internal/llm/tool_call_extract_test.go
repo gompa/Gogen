@@ -63,11 +63,11 @@ true
 		{
 			name: "Anthropic invoke format",
 			input: `<function_calls>
-<invoke name="glob_files">
+<invoke name="glob">
 <parameter name="pattern">*.go</parameter>
 </invoke>
 </function_calls>`,
-			want:  "glob_files",
+			want:  "glob",
 			wantN: 1,
 		},
 		{

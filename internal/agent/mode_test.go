@@ -10,17 +10,14 @@ import (
 func TestPlanModeAllowedTools(t *testing.T) {
 	a := &Agent{Mode: ModePlan}
 	allowed := a.AllowedToolNames()
-	if len(allowed) != 26 {
-		t.Fatalf("expected 26 tools, got %d", len(allowed))
+	if len(allowed) != 17 {
+		t.Fatalf("expected 17 tools, got %d", len(allowed))
 	}
 	if _, ok := allowed["read_file"]; !ok {
 		t.Fatal("read_file should be allowed")
 	}
-	if _, ok := allowed["git_status"]; !ok {
-		t.Fatal("git_status should be allowed in plan mode")
-	}
-	if _, ok := allowed["git_branch"]; ok {
-		t.Fatal("git_branch should not be allowed in plan mode")
+	if _, ok := allowed["git"]; !ok {
+		t.Fatal("git should be allowed in plan mode")
 	}
 	if _, ok := allowed["web_search"]; !ok {
 		t.Fatal("web_search should be allowed in plan mode")
@@ -31,32 +28,20 @@ func TestPlanModeAllowedTools(t *testing.T) {
 	if _, ok := allowed["find_file"]; !ok {
 		t.Fatal("find_file should be allowed in plan mode")
 	}
-	if _, ok := allowed["find_definition"]; !ok {
-		t.Fatal("find_definition should be allowed in plan mode")
+	if _, ok := allowed["find_symbol"]; !ok {
+		t.Fatal("find_symbol should be allowed in plan mode")
 	}
 	if _, ok := allowed["call_graph"]; !ok {
 		t.Fatal("call_graph should be allowed in plan mode (read-only analysis)")
 	}
-	if _, ok := allowed["dependency_analysis"]; !ok {
-		t.Fatal("dependency_analysis should be allowed in plan mode (read-only analysis)")
-	}
-	if _, ok := allowed["todo_list"]; !ok {
-		t.Fatal("todo_list should be allowed in plan mode")
+	if _, ok := allowed["todo"]; !ok {
+		t.Fatal("todo should be allowed in plan mode")
 	}
 	if _, ok := allowed["write_file"]; ok {
 		t.Fatal("write_file should not be allowed")
 	}
-	if _, ok := allowed["run_lint"]; ok {
-		t.Fatal("run_lint should not be allowed in plan mode")
-	}
-	if _, ok := allowed["move_file"]; ok {
-		t.Fatal("move_file should not be allowed in plan mode")
-	}
 	if _, ok := allowed["git_commit"]; ok {
 		t.Fatal("git_commit should not be allowed in plan mode")
-	}
-	if _, ok := allowed["todo_done"]; ok {
-		t.Fatal("todo_done should not be allowed in plan mode")
 	}
 }
 

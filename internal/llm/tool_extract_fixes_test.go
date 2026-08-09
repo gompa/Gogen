@@ -26,7 +26,7 @@ func TestExtractToolCallsNoDoubleInvoke(t *testing.T) {
 
 // TestExtractToolCallsInvokeOutsideToolCall verifies standalone <invoke> still works.
 func TestExtractToolCallsInvokeOutsideToolCall(t *testing.T) {
-	input := `<invoke name="glob_files">
+	input := `<invoke name="glob">
 <parameter name="pattern">*.go</parameter>
 </invoke>`
 
@@ -34,8 +34,8 @@ func TestExtractToolCallsInvokeOutsideToolCall(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("expected 1 tool call, got %d", len(calls))
 	}
-	if calls[0].Name != "glob_files" {
-		t.Fatalf("expected glob_files, got %q", calls[0].Name)
+	if calls[0].Name != "glob" {
+		t.Fatalf("expected glob, got %q", calls[0].Name)
 	}
 }
 

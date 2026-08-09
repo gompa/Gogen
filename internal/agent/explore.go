@@ -17,6 +17,11 @@ const (
 	exploreMaxEntries      = 500
 	readFilesMaxCount      = 20
 	readFilesMaxTotalBytes = 512 * 1024
+	// readFilesParallelism bounds concurrent file reads inside one
+	// read_files call. Reads are independent local I/O; a small worker pool
+	// captures the win on slow filesystems without spawning unbounded
+	// goroutines.
+	readFilesParallelism = 4
 )
 
 // cachedGitPath caches the result of exec.LookPath("git") so repeated calls
@@ -345,6 +350,33 @@ func (e *Executor) ReadFiles(paths []string) (string, error) {
 		return "", fmt.Errorf("too many paths (max %d)", readFilesMaxCount)
 	}
 
+	type fileResult struct {
+		content string
+		err     error
+	}
+	results := make([]fileResult, len(paths))
+
+	// Read files concurrently (bounded worker pool). Results are stored per
+	// input index, so the output order, separators, and truncation below are
+	// byte-identical to the sequential implementation — deterministic tool
+	// results keep the conversation prompt-cache prefix stable.
+	sem := make(chan struct{}, readFilesParallelism)
+	var wg sync.WaitGroup
+	for i, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue // empty paths are skipped, matching the sequential path
+		}
+		wg.Add(1)
+		go func(idx int, p string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			results[idx].content, results[idx].err = e.readFileContent(p)
+		}(i, path)
+	}
+	wg.Wait()
+
 	var b strings.Builder
 	total := 0
 	truncated := false
@@ -354,24 +386,10 @@ func (e *Executor) ReadFiles(paths []string) (string, error) {
 		if path == "" {
 			continue
 		}
-		secure, err := e.SecurePath(path)
-		if err != nil {
-			return "", err
+		if results[i].err != nil {
+			return "", results[i].err
 		}
-		info, err := os.Stat(secure)
-		if err != nil {
-			return "", fmt.Errorf("%s: %w", path, err)
-		}
-		if info.IsDir() {
-			return "", fmt.Errorf("%s is a directory", path)
-		}
-		if info.Size() > searchMaxFileBytes {
-			return "", fmt.Errorf("%s exceeds max file size (%d bytes)", path, searchMaxFileBytes)
-		}
-		content, err := os.ReadFile(secure)
-		if err != nil {
-			return "", fmt.Errorf("%s: %w", path, err)
-		}
+		content := results[i].content
 		header := fmt.Sprintf("=== %s ===\n", filepath.ToSlash(path))
 		block := header + string(content)
 		if i > 0 {
@@ -399,4 +417,29 @@ func (e *Executor) ReadFiles(paths []string) (string, error) {
 		out += fmt.Sprintf("\n… truncated (read %d bytes)", total)
 	}
 	return out, nil
+}
+
+// readFileContent validates and reads a single file: path boundary, regular
+// file check, per-file size cap, then the raw contents. Mirrors the checks
+// the sequential ReadFiles performed per file.
+func (e *Executor) readFileContent(path string) (string, error) {
+	secure, err := e.SecurePath(path)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(secure)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", path, err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("%s is a directory", path)
+	}
+	if info.Size() > searchMaxFileBytes {
+		return "", fmt.Errorf("%s exceeds max file size (%d bytes)", path, searchMaxFileBytes)
+	}
+	content, err := os.ReadFile(secure)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", path, err)
+	}
+	return string(content), nil
 }

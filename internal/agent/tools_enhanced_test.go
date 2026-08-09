@@ -208,7 +208,7 @@ func TestPatchFileDryRun(t *testing.T) {
 	}
 }
 
-func TestGitLogAndBlame(t *testing.T) {
+func TestGitLog(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
 	}
@@ -239,22 +239,43 @@ func TestGitLogAndBlame(t *testing.T) {
 	if !strings.Contains(logOut, "initial commit") {
 		t.Fatalf("unexpected git log: %q", logOut)
 	}
-
-	blameOut, err := exec.GitBlame(context.Background(), "tracked.go", 1, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(blameOut, "package main") {
-		t.Fatalf("unexpected git blame: %q", blameOut)
-	}
 }
 
 func TestPlanModeAllowsGitTools(t *testing.T) {
 	a := &Agent{Mode: ModePlan}
 	allowed := a.AllowedToolNames()
-	for _, tool := range []string{"find_references", "git_log", "git_blame"} {
+	for _, tool := range []string{"find_symbol", "git"} {
 		if _, ok := allowed[tool]; !ok {
 			t.Fatalf("%s should be allowed in plan mode", tool)
+		}
+	}
+}
+
+// TestMergedToolHandlersRejectUnknownActions pins the action/kind routing of
+// the consolidated tools (git, find_symbol, background_job): unknown enum
+// values fail fast with a clear message instead of falling through to the
+// executors.
+func TestMergedToolHandlersRejectUnknownActions(t *testing.T) {
+	a := &Agent{Executor: &Executor{WorkingDir: t.TempDir()}}
+	cases := []struct {
+		name string
+		call func() (string, error)
+		want string
+	}{
+		{"git", func() (string, error) {
+			return handleGit(context.Background(), a, map[string]interface{}{"action": "bogus"})
+		}, "unknown git action"},
+		{"find_symbol", func() (string, error) {
+			return handleFindSymbol(context.Background(), a, map[string]interface{}{"kind": "bogus", "symbol": "x"})
+		}, "unknown find_symbol kind"},
+		{"background_job", func() (string, error) {
+			return handleBackgroundJob(context.Background(), a, map[string]interface{}{"action": "bogus", "job_id": "j1"})
+		}, "unknown background_job action"},
+	}
+	for _, tc := range cases {
+		_, err := tc.call()
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("%s: expected error containing %q, got %v", tc.name, tc.want, err)
 		}
 	}
 }

@@ -183,25 +183,28 @@ func handleExecuteCommand(ctx context.Context, a *Agent, args map[string]interfa
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("Started background job %s.\nCommand: %s\nPoll with background_job_status (job_id: %q) or cancel with background_job_cancel.", id, command, id), nil
+		return fmt.Sprintf("Started background job %s.\nCommand: %s\nPoll with background_job (action=status, job_id: %q) or cancel with action=cancel.", id, command, id), nil
 	}
 	return a.Executor.ExecuteCommand(ctx, command)
 }
 
-func handleBackgroundJobStatus(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleBackgroundJob(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
+	action, err := stringArg(args, "action")
+	if err != nil {
+		return "", err
+	}
 	jobID, err := stringArg(args, "job_id")
 	if err != nil {
 		return "", err
 	}
-	return a.BackgroundJobStatus(jobID)
-}
-
-func handleBackgroundJobCancel(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
-	jobID, err := stringArg(args, "job_id")
-	if err != nil {
-		return "", err
+	switch action {
+	case "status":
+		return a.BackgroundJobStatus(jobID)
+	case "cancel":
+		return a.CancelBackgroundJob(jobID)
+	default:
+		return "", fmt.Errorf("unknown background_job action %q (want status or cancel)", action)
 	}
-	return a.CancelBackgroundJob(jobID)
 }
 
 func handleReplaceInFile(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
@@ -240,35 +243,12 @@ func handlePatchFile(ctx context.Context, a *Agent, args map[string]interface{})
 	return a.Executor.PatchFile(ctx, diff, dryRun, fuzzy)
 }
 
-func handleRunTests(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
-	target, _ := stringArgOptional(args, "target")
-	extra, _ := stringArgOptional(args, "extra_args")
-	return a.Executor.RunTests(ctx, target, extra, a.TestCommand)
-}
-
-func handleRunLint(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
-	extra, _ := stringArgOptional(args, "extra_args")
-	return a.Executor.RunLint(ctx, extra, a.LintCommand)
-}
-
 func handleDeleteFile(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
 	path, err := stringArg(args, "path")
 	if err != nil {
 		return "", err
 	}
 	return a.Executor.DeleteFile(ctx, path)
-}
-
-func handleMoveFile(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
-	src, err := stringArg(args, "source")
-	if err != nil {
-		return "", err
-	}
-	dst, err := stringArg(args, "destination")
-	if err != nil {
-		return "", err
-	}
-	return a.Executor.MoveFile(src, dst)
 }
 
 func handleShowDiff(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
@@ -294,52 +274,25 @@ func handleSearchCode(ctx context.Context, a *Agent, args map[string]interface{}
 	return a.Executor.SearchCode(ctx, pattern, subpath, glob, contextLines)
 }
 
-func handleFindReferences(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleFindSymbol(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+	kind, err := stringArg(args, "kind")
+	if err != nil {
+		return "", err
+	}
 	symbol, err := stringArg(args, "symbol")
 	if err != nil {
 		return "", err
 	}
 	subpath, _ := stringArgOptional(args, "path")
 	glob, _ := stringArgOptional(args, "glob")
-	return a.Executor.FindReferences(ctx, symbol, subpath, glob)
-}
-
-func handleGitLog(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
-	subpath, _ := stringArgOptional(args, "path")
-	limit, err := intArgOptional(args, "limit")
-	if err != nil {
-		return "", err
+	switch kind {
+	case "def":
+		return a.Executor.FindDefinition(ctx, symbol, subpath, glob)
+	case "refs":
+		return a.Executor.FindReferences(ctx, symbol, subpath, glob)
+	default:
+		return "", fmt.Errorf("unknown find_symbol kind %q (want def or refs)", kind)
 	}
-	return a.Executor.GitLog(ctx, subpath, limit)
-}
-
-func handleGitBlame(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
-	path, err := stringArg(args, "path")
-	if err != nil {
-		return "", err
-	}
-	startLine, err := intArgOptional(args, "start_line")
-	if err != nil {
-		return "", err
-	}
-	limit, err := intArgOptional(args, "limit")
-	if err != nil {
-		return "", err
-	}
-	return a.Executor.GitBlame(ctx, path, startLine, limit)
-}
-
-func handleGitStatus(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
-	subpath, _ := stringArgOptional(args, "path")
-	return a.Executor.GitStatus(ctx, subpath)
-}
-
-func handleGitCommit(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
-	message, err := stringArg(args, "message")
-	if err != nil {
-		return "", err
-	}
-	return a.Executor.GitCommit(ctx, message)
 }
 
 func handleGitStage(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
@@ -350,41 +303,39 @@ func handleGitStage(ctx context.Context, a *Agent, args map[string]interface{}) 
 	return a.Executor.GitStage(ctx, paths)
 }
 
-func handleGitBranch(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
-	name, _ := stringArgOptional(args, "name")
-	create, _ := boolArg(args, "create", false)
-	return a.Executor.GitBranch(ctx, name, create)
-}
-
-func handleGitStash(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
-	message, _ := stringArgOptional(args, "message")
-	pop, _ := boolArg(args, "pop", false)
-	return a.Executor.GitStash(ctx, message, pop)
-}
-
-func handleGitStashList(ctx context.Context, a *Agent, _ map[string]interface{}) (string, error) {
-	return a.Executor.GitStashList(ctx)
-}
-
-func handleGitShow(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
-	ref, _ := stringArgOptional(args, "ref")
-	return a.Executor.GitDiffShow(ctx, ref)
-}
-
-func handleCopyFile(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
-	src, err := stringArg(args, "source")
+func handleGitCommit(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+	message, err := stringArg(args, "message")
 	if err != nil {
 		return "", err
 	}
-	dst, err := stringArg(args, "destination")
+	return a.Executor.GitCommit(ctx, message)
+}
+
+func handleGit(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+	action, err := stringArg(args, "action")
 	if err != nil {
 		return "", err
 	}
-	return a.Executor.CopyFile(src, dst)
+	subpath, _ := stringArgOptional(args, "path")
+	switch action {
+	case "log":
+		limit, err := intArgOptional(args, "limit")
+		if err != nil {
+			return "", err
+		}
+		return a.Executor.GitLog(ctx, subpath, limit)
+	case "status":
+		return a.Executor.GitStatus(ctx, subpath)
+	case "show":
+		ref, _ := stringArgOptional(args, "ref")
+		return a.Executor.GitDiffShow(ctx, ref)
+	default:
+		return "", fmt.Errorf("unknown git action %q (want log, status, or show)", action)
+	}
 }
 
-func handleTodoAdd(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
-	text, err := stringArg(args, "text")
+func handleTodo(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
+	action, err := stringArg(args, "action")
 	if err != nil {
 		return "", err
 	}
@@ -392,67 +343,52 @@ func handleTodoAdd(_ context.Context, a *Agent, args map[string]interface{}) (st
 	if err != nil {
 		return "", err
 	}
-	out, err := tm.AddTodo(text)
-	if err != nil {
-		return "", err
+	switch action {
+	case "add":
+		text, err := stringArg(args, "text")
+		if err != nil {
+			return "", err
+		}
+		out, err := tm.AddTodo(text)
+		if err != nil {
+			return "", err
+		}
+		a.persistTodos()
+		return out, nil
+	case "list":
+		return tm.ListTodos(), nil
+	case "done":
+		id, err := intArgOptional(args, "id")
+		if err != nil || id == 0 {
+			return "", fmt.Errorf("missing required argument %q", "id")
+		}
+		out, err := tm.DoneTodo(id)
+		if err != nil {
+			return "", err
+		}
+		a.persistTodos()
+		return out, nil
+	case "remove":
+		id, err := intArgOptional(args, "id")
+		if err != nil || id == 0 {
+			return "", fmt.Errorf("missing required argument %q", "id")
+		}
+		out, err := tm.RemoveTodo(id)
+		if err != nil {
+			return "", err
+		}
+		a.persistTodos()
+		return out, nil
+	case "clear":
+		out, err := tm.ClearDoneTodos()
+		if err != nil {
+			return "", err
+		}
+		a.persistTodos()
+		return out, nil
+	default:
+		return "", fmt.Errorf("unknown todo action %q (want add, list, done, remove, or clear)", action)
 	}
-	a.persistTodos()
-	return out, nil
-}
-
-func handleTodoList(_ context.Context, a *Agent, _ map[string]interface{}) (string, error) {
-	tm, err := a.todo()
-	if err != nil {
-		return "", err
-	}
-	return tm.ListTodos(), nil
-}
-
-func handleTodoDone(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
-	id, err := intArgOptional(args, "id")
-	if err != nil || id == 0 {
-		return "", fmt.Errorf("missing required argument %q", "id")
-	}
-	tm, err := a.todo()
-	if err != nil {
-		return "", err
-	}
-	out, err := tm.DoneTodo(id)
-	if err != nil {
-		return "", err
-	}
-	a.persistTodos()
-	return out, nil
-}
-
-func handleTodoRemove(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
-	id, err := intArgOptional(args, "id")
-	if err != nil || id == 0 {
-		return "", fmt.Errorf("missing required argument %q", "id")
-	}
-	tm, err := a.todo()
-	if err != nil {
-		return "", err
-	}
-	out, err := tm.RemoveTodo(id)
-	if err != nil {
-		return "", err
-	}
-	a.persistTodos()
-	return out, nil
-}
-
-func handleTodoClearDone(_ context.Context, a *Agent, _ map[string]interface{}) (string, error) {
-	tm, err := a.todo()
-	if err != nil {
-		return "", err
-	}
-	out, err := tm.ClearDoneTodos()
-	if err != nil {
-		return "", err
-	}
-	a.persistTodos()
-	return out, nil
 }
 
 func handleListDefinitions(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
@@ -534,27 +470,12 @@ func handleFindFile(_ context.Context, a *Agent, args map[string]interface{}) (s
 	return a.Executor.FindFile(name, subpath, limit)
 }
 
-func handleFindDefinition(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
-	symbol, err := stringArg(args, "symbol")
-	if err != nil {
-		return "", err
-	}
-	subpath, _ := stringArgOptional(args, "path")
-	glob, _ := stringArgOptional(args, "glob")
-	return a.Executor.FindDefinition(ctx, symbol, subpath, glob)
-}
-
 func handleSessionRename(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
 	label, err := stringArg(args, "label")
 	if err != nil {
 		return "", err
 	}
 	return a.RenameSession(label)
-}
-
-func handleSessionUsage(_ context.Context, a *Agent, _ map[string]interface{}) (string, error) {
-	u := a.SnapshotUsageAccum()
-	return u.Format(), nil
 }
 
 func handleContextPinLast(_ context.Context, a *Agent, _ map[string]interface{}) (string, error) {
@@ -565,10 +486,6 @@ func handleContextPinLast(_ context.Context, a *Agent, _ map[string]interface{})
 		return "Pin manager not configured; context pinning is a no-op.", nil
 	}
 	return "Pinned the last user message", a.pinLastUser()
-}
-
-func handleContextPins(_ context.Context, a *Agent, _ map[string]interface{}) (string, error) {
-	return a.listPins(), nil
 }
 
 func handleRenameSymbol(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
@@ -586,23 +503,6 @@ func handleRenameSymbol(ctx context.Context, a *Agent, args map[string]interface
 	return a.Executor.RenameSymbol(ctx, oldName, newName, subpath, glob, dryRun)
 }
 
-func handleMultiEdit(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
-	pattern, err := stringArg(args, "pattern")
-	if err != nil {
-		return "", err
-	}
-	search, err := stringArg(args, "search")
-	if err != nil {
-		return "", err
-	}
-	replace, err := stringArg(args, "replace")
-	if err != nil {
-		return "", err
-	}
-	dryRun, _ := boolArg(args, "dry_run", false)
-	return a.Executor.MultiEdit(ctx, pattern, search, replace, dryRun)
-}
-
 func handleCallGraph(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
 	symbol, err := stringArg(args, "symbol")
 	if err != nil {
@@ -612,13 +512,4 @@ func handleCallGraph(ctx context.Context, a *Agent, args map[string]interface{})
 	glob, _ := stringArgOptional(args, "glob")
 	direction, _ := stringArgOptional(args, "direction")
 	return a.Executor.CallGraph(ctx, symbol, subpath, glob, direction)
-}
-
-func handleDependencyAnalysis(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
-	symbol, err := stringArg(args, "symbol")
-	if err != nil {
-		return "", err
-	}
-	subpath, _ := stringArgOptional(args, "path")
-	return a.Executor.DependencyAnalysis(ctx, symbol, subpath)
 }
