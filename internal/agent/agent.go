@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -51,7 +52,12 @@ type Agent struct {
 	// SessionLabel is guarded by statsMu (setSessionLabel /
 	// SessionLabelSnapshot): web probes read it without turnMu while the
 	// turn goroutine may derive it from the first user message.
-	SessionLabel   string
+	SessionLabel string
+	// labelRenamed is true when SessionLabel was set deliberately
+	// (RenameSession / session_rename tool). Guarded by statsMu; persisted
+	// via SessionSnapshot.LabelRenamed so the store never regenerates the
+	// label from the conversation (see sessionLabel).
+	labelRenamed   bool
 	SessionOneshot bool // true if this session was created by a single-prompt (-p) invocation
 	// UsageAccum is guarded by statsMu (clearTurnUsage / snapshot reads).
 	UsageAccum UsageAccumulator
@@ -355,6 +361,7 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 	a.statsMu.RLock()
 	msgs := cloneMessagesShallow(a.Messages)
 	label := a.SessionLabel
+	labelRenamed := a.labelRenamed
 	countsEpoch := a.countsEpoch
 	tokenCounts := append([]int(nil), a.tokenCounts...)
 	// Mode/thinking/oneshot are written under statsMu (SetMode,
@@ -406,6 +413,7 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 			ThinkingLevel:  thinking,
 			Oneshot:        oneshot,
 			Label:          label,
+			LabelRenamed:   labelRenamed,
 			ProjectProfile: profile,
 			Todos:          curMeta.todos,
 			Messages:       msgs,
@@ -519,6 +527,20 @@ func (a *Agent) replaceMessages(msgs []llm.Message) {
 	a.statsMu.Unlock()
 }
 
+// replaceMessagesWithCounts swaps the conversation wholesale and publishes
+// pre-computed per-message token counts in the same critical section. Unlike
+// replaceMessages (which clears the cache), this keeps the fast
+// shouldCompactUsingCounts path valid immediately — the caller computes the
+// counts before publishing, which is cheap for a compaction because the
+// conversation just shrank. Leaf lock.
+func (a *Agent) replaceMessagesWithCounts(msgs []llm.Message, counts []int) {
+	a.statsMu.Lock()
+	a.Messages = msgs
+	a.tokenCounts = counts
+	a.countsEpoch++
+	a.statsMu.Unlock()
+}
+
 // restoreMessages publishes a restored session's messages together with their
 // pre-computed token counts and marks every message as already-stabilized
 // (persisted ArgsStr). One atomic publish so concurrent readers never observe
@@ -530,7 +552,18 @@ func (a *Agent) restoreMessages(msgs []llm.Message, counts []int) {
 	a.tokenCounts = counts
 	a.countsEpoch++
 	for i := range a.Messages {
-		a.Messages[i].ArgsStabilized = true
+		m := &a.Messages[i]
+		m.ArgsStabilized = true
+		// Recompute the ArgsJSONValid memo for restored tool calls: the
+		// persisted ArgsStr is replayed byte-identically (never pinned or
+		// trimmed here), so the flag is set only when ArgsStr is already the
+		// exact trimmed valid wire bytes. A single validation per load beats
+		// re-validating every restored tool call on every request.
+		for j := range m.ToolCalls {
+			tc := &m.ToolCalls[j]
+			s := strings.TrimSpace(tc.ArgsStr)
+			tc.ArgsJSONValid = tc.ArgsStr != "" && tc.ArgsStr == s && json.Valid([]byte(s))
+		}
 	}
 	a.statsMu.Unlock()
 }
@@ -825,9 +858,17 @@ func (a *Agent) prepareMessages(ctx context.Context, h *llm.StreamHandlers) []ll
 				}
 				compacted, newPins, err := a.Context.CompactPinned(ctx, a.systemPromptPrefix(), a.Messages, pinned)
 				if err == nil {
-					// Publish the compacted history and invalidate the cached
-					// token counts in one atomic step.
-					a.replaceMessages(compacted)
+					// Compute the post-compaction counts BEFORE publishing —
+					// the conversation just shrank, so counting it is cheap —
+					// and publish them atomically. A nil cache here would
+					// make the next turn's shouldCompactUsingCounts fall back
+					// to a full EstimateTokens pass (the cache is otherwise
+					// only backfilled by ContextStats/doPersist).
+					counts := make([]int, len(compacted))
+					for i, m := range compacted {
+						counts[i] = contextmgr.ComputeMessageTokens(m)
+					}
+					a.replaceMessagesWithCounts(compacted, counts)
 					if a.PinManager != nil {
 						a.PinManager.ReplacePins(newPins)
 					}
@@ -902,7 +943,14 @@ func (a *Agent) CompactHistory(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	a.replaceMessages(compacted)
+	// Publish the compacted history together with its freshly computed token
+	// counts (cheap — compaction shrank the conversation) so the cached
+	// shouldCompactUsingCounts path stays valid on the next turn.
+	counts := make([]int, len(compacted))
+	for i, m := range compacted {
+		counts[i] = contextmgr.ComputeMessageTokens(m)
+	}
+	a.replaceMessagesWithCounts(compacted, counts)
 	if a.PinManager != nil {
 		a.PinManager.ReplacePins(newPins)
 	}

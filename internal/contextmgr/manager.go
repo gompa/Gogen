@@ -576,11 +576,17 @@ func (m *Manager) summarizeMiddle(ctx context.Context, ctxPrefix, middle []llm.M
 	// of summarizing). The conversation prefix stays byte-identical, so the
 	// provider prompt cache still covers the bulk of the request.
 	req = append(req, llm.Message{Role: "system", Content: summaryInstruction})
-	if m.EstimateTokens(req) <= budget {
+	// Tokenize the request exactly once and reuse the count for the budget
+	// check and both debuglog entries. (The map literal passed to
+	// debuglog.Write is evaluated eagerly even when debug logging is off, so
+	// a second EstimateTokens call here would duplicate the full
+	// tokenization of the conversation prefix on every compaction.)
+	reqTokens := m.EstimateTokens(req)
+	if reqTokens <= budget {
 		debuglog.Write("contextmgr/summarize", "continuation-summary request", "", map[string]interface{}{
 			"path":           "primary",
 			"middleMessages": len(middle),
-			"requestTokens":  m.EstimateTokens(req),
+			"requestTokens":  reqTokens,
 			"budget":         budget,
 		})
 		return m.summarizeRequest(ctx, req)
@@ -588,7 +594,7 @@ func (m *Manager) summarizeMiddle(ctx context.Context, ctxPrefix, middle []llm.M
 	debuglog.Write("contextmgr/summarize", "summary request exceeds window; using flattened-text fallback", "", map[string]interface{}{
 		"path":           "fallback",
 		"middleMessages": len(middle),
-		"requestTokens":  m.EstimateTokens(req),
+		"requestTokens":  reqTokens,
 		"budget":         budget,
 	})
 	return m.summarizeMessagesDepth(ctx, middle, 0)

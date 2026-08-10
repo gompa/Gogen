@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"gogen/internal/debuglog"
 
@@ -201,6 +202,15 @@ func (p *OpenAIProvider) messagesToChat(messages []Message) []openai.ChatComplet
 // deterministic — but it still usually differs from the provider's original
 // ArgsStr (spacing/key order), which is why pinning matters.
 func toolCallArgumentsJSON(tc *ToolCall) string {
+	// Fast path: ArgsStr was already validated (and trimmed) by
+	// StabilizeToolCallArgs or session restore, so re-running json.Valid —
+	// once per historical tool call on every API request — is pure overhead.
+	// The flag is only ever set before the message is published, never by
+	// this serializer (which runs outside the stats lock on shared
+	// stabilized ToolCalls), so a valid flag is always trustworthy.
+	if tc.ArgsJSONValid {
+		return tc.ArgsStr
+	}
 	if s := strings.TrimSpace(tc.ArgsStr); s != "" && json.Valid([]byte(s)) {
 		// Pin the exact bytes we send so history stays aligned with the wire.
 		if tc.ArgsStr != s {
@@ -254,9 +264,14 @@ func marshalToolArgsJSON(args map[string]interface{}) string {
 
 // StabilizeToolCallArgs pins ArgsStr to the bytes that will be sent on the
 // wire when ArgsStr is empty. Non-empty ArgsStr (valid or not) is left alone
-// so provider/history bytes are not rewritten mid-session.
+// so provider/history bytes are not rewritten mid-session. Records whether
+// the resulting ArgsStr is the exact trimmed valid wire bytes in
+// ArgsJSONValid, so the wire serializer can skip re-validating stabilized
+// tool calls on every request.
 func StabilizeToolCallArgs(tc *ToolCall) {
 	_ = toolCallArgumentsJSON(tc)
+	s := strings.TrimSpace(tc.ArgsStr)
+	tc.ArgsJSONValid = s != "" && json.Valid([]byte(s))
 }
 
 func (p *OpenAIProvider) GenerateResponse(ctx context.Context, messages []Message, allowedTools map[string]struct{}, tools []Tool) (Response, error) {
@@ -360,6 +375,17 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 
 	acc := newStreamAccumulator()
 
+	// reasoningStopGrace bounds the wait after a reasoning-only stop: a
+	// two-phase stream (reasoning → content) legitimately continues with
+	// content, but a provider that sends the stop and then holds the
+	// connection open without [DONE] would otherwise block the read for the
+	// full idle timeout. The timer is armed once the stop is seen and
+	// re-armed on every subsequent chunk while still pending (so an active
+	// but slow thinking stream is never cut short); it is disarmed the
+	// moment content/refusal/tool-calls resume. Closing the stream from the
+	// timer unblocks Next() promptly (same mechanism as the ctx watcher).
+	grace := reasoningStopGrace()
+	var stopGrace *time.Timer
 	for stream.Next() {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -367,6 +393,22 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 		if stop := acc.processChunk(stream.Current(), onToken, onThinking, h); stop {
 			break
 		}
+		if acc.stopPending && grace > 0 {
+			if stopGrace == nil {
+				stopGrace = time.AfterFunc(grace, func() {
+					acc.graceExpired.Store(true)
+					_ = stream.Close()
+				})
+			} else {
+				stopGrace.Reset(grace)
+			}
+		} else if stopGrace != nil {
+			stopGrace.Stop()
+			stopGrace = nil
+		}
+	}
+	if stopGrace != nil {
+		stopGrace.Stop()
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -374,6 +416,14 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 	}
 
 	if err := stream.Err(); err != nil {
+		if acc.graceExpired.Load() {
+			// The stream was closed by the reasoning-stop grace timer, not
+			// by a real failure: return the accumulated reasoning as a
+			// complete response (the provider held the connection open
+			// instead of sending [DONE]) rather than triggering the
+			// non-streaming fallback, which would re-request the turn.
+			return acc.buildResult()
+		}
 		return p.handleStreamFallback(ctx, messages, allowedTools, tools, h, err, acc)
 	}
 

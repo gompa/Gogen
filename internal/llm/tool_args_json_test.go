@@ -103,3 +103,39 @@ func TestToolCallArgumentsJSONStableAcrossCalls(t *testing.T) {
 		t.Fatalf("got %q, want sorted-key marshal", first)
 	}
 }
+
+// TestStabilizeToolCallArgsMemoizesValidity verifies StabilizeToolCallArgs
+// records ArgsJSONValid for valid ArgsStr so the wire serializer skips the
+// per-request json.Valid scan, while an invalid ArgsStr stays un-flagged so
+// the serializer keeps remarsaling for the wire (without overwriting
+// history) exactly as before.
+func TestStabilizeToolCallArgsMemoizesValidity(t *testing.T) {
+	valid := ToolCall{Name: "read_file", ArgsStr: `{"path":"a.go"}`}
+	StabilizeToolCallArgs(&valid)
+	if !valid.ArgsJSONValid {
+		t.Fatal("valid ArgsStr should be flagged ArgsJSONValid")
+	}
+	// The serializer takes the fast path and returns the exact bytes.
+	if got := toolCallArgumentsJSON(&valid); got != `{"path":"a.go"}` {
+		t.Fatalf("fast path returned %q", got)
+	}
+
+	invalid := ToolCall{Name: "read_file", ArgsStr: `{"path":`, Args: map[string]interface{}{"path": "a.go"}}
+	StabilizeToolCallArgs(&invalid)
+	if invalid.ArgsJSONValid {
+		t.Fatal("invalid ArgsStr must not be flagged valid")
+	}
+	// Serializer still remarsals for the wire without touching ArgsStr.
+	if got := toolCallArgumentsJSON(&invalid); got != `{"path":"a.go"}` {
+		t.Fatalf("invalid-path serialization = %q", got)
+	}
+	if invalid.ArgsStr != `{"path":` {
+		t.Fatalf("invalid ArgsStr overwritten: %q", invalid.ArgsStr)
+	}
+
+	empty := ToolCall{Name: "noop"}
+	StabilizeToolCallArgs(&empty)
+	if !empty.ArgsJSONValid || empty.ArgsStr != "{}" {
+		t.Fatalf("empty args should stabilize to pinned {} and be flagged: %q valid=%v", empty.ArgsStr, empty.ArgsJSONValid)
+	}
+}

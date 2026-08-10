@@ -13,12 +13,17 @@ const validateModelTimeout = 12 * time.Second
 
 // SessionSnapshot is persisted conversation state.
 type SessionSnapshot struct {
-	WorkingDir     string
-	Oneshot        bool
-	Model          string
-	Mode           string
-	ThinkingLevel  string // persisted thinking level; empty/absent means "off"
-	Label          string
+	WorkingDir    string
+	Oneshot       bool
+	Model         string
+	Mode          string
+	ThinkingLevel string // persisted thinking level; empty/absent means "off"
+	Label         string
+	// LabelRenamed is true when Label was set deliberately (RenameSession /
+	// the session_rename tool) rather than derived from the first user
+	// message. Persisted so the store never regenerates a deliberate rename
+	// (see sessionLabel's legacy-50-char migration rule).
+	LabelRenamed   bool
 	ProjectProfile string
 	Todos          *TodoList
 	Messages       []llm.Message
@@ -102,6 +107,10 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 	// so it is published under the same lock.
 	a.statsMu.Lock()
 	a.SessionOneshot = snap.Oneshot
+	// Restore the rename marker alongside the label: a label that was a
+	// deliberate rename before persistence must stay authoritative after a
+	// restart (sessionLabel's legacy-50-char migration must not clobber it).
+	a.labelRenamed = snap.LabelRenamed
 	if m, ok := ParseMode(snap.Mode); ok {
 		a.Mode = m
 	}
@@ -225,10 +234,25 @@ func sameWorkingDir(snapDir, currentDir string) bool {
 
 // setSessionLabel stores the session label under statsMu: web probes read it
 // without turnMu (agentConfigMsgBasic, contextMsg) while the turn
-// goroutine may derive it from the first user message.
+// goroutine may derive it from the first user message. Clears the rename
+// marker: derived, restored, and cleared labels are not renames by
+// themselves (restore re-establishes the marker from the persisted snapshot
+// when it was one).
 func (a *Agent) setSessionLabel(label string) {
 	a.statsMu.Lock()
 	a.SessionLabel = label
+	a.labelRenamed = false
+	a.statsMu.Unlock()
+}
+
+// setSessionLabelRenamed is setSessionLabel for deliberate renames
+// (RenameSession / the session_rename tool): the marker is persisted so the
+// store never regenerates the label from the conversation, even when it
+// happens to look like a legacy 50-char truncation of the first user message.
+func (a *Agent) setSessionLabelRenamed(label string) {
+	a.statsMu.Lock()
+	a.SessionLabel = label
+	a.labelRenamed = true
 	a.statsMu.Unlock()
 }
 
@@ -242,7 +266,7 @@ func (a *Agent) SessionLabelSnapshot() string {
 
 // RenameSession sets a user-visible label for the current session and persists it.
 func (a *Agent) RenameSession(label string) (string, error) {
-	a.setSessionLabel(label)
+	a.setSessionLabelRenamed(label)
 	a.FlushSession()
 	return "Session label set to " + label, nil
 }

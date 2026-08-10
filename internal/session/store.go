@@ -28,15 +28,20 @@ const version = 1
 const legacyLabelMaxLen = 50
 
 type file struct {
-	Version        int             `json:"version"`
-	ID             string          `json:"id"`
-	Created        time.Time       `json:"created"`
-	Updated        time.Time       `json:"updated"`
-	WorkingDir     string          `json:"workingDir"`
-	Model          string          `json:"model"`
-	Mode           string          `json:"mode"`
-	ThinkingLevel  string          `json:"thinkingLevel,omitempty"`
-	Label          string          `json:"label,omitempty"`
+	Version       int       `json:"version"`
+	ID            string    `json:"id"`
+	Created       time.Time `json:"created"`
+	Updated       time.Time `json:"updated"`
+	WorkingDir    string    `json:"workingDir"`
+	Model         string    `json:"model"`
+	Mode          string    `json:"mode"`
+	ThinkingLevel string    `json:"thinkingLevel,omitempty"`
+	Label         string    `json:"label,omitempty"`
+	// LabelRenamed records that Label was set deliberately (RenameSession /
+	// session_rename tool) rather than derived from the first user message.
+	// The store must never regenerate a renamed label — not even one that
+	// looks like a legacy 50-char truncation (see sessionLabel).
+	LabelRenamed   bool            `json:"labelRenamed,omitempty"`
 	ProjectProfile string          `json:"projectProfile,omitempty"`
 	Todos          *agent.TodoList `json:"todos,omitempty"`
 	Messages       []llm.Message   `json:"messages"`
@@ -66,6 +71,10 @@ type sessionIndexEntry struct {
 	Oneshot      bool      `json:"oneshot,omitempty"`
 	MessageCount int       `json:"messageCount"`
 	Label        string    `json:"label,omitempty"`
+	// LabelRenamed mirrors the session file's marker (see file.LabelRenamed)
+	// so List can keep a deliberate rename authoritative without re-reading
+	// the session file.
+	LabelRenamed bool `json:"labelRenamed,omitempty"`
 }
 
 // sessionIndex is the on-disk index of session metadata for fast listing.
@@ -234,6 +243,10 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 		}
 	}
 	created := time.Now().UTC()
+	// preloadedIdx is the metadata index read during Created recovery
+	// (cache-miss path only); updateIndex reuses it so a full save reads
+	// index.json at most once.
+	var preloadedIdx *sessionIndex
 	if cached, ok := s.createdCache[id]; ok {
 		created = cached
 	} else {
@@ -247,8 +260,9 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 		// target skips allocating the previous session's messages just to
 		// recover one timestamp.
 		found := false
-		if idx := s.readIndex(snap.WorkingDir); idx != nil {
-			for _, e := range idx.Entries {
+		preloadedIdx = s.readIndex(snap.WorkingDir)
+		if preloadedIdx != nil {
+			for _, e := range preloadedIdx.Entries {
 				if e.ID == id && !e.Created.IsZero() {
 					created = e.Created
 					found = true
@@ -277,6 +291,7 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 		Mode:           snap.Mode,
 		ThinkingLevel:  snap.ThinkingLevel,
 		Label:          snap.Label,
+		LabelRenamed:   snap.LabelRenamed,
 		ProjectProfile: snap.ProjectProfile,
 		Todos:          snap.Todos,
 		Messages:       snap.Messages,
@@ -301,13 +316,18 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 	}
 	s.setCreatedCache(id, created)
 	s.saveCount++
+	// Update index and invalidate in-memory cache. Runs before prune (order
+	// swap): prune always keeps the current session id, so its later index
+	// rewrite cannot clobber this entry, and the preloaded index — read
+	// during Created recovery and untouched since, under s.mu — is still
+	// fresh here. This lets a cache-miss full save read index.json once
+	// instead of twice.
+	label := sessionLabel(snap.Messages, snap.Label, snap.LabelRenamed)
+	s.updateIndex(snap.WorkingDir, id, out.Created, out.Updated, len(snap.Messages), label, snap.Oneshot, snap.LabelRenamed, preloadedIdx)
 	// Prune every 3 saves to avoid repeated directory scans on every write.
 	if s.autoPrune && s.saveCount%3 == 0 {
 		s.prune(snap.WorkingDir, id)
 	}
-	// Update index and invalidate in-memory cache.
-	label := sessionLabel(snap.Messages, snap.Label)
-	s.updateIndex(snap.WorkingDir, id, out.Created, out.Updated, len(snap.Messages), label, snap.Oneshot)
 	return nil
 }
 
@@ -500,6 +520,7 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 		ThinkingLevel:  f.ThinkingLevel,
 		Oneshot:        f.Oneshot,
 		Label:          f.Label,
+		LabelRenamed:   f.LabelRenamed,
 		ProjectProfile: f.ProjectProfile,
 		Todos:          f.Todos,
 		Messages:       f.Messages,
@@ -758,6 +779,12 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 		// session file on every list.
 		needsRewrite := false
 		for i, e := range idx.Entries {
+			// Deliberate renames (marker persisted by Save) are always
+			// authoritative: never regenerate them from the conversation,
+			// even when they are exactly the legacy truncation length.
+			if e.LabelRenamed {
+				continue
+			}
 			if len(e.Label) == legacyLabelMaxLen {
 				if raw := s.loadRawLabel(workingDir, e.ID); raw != "" && raw != e.Label {
 					idx.Entries[i].Label = raw
@@ -814,7 +841,7 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 		// Use the delta-aware effective timestamp (AppendMessages bumps only
 		// the index and mtimes, not the file's updated field).
 		updated := s.sessionUpdatedAt(workingDir, id, f.Updated)
-		lbl := sessionLabel(f.Messages, f.Label)
+		lbl := sessionLabel(f.Messages, f.Label, f.LabelRenamed)
 		items = append(items, item{
 			info: agent.SessionInfo{
 				ID:           id,
@@ -1050,10 +1077,22 @@ func (s *Store) writeIndex(workingDir string, idx *sessionIndex) error {
 // so callers that care (touchIndex) can propagate them; the other index
 // mutators swallow them, matching their historical behavior.
 func (s *Store) mutateIndex(workingDir string, createIfMissing bool, mutate func(idx *sessionIndex) bool) error {
+	return s.mutateIndexWith(workingDir, createIfMissing, nil, mutate)
+}
+
+// mutateIndexWith is mutateIndex with a caller-supplied preloaded index: when
+// preloaded is non-nil it is used instead of re-reading the index file (Save
+// reuses the index it already loaded for Created recovery). The preloaded
+// snapshot is only valid because the caller holds s.mu and no other index
+// mutator runs between the read and this mutation.
+func (s *Store) mutateIndexWith(workingDir string, createIfMissing bool, preloaded *sessionIndex, mutate func(idx *sessionIndex) bool) error {
 	if !s.enabled {
 		return nil
 	}
-	idx := s.readIndex(workingDir)
+	idx := preloaded
+	if idx == nil {
+		idx = s.readIndex(workingDir)
+	}
 	if idx == nil {
 		if !createIfMissing {
 			return nil
@@ -1075,8 +1114,12 @@ func (s *Store) mutateIndex(workingDir string, createIfMissing bool, mutate func
 // a process restart) can recover the immutable Created timestamp from the
 // index instead of re-reading the session file. Existing entries keep their
 // Created when created is zero (defensive: Save always passes non-zero).
-func (s *Store) updateIndex(workingDir, id string, created, updated time.Time, msgCount int, label string, oneshot bool) {
-	s.mutateIndex(workingDir, true, func(idx *sessionIndex) bool {
+// preloaded, when non-nil, is a caller-supplied index (see mutateIndexWith);
+// Save passes the index it already loaded for Created recovery so a full save
+// reads index.json at most once. labelRenamed mirrors the session file's
+// rename marker so List can keep deliberate renames authoritative.
+func (s *Store) updateIndex(workingDir, id string, created, updated time.Time, msgCount int, label string, oneshot, labelRenamed bool, preloaded *sessionIndex) {
+	s.mutateIndexWith(workingDir, true, preloaded, func(idx *sessionIndex) bool {
 		found := false
 		for i, e := range idx.Entries {
 			if e.ID == id {
@@ -1087,13 +1130,14 @@ func (s *Store) updateIndex(workingDir, id string, created, updated time.Time, m
 				idx.Entries[i].Oneshot = oneshot
 				idx.Entries[i].MessageCount = msgCount
 				idx.Entries[i].Label = label
+				idx.Entries[i].LabelRenamed = labelRenamed
 				found = true
 				break
 			}
 		}
 		if !found {
 			idx.Entries = append(idx.Entries, sessionIndexEntry{
-				ID: id, Created: created, Updated: updated, Oneshot: oneshot, MessageCount: msgCount, Label: label,
+				ID: id, Created: created, Updated: updated, Oneshot: oneshot, MessageCount: msgCount, Label: label, LabelRenamed: labelRenamed,
 			})
 		}
 		return true
@@ -1183,7 +1227,16 @@ func (s *Store) invalidateListCache(workingDir string) {
 	listCacheMu.Unlock()
 }
 
-func sessionLabel(messages []llm.Message, stored string) string {
+func sessionLabel(messages []llm.Message, stored string, renamed bool) string {
+	// A deliberate rename is always authoritative: the user (or the
+	// session_rename tool) chose it, so it must never be regenerated from
+	// the conversation. This closes the legacy-migration hole where a
+	// rename of exactly legacyLabelMaxLen characters that happens to be a
+	// prefix of the derived first-user-message label would be silently
+	// replaced by the longer derived label on the next full save.
+	if renamed {
+		return stored
+	}
 	derived := llm.SessionLabel(messages)
 	// The stored label is authoritative UNLESS it is a legacy 50-char
 	// truncation of the derived label. An older version truncated labels

@@ -37,8 +37,19 @@ func mergeToolCallDelta(
 	if toolCallDeltaArgsOnly(tc) {
 		if len(tcAccums) > 0 {
 			lastIdx := len(tcAccums) - 1
-			if last := tcAccums[lastIdx]; last.Index > tcIdx {
-				return applyToolCallDelta(tcAccums, lastIdx, tc)
+			// Local OpenAI-compatible servers often omit the index field on
+			// argument continuations, and the decoded zero value (0) would
+			// otherwise splice the fragment onto tool 0. Only apply the
+			// default-index-0 splice when the wire truly omitted the index:
+			// an EXPLICIT index=0 is a genuine continuation of tool 0 and
+			// must route through the index map — otherwise a server
+			// streaming tools 1..N in parallel with tool 0's continuation
+			// would mis-splice the fragment onto the last (highest-index)
+			// tool.
+			if !tc.JSON.Index.Valid() {
+				if last := tcAccums[lastIdx]; last.Index > tcIdx {
+					return applyToolCallDelta(tcAccums, lastIdx, tc)
+				}
 			}
 		}
 		if mapIdx, ok := tcIndexMap[tcIdx]; ok {

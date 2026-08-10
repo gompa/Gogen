@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"gogen/internal/contextmgr"
 )
 
 const (
@@ -403,9 +405,16 @@ func (e *Executor) ReadFiles(paths []string) (string, error) {
 			if remain <= len(header)+20 {
 				break
 			}
-			block = block[:remain] + fmt.Sprintf("\n… truncated (%d bytes total across files)", total+remain)
+			// Rune-safe cut: slicing at remain could split a multi-byte
+			// UTF-8 character mid-sequence and inject invalid bytes into the
+			// conversation (JSON-encoding would replace them with U+FFFD).
+			// Back off to a rune boundary like every other truncation path
+			// (contextmgr.TruncateRuneSafe); the reported byte total uses
+			// the actually-kept length, which can be a few bytes smaller.
+			cut := contextmgr.TruncateRuneSafe(block, remain)
+			block = cut + fmt.Sprintf("\n… truncated (%d bytes total across files)", total+len(cut))
 			b.WriteString(block)
-			total += remain
+			total += len(cut)
 			break
 		}
 		b.WriteString(block)

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -509,7 +510,15 @@ func (e *Executor) searchWithGo(ctx context.Context, searchRoot, relPrefix, patt
 		if limit <= 0 {
 			return false
 		}
-		fileMatches, err := scanFileSinglePass(path, rel, re, contextLines, limit)
+		reader, closer, binary, err := openSearchableFile(path)
+		if err != nil {
+			return false
+		}
+		defer closer.Close()
+		if binary {
+			return false
+		}
+		fileMatches, err := scanFileSinglePass(reader, rel, re, contextLines, limit)
 		if err != nil {
 			return false
 		}
@@ -553,7 +562,15 @@ func (e *Executor) searchWithGoMatches(ctx context.Context, searchRoot, relPrefi
 		if limit <= 0 {
 			return false
 		}
-		fileMatches, err := scanFileMatches(path, rel, re, limit)
+		reader, closer, binary, err := openSearchableFile(path)
+		if err != nil {
+			return false
+		}
+		defer closer.Close()
+		if binary {
+			return false
+		}
+		fileMatches, err := scanFileMatches(reader, rel, re, limit)
 		if err != nil {
 			return false
 		}
@@ -579,16 +596,11 @@ func (e *Executor) searchWithGoMatches(ctx context.Context, searchRoot, relPrefi
 	return matches, truncated, nil
 }
 
-// scanFileMatches reads the file once in a single streaming pass and returns
+// scanFileMatches reads the file once (via the caller-provided reader, which
+// already includes the binary probe) in a single streaming pass and returns
 // structured matches (no context lines).
-func scanFileMatches(path, relPath string, re *regexp.Regexp, matchLimit int) ([]SearchMatch, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
+func scanFileMatches(r io.Reader, relPath string, re *regexp.Regexp, matchLimit int) ([]SearchMatch, error) {
+	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), searchMaxFileBytes)
 
 	var out []SearchMatch
@@ -636,17 +648,12 @@ func compileSearchPattern(pattern string) (*regexp.Regexp, error) {
 	return re, nil
 }
 
-// scanFileSinglePass reads the file once, finds matches, and emits results
+// scanFileSinglePass reads the file once (via the caller-provided reader,
+// which already includes the binary probe), finds matches, and emits results
 // with context lines (contextLines > 0). The context-free case is handled by
 // scanFileMatches.
-func scanFileSinglePass(path, relPath string, re *regexp.Regexp, contextLines, matchLimit int) ([]string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
+func scanFileSinglePass(r io.Reader, relPath string, re *regexp.Regexp, contextLines, matchLimit int) ([]string, error) {
+	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), searchMaxFileBytes)
 
 	// Context-lines path: store lines to support before/after context.
@@ -718,32 +725,45 @@ var binaryProbePool = sync.Pool{
 	},
 }
 
-func isBinaryFile(path string) bool {
+// openSearchableFile opens path and probes the first searchBinaryProbe bytes
+// for NUL (binary detection) in the SAME open the scan will use. A binary
+// file returns binary=true with a nil reader (the probe bytes are discarded,
+// so binaries still cost only one 8KB read). A text file returns a reader
+// over the whole file — the probe bytes followed by the rest — so the caller
+// reads the file exactly once. The previous design probed with a separate
+// open (isBinaryFile) and then opened the file again for the scan, doubling
+// file opens on slow filesystems whenever ripgrep was unavailable. The probe
+// bytes are copied out of the pooled buffer because the returned reader
+// outlives the pool's ownership of the buffer.
+func openSearchableFile(path string) (reader io.Reader, closer io.Closer, binary bool, err error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return true
+		return nil, nil, false, err
 	}
-	defer f.Close()
 	bp := binaryProbePool.Get().(*[]byte)
-	defer binaryProbePool.Put(bp)
 	buf := *bp
 	n, _ := f.Read(buf)
+	binaryProbePool.Put(bp)
 	for i := 0; i < n; i++ {
 		if buf[i] == 0 {
-			return true
+			_ = f.Close()
+			return nil, nil, true, nil
 		}
 	}
-	return false
+	probe := make([]byte, n)
+	copy(probe, buf[:n])
+	return io.MultiReader(bytes.NewReader(probe), f), f, false, nil
 }
 
 // searchableWalkFile reports whether a walked file is worth reading: the
-// stat succeeded, the file is within the search size cap, and it is not
-// binary. Walkers silently skip files that fail this check.
+// stat succeeded and the file is within the search size cap. The binary
+// probe is deferred to the read (openSearchableFile) so each file is opened
+// exactly once; walkers silently skip files that fail this check.
 func searchableWalkFile(path string, info os.FileInfo, err error) bool {
 	if err != nil || info == nil || info.Size() > searchMaxFileBytes {
 		return false
 	}
-	return !isBinaryFile(path)
+	return true
 }
 
 // compactSearchOutput rewrites lines of the form "filepath:line:content" or

@@ -112,15 +112,73 @@ func TestSessionLabelLegacyTruncationStillMigrated(t *testing.T) {
 	msgs := []llm.Message{{Role: "user", Content: "implement session commands with labels and keep going"}}
 	derived := llm.SessionLabel(msgs)
 	legacy := derived[:legacyLabelMaxLen]
-	if got := sessionLabel(msgs, legacy); got != derived {
+	if got := sessionLabel(msgs, legacy, false); got != derived {
 		t.Fatalf("legacy truncated label = %q, want migrated to %q", got, derived)
 	}
 	// A rename shorter than the legacy length must NOT be regenerated.
-	if got := sessionLabel(msgs, "Short title"); got != "Short title" {
+	if got := sessionLabel(msgs, "Short title", false); got != "Short title" {
 		t.Fatalf("rename = %q, want kept, got %q", "Short title", got)
 	}
 	// Empty stored label falls back to the message-derived label.
-	if got := sessionLabel(msgs, ""); got != derived {
+	if got := sessionLabel(msgs, "", false); got != derived {
 		t.Fatalf("empty stored = %q, want %q", got, derived)
+	}
+	// A deliberate rename that EXACTLY matches the legacy 50-char truncation
+	// shape (a prefix of the derived label) must still be authoritative when
+	// the rename marker is set — the hole that the marker closes.
+	renamed := derived[:legacyLabelMaxLen]
+	if got := sessionLabel(msgs, renamed, true); got != renamed {
+		t.Fatalf("renamed 50-char label = %q, want kept verbatim (not migrated to %q)", got, derived)
+	}
+}
+
+// TestSaveLoadKeepsRenameMarkerAcrossRestart verifies the rename marker
+// survives a full save/load round trip (process-restart simulation: a fresh
+// Store with an empty createdCache), so a 50-char rename is not migrated by
+// the legacy-label rule after a restart.
+func TestSaveLoadKeepsRenameMarkerAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(true)
+	msgs := []llm.Message{
+		{Role: "user", Content: "implement session commands with labels and keep going"},
+		{Role: "assistant", Content: "ok"},
+	}
+	derived := llm.SessionLabel(msgs)
+	rename := derived[:legacyLabelMaxLen]
+	if err := store.Save("sess-renamed", agent.SessionSnapshot{
+		WorkingDir:   dir,
+		Messages:     msgs,
+		Label:        rename,
+		LabelRenamed: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Fresh store instance = empty createdCache (simulates a restart).
+	store2 := NewStore(true)
+	loaded, err := store2.LoadInWorkingDir(dir, "sess-renamed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.LabelRenamed {
+		t.Fatalf("LabelRenamed lost across save/load: %+v", loaded)
+	}
+	if loaded.Label != rename {
+		t.Fatalf("label=%q, want the 50-char rename kept verbatim", loaded.Label)
+	}
+	// A re-save after restart must not migrate the rename either.
+	if err := store2.Save("sess-renamed", agent.SessionSnapshot{
+		WorkingDir:   dir,
+		Messages:     msgs,
+		Label:        rename,
+		LabelRenamed: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	list, err := store2.List(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].Label != rename {
+		t.Fatalf("list label=%+v, want the rename kept", list)
 	}
 }

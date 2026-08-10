@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestListFilesRecursive(t *testing.T) {
@@ -246,6 +247,45 @@ func TestReadFilesParallelError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "missing.txt") {
 		t.Fatalf("expected error to name missing file, got %v", err)
+	}
+}
+
+// TestReadFilesTruncationRuneSafe pins the multi-file truncation to a UTF-8
+// rune boundary: the byte cap can land mid-rune, and the cut must back off
+// (contextmgr.TruncateRuneSafe) instead of emitting invalid UTF-8 that would
+// be U+FFFD-replaced when JSON-encoded to the model.
+func TestReadFilesTruncationRuneSafe(t *testing.T) {
+	dir := t.TempDir()
+	// "=== a.txt ===\n" is 14 bytes. Fill the first file so the second
+	// block's cut (remain = readFilesMaxTotalBytes - total = 61) lands one
+	// byte into a 3-byte rune (界): 15 bytes of block prefix
+	// ("\n=== b.txt ===\n") + 46 content bytes = 15 full runes + 1 partial.
+	contentA := strings.Repeat("a", readFilesMaxTotalBytes-14-61)
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte(contentA), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	contentB := strings.Repeat("界", 100) // 300 bytes
+	if err := os.WriteFile(filepath.Join(dir, "b.txt"), []byte(contentB), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := NewExecutor(dir)
+	out, err := exec.ReadFiles([]string{"a.txt", "b.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !utf8.ValidString(out) {
+		t.Fatalf("output contains invalid UTF-8 (mid-rune truncation): …%q", out[len(out)-80:])
+	}
+	if !strings.Contains(out, "=== b.txt ===") {
+		t.Fatal("second file header missing")
+	}
+	// Rune-safe backoff keeps exactly 15 full 界 runes (45 bytes), not 16.
+	if !strings.Contains(out, strings.Repeat("界", 15)) {
+		t.Fatal("expected 15 multibyte runes kept")
+	}
+	if !strings.Contains(out, "truncated") {
+		t.Fatal("expected truncation marker")
 	}
 }
 

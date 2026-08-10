@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/openai/openai-go"
@@ -15,6 +16,19 @@ func deltaTool(index int64, id, name, args string) openai.ChatCompletionChunkCho
 			Arguments: args,
 		},
 	}
+}
+
+// deltaToolFromJSON builds a tool-call delta from its raw wire JSON so the
+// JSON.* presence metadata — which the SSE decoder populates and the index
+// routing relies on to distinguish an omitted index from an explicit index=0
+// — is set exactly as it would be in a real stream.
+func deltaToolFromJSON(t *testing.T, raw string) openai.ChatCompletionChunkChoiceDeltaToolCall {
+	t.Helper()
+	var tc openai.ChatCompletionChunkChoiceDeltaToolCall
+	if err := json.Unmarshal([]byte(raw), &tc); err != nil {
+		t.Fatal(err)
+	}
+	return tc
 }
 
 func TestMergeToolCallDeltaMultipleTools(t *testing.T) {
@@ -118,6 +132,60 @@ func TestMergeToolCallDeltaArgsContinuationMissingIndex(t *testing.T) {
 	}
 	if accums[0].ArgsStr != `{"path":"a"}` {
 		t.Fatalf("first tool polluted: %q", accums[0].ArgsStr)
+	}
+}
+
+// TestMergeToolCallDeltaExplicitIndexZeroContinuation pins the routing of an
+// EXPLICIT index=0 args-only continuation while a higher-index tool is
+// streaming. The default-index-0 splice must only apply when the wire OMITTED
+// the index field; an explicit index=0 is a genuine continuation of tool 0
+// and must land on tool 0, not on the last (highest-index) tool.
+func TestMergeToolCallDeltaExplicitIndexZeroContinuation(t *testing.T) {
+	t.Parallel()
+	m := make(map[int]int)
+	var accums []tcAccum
+
+	accums, _ = mergeToolCallDelta(deltaTool(0, "a", "read_file", ""), accums, m)
+	accums, _ = mergeToolCallDelta(deltaTool(0, "", "", `{"path":"a"`), accums, m)
+	accums, _ = mergeToolCallDelta(deltaTool(1, "b", "read_file", ""), accums, m)
+	accums, _ = mergeToolCallDelta(deltaTool(1, "", "", `{"path":"b"}`), accums, m)
+	// Explicit index=0 continuation carrying a true delta fragment: the
+	// index field is PRESENT on the wire, so the fragment must continue
+	// tool 0 (the pre-fix code spliced it onto tool 1 because 1 > 0).
+	accums, _ = mergeToolCallDelta(deltaToolFromJSON(t, `{"index":0,"function":{"arguments":",\"offset\":10}"}}`), accums, m)
+
+	if len(accums) != 2 {
+		t.Fatalf("got %d accums, want 2", len(accums))
+	}
+	if accums[0].ArgsStr != `{"path":"a","offset":10}` {
+		t.Fatalf("tool 0 args = %q, want explicit index-0 continuation spliced onto tool 0", accums[0].ArgsStr)
+	}
+	if accums[1].ArgsStr != `{"path":"b"}` {
+		t.Fatalf("tool 1 polluted: %q", accums[1].ArgsStr)
+	}
+}
+
+// TestMergeToolCallDeltaExplicitHighIndexContinuation verifies an explicit
+// non-zero index routes through the index map (not the default-index-0
+// splice), so an interleaved continuation of tool 2 is not spliced onto the
+// last tool.
+func TestMergeToolCallDeltaExplicitHighIndexContinuation(t *testing.T) {
+	t.Parallel()
+	m := make(map[int]int)
+	var accums []tcAccum
+
+	accums, _ = mergeToolCallDelta(deltaTool(0, "a", "read_file", ""), accums, m)
+	accums, _ = mergeToolCallDelta(deltaTool(1, "b", "read_file", ""), accums, m)
+	accums, _ = mergeToolCallDelta(deltaTool(2, "c", "glob", ""), accums, m)
+	accums, _ = mergeToolCallDelta(deltaTool(2, "", "", `{"pattern":"*.go"`), accums, m)
+	// Explicit index=2 continuation: must land on tool 2 via the map.
+	accums, _ = mergeToolCallDelta(deltaToolFromJSON(t, `{"index":2,"function":{"arguments":",\"recursive\":true}"}}`), accums, m)
+
+	if accums[2].ArgsStr != `{"pattern":"*.go","recursive":true}` {
+		t.Fatalf("tool 2 args = %q, want explicit index-2 continuation", accums[2].ArgsStr)
+	}
+	if accums[0].ArgsStr != "" || accums[1].ArgsStr != "" {
+		t.Fatalf("tools 0/1 polluted: %#v", accums)
 	}
 }
 

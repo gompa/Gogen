@@ -2,10 +2,35 @@ package llm
 
 import (
 	"fmt"
+	"os"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/openai/openai-go"
 )
+
+// reasoningStopGrace is how long the stream waits for content to resume after
+// a reasoning-only finish_reason="stop" before treating the response as
+// complete. Two-phase streams (reasoning → content) legitimately continue
+// within the grace, so only a provider that sends the stop and then HOLDS the
+// connection open without [DONE] is cut short — otherwise the read would
+// block for the full idle timeout (streamReadIdleTimeout, default 10m). Set
+// GOGEN_REASONING_STOP_GRACE=0/off to disable the bound (wait indefinitely).
+func reasoningStopGrace() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("GOGEN_REASONING_STOP_GRACE"))
+	if raw == "" {
+		return 30 * time.Second
+	}
+	if raw == "0" || strings.EqualFold(raw, "off") || strings.EqualFold(raw, "false") {
+		return 0
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return 30 * time.Second
+	}
+	return d
+}
 
 // streamDrainLimit bounds how many post-finish chunks the accumulator
 // consumes while waiting for the final usage chunk. Usage is captured as
@@ -53,6 +78,16 @@ type streamAccumulator struct {
 	extras           extraFieldAccums
 	streamDone       bool
 	drainAfterDone   int
+	// stopPending is set when a reasoning-only finish_reason="stop" arrives:
+	// a two-phase stream may continue with content after it, so streamDone
+	// stays false, but the consuming loop bounds the wait for the next chunk
+	// (see reasoningStopGrace). Cleared as soon as content/refusal/tool-calls
+	// resume.
+	stopPending bool
+	// graceExpired is set when the reasoning-stop grace timer fires (the
+	// provider held the connection open without resuming or sending [DONE]),
+	// so the loop can distinguish a grace close from a real stream error.
+	graceExpired atomic.Bool
 }
 
 func newStreamAccumulator() *streamAccumulator {
@@ -92,11 +127,16 @@ func (a *streamAccumulator) processChunk(chunk openai.ChatCompletionChunk, onTok
 	if delta.Content != "" {
 		a.fullContent.WriteString(delta.Content)
 		onToken(delta.Content)
+		// Content resuming after a reasoning-only stop means the two-phase
+		// stream continued; the reasoning-stop grace is no longer needed.
+		a.stopPending = false
 	}
 	if delta.Refusal != "" {
 		a.fullRefusal.WriteString(delta.Refusal)
+		a.stopPending = false
 	}
 	if len(delta.ToolCalls) > 0 {
+		a.stopPending = false
 		for _, tc := range delta.ToolCalls {
 			var idx int
 			a.tcAccums, idx = mergeToolCallDelta(tc, a.tcAccums, a.tcIndexMap)
@@ -120,6 +160,14 @@ func (a *streamAccumulator) processChunk(chunk openai.ChatCompletionChunk, onTok
 			if a.fullContent.Len() > 0 || a.fullRefusal.Len() > 0 || len(a.tcAccums) > 0 {
 				a.lastFinishReason = choice.FinishReason
 				a.streamDone = true
+			} else if a.fullReasoning.Len() > 0 {
+				// Reasoning-only stop: a two-phase stream (reasoning →
+				// content) may continue with content after this chunk, so
+				// streamDone stays false. Record the pending state so the
+				// consuming loop can bound the wait — a provider that holds
+				// the connection open without [DONE] would otherwise block
+				// the read for the full idle timeout.
+				a.stopPending = true
 			}
 		default:
 			a.lastFinishReason = choice.FinishReason

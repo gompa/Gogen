@@ -5,7 +5,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
@@ -130,6 +132,66 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 	}
 	if result.Reasoning != "only thinking" {
 		t.Fatalf("Reasoning = %q", result.Reasoning)
+	}
+}
+
+// TestGenerateResponseStreamReasoningStopGraceFires pins the bounded wait
+// after a reasoning-only finish_reason="stop": a provider that sends the stop
+// and then HOLDS the connection open (no [DONE], no more data, no close) must
+// be treated as complete after reasoningStopGrace — returning the accumulated
+// reasoning without a fallback re-request — instead of blocking for the full
+// streamReadIdleTimeout. NOT parallel: it sets GOGEN_REASONING_STOP_GRACE.
+func TestGenerateResponseStreamReasoningStopGraceFires(t *testing.T) {
+	t.Setenv("GOGEN_REASONING_STOP_GRACE", "150ms")
+
+	var requests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("response writer does not support flushing")
+			return
+		}
+		_, _ = io.WriteString(w, `data: {"choices":[{"delta":{"reasoning_content":"only thinking"}}]}`+"\n\n")
+		fl.Flush()
+		_, _ = io.WriteString(w, `data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`+"\n\n")
+		fl.Flush()
+		// Hold the connection open with no further data. The client's grace
+		// timer closes the stream, which cancels this request context (the
+		// handler returns so the test server can shut down). Bound the wait
+		// in case the teardown does not propagate.
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(srv)
+	start := time.Now()
+	result, err := p.GenerateResponseStream(
+		t.Context(),
+		[]Message{{Role: "user", Content: "hi"}},
+		nil,
+		nil,
+		nil,
+	)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Reasoning != "only thinking" {
+		t.Fatalf("Reasoning = %q, want the accumulated reasoning", result.Reasoning)
+	}
+	if result.Content != "" {
+		t.Fatalf("Content should stay empty, got %q", result.Content)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("grace did not bound the wait: elapsed %v", elapsed)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("requests = %d, want exactly 1 (the grace close must not trigger a fallback re-request)", got)
 	}
 }
 

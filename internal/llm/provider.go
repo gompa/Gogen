@@ -47,6 +47,15 @@ type ToolCall struct {
 	// ArgsError is set when streamed tool arguments could not be parsed.
 	// Callers must not execute the tool; return this error as the tool result.
 	ArgsError string
+	// ArgsJSONValid is true when ArgsStr is non-empty, already trimmed, and
+	// valid JSON — i.e. the exact bytes the wire serializer will send.
+	// Set by StabilizeToolCallArgs (stabilization, stream finalization) and
+	// by session restore, always before the message is published; the wire
+	// serializer only READS it to skip the per-request json.Valid scan of
+	// every historical tool call. Never set by the serializer itself (it
+	// runs outside the stats lock on shared stabilized ToolCalls). Not
+	// serialized — restored messages recompute it once at load.
+	ArgsJSONValid bool `json:"-"`
 }
 
 // StreamCallback receives partial tokens as they arrive from a streamed response.

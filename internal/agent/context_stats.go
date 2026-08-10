@@ -154,8 +154,13 @@ func (a *Agent) ContextStats(ctx context.Context) TurnContext {
 	if lastUsage != nil && baselinePromptTokens > 0 && baselineMsgCount > 0 && a.Context != nil {
 		baseline := baselinePromptTokens
 		if n := len(msgs); n > baselineMsgCount {
-			extra := msgs[baselineMsgCount:]
-			baseline += a.Context.EstimateTokens(extra)
+			// The per-message counts (counts) already cover every message in
+			// msgs after the switch above — sum the post-baseline suffix
+			// instead of re-tokenizing it (a.Context.EstimateTokens would
+			// walk the same messages a second time).
+			for _, c := range counts[baselineMsgCount:] {
+				baseline += c
+			}
 		}
 		snap.Used = baseline
 		if snap.Limit > 0 {

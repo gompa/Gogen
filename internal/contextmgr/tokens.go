@@ -61,11 +61,16 @@ func sortedToolArgKeys(args map[string]interface{}) []string {
 
 // EstimateTokens approximates token count for a message list using cl100k_base
 // (GPT-family). Falls back to a bytes/4 heuristic if the tokenizer is unavailable.
-// No caching; the tokenizer is fast enough for on-demand use.
+// No caching; the tokenizer is fast enough for on-demand use. Sums the
+// per-message counts directly (no []int allocation, unlike TokenCounts).
 func (m *Manager) EstimateTokens(messages []llm.Message) int {
+	if len(messages) == 0 {
+		return 0
+	}
+	count := messageCounterFor()
 	total := 0
-	for _, c := range m.TokenCounts(messages) {
-		total += c
+	for i := range messages {
+		total += computeMessageTokens(messages[i], count) + imageTokenEstimate(messages[i])
 	}
 	return total
 }
