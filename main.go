@@ -368,9 +368,12 @@ func main() {
 	// MCP (if configured) + model validation in the background so the TUI
 	// can open immediately.
 	go initMCP()
-	go a.ValidateRestoredModel(context.Background(), restoredModel)
 	// Default: TUI mode.
 	c := tui.New(a, cfg)
+	// tui.New installs the model-change hook (ForceRender), so a background
+	// ValidateRestoredModel that clears or auto-selects a restored model
+	// re-renders the status bar even while the terminal is idle.
+	go a.ValidateRestoredModel(context.Background(), restoredModel)
 	c.Run(ctx)
 }
 

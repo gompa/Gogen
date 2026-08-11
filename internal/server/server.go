@@ -582,7 +582,8 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 	if cfg != nil {
 		hold = cfg.ApprovalHold()
 	}
-	reg.register(a.SessionID, newSessionRuntimeWithHold(a, hold))
+	rt := newSessionRuntimeWithHold(a, hold)
+	reg.register(a.SessionID, rt)
 	// In web mode the registry is the sole pruner: Save's
 	// internal auto-prune protects only one session and could delete another
 	// live session's file; the registry prunes with the full active set.
@@ -593,7 +594,7 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 	// a streaming turn no longer blocks editor saves except during the actual
 	// mutation window of a tool.
 	a.SetToolHandlers(wrapToolHandlers(agent.BuiltinToolHandlers(), &ws.fsMu))
-	return &Server{
+	s := &Server{
 		ws:             ws,
 		registry:       reg,
 		config:         cfg,
@@ -604,6 +605,12 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 		connLimiter:    newRateLimitState(defaultMaxWSConns),
 		upgradeLimiter: newIPLimiter(5, 10), // 5 upgrades/sec/IP, burst 10
 	}
+	// Background model validation for a restored default session runs after
+	// the server starts; push the result to the session's clients so the
+	// toolbar does not keep showing a model that was cleared or replaced by
+	// the validation.
+	a.OnModelChanged = func() { s.pushConfigForAgent(a) }
+	return s
 }
 
 // newSessionRuntimeFor builds a session runtime carrying the server's
@@ -683,6 +690,21 @@ func agentConfigMsgBasic(a *agent.Agent) WSMessage {
 	msg.ReasoningEfforts = a.CurrentModelEfforts()
 	msg.ModelDescription = a.CurrentModelDescription()
 	return msg
+}
+
+// pushConfigForAgent broadcasts a fresh config snapshot for a session agent
+// to its attached clients. Used after background model validation so a
+// client that attached before validation completed does not keep showing a
+// stale model (one that was cleared or auto-selected by the validation).
+// Safe without turnMu: agentConfigMsgBasic is internally synchronized (see
+// its contract above).
+func (s *Server) pushConfigForAgent(a *agent.Agent) {
+	if a == nil {
+		return
+	}
+	if rt, ok := s.registry.get(a.SessionID); ok {
+		rt.broadcast(agentConfigMsgBasic(a))
+	}
 }
 
 // agentConfigMsg is an internally-synchronized basic snapshot plus

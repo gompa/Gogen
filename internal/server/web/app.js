@@ -595,9 +595,12 @@
         let currentModelPricing = null; // { input, output, cached } or null
 
         function updateModelInfo(model, description) {
-            // Update toolbar model button
+            // Update toolbar model button. The server's config.Model is
+            // authoritative (it may be empty after validation cleared a
+            // stale restored model); do NOT fall back to the last-known
+            // catalog entry, which can still carry the cleared model.
             if (tbModelBtn) {
-                const name = model || (availableModels.length > 0 ? availableModels.find(m => m.current)?.id : null) || '—';
+                const name = model || '—';
                 tbModelBtn.innerHTML = name + ' <span class="tb-arrow">▾</span>';
                 // Hover tooltip: models.dev description of the current model.
                 if (description) {
@@ -615,7 +618,10 @@
 
         function updateModelSelect(models, current) {
             availableModels = Array.isArray(models) ? models : [];
-            const modelId = current || availableModels.find((m) => m.current)?.id || '';
+            // The server's `current` is authoritative (empty after
+            // validation cleared a stale restored model); do not fall back
+            // to the last-known catalog entry.
+            const modelId = current || '';
             const active = modelId
                 ? availableModels.find((m) => m.id === modelId)
                 : availableModels.find((m) => m.current);

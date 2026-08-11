@@ -106,6 +106,15 @@ func (s *Server) loadOrCreateRuntime(id string) (*sessionRuntime, error) {
 	if registered, ok := s.registry.get(id); ok {
 		rt = registered
 	}
+	// Model validation is spawned by the runtime owner (not by
+	// NewSessionAgent): the async result must push a config refresh to the
+	// session's clients, which requires the registered runtime. When a
+	// concurrent attach won the registration race above, this agent is an
+	// unregistered orphan — the winner validates its own agent.
+	if rt.agent == a && snap.Model != "" {
+		a.OnModelChanged = func() { s.pushConfigForAgent(a) }
+		go a.ValidateRestoredModel(context.Background(), snap.Model)
+	}
 	return rt, nil
 }
 
@@ -279,6 +288,14 @@ func (s *Server) sessionFork(ctx context.Context, ws *wsConn, pane **sessionRunt
 	s.registry.setDefault(newID)
 	s.switchPane(ws, pane, rt)
 	s.pruneSessions(evicted...)
+	// Validate the forked model asynchronously and push the result to the
+	// fork's clients: the model came from the source session, which may
+	// itself have been restored with a model that no longer exists on the
+	// current provider.
+	if snap.Model != "" {
+		a.OnModelChanged = func() { s.pushConfigForAgent(a) }
+		go a.ValidateRestoredModel(context.Background(), snap.Model)
+	}
 	// Persist the forked session. The source session is deliberately NOT
 	// touched (no TouchSession): forking is an interaction with the FORK,
 	// not the source, and bumping the source's Updated would push it to the

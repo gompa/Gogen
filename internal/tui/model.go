@@ -38,6 +38,12 @@ const (
 	ModalCompletion
 )
 
+// modelChangedMsg is sent by the TUI runner when a background agent state
+// change (e.g. restore model validation) may have altered what the status
+// bar shows. Handling it as a no-op still forces a re-render, which reads
+// the live provider model.
+type modelChangedMsg struct{}
+
 // Model is the top-level Bubble Tea model for the TUI.
 type Model struct {
 	// Core references
@@ -470,6 +476,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.SetSize(msg.Width, msg.Height)
+		return m, nil
+
+	case modelChangedMsg:
 		return m, nil
 
 	case spinner.TickMsg:

@@ -111,3 +111,31 @@ func TestNoExtraNewlineAcrossManyAppends(t *testing.T) {
 		t.Fatalf("wrappedContent = %q, want %q", m.wrappedContentString(), want)
 	}
 }
+
+// TestNoBlankLinesFromWrappedThinking reproduces the symptom where a
+// thinking block wider than the viewport word-wraps: lipgloss pads every
+// line (except the widest) with trailing spaces when a multi-line string is
+// rendered in one call, and reflow's wrap turns each padding run followed by
+// a newline into an extra blank visual line. The wide-viewport models used
+// elsewhere never wrap, so this test forces a narrow width to exercise the
+// wrap path.
+func TestNoBlankLinesFromWrappedThinking(t *testing.T) {
+	m := newStreamTestModel()
+	m.viewport.Width = 24 // force word-wrap
+
+	for _, tok := range []string{
+		"Let me think about this.\n",
+		"First, check the repo layout.\n",
+		"Second, look at config.\n",
+		"Third.\n",
+	} {
+		m.handleStreamThinking(tok)
+		if hasBlankRenderedLine(&m) {
+			t.Fatalf("blank line while streaming %q\n%s", tok, m.wrappedContentString())
+		}
+	}
+	m.closeThinkingBlock()
+	if hasBlankRenderedLine(&m) {
+		t.Fatalf("blank line after closing thinking block\n%s", m.wrappedContentString())
+	}
+}

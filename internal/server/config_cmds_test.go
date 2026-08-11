@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -179,9 +180,10 @@ func TestWorkspaceNewSessionAgentKeepsSavedModel(t *testing.T) {
 	if a.CurrentModel() != "m2" {
 		t.Fatalf("resumed provider model = %q, want saved model m2 (per-session D1)", a.CurrentModel())
 	}
-	// Give the async ValidateRestoredModel a chance to run; it must find m2
-	// listed and leave the model alone.
-	time.Sleep(100 * time.Millisecond)
+	// The runtime owner spawns ValidateRestoredModel after registration;
+	// run it explicitly here. It must find m2 listed and leave the model
+	// alone (the per-session D1 rule).
+	a.ValidateRestoredModel(context.Background(), "m2")
 	if a.CurrentModel() != "m2" {
 		t.Fatalf("provider model changed after validation = %q, want m2", a.CurrentModel())
 	}

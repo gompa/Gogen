@@ -54,7 +54,7 @@ func renderMessages(messages []llm.Message, workingDir string, modelName string,
 		case "assistant":
 			// Always render thinking block when reasoning is present.
 			if msg.Reasoning != "" {
-				lines = append(lines, ThinkingTagStyle.Render("<thinking>"+msg.Reasoning+"</thinking>"))
+				lines = append(lines, renderStyledBlock(ThinkingTagStyle, "<thinking>"+msg.Reasoning+"</thinking>"))
 			}
 			switch {
 			case msg.Content != "":

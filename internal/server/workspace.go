@@ -176,12 +176,10 @@ func (ws *Workspace) NewSessionAgent(snap *agent.SessionSnapshot, id string) *ag
 		// D1: model is per-session — a resumed session keeps its saved model
 		// (RestoreSessionLocal already calls Provider.SetModel(snap.Model));
 		// never overwrite it with the workspace default. Validate the saved
-		// model asynchronously: refresh the context limit if the snapshot had
-		// none pre-warmed, and drop the model if the provider no longer lists
-		// it (so requireModelSelected surfaces the gap on the first turn).
-		if snap.Model != "" {
-			go a.ValidateRestoredModel(context.Background(), snap.Model)
-		}
+		// model asynchronously via the runtime owner after registration (see
+		// loadOrCreateRuntime / sessionFork): the runtime broadcasts the
+		// refresh to attached clients, and requireModelSelected surfaces the
+		// gap on the first turn when the provider no longer lists the model.
 		// A restored session keeps its saved thinking level
 		// (RestoreSessionLocal restores it and syncs the provider). Seed the
 		// workspace default only when the snapshot predates the level field

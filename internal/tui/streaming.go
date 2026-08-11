@@ -12,6 +12,7 @@ import (
 	"gogen/internal/streamutil"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // --- Bubble Tea messages for streaming ---
@@ -182,6 +183,21 @@ func (m *Model) handleStreamToken(token string) {
 	m.bumpContextEstimate(token)
 }
 
+// renderStyledBlock renders multi-line text with style applied per line.
+// lipgloss pads every line (except the widest) with trailing spaces when a
+// multi-line string is rendered in a single call; those padding runs make
+// wrapLine (reflow wrap) emit spurious blank visual lines, because reflow
+// drops every consecutive space after a forced wrap and the content's own
+// newline then fires a second line break. Rendering each line separately
+// never pads, so the artifact cannot occur.
+func renderStyledBlock(style lipgloss.Style, text string) string {
+	lines := strings.Split(text, "\n")
+	for i, l := range lines {
+		lines[i] = style.Render(l)
+	}
+	return strings.Join(lines, "\n")
+}
+
 func (m *Model) handleStreamThinking(token string) {
 	// Guard: if tool calls are already in progress, thinking tokens belong
 	// before them (OpenAI protocol ensures this ordering).  Silently ignore
@@ -209,7 +225,7 @@ func (m *Model) handleStreamThinking(token string) {
 	// or when </thinking> replaces it on close.  Trim trailing newlines so
 	// the streaming display stays stable.
 	displayBuf := strings.TrimRight(m.streamThinkingBuf.String(), "\n")
-	m.replaceStreamLine(m.streamThinkingLine, ThinkingStyle.Render("<thinking>"+displayBuf))
+	m.replaceStreamLine(m.streamThinkingLine, renderStyledBlock(ThinkingStyle, "<thinking>"+displayBuf))
 }
 
 // closeThinkingBlock finalizes an open thinking line in place (not necessarily
@@ -221,9 +237,9 @@ func (m *Model) closeThinkingBlock() {
 	m.streamThinkingOpen = false
 	var line string
 	if m.streamThinkingBuf.Len() > 0 {
-		line = ThinkingTagStyle.Render("<thinking>" + m.streamThinkingBuf.String() + "</thinking>")
+		line = renderStyledBlock(ThinkingTagStyle, "<thinking>"+m.streamThinkingBuf.String()+"</thinking>")
 	} else {
-		line = ThinkingTagStyle.Render("<thinking></thinking>")
+		line = renderStyledBlock(ThinkingTagStyle, "<thinking></thinking>")
 	}
 	m.replaceStreamLine(m.streamThinkingLine, line)
 	m.streamThinkingBuf.Reset()

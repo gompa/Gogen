@@ -162,6 +162,10 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 	a.persistMu.Unlock()
 	if snap.Model != "" {
 		_ = a.Provider.SetModel(snap.Model)
+		// The restored model is unverified until ValidateRestoredModel (or
+		// the first turn's re-check) confirms it still exists at the
+		// provider; until then it must not be blindly sent to the endpoint.
+		a.setModelUnverified(true)
 	}
 
 	// Pre-warm the context limit from the snapshot so the first ContextStats
@@ -174,7 +178,7 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 	a.compareViewOnRestore(prevSessionID, newSessionID)
 }
 
-// ValidateRestoredModel checks that model still exists at the provider and
+// ValidateRestoredModel checks that the restored model still exists at the provider and
 // refreshes the context limit. Safe to run in the background after startup.
 // Bounded so a hung provider cannot run ListModels + ModelContextLimit
 // back-to-back for an unbounded wall time.
@@ -184,7 +188,12 @@ func (a *Agent) ValidateRestoredModel(ctx context.Context, model string) {
 
 	// Context limit first: ModelContextLimit tries /v1/models briefly (local
 	// n_ctx), then models.dev — without stacking a full catalog wait + Get.
-	if a.Context != nil && a.ContextLimit() <= 0 {
+	// Also refresh when no model is selected yet: the probe performs
+	// sole-model auto-select, which must not be skipped just because the
+	// context limit is already resolved (e.g. pre-warmed from a session
+	// snapshot) — otherwise a single-model provider never gets its model
+	// chosen and the session stays stuck on "no model selected".
+	if a.Context != nil && (a.ContextLimit() <= 0 || a.Provider.ModelName() == "") {
 		a.Context.RefreshAfterModelChange(ctx)
 	}
 	if model == "" {
@@ -192,6 +201,10 @@ func (a *Agent) ValidateRestoredModel(ctx context.Context, model string) {
 	}
 	models, err := a.Provider.ListModels(ctx)
 	if err != nil {
+		// Cannot verify the restored model right now (endpoint down,
+		// timeout). Fail open — keep the model — but leave it marked
+		// unverified so requireModelSelected re-checks on the first turn
+		// instead of sending a possibly-stale model to the endpoint.
 		return
 	}
 	found := false
@@ -201,8 +214,27 @@ func (a *Agent) ValidateRestoredModel(ctx context.Context, model string) {
 			break
 		}
 	}
-	if !found && a.Provider.ModelName() == model {
-		_ = a.Provider.SetModel("")
+	if found {
+		// The restored model is still served by this provider.
+		a.setModelUnverified(false)
+	} else {
+		// The restored model no longer exists at the provider. Clear it —
+		// unless a concurrent /models selection replaced it in the
+		// meantime — then re-probe so a single-model provider auto-selects
+		// its sole model immediately instead of leaving the session with
+		// no model until the next turn.
+		if a.Provider.ModelName() == model {
+			_ = a.Provider.SetModel("")
+		}
+		a.setModelUnverified(false)
+		if a.Provider.ModelName() == "" {
+			_, _ = a.Provider.ModelContextLimit(ctx)
+		}
+	}
+	// Let hosts refresh their UI: the restored model may have been cleared
+	// or replaced by sole-model auto-select.
+	if a.OnModelChanged != nil {
+		a.OnModelChanged()
 	}
 }
 

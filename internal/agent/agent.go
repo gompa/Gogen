@@ -62,6 +62,23 @@ type Agent struct {
 	// UsageAccum is guarded by statsMu (clearTurnUsage / snapshot reads).
 	UsageAccum UsageAccumulator
 
+	// OnModelChanged, when non-nil, is invoked after ValidateRestoredModel
+	// processes a restored model so hosts can refresh their UI (the model
+	// may have been cleared or replaced by sole-model auto-select). Set at
+	// construction by the TUI/web hosts before the validation goroutine is
+	// spawned; called from that goroutine. Must not block.
+	OnModelChanged func()
+
+	// modelUnverified is true when the selected model came from a session
+	// restore and has not yet been confirmed to exist at the provider.
+	// RestoreSessionLocal sets it; ValidateRestoredModel clears it once the
+	// restored model is resolved (present, absent, or auto-selected);
+	// SelectModel clears it (a selection comes from the provider's own
+	// list). requireModelSelected re-checks a still-unverified model on the
+	// first turn so a stale model from a previous provider is never sent to
+	// the endpoint. Guarded by statsMu.
+	modelUnverified bool
+
 	// bgMu guards bgJobs: shell commands started with execute_command
 	// background=true. Jobs outlive the turn that started them (they are
 	// owned by the session, not the turn) and are killed when the session
