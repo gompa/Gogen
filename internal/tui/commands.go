@@ -16,156 +16,212 @@ import (
 // Returns (handled, quit, tea.Cmd).
 func (m *Model) dispatchCommand(input string) (bool, bool, tea.Cmd) {
 	trimmed := strings.TrimSpace(input)
-
-	// help
-	if trimmed == "help" || trimmed == "/help" {
-		m.modal = ModalHelp
-		return true, false, nil
-	}
-
-	// exit
-	if trimmed == "exit" || trimmed == "/exit" || trimmed == "quit" || trimmed == "/quit" {
-		m.flushAndQuit()
-		return true, true, tea.Quit
-	}
-
-	// compact
-	if trimmed == "compact" || trimmed == "/compact" {
-		if err := m.agent.CompactHistory(m.ctx); err != nil {
-			m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Compact failed: %v", err)))
-		} else {
-			m.appendChatLine(SystemStyle.Render(fmt.Sprintf("History compacted (%d messages remaining).", len(m.agent.Messages))))
+	for _, cmd := range tuiCommands {
+		if cmd.match(input, trimmed) {
+			return cmd.run(m, input, trimmed)
 		}
-		return true, false, nil
 	}
-
-	// verbose toggle
-	if trimmed == "verbose" || trimmed == "/verbose" {
-		m.verbose = !m.verbose
-		state := "off"
-		if m.verbose {
-			state = "on"
-		}
-		m.appendChatLine(SystemStyle.Render(fmt.Sprintf("Verbose tool output: %s", state)))
-		return true, false, nil
-	}
-
-	// Mode commands
-	if out, handled := m.agent.HandleModeCommand(input); handled {
-		if trimmed == "/plan" || trimmed == "plan" || trimmed == "/act" || trimmed == "act" {
-			m.chatLines = renderMessages(m.agent.Messages, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())
-			m.chatLines = append(m.chatLines, SystemStyle.Render(out))
-			m.setViewportContent()
-			m.viewport.GotoBottom()
-		} else {
-			m.appendChatLine(SystemStyle.Render(out))
-		}
-		// SetMode persists the session.
-		m.checkPersistError()
-		return true, false, nil
-	}
-
-	// Thinking level command
-	if out, handled := m.agent.HandleThinkingCommand(input); handled {
-		m.appendChatLine(SystemStyle.Render(out))
-		m.checkPersistError()
-		return true, false, nil
-	}
-
-	// Context command
-	if out, handled := m.agent.HandleContextCommand(m.ctx, input); handled {
-		m.appendChatLine(SystemStyle.Render(out))
-		m.checkPersistError()
-		return true, false, nil
-	}
-
-	// Session commands
-	if result, handled, err := m.agent.HandleSessionCommand(m.ctx, input, session.NewID()); handled {
-		if err != nil {
-			m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Session: %v", err)))
-			// Errors from startNewSession/deleteSessionByID may surface a
-			// half-completed persist; check anyway.
-			m.checkPersistError()
-			return true, false, nil
-		}
-		if result.Action == agent.SessionActionClearChat {
-			// Clear chat and show new session info
-			m.chatLines = nil
-			m.chatLines = append(m.chatLines, SystemStyle.Render(result.Output))
-			if len(result.History) > 0 {
-				m.chatLines = append(m.chatLines, renderMessages(result.History, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())...)
-			}
-			m.setViewportContent()
-			m.viewport.GotoBottom()
-			m.sessionID = m.agent.SessionID
-			m.refreshContextStats()
-			return true, false, nil
-		} else if result.Sessions != nil {
-			// Show session list modal
-			m.sessionList = result.Sessions
-			m.sessionCursor = 0
-			m.modal = ModalSessions
-		} else {
-			m.appendChatLine(SystemStyle.Render(result.Output))
-			if len(result.History) > 0 {
-				m.chatLines = renderMessages(result.History, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())
-				m.setViewportContent()
-				m.viewport.GotoBottom()
-			}
-		}
-		// Session commands (new, resume, delete) persist.
-		m.checkPersistError()
-		return true, false, nil
-	}
-
-	// save-config
-	if input == "/save-config" || input == "save-config" {
-		if err := m.saveConfig(false); err != nil {
-			m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Save config failed: %v", err)))
-		}
-		return true, false, nil
-	}
-
-	// Models command
-	if out, handled, err := m.agent.HandleModelsCommand(m.ctx, input); handled {
-		// If no selector, show interactive modal
-		arg := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(trimmed, "/models"), "models"))
-		if arg == "" {
-			list, listErr := m.agent.ListModels(m.ctx)
-			if listErr != nil {
-				m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Models: %v", listErr)))
-			} else {
-				m.modelList = list
-				m.modelCursor = 0
-				m.modal = ModalModels
-			}
-			return true, false, nil
-		}
-		// Has selector — do inline switch
-		if err != nil {
-			m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Models: %v", err)))
-		} else {
-			m.appendChatLine(SystemStyle.Render(out))
-		}
-		return true, false, nil
-	}
-
-	// dir command
-	if strings.HasPrefix(trimmed, "dir ") {
-		newDir := strings.TrimSpace(strings.TrimPrefix(trimmed, "dir "))
-		absDir, err := filepath.Abs(newDir)
-		if err != nil || !agent.DirExists(absDir) {
-			m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Error: directory does not exist: %s", newDir)))
-		} else {
-			m.agent.SetWorkingDir(absDir)
-			m.agent.AfterWorkingDirChange()
-			m.appendChatLine(SystemStyle.Render(fmt.Sprintf("Changed working directory to: %s", absDir)))
-		}
-		m.checkPersistError()
-		return true, false, nil
-	}
-
 	return false, false, nil
+}
+
+// tuiCommand is one slash-command family handled by dispatchCommand.
+// Matchers are evaluated in table order (the original if/else order).
+type tuiCommand struct {
+	// match is a PURE string check (no side effects). The agent-delegated
+	// families must accept exactly the inputs their agent handler accepts —
+	// the handler runs only inside run — so commands cannot silently change
+	// from handled to prompt-sent (or vice versa).
+	match func(input, trimmed string) bool
+	run   func(m *Model, input, trimmed string) (bool, bool, tea.Cmd)
+}
+
+// exactAny matches any of the given exact trimmed forms.
+func exactAny(forms ...string) func(input, trimmed string) bool {
+	return func(input, trimmed string) bool {
+		for _, f := range forms {
+			if trimmed == f {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+var tuiCommands = []tuiCommand{
+	{match: exactAny("help", "/help"), run: cmdHelp},
+	{match: exactAny("exit", "/exit", "quit", "/quit"), run: cmdExit},
+	{match: exactAny("compact", "/compact"), run: cmdCompact},
+	{match: exactAny("verbose", "/verbose"), run: cmdVerbose},
+	// Mode commands: mirror HandleModeCommand's accepted forms.
+	{match: exactAny("plan", "/plan", "act", "/act", "mode", "/mode"), run: cmdMode},
+	// Thinking command: mirror HandleThinkingCommand's accepted forms.
+	{match: func(input, trimmed string) bool {
+		return trimmed == "think" || trimmed == "/think" ||
+			strings.HasPrefix(trimmed, "think ") || strings.HasPrefix(trimmed, "/think ")
+	}, run: cmdThinking},
+	{match: exactAny("context", "/context"), run: cmdContext},
+	// Session commands: reuse the agent's pure parser, mirroring its cases.
+	{match: func(input, trimmed string) bool {
+		cmd, _ := agent.ParseSessionCommand(input)
+		switch cmd {
+		case "new", "sessions", "resume", "fork":
+			return true
+		}
+		return false
+	}, run: cmdSession},
+	// save-config matches the RAW input (trailing whitespace matters),
+	// preserving the original exact-string check.
+	{match: func(input, trimmed string) bool {
+		return input == "/save-config" || input == "save-config"
+	}, run: cmdSaveConfig},
+	// Models command: reuse the agent's pure parser.
+	{match: func(input, trimmed string) bool {
+		_, ok := agent.ParseModelsCommand(input)
+		return ok
+	}, run: cmdModels},
+	{match: func(input, trimmed string) bool { return strings.HasPrefix(trimmed, "dir ") }, run: cmdDir},
+}
+
+func cmdHelp(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
+	m.modal = ModalHelp
+	return true, false, nil
+}
+
+func cmdExit(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
+	m.flushAndQuit()
+	return true, true, tea.Quit
+}
+
+func cmdCompact(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
+	if err := m.agent.CompactHistory(m.ctx); err != nil {
+		m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Compact failed: %v", err)))
+	} else {
+		m.appendChatLine(SystemStyle.Render(fmt.Sprintf("History compacted (%d messages remaining).", len(m.agent.Messages))))
+	}
+	return true, false, nil
+}
+
+func cmdVerbose(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
+	m.verbose = !m.verbose
+	state := "off"
+	if m.verbose {
+		state = "on"
+	}
+	m.appendChatLine(SystemStyle.Render(fmt.Sprintf("Verbose tool output: %s", state)))
+	return true, false, nil
+}
+
+func cmdMode(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
+	out, _ := m.agent.HandleModeCommand(input)
+	if trimmed == "/plan" || trimmed == "plan" || trimmed == "/act" || trimmed == "act" {
+		m.chatLines = renderMessages(m.agent.Messages, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())
+		m.chatLines = append(m.chatLines, SystemStyle.Render(out))
+		m.setViewportContent()
+		m.viewport.GotoBottom()
+	} else {
+		m.appendChatLine(SystemStyle.Render(out))
+	}
+	// SetMode persists the session.
+	m.checkPersistError()
+	return true, false, nil
+}
+
+func cmdThinking(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
+	out, _ := m.agent.HandleThinkingCommand(input)
+	m.appendChatLine(SystemStyle.Render(out))
+	m.checkPersistError()
+	return true, false, nil
+}
+
+func cmdContext(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
+	out, _ := m.agent.HandleContextCommand(m.ctx, input)
+	m.appendChatLine(SystemStyle.Render(out))
+	m.checkPersistError()
+	return true, false, nil
+}
+
+func cmdSession(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
+	result, _, err := m.agent.HandleSessionCommand(m.ctx, input, session.NewID())
+	if err != nil {
+		m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Session: %v", err)))
+		// Errors from startNewSession/deleteSessionByID may surface a
+		// half-completed persist; check anyway.
+		m.checkPersistError()
+		return true, false, nil
+	}
+	if result.Action == agent.SessionActionClearChat {
+		// Clear chat and show new session info
+		m.chatLines = nil
+		m.chatLines = append(m.chatLines, SystemStyle.Render(result.Output))
+		if len(result.History) > 0 {
+			m.chatLines = append(m.chatLines, renderMessages(result.History, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())...)
+		}
+		m.setViewportContent()
+		m.viewport.GotoBottom()
+		m.sessionID = m.agent.SessionID
+		m.refreshContextStats()
+		return true, false, nil
+	} else if result.Sessions != nil {
+		// Show session list modal
+		m.sessionList = result.Sessions
+		m.sessionCursor = 0
+		m.modal = ModalSessions
+	} else {
+		m.appendChatLine(SystemStyle.Render(result.Output))
+		if len(result.History) > 0 {
+			m.chatLines = renderMessages(result.History, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())
+			m.setViewportContent()
+			m.viewport.GotoBottom()
+		}
+	}
+	// Session commands (new, resume, delete) persist.
+	m.checkPersistError()
+	return true, false, nil
+}
+
+func cmdSaveConfig(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
+	if err := m.saveConfig(false); err != nil {
+		m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Save config failed: %v", err)))
+	}
+	return true, false, nil
+}
+
+func cmdModels(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
+	out, _, err := m.agent.HandleModelsCommand(m.ctx, input)
+	// If no selector, show interactive modal
+	arg := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(trimmed, "/models"), "models"))
+	if arg == "" {
+		list, listErr := m.agent.ListModels(m.ctx)
+		if listErr != nil {
+			m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Models: %v", listErr)))
+		} else {
+			m.modelList = list
+			m.modelCursor = 0
+			m.modal = ModalModels
+		}
+		return true, false, nil
+	}
+	// Has selector — do inline switch
+	if err != nil {
+		m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Models: %v", err)))
+	} else {
+		m.appendChatLine(SystemStyle.Render(out))
+	}
+	return true, false, nil
+}
+
+func cmdDir(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
+	newDir := strings.TrimSpace(strings.TrimPrefix(trimmed, "dir "))
+	absDir, err := filepath.Abs(newDir)
+	if err != nil || !agent.DirExists(absDir) {
+		m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Error: directory does not exist: %s", newDir)))
+	} else {
+		m.agent.SetWorkingDir(absDir)
+		m.agent.AfterWorkingDirChange()
+		m.appendChatLine(SystemStyle.Render(fmt.Sprintf("Changed working directory to: %s", absDir)))
+	}
+	m.checkPersistError()
+	return true, false, nil
 }
 
 func (m *Model) saveConfig(includeSecrets bool) error {
