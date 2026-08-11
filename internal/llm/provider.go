@@ -104,6 +104,13 @@ type ModelInfo struct {
 	ID           string
 	ContextLimit int
 	Current      bool
+	// Description is the models.dev model description; empty when the model is
+	// unknown or the registry has no entry.
+	Description string
+	// ReasoningEfforts are the reasoning_effort values this model accepts
+	// (from the models.dev registry). Empty when the model is unknown or has
+	// no effort control (toggle/budget-only models).
+	ReasoningEfforts []string
 	// Pricing from models.dev (USD per 1M tokens). Zero means no pricing data.
 	InputPricePer1M  float64
 	OutputPricePer1M float64
@@ -121,6 +128,27 @@ type LLMProvider interface {
 	// SetThinkingLevel controls reasoning/thinking effort. Pass empty string to
 	// omit the parameter (equivalent to "off").
 	SetThinkingLevel(level string)
+}
+
+// ReasoningEffortsProvider is implemented by providers that can report the
+// reasoning-effort values the current model accepts (from the models.dev
+// registry). It is optional: providers without it (test stubs, providers with
+// no registry data) fall back to DefaultReasoningEfforts.
+type ReasoningEffortsProvider interface {
+	// ModelReasoningEfforts returns the effective reasoning-effort options for
+	// modelID: the models.dev accepted set when the model is known (empty for
+	// toggle/budget-only models, meaning no effort control), else
+	// DefaultReasoningEfforts. Must never block on the network.
+	ModelReasoningEfforts(modelID string) []string
+}
+
+// ModelDescriptionProvider is implemented by providers that can report the
+// models.dev description of a model. It is optional: providers without it
+// yield an empty description (no tooltip in the UI).
+type ModelDescriptionProvider interface {
+	// ModelDescription returns the models.dev description for modelID, or ""
+	// when the model is unknown. Must never block on the network.
+	ModelDescription(modelID string) string
 }
 
 // Message represents a chat message.

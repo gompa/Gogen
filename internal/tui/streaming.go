@@ -287,6 +287,7 @@ func (m *Model) handleStreamToolCall(index int, id string, name string) {
 	m.streamAssistantBuf.Reset()
 	m.streamAssistantLine = -1
 	m.streamToolCallNames[index] = name
+	m.activeToolName = name
 	m.streamToolCallArgs[index] = ""
 	m.streamToolCallIDs[index] = id
 	m.streamToolCallLines[index] = len(m.chatLines) // appendChatLine will add at this index
@@ -440,6 +441,9 @@ func (m *Model) handleStreamToolResult(id string, name string, result string, su
 	// Collect all new lines first, then append in a batch so the viewport
 	// rebuilds once instead of on every appendChatLine call.
 	var newLines []string
+	// The tool finished; the next indicator phase is "thinking" for the next
+	// model round (which re-announces any new tool via handleStreamToolCall).
+	m.activeToolName = ""
 
 	newLines = append(newLines, toolResultStatusLine(name, success))
 
@@ -517,6 +521,7 @@ func (m *Model) resetStreamState(keepToolDiffShown bool) {
 	m.streamToolCallArgs = make(map[int]string)
 	m.streamToolCallIDs = make(map[int]string)
 	m.streamToolCallLines = make(map[int]int)
+	m.activeToolName = ""
 	m.toolCallDiffs = make(map[string]string)
 	m.streamToolDiffCount = make(map[int]int)
 	m.streamToolDiffStart = make(map[int]int)

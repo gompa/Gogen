@@ -1,75 +1,75 @@
 package agent
 
 import (
-	"reflect"
 	"testing"
 )
 
-// TestValidThinkingLevelsCanonical pins the user-facing level set: only
-// levels with a distinct reasoning_effort value on the wire are exposed,
-// in weakest → strongest order. The folded names (minimal/xhigh/max) must
-// not appear — they are parse-only aliases now.
-func TestValidThinkingLevelsCanonical(t *testing.T) {
-	want := []ThinkingLevel{ThinkingOff, ThinkingLow, ThinkingMedium, ThinkingHigh}
-	if got := ValidThinkingLevels(); !reflect.DeepEqual(got, want) {
-		t.Fatalf("ValidThinkingLevels() = %v, want %v", got, want)
+// TestNormalizeThinkingLevel pins the input canonicalization contract: input
+// is trimmed and lowercased, and blank input normalizes to "" (the "off"
+// sentinel). There is no vocabulary rejection — any non-blank token is a
+// literal reasoning_effort value whose validity is decided by the current
+// model's accepted set (see AvailableThinkingLevels), never by a fixed table.
+func TestNormalizeThinkingLevel(t *testing.T) {
+	cases := map[string]ThinkingLevel{
+		"off":    ThinkingOff,
+		"OFF":    ThinkingOff,
+		" off ":  ThinkingOff,
+		"low":    ThinkingLow,
+		"medium": ThinkingMedium,
+		"high":   ThinkingHigh,
+		"max":    ThinkingLevel("max"),   // open vocabulary: literal, never folded
+		"xhigh":  ThinkingLevel("xhigh"), // open vocabulary: literal, never folded
+		" Max ":  ThinkingLevel("max"),   // trimmed + case-insensitive
+		"min":    ThinkingLevel("min"),   // no alias folding — literal
+		"bogus":  ThinkingLevel("bogus"), // unknown to gogen, still a literal
+		"":       "",
+		"   ":    "",
+	}
+	for in, want := range cases {
+		if got := NormalizeThinkingLevel(in); got != want {
+			t.Fatalf("NormalizeThinkingLevel(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
-// TestParseThinkingLevelFoldsAliases verifies the old minimal/xhigh/max names
-// still parse (sessions persisted them before the fold) and normalize to the
-// canonical low/high levels, so a restored session shows the folded level
-// rather than a level that no longer exists.
-func TestParseThinkingLevelFoldsAliases(t *testing.T) {
-	cases := map[string]struct {
-		want ThinkingLevel
-		ok   bool
+// TestDefaultLevelLabels pins the display metadata of the closed default set
+// and the derived labels for values outside it: every accepted value must
+// render — defaults from the table, open values by title-case.
+func TestDefaultLevelLabels(t *testing.T) {
+	cases := []struct {
+		level      ThinkingLevel
+		label      string
+		shortLabel string
 	}{
-		"off":     {ThinkingOff, true},
-		"0":       {ThinkingOff, true},
-		"low":     {ThinkingLow, true},
-		"minimal": {ThinkingLow, true},
-		"min":     {ThinkingLow, true},
-		"medium":  {ThinkingMedium, true},
-		"med":     {ThinkingMedium, true},
-		"high":    {ThinkingHigh, true},
-		"xhigh":   {ThinkingHigh, true},
-		"x-high":  {ThinkingHigh, true},
-		"max":     {ThinkingHigh, true},
-		"bogus":   {ThinkingOff, false},
-		"":        {ThinkingOff, false},
-		" Max ":   {ThinkingHigh, true}, // trimmed + case-insensitive
+		{ThinkingOff, "Off", ""},
+		{ThinkingLow, "Low", "L"},
+		{ThinkingMedium, "Medium", "M"},
+		{ThinkingHigh, "High", "H"},
+		{ThinkingLevel("max"), "Max", "M"}, // derived (not in default set)
+		{ThinkingLevel("xhigh"), "Xhigh", "X"},
+		{ThinkingLevel("none"), "None", "N"},
+		{"", "Off", ""}, // unset renders as Off
 	}
-	for in, tc := range cases {
-		got, ok := ParseThinkingLevel(in)
-		if ok != tc.ok {
-			t.Fatalf("ParseThinkingLevel(%q) ok = %v, want %v", in, ok, tc.ok)
+	for _, tc := range cases {
+		if got := tc.level.Label(); got != tc.label {
+			t.Fatalf("level %q Label = %q, want %q", tc.level, got, tc.label)
 		}
-		if !ok {
-			continue
-		}
-		if got != tc.want {
-			t.Fatalf("ParseThinkingLevel(%q) = %q, want %q", in, got, tc.want)
-		}
-		// The folded result must display as the canonical level — never as
-		// "Mi"/"XH"/"Max" labels that no longer exist.
-		if got.Label() != tc.want.Label() || got.ShortLabel() != tc.want.ShortLabel() {
-			t.Fatalf("ParseThinkingLevel(%q) displays as %q/%q, want %q/%q",
-				in, got.Label(), got.ShortLabel(), tc.want.Label(), tc.want.ShortLabel())
+		if got := tc.level.ShortLabel(); got != tc.shortLabel {
+			t.Fatalf("level %q ShortLabel = %q, want %q", tc.level, got, tc.shortLabel)
 		}
 	}
 }
 
-// TestFoldedLevelsNotDisplayed guards the display surfaces: the folded names
-// must not appear in any label/short-label/detail metadata.
-func TestFoldedLevelsNotDisplayed(t *testing.T) {
-	for _, name := range []string{"minimal", "xhigh", "max", "Mi", "XH", "Max"} {
-		for _, level := range ValidThinkingLevels() {
-			for _, s := range []string{level.Label(), level.ShortLabel(), level.Details()} {
-				if s == name {
-					t.Fatalf("folded level name %q leaked into display of %q (%q)", name, level, s)
-				}
-			}
+// TestLabelNeverEmpty guards the display surfaces: a stored value (even one
+// inactive for the current model) must render a non-empty label instead of
+// leaking an empty string.
+func TestLabelNeverEmpty(t *testing.T) {
+	for _, l := range []ThinkingLevel{ThinkingLow, ThinkingMedium, ThinkingHigh, ThinkingLevel("max"), ThinkingLevel("xhigh"), ThinkingLevel("minimal")} {
+		if l.Label() == "" {
+			t.Fatalf("level %q has empty Label", l)
 		}
+	}
+	if ThinkingOff.Label() == "" {
+		t.Fatal("off Label is empty")
 	}
 }

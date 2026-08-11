@@ -192,14 +192,14 @@ func (ws *Workspace) NewSessionAgent(snap *agent.SessionSnapshot, id string) *ag
 		// merely opening a saved session corrupted its on-disk state until
 		// the next flush with restored content).
 		if snap.ThinkingLevel == "" {
-			if level, ok := agent.ParseThinkingLevel(ws.ThinkingLevel); ok {
+			if level := agent.NormalizeThinkingLevel(ws.ThinkingLevel); level != "" {
 				a.SetThinkingLevel(level)
 			}
 		}
 	} else {
 		// Fresh session: seed the workspace default thinking level so a
 		// new pane's first turn does not start at the "off" default.
-		if level, ok := agent.ParseThinkingLevel(ws.ThinkingLevel); ok {
+		if level := agent.NormalizeThinkingLevel(ws.ThinkingLevel); level != "" {
 			a.SetThinkingLevel(level)
 		}
 	}

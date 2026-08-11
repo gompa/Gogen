@@ -114,10 +114,8 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 	if m, ok := ParseMode(snap.Mode); ok {
 		a.Mode = m
 	}
-	if snap.ThinkingLevel != "" {
-		if l, ok := ParseThinkingLevel(snap.ThinkingLevel); ok {
-			a.ThinkingLevel = l
-		}
+	if l := NormalizeThinkingLevel(snap.ThinkingLevel); l != "" {
+		a.ThinkingLevel = l
 	}
 	a.statsMu.Unlock()
 	// The provider owns a separate reasoning-effort state (in web mode every
@@ -149,7 +147,7 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 	if m, ok := ParseMode(snap.Mode); ok {
 		seedMode = m.String()
 	}
-	if l, ok := ParseThinkingLevel(snap.ThinkingLevel); ok {
+	if l := NormalizeThinkingLevel(snap.ThinkingLevel); l != "" {
 		seedThinking = string(l)
 	}
 	a.lastMeta = persistMeta{

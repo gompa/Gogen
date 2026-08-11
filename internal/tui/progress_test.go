@@ -51,6 +51,28 @@ func TestSetProgressRestartsTick(t *testing.T) {
 	}
 }
 
+func TestActiveToolNameLifecycle(t *testing.T) {
+	m := newStreamTestModel()
+
+	m.handleStreamToolCall(0, "tc0", "read_file")
+	if m.activeToolName != "read_file" {
+		t.Fatalf("activeToolName after announce=%q, want read_file", m.activeToolName)
+	}
+	m.handleStreamToolResult("tc0", "read_file", "ok", true)
+	if m.activeToolName != "" {
+		t.Fatalf("activeToolName after result=%q, want empty", m.activeToolName)
+	}
+
+	m.handleStreamToolCall(1, "tc1", "patch_file")
+	if m.activeToolName != "patch_file" {
+		t.Fatalf("activeToolName after second announce=%q, want patch_file", m.activeToolName)
+	}
+	m.resetStreamState(false)
+	if m.activeToolName != "" {
+		t.Fatalf("activeToolName after reset=%q, want empty", m.activeToolName)
+	}
+}
+
 func TestRenderProgressInput(t *testing.T) {
 	ta := textarea.New()
 	ta.SetHeight(3)
@@ -66,6 +88,13 @@ func TestRenderProgressInput(t *testing.T) {
 	}
 	if h := lipgloss.Height(got); h != 3 {
 		t.Fatalf("progress input height=%d, want 3 (match textarea)", h)
+	}
+	// A tool whose arguments are streaming in should be named, not generic.
+	m.progressPhase = progressActive
+	m.activeToolName = "patch_file"
+	got = m.renderProgressInput()
+	if !strings.Contains(got, "patch_file") || !strings.Contains(got, "preparing") {
+		t.Fatalf("active tool render=%q", got)
 	}
 	m.progressPhase = progressTool
 	m.progressLabel = "running read_file"

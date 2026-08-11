@@ -88,10 +88,10 @@ func (p *OpenAIProvider) inferOpenCodeEndpoint(model string) *openai.Client {
 	if p.modelInfo == nil || model == "" || p.goClient == nil || p.zenClient == nil {
 		return nil
 	}
-	if _, _, err := p.modelInfo.Resolve(openCodeGoBaseURL, model); err == nil {
+	if _, _, _, _, err := p.modelInfo.Resolve(openCodeGoBaseURL, model); err == nil {
 		return p.goClient
 	}
-	if _, _, err := p.modelInfo.Resolve(openCodeZenBaseURL, model); err == nil {
+	if _, _, _, _, err := p.modelInfo.Resolve(openCodeZenBaseURL, model); err == nil {
 		return p.zenClient
 	}
 	return nil

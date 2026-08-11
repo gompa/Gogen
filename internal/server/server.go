@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -400,6 +401,12 @@ type ModelEntry struct {
 	InputPricePer1M  float64 `json:"inputPricePer1M,omitempty"`
 	OutputPricePer1M float64 `json:"outputPricePer1M,omitempty"`
 	CachedPricePer1M float64 `json:"cachedPricePer1M,omitempty"`
+	// ReasoningEfforts are the reasoning_effort values this model accepts
+	// (models.dev); empty for unknown or toggle/budget-only models.
+	ReasoningEfforts []string `json:"reasoningEfforts,omitempty"`
+	// Description is the models.dev model description; empty for unknown
+	// models. Shown as a hover tooltip in the client.
+	Description string `json:"description,omitempty"`
 }
 
 type SessionEntry struct {
@@ -461,14 +468,21 @@ type WSMessage struct {
 	InputPricePer1M  float64 `json:"inputPricePer1M,omitempty"`
 	OutputPricePer1M float64 `json:"outputPricePer1M,omitempty"`
 	CachedPricePer1M float64 `json:"cachedPricePer1M,omitempty"`
-	ContextLimit     int     `json:"contextLimit,omitempty"`
-	UsedTokens       int     `json:"usedTokens,omitempty"`
-	UsedSource       string  `json:"usedSource,omitempty"`
-	PromptTokens     int     `json:"promptTokens,omitempty"`
-	CompletionTokens int     `json:"completionTokens,omitempty"`
-	CachedTokens     int     `json:"cachedTokens,omitempty"`
-	CompactAt        int     `json:"compactAt,omitempty"`
-	MessageCount     int     `json:"messageCount,omitempty"`
+	// ReasoningEfforts are the reasoning_effort values the current model
+	// accepts (models.dev); empty means unknown or no effort control, and
+	// clients fall back to the default set for chips.
+	ReasoningEfforts []string `json:"reasoningEfforts,omitempty"`
+	// ModelDescription is the models.dev description of the current model;
+	// empty means unknown. Shown as a hover tooltip in the client.
+	ModelDescription string `json:"modelDescription,omitempty"`
+	ContextLimit     int    `json:"contextLimit,omitempty"`
+	UsedTokens       int    `json:"usedTokens,omitempty"`
+	UsedSource       string `json:"usedSource,omitempty"`
+	PromptTokens     int    `json:"promptTokens,omitempty"`
+	CompletionTokens int    `json:"completionTokens,omitempty"`
+	CachedTokens     int    `json:"cachedTokens,omitempty"`
+	CompactAt        int    `json:"compactAt,omitempty"`
+	MessageCount     int    `json:"messageCount,omitempty"`
 	// Images carries user-attached images (data URLs) on inbound "message"
 	// frames; the server validates and forwards them to the agent.
 	Images []llm.ImageInput `json:"images,omitempty"`
@@ -653,7 +667,7 @@ func applyContextStats(msg *WSMessage, stats agent.TurnContext, accum *agent.Usa
 // while holding turnMu — tokenize after unlocking via applyContextStats.
 func agentConfigMsgBasic(a *agent.Agent) WSMessage {
 	mode, thinking := a.ModeAndThinkingLevel()
-	return WSMessage{
+	msg := WSMessage{
 		Type:          "config",
 		WorkingDir:    a.Executor.GetWorkingDir(),
 		Model:         a.CurrentModel(),
@@ -663,6 +677,12 @@ func agentConfigMsgBasic(a *agent.Agent) WSMessage {
 		SessionID:     a.SessionID,
 		SessionLabel:  a.SessionLabelSnapshot(),
 	}
+	// Reasoning-effort options and description for the current model
+	// (in-memory lookups, never block), so the client can render the
+	// per-model chips and a hover tooltip.
+	msg.ReasoningEfforts = a.CurrentModelEfforts()
+	msg.ModelDescription = a.CurrentModelDescription()
+	return msg
 }
 
 // agentConfigMsg is an internally-synchronized basic snapshot plus
@@ -922,6 +942,8 @@ func (s *Server) modelEntries(models []llm.ModelInfo) []ModelEntry {
 			InputPricePer1M:  m.InputPricePer1M,
 			OutputPricePer1M: m.OutputPricePer1M,
 			CachedPricePer1M: m.CachedPricePer1M,
+			ReasoningEfforts: m.ReasoningEfforts,
+			Description:      m.Description,
 		}
 	}
 	return out
@@ -1551,8 +1573,8 @@ func (s *Server) handleWSSetThinkingLevel(ws *wsConn, ctx context.Context, rt *s
 		return
 	}
 	a := rt.agent
-	if level, ok := agent.ParseThinkingLevel(msg.ThinkingLevel); ok {
-		a.SetThinkingLevel(level)
+	if s.isValidThinkingLevel(a, msg.ThinkingLevel) {
+		a.SetThinkingLevel(agent.ThinkingLevel(msg.ThinkingLevel))
 	}
 	cfg := agentConfigMsgBasic(a)
 	rt.turnMu.Unlock()
@@ -1564,6 +1586,23 @@ func (s *Server) handleWSSetThinkingLevel(ws *wsConn, ctx context.Context, rt *s
 		applyContextStats(&cfg, a.ContextStats(ctx), &accum)
 		_ = ws.writeJSON(cfg)
 	}()
+}
+
+// isValidThinkingLevel reports whether v is a valid reasoning-effort selection
+// for the session's current model: ""/"off" are always valid (omit), and any
+// other value is valid only when it is in the model's effective accepted set
+// (models.dev when known, DefaultReasoningEfforts otherwise). Providers
+// without effort reporting (test stubs) accept any non-blank value.
+func (s *Server) isValidThinkingLevel(a *agent.Agent, v string) bool {
+	level := agent.NormalizeThinkingLevel(v)
+	if level == "" || level == agent.ThinkingOff {
+		return true // omit
+	}
+	if p, ok := a.Provider.(llm.ReasoningEffortsProvider); ok {
+		// Membership check against the normalized value ("Max" → "max").
+		return slices.Contains(p.ModelReasoningEfforts(a.CurrentModel()), string(level))
+	}
+	return true
 }
 
 func (s *Server) handleWSConfig(ws *wsConn, ctx context.Context, pane **sessionRuntime, msg WSMessage) {

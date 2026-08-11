@@ -42,11 +42,44 @@ type Cost struct {
 	CacheRead float64 `json:"cache_read"`
 }
 
+// reasoningOption is one entry in a model's reasoning_options array.
+// Models.dev uses three types: "toggle" (on/off, no graded effort),
+// "effort" (accepted reasoning_effort string values), and "budget_tokens"
+// (reasoning-token budget bounds, not string effort).
+type reasoningOption struct {
+	Type   string   `json:"type"`
+	Values []string `json:"values"` // JSON null entries decode to ""; see ReasoningEfforts
+	Min    int64    `json:"min,omitempty"`
+	Max    int64    `json:"max,omitempty"`
+}
+
 type modelEntry struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	Limit Limit  `json:"limit"`
-	Cost  Cost   `json:"cost"`
+	ID               string            `json:"id"`
+	Name             string            `json:"name"`
+	Description      string            `json:"description"`
+	Limit            Limit             `json:"limit"`
+	Cost             Cost              `json:"cost"`
+	ReasoningOptions []reasoningOption `json:"reasoning_options"`
+}
+
+// ReasoningEfforts returns the accepted reasoning_effort string values
+// declared by effort-type reasoning options, in registry order. Null entries
+// in the registry's values array decode to "" and are skipped. Models with
+// only toggle/budget control (or no options) yield an empty slice, meaning
+// "no reasoning_effort control".
+func (m modelEntry) ReasoningEfforts() []string {
+	var out []string
+	for _, opt := range m.ReasoningOptions {
+		if opt.Type != "effort" {
+			continue
+		}
+		for _, v := range opt.Values {
+			if v != "" {
+				out = append(out, v)
+			}
+		}
+	}
+	return out
 }
 
 type providerEntry struct {
@@ -293,12 +326,14 @@ func (r *Resolver) ResolveContextLimit(baseURL, modelID string) (Limit, error) {
 	return Limit{}, fmt.Errorf("provider %q found for %s, but no entry for model %q", provider.ID, baseURL, modelID)
 }
 
-// Resolve returns both context limit and pricing for a model in a single
-// registry lookup. Use this instead of separate ResolveContextLimit + ResolveCost
-// calls to avoid redundant map lookups.
-func (r *Resolver) Resolve(baseURL, modelID string) (Limit, *Cost, error) {
+// Resolve returns context limit, pricing, accepted reasoning-effort values,
+// and the model description in a single registry lookup. Use this instead of
+// separate ResolveContextLimit + ResolveCost calls to avoid redundant map
+// lookups. The efforts slice is a fresh copy; like the returned *Cost, it
+// must not be mutated by callers.
+func (r *Resolver) Resolve(baseURL, modelID string) (Limit, *Cost, []string, string, error) {
 	if err := r.load(); err != nil {
-		return Limit{}, nil, fmt.Errorf("loading model registry: %w", err)
+		return Limit{}, nil, nil, "", fmt.Errorf("loading model registry: %w", err)
 	}
 
 	r.mu.RLock()
@@ -306,12 +341,12 @@ func (r *Resolver) Resolve(baseURL, modelID string) (Limit, *Cost, error) {
 
 	provider, ok := r.byAPI[normalizeURL(baseURL)]
 	if !ok {
-		return Limit{}, nil, fmt.Errorf("no provider in models.dev registry matches base URL %q", baseURL)
+		return Limit{}, nil, nil, "", fmt.Errorf("no provider in models.dev registry matches base URL %q", baseURL)
 	}
 	if m, ok := provider.Models[modelID]; ok {
-		return m.Limit, &m.Cost, nil
+		return m.Limit, &m.Cost, m.ReasoningEfforts(), m.Description, nil
 	}
-	return Limit{}, nil, fmt.Errorf("provider %q found, but no entry for model %q", provider.ID, modelID)
+	return Limit{}, nil, nil, "", fmt.Errorf("provider %q found, but no entry for model %q", provider.ID, modelID)
 }
 
 // ProviderID returns the models.dev provider ID matching a base URL, if any.

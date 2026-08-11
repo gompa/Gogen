@@ -50,6 +50,8 @@ func (m *Model) setProgress(phase progressPhase, label string) tea.Cmd {
 func (m *Model) clearProgress() {
 	m.progressPhase = progressHidden
 	m.progressLabel = ""
+	// No tool is being prepared/executed any more (turn end, cancel, error).
+	m.activeToolName = ""
 }
 
 // renderProgressInput draws the wait indicator in the input band.
@@ -71,7 +73,13 @@ func (m *Model) renderProgressInput() string {
 		}
 		line = DimStyle.Render("  " + m.spinner.View() + " " + label)
 	case progressActive:
-		line = progressStreamingLine
+		// Name the tool whose arguments are streaming in, so the long
+		// pre-execution stretch of tools like patch_file is not opaque.
+		if m.activeToolName != "" {
+			line = DimStyle.Render("  preparing " + m.activeToolName + "…")
+		} else {
+			line = progressStreamingLine
+		}
 	default:
 		// Fallback for progressHidden (renderProgressInput is only called
 		// when streaming is true, but handle defensively).

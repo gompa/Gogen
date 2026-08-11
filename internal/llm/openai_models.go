@@ -226,7 +226,7 @@ func (p *OpenAIProvider) ModelContextLimit(ctx context.Context) (int, error) {
 
 	// 2. models.dev registry: disk-cached, resolves instantly with no network.
 	modelName := p.currentModel()
-	if limit, _ := p.lookupModelsDevLimit(modelName); limit > 0 {
+	if limit, _, _, _ := p.lookupModelsDevInfo(modelName); limit > 0 {
 		return limit, nil
 	}
 
@@ -278,11 +278,13 @@ func (p *OpenAIProvider) ListModels(ctx context.Context) ([]ModelInfo, error) {
 		if m.ID == "" {
 			continue
 		}
-		limit, cost := p.resolveContextLimit(m.RawJSON(), m.ID)
+		limit, cost, efforts, desc := p.resolveContextLimit(m.RawJSON(), m.ID)
 		info := ModelInfo{
-			ID:           m.ID,
-			ContextLimit: limit,
-			Current:      m.ID == current,
+			ID:               m.ID,
+			ContextLimit:     limit,
+			Current:          m.ID == current,
+			Description:      desc,
+			ReasoningEfforts: efforts,
 		}
 		if m.ID == current && cost != nil {
 			info.InputPricePer1M = cost.Input
@@ -294,13 +296,11 @@ func (p *OpenAIProvider) ListModels(ctx context.Context) ([]ModelInfo, error) {
 	return out, nil
 }
 
-// lookupModelsDevLimit queries the models.dev registry by base URL + model ID
-// for both context limit and pricing in a single pass. OpenCode dual endpoints
-// are both tried so zen and go models resolve.
-func (p *OpenAIProvider) lookupModelsDevLimit(modelID string) (int, *modelinfo.Cost) {
-	if p == nil || p.modelInfo == nil || modelID == "" {
-		return 0, nil
-	}
+// modelsDevURLs returns the models.dev base URLs to try for this provider:
+// the configured base URL first, then the two OpenCode catalog endpoints when
+// the provider is OpenCode (zen and go models may be authored under either
+// registry entry). Deduplicated.
+func (p *OpenAIProvider) modelsDevURLs() []string {
 	urls := make([]string, 0, 3)
 	seen := make(map[string]struct{}, 3)
 	add := func(u string) {
@@ -318,40 +318,64 @@ func (p *OpenAIProvider) lookupModelsDevLimit(modelID string) (int, *modelinfo.C
 		add(openCodeZenBaseURL)
 		add(openCodeGoBaseURL)
 	}
-	for _, u := range urls {
-		lim, cost, err := p.modelInfo.Resolve(u, modelID)
-		if err == nil {
-			var c *modelinfo.Cost
-			if cost != nil && (cost.Input > 0 || cost.Output > 0) {
-				c = cost
-			}
-			if lim.Context > 0 {
-				return lim.Context, c
-			}
-			if c != nil {
-				return 0, c
-			}
-		}
-	}
-	return 0, nil
+	return urls
 }
 
-// resolveContextLimit resolves context limit and pricing. Provider JSON is
-// tried first for the limit, but models.dev is always consulted for cost
-// data since provider JSON never includes pricing.
-func (p *OpenAIProvider) resolveContextLimit(rawJSON, modelID string) (int, *modelinfo.Cost) {
-	// Always look up models.dev for pricing (provider JSON never has it).
+// lookupModelsDevInfo queries the models.dev registry by base URL + model ID
+// for context limit, pricing, accepted reasoning-effort values, and the model
+// description in a single pass. OpenCode dual endpoints are both tried so zen
+// and go models resolve. Only models.dev entries with a usable limit or cost
+// are returned; the loop keeps trying the remaining URLs otherwise, matching
+// the previous behavior.
+func (p *OpenAIProvider) lookupModelsDevInfo(modelID string) (int, *modelinfo.Cost, []string, string) {
+	if p == nil || p.modelInfo == nil || modelID == "" {
+		return 0, nil, nil, ""
+	}
+	for _, u := range p.modelsDevURLs() {
+		lim, cost, efforts, desc, err := p.modelInfo.Resolve(u, modelID)
+		if err != nil {
+			continue
+		}
+		var c *modelinfo.Cost
+		if cost != nil && (cost.Input > 0 || cost.Output > 0) {
+			c = cost
+		}
+		if lim.Context > 0 {
+			return lim.Context, c, efforts, desc
+		}
+		if c != nil {
+			return 0, c, efforts, desc
+		}
+	}
+	return 0, nil, nil, ""
+}
+
+// resolveContextLimit resolves context limit, pricing, accepted
+// reasoning-effort values, and the model description. Provider JSON is tried
+// first for the limit, but models.dev is always consulted for cost, efforts,
+// and description since provider JSON never includes them.
+func (p *OpenAIProvider) resolveContextLimit(rawJSON, modelID string) (int, *modelinfo.Cost, []string, string) {
+	// Always look up models.dev for pricing/efforts/description (provider JSON
+	// never has them).
 	var cost *modelinfo.Cost
-	devLimit, devCost := p.lookupModelsDevLimit(modelID)
+	var efforts []string
+	var desc string
+	devLimit, devCost, devEfforts, devDesc := p.lookupModelsDevInfo(modelID)
 	if devCost != nil {
 		cost = devCost
 	}
+	if len(devEfforts) > 0 {
+		efforts = devEfforts
+	}
+	if devDesc != "" {
+		desc = devDesc
+	}
 	// Prefer provider JSON limit, then models.dev, then default.
 	if limit := parseContextLimitFromJSON(rawJSON); limit > 0 {
-		return limit, cost
+		return limit, cost, efforts, desc
 	}
 	if devLimit > 0 {
-		return devLimit, cost
+		return devLimit, cost, efforts, desc
 	}
-	return config.DefaultContextLimit, cost
+	return config.DefaultContextLimit, cost, efforts, desc
 }

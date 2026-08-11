@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 
 	"github.com/openai/openai-go"
@@ -64,16 +65,23 @@ func (p *OpenAIProvider) applyChatCompletionExtras(ctx context.Context, params *
 	})
 }
 
+// DefaultReasoningEfforts is the reasoning_effort value set used when the
+// current model has no models.dev entry (unknown/self-hosted endpoints). It is
+// the most common accepted set in the registry: the low/medium/high triple is
+// the mode of models.dev's per-model effort values (accepted by ~80%+ of the
+// effort-enabled models; high alone by 99%).
+var DefaultReasoningEfforts = []string{"low", "medium", "high"}
+
 // applyThinkingLevel sets the reasoning_effort field on chat completion params
-// when a non-empty thinking level is configured. Empty level means omit the
-// parameter entirely (no thinking/reasoning requested from the API).
+// when a non-empty thinking level is configured. Empty or "off" means omit the
+// parameter entirely (no reasoning/effort requested from the API).
 //
-// Gogen exposes more levels (off/minimal/low/medium/high/xhigh/max) than the
-// reasoning_effort values most models accept. The widely-supported set is
-// low/medium/high (o1/o3/o4-mini and most OpenAI-compatible endpoints); only
-// newer GPT-5.x-class models add minimal/xhigh/max. To stay compatible with
-// the majority of models, the extra levels are folded onto the common set:
-// minimal → low, xhigh/max → high.
+// The configured value is sent verbatim — never translated — but only when the
+// current model accepts it. The accepted set comes from the models.dev
+// registry when the model is known (empty for toggle/budget-only models);
+// unknown/self-hosted models fall back to DefaultReasoningEfforts. A stored
+// value the model does not accept is omitted rather than rewritten (policy B:
+// it stays stored, inactive, and re-activates if a later model accepts it).
 func (p *OpenAIProvider) applyThinkingLevel(_ context.Context, params *openai.ChatCompletionNewParams) {
 	if p == nil || params == nil {
 		return
@@ -84,14 +92,18 @@ func (p *OpenAIProvider) applyThinkingLevel(_ context.Context, params *openai.Ch
 	if level == "" || level == "off" {
 		return
 	}
-	switch level {
-	case "minimal", "low":
-		params.ReasoningEffort = shared.ReasoningEffortLow
-	case "medium":
-		params.ReasoningEffort = shared.ReasoningEffortMedium
-	case "high", "xhigh", "max":
-		params.ReasoningEffort = shared.ReasoningEffortHigh
+	if !slices.Contains(p.acceptedReasoningEfforts(), level) {
+		return // stored value not accepted by this model → omit (policy B)
 	}
+	params.ReasoningEffort = shared.ReasoningEffort(level)
+}
+
+// acceptedReasoningEfforts returns the effective reasoning-effort options for
+// the current model: its models.dev accepted set when known (empty for
+// toggle-only/budget-only models), else DefaultReasoningEfforts. Never blocks
+// — registry lookups are in-memory/disk-cached map lookups.
+func (p *OpenAIProvider) acceptedReasoningEfforts() []string {
+	return p.ModelReasoningEfforts(p.currentModel())
 }
 
 // templateSupportsPreserveReasoning probes llama.cpp GET /props once and caches

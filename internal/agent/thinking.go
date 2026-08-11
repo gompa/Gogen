@@ -2,14 +2,20 @@ package agent
 
 import (
 	"fmt"
+	"slices"
 	"strings"
+	"unicode"
+
+	"gogen/internal/llm"
 )
 
-// ThinkingLevel controls how much reasoning/thinking the model performs.
-// The zero value ("off") means no thinking parameter is sent to the API.
-// Only levels that map to a distinct reasoning_effort value on the wire are
-// exposed (off/low/medium/high); the older minimal/xhigh/max names are still
-// accepted as parse aliases and fold onto low/high (see thinkingLevels).
+// ThinkingLevel is a literal reasoning_effort wire value or "off" — the zero
+// value — which means no thinking parameter is sent to the API. The default
+// levels (off/low/medium/high) are the closed fallback set; any other value
+// the current model accepts (see ReasoningEffortsProvider) is also a valid
+// literal. Values are sent verbatim (never translated) and are only effective
+// when the current model accepts them; a stored value the model does not
+// accept is kept but not sent (policy B).
 type ThinkingLevel string
 
 const (
@@ -19,97 +25,139 @@ const (
 	ThinkingHigh   ThinkingLevel = "high"
 )
 
-// thinkingInfo holds display and parsing metadata for a thinking level.
+// thinkingInfo holds display metadata for a default thinking level.
 type thinkingInfo struct {
 	label      string
 	shortLabel string
-	details    string
-	aliases    []string // parse aliases (lowercase)
 }
 
-// thinkingLevelOrder is the canonical level ordering (weakest → strongest),
-// used by ValidThinkingLevels so listings (help text, /think error messages)
-// are deterministic instead of map-iteration order.
-var thinkingLevelOrder = []ThinkingLevel{
-	ThinkingOff,
-	ThinkingLow,
-	ThinkingMedium,
-	ThinkingHigh,
-}
-
-// thinkingLevels is the single source of truth for all level metadata.
-var thinkingLevels = map[ThinkingLevel]thinkingInfo{
+// defaultLevels holds display metadata for the closed default set
+// (off/low/medium/high). Values outside the defaults — e.g. "max" or "xhigh"
+// reported by a model's models.dev entry — fall back to derived labels (see
+// Label/ShortLabel) so every accepted value renders.
+var defaultLevels = map[ThinkingLevel]thinkingInfo{
 	ThinkingOff: {
 		label:      "Off",
 		shortLabel: "",
-		details:    "No reasoning",
-		aliases:    []string{"off", "0"},
 	},
 	ThinkingLow: {
 		label:      "Low",
 		shortLabel: "L",
-		details:    "Light reasoning",
-		aliases:    []string{"low", "minimal", "min"},
 	},
 	ThinkingMedium: {
 		label:      "Medium",
 		shortLabel: "M",
-		details:    "Moderate reasoning",
-		aliases:    []string{"medium", "med"},
 	},
 	ThinkingHigh: {
 		label:      "High",
 		shortLabel: "H",
-		details:    "Deep reasoning",
-		// "xhigh"/"max" are kept as parse aliases for sessions that
-		// persisted them before the fold; they normalize to "high".
-		aliases: []string{"high", "xhigh", "x-high", "max"},
 	},
 }
 
-// ValidThinkingLevels returns all supported thinking levels in canonical
-// (weakest → strongest) order.
-func ValidThinkingLevels() []ThinkingLevel {
-	all := make([]ThinkingLevel, len(thinkingLevelOrder))
-	copy(all, thinkingLevelOrder)
-	return all
+// NormalizeThinkingLevel canonicalizes a thinking-level input: trimmed,
+// lowercased, and "" when the input is blank. There is no fixed vocabulary to
+// validate against — the set of selectable values is whatever the current
+// model accepts (see AvailableThinkingLevels) — so any non-blank token is a
+// literal reasoning_effort value.
+func NormalizeThinkingLevel(s string) ThinkingLevel {
+	return ThinkingLevel(strings.ToLower(strings.TrimSpace(s)))
 }
 
-// ParseThinkingLevel parses a thinking level string. Returns false on unknown input.
-func ParseThinkingLevel(s string) (ThinkingLevel, bool) {
-	normalized := strings.ToLower(strings.TrimSpace(s))
-	for level, info := range thinkingLevels {
-		for _, alias := range info.aliases {
-			if normalized == alias {
-				return level, true
-			}
-		}
+// CurrentModelEfforts returns the reasoning-effort values the current model
+// accepts (without "off"): the models.dev registry set when the model is
+// known (empty for toggle/budget-only models), else llm.DefaultReasoningEfforts.
+// Never blocks.
+func (a *Agent) CurrentModelEfforts() []string {
+	if p, ok := a.Provider.(llm.ReasoningEffortsProvider); ok {
+		return p.ModelReasoningEfforts(a.CurrentModel())
 	}
-	return ThinkingOff, false
+	return llm.DefaultReasoningEfforts
 }
 
-// ShortLabel returns a compact label for display in toolbars (empty for "off").
-func (l ThinkingLevel) ShortLabel() string {
-	if info, ok := thinkingLevels[l]; ok {
-		return info.shortLabel
+// CurrentModelDescription returns the models.dev description of the current
+// model, or "" when the provider cannot report one (unknown model, provider
+// without registry data). Never blocks.
+func (a *Agent) CurrentModelDescription() string {
+	if p, ok := a.Provider.(llm.ModelDescriptionProvider); ok {
+		return p.ModelDescription(a.CurrentModel())
 	}
 	return ""
 }
 
-// Label returns a user-friendly label.
+// AvailableThinkingLevels returns the thinking levels selectable for the
+// current model: "off" (omit) plus the model's accepted reasoning-effort
+// values in the provider's order. Toggle-only models yield just "off".
+func (a *Agent) AvailableThinkingLevels() []ThinkingLevel {
+	efforts := a.CurrentModelEfforts()
+	out := make([]ThinkingLevel, 0, len(efforts)+1)
+	out = append(out, ThinkingOff)
+	for _, e := range efforts {
+		if e == "" || e == "off" {
+			continue
+		}
+		out = append(out, ThinkingLevel(e))
+	}
+	return out
+}
+
+// IsThinkingLevelActive reports whether the stored thinking level is currently
+// sent to the provider: false when off, or when the value is not in the
+// current model's accepted set (policy B keeps it stored but inactive).
+func (a *Agent) IsThinkingLevelActive() bool {
+	level := a.ThinkingLevel
+	if level == "" || level == ThinkingOff {
+		return false
+	}
+	if p, ok := a.Provider.(llm.ReasoningEffortsProvider); ok {
+		return slices.Contains(p.ModelReasoningEfforts(a.CurrentModel()), string(level))
+	}
+	return true // provider without effort reporting: assume active
+}
+
+func joinThinkingLevels(levels []ThinkingLevel) string {
+	parts := make([]string, len(levels))
+	for i, l := range levels {
+		parts[i] = string(l)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// Label returns a user-friendly label: the default table for the closed
+// default set, or a derived title-case of the wire value otherwise, so a
+// stored value (even one inactive for the current model) always renders.
 func (l ThinkingLevel) Label() string {
-	if info, ok := thinkingLevels[l]; ok {
+	if info, ok := defaultLevels[l]; ok {
 		return info.label
 	}
-	return "Off"
+	if l == "" {
+		return "Off"
+	}
+	return titleCase(string(l))
 }
 
-// Details returns a longer description of the thinking level.
-func (l ThinkingLevel) Details() string {
-	if info, ok := thinkingLevels[l]; ok {
-		return info.details
+// ShortLabel returns a compact label for display in toolbars (empty for
+// "off" and blank): the default table for the closed default set, or the
+// first letter of the derived label otherwise.
+func (l ThinkingLevel) ShortLabel() string {
+	if info, ok := defaultLevels[l]; ok {
+		return info.shortLabel
 	}
-	return ""
+	if l == "" {
+		return ""
+	}
+	label := l.Label()
+	if label == "" {
+		return ""
+	}
+	return string([]rune(label)[:1])
+}
+
+// titleCase upper-cases the first letter of s ("max" → "Max"); s must be
+// non-empty.
+func titleCase(s string) string {
+	r := []rune(s)
+	r[0] = unicode.ToUpper(r[0])
+	return string(r)
 }
 
 // SetThinkingLevel sets the agent's thinking level, syncs the provider's
@@ -128,30 +176,38 @@ func (a *Agent) SetThinkingLevel(l ThinkingLevel) {
 	a.FlushSession()
 }
 
-// HandleThinkingCommand processes /think commands.
+// HandleThinkingCommand processes /think commands. The values offered are the
+// current model's accepted reasoning efforts plus "off" (see
+// AvailableThinkingLevels); a value the model does not accept is rejected
+// rather than stored inactive, so the stored level always matches the wire.
 func (a *Agent) HandleThinkingCommand(input string) (string, bool) {
 	trimmed := strings.TrimSpace(input)
+	available := a.AvailableThinkingLevels()
 	if trimmed == "/think" || trimmed == "think" {
-		return fmt.Sprintf("Thinking level: %s (%s)", a.ThinkingLevel.Label(), a.ThinkingLevel.Details()), true
+		msg := fmt.Sprintf("Thinking level: %s", a.ThinkingLevel.Label())
+		if a.ThinkingLevel != ThinkingOff && !a.IsThinkingLevelActive() {
+			msg += " (inactive for this model — not sent)"
+		}
+		msg += fmt.Sprintf(". Available: %s", joinThinkingLevels(available))
+		return msg, true
 	}
 	if strings.HasPrefix(trimmed, "/think ") || strings.HasPrefix(trimmed, "think ") {
 		parts := strings.SplitN(trimmed, " ", 2)
 		if len(parts) < 2 {
 			return "", false
 		}
-		level, ok := ParseThinkingLevel(parts[1])
-		if !ok {
-			valid := make([]string, len(ValidThinkingLevels()))
-			for i, l := range ValidThinkingLevels() {
-				valid[i] = string(l)
-			}
-			return fmt.Sprintf("Unknown thinking level %q. Valid levels: %s", parts[1], strings.Join(valid, ", ")), true
+		level := NormalizeThinkingLevel(parts[1])
+		if level == "" {
+			return fmt.Sprintf("Unknown thinking level %q. Available: %s", parts[1], joinThinkingLevels(available)), true
+		}
+		if level != ThinkingOff && !slices.Contains(available, level) {
+			return fmt.Sprintf("Thinking level %q is not available for the current model. Available: %s", parts[1], joinThinkingLevels(available)), true
 		}
 		a.SetThinkingLevel(level)
 		if level == ThinkingOff {
-			return "Thinking level set to off (no thinking parameter sent to the API).", true
+			return "Thinking level set to off (no reasoning effort sent to the API).", true
 		}
-		return fmt.Sprintf("Thinking level set to %s (%s).", level.Label(), level.Details()), true
+		return fmt.Sprintf("Thinking level set to %s.", level.Label()), true
 	}
 	return "", false
 }

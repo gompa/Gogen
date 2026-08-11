@@ -94,6 +94,7 @@ type Model struct {
 	streamToolCallIDs   map[int]string    // index -> call ID (for correlating results)
 	streamToolCallLines map[int]int       // index -> chatLines index where the tool call line was added
 	toolCallDiffs       map[string]string // call ID -> diff text (for patch_file/show_diff)
+	activeToolName      string            // tool being prepared or executed; names the progress indicator
 
 	streamToolDiffCount map[int]int     // index -> number of diff lines already rendered progressively
 	streamToolDiffStart map[int]int     // index -> chatLines index where the first diff line is (after top border)

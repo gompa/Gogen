@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,9 +19,13 @@ func sampleRegistry() registry {
 			API: "https://opencode.ai/zen/v1",
 			Models: map[string]modelEntry{
 				"claude-opus-4-8": {
-					ID:    "claude-opus-4-8",
-					Name:  "Claude Opus 4.8",
-					Limit: Limit{Context: 1000000, Output: 128000},
+					ID:          "claude-opus-4-8",
+					Name:        "Claude Opus 4.8",
+					Description: "Claude Opus 4.8",
+					Limit:       Limit{Context: 1000000, Output: 128000},
+					ReasoningOptions: []reasoningOption{
+						{Type: "effort", Values: []string{"low", "medium", "high", "xhigh", "max"}},
+					},
 				},
 			},
 		},
@@ -31,6 +36,9 @@ func sampleRegistry() registry {
 				"mimo-v2.5-pro": {
 					ID:    "mimo-v2.5-pro",
 					Limit: Limit{Context: 1048576, Output: 128000},
+					ReasoningOptions: []reasoningOption{
+						{Type: "toggle"},
+					},
 				},
 			},
 		},
@@ -264,6 +272,65 @@ func TestProviderID(t *testing.T) {
 func TestNormalizeURL(t *testing.T) {
 	if got := normalizeURL(" https://x/v1/ "); got != "https://x/v1" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestResolveReasoningEfforts(t *testing.T) {
+	r := NewResolver("")
+	r.mu.Lock()
+	r.setDataLocked(sampleRegistry())
+	r.mu.Unlock()
+
+	// effort-type option → values in registry order, alongside limit/cost.
+	lim, cost, efforts, desc, err := r.Resolve("https://opencode.ai/zen/v1", "claude-opus-4-8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lim.Context != 1000000 {
+		t.Fatalf("Context=%d, want 1000000", lim.Context)
+	}
+	if cost == nil {
+		t.Fatal("expected non-nil cost")
+	}
+	want := []string{"low", "medium", "high", "xhigh", "max"}
+	if !slices.Equal(efforts, want) {
+		t.Fatalf("efforts = %v, want %v", efforts, want)
+	}
+	if desc != "Claude Opus 4.8" {
+		t.Fatalf("description = %q, want %q", desc, "Claude Opus 4.8")
+	}
+
+	// toggle-only model → no effort control (empty slice, no error).
+	_, _, efforts, _, err = r.Resolve("https://opencode.ai/zen/go/v1", "mimo-v2.5-pro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(efforts) != 0 {
+		t.Fatalf("toggle-only model efforts = %v, want empty", efforts)
+	}
+
+	// Unknown model / provider → error.
+	if _, _, _, _, err := r.Resolve("https://opencode.ai/zen/v1", "nope"); err == nil {
+		t.Fatal("expected error for unknown model")
+	}
+	if _, _, _, _, err := r.Resolve("https://example.com/v1", "claude-opus-4-8"); err == nil {
+		t.Fatal("expected error for unknown provider")
+	}
+}
+
+// TestReasoningEffortsSkipsNullValues pins the JSON-null handling: models.dev
+// effort values arrays may contain null entries, which decode to "" and must
+// be skipped rather than surfaced as accepted values.
+func TestReasoningEffortsSkipsNullValues(t *testing.T) {
+	var m modelEntry
+	raw := `{"id":"x","reasoning_options":[{"type":"effort","values":["none",null,"low"]},{"type":"budget_tokens","min":1024,"max":64000}]}`
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		t.Fatal(err)
+	}
+	got := m.ReasoningEfforts()
+	want := []string{"none", "low"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("efforts = %v, want %v", got, want)
 	}
 }
 

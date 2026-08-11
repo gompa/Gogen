@@ -229,9 +229,40 @@ func (p *OpenAIProvider) SetThinkingLevel(level string) {
 // ModelPricing returns per-token pricing (USD per 1M tokens) for the given
 // model from the models.dev registry. Only cached map lookup — never blocks.
 func (p *OpenAIProvider) ModelPricing(modelID string) (input, output, cached float64, ok bool) {
-	_, cost := p.lookupModelsDevLimit(modelID)
+	_, cost, _, _ := p.lookupModelsDevInfo(modelID)
 	if cost != nil {
 		return cost.Input, cost.Output, cost.CacheRead, true
 	}
 	return 0, 0, 0, false
+}
+
+// ModelReasoningEfforts returns the effective reasoning-effort options for the
+// given model: its models.dev accepted set when the model is known (empty for
+// toggle/budget-only models, meaning no effort control), else
+// DefaultReasoningEfforts. Only cached map lookup — never blocks. This is the
+// same set applyThinkingLevel uses to gate the wire value.
+func (p *OpenAIProvider) ModelReasoningEfforts(modelID string) []string {
+	if p == nil || p.modelInfo == nil || modelID == "" {
+		return DefaultReasoningEfforts
+	}
+	for _, u := range p.modelsDevURLs() {
+		if _, _, efforts, _, err := p.modelInfo.Resolve(u, modelID); err == nil {
+			return efforts // known model: accepted set (possibly empty)
+		}
+	}
+	return DefaultReasoningEfforts // unknown model
+}
+
+// ModelDescription returns the models.dev description for the given model, or
+// "" when the model is unknown. Only cached map lookup — never blocks.
+func (p *OpenAIProvider) ModelDescription(modelID string) string {
+	if p == nil || p.modelInfo == nil || modelID == "" {
+		return ""
+	}
+	for _, u := range p.modelsDevURLs() {
+		if _, _, _, desc, err := p.modelInfo.Resolve(u, modelID); err == nil {
+			return desc
+		}
+	}
+	return ""
 }

@@ -348,6 +348,8 @@
                 const row = document.createElement('button');
                 row.className = 'tb-model-row' + (active ? ' active' : '');
                 row.type = 'button';
+                // Hover tooltip: models.dev description of this model.
+                if (m.description) row.title = m.description;
                 const label = document.createElement('span');
                 label.textContent = m.id;
                 row.appendChild(label);
@@ -377,22 +379,39 @@
         }
 
         // ── Toolbar: thinking level chips ──
+        // Labels for the default reasoning_effort levels (off/low/medium/high).
+        // Values outside the defaults (e.g. a model's "max" from models.dev)
+        // derive their label by title-casing. Chips are rendered from the
+        // ACTIVE model's accepted values (config reasoningEfforts); unknown
+        // models fall back to the default set.
         const THINKING_LABELS = { off: 'Off', low: 'L', medium: 'M', high: 'H' };
+        const DEFAULT_THINKING_EFFORTS = ['low', 'medium', 'high'];
 
-        function renderThinkingChips(level) {
+        function thinkingLabel(value) {
+            return THINKING_LABELS[value] || (value ? value[0].toUpperCase() + value.slice(1) : value);
+        }
+
+        function renderThinkingChips(level, efforts) {
             if (!tbThinkingGrid) return;
             tbThinkingGrid.innerHTML = '';
-            for (const [key, label] of Object.entries(THINKING_LABELS)) {
+            const values = (Array.isArray(efforts) && efforts.length > 0) ? efforts : DEFAULT_THINKING_EFFORTS;
+            for (const value of values) {
                 const chip = document.createElement('button');
-                chip.className = 'tb-thinking-chip' + (key === level ? ' active' : '');
+                const label = thinkingLabel(value);
+                chip.className = 'tb-thinking-chip' + (value === level ? ' active' : '');
                 chip.type = 'button';
                 chip.textContent = label;
-                chip.title = key;
+                chip.title = value === level ? 'Click to clear (no reasoning_effort sent)' : value;
                 chip.addEventListener('click', (e) => {
                     e.stopPropagation();
-                    if (key === level) return;
                     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-                    ws.send(JSON.stringify({ type: 'set_thinking_level', thinkingLevel: key, sessionId: activePane().id }));
+                    // Toggle: clicking the active chip deselects (sends
+                    // 'off' → parameter omitted); clicking another chip
+                    // switches to that value. A stored level the model does
+                    // not accept is never an active chip (policy B), so it
+                    // can only be switched, not toggled off.
+                    const next = value === level ? 'off' : value;
+                    ws.send(JSON.stringify({ type: 'set_thinking_level', thinkingLevel: next, sessionId: activePane().id }));
                 });
                 tbThinkingGrid.appendChild(chip);
             }
@@ -575,29 +594,35 @@
         let availableModels = [];
         let currentModelPricing = null; // { input, output, cached } or null
 
-        function updateModelInfo(model) {
+        function updateModelInfo(model, description) {
             // Update toolbar model button
             if (tbModelBtn) {
                 const name = model || (availableModels.length > 0 ? availableModels.find(m => m.current)?.id : null) || '—';
                 tbModelBtn.innerHTML = name + ' <span class="tb-arrow">▾</span>';
+                // Hover tooltip: models.dev description of the current model.
+                if (description) {
+                    tbModelBtn.title = description;
+                } else {
+                    tbModelBtn.removeAttribute('title');
+                }
             }
         }
 
-        function updateThinkingInfo(level) {
+        function updateThinkingInfo(level, efforts) {
             // Update toolbar thinking chips
-            renderThinkingChips(level);
+            renderThinkingChips(level, efforts);
         }
 
         function updateModelSelect(models, current) {
             availableModels = Array.isArray(models) ? models : [];
             const modelId = current || availableModels.find((m) => m.current)?.id || '';
-            updateModelInfo(modelId);
-            // Populate toolbar model list
-            renderToolbarModelList(availableModels, modelId);
-            // Extract pricing for the active model
             const active = modelId
                 ? availableModels.find((m) => m.id === modelId)
                 : availableModels.find((m) => m.current);
+            updateModelInfo(modelId, active && active.description);
+            // Populate toolbar model list
+            renderToolbarModelList(availableModels, modelId);
+            // Extract pricing for the active model
             if (active && active.inputPricePer1M) {
                 currentModelPricing = {
                     input: active.inputPricePer1M,
@@ -684,7 +709,6 @@
                 dirInput.value = data.workingDir;
                 if (workingDirPath) workingDirPath.textContent = data.workingDir;
             }
-            updateModelInfo(data.model);
             // Keep the popover model list in sync with the active model after a switch
             if (data.model && availableModels.length > 0) {
                 for (const m of availableModels) {
@@ -692,7 +716,16 @@
                 }
                 renderToolbarModelList(availableModels, data.model);
             }
-            updateThinkingInfo(data.thinkingLevel);
+            // Remember the active model's accepted efforts + description so
+            // pane switches and focus restores re-render the correct chips
+            // and tooltip.
+            const cfgPane = activePane();
+            if (cfgPane) {
+                cfgPane.reasoningEfforts = data.reasoningEfforts || [];
+                cfgPane.modelDescription = data.modelDescription || '';
+            }
+            updateThinkingInfo(data.thinkingLevel, data.reasoningEfforts);
+            updateModelInfo(data.model, data.modelDescription);
             updateModeInfo(data.mode);
             updateGlobalMode(data.globalMode);
             // Sync pricing from server-provided fields (always present on config from cached lookups)
@@ -1181,6 +1214,8 @@
                 case 'config':
                     pane.mode = data.mode || pane.mode;
                     pane.thinkingLevel = data.thinkingLevel || pane.thinkingLevel;
+                    pane.reasoningEfforts = data.reasoningEfforts || pane.reasoningEfforts;
+                    pane.modelDescription = data.modelDescription || pane.modelDescription;
                     pane.model = data.model || pane.model;
                     if (data.sessionLabel) pane.label = data.sessionLabel;
                     // A resend whose reply sequence (response → clear_chat →
@@ -1284,8 +1319,8 @@
             // Mode/thinking/model are per-session; restore the toolbar to
             // this pane's last-known values.
             if (pane.mode) updateModeInfo(pane.mode);
-            if (pane.thinkingLevel) renderThinkingChips(pane.thinkingLevel);
-            if (pane.model) updateModelInfo(pane.model);
+            if (pane.thinkingLevel) renderThinkingChips(pane.thinkingLevel, pane.reasoningEfforts);
+            if (pane.model) updateModelInfo(pane.model, pane.modelDescription);
             if (sessionInfoDiv) sessionInfoDiv.textContent = pane.id || '';
             refreshSidebarSessions();
             if (pane.id && ws && ws.readyState === WebSocket.OPEN) {
@@ -2459,8 +2494,7 @@
             // Always prepare a diff host for patch_file; other streaming tools
             // keep the raw args stream until finalized.
             if (streaming && name === 'patch_file') {
-                monacoHost = document.createElement('div');
-                monacoHost.className = 'monaco-tool-host';
+                monacoHost = makeDiffHostElement();
                 card.appendChild(monacoHost);
             } else if (streaming) {
                 argsStream = document.createElement('div');
@@ -2468,8 +2502,7 @@
                 argsStream.textContent = '(';
                 card.appendChild(argsStream);
             } else if (name === 'patch_file' && args && typeof args.diff === 'string') {
-                monacoHost = document.createElement('div');
-                monacoHost.className = 'monaco-tool-host';
+                monacoHost = makeDiffHostElement();
                 card.appendChild(monacoHost);
                 waiting = document.createElement('div');
                 waiting.className = 'tool-waiting';
@@ -2627,9 +2660,21 @@
             return localStorage.getItem('gogen_chat_diff_viewer') === 'monaco' ? 'monaco' : 'tokenizer';
         }
 
-        function createDiffHost(cardInfo) {
+        // The chat diff host is a fixed-height box in Monaco mode (the editor
+        // scrolls internally) and an auto-height box in tokenizer mode (the
+        // fallback <pre> IS the viewer, sized to its content up to the 400px
+        // cap). Shared by createToolCard (hosts pre-created for patch_file)
+        // and createDiffHost (late upgrades), so streaming patch cards get
+        // the same class as every other viewer instead of a hidden 100px
+        // scroller that emits synthetic scroll events on every delta.
+        function makeDiffHostElement() {
             const host = document.createElement('div');
             host.className = 'monaco-tool-host' + (diffViewerMode() === 'tokenizer' ? ' diff-static' : '');
+            return host;
+        }
+
+        function createDiffHost(cardInfo) {
+            const host = makeDiffHostElement();
             cardInfo.monacoHost = host;
             return host;
         }
@@ -4257,7 +4302,7 @@
                     if (data.models) {
                         updateModelSelect(data.models, data.model);
                     } else if (data.model) {
-                        updateModelInfo(data.model);
+                        updateModelInfo(data.model, availableModels.find((m) => m.id === data.model)?.description);
                     }
                     // list_models replies omit context stats — don't wipe the indicator
                     if (data.contextLimit || data.usedTokens || data.usedSource) {
@@ -4385,6 +4430,8 @@
                     }
                     pane.mode = data.mode || pane.mode;
                     pane.thinkingLevel = data.thinkingLevel || pane.thinkingLevel;
+                    pane.reasoningEfforts = data.reasoningEfforts || pane.reasoningEfforts;
+                    pane.modelDescription = data.modelDescription || pane.modelDescription;
                     pane.model = data.model || pane.model;
                     if (data.sessionLabel) pane.label = data.sessionLabel;
                     applyServerConfig(data);
@@ -5310,6 +5357,7 @@
             '.monaco-tool-host',          // diff viewer host
             '.diff-fallback',             // pre-Monaco diff fallback
             '.tool-result-content',       // scrollable tool output bodies
+            '.tool-live-output',          // live tool-output region (re-pins itself per chunk)
         ].join(', ');
         // Timestamp (performance.now) of the last unpin; gates the d<=8
         // re-pin branch in the scroll handler (see UNPIN_REPIN_GRACE_MS).
@@ -5425,7 +5473,19 @@
 
         // Throttle scroll handler to rAF to avoid layout thrashing during streaming.
         let _scrollPending = false;
-        messagesDiv.addEventListener('scroll', () => {
+        messagesDiv.addEventListener('scroll', (e) => {
+            // Scroll events bubble up from nested scrollers: the diff
+            // viewer's fallback <pre> restores its scrollTop on every
+            // streaming delta, and the live-output region re-pins itself per
+            // chunk — both fire real scroll events whose target is the inner
+            // scroller, not #messages. Reacting to those (e.g. evaluating
+            // the chat's distance right after the diff host grew it past the
+            // fold) flipped stickToBottom off and permanently killed follow
+            // while the stream continued below. Only scrolls of #messages
+            // itself are chat-scroll intent; chained native scrolls that
+            // actually move the chat fire on #messages and still pass.
+            const t = e.target;
+            if (t && typeof t.closest === 'function' && t.closest(NESTED_SCROLLER_SELECTOR)) return;
             if (_scrollPending) return;
             _scrollPending = true;
             requestAnimationFrame(() => {

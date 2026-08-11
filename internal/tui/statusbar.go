@@ -42,10 +42,14 @@ func (m *Model) renderStatusBar() string {
 		leftParts = append(leftParts, StatusBarDimStyle.Render(model))
 	}
 
-	// Thinking level (show only when non-off)
+	// Thinking level (show only when non-off AND active for the current
+	// model: an inactive stored value renders nothing, matching the web
+	// toolbar's "no chip selected" state).
 	if level := m.agent.ThinkingLevel; level != "" && level != "off" {
-		if short := level.ShortLabel(); short != "" {
-			leftParts = append(leftParts, StatusBarDimStyle.Render("("+short+")"))
+		if m.agent.IsThinkingLevelActive() {
+			if short := level.ShortLabel(); short != "" {
+				leftParts = append(leftParts, StatusBarDimStyle.Render("("+short+")"))
+			}
 		}
 	}
 
