@@ -301,65 +301,13 @@ func ForkMessages(messages []llm.Message, args string) ([]llm.Message, error) {
 		return m.Role == "assistant" && m.Content == "" && m.Refusal == "" && len(m.ToolCalls) == 0
 	}
 
-	// Determine the fork index
-	idx := -1
-	args = strings.TrimSpace(args)
-	switch {
-	case args == "" || args == "last":
-		// Fork from the last assistant message
-		for i := len(messages) - 1; i >= 0; i-- {
-			if messages[i].Role == "assistant" && !isInvisibleAssistant(messages[i]) {
-				idx = i
-				break
-			}
-		}
-		if idx < 0 {
-			return nil, fmt.Errorf("no assistant message found to fork from")
-		}
-	case strings.HasPrefix(args, "created "):
-		ts := strings.TrimSpace(strings.TrimPrefix(args, "created "))
-		createdAt, err := time.Parse(time.RFC3339Nano, ts)
-		if err != nil {
-			return nil, fmt.Errorf("invalid timestamp %q: %v", ts, err)
-		}
-		for i, m := range messages {
-			diff := m.CreatedAt.Sub(createdAt)
-			if diff < 0 {
-				diff = -diff
-			}
-			if diff <= time.Millisecond {
-				idx = i
-				break
-			}
-		}
-		if idx < 0 {
-			return nil, fmt.Errorf("message with timestamp %q not found", ts)
-		}
-	case strings.HasPrefix(args, "assistant "):
-		n, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(args, "assistant ")))
-		if err != nil {
-			return nil, fmt.Errorf("usage: fork [assistant <N>] — invalid number: %v", err)
-		}
-		count := 0
-		for i, m := range messages {
-			if m.Role == "assistant" {
-				if count == n {
-					idx = i
-					break
-				}
-				count++
-			}
-		}
-		if idx < 0 {
-			return nil, fmt.Errorf("assistant message %d not found (only %d assistant messages)", n, count)
-		}
-	default:
-		// Raw index into the Messages array (matches histIdx from the client).
-		n, err := strconv.Atoi(args)
-		if err != nil || n < 0 || n >= len(messages) {
-			return nil, fmt.Errorf("usage: fork [<N> | last | assistant <N> | created <timestamp>] — invalid index %q", args)
-		}
-		idx = n
+	spec, err := parseForkArg(args, len(messages))
+	if err != nil {
+		return nil, err
+	}
+	idx, err := findForkIndex(messages, spec, isInvisibleAssistant)
+	if err != nil {
+		return nil, err
 	}
 
 	// Never fork from an invisible assistant message (a truncated
@@ -393,6 +341,99 @@ func ForkMessages(messages []llm.Message, args string) ([]llm.Message, error) {
 	}
 
 	return forkedMsgs, nil
+}
+
+// forkKind identifies which fork selector parseForkArg resolved.
+type forkKind int
+
+const (
+	forkLast forkKind = iota
+	forkCreated
+	forkAssistant
+	forkIndex
+)
+
+// forkSpec is a parsed /fork argument.
+type forkSpec struct {
+	kind forkKind
+	// created is the parsed timestamp for forkCreated; createdRaw keeps the
+	// caller's original (trimmed) text for error messages.
+	created    time.Time
+	createdRaw string
+	assistant  int // forkAssistant: the Nth assistant message (0-indexed)
+	index      int // forkIndex: raw message index
+}
+
+// parseForkArg parses a /fork argument: "last" (or empty), "created
+// <RFC3339Nano>", "assistant <N>", or a raw message index. The raw index is
+// validated against messageCount so out-of-range values fail here with the
+// usage error; the other selectors validate during the search.
+func parseForkArg(args string, messageCount int) (forkSpec, error) {
+	args = strings.TrimSpace(args)
+	switch {
+	case args == "" || args == "last":
+		return forkSpec{kind: forkLast}, nil
+	case strings.HasPrefix(args, "created "):
+		ts := strings.TrimSpace(strings.TrimPrefix(args, "created "))
+		createdAt, err := time.Parse(time.RFC3339Nano, ts)
+		if err != nil {
+			return forkSpec{}, fmt.Errorf("invalid timestamp %q: %v", ts, err)
+		}
+		return forkSpec{kind: forkCreated, created: createdAt, createdRaw: ts}, nil
+	case strings.HasPrefix(args, "assistant "):
+		n, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(args, "assistant ")))
+		if err != nil {
+			return forkSpec{}, fmt.Errorf("usage: fork [assistant <N>] — invalid number: %v", err)
+		}
+		return forkSpec{kind: forkAssistant, assistant: n}, nil
+	default:
+		// Raw index into the Messages array (matches histIdx from the client).
+		n, err := strconv.Atoi(args)
+		if err != nil || n < 0 || n >= messageCount {
+			return forkSpec{}, fmt.Errorf("usage: fork [<N> | last | assistant <N> | created <timestamp>] — invalid index %q", args)
+		}
+		return forkSpec{kind: forkIndex, index: n}, nil
+	}
+}
+
+// findForkIndex resolves a parsed fork spec to a message index.
+// isInvisibleAssistant excludes ghost assistant messages from "last" forks
+// (the explicit-index walk-back stays with the caller).
+func findForkIndex(messages []llm.Message, spec forkSpec, isInvisibleAssistant func(llm.Message) bool) (int, error) {
+	switch spec.kind {
+	case forkLast:
+		// Fork from the last assistant message
+		for i := len(messages) - 1; i >= 0; i-- {
+			if messages[i].Role == "assistant" && !isInvisibleAssistant(messages[i]) {
+				return i, nil
+			}
+		}
+		return -1, fmt.Errorf("no assistant message found to fork from")
+	case forkCreated:
+		for i, m := range messages {
+			diff := m.CreatedAt.Sub(spec.created)
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff <= time.Millisecond {
+				return i, nil
+			}
+		}
+		return -1, fmt.Errorf("message with timestamp %q not found", spec.createdRaw)
+	case forkAssistant:
+		count := 0
+		for i, m := range messages {
+			if m.Role == "assistant" {
+				if count == spec.assistant {
+					return i, nil
+				}
+				count++
+			}
+		}
+		return -1, fmt.Errorf("assistant message %d not found (only %d assistant messages)", spec.assistant, count)
+	default: // forkIndex
+		return spec.index, nil
+	}
 }
 
 // ForkSession forks the current conversation into a NEW session: the current
