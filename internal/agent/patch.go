@@ -341,6 +341,178 @@ func looksLikePatchTimestamp(s string) bool {
 	return false
 }
 
+// patchParseState tracks the diff section the parser is in. The plan's
+// three-state sketch (fileHeader/hunkHeader/hunkBody) collapses to two: a
+// freshly parsed @@ line and a hunk with body lines behave identically
+// (zero-count hunks complete immediately via hunkComplete), so hunkHeader
+// carries no distinct behavior.
+type patchParseState int
+
+const (
+	// stateFileHeader expects a file header (---/+++), a hunk header (@@),
+	// git metadata, or a patch delimiter; any other line is skipped (stray
+	// text between sections is tolerated).
+	stateFileHeader patchParseState = iota
+	// stateHunkBody consumes hunk body lines until the hunk's declared
+	// counts are consumed, the next section begins, or the patch ends.
+	stateHunkBody
+	// stateDone ends parsing: a model-added delimiter was seen and the
+	// pending file was flushed. Lines after the delimiter are ignored.
+	stateDone
+)
+
+// diffParser holds the state of a parseUnifiedDiff run. The per-state line
+// handlers are methods so each stays small and testable.
+type diffParser struct {
+	lines         []string
+	boundaryAhead []bool
+	files         []patchFile
+	current       *patchFile
+	hunk          *patchHunk
+	state         patchParseState
+}
+
+func (p *diffParser) flushHunk() {
+	if p.current != nil && p.hunk != nil && (len(p.hunk.oldLines) > 0 || len(p.hunk.newLines) > 0) {
+		p.current.hunks = append(p.current.hunks, *p.hunk)
+	}
+	p.hunk = nil
+}
+
+func (p *diffParser) flushFile() {
+	p.flushHunk()
+	if p.current != nil {
+		// A file section with no hunks and no /dev/null target is
+		// malformed. Models sometimes repeat the ---/+++ header before
+		// the real hunk section (a duplicate header); failing the whole
+		// patch on such a section is spurious. Drop it and keep parsing —
+		// a lone header-only section yields "no patches found" below
+		// (still loud), and real hunks in a later section still apply.
+		if p.current.newName != "/dev/null" && len(p.current.hunks) == 0 {
+			p.current = nil
+			return
+		}
+		p.files = append(p.files, *p.current)
+		p.current = nil
+	}
+}
+
+// handleFileHeaderLine processes one line between file sections: git
+// metadata, ---/+++ headers, @@ hunk headers, delimiters, and stray text
+// (skipped). Returns the next state.
+func (p *diffParser) handleFileHeaderLine(i int) (patchParseState, error) {
+	switch {
+	case strings.HasPrefix(p.lines[i], "diff --git "):
+		p.flushFile()
+	case isGitPreamble(p.lines[i]):
+		// git metadata between file sections — skip.
+	case strings.HasPrefix(p.lines[i], "--- "):
+		p.flushFile()
+		p.current = &patchFile{oldName: strings.TrimSpace(strings.TrimPrefix(p.lines[i], "--- "))}
+	case strings.HasPrefix(p.lines[i], "+++ "):
+		if p.current == nil {
+			return stateFileHeader, fmt.Errorf("malformed diff: +++ before ---")
+		}
+		p.current.newName = strings.TrimSpace(strings.TrimPrefix(p.lines[i], "+++ "))
+	case strings.HasPrefix(p.lines[i], "@@"):
+		p.flushHunk()
+		if p.current == nil {
+			return stateFileHeader, fmt.Errorf("malformed diff: hunk before file header")
+		}
+		parsed, err := parseHunkHeader(p.lines[i])
+		if err != nil {
+			return stateFileHeader, err
+		}
+		p.hunk = &parsed
+		return stateHunkBody, nil
+	case isPatchDelimiterMarker(p.lines[i]) || isBareCodeFence(p.lines[i]):
+		// A model-added delimiter (e.g. "*** End Patch", "***endpatch",
+		// "*** End of file", a bare "***", or a closing code fence) marks
+		// the end of the patch. Flush the pending file and stop parsing,
+		// so repeated markers or stray text after the marker are ignored
+		// instead of being parsed as new files. Prefixed lines such as
+		// "+*** note" still parse as added lines because they start with
+		// a hunk prefix, not "***". Context-format range headers
+		// ("*** 16,20 ***", diff -c) are NOT delimiters: they signal the
+		// model switched diff formats and must keep failing loudly. A
+		// delimiter before the first file header (e.g. "*** Start Patch")
+		// is a preamble and is skipped.
+		if p.current != nil {
+			p.flushFile()
+			return stateDone, nil
+		}
+	}
+	return stateFileHeader, nil
+}
+
+// handleHunkBodyLine processes one hunk body line. Returns the next state;
+// stateDone ends the patch (delimiter seen).
+func (p *diffParser) handleHunkBodyLine(i int) (patchParseState, error) {
+	switch {
+	case strings.HasPrefix(p.lines[i], "diff --git "):
+		p.flushFile()
+		return stateFileHeader, nil
+	// "--- "/"+++ " are file headers ONLY outside a hunk (or after a
+	// hunk that has consumed its declared line counts). A hunk's own
+	// removed/added lines can themselves start with "-- "/"++ " — e.g.
+	// deleting a SQL comment line "-- foo" yields the wire line
+	// "--- foo" — and an unconditional header check would flush the
+	// current hunk and silently corrupt the patch. git resolves the
+	// same ambiguity with section state; we use the hunk's declared
+	// counts as the tie-breaker (>= because LLM counts are frequently
+	// imprecise). A hunk whose declared counts EXCEED its emitted lines
+	// never completes; when the next file's header pair follows with no
+	// blank separator, isHeaderPairAhead hands control back to header
+	// mode instead of absorbing "--- a/b.txt" as a removed line.
+	case strings.HasPrefix(p.lines[i], "--- ") && (hunkComplete(p.hunk) || isHeaderPairAhead(p.lines, i)):
+		p.flushFile()
+		p.current = &patchFile{oldName: strings.TrimSpace(strings.TrimPrefix(p.lines[i], "--- "))}
+		return stateFileHeader, nil
+	case strings.HasPrefix(p.lines[i], "+++ ") && hunkComplete(p.hunk):
+		if p.current == nil {
+			return stateHunkBody, fmt.Errorf("malformed diff: +++ before ---")
+		}
+		p.current.newName = strings.TrimSpace(strings.TrimPrefix(p.lines[i], "+++ "))
+		return stateFileHeader, nil
+	case strings.HasPrefix(p.lines[i], "@@"):
+		p.flushHunk()
+		if p.current == nil {
+			return stateHunkBody, fmt.Errorf("malformed diff: hunk before file header")
+		}
+		parsed, err := parseHunkHeader(p.lines[i])
+		if err != nil {
+			return stateHunkBody, err
+		}
+		p.hunk = &parsed
+		return stateHunkBody, nil
+	case isPatchDelimiterMarker(p.lines[i]) || isBareCodeFence(p.lines[i]):
+		if p.current != nil {
+			p.flushFile()
+			return stateDone, nil
+		}
+		return stateHunkBody, nil
+	case p.lines[i] == `\ No newline at end of file`:
+		return stateHunkBody, nil
+	case len(p.lines[i]) == 0:
+		// Empty lines in a hunk body are treated as empty context lines.
+		// Unified diffs normally encode them as a single space (" "), but
+		// LLMs often emit a bare blank line instead — dropping those
+		// corrupts patches. Exception: blanks that only separate file
+		// sections must not become context.
+		if p.boundaryAhead[i+1] {
+			p.flushHunk()
+			return stateFileHeader, nil
+		}
+		p.hunk.oldLines = append(p.hunk.oldLines, "")
+		p.hunk.newLines = append(p.hunk.newLines, "")
+		return stateHunkBody, nil
+	}
+	if err := appendHunkLine(p.hunk, p.lines[i]); err != nil {
+		return stateHunkBody, err
+	}
+	return stateHunkBody, nil
+}
+
 func parseUnifiedDiff(diff string) ([]patchFile, error) {
 	// Normalize line endings: handle CRLF (Windows) and bare CR (legacy Mac).
 	diff = strings.ReplaceAll(diff, "\r\n", "\n")
@@ -351,144 +523,61 @@ func parseUnifiedDiff(diff string) ([]patchFile, error) {
 	if len(lines) > 0 && lines[len(lines)-1] == "" {
 		lines = lines[:len(lines)-1]
 	}
-	boundaryAhead := computeBoundaryAhead(lines)
-	var files []patchFile
-	var current *patchFile
-	var hunk *patchHunk
+	p := &diffParser{
+		lines:         lines,
+		boundaryAhead: computeBoundaryAhead(lines),
+		state:         stateFileHeader,
+	}
+	for i := 0; i < len(p.lines); i++ {
+		var err error
+		switch p.state {
+		case stateFileHeader:
+			p.state, err = p.handleFileHeaderLine(i)
+		case stateHunkBody:
+			p.state, err = p.handleHunkBodyLine(i)
+		default: // stateDone: ignore everything after the delimiter.
+		}
+		if err != nil {
+			return nil, err
+		}
+		if p.state == stateDone {
+			return p.files, nil
+		}
+	}
+	p.flushFile()
+	return p.files, nil
+}
 
-	flushHunk := func() {
-		if current != nil && hunk != nil && (len(hunk.oldLines) > 0 || len(hunk.newLines) > 0) {
-			current.hunks = append(current.hunks, *hunk)
-		}
-		hunk = nil
+// appendHunkLine appends one unified-diff body line to the hunk: a leading
+// space marks context, "-" a removed line, "+" an added line. Anything else
+// is a malformed hunk line (context lines need a leading space).
+func appendHunkLine(hunk *patchHunk, line string) error {
+	switch line[0] {
+	case ' ':
+		text := line[1:]
+		hunk.oldLines = append(hunk.oldLines, text)
+		hunk.newLines = append(hunk.newLines, text)
+	case '-':
+		hunk.oldLines = append(hunk.oldLines, line[1:])
+	case '+':
+		hunk.newLines = append(hunk.newLines, line[1:])
+	default:
+		return fmt.Errorf("malformed hunk line: %q (context lines need a leading space)", line)
 	}
-	flushFile := func() {
-		flushHunk()
-		if current != nil {
-			// A file section with no hunks and no /dev/null target is
-			// malformed. Models sometimes repeat the ---/+++ header before
-			// the real hunk section (a duplicate header); failing the whole
-			// patch on such a section is spurious. Drop it and keep parsing —
-			// a lone header-only section yields "no patches found" below
-			// (still loud), and real hunks in a later section still apply.
-			if current.newName != "/dev/null" && len(current.hunks) == 0 {
-				current = nil
-				return
-			}
-			files = append(files, *current)
-			current = nil
-		}
-	}
+	return nil
+}
 
-	for i := 0; i < len(lines); i++ {
-		line := lines[i]
-		// Git multi-file diffs insert these between file sections.
-		if strings.HasPrefix(line, "diff --git ") {
-			flushFile()
-			continue
-		}
-		if hunk == nil && (strings.HasPrefix(line, "index ") ||
-			strings.HasPrefix(line, "old mode ") ||
-			strings.HasPrefix(line, "new mode ") ||
-			strings.HasPrefix(line, "new file mode ") ||
-			strings.HasPrefix(line, "deleted file mode ") ||
-			strings.HasPrefix(line, "similarity index ") ||
-			strings.HasPrefix(line, "rename from ") ||
-			strings.HasPrefix(line, "rename to ")) {
-			continue
-		}
-		// "--- "/"+++ " are file headers ONLY outside a hunk (or after a
-		// hunk that has consumed its declared line counts). A hunk's own
-		// removed/added lines can themselves start with "-- "/"++ " — e.g.
-		// deleting a SQL comment line "-- foo" yields the wire line
-		// "--- foo" — and an unconditional header check would flush the
-		// current hunk and silently corrupt the patch. git resolves the
-		// same ambiguity with section state; we use the hunk's declared
-		// counts as the tie-breaker (>= because LLM counts are frequently
-		// imprecise). A hunk whose declared counts EXCEED its emitted lines
-		// never completes; when the next file's header pair follows with no
-		// blank separator, isHeaderPairAhead hands control back to header
-		// mode instead of absorbing "--- a/b.txt" as a removed line.
-		if strings.HasPrefix(line, "--- ") && (hunk == nil || hunkComplete(hunk) || isHeaderPairAhead(lines, i)) {
-			flushFile()
-			current = &patchFile{oldName: strings.TrimSpace(strings.TrimPrefix(line, "--- "))}
-			continue
-		}
-		if strings.HasPrefix(line, "+++ ") && (hunk == nil || hunkComplete(hunk)) {
-			if current == nil {
-				return nil, fmt.Errorf("malformed diff: +++ before ---")
-			}
-			current.newName = strings.TrimSpace(strings.TrimPrefix(line, "+++ "))
-			continue
-		}
-		if strings.HasPrefix(line, "@@") {
-			flushHunk()
-			if current == nil {
-				return nil, fmt.Errorf("malformed diff: hunk before file header")
-			}
-			parsed, err := parseHunkHeader(line)
-			if err != nil {
-				return nil, err
-			}
-			hunk = &parsed
-			continue
-		}
-		// A model-added delimiter (e.g. "*** End Patch", "***endpatch",
-		// "*** End of file", a bare "***", or a closing code fence) marks the
-		// end of the patch. Flush the pending hunk/file and stop parsing, so
-		// repeated markers or stray text after the marker are ignored instead
-		// of being absorbed as hunk content or failing with "malformed hunk
-		// line". The check runs BEFORE the hunk==nil guard so the marker ends
-		// the patch even when no hunk is open (e.g. wedged between a +++
-		// header and its hunk, or after a hunk was flushed by a blank
-		// separator) — without it, sections after the marker would still be
-		// parsed as new files. Prefixed lines such as "+*** note" still parse
-		// as added lines because they start with a hunk prefix, not "***".
-		// Context-format range headers ("*** 16,20 ***", diff -c) are NOT
-		// delimiters: they signal the model switched diff formats and must
-		// keep failing loudly. A delimiter before the first file header (e.g.
-		// "*** Start Patch") is a preamble and is skipped.
-		if isPatchDelimiterMarker(line) || isBareCodeFence(line) {
-			if current != nil {
-				flushFile()
-				return files, nil
-			}
-			continue
-		}
-		if hunk == nil {
-			continue
-		}
-		if line == `\ No newline at end of file` {
-			continue
-		}
-		// Empty lines in a hunk body are treated as empty context lines.
-		// Unified diffs normally encode them as a single space (" "), but LLMs
-		// often emit a bare blank line instead — dropping those corrupts patches.
-		// Exception: blanks that only separate file sections must not become context.
-		if len(line) == 0 {
-			if boundaryAhead[i+1] {
-				flushHunk()
-				continue
-			}
-			hunk.oldLines = append(hunk.oldLines, "")
-			hunk.newLines = append(hunk.newLines, "")
-			continue
-		}
-		switch line[0] {
-		case ' ':
-			text := line[1:]
-			hunk.oldLines = append(hunk.oldLines, text)
-			hunk.newLines = append(hunk.newLines, text)
-		case '-':
-			hunk.oldLines = append(hunk.oldLines, line[1:])
-		case '+':
-			hunk.newLines = append(hunk.newLines, line[1:])
-		default:
-			return nil, fmt.Errorf("malformed hunk line: %q (context lines need a leading space)", line)
-		}
-	}
-	flushFile()
-	return files, nil
+// isGitPreamble reports whether line is git metadata emitted between file
+// sections (index/mode/rename/similarity headers).
+func isGitPreamble(line string) bool {
+	return strings.HasPrefix(line, "index ") ||
+		strings.HasPrefix(line, "old mode ") ||
+		strings.HasPrefix(line, "new mode ") ||
+		strings.HasPrefix(line, "new file mode ") ||
+		strings.HasPrefix(line, "deleted file mode ") ||
+		strings.HasPrefix(line, "similarity index ") ||
+		strings.HasPrefix(line, "rename from ") ||
+		strings.HasPrefix(line, "rename to ")
 }
 
 // hunkComplete reports whether the hunk has already consumed its declared
