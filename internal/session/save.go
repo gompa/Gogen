@@ -1,0 +1,470 @@
+package session
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	"gogen/internal/agent"
+	"gogen/internal/ioutil"
+)
+
+// maxCreatedCacheEntries limits the in-memory created-timestamp cache so it
+// cannot grow unboundedly on long-running processes with many sessions.
+const maxCreatedCacheEntries = 200
+
+// setCreatedCache adds an entry to the created-timestamp cache, evicting the
+// entry with the oldest Created timestamp if the cache exceeds
+// maxCreatedCacheEntries to prevent unbounded memory growth on long-running
+// processes. (Go map iteration is unordered, so the oldest must be found by
+// comparing timestamps rather than "first entry".)
+//
+// Callers must hold s.mu (all callers are Store methods that already guard
+// against a nil receiver).
+func (s *Store) setCreatedCache(id string, created time.Time) {
+	if len(s.createdCache) >= maxCreatedCacheEntries {
+		var oldestID string
+		var oldest time.Time
+		for k, v := range s.createdCache {
+			if oldestID == "" || v.Before(oldest) {
+				oldestID, oldest = k, v
+			}
+		}
+		if oldestID != "" {
+			delete(s.createdCache, oldestID)
+		}
+	}
+	s.createdCache[id] = created
+}
+
+// Save writes a session snapshot.
+func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
+	if !s.enabled || id == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
+	dir := s.dir(snap.WorkingDir)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	path := s.path(snap.WorkingDir, id)
+	if err := ensureUnderSessionsDir(snap.WorkingDir, path, s.globalDir); err != nil {
+		return err
+	}
+	// Skip persisting a session that has never had content and has no
+	// on-disk state yet: /new panes that are never used are flushed on
+	// server quit (ShutdownSessions flushes every registered runtime), and
+	// writing a 0-message file + index entry for each one would bloat the
+	// saved-session list with empty sessions after every restart (the
+	// sidebar renders a row per index entry; a 0-message row shows no
+	// count — messageCount is omitempty, so zero is absent from the
+	// payload). A session that
+	// WAS saved before and was rolled back to empty must still update its
+	// file — the old content was deliberately dropped — so the skip applies
+	// only when neither the snapshot nor a pending delta exists on disk. A
+	// label is the one exception: it can only be set deliberately
+	// (RenameSession / the session_rename tool), so an empty session that
+	// was explicitly named must be persisted — otherwise the rename is
+	// silently dropped. (Oneshot single-prompt sessions are NOT an
+	// exception: their pre-prompt flush must stay skipped or every `-p`
+	// run would leave an empty session entry behind.)
+	if len(snap.Messages) == 0 && snap.Label == "" {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			if _, err := os.Stat(s.deltaPath(snap.WorkingDir, id)); os.IsNotExist(err) {
+				return nil
+			}
+		}
+	}
+	created := time.Now().UTC()
+	// preloadedIdx is the metadata index read during Created recovery
+	// (cache-miss path only); updateIndex reuses it so a full save reads
+	// index.json at most once.
+	var preloadedIdx *sessionIndex
+	if cached, ok := s.createdCache[id]; ok {
+		created = cached
+	} else {
+		// Cache miss (e.g. first save after process restart before Load):
+		// preserve Created instead of resetting it. Prefer the metadata
+		// index — Created is immutable per session id and is written there
+		// on every save, so the common restart case avoids re-reading (and
+		// re-unmarshalling) the potentially large session file. Fall back to
+		// a minimal field-only decode of the file for legacy indexes that
+		// predate the created field (index-loss recovery); the minimal
+		// target skips allocating the previous session's messages just to
+		// recover one timestamp.
+		found := false
+		preloadedIdx = s.readIndex(snap.WorkingDir)
+		if preloadedIdx != nil {
+			for _, e := range preloadedIdx.Entries {
+				if e.ID == id && !e.Created.IsZero() {
+					created = e.Created
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			if data, err := os.ReadFile(path); err == nil {
+				var prevMeta struct {
+					Created time.Time `json:"created"`
+				}
+				if err := json.Unmarshal(data, &prevMeta); err == nil && !prevMeta.Created.IsZero() {
+					created = prevMeta.Created
+				}
+			}
+		}
+	}
+	out := file{
+		Version:        version,
+		ID:             id,
+		Created:        created,
+		Updated:        time.Now().UTC(),
+		WorkingDir:     snap.WorkingDir,
+		Model:          snap.Model,
+		Mode:           snap.Mode,
+		ThinkingLevel:  snap.ThinkingLevel,
+		Label:          snap.Label,
+		LabelRenamed:   snap.LabelRenamed,
+		ProjectProfile: snap.ProjectProfile,
+		Todos:          snap.Todos,
+		Messages:       snap.Messages,
+		Oneshot:        snap.Oneshot,
+		TokenCounts:    snap.TokenCounts,
+		ContextLimit:   snap.ContextLimit,
+	}
+	data, err := json.Marshal(out)
+	if err != nil {
+		return err
+	}
+	if err := ioutil.WriteFileAtomicNoSync(path, data, 0o600); err != nil {
+		return err
+	}
+	// The full snapshot now supersedes the delta. Remove it only after the
+	// snapshot write succeeded: clearing it first meant a crash or a write
+	// failure between the two operations permanently lost the messages that
+	// existed only in the delta. A stale delta that survives into a later
+	// load is detected and dropped by LoadInWorkingDir's baseCount check.
+	if err := s.clearDeltaFile(snap.WorkingDir, id); err != nil && !os.IsNotExist(err) {
+		log.Printf("warning: failed to remove delta for session %s: %v", id, err)
+	}
+	s.setCreatedCache(id, created)
+	s.saveCount++
+	// Update index and invalidate in-memory cache. Runs before prune (order
+	// swap): prune always keeps the current session id, so its later index
+	// rewrite cannot clobber this entry, and the preloaded index — read
+	// during Created recovery and untouched since, under s.mu — is still
+	// fresh here. This lets a cache-miss full save read index.json once
+	// instead of twice.
+	label := sessionLabel(snap.Messages, snap.Label, snap.LabelRenamed)
+	s.updateIndex(snap.WorkingDir, id, out.Created, out.Updated, len(snap.Messages), label, snap.Oneshot, snap.LabelRenamed, preloadedIdx)
+	// Prune every 3 saves to avoid repeated directory scans on every write.
+	if s.autoPrune && s.saveCount%3 == 0 {
+		s.prune(snap.WorkingDir, id)
+	}
+	return nil
+}
+
+// TouchSession updates only the session's timestamp metadata without
+// rewriting the full message payload. Uses file mtime plus the index file.
+func (s *Store) TouchSession(workingDir, id string) error {
+	if !s.enabled || id == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
+	path := s.path(workingDir, id)
+	if err := ensureUnderSessionsDir(workingDir, path, s.globalDir); err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	if err := os.Chtimes(path, now, now); err != nil {
+		return err
+	}
+	return s.touchIndex(workingDir, id, now)
+}
+
+// UpdatedAt returns the session's persisted Updated timestamp for workingDir:
+// the metadata index entry when present, falling back to the session file's
+// updated field (index-loss recovery). Returns the zero time when the session
+// has no persisted state in that directory (a never-saved /new pane).
+func (s *Store) UpdatedAt(workingDir, id string) time.Time {
+	if !s.enabled || id == "" || workingDir == "" {
+		return time.Time{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := validateSessionID(id); err != nil {
+		return time.Time{}
+	}
+	if idx := s.readIndex(workingDir); idx != nil {
+		for _, e := range idx.Entries {
+			if e.ID == id {
+				return e.Updated
+			}
+		}
+	}
+	path := s.path(workingDir, id)
+	if err := ensureUnderSessionsDir(workingDir, path, s.globalDir); err != nil {
+		return time.Time{}
+	}
+	if data, err := os.ReadFile(path); err == nil {
+		var f file
+		if json.Unmarshal(data, &f) == nil {
+			// Delta-aware fallback (see sessionUpdatedAt): a delta written
+			// after the last full save means the file field is stale.
+			return s.sessionUpdatedAt(workingDir, id, f.Updated)
+		}
+	}
+	return time.Time{}
+}
+
+// SetUpdatedAt rewrites the session's Updated timestamp in the metadata index
+// (index file only — the session file's updated field is left as-is, the same
+// accepted divergence AppendMessages/TouchSession have). Used to preserve a
+// session's recency ranking across a working-directory change, where the
+// relocation flush would otherwise stamp Updated=now on a session the user
+// did not touch. No-op when the session has no index entry in workingDir.
+func (s *Store) SetUpdatedAt(workingDir, id string, updated time.Time) error {
+	if !s.enabled || id == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
+	return s.touchIndex(workingDir, id, updated)
+}
+
+// LoadInWorkingDir loads a session from a working directory.
+func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, error) {
+	if !s.enabled {
+		return agent.SessionSnapshot{}, fmt.Errorf("session persistence disabled")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := validateSessionID(id); err != nil {
+		return agent.SessionSnapshot{}, err
+	}
+	path := s.path(workingDir, id)
+	if err := ensureUnderSessionsDir(workingDir, path, s.globalDir); err != nil {
+		return agent.SessionSnapshot{}, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return agent.SessionSnapshot{}, err
+	}
+	var f file
+	if err := json.Unmarshal(data, &f); err != nil {
+		return agent.SessionSnapshot{}, err
+	}
+	if !f.Created.IsZero() {
+		s.setCreatedCache(id, f.Created)
+	}
+
+	// Merge any delta file (messages appended since the last full snapshot).
+	// The delta is deliberately NOT removed after a successful merge: it
+	// stays on disk until the next full save replaces it, so a crash or an
+	// early exit after restore cannot lose messages that only exist in the
+	// delta. The baseCount check below also detects stale deltas (the
+	// snapshot already contains them) and truncated sessions (the delta's
+	// messages were deliberately dropped).
+	snap, deltaErr := s.loadDelta(workingDir, id)
+	if deltaErr == nil && snap.Messages != nil {
+		// mergeFrom is the index into snap.Messages where the merge starts:
+		// 0 merges the whole delta, k>0 merges only the delta tail (the
+		// snapshot already absorbed the delta's first k messages), and -1
+		// drops the delta entirely.
+		mergeFrom := -1
+		switch {
+		case snap.BaseCount == 0:
+			// Legacy delta written before baseCount was recorded. Merging
+			// unconditionally (the historic behavior) double-appends when a
+			// later full save already included the delta's messages — the
+			// crash window Save has between the snapshot write and the delta
+			// unlink, which baseCount deltas survive but legacy deltas do
+			// not. The snapshot's Updated timestamp versus the delta file's
+			// mtime disambiguates: a snapshot saved AFTER the delta was
+			// written already contains its messages. When the timestamps
+			// are ambiguous (coarse filesystems), prefer merging — the
+			// historic behavior — rather than risk dropping real messages.
+			if fi, err := os.Stat(s.deltaPath(workingDir, id)); err == nil && f.Updated.After(fi.ModTime()) {
+				_ = s.clearDeltaFile(workingDir, id)
+			} else {
+				mergeFrom = 0
+			}
+		case len(f.Messages) == snap.BaseCount:
+			// Snapshot is exactly the base the delta was written against:
+			// the delta extends it.
+			mergeFrom = 0
+		case len(f.Messages) >= snap.BaseCount+len(snap.Messages):
+			// Snapshot already contains the delta's messages (a full save
+			// wrote the snapshot but crashed before removing the delta).
+			_ = s.clearDeltaFile(workingDir, id)
+		case len(f.Messages) > snap.BaseCount:
+			// Snapshot is LONGER than the delta's base but shorter than
+			// base+delta. This is the two-writer race shape: a concurrent
+			// full save (another process, or an attach whose restore flush
+			// landed while the registered agent still appends deltas against
+			// its older base) absorbed a PREFIX of the delta into the
+			// snapshot. When the snapshot's extra messages are exactly the
+			// delta's leading messages, the delta's TAIL is real history
+			// that exists nowhere else — merge just the tail instead of
+			// dropping the delta (which previously lost those messages). A
+			// content mismatch means the snapshot diverged (another writer
+			// truncated/rolled back) — keep the snapshot and drop the delta,
+			// the same conservative choice as the truncation case below.
+			overlap := len(f.Messages) - snap.BaseCount
+			if deltaPrefixMatches(f.Messages[snap.BaseCount:], snap.Messages[:overlap]) {
+				mergeFrom = overlap
+			} else {
+				_ = s.clearDeltaFile(workingDir, id)
+			}
+		default:
+			// Snapshot is shorter than the delta's base: the conversation
+			// was truncated (compaction/rollback) and re-saved, so the
+			// delta's messages were deliberately dropped.
+			_ = s.clearDeltaFile(workingDir, id)
+		}
+		if mergeFrom >= 0 {
+			if mergeFrom > 0 {
+				// The snapshot already contains the delta's first
+				// mergeFrom messages; append only the tail.
+				f.Messages = append(f.Messages, snap.Messages[mergeFrom:]...)
+				if len(snap.TokenCounts) > 0 {
+					f.TokenCounts = append(f.TokenCounts, snap.TokenCounts[mergeFrom:]...)
+				}
+			} else {
+				f.Messages = append(f.Messages, snap.Messages...)
+				if len(snap.TokenCounts) > 0 {
+					f.TokenCounts = append(f.TokenCounts, snap.TokenCounts...)
+				}
+			}
+		}
+	}
+
+	return agent.SessionSnapshot{
+		WorkingDir:     f.WorkingDir,
+		Model:          f.Model,
+		Mode:           f.Mode,
+		ThinkingLevel:  f.ThinkingLevel,
+		Oneshot:        f.Oneshot,
+		Label:          f.Label,
+		LabelRenamed:   f.LabelRenamed,
+		ProjectProfile: f.ProjectProfile,
+		Todos:          f.Todos,
+		Messages:       f.Messages,
+		TokenCounts:    f.TokenCounts,
+		ContextLimit:   f.ContextLimit,
+	}, nil
+}
+
+// AppendMessages writes new messages to the delta file for incremental saves.
+// The delta file is a lightweight JSON file that holds messages appended since
+// the last full snapshot. On restore, the delta is merged into the full snapshot.
+// This avoids rewriting the entire (potentially large) message list on every save.
+// totalMsgCount is the agent's total message count at save time; because the
+// delta is cumulative, it is the correct index count between full snapshots.
+// BaseCount (totalMsgCount minus the delta length) records the message count
+// of the snapshot the delta extends, letting loads detect stale deltas.
+func (s *Store) AppendMessages(id string, snap agent.SessionSnapshot, totalMsgCount int) error {
+	if !s.enabled || id == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
+	dir := s.dir(snap.WorkingDir)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	path := s.deltaPath(snap.WorkingDir, id)
+	if err := ensureUnderSessionsDir(snap.WorkingDir, path, s.globalDir); err != nil {
+		return err
+	}
+
+	df := deltaFile{
+		Messages:    snap.Messages,
+		TokenCounts: snap.TokenCounts,
+	}
+	df.BaseCount = totalMsgCount - len(snap.Messages)
+	if df.BaseCount < 0 {
+		df.BaseCount = 0
+	}
+	data, err := json.Marshal(df)
+	if err != nil {
+		return err
+	}
+	if err := ioutil.WriteFileAtomicNoSync(path, data, 0o600); err != nil {
+		return err
+	}
+
+	// Update the main file's mtime so the session appears recent in listings.
+	mainPath := s.path(snap.WorkingDir, id)
+	_ = os.Chtimes(mainPath, time.Now(), time.Now())
+
+	// Update the index so the session appears recent in listings. The delta
+	// file always holds every message since the last full snapshot, so the
+	// agent's total count is authoritative. Label and oneshot flags are
+	// preserved — appends do not change them.
+	s.updateIndexCount(snap.WorkingDir, id, time.Now().UTC(), totalMsgCount)
+	return nil
+}
+
+// Delete removes a saved session file.
+func (s *Store) Delete(workingDir, id string) error {
+	if !s.enabled {
+		return fmt.Errorf("session persistence disabled")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
+	path := s.path(workingDir, id)
+	if err := ensureUnderSessionsDir(workingDir, path, s.globalDir); err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			// The session may exist only in memory: a /new pane that was
+			// never used is not persisted on quit (see Save's empty-session
+			// skip), yet the user can still delete it (sidebar ✕ / resume
+			// del). Deleting it is a success — there is no persisted state
+			// to remove — so clean up any leftover delta/index entry and
+			// return nil instead of "session not found".
+			if err := s.clearDeltaFile(workingDir, id); err != nil && !os.IsNotExist(err) {
+				log.Printf("warning: failed to remove delta for session %s: %v", id, err)
+			}
+			// Mirror the found-path cleanup: a stale Created cache entry would
+			// otherwise be re-used by a later Save of a new session with the
+			// same id (in-memory-only sessions are created and deleted without
+			// ever touching disk).
+			delete(s.createdCache, id)
+			s.removeFromIndex(workingDir, id)
+			s.invalidateListCache(workingDir)
+			return nil
+		}
+		return err
+	}
+	// Remove any pending delta for the session as well.
+	if err := s.clearDeltaFile(workingDir, id); err != nil && !os.IsNotExist(err) {
+		log.Printf("warning: failed to remove delta for session %s: %v", id, err)
+	}
+	delete(s.createdCache, id)
+	// Remove from index and invalidate in-memory cache.
+	s.removeFromIndex(workingDir, id)
+	s.invalidateListCache(workingDir)
+	return nil
+}
