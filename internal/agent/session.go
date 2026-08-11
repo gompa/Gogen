@@ -394,37 +394,17 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 	// snapshot path can reuse them instead of re-tokenizing everything.
 	a.extendTokenCounts()
 
-	// Snapshot the conversation and label under statsMu: web probes read
-	// them without turnMu, so doPersist must not touch the live
-	// fields outside the lock. The clone is deep (ToolCalls included) so
-	// the snapshot cannot race a concurrent in-place stabilization, and it
-	// is safe to tokenize and serialize after releasing the lock.
-	a.statsMu.RLock()
-	msgs := cloneMessagesShallow(a.Messages)
-	label := a.SessionLabel
-	labelRenamed := a.labelRenamed
-	countsEpoch := a.countsEpoch
-	tokenCounts := append([]int(nil), a.tokenCounts...)
-	// Mode/thinking/oneshot are written under statsMu (SetMode,
-	// SetThinkingLevel, RestoreSessionLocal), so read them under the same
-	// lock: doPersist also runs on the shutdown flush path with no turnMu,
-	// and an unlocked read there would race a concurrent SetMode or
-	// SetThinkingLevel from a still-running turn's command handler.
-	mode := a.Mode.String()
-	thinking := string(a.ThinkingLevel)
-	oneshot := a.SessionOneshot
-	workingDir := a.WorkingDir
-	a.statsMu.RUnlock()
-	count := len(msgs)
-	profile := a.ensureProjectProfile()
-	model := a.CurrentModel()
-	curMeta := persistMeta{
-		label:    label,
-		mode:     mode,
-		model:    model,
-		thinking: thinking,
-		oneshot:  oneshot,
-		profile:  profile,
+	st := a.capturePersistState()
+	count := len(st.msgs)
+	st.profile = a.ensureProjectProfile()
+	st.model = a.CurrentModel()
+	st.meta = persistMeta{
+		label:    st.label,
+		mode:     st.mode,
+		model:    st.model,
+		thinking: st.thinking,
+		oneshot:  st.oneshot,
+		profile:  st.profile,
 		todos:    todoSnapshot(a.TodoManager),
 	}
 
@@ -444,85 +424,145 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 	needsFullSave := a.lastSavedMsgCount == 0 ||
 		count-a.lastSavedMsgCount > 5 ||
 		time.Since(a.lastFullSaveTime) > 30*time.Second ||
-		!reflect.DeepEqual(curMeta, a.lastMeta)
+		!reflect.DeepEqual(st.meta, a.lastMeta)
 
+	var ok bool
 	if needsFullSave {
-		snap := SessionSnapshot{
-			WorkingDir:     workingDir,
-			Model:          model,
-			Mode:           mode,
-			ThinkingLevel:  thinking,
-			Oneshot:        oneshot,
-			Label:          label,
-			LabelRenamed:   labelRenamed,
-			ProjectProfile: profile,
-			Todos:          curMeta.todos,
-			Messages:       msgs,
-			ContextLimit:   a.ContextLimit(),
-		}
-		if len(tokenCounts) == len(msgs) {
-			snap.TokenCounts = tokenCounts
-		} else if a.Context != nil && !skipTokenCounts {
-			snap.TokenCounts = a.Context.TokenCounts(msgs)
-			// Backfill the in-memory cache so the next save or context probe
-			// reuses these counts instead of re-tokenizing. The epoch guard
-			// drops the result if the message list changed underneath us.
-			a.statsMu.Lock()
-			if a.countsEpoch == countsEpoch && len(a.tokenCounts) < len(msgs) {
-				a.tokenCounts = append(a.tokenCounts, snap.TokenCounts[len(a.tokenCounts):]...)
-			}
-			a.statsMu.Unlock()
-		}
-		if err := a.SessionStore.Save(a.SessionID, snap); err != nil {
-			log.Printf("session save failed (id=%s): %v", a.SessionID, err)
-			a.lastPersistErr = err
-			return
-		}
-		a.lastSavedMsgCount = count
-		a.lastFullSaveTime = time.Now()
-		a.lastMeta = curMeta
+		ok = a.persistFullSnapshot(st, count, skipTokenCounts)
 	} else {
-		// Incremental: only serialise new messages since the last full save.
-		newMsgs := msgs[a.lastSavedMsgCount:]
-		var newCounts []int
-		if a.Context != nil && !skipTokenCounts {
-			if len(tokenCounts) >= count {
-				// extendTokenCounts ran above, so the in-memory cache already
-				// covers these messages; reuse it instead of re-tokenizing
-				// the same content a second time.
-				newCounts = append([]int(nil), tokenCounts[a.lastSavedMsgCount:count]...)
-			} else {
-				newCounts = make([]int, len(newMsgs))
-				for i := range newMsgs {
-					newCounts[i] = contextmgr.ComputeMessageTokens(newMsgs[i])
-				}
-			}
-		}
-		deltaSnap := SessionSnapshot{
-			WorkingDir:  workingDir,
-			Oneshot:     oneshot,
-			Label:       label,
-			Messages:    newMsgs,
-			TokenCounts: newCounts,
-		}
-		if err := a.SessionStore.AppendMessages(a.SessionID, deltaSnap, count); err != nil {
-			log.Printf("session delta save failed (id=%s): %v", a.SessionID, err)
-			a.lastPersistErr = err
-			return
-		}
-		// Do NOT advance lastSavedMsgCount here.  The delta file is
-		// overwritten on each incremental save and must always contain ALL
-		// messages since the last full snapshot.  Advancing lastSavedMsgCount
-		// would make the next delta save include only the newest messages,
-		// and a crash between increments would permanently lose the earlier
-		// batches.  The full-save thresholds (5 new messages or 30 s) will
-		// trigger a full snapshot soon enough, at which point lastSavedMsgCount
-		// is updated.
-		_ = count // referenced for clarity; not saved until next full snapshot
+		ok = a.persistDeltaSnapshot(st, count, skipTokenCounts)
 	}
-
+	if !ok {
+		return // the helper recorded the error; lastPersistTime stays stale
+	}
 	a.lastPersistErr = nil
 	a.lastPersistTime = time.Now()
+}
+
+// persistState is the data doPersist captured under statsMu before
+// serializing. It is immutable after capture: the write path never touches
+// the live fields outside the lock.
+type persistState struct {
+	msgs         []llm.Message
+	tokenCounts  []int
+	countsEpoch  uint64
+	label        string
+	labelRenamed bool
+	mode         string
+	thinking     string
+	oneshot      bool
+	workingDir   string
+	profile      string
+	model        string
+	meta         persistMeta
+}
+
+// capturePersistState snapshots the conversation and metadata under statsMu:
+// web probes read them without turnMu, so doPersist must not touch the live
+// fields outside the lock. The clone is deep (ToolCalls included) so the
+// snapshot cannot race a concurrent in-place stabilization, and it is safe
+// to tokenize and serialize after releasing the lock. Mode/thinking/oneshot
+// are written under statsMu (SetMode, SetThinkingLevel, RestoreSessionLocal),
+// so they are read under the same lock: doPersist also runs on the shutdown
+// flush path with no turnMu, and an unlocked read there would race a
+// concurrent SetMode or SetThinkingLevel from a still-running turn's command
+// handler. Caller must hold persistMu.
+func (a *Agent) capturePersistState() persistState {
+	a.statsMu.RLock()
+	defer a.statsMu.RUnlock()
+	return persistState{
+		msgs:         cloneMessagesShallow(a.Messages),
+		label:        a.SessionLabel,
+		labelRenamed: a.labelRenamed,
+		countsEpoch:  a.countsEpoch,
+		tokenCounts:  append([]int(nil), a.tokenCounts...),
+		mode:         a.Mode.String(),
+		thinking:     string(a.ThinkingLevel),
+		oneshot:      a.SessionOneshot,
+		workingDir:   a.WorkingDir,
+	}
+}
+
+// persistFullSnapshot writes a complete session snapshot, reusing the
+// in-memory token counts when they cover the conversation (or tokenizing and
+// backfilling the cache otherwise), then advances the incremental-save
+// counters. Returns false after recording the error; the caller then skips
+// the success bookkeeping.
+func (a *Agent) persistFullSnapshot(st persistState, count int, skipTokenCounts bool) bool {
+	snap := SessionSnapshot{
+		WorkingDir:     st.workingDir,
+		Model:          st.model,
+		Mode:           st.mode,
+		ThinkingLevel:  st.thinking,
+		Oneshot:        st.oneshot,
+		Label:          st.label,
+		LabelRenamed:   st.labelRenamed,
+		ProjectProfile: st.profile,
+		Todos:          st.meta.todos,
+		Messages:       st.msgs,
+		ContextLimit:   a.ContextLimit(),
+	}
+	if len(st.tokenCounts) == len(st.msgs) {
+		snap.TokenCounts = st.tokenCounts
+	} else if a.Context != nil && !skipTokenCounts {
+		snap.TokenCounts = a.Context.TokenCounts(st.msgs)
+		// Backfill the in-memory cache so the next save or context probe
+		// reuses these counts instead of re-tokenizing. The epoch guard
+		// drops the result if the message list changed underneath us.
+		a.statsMu.Lock()
+		if a.countsEpoch == st.countsEpoch && len(a.tokenCounts) < len(st.msgs) {
+			a.tokenCounts = append(a.tokenCounts, snap.TokenCounts[len(a.tokenCounts):]...)
+		}
+		a.statsMu.Unlock()
+	}
+	if err := a.SessionStore.Save(a.SessionID, snap); err != nil {
+		log.Printf("session save failed (id=%s): %v", a.SessionID, err)
+		a.lastPersistErr = err
+		return false
+	}
+	a.lastSavedMsgCount = count
+	a.lastFullSaveTime = time.Now()
+	a.lastMeta = st.meta
+	return true
+}
+
+// persistDeltaSnapshot appends only the messages since the last full save.
+// lastSavedMsgCount is deliberately NOT advanced here: the delta file is
+// overwritten on each incremental save and must always contain ALL messages
+// since the last full snapshot. Advancing it would make the next delta save
+// include only the newest messages, and a crash between increments would
+// permanently lose the earlier batches. The full-save thresholds (5 new
+// messages or 30 s) trigger a full snapshot soon enough, at which point
+// lastSavedMsgCount is updated.
+func (a *Agent) persistDeltaSnapshot(st persistState, count int, skipTokenCounts bool) bool {
+	newMsgs := st.msgs[a.lastSavedMsgCount:]
+	var newCounts []int
+	if a.Context != nil && !skipTokenCounts {
+		if len(st.tokenCounts) >= count {
+			// extendTokenCounts ran above, so the in-memory cache already
+			// covers these messages; reuse it instead of re-tokenizing
+			// the same content a second time.
+			newCounts = append([]int(nil), st.tokenCounts[a.lastSavedMsgCount:count]...)
+		} else {
+			newCounts = make([]int, len(newMsgs))
+			for i := range newMsgs {
+				newCounts[i] = contextmgr.ComputeMessageTokens(newMsgs[i])
+			}
+		}
+	}
+	deltaSnap := SessionSnapshot{
+		WorkingDir:  st.workingDir,
+		Oneshot:     st.oneshot,
+		Label:       st.label,
+		Messages:    newMsgs,
+		TokenCounts: newCounts,
+	}
+	if err := a.SessionStore.AppendMessages(a.SessionID, deltaSnap, count); err != nil {
+		log.Printf("session delta save failed (id=%s): %v", a.SessionID, err)
+		a.lastPersistErr = err
+		return false
+	}
+	return true
 }
 
 // resetSaveTracking resets the incremental-save counters so the next

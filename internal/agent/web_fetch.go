@@ -450,26 +450,9 @@ func (e *Executor) WebFetch(ctx context.Context, rawURL string, opts WebFetchOpt
 		return "", err
 	}
 
-	var text string
-	readable := false          // text came from readability main-content extraction
-	readabilityFailed := false // readability found no article; full page returned
-	if opts.Selector != "" {
-		text, err = extractBySelector(body, opts.Selector, finalURL)
-		if err != nil {
-			return "", err
-		}
-	} else if isHTMLLike(contentType, finalURL, body) {
-		if md, ok := extractReadable(body, finalURL); ok {
-			text = md
-			readable = true
-		} else {
-			// Readability found no single main article (list pages, docs
-			// indexes, tables, ...): fall back to full-page conversion.
-			text = extractResponseText(contentType, finalURL, body)
-			readabilityFailed = true
-		}
-	} else {
-		text = extractResponseText(contentType, finalURL, body)
+	text, readable, readabilityFailed, err := extractWebContent(body, contentType, finalURL, opts)
+	if err != nil {
+		return "", err
 	}
 
 	if opts.Query != "" {
@@ -480,15 +463,42 @@ func (e *Executor) WebFetch(ctx context.Context, rawURL string, opts WebFetchOpt
 		return result, nil
 	}
 
-	// Build result.
+	return buildFetchResult(text, truncated, maxBytes, opts.Selector != "" || readable, readabilityFailed, finalURL, parsed.String()), nil
+}
+
+// extractWebContent converts a fetched body to text: CSS-selector extraction
+// when requested, readability main-content extraction for HTML, or full-page
+// conversion. Returns the text plus flags describing which path ran.
+func extractWebContent(body []byte, contentType, finalURL string, opts WebFetchOptions) (text string, readable, readabilityFailed bool, err error) {
+	if opts.Selector != "" {
+		text, err = extractBySelector(body, opts.Selector, finalURL)
+		if err != nil {
+			return "", false, false, err
+		}
+		return text, false, false, nil
+	}
+	if isHTMLLike(contentType, finalURL, body) {
+		if md, ok := extractReadable(body, finalURL); ok {
+			return md, true, false, nil
+		}
+		// Readability found no single main article (list pages, docs
+		// indexes, tables, ...): fall back to full-page conversion.
+		return extractResponseText(contentType, finalURL, body), false, true, nil
+	}
+	return extractResponseText(contentType, finalURL, body), false, false, nil
+}
+
+// buildFetchResult assembles the final web_fetch output, marking truncated
+// bodies and over-limit text explicitly (a silent mid-file cut previously
+// looked like the complete document).
+func buildFetchResult(text string, truncated bool, maxBytes int, extraction, readabilityFailed bool, finalURL, originalURL string) string {
 	var b strings.Builder
-	if finalURL != parsed.String() {
+	if finalURL != originalURL {
 		fmt.Fprintf(&b, "Final URL (after redirects): %s\n\n", finalURL)
 	}
 	if readabilityFailed {
 		fmt.Fprintf(&b, "Note: no single main article found; returning the full page instead.\n\n")
 	}
-	extraction := opts.Selector != "" || readable
 	if extraction && truncated {
 		fmt.Fprintf(&b, "Note: body exceeded max_bytes and was cut before extraction; raise max_bytes (up to %d) if the result seems incomplete.\n\n", webFetchHardMax)
 	}
@@ -516,7 +526,7 @@ func (e *Executor) WebFetch(ctx context.Context, rawURL string, opts WebFetchOpt
 	default:
 		b.WriteString(text)
 	}
-	return b.String(), nil
+	return b.String()
 }
 
 func validateFetchURL(rawURL string) (*url.URL, error) {
