@@ -82,35 +82,11 @@ func listDefinitionsText(path string, content []byte) string {
 // `type (` line), which the caller skips.
 func outlineKindName(keyword, rest string) (kind, name string) {
 	kind = keyword
-	switch keyword {
-	case "func", "fn", "function", "def":
-		kind = "func"
-	case "mod":
-		kind = "module"
+	if k, ok := outlineKindNormalized[keyword]; ok {
+		kind = k
 	}
 	rest = strings.TrimSpace(rest)
-	// Skip a Go receiver before the method name.
-	if strings.HasPrefix(rest, "(") {
-		depth := 0
-		end := -1
-		for i, r := range rest {
-			switch r {
-			case '(':
-				depth++
-			case ')':
-				depth--
-				if depth == 0 {
-					end = i
-				}
-			}
-			if end >= 0 {
-				break
-			}
-		}
-		if end >= 0 {
-			rest = strings.TrimSpace(rest[end+1:])
-		}
-	}
+	rest = skipGoReceiver(rest)
 	// Strip generics: `Foo[T any]` names Foo.
 	if i := strings.IndexByte(rest, '['); i > 0 {
 		rest = rest[:i]
@@ -123,4 +99,40 @@ func outlineKindName(keyword, rest string) (kind, name string) {
 		}
 	}
 	return kind, rest
+}
+
+// outlineKindNormalized maps language outline keywords to the canonical kind
+// name sent to clients.
+var outlineKindNormalized = map[string]string{
+	"func": "func", "fn": "func", "function": "func", "def": "func",
+	"mod": "module",
+}
+
+// skipGoReceiver strips a leading Go receiver (e.g. "(s *Server)") from a
+// definition line so the method name follows. Non-receiver input is returned
+// unchanged.
+func skipGoReceiver(rest string) string {
+	if !strings.HasPrefix(rest, "(") {
+		return rest
+	}
+	depth := 0
+	end := -1
+	for i, r := range rest {
+		switch r {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				end = i
+			}
+		}
+		if end >= 0 {
+			break
+		}
+	}
+	if end >= 0 {
+		return strings.TrimSpace(rest[end+1:])
+	}
+	return rest
 }

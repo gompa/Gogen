@@ -43,68 +43,61 @@ type GitStatusEntry struct {
 	Status string `json:"status"`
 }
 
+// extLanguage maps a lowercase file extension to the language name sent to
+// the web editor. Unknown extensions fall back to "plaintext".
+var extLanguage = map[string]string{
+	".go":          "go",
+	".js":          "javascript",
+	".mjs":         "javascript",
+	".cjs":         "javascript",
+	".jsx":         "javascript",
+	".ts":          "typescript",
+	".tsx":         "typescript",
+	".json":        "json",
+	".md":          "markdown",
+	".markdown":    "markdown",
+	".html":        "html",
+	".htm":         "html",
+	".css":         "css",
+	".scss":        "scss",
+	".less":        "less",
+	".yaml":        "yaml",
+	".yml":         "yaml",
+	".toml":        "ini",
+	".xml":         "xml",
+	".sh":          "shell",
+	".bash":        "shell",
+	".zsh":         "shell",
+	".py":          "python",
+	".rs":          "rust",
+	".java":        "java",
+	".c":           "c",
+	".h":           "c",
+	".cpp":         "cpp",
+	".cc":          "cpp",
+	".cxx":         "cpp",
+	".hpp":         "cpp",
+	".cs":          "csharp",
+	".sql":         "sql",
+	".rb":          "ruby",
+	".php":         "php",
+	".swift":       "swift",
+	".kt":          "kotlin",
+	".lua":         "lua",
+	".r":           "r",
+	".diff":        "diff",
+	".patch":       "diff",
+	".mod":         "go",
+}
+
+// languageFromPath maps a file path to the editor language name. Pure
+// lookup; unknown extensions fall back to "plaintext".
 func languageFromPath(path string) string {
 	ext := strings.ToLower(filepath.Ext(path))
-	switch ext {
-	case ".go":
-		return "go"
-	case ".js", ".mjs", ".cjs", ".jsx":
-		return "javascript"
-	case ".ts", ".tsx":
-		return "typescript"
-	case ".json":
-		return "json"
-	case ".md", ".markdown":
-		return "markdown"
-	case ".html", ".htm":
-		return "html"
-	case ".css":
-		return "css"
-	case ".scss":
-		return "scss"
-	case ".less":
-		return "less"
-	case ".yaml", ".yml":
-		return "yaml"
-	case ".toml":
-		return "ini"
-	case ".xml":
-		return "xml"
-	case ".sh", ".bash", ".zsh":
-		return "shell"
-	case ".py":
-		return "python"
-	case ".rs":
-		return "rust"
-	case ".java":
-		return "java"
-	case ".c", ".h":
-		return "c"
-	case ".cpp", ".cc", ".cxx", ".hpp":
-		return "cpp"
-	case ".cs":
-		return "csharp"
-	case ".sql":
-		return "sql"
-	case ".rb":
-		return "ruby"
-	case ".php":
-		return "php"
-	case ".swift":
-		return "swift"
-	case ".kt":
-		return "kotlin"
-	case ".lua":
-		return "lua"
-	case ".r":
-		return "r"
-	case ".diff", ".patch":
-		return "diff"
-	case ".mod":
-		return "go"
-	default:
-		return "plaintext"
+	if lang, ok := extLanguage[ext]; ok {
+		return lang
 	}
+	return "plaintext"
 }
 
 func (s *Server) fsList(path string) ([]FSEntry, error) {
