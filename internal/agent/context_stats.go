@@ -103,45 +103,7 @@ func (a *Agent) ContextStats(ctx context.Context) TurnContext {
 
 	var snap contextmgr.ContextSnapshot
 	if a.Context != nil {
-		switch {
-		case counts == nil:
-			// No cached counts (fresh session, or a compaction/restore just
-			// cleared them): compute them once for this snapshot, then publish
-			// the result so subsequent probes skip re-tokenization entirely.
-			// The computed counts stay valid for the cloned snapshot even if
-			// the live list changes before the store; the epoch guard keeps
-			// stale counts from ever being published.
-			counts = make([]int, len(msgs))
-			for i := range msgs {
-				counts[i] = contextmgr.ComputeMessageTokens(msgs[i])
-			}
-			snap = a.Context.SnapshotWithCounts(msgs, view, counts)
-			a.statsMu.Lock()
-			if a.countsEpoch == countsEpoch && len(a.tokenCounts) < len(msgs) {
-				a.tokenCounts = append(a.tokenCounts, counts[len(a.tokenCounts):]...)
-			}
-			a.statsMu.Unlock()
-		case len(counts) < len(msgs):
-			// The cache is a valid prefix but messages were appended since it
-			// was last extended (ContextStats can race a burst of appends).
-			// Compute counts for only the missing suffix locally and publish
-			// the extension under the epoch guard.
-			extended := make([]int, len(msgs))
-			copy(extended, counts)
-			for i := len(counts); i < len(msgs); i++ {
-				extended[i] = contextmgr.ComputeMessageTokens(msgs[i])
-			}
-			counts = extended
-			snap = a.Context.SnapshotWithCounts(msgs, view, counts)
-			a.statsMu.Lock()
-			if a.countsEpoch == countsEpoch && len(a.tokenCounts) < len(msgs) {
-				a.tokenCounts = append(a.tokenCounts, counts[len(a.tokenCounts):]...)
-			}
-			a.statsMu.Unlock()
-		default:
-			// Complete cache: the fast path — no tokenization at all.
-			snap = a.Context.SnapshotWithCounts(msgs, view, counts)
-		}
+		snap, counts = a.contextSnapshot(msgs, view, counts, countsEpoch)
 	} else {
 		snap = contextmgr.ContextSnapshot{
 			MessageCount: len(msgs),
@@ -151,22 +113,7 @@ func (a *Agent) ContextStats(ctx context.Context) TurnContext {
 	// If we have an API baseline, use it as the authoritative count for
 	// messages that were in the last request, then add local estimates
 	// for any messages appended since then.
-	if lastUsage != nil && baselinePromptTokens > 0 && baselineMsgCount > 0 && a.Context != nil {
-		baseline := baselinePromptTokens
-		if n := len(msgs); n > baselineMsgCount {
-			// The per-message counts (counts) already cover every message in
-			// msgs after the switch above — sum the post-baseline suffix
-			// instead of re-tokenizing it (a.Context.EstimateTokens would
-			// walk the same messages a second time).
-			for _, c := range counts[baselineMsgCount:] {
-				baseline += c
-			}
-		}
-		snap.Used = baseline
-		if snap.Limit > 0 {
-			snap.Percent = float64(baseline) / float64(snap.Limit)
-		}
-	}
+	applyAPIBaseline(&snap, msgs, counts, lastUsage, baselinePromptTokens, baselineMsgCount, a.Context != nil)
 
 	stats := TurnContext{
 		Snapshot:  snap,
@@ -181,6 +128,80 @@ func (a *Agent) ContextStats(ctx context.Context) TurnContext {
 	}
 
 	return stats
+}
+
+// contextSnapshot computes the context snapshot, tokenizing the full
+// conversation when the counts cache is cold (or extending it for a
+// mid-probe burst of appends) and publishing the result under the epoch
+// guard so subsequent probes skip re-tokenization. It returns the resolved
+// per-message counts too — the caller's API-baseline math needs them.
+func (a *Agent) contextSnapshot(msgs, view []llm.Message, counts []int, countsEpoch uint64) (contextmgr.ContextSnapshot, []int) {
+	if counts == nil {
+		// No cached counts (fresh session, or a compaction/restore just
+		// cleared them): compute them once for this snapshot, then publish
+		// the result so subsequent probes skip re-tokenization entirely.
+		// The computed counts stay valid for the cloned snapshot even if
+		// the live list changes before the store; the epoch guard keeps
+		// stale counts from ever being published.
+		counts = make([]int, len(msgs))
+		for i := range msgs {
+			counts[i] = contextmgr.ComputeMessageTokens(msgs[i])
+		}
+		snap := a.Context.SnapshotWithCounts(msgs, view, counts)
+		a.publishTokenCounts(counts, len(msgs), countsEpoch)
+		return snap, counts
+	}
+	if len(counts) < len(msgs) {
+		// The cache is a valid prefix but messages were appended since it
+		// was last extended (ContextStats can race a burst of appends).
+		// Compute counts for only the missing suffix locally and publish
+		// the extension under the epoch guard.
+		extended := make([]int, len(msgs))
+		copy(extended, counts)
+		for i := len(counts); i < len(msgs); i++ {
+			extended[i] = contextmgr.ComputeMessageTokens(msgs[i])
+		}
+		snap := a.Context.SnapshotWithCounts(msgs, view, extended)
+		a.publishTokenCounts(extended, len(msgs), countsEpoch)
+		return snap, extended
+	}
+	// Complete cache: the fast path — no tokenization at all.
+	return a.Context.SnapshotWithCounts(msgs, view, counts), counts
+}
+
+// publishTokenCounts backfills the in-memory token-count cache so the next
+// save or context probe reuses freshly computed counts. The epoch guard
+// drops the result if the message list changed underneath us.
+func (a *Agent) publishTokenCounts(counts []int, msgCount int, countsEpoch uint64) {
+	a.statsMu.Lock()
+	if a.countsEpoch == countsEpoch && len(a.tokenCounts) < msgCount {
+		a.tokenCounts = append(a.tokenCounts, counts[len(a.tokenCounts):]...)
+	}
+	a.statsMu.Unlock()
+}
+
+// applyAPIBaseline uses the last request's exact prompt_tokens as the
+// authoritative count for the messages that were in that request, adding
+// local estimates for anything appended since. hasContext gates the same way
+// the original inline check did (no context manager, no baseline).
+func applyAPIBaseline(snap *contextmgr.ContextSnapshot, msgs []llm.Message, counts []int, lastUsage *llm.Usage, baselinePromptTokens, baselineMsgCount int, hasContext bool) {
+	if !hasContext || lastUsage == nil || baselinePromptTokens <= 0 || baselineMsgCount <= 0 {
+		return
+	}
+	baseline := baselinePromptTokens
+	if n := len(msgs); n > baselineMsgCount {
+		// The per-message counts (counts) already cover every message in
+		// msgs after the switch above — sum the post-baseline suffix
+		// instead of re-tokenizing it (a.Context.EstimateTokens would
+		// walk the same messages a second time).
+		for _, c := range counts[baselineMsgCount:] {
+			baseline += c
+		}
+	}
+	snap.Used = baseline
+	if snap.Limit > 0 {
+		snap.Percent = float64(baseline) / float64(snap.Limit)
+	}
 }
 
 // HandleContextCommand processes /context.
