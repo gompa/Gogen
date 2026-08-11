@@ -12,20 +12,16 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
 
 	"gogen/internal/agent"
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/debuglog"
 	"gogen/internal/llm"
-	"gogen/internal/mcp"
 	"gogen/internal/profiling"
 	"gogen/internal/projectfile"
-	"gogen/internal/server"
 	"gogen/internal/session"
 	"gogen/internal/treesitter"
-	"gogen/internal/tui"
 )
 
 type cliFlags struct {
@@ -164,128 +160,15 @@ func main() {
 	// does not block on the ~2.6 MB init overhead.
 	contextmgr.WarmTokenizer()
 
-	provider := llm.NewOpenAIProvider(cfg.OpenAIKey, cfg.OpenAIModel, cfg.OpenAIURL, cfg.WorkingDir)
-
-	// Derive a stable prompt-cache key from the working directory so
-	// provider-side prefix caches survive sequential requests.
-	provider.SetPromptCacheKey(llm.ProjectPromptCacheKey(cfg.WorkingDir))
-	provider.SetPreserveReasoningMode(cfg.PreserveReasoning)
-
-	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{
-		ContextLimit:              cfg.ContextLimit,
-		CompactThreshold:          cfg.CompactThreshold,
-		CompactKeepRecentMessages: cfg.CompactKeepRecentMessages,
-		MaxToolResultBytes:        cfg.MaxToolResultBytes,
-		CompactReserveTokens:      cfg.CompactReserveTokens,
-	})
-
-	exec := agent.NewExecutorWithGuard(cfg.WorkingDir, agent.NewCommandGuard(cfg.CommandSafetyMode, agent.ParseAllowlist(cfg.CommandAllowlist)))
-	exec.RequireDeleteApproval = !strings.EqualFold(cfg.DeleteApproval, "off")
-	exec.Sandbox = cfg.CommandSandbox
-	if cfg.CommandTimeoutSecs > 0 {
-		exec.CommandTimeout = time.Duration(cfg.CommandTimeoutSecs) * time.Second
-	}
-	if isGlobalMode {
-		// In global mode, relax the path boundary to the user's home directory.
-		exec.PathBoundary = projectfile.HomeDir()
-	}
-	a := agent.NewAgent(provider, exec, ctxMgr)
+	a, restoredModel := newAgent(cfg, isGlobalMode)
 	// Background jobs (execute_command background=true) are owned by the
 	// session and killed when it closes; this defer covers the TUI, CLI, and
 	// web default-session agents at process exit (web session agents are
 	// closed by ShutdownSessions). Idempotent.
 	defer a.Close()
-	a.GlobalMode = isGlobalMode
-	a.SetProjectContext(cfg.ProjectFilePath, cfg.ProjectGuidelines, cfg.TestCommand, cfg.LintCommand)
-	a.TodoManager = agent.NewTodoManager(cfg.WorkingDir)
-	a.PinManager = agent.NewPinManager()
-	a.DebugCompareMessages = cfg.DebugCompareMessages
-	if cfg.DebugCompareMessages && !agent.ViewDriftCompiledIn() {
-		fmt.Fprintf(os.Stderr, "GOGEN_DEBUG_COMPARE_MESSAGES requires a debug build (-tags debug); ignoring\n")
-		a.DebugCompareMessages = false
-	}
 
-	sessionEnabled := !strings.EqualFold(os.Getenv("GOGEN_SESSION_PERSIST"), "off")
-	sessionOpts := session.StoreOptions{
-		MaxCount:   cfg.SessionMaxCount,
-		MaxAgeDays: cfg.SessionMaxAgeDays,
-	}
-	store := session.NewStoreWithOptions(sessionEnabled, sessionOpts)
-	if isGlobalMode {
-		// Use global session dir ~/.local/share/gogen/sessions/
-		store.SetGlobalDir(projectfile.GlobalSessionDir())
-	}
-	a.SessionStore = store
-	a.SessionID = session.NewID()
-	// Local-only restore: avoid blocking startup on provider ListModels.
-	var restoredModel string
-	if sessionEnabled {
-		if latest, err := store.LatestID(cfg.WorkingDir); err == nil && latest != "" {
-			if snap, err := store.LoadInWorkingDir(cfg.WorkingDir, latest); err == nil {
-				a.RestoreSession(snap, latest)
-				restoredModel = snap.Model
-				fmt.Fprintf(os.Stderr, "Session %s (%d msgs)\n", latest, len(a.Messages))
-			}
-		}
-	}
-	// One-time migration: adopt project-global todos.json into the current
-	// session when it has no todos yet, then rename the legacy file.
-	if a.ImportLegacyTodos() {
-		fmt.Fprintf(os.Stderr, "Migrated legacy todos into session %s\n", a.SessionID)
-	}
-	if name := provider.ModelName(); name != "" {
-		fmt.Fprintf(os.Stderr, "Model: %s\n", name)
-	} else {
-		fmt.Fprintf(os.Stderr, "No model selected; use /models to choose\n")
-	}
-
-	var mcpMgr *mcp.Manager
-	mcpDone := make(chan struct{})
-	initMCP := func() {
-		defer close(mcpDone)
-		servers := mcp.ValidServers(cfg.MCPServers)
-		if !cfg.MCPEnabled() {
-			if len(cfg.MCPServers) > 0 {
-				fmt.Fprintf(os.Stderr, "MCP servers configured but mcp is off; set mcp: on or GOGEN_MCP=on to enable\n")
-			}
-			return
-		}
-		if len(servers) == 0 {
-			// mcp: on with no usable servers — do not start a manager.
-			if len(cfg.MCPServers) > 0 {
-				fmt.Fprintf(os.Stderr, "MCP enabled but no valid mcp_servers entries (need name + command)\n")
-			}
-			return
-		}
-		var mcpErr error
-		mcpMgr, mcpErr = mcp.NewManager(servers)
-		if mcpErr != nil {
-			fmt.Fprintf(os.Stderr, "MCP init error: %v\n", mcpErr)
-		} else if reg := mcpMgr.Registry(); reg != nil {
-			a.SetMCPRegistry(reg)
-			fmt.Fprintf(os.Stderr, "MCP tools: %d\n", len(reg.ToolNames()))
-		}
-	}
-	defer func() {
-		select {
-		case <-mcpDone:
-		case <-time.After(3 * time.Second):
-			log.Printf("mcp shutdown: timed out waiting for init")
-		}
-		if mcpMgr == nil {
-			return
-		}
-		done := make(chan struct{})
-		go func() {
-			_ = mcpMgr.Close()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			log.Printf("mcp shutdown: timed out closing manager")
-		}
-	}()
+	mcpH := startMCP(a, cfg)
+	defer closeMCP(mcpH)
 
 	// Inherited SIG_IGN sticks across Notify unless cleared first.
 	signal.Reset(syscall.SIGINT, syscall.SIGTERM)
@@ -294,87 +177,18 @@ func main() {
 	defer a.FlushPending()
 
 	if opts.prompt != "" {
-		go initMCP()
 		go a.ValidateRestoredModel(context.Background(), restoredModel)
 		runSinglePrompt(ctx, a, opts.prompt, cfg)
 		return
 	}
 
 	if opts.web {
-		// Determine the listen address first so we can check for loopback
-		// and auto-generate a token before creating the server.
-		addr := cfg.WebBind
-		var isLoopback bool
-		if addr == "" {
-			addr = "127.0.0.1:8081"
-			isLoopback = true
-		} else {
-			if !strings.Contains(addr, ":") {
-				addr += ":8081"
-			}
-			isLoopback = server.IsLoopbackBind(addr)
-		}
-
-		// For non-loopback binds, auto-generate a token if none is provided.
-		if !isLoopback && cfg.WebAuthToken == "" {
-			token, err := generateToken()
-			if err != nil {
-				log.Fatalf("failed to generate auth token: %v", err)
-			}
-			cfg.WebAuthToken = token
-		}
-
-		s := server.NewServer(a, cfg)
-		// Flush every registered session agent on shutdown. Both this
-		// sweep and the outer defer use the
-		// non-forcing FlushPending: the sweep must persist unsaved state,
-		// but a forced write on a clean session re-stamps its Updated
-		// timestamp with ~now in registry order, which reshuffled the
-		// saved-session list on every restart and demoted the session that
-		// was active at shutdown. The outer defer still covers the default
-		// session idempotently and the TUI/CLI paths (flushAndQuit already
-		// forces the TUI write; a dirty session is still written here).
-		defer s.ShutdownSessions()
-
-		// Build a user-friendly URL for the startup message.
-		// Replace 0.0.0.0 with 127.0.0.1 so the link works when clicked.
-		displayAddr := addr
-		if strings.HasPrefix(displayAddr, "0.0.0.0:") {
-			displayAddr = "127.0.0.1:" + displayAddr[len("0.0.0.0:"):]
-		}
-		if cfg.WebAuthToken != "" {
-			fmt.Printf("Open http://%s?token=%s\n", displayAddr, cfg.WebAuthToken)
-		} else {
-			fmt.Printf("Open http://%s\n", displayAddr)
-		}
-		// Listen first so the UI can connect immediately. Provider model
-		// validation and context-limit lookup continue in the background.
-		// MCP only starts when there is at least one valid server configured.
-		errCh := make(chan error, 1)
-		go func() {
-			errCh <- s.Start(ctx, addr)
-		}()
-		go func() {
-			a.ValidateRestoredModel(context.Background(), restoredModel)
-			cfg.OpenAIModel = provider.ModelName()
-		}()
-		go initMCP()
-		if err := <-errCh; err != nil {
-			log.Printf("web server error: %v", err)
-		}
+		runWeb(ctx, a, cfg, restoredModel)
 		return
 	}
 
-	// MCP (if configured) + model validation in the background so the TUI
-	// can open immediately.
-	go initMCP()
 	// Default: TUI mode.
-	c := tui.New(a, cfg)
-	// tui.New installs the model-change hook (ForceRender), so a background
-	// ValidateRestoredModel that clears or auto-selects a restored model
-	// re-renders the status bar even while the terminal is idle.
-	go a.ValidateRestoredModel(context.Background(), restoredModel)
-	c.Run(ctx)
+	runTUI(ctx, a, cfg, restoredModel)
 }
 
 // runSinglePrompt processes one user prompt and exits.
