@@ -124,6 +124,18 @@ func (a *streamAccumulator) processChunk(chunk openai.ChatCompletionChunk, onTok
 	delta := choice.Delta
 	a.extras.addFromDelta(delta, onThinking, &a.fullReasoning)
 
+	a.accumulateDeltaContent(delta, onToken)
+	if len(delta.ToolCalls) > 0 {
+		a.accumulateDeltaToolCalls(delta, h)
+	}
+	return a.finishDelta(choice, delta)
+}
+
+// accumulateDeltaContent appends the delta's content and refusal text to the
+// accumulators, forwarding content tokens to the UI callback. Any content
+// after a reasoning-only stop clears the pending-stop state (the two-phase
+// stream continued).
+func (a *streamAccumulator) accumulateDeltaContent(delta openai.ChatCompletionChunkChoiceDelta, onToken func(string)) {
 	if delta.Content != "" {
 		a.fullContent.WriteString(delta.Content)
 		onToken(delta.Content)
@@ -135,22 +147,29 @@ func (a *streamAccumulator) processChunk(chunk openai.ChatCompletionChunk, onTok
 		a.fullRefusal.WriteString(delta.Refusal)
 		a.stopPending = false
 	}
-	if len(delta.ToolCalls) > 0 {
-		a.stopPending = false
-		for _, tc := range delta.ToolCalls {
-			var idx int
-			a.tcAccums, idx = mergeToolCallDelta(tc, a.tcAccums, a.tcIndexMap)
-			tacc := &a.tcAccums[idx]
-			if tc.Function.Name != "" {
-				emitToolCallStart(tacc.Index, tacc, h)
-			}
-			if tc.Function.Arguments != "" {
-				emitToolCallStart(tacc.Index, tacc, h)
-				emitToolCallArgsDelta(tacc.Index, tacc, tc.Function.Arguments, h)
-			}
+}
+
+// accumulateDeltaToolCalls merges the delta's tool-call fragments into the
+// per-call accumulators, emitting start/args-delta UI callbacks.
+func (a *streamAccumulator) accumulateDeltaToolCalls(delta openai.ChatCompletionChunkChoiceDelta, h *StreamHandlers) {
+	a.stopPending = false
+	for _, tc := range delta.ToolCalls {
+		var idx int
+		a.tcAccums, idx = mergeToolCallDelta(tc, a.tcAccums, a.tcIndexMap)
+		tacc := &a.tcAccums[idx]
+		if tc.Function.Name != "" {
+			emitToolCallStart(tacc.Index, tacc, h)
+		}
+		if tc.Function.Arguments != "" {
+			emitToolCallStart(tacc.Index, tacc, h)
+			emitToolCallArgsDelta(tacc.Index, tacc, tc.Function.Arguments, h)
 		}
 	}
+}
 
+// finishDelta resolves the chunk's finish state. Returns true when the
+// stream is done (the caller stops consuming).
+func (a *streamAccumulator) finishDelta(choice openai.ChatCompletionChunkChoice, delta openai.ChatCompletionChunkChoiceDelta) bool {
 	if choice.FinishReason != "" {
 		switch choice.FinishReason {
 		case "tool_calls":

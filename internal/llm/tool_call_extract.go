@@ -379,29 +379,47 @@ func extractJSONObject(src string, start int) (string, int) {
 }
 
 func parseToolCallFromJSONString(jsonStr string) []ToolCall {
-	var result []ToolCall
-
 	// Try to unmarshal as a map
 	var obj map[string]interface{}
 	if err := json.Unmarshal([]byte(jsonStr), &obj); err != nil {
-		return result
+		return nil
 	}
+	name := toolCallNameFromObject(obj)
+	if name == "" {
+		return nil
+	}
+	argsMap, argsStr := normalizeToolCallArguments(obj)
 
-	name := ""
+	// Create ToolCall
+	// Note: Index and ID are assigned by the caller (extractToolCallsFromBlock)
+	// to ensure they are unique within the full result set.
+	toolCall := ToolCall{Name: name, Args: argsMap, ArgsStr: argsStr}
+	return []ToolCall{toolCall}
+}
+
+// toolCallNameFromObject extracts the tool name from a decoded JSON object:
+// the "name" field, or the "function" field when it is a string or an object
+// with its own "name". Returns "" when no usable name is present.
+func toolCallNameFromObject(obj map[string]interface{}) string {
 	if n, ok := obj["name"].(string); ok && n != "" {
-		name = n
-	} else if n, ok := obj["function"].(string); ok && n != "" {
-		name = n
-	} else if n, ok := obj["function"].(map[string]interface{}); ok {
+		return n
+	}
+	if n, ok := obj["function"].(string); ok && n != "" {
+		return n
+	}
+	if n, ok := obj["function"].(map[string]interface{}); ok {
 		if nName, ok := n["name"].(string); ok && nName != "" {
-			name = nName
+			return nName
 		}
 	}
+	return ""
+}
 
-	if name == "" {
-		return result
-	}
-
+// normalizeToolCallArguments resolves the arguments of a decoded tool-call
+// object into the Args map and canonical ArgsStr. The "arguments" field wins;
+// when absent, "input" (or the first non-metadata key) is used, mirroring the
+// recovery shapes models emit.
+func normalizeToolCallArguments(obj map[string]interface{}) (map[string]interface{}, string) {
 	arguments := obj["arguments"]
 	if arguments == nil {
 		// check if 'input' or the whole obj is the args
@@ -452,12 +470,5 @@ func parseToolCallFromJSONString(jsonStr string) []ToolCall {
 			argsMap = map[string]interface{}{"input": arguments}
 		}
 	}
-
-	// Create ToolCall
-	// Note: Index and ID are assigned by the caller (extractToolCallsFromBlock)
-	// to ensure they are unique within the full result set.
-	toolCall := ToolCall{Name: name, Args: argsMap, ArgsStr: argsStr}
-	result = append(result, toolCall)
-
-	return result
+	return argsMap, argsStr
 }
