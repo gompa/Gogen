@@ -558,221 +558,302 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	var target *sessionRuntime
 	for msg := range incoming {
-		// Session-scoped messages WITHOUT an explicit sessionId act on this
-		// connection's own pane, not the server-global default. The default
-		// is only the bootstrap fallback for the initial attach
-		// (pane := registry.first()) and is moved by ANY tab's
-		// session_attach/session_new (setDefault is global), so an id-less
-		// cancel/set_mode/session_detach would silently hit the WRONG
-		// session in a multi-tab setup. The pane is the sender's
-		// current session, which is what an id-less message means. On first
-		// load the pane IS the default, so legacy behavior is unchanged.
-		// (Approval responses are intercepted in the read goroutine above
-		// and keep default routing — an empty id there is a malformed
-		// client, and the goroutine must not touch the shared pane.)
-		target := s.resolveRuntime(msg.SessionID)
-		if msg.SessionID == "" {
-			// The pane pointer can reference a runtime that left the
-			// registry while this connection was open — its session was
-			// deleted by another tab (session_delete detaches every
-			// attached client), or it was cap/orphan-evicted while the
-			// pane was open. Routing an id-less message to the evicted
-			// runtime would silently drop it (the handlers' evicted
-			// guard), so fall back to the default session when one is
-			// live. When the registry is EMPTY (this connection closed
-			// its only pane via session_close / session_delete and has
-			// not re-keyed yet), deliberately do NOT bootstrap: the
-			// latest saved session is the one the user just closed, and
-			// createBootstrapSession would resurrect it as an active
-			// runtime (the sessions payload would show it "active" again
-			// and session_close's eviction would appear undone). The
-			// stale pane stays in place and the handlers' evicted guard
-			// drops the message safely; the client re-keys (session_new /
-			// session_attach) and the next explicit-id message re-aligns
-			// the pane.
-			if pane == nil || pane.evicted.Load() {
-				if d := s.registry.first(); d != nil {
-					pane = d
-				}
-			}
-			target = pane
-		}
-		switch msg.Type {
-		case "session_fork":
-			// The fork source is the pane named by sessionId (edit-resend
-			// forks its own pane's session). Re-align the connection's pane
-			// with the explicit id so a reconnect-stale pointer cannot fork
-			// the wrong session, and drop the request when the source
-			// session is gone entirely (never fork a different session).
-			if msg.SessionID != "" {
-				t := s.resolveRuntime(msg.SessionID)
-				if t == nil {
-					if pane != nil && pane.agent.SessionID == msg.SessionID {
-						t = pane
-					} else {
-						continue
-					}
-				}
-				pane = t
-			}
-			s.handleWSSessionAction(ws, r.Context(), &pane, msg)
-		case "fs_list", "fs_read", "fs_search", "git_status", "git_file_diff":
-			s.handleFSReadMessage(ws, r.Context(), msg)
-		case "fs_write", "fs_replace", "fs_apply_patch":
-			s.handleFSWriteMessage(ws, r.Context(), msg)
-		case "list_sessions":
-			if target == nil {
-				target = s.registry.first()
-			}
-			if target == nil {
-				// Registry empty (every runtime evicted or closed): there is
-				// no session to query for the list. Drop the request like
-				// the other session-scoped handlers — handleWSListSessions
-				// dereferences rt.agent in a goroutine and a nil runtime
-				// would panic the whole process. The client re-requests
-				// after its next session_new / session_attach.
-				break
-			}
-			s.handleWSListSessions(ws, target)
-		case "session_new", "session_resume", "session_delete":
-			// session_new creates for the connection's CURRENT pane, but the
-			// client's edit-resend path scopes it with the acting pane's id
-			// (beginResend: histIdx == 0 sends session_new with sessionId).
-			// Re-align the pane pointer to that id (like session_fork does)
-			// so a reconnect-stale pointer can never replace the WRONG pane's
-			// session. session_resume/session_delete are NOT re-aligned: their
-			// sessionId names the TARGET session, not the acting pane.
-			if msg.Type == "session_new" && msg.SessionID != "" {
-				if t := s.resolveRuntime(msg.SessionID); t != nil {
-					pane = t
-				}
-			}
-			s.handleWSSessionAction(ws, r.Context(), &pane, msg)
-		case "list_models":
-			if target == nil {
-				target = s.registry.first()
-			}
-			if target == nil {
-				// Registry empty: drop the request (handleWSListModels
-				// dereferences rt.agent in a goroutine and a nil runtime
-				// would panic the process). Matches the other
-				// session-scoped handlers.
-				break
-			}
-			s.handleWSListModels(ws, r.Context(), target)
-		case "set_model":
-			if target == nil {
-				break
-			}
-			s.handleWSSetModel(ws, r.Context(), target, msg)
-		case "set_mode":
-			if target == nil {
-				break
-			}
-			s.handleWSSetMode(ws, r.Context(), target, msg)
-		case "set_thinking_level":
-			if target == nil {
-				break
-			}
-			s.handleWSSetThinkingLevel(ws, r.Context(), target, msg)
-		case "config":
-			// The client scopes config with the sessionId of the pane it is
-			// acting on, but the server routes it via the connection's
-			// current pane. After a reconnect the re-attach loop leaves that
-			// pointer on the LAST attached pane, which can differ from the
-			// client's active pane — re-align it with the explicit id so the
-			// working-dir change interrupts the right session's turn.
-			// session_delete/session_detach are NOT re-aligned here: their
-			// sessionId names the TARGET session, not the acting pane.
-			if msg.SessionID != "" && target != nil {
-				pane = target
-			}
-			s.handleWSConfig(ws, r.Context(), &pane, msg)
-		case "cancel":
-			if target == nil {
-				break
-			}
-			// Cancel is the ONLY way to stop a turn, and it works
-			// cross-connection (scoped to the targeted session).
-			target.stream.cancelInFlight()
-		case "session_attach":
-			// Attach a pane: make it the connection's current pane
-			// and resend session_state + history + config + context. Sessions
-			// that are not currently active are loaded from the store, so the
-			// sidebar's "open session" works for saved sessions too.
-			rt2, err := s.ensureSessionRuntime(msg.SessionID)
-			if err != nil {
-				// The session no longer exists (deleted elsewhere / server
-				// restarted with pruning): tell the client to drop the pane.
-				_ = ws.writeJSON(WSMessage{Type: "session_removed", SessionID: msg.SessionID, Content: err.Error()})
-			} else {
-				s.switchPane(ws, &pane, rt2)
-				s.attachSession(ws, r, rt2)
-			}
-		case "session_detach":
-			// The client declared the pane closed; detach without cancelling
-			// any running turn.
-			if target == nil {
-				break
-			}
-			target.detach(ws)
-		case "session_close":
-			// The client pressed ✕ on an open pane: the session is
-			// explicitly closed. Detach, then — when no other socket is
-			// still attached (another tab may be watching the same session
-			// and must not have its turn cancelled or its runtime evicted)
-			// — cancel the in-flight turn, flush, and unregister. The
-			// session stays saved on disk and reopens from the store like
-			// any other saved session (ensureSessionRuntime). If the detach
-			// already orphan-evicted an idle runtime, closeRuntime is a
-			// no-op (evicted flag).
-			if target == nil {
-				break
-			}
-			target.detach(ws)
-			if target.clientCount() == 0 {
-				s.registry.closeRuntime(target)
-			}
-		case "user_term_input":
-			if ut := userTermHolder.get(); ut != nil {
-				_ = ut.Write([]byte(msg.Content))
-			}
-		case "user_term_resize":
-			if ut := userTermHolder.get(); ut != nil && msg.Cols > 0 && msg.Rows > 0 {
-				_ = ut.Resize(uint16(msg.Cols), uint16(msg.Rows))
-			}
-		case "user_term_request":
-			s.spawnUserTerminal(ws, userTermHolder)
-		case "compact":
-			if target == nil {
-				break
-			}
-			s.handleWSCompact(ws, r, target)
-		case "message":
-			// The client scopes every message with the sessionId of the pane
-			// it was typed in, but the server routes messages via the
-			// connection's current pane. After a reconnect the re-attach
-			// loop leaves that pointer on the LAST attached pane, which may
-			// not be the pane the client is using — so route by the explicit
-			// id (the pane pointer remains the fallback for legacy empty
-			// ids). An id that no longer resolves is either an in-flight
-			// eviction of THIS very session (continue on the same runtime)
-			// or a stale pane — in the latter case drop the message rather
-			// than deliver it to a different session.
-			if msg.SessionID != "" {
-				if target == nil {
-					if pane != nil && pane.agent.SessionID == msg.SessionID {
-						target = pane
-					} else {
-						continue
-					}
-				}
-				pane = target
-			}
-			s.handleWSUserMessage(ws, r, &pane, msg)
+		target, pane = s.resolveMessageTarget(msg, pane)
+		if h, ok := wsHandlers[msg.Type]; ok {
+			h(s, ws, r, &pane, target, msg, userTermHolder)
 		}
 	}
+}
+
+// resolveMessageTarget resolves the session runtime a message acts on: the
+// id-resolved runtime for explicit ids, or the connection's pane for id-less
+// messages. Session-scoped messages WITHOUT an explicit sessionId act on this
+// connection's own pane, not the server-global default. The default is only
+// the bootstrap fallback for the initial attach (pane := registry.first())
+// and is moved by ANY tab's session_attach/session_new (setDefault is
+// global), so an id-less cancel/set_mode/session_detach would silently hit
+// the WRONG session in a multi-tab setup. The pane is the sender's current
+// session, which is what an id-less message means. On first load the pane IS
+// the default, so legacy behavior is unchanged. (Approval responses are
+// intercepted in the read goroutine and keep default routing — an empty id
+// there is a malformed client, and the goroutine must not touch the shared
+// pane.) Returns the target and the (possibly re-aligned) pane.
+func (s *Server) resolveMessageTarget(msg WSMessage, pane *sessionRuntime) (*sessionRuntime, *sessionRuntime) {
+	target := s.resolveRuntime(msg.SessionID)
+	if msg.SessionID == "" {
+		// The pane pointer can reference a runtime that left the
+		// registry while this connection was open — its session was
+		// deleted by another tab (session_delete detaches every
+		// attached client), or it was cap/orphan-evicted while the
+		// pane was open. Routing an id-less message to the evicted
+		// runtime would silently drop it (the handlers' evicted
+		// guard), so fall back to the default session when one is
+		// live. When the registry is EMPTY (this connection closed
+		// its only pane via session_close / session_delete and has
+		// not re-keyed yet), deliberately do NOT bootstrap: the
+		// latest saved session is the one the user just closed, and
+		// createBootstrapSession would resurrect it as an active
+		// runtime (the sessions payload would show it "active" again
+		// and session_close's eviction would appear undone). The
+		// stale pane stays in place and the handlers' evicted guard
+		// drops the message safely; the client re-keys (session_new /
+		// session_attach) and the next explicit-id message re-aligns
+		// the pane.
+		if pane == nil || pane.evicted.Load() {
+			if d := s.registry.first(); d != nil {
+				pane = d
+			}
+		}
+		target = pane
+	}
+	return target, pane
+}
+
+// wsMessageHandler dispatches one inbound message type. pane is the
+// connection's current session pointer (handlers may re-align it, e.g. the
+// fork/edit-resend path), target is the id-resolved runtime (nil for stale
+// ids — handlers drop the message), and holder is the connection's
+// interactive user terminal (for user_term_*). A handler's return is
+// equivalent to the old switch's `continue`: the message is consumed.
+type wsMessageHandler func(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder)
+
+// wsHandlers maps inbound message types to their handlers. Unknown types are
+// dropped silently, exactly like the switch's implicit default.
+var wsHandlers = map[string]wsMessageHandler{
+	"session_fork":       wsHandleFork,
+	"fs_list":            wsHandleFSRead,
+	"fs_read":            wsHandleFSRead,
+	"fs_search":          wsHandleFSRead,
+	"git_status":         wsHandleFSRead,
+	"git_file_diff":      wsHandleFSRead,
+	"fs_write":           wsHandleFSWrite,
+	"fs_replace":         wsHandleFSWrite,
+	"fs_apply_patch":     wsHandleFSWrite,
+	"list_sessions":      wsHandleListSessions,
+	"session_new":        wsHandleSessionAction,
+	"session_resume":     wsHandleSessionAction,
+	"session_delete":     wsHandleSessionAction,
+	"list_models":        wsHandleListModels,
+	"set_model":          wsHandleSetModel,
+	"set_mode":           wsHandleSetMode,
+	"set_thinking_level": wsHandleSetThinkingLevel,
+	"config":             wsHandleConfig,
+	"cancel":             wsHandleCancel,
+	"session_attach":     wsHandleAttach,
+	"session_detach":     wsHandleDetach,
+	"session_close":      wsHandleClose,
+	"user_term_input":    wsHandleUserTermInput,
+	"user_term_resize":   wsHandleUserTermResize,
+	"user_term_request":  wsHandleUserTermRequest,
+	"compact":            wsHandleCompact,
+	"message":            wsHandleMessage,
+}
+
+// wsHandleFork handles session_fork: the fork source is the pane named by
+// sessionId (edit-resend forks its own pane's session). Re-align the
+// connection's pane with the explicit id so a reconnect-stale pointer cannot
+// fork the wrong session, and drop the request when the source session is
+// gone entirely (never fork a different session).
+func wsHandleFork(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
+	if msg.SessionID != "" {
+		t := s.resolveRuntime(msg.SessionID)
+		if t == nil {
+			if *pane != nil && (*pane).agent.SessionID == msg.SessionID {
+				t = *pane
+			} else {
+				return
+			}
+		}
+		*pane = t
+	}
+	s.handleWSSessionAction(ws, r.Context(), pane, msg)
+}
+
+func wsHandleFSRead(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
+	s.handleFSReadMessage(ws, r.Context(), msg)
+}
+
+func wsHandleFSWrite(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
+	s.handleFSWriteMessage(ws, r.Context(), msg)
+}
+
+// wsHandleListSessions lists the saved sessions for the targeted session's
+// working directory. An empty registry drops the request (handleWSListSessions
+// dereferences rt.agent in a goroutine and a nil runtime would panic the
+// whole process); the client re-requests after its next session_new /
+// session_attach.
+func wsHandleListSessions(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
+	if target == nil {
+		target = s.registry.first()
+	}
+	if target == nil {
+		return
+	}
+	s.handleWSListSessions(ws, target)
+}
+
+// wsHandleSessionAction handles session_new/session_resume/session_delete.
+// session_new creates for the connection's CURRENT pane, but the client's
+// edit-resend path scopes it with the acting pane's id (beginResend:
+// histIdx == 0 sends session_new with sessionId). Re-align the pane pointer
+// to that id (like session_fork does) so a reconnect-stale pointer can never
+// replace the WRONG pane's session. session_resume/session_delete are NOT
+// re-aligned: their sessionId names the TARGET session, not the acting pane.
+func wsHandleSessionAction(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
+	if msg.Type == "session_new" && msg.SessionID != "" {
+		if t := s.resolveRuntime(msg.SessionID); t != nil {
+			*pane = t
+		}
+	}
+	s.handleWSSessionAction(ws, r.Context(), pane, msg)
+}
+
+// wsHandleListModels lists the provider models for the targeted session. An
+// empty registry drops the request (handleWSListModels dereferences
+// rt.agent in a goroutine and a nil runtime would panic the process).
+func wsHandleListModels(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
+	if target == nil {
+		target = s.registry.first()
+	}
+	if target == nil {
+		return
+	}
+	s.handleWSListModels(ws, r.Context(), target)
+}
+
+func wsHandleSetModel(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
+	if target == nil {
+		return
+	}
+	s.handleWSSetModel(ws, r.Context(), target, msg)
+}
+
+func wsHandleSetMode(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
+	if target == nil {
+		return
+	}
+	s.handleWSSetMode(ws, r.Context(), target, msg)
+}
+
+func wsHandleSetThinkingLevel(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
+	if target == nil {
+		return
+	}
+	s.handleWSSetThinkingLevel(ws, r.Context(), target, msg)
+}
+
+// wsHandleConfig routes config scoped by the pane's sessionId. After a
+// reconnect the re-attach loop leaves the pane pointer on the LAST attached
+// pane, which can differ from the client's active pane — re-align it with
+// the explicit id so the working-dir change interrupts the right session's
+// turn. session_delete/session_detach are NOT re-aligned here: their
+// sessionId names the TARGET session, not the acting pane.
+func wsHandleConfig(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
+	if msg.SessionID != "" && target != nil {
+		*pane = target
+	}
+	s.handleWSConfig(ws, r.Context(), pane, msg)
+}
+
+// wsHandleCancel cancels the targeted session's in-flight turn. Cancel is
+// the ONLY way to stop a turn, and it works cross-connection (scoped to the
+// targeted session).
+func wsHandleCancel(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
+	if target == nil {
+		return
+	}
+	target.stream.cancelInFlight()
+}
+
+// wsHandleAttach makes the session the connection's current pane and resends
+// session_state + history + config + context. Sessions that are not currently
+// active are loaded from the store, so the sidebar's "open session" works for
+// saved sessions too.
+func wsHandleAttach(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
+	rt2, err := s.ensureSessionRuntime(msg.SessionID)
+	if err != nil {
+		// The session no longer exists (deleted elsewhere / server
+		// restarted with pruning): tell the client to drop the pane.
+		_ = ws.writeJSON(WSMessage{Type: "session_removed", SessionID: msg.SessionID, Content: err.Error()})
+	} else {
+		s.switchPane(ws, pane, rt2)
+		s.attachSession(ws, r, rt2)
+	}
+}
+
+// wsHandleDetach handles session_detach: the client declared the pane
+// closed; detach without cancelling any running turn.
+func wsHandleDetach(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
+	if target == nil {
+		return
+	}
+	target.detach(ws)
+}
+
+// wsHandleClose handles session_close: the client pressed ✕ on an open pane;
+// the session is explicitly closed. Detach, then — when no other socket is
+// still attached (another tab may be watching the same session and must not
+// have its turn cancelled or its runtime evicted) — cancel the in-flight
+// turn, flush, and unregister. The session stays saved on disk and reopens
+// from the store like any other saved session (ensureSessionRuntime). If the
+// detach already orphan-evicted an idle runtime, closeRuntime is a no-op
+// (evicted flag).
+func wsHandleClose(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
+	if target == nil {
+		return
+	}
+	target.detach(ws)
+	if target.clientCount() == 0 {
+		s.registry.closeRuntime(target)
+	}
+}
+
+func wsHandleUserTermInput(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
+	if ut := holder.get(); ut != nil {
+		_ = ut.Write([]byte(msg.Content))
+	}
+}
+
+func wsHandleUserTermResize(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
+	if ut := holder.get(); ut != nil && msg.Cols > 0 && msg.Rows > 0 {
+		_ = ut.Resize(uint16(msg.Cols), uint16(msg.Rows))
+	}
+}
+
+func wsHandleUserTermRequest(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
+	s.spawnUserTerminal(ws, holder)
+}
+
+func wsHandleCompact(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
+	if target == nil {
+		return
+	}
+	s.handleWSCompact(ws, r, target)
+}
+
+// wsHandleMessage routes a user message. The client scopes every message
+// with the sessionId of the pane it was typed in, but the server routes
+// messages via the connection's current pane. After a reconnect the
+// re-attach loop leaves that pointer on the LAST attached pane, which may
+// not be the pane the client is using — so route by the explicit id (the
+// pane pointer remains the fallback for legacy empty ids). An id that no
+// longer resolves is either an in-flight eviction of THIS very session
+// (continue on the same runtime) or a stale pane — in the latter case drop
+// the message rather than deliver it to a different session.
+func wsHandleMessage(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
+	if msg.SessionID != "" {
+		if target == nil {
+			if *pane != nil && (*pane).agent.SessionID == msg.SessionID {
+				target = *pane
+			} else {
+				return
+			}
+		}
+		*pane = target
+	}
+	s.handleWSUserMessage(ws, r, pane, msg)
 }
 
 // resolveRuntime returns the session runtime for id. An EMPTY id targets the
