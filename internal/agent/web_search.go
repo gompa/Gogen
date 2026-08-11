@@ -110,21 +110,7 @@ type searchResult struct {
 func parseDDGHTMLResults(body []byte, maxResults int) []searchResult {
 	z := html.NewTokenizer(bytes.NewReader(body))
 	var results []searchResult
-
-	var (
-		inResult    bool
-		resultDepth int // >0 inside result; emit when drops to 0
-		inTitle     bool
-		inSnippet   bool
-		titleTag    string // tag name that opened result__title (e.g. "h2")
-		snippetTag  string // tag name that opened result__snippet (e.g. "a")
-		href        string
-		titleBuf    strings.Builder
-		snipBuf     strings.Builder
-		// cachedClasses avoids re-parsing the class attribute on every
-		// tokenHasClass call for the same HTML token.
-		cachedClasses []string
-	)
+	st := &ddgResultState{}
 
 	for {
 		if len(results) >= maxResults {
@@ -134,78 +120,113 @@ func parseDDGHTMLResults(body []byte, maxResults int) []searchResult {
 		if tt == html.ErrorToken {
 			break
 		}
-		tok := z.Token()
-		cachedClasses = nil // reset per token
-
-		switch tt {
-		case html.StartTagToken, html.SelfClosingTagToken:
-			// <div class="result results_links ...">  → enter result
-			if tok.Data == "div" && tokenHasClassCached(tok, "result", &cachedClasses) && tokenHasClassCached(tok, "results_links", &cachedClasses) {
-				inResult = true
-				resultDepth = 0
-				href = ""
-				titleBuf.Reset()
-				snipBuf.Reset()
-			} else if inResult && tok.Data == "div" {
-				resultDepth++
-			}
-			if inResult {
-				// <a class="result__a" href="...">  → capture link (inside title h2)
-				if tok.Data == "a" && tokenHasClassCached(tok, "result__a", &cachedClasses) {
-					for _, a := range tok.Attr {
-						if a.Key == "href" {
-							href = a.Val
-							break
-						}
-					}
-				}
-				// Any element with class="result__title"  → start collecting title text
-				if tokenHasClassCached(tok, "result__title", &cachedClasses) {
-					inTitle = true
-					titleTag = tok.Data
-				}
-				// Any element with class="result__snippet"  → start collecting snippet text
-				if tokenHasClassCached(tok, "result__snippet", &cachedClasses) {
-					inSnippet = true
-					snippetTag = tok.Data
-				}
-			}
-
-		case html.EndTagToken:
-			// Close title/snippet when the matching element ends.
-			if inTitle && tok.Data == titleTag {
-				inTitle = false
-			}
-			if inSnippet && tok.Data == snippetTag {
-				inSnippet = false
-			}
-			// Track div nesting; emit result when outer wrapper closes.
-			if inResult && tok.Data == "div" {
-				resultDepth--
-				if resultDepth < 0 {
-					inResult = false
-					title := html.UnescapeString(strings.TrimSpace(titleBuf.String()))
-					snippet := html.UnescapeString(strings.TrimSpace(snipBuf.String()))
-					link := cleanDDGLink(href)
-					if title == "" && link == "" {
-						continue
-					}
-					if title == "" {
-						title = link
-					}
-					results = append(results, searchResult{title: title, link: link, snippet: snippet})
-				}
-			}
-
-		case html.TextToken:
-			if inTitle {
-				titleBuf.WriteString(string(tok.Data))
-			} else if inSnippet {
-				snipBuf.WriteString(string(tok.Data))
-			}
+		if r := st.handleToken(tt, z.Token()); r != nil {
+			results = append(results, *r)
 		}
 	}
 	return results
+}
+
+// ddgResultState holds the tokenizer state while parsing one DDG result
+// block. The per-token-type handlers below replace the old inline state
+// machine; the loop in parseDDGHTMLResults just feeds tokens in.
+type ddgResultState struct {
+	inResult    bool
+	resultDepth int // >0 inside result; emit when drops to 0
+	inTitle     bool
+	inSnippet   bool
+	titleTag    string // tag name that opened result__title (e.g. "h2")
+	snippetTag  string // tag name that opened result__snippet (e.g. "a")
+	href        string
+	titleBuf    strings.Builder
+	snipBuf     strings.Builder
+}
+
+// handleToken routes one token to its type handler. Returns a completed
+// result when the result's outer wrapper closes (nil otherwise).
+func (st *ddgResultState) handleToken(tt html.TokenType, tok html.Token) *searchResult {
+	switch tt {
+	case html.StartTagToken, html.SelfClosingTagToken:
+		st.handleStartTag(tok)
+	case html.EndTagToken:
+		return st.handleEndTag(tok)
+	case html.TextToken:
+		st.handleText(tok)
+	}
+	return nil
+}
+
+func (st *ddgResultState) handleStartTag(tok html.Token) {
+	// cachedClasses avoids re-parsing the class attribute on every
+	// tokenHasClass call for the same HTML token.
+	var cachedClasses []string
+	// <div class="result results_links ...">  → enter result
+	if tok.Data == "div" && tokenHasClassCached(tok, "result", &cachedClasses) && tokenHasClassCached(tok, "results_links", &cachedClasses) {
+		st.inResult = true
+		st.resultDepth = 0
+		st.href = ""
+		st.titleBuf.Reset()
+		st.snipBuf.Reset()
+	} else if st.inResult && tok.Data == "div" {
+		st.resultDepth++
+	}
+	if st.inResult {
+		// <a class="result__a" href="...">  → capture link (inside title h2)
+		if tok.Data == "a" && tokenHasClassCached(tok, "result__a", &cachedClasses) {
+			for _, a := range tok.Attr {
+				if a.Key == "href" {
+					st.href = a.Val
+					break
+				}
+			}
+		}
+		// Any element with class="result__title"  → start collecting title text
+		if tokenHasClassCached(tok, "result__title", &cachedClasses) {
+			st.inTitle = true
+			st.titleTag = tok.Data
+		}
+		// Any element with class="result__snippet"  → start collecting snippet text
+		if tokenHasClassCached(tok, "result__snippet", &cachedClasses) {
+			st.inSnippet = true
+			st.snippetTag = tok.Data
+		}
+	}
+}
+
+func (st *ddgResultState) handleEndTag(tok html.Token) *searchResult {
+	// Close title/snippet when the matching element ends.
+	if st.inTitle && tok.Data == st.titleTag {
+		st.inTitle = false
+	}
+	if st.inSnippet && tok.Data == st.snippetTag {
+		st.inSnippet = false
+	}
+	// Track div nesting; emit result when outer wrapper closes.
+	if st.inResult && tok.Data == "div" {
+		st.resultDepth--
+		if st.resultDepth < 0 {
+			st.inResult = false
+			title := html.UnescapeString(strings.TrimSpace(st.titleBuf.String()))
+			snippet := html.UnescapeString(strings.TrimSpace(st.snipBuf.String()))
+			link := cleanDDGLink(st.href)
+			if title == "" && link == "" {
+				return nil
+			}
+			if title == "" {
+				title = link
+			}
+			return &searchResult{title: title, link: link, snippet: snippet}
+		}
+	}
+	return nil
+}
+
+func (st *ddgResultState) handleText(tok html.Token) {
+	if st.inTitle {
+		st.titleBuf.WriteString(string(tok.Data))
+	} else if st.inSnippet {
+		st.snipBuf.WriteString(string(tok.Data))
+	}
 }
 
 // tokenHasClassCached is like tokenHasClass but uses a cached slice of class
