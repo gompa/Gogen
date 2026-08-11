@@ -182,47 +182,50 @@ func (m *Model) handleMouseSelection(msg tea.MouseMsg) bool {
 	}
 
 	vpHeight := m.viewport.Height
-
 	if m.selection != nil && m.selection.Active {
-		switch {
-		case m.selection.Dragging && msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionMotion:
-			x, y := m.mouseToContent(msg.X, msg.Y)
-			if x >= 0 && y >= 0 {
-				m.selection.EndX = x
-				m.selection.EndY = y
-			}
-			return true
-		case m.selection.Dragging && msg.Action == tea.MouseActionRelease:
-			m.selection.Dragging = false
-			m.selectionYOff = -1 // unlock scroll; coords are content-absolute
-			text := m.getSelectedText()
-			if text == "" {
-				m.clearSelection()
-				m.statusMsg = ""
-			} else {
-				m.statusMsg = fmt.Sprintf("Selected %d chars — ctrl+shift+c to copy", utf8.RuneCountInString(text))
-			}
-			return true
-		case msg.Button == tea.MouseButtonRight &&
-			(msg.Action == tea.MouseActionPress || msg.Action == tea.MouseActionRelease):
-			m.clearSelection()
-			m.statusMsg = ""
-			return true
-		case !m.selection.Dragging && msg.Button == tea.MouseButtonLeft &&
-			msg.Action == tea.MouseActionPress && msg.Y >= 0 && msg.Y < vpHeight:
-			// Replace the existing selection; start logic below the if handles it.
-			m.clearSelection()
-		case m.selection.Dragging:
-			// Ignore other events while dragging (e.g. ButtonNone motion that
-			// some terminals emit). Do NOT clear — that was wiping the
-			// selection before the user could copy.
-			return true
-		default:
-			return false
-		}
+		return m.handleActiveSelectionMouse(msg, vpHeight)
 	}
+	return m.startSelectionAt(msg, vpHeight)
+}
 
-	// No active selection (or just cleared): left-press inside viewport starts one.
+// handleActiveSelectionMouse processes mouse events while a selection is
+// active: drag updates the end point, release finalizes it, right-click
+// clears, and left-press restarts. Returns true when the event was consumed.
+func (m *Model) handleActiveSelectionMouse(msg tea.MouseMsg, vpHeight int) bool {
+	switch {
+	case m.selection.Dragging && msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionMotion:
+		x, y := m.mouseToContent(msg.X, msg.Y)
+		if x >= 0 && y >= 0 {
+			m.selection.EndX = x
+			m.selection.EndY = y
+		}
+		return true
+	case m.selection.Dragging && msg.Action == tea.MouseActionRelease:
+		m.finalizeSelection()
+		return true
+	case msg.Button == tea.MouseButtonRight &&
+		(msg.Action == tea.MouseActionPress || msg.Action == tea.MouseActionRelease):
+		m.clearSelection()
+		m.statusMsg = ""
+		return true
+	case !m.selection.Dragging && msg.Button == tea.MouseButtonLeft &&
+		msg.Action == tea.MouseActionPress && msg.Y >= 0 && msg.Y < vpHeight:
+		// Replace the existing selection; start logic below the if handles it.
+		m.clearSelection()
+		return m.startSelectionAt(msg, vpHeight)
+	case m.selection.Dragging:
+		// Ignore other events while dragging (e.g. ButtonNone motion that
+		// some terminals emit). Do NOT clear — that was wiping the
+		// selection before the user could copy.
+		return true
+	default:
+		return false
+	}
+}
+
+// startSelectionAt begins a new selection on a left-press inside the
+// viewport. Returns true when the event was consumed.
+func (m *Model) startSelectionAt(msg tea.MouseMsg, vpHeight int) bool {
 	if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress &&
 		msg.Y >= 0 && msg.Y < vpHeight {
 		x, y := m.mouseToContent(msg.X, msg.Y)
@@ -240,8 +243,21 @@ func (m *Model) handleMouseSelection(msg tea.MouseMsg) bool {
 		}
 		return true
 	}
-
 	return false
+}
+
+// finalizeSelection ends a drag: unlock scrolling, report the selected
+// character count (or clear when nothing was actually selected).
+func (m *Model) finalizeSelection() {
+	m.selection.Dragging = false
+	m.selectionYOff = -1 // unlock scroll; coords are content-absolute
+	text := m.getSelectedText()
+	if text == "" {
+		m.clearSelection()
+		m.statusMsg = ""
+	} else {
+		m.statusMsg = fmt.Sprintf("Selected %d chars — ctrl+shift+c to copy", utf8.RuneCountInString(text))
+	}
 }
 
 // copySelection copies the current selection to the clipboard.
