@@ -1,0 +1,13 @@
+--- a/a.txt
++++ b/a.txt
+@@ -1 +1,2 @@
+ A
++B
+--- a/b.txt
++++ b/b.txt
+@@ -1 +1,2 @@
+ X
++Y
+*** End Patch
+here is trailing garbage the model added
+more garbage lines that must be ignored

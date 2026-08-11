@@ -1,0 +1,10 @@
+diff --git a/old_name.txt b/new_name.txt
+similarity index 90%
+rename from old_name.txt
+rename to new_name.txt
+--- a/old_name.txt
++++ b/new_name.txt
+@@ -1,2 +1,2 @@
+ hello
+-world
++there

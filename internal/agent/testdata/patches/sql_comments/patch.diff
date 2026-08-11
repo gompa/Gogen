@@ -1,0 +1,7 @@
+--- a/schema.sql
++++ b/schema.sql
+@@ -1,4 +1,2 @@
+ -- keep this
+--- drop this
+--- drop that
+ SELECT 1;
