@@ -1331,56 +1331,8 @@ func (s *Server) handleWSCompact(ws *wsConn, r *http.Request, rt *sessionRuntime
 
 func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **sessionRuntime, msg WSMessage) {
 	rt := *pane
-	// Validate user-attached images first: a malformed image frame must be
-	// rejected without cancelling an in-flight turn or taking the turn lock.
-	images, err := validateImageInputs(msg.Images)
-	if err != nil {
-		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: " + err.Error()})
-		return
-	}
-	// Interrupt semantics apply only to the connection that owns the current
-	// turn; a second connection's message must not cancel a turn it does not
-	// own — it gets the busy rejection below.
-	if rt.ownsTurn(ws) {
-		rt.stream.cancelInFlight()
-	}
-
-	// A literal /compact typed into the composer (or sent by older clients)
-	// routes to the real compact command instead of reaching the LLM as a
-	// prompt. /compact is registered TUI-only, but the web banner and command
-	// palette rely on this path.
-	if strings.TrimSpace(msg.Content) == "/compact" {
-		s.handleWSCompact(ws, r, rt)
-		return
-	}
-
-	if out, handled := agent.HandleHelpCommand(msg.Content, true, false); handled {
-		_ = ws.writeJSON(WSMessage{Type: "response", Content: out})
-		return
-	}
-
-	if sel, isModels := agent.ParseModelsCommand(msg.Content); isModels && sel == "" {
-		go func(content string) {
-			a := rt.agent
-			out, _, err := a.HandleModelsCommand(r.Context(), content)
-			resp := WSMessage{Type: "response", Content: out}
-			if err != nil {
-				resp.Content = fmt.Sprintf("Error: %v", err)
-				_ = ws.writeJSON(resp)
-				return
-			}
-			if models, listErr := a.ListModels(r.Context()); listErr == nil && len(models) > 1 {
-				resp.Type = "models"
-				resp.Models = s.modelEntries(models)
-			}
-			cfg := agentConfigMsg(r.Context(), rt)
-			resp.Model = cfg.Model
-			resp.ContextLimit = cfg.ContextLimit
-			resp.UsedTokens = cfg.UsedTokens
-			resp.UsedSource = cfg.UsedSource
-			resp.UsedPercent = cfg.UsedPercent
-			_ = ws.writeJSON(resp)
-		}(msg.Content)
+	images, handled := s.preprocessWSUserMessage(ws, r, rt, msg)
+	if handled {
 		return
 	}
 
@@ -1396,27 +1348,7 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 	if sel, isModels := agent.ParseModelsCommand(msg.Content); isModels && sel != "" {
 		_, _ = rt.agent.ListModels(r.Context())
 	}
-	if !rt.tryAcquireTurn(wsTurnAcquireWait) {
-		// Cancel may have timed out while a tool was still exiting; wait once
-		// more. Only re-cancel when this connection owns the turn — a second
-		// connection must not kill a turn it does not own.
-		if rt.ownsTurn(ws) {
-			rt.stream.cancelInFlight()
-		}
-		if !rt.tryAcquireTurn(wsStreamDrainWait) {
-			_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
-			return
-		}
-	}
-
-	// The session may have been evicted (registry cap / delete) after this
-	// connection resolved it (e.g. a stale id-less pane). Starting a turn on
-	// an evicted runtime would be invisible to cancel/prune/shutdown. The
-	// flag is set while the eviction holds turnMu, so the check under the
-	// lock is race-free (see acquireTurnForHandler). Drop silently — the
-	// client already got session_detached and closed the pane.
-	if rt.evicted.Load() {
-		rt.turnMu.Unlock()
+	if !s.acquireTurnForHandler(ws, rt) {
 		return
 	}
 
@@ -1500,6 +1432,98 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 	rt.startTurn(ws, msg.Content, images)
 }
 
+// preprocessWSUserMessage validates user-attached images, applies the
+// interrupt semantics, and routes the commands that never need the turn
+// lock (a literal /compact, /help, and a bare /models list). Returns the
+// validated images (for the turn fall-through) and whether the message was
+// fully handled.
+func (s *Server) preprocessWSUserMessage(ws *wsConn, r *http.Request, rt *sessionRuntime, msg WSMessage) ([]llm.ImageInput, bool) {
+	// Validate user-attached images first: a malformed image frame must be
+	// rejected without cancelling an in-flight turn or taking the turn lock.
+	images, err := validateImageInputs(msg.Images)
+	if err != nil {
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: " + err.Error()})
+		return nil, true
+	}
+	// Interrupt semantics apply only to the connection that owns the current
+	// turn; a second connection's message must not cancel a turn it does not
+	// own — it gets the busy rejection below.
+	if rt.ownsTurn(ws) {
+		rt.stream.cancelInFlight()
+	}
+
+	// A literal /compact typed into the composer (or sent by older clients)
+	// routes to the real compact command instead of reaching the LLM as a
+	// prompt. /compact is registered TUI-only, but the web banner and command
+	// palette rely on this path.
+	if strings.TrimSpace(msg.Content) == "/compact" {
+		s.handleWSCompact(ws, r, rt)
+		return nil, true
+	}
+
+	if out, handled := agent.HandleHelpCommand(msg.Content, true, false); handled {
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: out})
+		return nil, true
+	}
+
+	if sel, isModels := agent.ParseModelsCommand(msg.Content); isModels && sel == "" {
+		go func(content string) {
+			a := rt.agent
+			out, _, err := a.HandleModelsCommand(r.Context(), content)
+			resp := WSMessage{Type: "response", Content: out}
+			if err != nil {
+				resp.Content = fmt.Sprintf("Error: %v", err)
+				_ = ws.writeJSON(resp)
+				return
+			}
+			if models, listErr := a.ListModels(r.Context()); listErr == nil && len(models) > 1 {
+				resp.Type = "models"
+				resp.Models = s.modelEntries(models)
+			}
+			cfg := agentConfigMsg(r.Context(), rt)
+			resp.Model = cfg.Model
+			resp.ContextLimit = cfg.ContextLimit
+			resp.UsedTokens = cfg.UsedTokens
+			resp.UsedSource = cfg.UsedSource
+			resp.UsedPercent = cfg.UsedPercent
+			_ = ws.writeJSON(resp)
+		}(msg.Content)
+		return nil, true
+	}
+	return images, false
+}
+
+// acquireTurnForHandler takes the session turn lock for a message handler,
+// waiting briefly and re-cancelling once when the previous turn is still
+// draining. Returns false when the runtime is busy or was evicted; the
+// caller drops the message. On success the caller owns rt.turnMu.
+func (s *Server) acquireTurnForHandler(ws *wsConn, rt *sessionRuntime) bool {
+	if !rt.tryAcquireTurn(wsTurnAcquireWait) {
+		// Cancel may have timed out while a tool was still exiting; wait once
+		// more. Only re-cancel when this connection owns the turn — a second
+		// connection must not kill a turn it does not own.
+		if rt.ownsTurn(ws) {
+			rt.stream.cancelInFlight()
+		}
+		if !rt.tryAcquireTurn(wsStreamDrainWait) {
+			_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+			return false
+		}
+	}
+
+	// The session may have been evicted (registry cap / delete) after this
+	// connection resolved it (e.g. a stale id-less pane). Starting a turn on
+	// an evicted runtime would be invisible to cancel/prune/shutdown. The
+	// flag is set while the eviction holds turnMu, so the check under the
+	// lock is race-free (see acquireTurnForHandler). Drop silently — the
+	// client already got session_detached and closed the pane.
+	if rt.evicted.Load() {
+		rt.turnMu.Unlock()
+		return false
+	}
+	return true
+}
+
 // startTurn begins a streaming turn owned by the session runtime. The caller
 // (the connection read loop) must already hold rt.turnMu; the goroutine
 // defers the unlock. The turn context derives from context.Background() plus
@@ -1567,159 +1591,7 @@ func (rt *sessionRuntime) startTurn(owner *wsConn, content string, images []llm.
 		termBatches := map[string]*streamutil.TokenBatcher{}
 		termOpened := map[string]struct{}{}
 
-		handlers := &llm.StreamHandlers{
-			OnCompacting: func() {
-				write(WSMessage{Type: "compacting"})
-			},
-			OnStart: func() {
-				// Reset the live-turn buffer for the new turn.
-				rt.liveTurnBegin()
-				// Tell the client the server-side index of the user message
-				// that StreamProcessInput just appended (for edit/resend).
-				// Index goes in Content because WSMessage.Index has omitempty
-				// and the first message is index 0.
-				userIdx := rt.agent.MessageCount() - 1
-				if userIdx >= 0 {
-					write(WSMessage{Type: "user_acked", Content: fmt.Sprintf("%d", userIdx)})
-				}
-				write(WSMessage{Type: "thinking"})
-				if ctx.Err() != nil {
-					return
-				}
-				write(contextMsg(ctx, rt.agent))
-			},
-			OnRoundStart: func() {
-				rt.liveRoundBegin()
-				write(WSMessage{Type: "thinking"})
-				if ctx.Err() != nil {
-					return
-				}
-				write(contextMsg(ctx, rt.agent))
-			},
-			OnStreamOpened: func() {
-				write(WSMessage{Type: "waiting"})
-			},
-			OnStreamActivity: func() {},
-			OnThinkingToken: func(token string) {
-				rt.liveAppendThinking(token)
-				tokens.ThinkToken(token)
-			},
-			OnToken: func(token string) {
-				rt.liveAppendContent(token)
-				tokens.StreamToken(token)
-			},
-			OnStreamEnd: func() {
-				tokens.Flush()
-				rt.liveRoundEnd()
-				write(WSMessage{Type: "stream_end"})
-			},
-			OnReplyModel: func(model string) {
-				// Fired by the agent before each round's OnStreamEnd, so
-				// this frame must arrive before stream_end for the client
-				// to stamp the still-live assistant bubble (intermediate
-				// content+tool rounds included). Flush pending content
-				// tokens first so the client has created the bubble by the
-				// time model_used is processed.
-				if model == "" {
-					return
-				}
-				tokens.Flush()
-				write(WSMessage{Type: "model_used", Model: model})
-			},
-			OnToolCallStart: func(index int, id, name string) {
-				tokens.Flush()
-				rt.liveToolStart(index, id, name)
-				write(WSMessage{
-					Type:       "tool_call_start",
-					Tool:       name,
-					ToolCallID: id,
-					Index:      index,
-				})
-			},
-			OnToolCallArgsDelta: func(index int, id, name, argsDelta string) {
-				tokens.Flush()
-				argsPos := rt.liveToolArgsAppend(index, argsDelta)
-				write(WSMessage{
-					Type:       "tool_call_delta",
-					Tool:       name,
-					ToolCallID: id,
-					Index:      index,
-					ArgsDelta:  argsDelta,
-					ArgsPos:    argsPos,
-				})
-			},
-			OnToolCall: func(tc llm.ToolCall) {
-				tokens.Flush()
-				write(WSMessage{
-					Type:       "tool_call",
-					Tool:       tc.Name,
-					ToolCallID: tc.ID,
-					Index:      tc.Index,
-					Args:       tc.Args,
-				})
-			},
-			OnToolExecute: func(name string) {
-				write(WSMessage{Type: "tool_execute", Tool: name})
-			},
-			OnToolOutput: func(id, name, command, chunk string) {
-				if ctx.Err() != nil {
-					return
-				}
-				termMu.Lock()
-				first := false
-				if _, ok := termOpened[id]; !ok {
-					termOpened[id] = struct{}{}
-					first = true
-				}
-				b := termBatches[id]
-				if b == nil {
-					b = streamutil.NewTokenBatcher(func(_ bool, text string) {
-						write(WSMessage{Type: "term_output", TermID: id, Content: text})
-					}, wsTokenFlushInterval)
-					termBatches[id] = b
-				}
-				termMu.Unlock()
-				if first {
-					write(WSMessage{Type: "term_opened", TermID: id, ToolCallID: id, Tool: name, Content: "$ " + command})
-				}
-				b.StreamToken(chunk)
-			},
-			OnToolResult: func(id, name, result string, success bool) {
-				// Close this tool call's live terminal tab, if one was
-				// opened. Flush first so buffered chunks land before
-				// term_exit (the send queue is FIFO).
-				termMu.Lock()
-				b := termBatches[id]
-				delete(termBatches, id)
-				_, opened := termOpened[id]
-				delete(termOpened, id)
-				termMu.Unlock()
-				if b != nil {
-					b.Flush()
-					b.Close()
-				}
-				if opened {
-					write(WSMessage{Type: "term_exit", TermID: id, ToolCallID: id, Success: success})
-				}
-				truncated := false
-				const maxResult = 128 * 1024
-				origLen := len(result)
-				if origLen > maxResult {
-					// Rune-safe cut: slicing at maxResult could split a UTF-8
-					// rune mid-sequence and render a broken character.
-					result = contextmgr.TruncateRuneSafe(result, maxResult) + fmt.Sprintf("\n… truncated (%d bytes total)", origLen)
-					truncated = true
-				}
-				write(WSMessage{
-					Type:            "tool_result",
-					Tool:            name,
-					ToolCallID:      id,
-					Result:          result,
-					Success:         success,
-					ResultTruncated: truncated,
-				})
-			},
-		}
+		handlers := rt.buildStreamHandlers(ctx, write, tokens, &termMu, termBatches, termOpened)
 
 		_, err := rt.agent.StreamProcessInputWithImages(ctx, content, images, handlers)
 		var persistErr error
@@ -1759,6 +1631,169 @@ func (rt *sessionRuntime) startTurn(owner *wsConn, content string, images []llm.
 			write(ctxMsg)
 		}
 	}(content, images, streamCtx, errCh)
+}
+
+// buildStreamHandlers wires the runtime's live-turn state and the token
+// batcher to the agent's stream callbacks. write fans out to every attached
+// socket with session tagging; the terminal-tab maps are mutex-guarded
+// (accessed from the exec pipe and the stream goroutines).
+func (rt *sessionRuntime) buildStreamHandlers(ctx context.Context, write func(WSMessage), tokens *streamutil.TokenBatcher, termMu *sync.Mutex, termBatches map[string]*streamutil.TokenBatcher, termOpened map[string]struct{}) *llm.StreamHandlers {
+	return &llm.StreamHandlers{
+		OnCompacting: func() {
+			write(WSMessage{Type: "compacting"})
+		},
+		OnStart: func() {
+			// Reset the live-turn buffer for the new turn.
+			rt.liveTurnBegin()
+			// Tell the client the server-side index of the user message
+			// that StreamProcessInput just appended (for edit/resend).
+			// Index goes in Content because WSMessage.Index has omitempty
+			// and the first message is index 0.
+			userIdx := rt.agent.MessageCount() - 1
+			if userIdx >= 0 {
+				write(WSMessage{Type: "user_acked", Content: fmt.Sprintf("%d", userIdx)})
+			}
+			write(WSMessage{Type: "thinking"})
+			if ctx.Err() != nil {
+				return
+			}
+			write(contextMsg(ctx, rt.agent))
+		},
+		OnRoundStart: func() {
+			rt.liveRoundBegin()
+			write(WSMessage{Type: "thinking"})
+			if ctx.Err() != nil {
+				return
+			}
+			write(contextMsg(ctx, rt.agent))
+		},
+		OnStreamOpened: func() {
+			write(WSMessage{Type: "waiting"})
+		},
+		OnStreamActivity: func() {},
+		OnThinkingToken: func(token string) {
+			rt.liveAppendThinking(token)
+			tokens.ThinkToken(token)
+		},
+		OnToken: func(token string) {
+			rt.liveAppendContent(token)
+			tokens.StreamToken(token)
+		},
+		OnStreamEnd: func() {
+			tokens.Flush()
+			rt.liveRoundEnd()
+			write(WSMessage{Type: "stream_end"})
+		},
+		OnReplyModel: func(model string) {
+			// Fired by the agent before each round's OnStreamEnd, so
+			// this frame must arrive before stream_end for the client
+			// to stamp the still-live assistant bubble (intermediate
+			// content+tool rounds included). Flush pending content
+			// tokens first so the client has created the bubble by the
+			// time model_used is processed.
+			if model == "" {
+				return
+			}
+			tokens.Flush()
+			write(WSMessage{Type: "model_used", Model: model})
+		},
+		OnToolCallStart: func(index int, id, name string) {
+			tokens.Flush()
+			rt.liveToolStart(index, id, name)
+			write(WSMessage{
+				Type:       "tool_call_start",
+				Tool:       name,
+				ToolCallID: id,
+				Index:      index,
+			})
+		},
+		OnToolCallArgsDelta: func(index int, id, name, argsDelta string) {
+			tokens.Flush()
+			argsPos := rt.liveToolArgsAppend(index, argsDelta)
+			write(WSMessage{
+				Type:       "tool_call_delta",
+				Tool:       name,
+				ToolCallID: id,
+				Index:      index,
+				ArgsDelta:  argsDelta,
+				ArgsPos:    argsPos,
+			})
+		},
+		OnToolCall: func(tc llm.ToolCall) {
+			tokens.Flush()
+			write(WSMessage{
+				Type:       "tool_call",
+				Tool:       tc.Name,
+				ToolCallID: tc.ID,
+				Index:      tc.Index,
+				Args:       tc.Args,
+			})
+		},
+		OnToolExecute: func(name string) {
+			write(WSMessage{Type: "tool_execute", Tool: name})
+		},
+		OnToolOutput: func(id, name, command, chunk string) {
+			if ctx.Err() != nil {
+				return
+			}
+			termMu.Lock()
+			first := false
+			if _, ok := termOpened[id]; !ok {
+				termOpened[id] = struct{}{}
+				first = true
+			}
+			b := termBatches[id]
+			if b == nil {
+				b = streamutil.NewTokenBatcher(func(_ bool, text string) {
+					write(WSMessage{Type: "term_output", TermID: id, Content: text})
+				}, wsTokenFlushInterval)
+				termBatches[id] = b
+			}
+			termMu.Unlock()
+			if first {
+				write(WSMessage{Type: "term_opened", TermID: id, ToolCallID: id, Tool: name, Content: "$ " + command})
+			}
+			b.StreamToken(chunk)
+		},
+		OnToolResult: func(id, name, result string, success bool) {
+			// Close this tool call's live terminal tab, if one was
+			// opened. Flush first so buffered chunks land before
+			// term_exit (the send queue is FIFO).
+			termMu.Lock()
+			b := termBatches[id]
+			delete(termBatches, id)
+			_, opened := termOpened[id]
+			delete(termOpened, id)
+			termMu.Unlock()
+			if b != nil {
+				b.Flush()
+				b.Close()
+			}
+			if opened {
+				write(WSMessage{Type: "term_exit", TermID: id, ToolCallID: id, Success: success})
+			}
+			write(WSMessage{
+				Type:            "tool_result",
+				Tool:            name,
+				ToolCallID:      id,
+				Result:          truncateToolResult(result),
+				Success:         success,
+				ResultTruncated: len(result) > 128*1024,
+			})
+		},
+	}
+}
+
+// truncateToolResult cuts oversized tool results at a rune boundary so the
+// client never renders a broken UTF-8 character, marking the cut explicitly.
+func truncateToolResult(result string) string {
+	const maxResult = 128 * 1024
+	if len(result) <= maxResult {
+		return result
+	}
+	// Rune-safe cut: slicing at maxResult could split a UTF-8
+	// rune mid-sequence and render a broken character.
+	return contextmgr.TruncateRuneSafe(result, maxResult) + fmt.Sprintf("\n… truncated (%d bytes total)", len(result))
 }
 
 // Start serves the web UI until ctx is cancelled or the listener fails.
