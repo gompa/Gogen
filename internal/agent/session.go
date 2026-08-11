@@ -2,9 +2,14 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"log"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"time"
 
+	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
 )
 
@@ -299,4 +304,351 @@ func (a *Agent) RenameSession(label string) (string, error) {
 	a.setSessionLabelRenamed(label)
 	a.FlushSession()
 	return "Session label set to " + label, nil
+}
+
+// persistSession marks the session dirty and writes to disk only if the
+// minimum interval since the last write has elapsed.  This coalesces
+// rapid-fire saves during multi-tool turns into at most one write per
+// persistMinInterval.  For final boundaries (turn complete, errors,
+// context cancellation) use flushSession instead.
+func (a *Agent) persistSession() {
+	a.sessionDirty.Store(true)
+	if a.SessionStore == nil || a.SessionID == "" {
+		return
+	}
+	// Skip if debounced — no point computing hash or doing I/O.
+	// The debounce read must not race a concurrent doPersist's write of
+	// lastPersistTime, so it runs under persistMu (best-effort timing).
+	a.persistMu.Lock()
+	debounced := !a.lastPersistTime.IsZero() && time.Since(a.lastPersistTime) < persistMinInterval
+	a.persistMu.Unlock()
+	if debounced {
+		return
+	}
+	a.doPersist(false)
+}
+
+// FlushSession forces an immediate disk write regardless of debounce timing.
+// Use at final boundaries: turn complete, errors, context cancellation, and quit.
+// Skips full re-tokenization so Ctrl+C / --web shutdown stays snappy on large
+// sessions; restored counts are reused when still valid.
+func (a *Agent) FlushSession() {
+	a.sessionDirty.Store(true)
+	if a.SessionStore == nil || a.SessionID == "" {
+		return
+	}
+	a.doPersist(true)
+}
+
+// FlushPending writes any unsaved state to disk but, unlike FlushSession,
+// does NOT mark the session dirty — a clean session is left untouched
+// (doPersist's dirty-flag check makes it a no-op). The shutdown sweep uses
+// this instead of FlushSession: forcing a write on every clean session
+// re-stamped each one's Updated timestamp with ~now in sweep order (the
+// focused session first, so it received the OLDEST stamp), which destroyed
+// the recency ordering List/LatestID rely on after a restart — the
+// saved-session list reshuffled and the session active at shutdown was
+// demoted instead of restored as current. Dirty sessions (an unsaved turn,
+// pending metadata change) still write exactly as before, so no state is at
+// risk.
+func (a *Agent) FlushPending() {
+	if a.SessionStore == nil || a.SessionID == "" {
+		return
+	}
+	a.doPersist(true)
+}
+
+// doPersist is the actual write — called by persistSession/flushSession.
+// Callers (persistSession, FlushSession) already validate SessionStore/SessionID;
+// this method only checks the dirty flag.
+//
+// It uses incremental delta saves when only a few messages have been added
+// since the last full snapshot, avoiding full JSON serialization on every
+// 5-second debounce tick.  Importantly, lastSavedMsgCount is NOT advanced on
+// incremental saves, so each delta always contains ALL messages since the last
+// full snapshot — making the delta file self-contained and crash-safe.
+// When skipTokenCounts is true (FlushSession), avoid cl100k re-tokenization.
+func (a *Agent) doPersist(skipTokenCounts bool) {
+	a.persistMu.Lock()
+	defer a.persistMu.Unlock()
+	// Consume the dirty flag up front instead of checking it here and
+	// clearing it at the end. Two flushes can be pending concurrently — the
+	// turn's persistSession (holding turnMu) and the shutdown/delete/eviction
+	// flush paths (no turnMu, e.g. ShutdownSessions after the 2s drain times
+	// out) — and a write that snapshots EARLIER state must not clear the flag
+	// set by a caller whose state it did not include. With Load-then-Store,
+	// the earlier writer's trailing Store(false) wiped the later caller's
+	// mark, so the later (possibly final, pre-exit) doPersist saw
+	// dirty==false and returned without writing — the "quit during a running
+	// turn still loses the last messages" bug. Swapping the flag at the start
+	// (under persistMu) makes the writer consume exactly the mutations
+	// published before it snapshotted; anything marked during the write
+	// stays set and is picked up by the next flush.
+	if !a.sessionDirty.Swap(false) {
+		return
+	}
+	if a.SessionStore == nil || a.SessionID == "" {
+		return
+	}
+	// Extend cached token counts to cover any new messages so the full
+	// snapshot path can reuse them instead of re-tokenizing everything.
+	a.extendTokenCounts()
+
+	// Snapshot the conversation and label under statsMu: web probes read
+	// them without turnMu, so doPersist must not touch the live
+	// fields outside the lock. The clone is deep (ToolCalls included) so
+	// the snapshot cannot race a concurrent in-place stabilization, and it
+	// is safe to tokenize and serialize after releasing the lock.
+	a.statsMu.RLock()
+	msgs := cloneMessagesShallow(a.Messages)
+	label := a.SessionLabel
+	labelRenamed := a.labelRenamed
+	countsEpoch := a.countsEpoch
+	tokenCounts := append([]int(nil), a.tokenCounts...)
+	// Mode/thinking/oneshot are written under statsMu (SetMode,
+	// SetThinkingLevel, RestoreSessionLocal), so read them under the same
+	// lock: doPersist also runs on the shutdown flush path with no turnMu,
+	// and an unlocked read there would race a concurrent SetMode or
+	// SetThinkingLevel from a still-running turn's command handler.
+	mode := a.Mode.String()
+	thinking := string(a.ThinkingLevel)
+	oneshot := a.SessionOneshot
+	workingDir := a.WorkingDir
+	a.statsMu.RUnlock()
+	count := len(msgs)
+	profile := a.ensureProjectProfile()
+	model := a.CurrentModel()
+	curMeta := persistMeta{
+		label:    label,
+		mode:     mode,
+		model:    model,
+		thinking: thinking,
+		oneshot:  oneshot,
+		profile:  profile,
+		todos:    todoSnapshot(a.TodoManager),
+	}
+
+	// Safety: if the message list was truncated since last save (e.g.
+	// compaction, error rollback), force a full snapshot.
+	if a.lastSavedMsgCount > count {
+		a.lastSavedMsgCount = 0
+	}
+
+	// Decide: full snapshot or incremental delta?
+	// Full snapshot on first save, when more than 5 new messages have
+	// arrived, or when it's been >30s since the last full snapshot.
+	// Also when non-message metadata (label, mode, model, thinking level,
+	// oneshot, project profile, todos) changed since the last full snapshot:
+	// incremental deltas do not carry those fields, so a quit before the
+	// next full save would silently drop the change.
+	needsFullSave := a.lastSavedMsgCount == 0 ||
+		count-a.lastSavedMsgCount > 5 ||
+		time.Since(a.lastFullSaveTime) > 30*time.Second ||
+		!reflect.DeepEqual(curMeta, a.lastMeta)
+
+	if needsFullSave {
+		snap := SessionSnapshot{
+			WorkingDir:     workingDir,
+			Model:          model,
+			Mode:           mode,
+			ThinkingLevel:  thinking,
+			Oneshot:        oneshot,
+			Label:          label,
+			LabelRenamed:   labelRenamed,
+			ProjectProfile: profile,
+			Todos:          curMeta.todos,
+			Messages:       msgs,
+			ContextLimit:   a.ContextLimit(),
+		}
+		if len(tokenCounts) == len(msgs) {
+			snap.TokenCounts = tokenCounts
+		} else if a.Context != nil && !skipTokenCounts {
+			snap.TokenCounts = a.Context.TokenCounts(msgs)
+			// Backfill the in-memory cache so the next save or context probe
+			// reuses these counts instead of re-tokenizing. The epoch guard
+			// drops the result if the message list changed underneath us.
+			a.statsMu.Lock()
+			if a.countsEpoch == countsEpoch && len(a.tokenCounts) < len(msgs) {
+				a.tokenCounts = append(a.tokenCounts, snap.TokenCounts[len(a.tokenCounts):]...)
+			}
+			a.statsMu.Unlock()
+		}
+		if err := a.SessionStore.Save(a.SessionID, snap); err != nil {
+			log.Printf("session save failed (id=%s): %v", a.SessionID, err)
+			a.lastPersistErr = err
+			return
+		}
+		a.lastSavedMsgCount = count
+		a.lastFullSaveTime = time.Now()
+		a.lastMeta = curMeta
+	} else {
+		// Incremental: only serialise new messages since the last full save.
+		newMsgs := msgs[a.lastSavedMsgCount:]
+		var newCounts []int
+		if a.Context != nil && !skipTokenCounts {
+			if len(tokenCounts) >= count {
+				// extendTokenCounts ran above, so the in-memory cache already
+				// covers these messages; reuse it instead of re-tokenizing
+				// the same content a second time.
+				newCounts = append([]int(nil), tokenCounts[a.lastSavedMsgCount:count]...)
+			} else {
+				newCounts = make([]int, len(newMsgs))
+				for i := range newMsgs {
+					newCounts[i] = contextmgr.ComputeMessageTokens(newMsgs[i])
+				}
+			}
+		}
+		deltaSnap := SessionSnapshot{
+			WorkingDir:  workingDir,
+			Oneshot:     oneshot,
+			Label:       label,
+			Messages:    newMsgs,
+			TokenCounts: newCounts,
+		}
+		if err := a.SessionStore.AppendMessages(a.SessionID, deltaSnap, count); err != nil {
+			log.Printf("session delta save failed (id=%s): %v", a.SessionID, err)
+			a.lastPersistErr = err
+			return
+		}
+		// Do NOT advance lastSavedMsgCount here.  The delta file is
+		// overwritten on each incremental save and must always contain ALL
+		// messages since the last full snapshot.  Advancing lastSavedMsgCount
+		// would make the next delta save include only the newest messages,
+		// and a crash between increments would permanently lose the earlier
+		// batches.  The full-save thresholds (5 new messages or 30 s) will
+		// trigger a full snapshot soon enough, at which point lastSavedMsgCount
+		// is updated.
+		_ = count // referenced for clarity; not saved until next full snapshot
+	}
+
+	a.lastPersistErr = nil
+	a.lastPersistTime = time.Now()
+}
+
+// resetSaveTracking resets the incremental-save counters so the next
+// doPersist writes a full snapshot. Call after any operation that
+// truncates or replaces a.Messages (compaction, session restore, etc.).
+func (a *Agent) resetSaveTracking() {
+	// Serialize against a concurrent doPersist so the counters cannot change
+	// mid-write: without this a shutdown flush could clone messages, then the
+	// turn's truncate+reset lands, and the flush writes the pre-truncate
+	// state as the final one.
+	a.persistMu.Lock()
+	defer a.persistMu.Unlock()
+	a.lastSavedMsgCount = 0
+	a.lastFullSaveTime = time.Time{}
+}
+
+// appendMessage appends one message to the conversation and, when the token
+// count cache is complete (covers every previous message), extends it in the
+// same critical section so the message list and the counts cache stay
+// consistent for concurrent readers. This is the only way Messages grows
+// during a turn. Thread-safe: ContextStats and SnapshotMessages snapshot
+// Messages + counts under statsMu while the turn goroutine appends. Leaf
+// lock: never acquire turnMu under it.
+func (a *Agent) appendMessage(m llm.Message) {
+	a.statsMu.Lock()
+	a.Messages = append(a.Messages, m)
+	if a.tokenCounts != nil && len(a.tokenCounts) == len(a.Messages)-1 {
+		a.tokenCounts = append(a.tokenCounts,
+			contextmgr.ComputeMessageTokens(m))
+	}
+	a.statsMu.Unlock()
+}
+
+// replaceMessages swaps the conversation wholesale and invalidates the cached
+// token counts (compaction, session restore, fork, reset). Publishing the new
+// slice and clearing the counts in one critical section means a concurrent
+// ContextStats never pairs new messages with stale counts. Leaf lock.
+func (a *Agent) replaceMessages(msgs []llm.Message) {
+	a.statsMu.Lock()
+	a.Messages = msgs
+	a.tokenCounts = nil
+	a.countsEpoch++
+	a.statsMu.Unlock()
+}
+
+// replaceMessagesWithCounts swaps the conversation wholesale and publishes
+// pre-computed per-message token counts in the same critical section. Unlike
+// replaceMessages (which clears the cache), this keeps the fast
+// shouldCompactUsingCounts path valid immediately — the caller computes the
+// counts before publishing, which is cheap for a compaction because the
+// conversation just shrank. Leaf lock.
+func (a *Agent) replaceMessagesWithCounts(msgs []llm.Message, counts []int) {
+	a.statsMu.Lock()
+	a.Messages = msgs
+	a.tokenCounts = counts
+	a.countsEpoch++
+	a.statsMu.Unlock()
+}
+
+// restoreMessages publishes a restored session's messages together with their
+// pre-computed token counts and marks every message as already-stabilized
+// (persisted ArgsStr). One atomic publish so concurrent readers never observe
+// partially-initialized messages. Takes ownership of msgs (no defensive copy).
+// Leaf lock.
+func (a *Agent) restoreMessages(msgs []llm.Message, counts []int) {
+	a.statsMu.Lock()
+	a.Messages = msgs
+	a.tokenCounts = counts
+	a.countsEpoch++
+	for i := range a.Messages {
+		m := &a.Messages[i]
+		m.ArgsStabilized = true
+		// Recompute the ArgsJSONValid memo for restored tool calls: the
+		// persisted ArgsStr is replayed byte-identically (never pinned or
+		// trimmed here), so the flag is set only when ArgsStr is already the
+		// exact trimmed valid wire bytes. A single validation per load beats
+		// re-validating every restored tool call on every request.
+		for j := range m.ToolCalls {
+			tc := &m.ToolCalls[j]
+			s := strings.TrimSpace(tc.ArgsStr)
+			tc.ArgsJSONValid = tc.ArgsStr != "" && tc.ArgsStr == s && json.Valid([]byte(s))
+		}
+	}
+	a.statsMu.Unlock()
+}
+
+// truncateMessages removes the last n messages (rollback paths) and trims the
+// cached token counts to match, keeping the fast SnapshotWithCounts path valid
+// after a rollback. Caller must guarantee n <= len(a.Messages). Leaf lock.
+func (a *Agent) truncateMessages(n int) {
+	a.statsMu.Lock()
+	a.Messages = a.Messages[:len(a.Messages)-n]
+	if a.tokenCounts != nil && len(a.tokenCounts) > len(a.Messages) {
+		a.tokenCounts = a.tokenCounts[:len(a.Messages)]
+	}
+	a.countsEpoch++
+	a.statsMu.Unlock()
+}
+
+// SnapshotMessages returns a copy of the current conversation messages that
+// is safe to read after the lock is released: unstabilized ToolCalls are
+// deep-copied, stabilized ones are shared (see cloneMessagesShallow). Used by the
+// web server for history snapshots without holding the turn lock.
+func (a *Agent) SnapshotMessages() []llm.Message {
+	a.statsMu.RLock()
+	msgs := cloneMessagesShallow(a.Messages)
+	a.statsMu.RUnlock()
+	return msgs
+}
+
+// MessageCount returns the current conversation message count. Thread-safe.
+func (a *Agent) MessageCount() int {
+	a.statsMu.RLock()
+	n := len(a.Messages)
+	a.statsMu.RUnlock()
+	return n
+}
+
+// HistoryEpoch returns a counter bumped whenever the conversation is replaced
+// wholesale (compaction, session restore, rollback, fork). History snapshots
+// stamp it so clients can tell a snapshot that predates a reshape (e.g. a
+// compaction that reset message indexes) from one that is merely older than
+// the transcript they already rendered. Thread-safe.
+func (a *Agent) HistoryEpoch() uint64 {
+	a.statsMu.RLock()
+	e := a.countsEpoch
+	a.statsMu.RUnlock()
+	return e
 }
