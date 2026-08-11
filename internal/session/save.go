@@ -57,69 +57,10 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 	if err := ensureUnderSessionsDir(snap.WorkingDir, path, s.globalDir); err != nil {
 		return err
 	}
-	// Skip persisting a session that has never had content and has no
-	// on-disk state yet: /new panes that are never used are flushed on
-	// server quit (ShutdownSessions flushes every registered runtime), and
-	// writing a 0-message file + index entry for each one would bloat the
-	// saved-session list with empty sessions after every restart (the
-	// sidebar renders a row per index entry; a 0-message row shows no
-	// count — messageCount is omitempty, so zero is absent from the
-	// payload). A session that
-	// WAS saved before and was rolled back to empty must still update its
-	// file — the old content was deliberately dropped — so the skip applies
-	// only when neither the snapshot nor a pending delta exists on disk. A
-	// label is the one exception: it can only be set deliberately
-	// (RenameSession / the session_rename tool), so an empty session that
-	// was explicitly named must be persisted — otherwise the rename is
-	// silently dropped. (Oneshot single-prompt sessions are NOT an
-	// exception: their pre-prompt flush must stay skipped or every `-p`
-	// run would leave an empty session entry behind.)
-	if len(snap.Messages) == 0 && snap.Label == "" {
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			if _, err := os.Stat(s.deltaPath(snap.WorkingDir, id)); os.IsNotExist(err) {
-				return nil
-			}
-		}
+	if s.skipEmptySave(id, snap, path) {
+		return nil
 	}
-	created := time.Now().UTC()
-	// preloadedIdx is the metadata index read during Created recovery
-	// (cache-miss path only); updateIndex reuses it so a full save reads
-	// index.json at most once.
-	var preloadedIdx *sessionIndex
-	if cached, ok := s.createdCache[id]; ok {
-		created = cached
-	} else {
-		// Cache miss (e.g. first save after process restart before Load):
-		// preserve Created instead of resetting it. Prefer the metadata
-		// index — Created is immutable per session id and is written there
-		// on every save, so the common restart case avoids re-reading (and
-		// re-unmarshalling) the potentially large session file. Fall back to
-		// a minimal field-only decode of the file for legacy indexes that
-		// predate the created field (index-loss recovery); the minimal
-		// target skips allocating the previous session's messages just to
-		// recover one timestamp.
-		found := false
-		preloadedIdx = s.readIndex(snap.WorkingDir)
-		if preloadedIdx != nil {
-			for _, e := range preloadedIdx.Entries {
-				if e.ID == id && !e.Created.IsZero() {
-					created = e.Created
-					found = true
-					break
-				}
-			}
-		}
-		if !found {
-			if data, err := os.ReadFile(path); err == nil {
-				var prevMeta struct {
-					Created time.Time `json:"created"`
-				}
-				if err := json.Unmarshal(data, &prevMeta); err == nil && !prevMeta.Created.IsZero() {
-					created = prevMeta.Created
-				}
-			}
-		}
-	}
+	created, preloadedIdx := s.recoverCreated(id, path, snap.WorkingDir)
 	out := file{
 		Version:        version,
 		ID:             id,
@@ -168,6 +109,73 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 		s.prune(snap.WorkingDir, id)
 	}
 	return nil
+}
+
+// skipEmptySave reports whether a session with no content should not be
+// persisted: /new panes that are never used are flushed on server quit
+// (ShutdownSessions flushes every registered runtime), and writing a
+// 0-message file + index entry for each one would bloat the saved-session
+// list with empty sessions after every restart (the sidebar renders a row
+// per index entry; a 0-message row shows no count — messageCount is
+// omitempty, so zero is absent from the payload). A session that WAS saved
+// before and was rolled back to empty must still update its file — the old
+// content was deliberately dropped — so the skip applies only when neither
+// the snapshot nor a pending delta exists on disk. A label is the one
+// exception: it can only be set deliberately (RenameSession / the
+// session_rename tool), so an empty session that was explicitly named must
+// be persisted — otherwise the rename is silently dropped. (Oneshot
+// single-prompt sessions are NOT an exception: their pre-prompt flush must
+// stay skipped or every `-p` run would leave an empty session entry
+// behind.) Caller must hold s.mu.
+func (s *Store) skipEmptySave(id string, snap agent.SessionSnapshot, path string) bool {
+	if len(snap.Messages) == 0 && snap.Label == "" {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			if _, err := os.Stat(s.deltaPath(snap.WorkingDir, id)); os.IsNotExist(err) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// recoverCreated returns the immutable Created timestamp for a session,
+// preserving it across saves: the in-memory createdCache when warm, else
+// the metadata index (Created is written there on every save, so the common
+// restart case avoids re-reading the potentially large session file), else a
+// minimal field-only decode of the session file for legacy indexes that
+// predate the created field (index-loss recovery; the minimal target skips
+// allocating the previous session's messages just to recover one
+// timestamp). The index read during recovery is returned as preloadedIdx so
+// updateIndex can reuse it — a cache-miss full save then reads index.json
+// at most once. Caller must hold s.mu.
+func (s *Store) recoverCreated(id, path, workingDir string) (time.Time, *sessionIndex) {
+	created := time.Now().UTC()
+	var preloadedIdx *sessionIndex
+	if cached, ok := s.createdCache[id]; ok {
+		return cached, nil
+	}
+	found := false
+	preloadedIdx = s.readIndex(workingDir)
+	if preloadedIdx != nil {
+		for _, e := range preloadedIdx.Entries {
+			if e.ID == id && !e.Created.IsZero() {
+				created = e.Created
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		if data, err := os.ReadFile(path); err == nil {
+			var prevMeta struct {
+				Created time.Time `json:"created"`
+			}
+			if err := json.Unmarshal(data, &prevMeta); err == nil && !prevMeta.Created.IsZero() {
+				created = prevMeta.Created
+			}
+		}
+	}
+	return created, preloadedIdx
 }
 
 // TouchSession updates only the session's timestamp metadata without
