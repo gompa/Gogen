@@ -2017,80 +2017,85 @@
                 e.stopPropagation();
                 if (turnActive) return;
                 if (msgDiv.querySelector('.inline-edit-bar')) return;
-
                 const tw = msgDiv.querySelector('.msg-text');
                 if (!tw) return;
-                const raw = msgDiv.dataset.rawContent || '';
-
-                msgDiv.querySelectorAll('.resend-btn, .edit-btn').forEach(b => { b.style.display = 'none'; });
-
-                // Plain text — markdown DOM is not a reliable contenteditable surface.
-                tw.textContent = raw;
-                tw.contentEditable = 'true';
-                tw.classList.add('editing');
-                tw.focus();
-                const range = document.createRange();
-                range.selectNodeContents(tw);
-                range.collapse(false);
-                const sel = window.getSelection();
-                sel.removeAllRanges();
-                sel.addRange(range);
-
-                const bar = document.createElement('div');
-                bar.className = 'inline-edit-bar';
-                const sendBtn2 = document.createElement('button');
-                sendBtn2.className = 'inline-edit-send';
-                sendBtn2.type = 'button';
-                sendBtn2.innerHTML = '▶';
-                sendBtn2.title = 'Send (Enter)';
-                const cancelBtn2 = document.createElement('button');
-                cancelBtn2.className = 'inline-edit-cancel';
-                cancelBtn2.type = 'button';
-                cancelBtn2.innerHTML = '×';
-                cancelBtn2.title = 'Cancel (Esc)';
-                bar.appendChild(sendBtn2);
-                bar.appendChild(cancelBtn2);
-                msgDiv.appendChild(bar);
-
-                function onEditKeydown(ev) {
-                    if (ev.key === 'Escape') {
-                        ev.preventDefault();
-                        finishEdit(true);
-                    } else if (ev.key === 'Enter' && !ev.shiftKey) {
-                        ev.preventDefault();
-                        sendBtn2.click();
-                    }
-                }
-
-                function finishEdit(restore) {
-                    tw.removeEventListener('keydown', onEditKeydown);
-                    tw.contentEditable = 'false';
-                    tw.classList.remove('editing');
-                    if (restore) {
-                        setMessageMarkdown(msgDiv, escapeHtml(msgDiv.dataset.rawContent || ''));
-                    }
-                    bar.remove();
-                    msgDiv.querySelectorAll('.resend-btn, .edit-btn').forEach(b => { b.style.display = ''; });
-                }
-
-                cancelBtn2.addEventListener('click', (ev) => {
-                    ev.stopPropagation();
-                    finishEdit(true);
-                });
-
-                tw.addEventListener('keydown', onEditKeydown);
-
-                sendBtn2.addEventListener('click', (ev) => {
-                    ev.stopPropagation();
-                    const newContent = tw.innerText.replace(/\u00a0/g, ' ').trim();
-                    if (!newContent) return;
-                    finishEdit(false);
-                    const idx = parseInt(msgDiv.dataset.histIdx, 10);
-                    if (Number.isNaN(idx) || idx < 0) return;
-                    beginResend(idx, newContent);
-                });
+                startInlineEdit(msgDiv, tw, msgDiv.dataset.rawContent || '');
             });
             msgDiv.appendChild(editBtn);
+        }
+
+        // Enter inline-edit mode for a user message: replace the rendered
+        // markdown with an editable plain-text surface, add the send/cancel
+        // bar, and wire Enter/Esc (finishEdit restores the markdown when
+        // cancelled).
+        function startInlineEdit(msgDiv, tw, raw) {
+            msgDiv.querySelectorAll('.resend-btn, .edit-btn').forEach(b => { b.style.display = 'none'; });
+
+            // Plain text — markdown DOM is not a reliable contenteditable surface.
+            tw.textContent = raw;
+            tw.contentEditable = 'true';
+            tw.classList.add('editing');
+            tw.focus();
+            const range = document.createRange();
+            range.selectNodeContents(tw);
+            range.collapse(false);
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(range);
+
+            const bar = document.createElement('div');
+            bar.className = 'inline-edit-bar';
+            const sendBtn2 = document.createElement('button');
+            sendBtn2.className = 'inline-edit-send';
+            sendBtn2.type = 'button';
+            sendBtn2.innerHTML = '▶';
+            sendBtn2.title = 'Send (Enter)';
+            const cancelBtn2 = document.createElement('button');
+            cancelBtn2.className = 'inline-edit-cancel';
+            cancelBtn2.type = 'button';
+            cancelBtn2.innerHTML = '×';
+            cancelBtn2.title = 'Cancel (Esc)';
+            bar.appendChild(sendBtn2);
+            bar.appendChild(cancelBtn2);
+            msgDiv.appendChild(bar);
+
+            function onEditKeydown(ev) {
+                if (ev.key === 'Escape') {
+                    ev.preventDefault();
+                    finishEdit(true);
+                } else if (ev.key === 'Enter' && !ev.shiftKey) {
+                    ev.preventDefault();
+                    sendBtn2.click();
+                }
+            }
+
+            function finishEdit(restore) {
+                tw.removeEventListener('keydown', onEditKeydown);
+                tw.contentEditable = 'false';
+                tw.classList.remove('editing');
+                if (restore) {
+                    setMessageMarkdown(msgDiv, escapeHtml(msgDiv.dataset.rawContent || ''));
+                }
+                bar.remove();
+                msgDiv.querySelectorAll('.resend-btn, .edit-btn').forEach(b => { b.style.display = ''; });
+            }
+
+            cancelBtn2.addEventListener('click', (ev) => {
+                ev.stopPropagation();
+                finishEdit(true);
+            });
+
+            tw.addEventListener('keydown', onEditKeydown);
+
+            sendBtn2.addEventListener('click', (ev) => {
+                ev.stopPropagation();
+                const newContent = tw.innerText.replace(/\u00a0/g, ' ').trim();
+                if (!newContent) return;
+                finishEdit(false);
+                const idx = parseInt(msgDiv.dataset.histIdx, 10);
+                if (Number.isNaN(idx) || idx < 0) return;
+                beginResend(idx, newContent);
+            });
         }
 
         function appendMessage(role, text, date, histIdx, images) {
@@ -2497,59 +2502,9 @@
                 card.dataset.streamIndex = String(streamIndex);
             }
 
-            const header = document.createElement('div');
-            header.className = 'tool-call-header';
-
-            const icon = document.createElement('span');
-            icon.className = 'tool-icon';
-
-            const toolName = document.createElement('span');
-            toolName.className = 'tool-name';
-            toolName.textContent = name;
-
-            const toolArgs = document.createElement('span');
-            toolArgs.className = 'tool-args';
-            if (streaming) toolArgs.textContent = '';
-            else toolArgs.appendChild(formatToolArgsFragment(args));
-
-            const toggle = document.createElement('span');
-            toggle.className = 'tool-toggle';
-            toggle.textContent = '▾';
-
-            header.appendChild(icon);
-            header.appendChild(toolName);
-            header.appendChild(toolArgs);
-            header.appendChild(toggle);
-
-            let waiting = null;
-            let argsStream = null;
-            let monacoHost = null;
-
+            const { header, toolArgs, toggle } = buildToolCardHeader(name, args, streaming);
             card.appendChild(header);
-
-            // Always prepare a diff host for patch_file; other streaming tools
-            // keep the raw args stream until finalized.
-            if (streaming && name === 'patch_file') {
-                monacoHost = makeDiffHostElement();
-                card.appendChild(monacoHost);
-            } else if (streaming) {
-                argsStream = document.createElement('div');
-                argsStream.className = 'tool-args-streaming cursor';
-                argsStream.textContent = '(';
-                card.appendChild(argsStream);
-            } else if (name === 'patch_file' && args && typeof args.diff === 'string') {
-                monacoHost = makeDiffHostElement();
-                card.appendChild(monacoHost);
-                waiting = document.createElement('div');
-                waiting.className = 'tool-waiting';
-                waiting.textContent = 'executing...';
-                card.appendChild(waiting);
-            } else {
-                waiting = document.createElement('div');
-                waiting.className = 'tool-waiting';
-                waiting.textContent = 'executing...';
-                card.appendChild(waiting);
-            }
+            const { waiting, argsStream, monacoHost } = buildToolCardBody(card, name, args, streaming);
 
             messagesDiv.appendChild(card);
             smartScroll();
@@ -2640,6 +2595,65 @@
                 setCollapsed: (c) => { toggle.classList.toggle('collapsed', c); },
             };
             return cardInfo;
+        }
+
+        // Build the tool-card header row (icon, name, live args, collapse
+        // toggle). Streaming cards start with an empty args span; finalized
+        // cards render the formatted args fragment.
+        function buildToolCardHeader(name, args, streaming) {
+            const header = document.createElement('div');
+            header.className = 'tool-call-header';
+            const icon = document.createElement('span');
+            icon.className = 'tool-icon';
+            const toolName = document.createElement('span');
+            toolName.className = 'tool-name';
+            toolName.textContent = name;
+            const toolArgs = document.createElement('span');
+            toolArgs.className = 'tool-args';
+            if (streaming) toolArgs.textContent = '';
+            else toolArgs.appendChild(formatToolArgsFragment(args));
+            const toggle = document.createElement('span');
+            toggle.className = 'tool-toggle';
+            toggle.textContent = '▾';
+            header.appendChild(icon);
+            header.appendChild(toolName);
+            header.appendChild(toolArgs);
+            header.appendChild(toggle);
+            return { header, toolArgs, toggle };
+        }
+
+        // Build the card body under the header: a diff host for patch_file
+        // (streaming or finalized with a diff), a raw args stream for other
+        // streaming tools, or the "executing..." waiting line. Returns the
+        // pieces the caller tracks for later updates.
+        function buildToolCardBody(card, name, args, streaming) {
+            let waiting = null;
+            let argsStream = null;
+            let monacoHost = null;
+            // Always prepare a diff host for patch_file; other streaming tools
+            // keep the raw args stream until finalized.
+            if (streaming && name === 'patch_file') {
+                monacoHost = makeDiffHostElement();
+                card.appendChild(monacoHost);
+            } else if (streaming) {
+                argsStream = document.createElement('div');
+                argsStream.className = 'tool-args-streaming cursor';
+                argsStream.textContent = '(';
+                card.appendChild(argsStream);
+            } else if (name === 'patch_file' && args && typeof args.diff === 'string') {
+                monacoHost = makeDiffHostElement();
+                card.appendChild(monacoHost);
+                waiting = document.createElement('div');
+                waiting.className = 'tool-waiting';
+                waiting.textContent = 'executing...';
+                card.appendChild(waiting);
+            } else {
+                waiting = document.createElement('div');
+                waiting.className = 'tool-waiting';
+                waiting.textContent = 'executing...';
+                card.appendChild(waiting);
+            }
+            return { waiting, argsStream, monacoHost };
         }
 
         // Cap for the live-output region on tool cards: mirrors the server's
@@ -4948,138 +4962,144 @@
                 return;
             }
             for (const r of rows) {
-                const pane = r.pane;
-                const entry = r.entry;
-                const s = entry || {
-                    id: pane ? pane.id : '',
-                    label: pane ? pane.label : '',
-                    messageCount: null,
-                    active: true,
-                    updatedAt: '',
-                };
-                const isActivePane = !!pane && pane === act;
-                // A fresh session has an id but no label yet — show the
-                // "New session" placeholder as its title until the first
-                // turn derives a real label. The raw id stays available in
-                // the row tooltip and in dataset.sessionId (delete/attach).
-                const paneTitle = pane ? (pane.label || (entry && entry.label) || '') : '';
-                const label = pane
-                    ? (paneTitle || 'New session…')
-                    : (s.label || s.id || '(unknown)');
-                const row = document.createElement('div');
-                row.className = 'session-row' + (isActivePane ? ' current' : '') + (pane && pane.turnActive ? ' busy' : '');
-                row.dataset.sessionId = pane ? pane.id : (entry ? entry.id : '');
-                row.title = !paneTitle && pane && pane.id ? `${label} (${pane.id})` : label;
-                const content = document.createElement('div');
-                content.className = 'session-row-content';
-                const title = document.createElement('div');
-                title.className = 'session-row-title';
-                title.textContent = label;
-                const meta = document.createElement('div');
-                meta.className = 'session-row-meta';
-                const frags = [];
-                // Every pane state gets a uniform colored-dot indicator: the
-                // dot carries the state color and the label stays muted. The
-                // status indicator is pushed first so it always renders ahead
-                // of the message count and relative time in the meta row.
-                //   active              → green   (this pane is focused)
-                //   responding          → amber   (a turn is running)
-                //   creating…           → gray    (session id not assigned yet)
-                //   open                → blue    (background pane in this tab)
-                //   resume to continue  → violet  (live elsewhere / headless)
-                let stateLabel = '';
-                let stateClass = '';
-                if (pane && pane.turnActive) {
-                    stateLabel = 'responding';
-                    stateClass = 'amber';
-                } else if (pane && !pane.id) {
-                    stateLabel = 'creating…';
-                    stateClass = 'gray';
-                } else if (isActivePane) {
-                    stateLabel = 'active';
-                    stateClass = 'green';
-                } else if (pane && pane.id) {
-                    // Open as a background pane in this tab — clicking the
-                    // row focuses it.
-                    stateLabel = 'open';
-                    stateClass = 'blue';
-                } else if (s.active) {
-                    // Live in-memory runtime elsewhere (another tab, or a
-                    // headless turn running): reopening attaches to it.
-                    stateLabel = 'resume to continue';
-                    stateClass = 'violet';
-                }
-                if (stateLabel) {
-                    const group = document.createElement('span');
-                    group.className = 'session-state';
-                    const dot = document.createElement('span');
-                    dot.className = 'session-state-dot ' + stateClass;
-                    dot.title = stateLabel;
-                    dot.setAttribute('aria-label', stateLabel);
-                    const label = document.createElement('span');
-                    label.className = 'session-state-label';
-                    label.textContent = stateLabel;
-                    group.appendChild(dot);
-                    group.appendChild(label);
-                    frags.push(group);
-                }
-                if (entry && entry.messageCount != null) frags.push(`${entry.messageCount} msgs`);
-                const rel = relativeTime(s.updatedAt);
-                if (rel) {
-                    // Tag the relative time so the 30s tick can refresh it in
-                    // place (session rows are otherwise re-rendered only on
-                    // pane-state changes or new sessions payloads, leaving the
-                    // "3m ago" labels to go stale).
-                    const t = document.createElement('span');
-                    t.className = 'session-row-time';
-                    t.dataset.updated = s.updatedAt || '';
-                    t.textContent = rel;
-                    frags.push(t);
-                }
-                for (let i = 0; i < frags.length; i++) {
-                    if (i > 0) meta.appendChild(document.createTextNode(' · '));
-                    if (typeof frags[i] === 'string') {
-                        meta.appendChild(document.createTextNode(frags[i]));
-                    } else {
-                        meta.appendChild(frags[i]);
-                    }
-                }
-                content.appendChild(title);
-                content.appendChild(meta);
-                content.onclick = () => {
-                    if (pane) {
-                        // Open pane rows focus the pane (no-op when already
-                        // active).
-                        focusPane(pane.key);
-                    } else {
-                        // Saved rows attach the session as a new pane.
-                        openSessionPane(s.id);
-                    }
-                };
-                row.appendChild(content);
-                // Close/delete button (hidden by default, shown on row
-                // hover): an OPEN session's ✕ closes the pane — the session
-                // is detached (it stays saved and its row reappears as a
-                // saved session); a saved session's ✕ deletes it.
-                const closeBtn = document.createElement('button');
-                closeBtn.className = 'session-row-del';
-                closeBtn.textContent = '✕';
-                if (pane) {
-                    closeBtn.title = 'Close session (stays saved)';
-                    closeBtn.onclick = (e) => {
-                        e.stopPropagation();
-                        closePane(pane.key);
-                    };
-                } else {
-                    closeBtn.title = 'Delete this session';
-                    closeBtn.onclick = (e) => {
-                        e.stopPropagation();
-                        deleteSession(s.id, s.label);
-                    };
-                }
-                row.appendChild(closeBtn);
-                sessionListDiv.appendChild(row);
+                sessionListDiv.appendChild(buildSessionRow(r.pane, r.entry, act));
             }
+        }
+
+        // Build one sidebar row for an open pane (pane != null) or a saved
+        // session (pane == null). act is the active pane used to mark the
+        // current row; it is passed in so re-renders never re-derive it
+        // inconsistently with the caller's snapshot.
+        function buildSessionRow(pane, entry, act) {
+            const s = entry || {
+                id: pane ? pane.id : '',
+                label: pane ? pane.label : '',
+                messageCount: null,
+                active: true,
+                updatedAt: '',
+            };
+            const isActivePane = !!pane && pane === act;
+            // A fresh session has an id but no label yet — show the
+            // "New session" placeholder as its title until the first
+            // turn derives a real label. The raw id stays available in
+            // the row tooltip and in dataset.sessionId (delete/attach).
+            const paneTitle = pane ? (pane.label || (entry && entry.label) || '') : '';
+            const label = pane
+                ? (paneTitle || 'New session…')
+                : (s.label || s.id || '(unknown)');
+            const row = document.createElement('div');
+            row.className = 'session-row' + (isActivePane ? ' current' : '') + (pane && pane.turnActive ? ' busy' : '');
+            row.dataset.sessionId = pane ? pane.id : (entry ? entry.id : '');
+            row.title = !paneTitle && pane && pane.id ? `${label} (${pane.id})` : label;
+            const content = document.createElement('div');
+            content.className = 'session-row-content';
+            const title = document.createElement('div');
+            title.className = 'session-row-title';
+            title.textContent = label;
+            const meta = document.createElement('div');
+            meta.className = 'session-row-meta';
+            const frags = [];
+            // Every pane state gets a uniform colored-dot indicator: the
+            // dot carries the state color and the label stays muted. The
+            // status indicator is pushed first so it always renders ahead
+            // of the message count and relative time in the meta row.
+            //   active              → green   (this pane is focused)
+            //   responding          → amber   (a turn is running)
+            //   creating…           → gray    (session id not assigned yet)
+            //   open                → blue    (background pane in this tab)
+            //   resume to continue  → violet  (live elsewhere / headless)
+            let stateLabel = '';
+            let stateClass = '';
+            if (pane && pane.turnActive) {
+                stateLabel = 'responding';
+                stateClass = 'amber';
+            } else if (pane && !pane.id) {
+                stateLabel = 'creating…';
+                stateClass = 'gray';
+            } else if (isActivePane) {
+                stateLabel = 'active';
+                stateClass = 'green';
+            } else if (pane && pane.id) {
+                // Open as a background pane in this tab — clicking the
+                // row focuses it.
+                stateLabel = 'open';
+                stateClass = 'blue';
+            } else if (s.active) {
+                // Live in-memory runtime elsewhere (another tab, or a
+                // headless turn running): reopening attaches to it.
+                stateLabel = 'resume to continue';
+                stateClass = 'violet';
+            }
+            if (stateLabel) {
+                const group = document.createElement('span');
+                group.className = 'session-state';
+                const dot = document.createElement('span');
+                dot.className = 'session-state-dot ' + stateClass;
+                dot.title = stateLabel;
+                dot.setAttribute('aria-label', stateLabel);
+                const label = document.createElement('span');
+                label.className = 'session-state-label';
+                label.textContent = stateLabel;
+                group.appendChild(dot);
+                group.appendChild(label);
+                frags.push(group);
+            }
+            if (entry && entry.messageCount != null) frags.push(`${entry.messageCount} msgs`);
+            const rel = relativeTime(s.updatedAt);
+            if (rel) {
+                // Tag the relative time so the 30s tick can refresh it in
+                // place (session rows are otherwise re-rendered only on
+                // pane-state changes or new sessions payloads, leaving the
+                // "3m ago" labels to go stale).
+                const t = document.createElement('span');
+                t.className = 'session-row-time';
+                t.dataset.updated = s.updatedAt || '';
+                t.textContent = rel;
+                frags.push(t);
+            }
+            for (let i = 0; i < frags.length; i++) {
+                if (i > 0) meta.appendChild(document.createTextNode(' · '));
+                if (typeof frags[i] === 'string') {
+                    meta.appendChild(document.createTextNode(frags[i]));
+                } else {
+                    meta.appendChild(frags[i]);
+                }
+            }
+            content.appendChild(title);
+            content.appendChild(meta);
+            content.onclick = () => {
+                if (pane) {
+                    // Open pane rows focus the pane (no-op when already
+                    // active).
+                    focusPane(pane.key);
+                } else {
+                    // Saved rows attach the session as a new pane.
+                    openSessionPane(s.id);
+                }
+            };
+            row.appendChild(content);
+            // Close/delete button (hidden by default, shown on row
+            // hover): an OPEN session's ✕ closes the pane — the session
+            // is detached (it stays saved and its row reappears as a
+            // saved session); a saved session's ✕ deletes it.
+            const closeBtn = document.createElement('button');
+            closeBtn.className = 'session-row-del';
+            closeBtn.textContent = '✕';
+            if (pane) {
+                closeBtn.title = 'Close session (stays saved)';
+                closeBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    closePane(pane.key);
+                };
+            } else {
+                closeBtn.title = 'Delete this session';
+                closeBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    deleteSession(s.id, s.label);
+                };
+            }
+            row.appendChild(closeBtn);
+            return row;
         }
 
         /**
@@ -5256,62 +5276,7 @@
             lines.push(`_Exported ${new Date().toLocaleString()}_`);
             lines.push('');
             for (const el of messagesDiv.querySelectorAll('.message, .tool-card')) {
-                if (el.classList.contains('system') || el.classList.contains('thinking') || el.classList.contains('thinking-block')) {
-                    continue;
-                }
-                if (el.classList.contains('thought-card')) continue;
-                if (el.classList.contains('tool-card')) {
-                    // Tool call card: name, args, result, and (for patch_file /
-                    // show_diff) the raw diff text from the fallback <pre>.
-                    const nameEl = el.querySelector('.tool-name');
-                    const name = nameEl ? nameEl.textContent.trim() : 'tool';
-                    const statusEl = el.querySelector('.tool-status-bar');
-                    const status = statusEl ? statusEl.textContent.trim() : '';
-                    const argsText = (el.querySelector('.tool-args')?.textContent || '').trim();
-                    let resultText = (el.querySelector('.tool-result-body')?.textContent || '').trim();
-                    // The status bar is a child of the result body; drop its
-                    // label from the text so it is not duplicated.
-                    if (status && resultText.startsWith(status)) {
-                        resultText = resultText.slice(status.length).trim();
-                    }
-                    const copyLabel = el.querySelector('.tool-result-copy')?.textContent || '';
-                    if (copyLabel && resultText.startsWith(copyLabel)) {
-                        resultText = resultText.slice(copyLabel.length).trim();
-                    }
-                    const diffText = (el.querySelector('.monaco-tool-host .diff-fallback')?.textContent || '').trim();
-                    if (!argsText && !resultText && !diffText) continue;
-                    lines.push(`### tool: ${name}${status ? ` — ${status}` : ''}`);
-                    if (argsText) {
-                        lines.push('');
-                        lines.push('```');
-                        lines.push(argsText);
-                        lines.push('```');
-                    }
-                    if (diffText) {
-                        lines.push('');
-                        lines.push('```diff');
-                        lines.push(diffText);
-                        lines.push('```');
-                    }
-                    if (resultText) {
-                        lines.push('');
-                        lines.push(resultText);
-                    }
-                    lines.push('');
-                    continue;
-                }
-                const role = el.classList.contains('user') ? 'user'
-                    : el.classList.contains('assistant') ? 'assistant' : null;
-                if (!role) continue;
-                const raw = messageRawStore.get(el);
-                const body = (raw != null ? raw : el.textContent || '').trim();
-                if (!body) continue;
-                const ts = el.dataset.createdAt ? new Date(el.dataset.createdAt) : null;
-                const stamp = (ts && !Number.isNaN(ts.getTime())) ? ` — ${ts.toLocaleString()}` : '';
-                lines.push(`## ${role}${stamp}`);
-                lines.push('');
-                lines.push(body);
-                lines.push('');
+                appendExportEntry(lines, el);
             }
             const labelSlug = label.toLowerCase().replace(/[^\w.-]+/g, '_').replace(/^_+|_+$/g, '');
             const base = labelSlug ? `${labelSlug}-${sessionId}` : sessionId;
@@ -5322,6 +5287,70 @@
             a.click();
             URL.revokeObjectURL(a.href);
             showToast('Chat exported', 'success');
+        }
+
+        // Append the markdown lines for one chat element (a tool call card or
+        // a user/assistant message) to the export buffer. Returns false when
+        // the element is skipped (system/thinking/thought cards, or an
+        // element with no exportable body).
+        function appendExportEntry(lines, el) {
+            if (el.classList.contains('system') || el.classList.contains('thinking') || el.classList.contains('thinking-block')) {
+                return false;
+            }
+            if (el.classList.contains('thought-card')) return false;
+            if (el.classList.contains('tool-card')) {
+                // Tool call card: name, args, result, and (for patch_file /
+                // show_diff) the raw diff text from the fallback <pre>.
+                const nameEl = el.querySelector('.tool-name');
+                const name = nameEl ? nameEl.textContent.trim() : 'tool';
+                const statusEl = el.querySelector('.tool-status-bar');
+                const status = statusEl ? statusEl.textContent.trim() : '';
+                const argsText = (el.querySelector('.tool-args')?.textContent || '').trim();
+                let resultText = (el.querySelector('.tool-result-body')?.textContent || '').trim();
+                // The status bar is a child of the result body; drop its
+                // label from the text so it is not duplicated.
+                if (status && resultText.startsWith(status)) {
+                    resultText = resultText.slice(status.length).trim();
+                }
+                const copyLabel = el.querySelector('.tool-result-copy')?.textContent || '';
+                if (copyLabel && resultText.startsWith(copyLabel)) {
+                    resultText = resultText.slice(copyLabel.length).trim();
+                }
+                const diffText = (el.querySelector('.monaco-tool-host .diff-fallback')?.textContent || '').trim();
+                if (!argsText && !resultText && !diffText) return false;
+                lines.push(`### tool: ${name}${status ? ` — ${status}` : ''}`);
+                if (argsText) {
+                    lines.push('');
+                    lines.push('```');
+                    lines.push(argsText);
+                    lines.push('```');
+                }
+                if (diffText) {
+                    lines.push('');
+                    lines.push('```diff');
+                    lines.push(diffText);
+                    lines.push('```');
+                }
+                if (resultText) {
+                    lines.push('');
+                    lines.push(resultText);
+                }
+                lines.push('');
+                return true;
+            }
+            const role = el.classList.contains('user') ? 'user'
+                : el.classList.contains('assistant') ? 'assistant' : null;
+            if (!role) return false;
+            const raw = messageRawStore.get(el);
+            const body = (raw != null ? raw : el.textContent || '').trim();
+            if (!body) return false;
+            const ts = el.dataset.createdAt ? new Date(el.dataset.createdAt) : null;
+            const stamp = (ts && !Number.isNaN(ts.getTime())) ? ` — ${ts.toLocaleString()}` : '';
+            lines.push(`## ${role}${stamp}`);
+            lines.push('');
+            lines.push(body);
+            lines.push('');
+            return true;
         }
 
         const PALETTE_COMMANDS = [
