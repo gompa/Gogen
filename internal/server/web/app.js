@@ -116,6 +116,16 @@
             connIndicator.setAttribute('aria-label', label);
         }
 
+        // True when the chat socket is usable; otherwise toasts the standard
+        // "Not connected" error and returns false so callers can bail out.
+        function ensureConnected() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                showToast('Not connected', 'error');
+                return false;
+            }
+            return true;
+        }
+
         // Keep in sync with agent.SlashCommands (Web: true).
         const SLASH_COMMANDS = [
             { name: '/help', description: 'Show available commands' },
@@ -274,6 +284,10 @@
             sendBtn.disabled = true;
             openModal(deleteOverlay);
             deleteOverlay.addEventListener('keydown', deleteApprovalEsc);
+            // Always notify: delete approval requires user action even when
+            // the tab is backgrounded.
+            const paths = (data.paths || []).join(', ');
+            sendNotification('GoGen — Approval needed', `File delete requested: ${paths}`, 'gogen-delete-approval');
         }
 
         // ── Toolbar: model picker popover ──
@@ -296,10 +310,15 @@
             tbModelPopover.classList.remove('open');
         }
 
-        // Click outside popover to close
+        // Click outside a popover to close it (model + mode pickers). The
+        // toggle buttons stopPropagation, so a click on them never reaches
+        // this document-level handler.
         document.addEventListener('click', (e) => {
             if (tbModelPopoverOpen && !tbModelBtn.contains(e.target) && !tbModelPopover.contains(e.target)) {
                 closeModelPopover();
+            }
+            if (tbModePopoverOpen && !tbModePicker.contains(e.target)) {
+                closeModePopover();
             }
         });
 
@@ -318,29 +337,30 @@
             toggleModelPopover();
         });
 
+        // Non-interactive placeholder row for the model list when there is
+        // nothing to show (catalog not loaded yet, or the filter matched
+        // nothing).
+        function appendEmptyModelRow(text) {
+            const empty = document.createElement('div');
+            empty.className = 'tb-model-row';
+            empty.textContent = text;
+            empty.style.color = 'var(--fg-muted)';
+            empty.style.fontSize = '0.82em';
+            empty.style.cursor = 'default';
+            tbModelList.appendChild(empty);
+        }
+
         function renderToolbarModelList(models, current) {
             if (!tbModelList) return;
             tbModelList.innerHTML = '';
             if (!models || models.length === 0) {
-                const empty = document.createElement('div');
-                empty.className = 'tb-model-row';
-                empty.textContent = 'No models loaded';
-                empty.style.color = 'var(--fg-muted)';
-                empty.style.fontSize = '0.82em';
-                empty.style.cursor = 'default';
-                tbModelList.appendChild(empty);
+                appendEmptyModelRow('No models loaded');
                 return;
             }
             const q = modelFilterQuery;
             const filtered = q ? models.filter((m) => m.id.toLowerCase().includes(q)) : models;
             if (filtered.length === 0) {
-                const empty = document.createElement('div');
-                empty.className = 'tb-model-row';
-                empty.textContent = `No models match "${tbModelFilter ? tbModelFilter.value : q}"`;
-                empty.style.color = 'var(--fg-muted)';
-                empty.style.fontSize = '0.82em';
-                empty.style.cursor = 'default';
-                tbModelList.appendChild(empty);
+                appendEmptyModelRow(`No models match "${tbModelFilter ? tbModelFilter.value : q}"`);
                 return;
             }
             for (const m of filtered) {
@@ -432,12 +452,6 @@
             tbModePopover.classList.remove('open');
         }
 
-        document.addEventListener('click', (e) => {
-            if (tbModePopoverOpen && !tbModePicker.contains(e.target)) {
-                closeModePopover();
-            }
-        });
-
         tbModeBtn.addEventListener('click', (e) => {
             e.stopPropagation();
             toggleModePopover();
@@ -452,16 +466,6 @@
                 closeModePopover();
             });
         });
-
-        function updateToolbarMode(mode) {
-            if (!tbModeBtn) return;
-            const label = mode === 'plan' ? 'Plan' : 'Act';
-            tbModeBtn.innerHTML = `${label} <span class="tb-arrow">▾</span>`;
-            // Highlight active option in popover
-            document.querySelectorAll('#tb-mode-list .tb-model-row').forEach((r) => {
-                r.classList.toggle('active', r.dataset.mode === mode);
-            });
-        }
 
         // ── Toolbar: context badge ──
         // The badge DOM is built once and mutated in place. Per-token context
@@ -568,19 +572,13 @@
 
         function updateModeInfo(mode) {
             currentMode = (mode || 'act').toLowerCase();
-            updateToolbarMode(currentMode);
-        }
-
-        function updateGlobalMode(isGlobal) {
-            // The server omits globalMode when false (JSON omitempty), so
-            // absence always means project mode.
-            isGlobalMode = !!isGlobal;
-            if (globalModeBadge) globalModeBadge.classList.toggle('visible', isGlobalMode);
-            // The working directory can only be changed in global mode:
-            // project mode shows a read-only path, global mode shows the
-            // editable control (the server also rejects the change).
-            if (workingDirDisplay) workingDirDisplay.style.display = isGlobalMode ? 'none' : '';
-            if (workingDirConfig) workingDirConfig.style.display = isGlobalMode ? '' : 'none';
+            if (!tbModeBtn) return;
+            const label = currentMode === 'plan' ? 'Plan' : 'Act';
+            tbModeBtn.innerHTML = `${label} <span class="tb-arrow">▾</span>`;
+            // Highlight active option in popover
+            document.querySelectorAll('#tb-mode-list .tb-model-row').forEach((r) => {
+                r.classList.toggle('active', r.dataset.mode === currentMode);
+            });
         }
 
         function formatTokenCount(n, zeroText = '—') {
@@ -611,11 +609,6 @@
             }
         }
 
-        function updateThinkingInfo(level, efforts) {
-            // Update toolbar thinking chips
-            renderThinkingChips(level, efforts);
-        }
-
         function updateModelSelect(models, current) {
             availableModels = Array.isArray(models) ? models : [];
             // The server's `current` is authoritative (empty after
@@ -629,14 +622,23 @@
             // Populate toolbar model list
             renderToolbarModelList(availableModels, modelId);
             // Extract pricing for the active model
-            if (active && active.inputPricePer1M) {
-                currentModelPricing = {
-                    input: active.inputPricePer1M,
-                    output: active.outputPricePer1M || 0,
-                    cached: active.cachedPricePer1M || 0,
-                };
-            }
-            if (!active || !active.inputPricePer1M) { currentModelPricing = null; }
+            currentModelPricing = modelPricing(
+                active && active.inputPricePer1M,
+                active && active.outputPricePer1M,
+                active && active.cachedPricePer1M
+            );
+        }
+
+        // Build the toolbar's per-model pricing snapshot (used for the
+        // context-tooltip cost estimate). Null when the model has no
+        // published input price.
+        function modelPricing(input, output, cached) {
+            if (!input) return null;
+            return {
+                input,
+                output: output || 0,
+                cached: cached || 0,
+            };
         }
 
         // Fetch the model catalog lazily so it never blocks initial connect.
@@ -655,11 +657,6 @@
         // session change.
         let nearCompactDismissed = false;
 
-        function updateNearCompactBanner(nearCompact) {
-            if (!nearCompactBanner) return;
-            nearCompactBanner.hidden = nearCompactDismissed || !nearCompact;
-        }
-
         // True while a compact command is in flight (server-side summarization
         // can take a while); drives the persistent "Compacting context…"
         // indicator and gates duplicate clicks. Cleared when the compact
@@ -667,10 +664,7 @@
         let compacting = false;
 
         function startCompact() {
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
-                showToast('Not connected', 'error');
-                return;
-            }
+            if (!ensureConnected()) return;
             if (compacting) return;
             compacting = true;
             ws.send(JSON.stringify({ type: 'compact', sessionId: activePane().id }));
@@ -693,7 +687,9 @@
             // warnNearCompact drives the banner (early warning); the server
             // always sends it explicitly, false included, so a post-compaction
             // message reliably hides a banner that was previously shown.
-            if (typeof data.warnNearCompact === 'boolean') updateNearCompactBanner(data.warnNearCompact);
+            if (typeof data.warnNearCompact === 'boolean' && nearCompactBanner) {
+                nearCompactBanner.hidden = nearCompactDismissed || !data.warnNearCompact;
+            }
             const used = data.usedTokens || 0;
             const limit = data.contextLimit || 0;
             if (data.usedSource !== 'estimated') {
@@ -730,26 +726,26 @@
                 cfgPane.reasoningEfforts = data.reasoningEfforts || [];
                 cfgPane.modelDescription = data.modelDescription || '';
             }
-            updateThinkingInfo(data.thinkingLevel, data.reasoningEfforts);
+            renderThinkingChips(data.thinkingLevel, data.reasoningEfforts);
             updateModelInfo(data.model, data.modelDescription);
             updateModeInfo(data.mode);
-            updateGlobalMode(data.globalMode);
+            // The server omits globalMode when false (JSON omitempty), so
+            // absence always means project mode.
+            isGlobalMode = !!data.globalMode;
+            if (globalModeBadge) globalModeBadge.classList.toggle('visible', isGlobalMode);
+            // The working directory can only be changed in global mode:
+            // project mode shows a read-only path, global mode shows the
+            // editable control (the server also rejects the change).
+            if (workingDirDisplay) workingDirDisplay.style.display = isGlobalMode ? 'none' : '';
+            if (workingDirConfig) workingDirConfig.style.display = isGlobalMode ? '' : 'none';
             // Sync pricing from server-provided fields (always present on config from cached lookups)
             if (data.inputPricePer1M) {
-                currentModelPricing = {
-                    input: data.inputPricePer1M,
-                    output: data.outputPricePer1M || 0,
-                    cached: data.cachedPricePer1M || 0,
-                };
+                currentModelPricing = modelPricing(data.inputPricePer1M, data.outputPricePer1M, data.cachedPricePer1M);
             } else if (data.model && availableModels.length > 0) {
                 // Fallback: look up from locally cached model list
                 const active = availableModels.find((m) => m.id === data.model);
                 if (active && active.inputPricePer1M) {
-                    currentModelPricing = {
-                        input: active.inputPricePer1M,
-                        output: active.outputPricePer1M || 0,
-                        cached: active.cachedPricePer1M || 0,
-                    };
+                    currentModelPricing = modelPricing(active.inputPricePer1M, active.outputPricePer1M, active.cachedPricePer1M);
                 }
             }
             updateContextInfo(data);
@@ -789,7 +785,12 @@
             setTurnActive(false, { silent: true, noMirror: true });
             setInputProgress(null);
             scrollBottomBtn.classList.remove('visible');
-            maybeShowEmptyState();
+            // Show the empty-state placeholder only while the transcript is
+            // truly empty.
+            if (!messagesDiv.querySelector('.message, .thought-card, .tool-card')
+                && !messagesDiv.querySelector('.empty-state')) {
+                messagesDiv.appendChild(buildEmptyState());
+            }
         }
 
         // ── Empty chat state (fresh session) ──
@@ -802,10 +803,7 @@
         ];
 
         function sendStarterPrompt(text) {
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
-                showToast('Not connected', 'error');
-                return;
-            }
+            if (!ensureConnected()) return;
             inputArea.value = text;
             sendMessage();
         }
@@ -837,13 +835,6 @@
             hint.textContent = 'Type / for commands · Ctrl+K for the command palette';
             wrap.append(emoji, title, sub, prompts, hint);
             return wrap;
-        }
-
-        function maybeShowEmptyState() {
-            if (!messagesDiv) return;
-            if (messagesDiv.querySelector('.message, .thought-card, .tool-card')) return;
-            if (messagesDiv.querySelector('.empty-state')) return;
-            messagesDiv.appendChild(buildEmptyState());
         }
 
         function removeEmptyState() {
@@ -1164,6 +1155,30 @@
             if (!turnActive) toolsStartedThisTurn = false;
         }
 
+        // Apply the per-session toolbar mirrors (mode, thinking level,
+        // model, description, label) from a config/context echo. Used for
+        // both the active pane (connect config handler) and background
+        // panes (handleBackgroundMessage) so pane switches re-render the
+        // correct chips and tooltip.
+        function applyPaneMeta(pane, data) {
+            pane.mode = data.mode || pane.mode;
+            pane.thinkingLevel = data.thinkingLevel || pane.thinkingLevel;
+            pane.reasoningEfforts = data.reasoningEfforts || pane.reasoningEfforts;
+            pane.modelDescription = data.modelDescription || pane.modelDescription;
+            pane.model = data.model || pane.model;
+            if (data.sessionLabel) pane.label = data.sessionLabel;
+        }
+
+        // Release a session this connection no longer has open, but only
+        // when no other pane still holds it: detaching a session a
+        // background pane still shows would orphan that pane's event
+        // stream. No-op when already detached or the socket is down.
+        function sendSessionDetach(oldId) {
+            if (oldId && !findPaneBySession(oldId) && ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'session_detach', sessionId: oldId }));
+            }
+        }
+
         // Apply a session-scoped message to a background pane without touching
         // the DOM: turn/badge state, context data, and config mirrors. The
         // transcript is re-derived from the server when the pane is focused.
@@ -1218,12 +1233,7 @@
                     }
                     break;
                 case 'config':
-                    pane.mode = data.mode || pane.mode;
-                    pane.thinkingLevel = data.thinkingLevel || pane.thinkingLevel;
-                    pane.reasoningEfforts = data.reasoningEfforts || pane.reasoningEfforts;
-                    pane.modelDescription = data.modelDescription || pane.modelDescription;
-                    pane.model = data.model || pane.model;
-                    if (data.sessionLabel) pane.label = data.sessionLabel;
+                    applyPaneMeta(pane, data);
                     // A resend whose reply sequence (response → clear_chat →
                     // history → config) completed while this pane was in the
                     // background: the active pane's config handler never ran,
@@ -1274,9 +1284,7 @@
                         if (!other || other === pane) {
                             const oldId = pane.id;
                             pane.id = data.sessionId;
-                            if (oldId && !findPaneBySession(oldId) && ws && ws.readyState === WebSocket.OPEN) {
-                                ws.send(JSON.stringify({ type: 'session_detach', sessionId: oldId }));
-                            }
+                            sendSessionDetach(oldId);
                         }
                     }
                     break;
@@ -1334,6 +1342,21 @@
             }
         }
 
+        // Create a fresh active pane: the sidebar "New" / /new / session
+        // removal paths all need a new id-less pane adopted by the server's
+        // next session_new reply. `pendingSessionResponse` gates the reply
+        // so the config handler re-keys the pane.
+        function replaceActivePane() {
+            const p = makePane();
+            activePaneKey = p.key;
+            clearChat();
+            loadActivePaneState();
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                pendingSessionResponse = true;
+                ws.send(JSON.stringify({ type: 'session_new' }));
+            }
+        }
+
         // Close a pane: the session is explicitly closed — the server
         // cancels any in-flight turn and unregisters the runtime (the
         // session stays saved server-side) — then remove it from the UI.
@@ -1347,14 +1370,7 @@
             panes.delete(key);
             if (activePaneKey === key) {
                 if (panes.size === 0) {
-                    const p = makePane();
-                    activePaneKey = p.key;
-                    clearChat();
-                    loadActivePaneState();
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        pendingSessionResponse = true;
-                        ws.send(JSON.stringify({ type: 'session_new' }));
-                    }
+                    replaceActivePane();
                 } else {
                     focusPane(panes.keys().next().value);
                 }
@@ -1372,10 +1388,7 @@
         // when not currently active) and the transcript re-derives from the
         // server's attach response.
         function openSessionPane(id) {
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
-                showToast('Not connected', 'error');
-                return;
-            }
+            if (!ensureConnected()) return;
             if (!id) return;
             if (resendAwaitingHistory) {
                 showToast('Resend already in progress', 'info');
@@ -3923,554 +3936,8 @@
                     handleBackgroundMessage(msgPane, data);
                     return;
                 }
-                if (data.type === 'compacting') {
-                    // Auto-compaction inside a normal turn (or the manual
-                    // /compact command): keep a live indicator until the next
-                    // progress event (thinking/stream/tool) or the compact
-                    // response replaces it.
-                    setInputProgress('compacting', 'Compacting context\u2026');
-                } else if (data.type === 'thinking') {
-                    setTurnActive(true);
-                    updateTitle('thinking');
-                    // New model round (OnStart / OnRoundStart): clear per-round
-                    // tool state so reasoning shows again, matching TUI.
-                    toolsStartedThisTurn = false;
-                    streamingToolCards = {};
-                    lastStreamDiv = null; // new round: forget any prior bubble
-                    finalizeThinking();
-                    setInputProgress('thinking', 'Thinking\u2026');
-                } else if (data.type === 'waiting') {
-                    setTurnActive(true);
-                    setInputProgress('thinking', 'Waiting for model\u2026');
-                } else if (data.type === 'thinking_token') {
-                    setTurnActive(true);
-                    appendThinkingToken(data.content || '', data.thinkingPos);
-                } else if (data.type === 'stream') {
-                    setTurnActive(true);
-                    updateTitle('streaming');
-                    setInputProgress('streaming', 'Streaming\u2026');
-                    finalizeThinking();
-                    if (!currentStreamDiv) startStream();
-                    appendStreamToken(data.content, data.contentPos);
-                } else if (data.type === 'stream_end') {
-                    finalizeThinking();
-                    endStream();
-                } else if (data.type === 'model_used') {
-                    // Stamp the last (still-live) assistant bubble with the
-                    // provider-reported model. The server sends this before
-                    // stream_end; history replay attributes older messages.
-                    if (data.model) {
-                        const bubble = currentStreamDiv || lastStreamDiv;
-                        if (bubble) {
-                            bubble.dataset.model = data.model;
-                            applyReplyModelChip(bubble);
-                        }
-                    }
-                } else if (data.type === 'tool_call_start') {
-                    setTurnActive(true);
-                    setInputProgress('tool', 'Running ' + (data.tool || 'tool') + '\u2026');
-                    startStreamingToolCard(data.index, data.tool);
-                } else if (data.type === 'tool_call_delta') {
-                    finalizeThinking();
-                    if (!streamingToolCards[data.index]) {
-                        startStreamingToolCard(data.index, data.tool || 'tool');
-                    } else if (data.tool) {
-                        streamingToolCards[data.index].toolName = data.tool;
-                    }
-                    appendStreamingToolArgs(data.index, data.argsDelta || '', data.argsPos);
-                } else if (data.type === 'tool_call') {
-                    finalizeThinking();
-                    endStream();
-                    toolsStartedThisTurn = true;
-                    finalizeStreamingToolCard(data.index, data.toolCallId, data.tool, data.args || {});
-                } else if (data.type === 'tool_execute') {
-                    // Update waiting text on the matching pending card if present
-                    const name = data.tool || '';
-                    setInputProgress('tool', name ? ('Running ' + name + '\u2026') : 'Running tool\u2026');
-                    for (const id of Object.keys(pendingToolCards)) {
-                        const cardInfo = pendingToolCards[id];
-                        if (cardInfo && cardInfo.waiting && (!name || cardInfo.toolName === name)) {
-                            cardInfo.waiting.textContent = name ? `running ${name}...` : 'executing...';
-                        }
-                    }
-                } else if (data.type === 'tool_result') {
-                    finalizeThinking();
-                    // Account for tool result tokens in the live context estimate.
-                    bumpContextEstimate(data.result);
-                    // Stay busy until turn_end — more rounds may follow.
-                    const cardInfo = pendingToolCards[data.toolCallId];
-                    if (cardInfo) {
-                        updateToolCardWithResult(
-                            cardInfo,
-                            data.result,
-                            // Server serializes Success with omitempty, so a
-                            // failed tool omits the field entirely (undefined).
-                            // Only an explicit true means success.
-                            data.success === true,
-                            data.resultTruncated,
-                            data.tool || cardInfo.toolName
-                        );
-                        delete pendingToolCards[data.toolCallId];
-                    } else {
-                        appendMessage('system', `[${data.tool}] ${data.result}`);
-                    }
-                } else if (data.type === 'term_opened') {
-                    terminalOpen(data.termId, data.tool || '', data.content || '');
-                    // Mirror the command echo into the pending tool card so
-                    // shell output streams into the chat, not just the
-                    // (collapsed-by-default) terminal dock.
-                    const cardInfo = pendingToolCards[data.termId];
-                    if (cardInfo && data.content) {
-                        // Echo the command like the terminal tab does, on its
-                        // own line ("$ ..." then the streaming output).
-                        appendToolCardLiveOutput(cardInfo, data.content + '\n');
-                    }
-                } else if (data.type === 'term_output') {
-                    terminalWrite(data.termId, data.content || '');
-                    const cardInfo = pendingToolCards[data.termId];
-                    if (cardInfo) {
-                        appendToolCardLiveOutput(cardInfo, data.content || '');
-                    }
-                } else if (data.type === 'term_exit') {
-                    // Success is omitted when false, so only an explicit true
-                    // marks the tab as ok; anything else is a failure.
-                    terminalExit(data.termId, data.success === true);
-                    terminalFitSoon();
-                    const cardInfo = pendingToolCards[data.termId];
-                    if (cardInfo && cardInfo.liveOutput) {
-                        cardInfo.liveOutput.classList.add('done');
-                        cardInfo.liveOutput.classList.add(data.success === true ? 'success' : 'error');
-                    }
-                } else if (data.type === 'user_term_opened') {
-                    terminalUserOpened(data.content || 'shell', data.workingDir || '');
-                } else if (data.type === 'user_term_output') {
-                    terminalEnsureUserTab();
-                    terminalWrite(USER_TERM_ID, data.content || '');
-                } else if (data.type === 'user_term_exit') {
-                    terminalUserExited(data.code || 0);
-                } else if (data.type === 'cancelled') {
-                    // Stale cancel from a turn we replaced with resend/send — ignore.
-                    if (suppressTurnEnds > 0) return;
-                    abortInFlightUI(data.content || 'Cancelled.');
-                    setTurnActive(false);
-                    setInputProgress(null);
-                    refreshSidebarSessions();
-                } else if (data.type === 'turn_end') {
-                    // Ignore turn_end from a turn we cancelled to start a resend/send.
-                    // Otherwise it clears pendingSessionResponse / turnActive mid-flow.
-                    if (suppressTurnEnds > 0) {
-                        suppressTurnEnds--;
-                        return;
-                    }
-                    // A turn we deliberately left behind when resuming another
-                    // session: the old session keeps running headless (resume
-                    // does not cancel it), so its turn_end must not clear the
-                    // pending flag or block the resumed session's convergence.
-                    // (Before the reply re-keys the pane, the old session is
-                    // still this pane's id; after the re-key, paneForMessage
-                    // drops the old id entirely.)
-                    const pane = activePane();
-                    if (pane && pane.ignoreTurnEndsFor && data.sessionId === pane.ignoreTurnEndsFor) {
-                        pane.ignoreTurnEndsFor = null;
-                        return;
-                    }
-                    setTurnActive(false);
-                    updateTitle('idle');
-                    setInputProgress(null);
-                    pendingSessionResponse = false;
-                    // A pane attached mid-turn never received the in-flight
-                    // reply (assistant messages are appended only
-                    // when a round completes). Now that the turn is done the
-                    // full history is available — re-attach once so the
-                    // transcript converges.
-                    const tp = pane;
-                    if (tp && tp.needsFreshHistory) {
-                        tp.needsFreshHistory = false;
-                        if (tp.id && ws && ws.readyState === WebSocket.OPEN) {
-                            ws.send(JSON.stringify({ type: 'session_attach', sessionId: tp.id }));
-                        }
-                    }
-                    refreshSidebarSessions();
-                    // The turn just finished: fetch a fresh sessions payload
-                    // instead of re-rendering the cached one, so the sidebar's
-                    // saved-section order and per-row relative times reflect
-                    // the completed turn's new Updated timestamp (the cache is
-                    // only refreshed on explicit list_sessions round-trips).
-                    requestSessionList();
-                } else if (data.type === 'clear_chat') {
-                    clearChat();
-                    // Do NOT re-arm pendingSessionResponse here: the response
-                    // handler already re-keyed the pane to the new session id
-                    // and cleared the flag, so the follow-up history/config
-                    // route by session id without the fallback. Re-arming left
-                    // the flag stuck true until the next turn_end / reconnect,
-                    // which permanently blocked resumeSession()/deleteSession()
-                    // ("Session change already in progress") and made
-                    // paneForMessage route stale messages to the active pane
-                    // (which then wrongly re-keyed it).
-                } else if (data.type === 'user_acked') {
-                    // Server assigned the Messages index for the user turn just started.
-                    // Index is in content so 0 is not dropped by JSON omitempty.
-                    const idx = parseInt(data.content, 10);
-                    const el = messagesDiv.querySelector('.message.user[data-pending-ack="1"]')
-                        || [...messagesDiv.querySelectorAll('.message.user:not([data-hist-idx])')].at(-1);
-                    if (el && Number.isFinite(idx) && idx >= 0) {
-                        delete el.dataset.pendingAck;
-                        el.dataset.histIdx = String(idx);
-                        ensureUserResendActions(el);
-                    }
-                } else if (data.type === 'sessions') {
-                    // Structured list only — never dump slash help text into chat.
-                    // Deliberately do NOT finalize/endStream here: the sessions
-                    // payload is sidebar metadata that can arrive while the
-                    // active pane's turn is still streaming (e.g. closing a
-                    // background pane's ✕ calls requestSessionList mid-turn).
-                    // Finalizing would split the in-flight reply into a second
-                    // assistant bubble and stamp a fork button on a partial one.
-                    renderSessionList(data.sessions || []);
-                    if (data.contextLimit || data.usedTokens) { updateContextInfo(data); }
-                } else if (data.type === 'session_state') {
-                    // Attach reply: tells us whether a headless turn is
-                    // running so we can render "resuming…". It also carries
-                    // the session id: adopt it when the pane does not have
-                    // one yet, so the pane is usable immediately (routing,
-                    // send guard, sidebar "open" row) even while a running
-                    // turn keeps the config echo — which normally adopts the
-                    // id — pending until the turn ends.
-                    const pane = activePane();
-                    if (data.sessionId && pane.id === null) {
-                        pane.id = data.sessionId;
-                    }
-                    pane.turnActive = !!data.turnActive;
-                    setTurnActive(pane.turnActive, { silent: true });
-                    if (pane.turnActive) {
-                        setInputProgress('thinking', 'Resuming\u2026');
-                        // Attached to a running turn: the history snapshot
-                        // cannot contain the in-flight reply, so latch the
-                        // turn-end refetch that converges the transcript.
-                        pane.needsFreshHistory = true;
-                    } else {
-                        // Idle attach: the history snapshot is complete — no
-                        // convergence refetch needed. Also clears a latch
-                        // left over from an earlier busy attach whose turn_end
-                        // was already consumed (e.g. focus after the turn
-                        // ended).
-                        pane.needsFreshHistory = false;
-                    }
-                    // Reflect the busy/resuming state in the sidebar session
-                    // row (same staleness class: the row shows turn state).
-                    refreshSidebarSessions();
-                } else if (data.type === 'session_removed') {
-                    // The session no longer exists (deleted elsewhere, or an
-                    // attach failed after a restart with pruning). Close its
-                    // pane. For the ACTIVE pane: when THIS connection
-                    // initiated the delete, the server re-keys the pane via
-                    // the follow-up config (pendingSessionResponse is set);
-                    // when ANOTHER connection deleted it, no follow-up comes
-                    // — start a fresh session so the pane is not orphaned on
-                    // a deleted runtime (messages would route to a stale
-                    // agent and silently re-persist the deleted file).
-                    const pane = findPaneBySession(data.sessionId);
-                    if (pane === activePane() && !pendingSessionResponse) {
-                        // Drop the stale pane FIRST (mirrors session_detached):
-                        // leaving it in the map rendered a ghost sidebar row for
-                        // the deleted session, and clicking it re-attached the
-                        // deleted id — the server replied session_removed again,
-                        // spawning another fresh session (and another ghost) per
-                        // click. Its state is discarded with the session, so no
-                        // saveActivePaneState is needed.
-                        panes.delete(pane.key);
-                        const p = makePane();
-                        activePaneKey = p.key;
-                        clearChat();
-                        loadActivePaneState();
-                        if (ws && ws.readyState === WebSocket.OPEN) {
-                            pendingSessionResponse = true;
-                            ws.send(JSON.stringify({ type: 'session_new' }));
-                        }
-                    } else if (pane && pane !== activePane()) {
-                        panes.delete(pane.key);
-                        refreshSidebarSessions();
-                    }
-                    requestSessionList();
-                } else if (data.type === 'session_detached') {
-                    // The runtime is gone: the registry evicted this session
-                    // (web_max_active_sessions cap), or it was
-                    // explicitly closed (session_close) while this tab raced
-                    // to attach. It is saved, not deleted: close the pane
-                    // like a removal — the session stays in the saved-
-                    // sessions list and can be reopened (re-attach reloads
-                    // it from the store). Closing avoids sending messages to
-                    // a runtime that is no longer registered.
-                    const pane = findPaneBySession(data.sessionId);
-                    if (pane) {
-                        panes.delete(pane.key);
-                        if (activePaneKey === pane.key) {
-                            if (panes.size === 0) {
-                                const p = makePane();
-                                activePaneKey = p.key;
-                                clearChat();
-                                loadActivePaneState();
-                                if (ws && ws.readyState === WebSocket.OPEN) {
-                                    pendingSessionResponse = true;
-                                    ws.send(JSON.stringify({ type: 'session_new' }));
-                                }
-                            } else {
-                                focusPane(panes.keys().next().value);
-                            }
-                        } else {
-                            refreshSidebarSessions();
-                        }
-                    }
-                    requestSessionList();
-                } else if (data.type === 'response') {
-                    finalizeThinking();
-                    endStream();
-                    // A session command (typed /new, /resume, /fork, resend)
-                    // replies with the NEW session id on the response message
-                    // — the first message of the change, before clear_chat/
-                    // history/config arrive. Adopt it here so those follow-up
-                    // messages route to this pane (its id is otherwise still
-                    // the old session, and paneForMessage would drop them).
-                    // Sidebar-new and resend already set pendingSessionResponse
-                    // and go through this same path.
-                    const rp = activePane();
-                    let rekeySkipped = false;
-                    if (rp && data.sessionId && rp.id !== data.sessionId) {
-                        // A session change (typed /new, /resume, /fork,
-                        // resend, delete-of-current) is the only legitimate
-                        // reason to adopt a different id here — every such
-                        // reply carries a sessionAction. A plain response
-                        // with a different id (e.g. a delete whose reply was
-                        // tagged with a stale server-side pane) must not
-                        // hijack this pane onto another session. Also refuse
-                        // to adopt an id another pane already holds (e.g.
-                        // "resume latest" resolving to a session open
-                        // elsewhere): that would create a duplicate pane for
-                        // one session and desync one of the two.
-                        const other = findPaneBySession(data.sessionId);
-                        if ((rp.id === null || data.sessionAction) && (!other || other === rp)) {
-                            const oldId = rp.id;
-                            rp.id = data.sessionId;
-                            refreshSidebarSessions();
-                            // Release the old session's attachment only when
-                            // no other pane still has it open: detaching a
-                            // session a background pane still shows would
-                            // orphan that pane's event stream.
-                            if (oldId && !findPaneBySession(oldId) && ws && ws.readyState === WebSocket.OPEN) {
-                                ws.send(JSON.stringify({ type: 'session_detach', sessionId: oldId }));
-                            }
-                        } else {
-                            rekeySkipped = true;
-                        }
-                    }
-                    // Whether the change succeeded or failed, the pane is (or
-                    // stays) on a known session: from here its own turn_end
-                    // must be processed normally. (On success the old
-                    // session's id no longer routes here; on failure it is
-                    // still this pane's session and its turn_end matters.)
-                    // needsFreshHistory is deliberately NOT reset here — the
-                    // session_state sent before the reply owns the latch, and
-                    // a resumed session may be mid-turn and needs the
-                    // turn-end convergence refetch.
-                    rp.ignoreTurnEndsFor = null;
-                    if (compacting) {
-                        // Terminal event for the manual /compact command:
-                        // clear the persistent indicator and surface the
-                        // outcome (the context message that follows will
-                        // refresh the badge/banner).
-                        compacting = false;
-                        setInputProgress(null);
-                        const text = data.content || '';
-                        if (String(text).startsWith('Error:')) {
-                            showToast(text, 'error');
-                        } else {
-                            showToast(text, 'success');
-                        }
-                        appendMessage('system', text);
-                    } else if (pendingSessionResponse) {
-                        pendingSessionResponse = false;
-                        nearCompactDismissed = false; // new session: allow the banner again
-                        // Only track the session id when the pane actually
-                        // adopted it (a skipped re-key keeps the old id).
-                        if (data.sessionId && rp.id === data.sessionId) sessionInfoDiv.textContent = data.sessionId;
-                        updateContextInfo(data);
-                        const msg = (data.content || '').split('\n')[0] || 'Session updated';
-                        if (rekeySkipped) {
-                            // The reply named a session another pane already
-                            // owns: this pane stays on its current session.
-                            showToast('Session already open in another pane', 'info');
-                            requestSessionList();
-                        } else if (String(data.content || '').startsWith('Error:')) {
-                            clearPendingResend();
-                            showToast(data.content, 'error');
-                            appendMessage('system', data.content);
-                        } else if (!resendAwaitingHistory) {
-                            // Normal session switch — toast. Resend follow-up
-                            // suppresses the toast; flush happens after history.
-                            showToast(msg, 'success');
-                            requestSessionList();
-                        } else {
-                            requestSessionList();
-                        }
-                    } else if (data.content && String(data.content).startsWith('Error:')) {
-                        showToast(data.content, 'error');
-                        appendMessage('system', data.content);
-                    } else {
-                        appendMessage('assistant', data.content);
-                    }
-                } else if (data.type === 'models') {
-                    if (data.content) {
-                        finalizeThinking();
-                        endStream();
-                        appendMessage('assistant', data.content);
-                    }
-                    if (data.models) {
-                        updateModelSelect(data.models, data.model);
-                    } else if (data.model) {
-                        updateModelInfo(data.model, availableModels.find((m) => m.id === data.model)?.description);
-                    }
-                    // list_models replies omit context stats — don't wipe the indicator
-                    if (data.contextLimit || data.usedTokens || data.usedSource) {
-                        updateContextInfo(data);
-                    }
-                } else if (data.type === 'history') {
-                    // Full snapshot — replace the pane so reconnect / session
-                    // restore never stacks duplicate transcripts.
-                    const histPane = activePane();
-                    const hasLiveInFlight = !!(currentStreamDiv || currentThinkingDiv
-                        || Object.keys(streamingToolCards).length > 0
-                        || Object.keys(pendingToolCards).length > 0);
-                    // A stale snapshot — the attach's deep clone finished
-                    // after the turn completed, landing after the turn_end
-                    // convergence refetch — must not wipe the rendered
-                    // transcript. Skip only when the snapshot is older than
-                    // the DOM (its last message index ≤ the newest rendered
-                    // one), the server's history was not reshaped since we
-                    // rendered (epoch match — compaction/rollback reset
-                    // indexes, making the comparison meaningless), and
-                    // nothing is still streaming (converge at turn_end).
-                    if (!histPane.needsFreshHistory && !hasLiveInFlight
-                        && histPane.histEpoch !== undefined
-                        && data.historyEpoch === histPane.histEpoch
-                        && lastHistoryIndex(data.history) >= 0
-                        && newestDomHistIdx() >= 0
-                        && lastHistoryIndex(data.history) <= newestDomHistIdx()) {
-                        return;
-                    }
-                    // Mid-turn attach with live content already rendering and
-                    // no rewind in the snapshot (older server): keep the live
-                    // content — the turn_end convergence refetch paints the
-                    // full transcript.
-                    if (histPane.needsFreshHistory && hasLiveInFlight && !data.rewind) {
-                        return;
-                    }
-                    // Capture the live stream state BEFORE clearing so the
-                    // rewind (the in-flight reply) can merge exactly with
-                    // whatever the client already rendered live — never
-                    // duplicating or dropping a character.
-                    const captured = captureLiveStreamState();
-                    let rewindRendered = false;
-                    clearChat();
-                    histPane.histEpoch = data.historyEpoch;
-                    const afterHistory = () => {
-                        // Render the in-flight partial (the server's live-turn
-                        // buffer) through the normal stream machinery, then
-                        // merge any content the client had already rendered
-                        // live. Runs on both the replay and the fallback path.
-                        if (data.rewind) {
-                            rewindRendered = renderRewindAndMerge(data.rewind, captured);
-                        }
-                        // A headless turn may be running (session_state said
-                        // turnActive): restore the busy indicator now that the
-                        // transcript is rebuilt (clearChat reset it). The
-                        // rewind render already set the phase when it painted
-                        // the in-flight reply.
-                        const pane = activePane();
-                        if (pane && pane.turnActive && !rewindRendered) {
-                            setTurnActive(true, { silent: true });
-                            setInputProgress('thinking', 'Resuming\u2026');
-                        }
-                        // NOTE: the resend message is flushed from the config
-                        // handler, which adopts the new session id first (the
-                        // server sends history before config).
-                    };
-                    if (data.history && data.history.length) {
-                        replayHistory(data.history).then(afterHistory).catch((err) => {
-                            console.warn('history replay failed', err);
-                            // Ensure the replay scroll-suppression flag is off
-                            // so the fallback re-append below scrolls normally.
-                            replayInProgress = false;
-                            disarmReplayWatchdog();
-                            flushDeferredResultColorize();
-                            for (const h of data.history) {
-                                if (h.role === 'user' || h.role === 'assistant') {
-                                    if (h.content) {
-                                        appendMessageAtTime(
-                                            h.role,
-                                            h.content,
-                                            h.createdAt ? new Date(h.createdAt) : new Date(),
-                                            h.index,
-                                            h.images,
-                                            h.model
-                                        );
-                                    }
-                                }
-                            }
-                            afterHistory();
-                        });
-                    } else {
-                        afterHistory();
-                    }
-                } else if (data.type === 'config') {
-                    // The pane's session identity may have changed (new /
-                    // resume / fork / attach): adopt the new id and keep the
-                    // per-session toolbar mirrors current.
-                    const pane = activePane();
-                    const oldId = pane.id;
-                    if (data.sessionId && pane.id !== data.sessionId) {
-                        // Re-key ONLY when the pane has no id yet (startup /
-                        // fresh pane) or a session change is genuinely in
-                        // flight (typed /new, /resume, /fork, resend). A
-                        // stale full config from a pane we left/closed (its
-                        // ContextStats tokenization lags a running turn) must
-                        // not flip the active pane's id — paneForMessage
-                        // would then drop every message for the session the
-                        // user switched to ("can't switch to the responding
-                        // session").
-                        if (pane.id === null || pendingSessionResponse) {
-                            pane.id = data.sessionId;
-                            pane.needsFreshHistory = false; // new session: no mid-turn gap from the old one
-                            refreshSidebarSessions();
-                            // The pane's session changed (typed /new, /resume,
-                            // fork, resend): release the old session's
-                            // attachment — the server keeps panes attached
-                            // until explicitly detached, and the old session
-                            // is no longer open. Only when no other pane
-                            // still has the old session open (detaching it
-                            // would orphan that pane's event stream).
-                            if (oldId && !findPaneBySession(oldId) && ws && ws.readyState === WebSocket.OPEN) {
-                                ws.send(JSON.stringify({ type: 'session_detach', sessionId: oldId }));
-                            }
-                        }
-                    }
-                    pane.mode = data.mode || pane.mode;
-                    pane.thinkingLevel = data.thinkingLevel || pane.thinkingLevel;
-                    pane.reasoningEfforts = data.reasoningEfforts || pane.reasoningEfforts;
-                    pane.modelDescription = data.modelDescription || pane.modelDescription;
-                    pane.model = data.model || pane.model;
-                    if (data.sessionLabel) pane.label = data.sessionLabel;
-                    applyServerConfig(data);
-                    // The resend message must carry the (possibly new) session
-                    // id, which config just adopted — flushing from history
-                    // would use the stale pre-fork id.
-                    if (resendAwaitingHistory) flushPendingResend();
-                } else if (data.type === 'context') {
-                    updateContextInfo(data);
-                    updateCurrentSessionLabel(data.sessionLabel);
-                } else if (data.type === 'delete_approval') {
-                    showDeleteApproval(data);
-                }
+                const handler = WS_HANDLERS[data.type];
+                if (handler) handler(data);
             };
 
             ws.onclose = () => {
@@ -4508,6 +3975,697 @@
             };
         }
 
+        // ── WebSocket message dispatch ──
+        // connect()'s onmessage routes each server message type to a
+        // dedicated handler below. The map is the single source of truth;
+        // unknown types are ignored (matching the pre-refactor else-if
+        // chain's implicit fall-through).
+        const WS_HANDLERS = {
+            compacting: handleCompacting,
+            thinking: handleThinking,
+            waiting: handleWaiting,
+            thinking_token: handleThinkingToken,
+            stream: handleStream,
+            stream_end: handleStreamEnd,
+            model_used: handleModelUsed,
+            tool_call_start: handleToolCallStart,
+            tool_call_delta: handleToolCallDelta,
+            tool_call: handleToolCall,
+            tool_execute: handleToolExecute,
+            tool_result: handleToolResult,
+            term_opened: handleTermOpened,
+            term_output: handleTermOutput,
+            term_exit: handleTermExit,
+            user_term_opened: handleUserTermOpened,
+            user_term_output: handleUserTermOutput,
+            user_term_exit: handleUserTermExit,
+            cancelled: handleCancelled,
+            turn_end: handleTurnEnd,
+            clear_chat: handleClearChat,
+            user_acked: handleUserAcked,
+            sessions: handleSessions,
+            session_state: handleSessionState,
+            session_removed: handleSessionRemoved,
+            session_detached: handleSessionDetached,
+            response: handleResponse,
+            models: handleModels,
+            history: handleHistory,
+            config: handleConfig,
+            context: handleContext,
+            delete_approval: handleDeleteApproval,
+        };
+
+        function handleCompacting(data) {
+
+            // Auto-compaction inside a normal turn (or the manual
+            // /compact command): keep a live indicator until the next
+            // progress event (thinking/stream/tool) or the compact
+            // response replaces it.
+            setInputProgress('compacting', 'Compacting context\u2026');
+
+        }
+
+        function handleThinking(data) {
+
+            setTurnActive(true);
+            updateTitle('thinking');
+            // New model round (OnStart / OnRoundStart): clear per-round
+            // tool state so reasoning shows again, matching TUI.
+            toolsStartedThisTurn = false;
+            streamingToolCards = {};
+            lastStreamDiv = null; // new round: forget any prior bubble
+            finalizeThinking();
+            setInputProgress('thinking', 'Thinking\u2026');
+
+        }
+
+        function handleWaiting(data) {
+
+            setTurnActive(true);
+            setInputProgress('thinking', 'Waiting for model\u2026');
+
+        }
+
+        function handleThinkingToken(data) {
+
+            setTurnActive(true);
+            appendThinkingToken(data.content || '', data.thinkingPos);
+
+        }
+
+        function handleStream(data) {
+
+            setTurnActive(true);
+            updateTitle('streaming');
+            setInputProgress('streaming', 'Streaming\u2026');
+            finalizeThinking();
+            if (!currentStreamDiv) startStream();
+            appendStreamToken(data.content, data.contentPos);
+
+        }
+
+        function handleStreamEnd(data) {
+
+            finalizeThinking();
+            endStream();
+
+        }
+
+        function handleModelUsed(data) {
+
+            // Stamp the last (still-live) assistant bubble with the
+            // provider-reported model. The server sends this before
+            // stream_end; history replay attributes older messages.
+            if (data.model) {
+                const bubble = currentStreamDiv || lastStreamDiv;
+                if (bubble) {
+                    bubble.dataset.model = data.model;
+                    applyReplyModelChip(bubble);
+                }
+            }
+
+        }
+
+        function handleToolCallStart(data) {
+
+            setTurnActive(true);
+            setInputProgress('tool', 'Running ' + (data.tool || 'tool') + '\u2026');
+            startStreamingToolCard(data.index, data.tool);
+
+        }
+
+        function handleToolCallDelta(data) {
+
+            finalizeThinking();
+            if (!streamingToolCards[data.index]) {
+                startStreamingToolCard(data.index, data.tool || 'tool');
+            } else if (data.tool) {
+                streamingToolCards[data.index].toolName = data.tool;
+            }
+            appendStreamingToolArgs(data.index, data.argsDelta || '', data.argsPos);
+
+        }
+
+        function handleToolCall(data) {
+
+            finalizeThinking();
+            endStream();
+            toolsStartedThisTurn = true;
+            finalizeStreamingToolCard(data.index, data.toolCallId, data.tool, data.args || {});
+
+        }
+
+        function handleToolExecute(data) {
+
+            // Update waiting text on the matching pending card if present
+            const name = data.tool || '';
+            setInputProgress('tool', name ? ('Running ' + name + '\u2026') : 'Running tool\u2026');
+            for (const id of Object.keys(pendingToolCards)) {
+                const cardInfo = pendingToolCards[id];
+                if (cardInfo && cardInfo.waiting && (!name || cardInfo.toolName === name)) {
+                    cardInfo.waiting.textContent = name ? `running ${name}...` : 'executing...';
+                }
+            }
+
+        }
+
+        function handleToolResult(data) {
+
+            finalizeThinking();
+            // Account for tool result tokens in the live context estimate.
+            bumpContextEstimate(data.result);
+            // Stay busy until turn_end — more rounds may follow.
+            const cardInfo = pendingToolCards[data.toolCallId];
+            if (cardInfo) {
+                updateToolCardWithResult(
+                    cardInfo,
+                    data.result,
+                    // Server serializes Success with omitempty, so a
+                    // failed tool omits the field entirely (undefined).
+                    // Only an explicit true means success.
+                    data.success === true,
+                    data.resultTruncated,
+                    data.tool || cardInfo.toolName
+                );
+                delete pendingToolCards[data.toolCallId];
+            } else {
+                appendMessage('system', `[${data.tool}] ${data.result}`);
+            }
+
+        }
+
+        function handleTermOpened(data) {
+
+            terminalOpen(data.termId, data.tool || '', data.content || '');
+            // Mirror the command echo into the pending tool card so
+            // shell output streams into the chat, not just the
+            // (collapsed-by-default) terminal dock.
+            const cardInfo = pendingToolCards[data.termId];
+            if (cardInfo && data.content) {
+                // Echo the command like the terminal tab does, on its
+                // own line ("$ ..." then the streaming output).
+                appendToolCardLiveOutput(cardInfo, data.content + '\n');
+            }
+
+        }
+
+        function handleTermOutput(data) {
+
+            terminalWrite(data.termId, data.content || '');
+            const cardInfo = pendingToolCards[data.termId];
+            if (cardInfo) {
+                appendToolCardLiveOutput(cardInfo, data.content || '');
+            }
+
+        }
+
+        function handleTermExit(data) {
+
+            // Success is omitted when false, so only an explicit true
+            // marks the tab as ok; anything else is a failure.
+            terminalExit(data.termId, data.success === true);
+            terminalFitSoon();
+            const cardInfo = pendingToolCards[data.termId];
+            if (cardInfo && cardInfo.liveOutput) {
+                cardInfo.liveOutput.classList.add('done');
+                cardInfo.liveOutput.classList.add(data.success === true ? 'success' : 'error');
+            }
+
+        }
+
+        function handleUserTermOpened(data) {
+
+            terminalUserOpened(data.content || 'shell', data.workingDir || '');
+
+        }
+
+        function handleUserTermOutput(data) {
+
+            terminalEnsureUserTab();
+            terminalWrite(USER_TERM_ID, data.content || '');
+
+        }
+
+        function handleUserTermExit(data) {
+
+            terminalUserExited(data.code || 0);
+
+        }
+
+        function handleCancelled(data) {
+
+            // Stale cancel from a turn we replaced with resend/send — ignore.
+            if (suppressTurnEnds > 0) return;
+            abortInFlightUI(data.content || 'Cancelled.');
+            setTurnActive(false);
+            setInputProgress(null);
+            refreshSidebarSessions();
+
+        }
+
+        function handleTurnEnd(data) {
+
+            // Ignore turn_end from a turn we cancelled to start a resend/send.
+            // Otherwise it clears pendingSessionResponse / turnActive mid-flow.
+            if (suppressTurnEnds > 0) {
+                suppressTurnEnds--;
+                return;
+            }
+            // A turn we deliberately left behind when resuming another
+            // session: the old session keeps running headless (resume
+            // does not cancel it), so its turn_end must not clear the
+            // pending flag or block the resumed session's convergence.
+            // (Before the reply re-keys the pane, the old session is
+            // still this pane's id; after the re-key, paneForMessage
+            // drops the old id entirely.)
+            const pane = activePane();
+            if (pane && pane.ignoreTurnEndsFor && data.sessionId === pane.ignoreTurnEndsFor) {
+                pane.ignoreTurnEndsFor = null;
+                return;
+            }
+            setTurnActive(false);
+            updateTitle('idle');
+            setInputProgress(null);
+            pendingSessionResponse = false;
+            // A pane attached mid-turn never received the in-flight
+            // reply (assistant messages are appended only
+            // when a round completes). Now that the turn is done the
+            // full history is available — re-attach once so the
+            // transcript converges.
+            const tp = pane;
+            if (tp && tp.needsFreshHistory) {
+                tp.needsFreshHistory = false;
+                if (tp.id && ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'session_attach', sessionId: tp.id }));
+                }
+            }
+            refreshSidebarSessions();
+            // The turn just finished: fetch a fresh sessions payload
+            // instead of re-rendering the cached one, so the sidebar's
+            // saved-section order and per-row relative times reflect
+            // the completed turn's new Updated timestamp (the cache is
+            // only refreshed on explicit list_sessions round-trips).
+            requestSessionList();
+
+        }
+
+        function handleClearChat(data) {
+
+            clearChat();
+            // Do NOT re-arm pendingSessionResponse here: the response
+            // handler already re-keyed the pane to the new session id
+            // and cleared the flag, so the follow-up history/config
+            // route by session id without the fallback. Re-arming left
+            // the flag stuck true until the next turn_end / reconnect,
+            // which permanently blocked resumeSession()/deleteSession()
+            // ("Session change already in progress") and made
+            // paneForMessage route stale messages to the active pane
+            // (which then wrongly re-keyed it).
+
+        }
+
+        function handleUserAcked(data) {
+
+            // Server assigned the Messages index for the user turn just started.
+            // Index is in content so 0 is not dropped by JSON omitempty.
+            const idx = parseInt(data.content, 10);
+            const el = messagesDiv.querySelector('.message.user[data-pending-ack="1"]')
+                || [...messagesDiv.querySelectorAll('.message.user:not([data-hist-idx])')].at(-1);
+            if (el && Number.isFinite(idx) && idx >= 0) {
+                delete el.dataset.pendingAck;
+                el.dataset.histIdx = String(idx);
+                ensureUserResendActions(el);
+            }
+
+        }
+
+        function handleSessions(data) {
+
+            // Structured list only — never dump slash help text into chat.
+            // Deliberately do NOT finalize/endStream here: the sessions
+            // payload is sidebar metadata that can arrive while the
+            // active pane's turn is still streaming (e.g. closing a
+            // background pane's ✕ calls requestSessionList mid-turn).
+            // Finalizing would split the in-flight reply into a second
+            // assistant bubble and stamp a fork button on a partial one.
+            renderSessionList(data.sessions || []);
+            if (data.contextLimit || data.usedTokens) { updateContextInfo(data); }
+
+        }
+
+        function handleSessionState(data) {
+
+            // Attach reply: tells us whether a headless turn is
+            // running so we can render "resuming…". It also carries
+            // the session id: adopt it when the pane does not have
+            // one yet, so the pane is usable immediately (routing,
+            // send guard, sidebar "open" row) even while a running
+            // turn keeps the config echo — which normally adopts the
+            // id — pending until the turn ends.
+            const pane = activePane();
+            if (data.sessionId && pane.id === null) {
+                pane.id = data.sessionId;
+            }
+            pane.turnActive = !!data.turnActive;
+            setTurnActive(pane.turnActive, { silent: true });
+            if (pane.turnActive) {
+                setInputProgress('thinking', 'Resuming\u2026');
+                // Attached to a running turn: the history snapshot
+                // cannot contain the in-flight reply, so latch the
+                // turn-end refetch that converges the transcript.
+                pane.needsFreshHistory = true;
+            } else {
+                // Idle attach: the history snapshot is complete — no
+                // convergence refetch needed. Also clears a latch
+                // left over from an earlier busy attach whose turn_end
+                // was already consumed (e.g. focus after the turn
+                // ended).
+                pane.needsFreshHistory = false;
+            }
+            // Reflect the busy/resuming state in the sidebar session
+            // row (same staleness class: the row shows turn state).
+            refreshSidebarSessions();
+
+        }
+
+        function handleSessionRemoved(data) {
+
+            // The session no longer exists (deleted elsewhere, or an
+            // attach failed after a restart with pruning). Close its
+            // pane. For the ACTIVE pane: when THIS connection
+            // initiated the delete, the server re-keys the pane via
+            // the follow-up config (pendingSessionResponse is set);
+            // when ANOTHER connection deleted it, no follow-up comes
+            // — start a fresh session so the pane is not orphaned on
+            // a deleted runtime (messages would route to a stale
+            // agent and silently re-persist the deleted file).
+            const pane = findPaneBySession(data.sessionId);
+            if (pane === activePane() && !pendingSessionResponse) {
+                // Drop the stale pane FIRST (mirrors session_detached):
+                // leaving it in the map rendered a ghost sidebar row for
+                // the deleted session, and clicking it re-attached the
+                // deleted id — the server replied session_removed again,
+                // spawning another fresh session (and another ghost) per
+                // click. Its state is discarded with the session, so no
+                // saveActivePaneState is needed.
+                panes.delete(pane.key);
+                replaceActivePane();
+            } else if (pane && pane !== activePane()) {
+                panes.delete(pane.key);
+                refreshSidebarSessions();
+            }
+            requestSessionList();
+
+        }
+
+        function handleSessionDetached(data) {
+
+            // The runtime is gone: the registry evicted this session
+            // (web_max_active_sessions cap), or it was
+            // explicitly closed (session_close) while this tab raced
+            // to attach. It is saved, not deleted: close the pane
+            // like a removal — the session stays in the saved-
+            // sessions list and can be reopened (re-attach reloads
+            // it from the store). Closing avoids sending messages to
+            // a runtime that is no longer registered.
+            const pane = findPaneBySession(data.sessionId);
+            if (pane) {
+                panes.delete(pane.key);
+                if (activePaneKey === pane.key) {
+                    if (panes.size === 0) {
+                        replaceActivePane();
+                    } else {
+                        focusPane(panes.keys().next().value);
+                    }
+                } else {
+                    refreshSidebarSessions();
+                }
+            }
+            requestSessionList();
+
+        }
+
+        function handleResponse(data) {
+
+            finalizeThinking();
+            endStream();
+            // A session command (typed /new, /resume, /fork, resend)
+            // replies with the NEW session id on the response message
+            // — the first message of the change, before clear_chat/
+            // history/config arrive. Adopt it here so those follow-up
+            // messages route to this pane (its id is otherwise still
+            // the old session, and paneForMessage would drop them).
+            // Sidebar-new and resend already set pendingSessionResponse
+            // and go through this same path.
+            const rp = activePane();
+            let rekeySkipped = false;
+            if (rp && data.sessionId && rp.id !== data.sessionId) {
+                // A session change (typed /new, /resume, /fork,
+                // resend, delete-of-current) is the only legitimate
+                // reason to adopt a different id here — every such
+                // reply carries a sessionAction. A plain response
+                // with a different id (e.g. a delete whose reply was
+                // tagged with a stale server-side pane) must not
+                // hijack this pane onto another session. Also refuse
+                // to adopt an id another pane already holds (e.g.
+                // "resume latest" resolving to a session open
+                // elsewhere): that would create a duplicate pane for
+                // one session and desync one of the two.
+                const other = findPaneBySession(data.sessionId);
+                if ((rp.id === null || data.sessionAction) && (!other || other === rp)) {
+                    const oldId = rp.id;
+                    rp.id = data.sessionId;
+                    refreshSidebarSessions();
+                    // Release the old session's attachment only when
+                    // no other pane still has it open: detaching a
+                    // session a background pane still shows would
+                    // orphan that pane's event stream.
+                    sendSessionDetach(oldId);
+                } else {
+                    rekeySkipped = true;
+                }
+            }
+            // Whether the change succeeded or failed, the pane is (or
+            // stays) on a known session: from here its own turn_end
+            // must be processed normally. (On success the old
+            // session's id no longer routes here; on failure it is
+            // still this pane's session and its turn_end matters.)
+            // needsFreshHistory is deliberately NOT reset here — the
+            // session_state sent before the reply owns the latch, and
+            // a resumed session may be mid-turn and needs the
+            // turn-end convergence refetch.
+            rp.ignoreTurnEndsFor = null;
+            if (compacting) {
+                // Terminal event for the manual /compact command:
+                // clear the persistent indicator and surface the
+                // outcome (the context message that follows will
+                // refresh the badge/banner).
+                compacting = false;
+                setInputProgress(null);
+                const text = data.content || '';
+                if (String(text).startsWith('Error:')) {
+                    showToast(text, 'error');
+                } else {
+                    showToast(text, 'success');
+                }
+                appendMessage('system', text);
+            } else if (pendingSessionResponse) {
+                pendingSessionResponse = false;
+                nearCompactDismissed = false; // new session: allow the banner again
+                // Only track the session id when the pane actually
+                // adopted it (a skipped re-key keeps the old id).
+                if (data.sessionId && rp.id === data.sessionId) sessionInfoDiv.textContent = data.sessionId;
+                updateContextInfo(data);
+                const msg = (data.content || '').split('\n')[0] || 'Session updated';
+                if (rekeySkipped) {
+                    // The reply named a session another pane already
+                    // owns: this pane stays on its current session.
+                    showToast('Session already open in another pane', 'info');
+                    requestSessionList();
+                } else if (String(data.content || '').startsWith('Error:')) {
+                    clearPendingResend();
+                    showToast(data.content, 'error');
+                    appendMessage('system', data.content);
+                } else if (!resendAwaitingHistory) {
+                    // Normal session switch — toast. Resend follow-up
+                    // suppresses the toast; flush happens after history.
+                    showToast(msg, 'success');
+                    requestSessionList();
+                } else {
+                    requestSessionList();
+                }
+            } else if (data.content && String(data.content).startsWith('Error:')) {
+                showToast(data.content, 'error');
+                appendMessage('system', data.content);
+            } else {
+                appendMessage('assistant', data.content);
+            }
+
+        }
+
+        function handleModels(data) {
+
+            if (data.content) {
+                finalizeThinking();
+                endStream();
+                appendMessage('assistant', data.content);
+            }
+            if (data.models) {
+                updateModelSelect(data.models, data.model);
+            } else if (data.model) {
+                updateModelInfo(data.model, availableModels.find((m) => m.id === data.model)?.description);
+            }
+            // list_models replies omit context stats — don't wipe the indicator
+            if (data.contextLimit || data.usedTokens || data.usedSource) {
+                updateContextInfo(data);
+            }
+
+        }
+
+        function handleHistory(data) {
+
+            // Full snapshot — replace the pane so reconnect / session
+            // restore never stacks duplicate transcripts.
+            const histPane = activePane();
+            const hasLiveInFlight = !!(currentStreamDiv || currentThinkingDiv
+                || Object.keys(streamingToolCards).length > 0
+                || Object.keys(pendingToolCards).length > 0);
+            // A stale snapshot — the attach's deep clone finished
+            // after the turn completed, landing after the turn_end
+            // convergence refetch — must not wipe the rendered
+            // transcript. Skip only when the snapshot is older than
+            // the DOM (its last message index ≤ the newest rendered
+            // one), the server's history was not reshaped since we
+            // rendered (epoch match — compaction/rollback reset
+            // indexes, making the comparison meaningless), and
+            // nothing is still streaming (converge at turn_end).
+            if (!histPane.needsFreshHistory && !hasLiveInFlight
+                && histPane.histEpoch !== undefined
+                && data.historyEpoch === histPane.histEpoch
+                && lastHistoryIndex(data.history) >= 0
+                && newestDomHistIdx() >= 0
+                && lastHistoryIndex(data.history) <= newestDomHistIdx()) {
+                return;
+            }
+            // Mid-turn attach with live content already rendering and
+            // no rewind in the snapshot (older server): keep the live
+            // content — the turn_end convergence refetch paints the
+            // full transcript.
+            if (histPane.needsFreshHistory && hasLiveInFlight && !data.rewind) {
+                return;
+            }
+            // Capture the live stream state BEFORE clearing so the
+            // rewind (the in-flight reply) can merge exactly with
+            // whatever the client already rendered live — never
+            // duplicating or dropping a character.
+            const captured = captureLiveStreamState();
+            let rewindRendered = false;
+            clearChat();
+            histPane.histEpoch = data.historyEpoch;
+            const afterHistory = () => {
+                // Render the in-flight partial (the server's live-turn
+                // buffer) through the normal stream machinery, then
+                // merge any content the client had already rendered
+                // live. Runs on both the replay and the fallback path.
+                if (data.rewind) {
+                    rewindRendered = renderRewindAndMerge(data.rewind, captured);
+                }
+                // A headless turn may be running (session_state said
+                // turnActive): restore the busy indicator now that the
+                // transcript is rebuilt (clearChat reset it). The
+                // rewind render already set the phase when it painted
+                // the in-flight reply.
+                const pane = activePane();
+                if (pane && pane.turnActive && !rewindRendered) {
+                    setTurnActive(true, { silent: true });
+                    setInputProgress('thinking', 'Resuming\u2026');
+                }
+                // NOTE: the resend message is flushed from the config
+                // handler, which adopts the new session id first (the
+                // server sends history before config).
+            };
+            if (data.history && data.history.length) {
+                replayHistory(data.history).then(afterHistory).catch((err) => {
+                    console.warn('history replay failed', err);
+                    // Ensure the replay scroll-suppression flag is off
+                    // so the fallback re-append below scrolls normally.
+                    replayInProgress = false;
+                    disarmReplayWatchdog();
+                    flushDeferredResultColorize();
+                    for (const h of data.history) {
+                        if (h.role === 'user' || h.role === 'assistant') {
+                            if (h.content) {
+                                appendMessageAtTime(
+                                    h.role,
+                                    h.content,
+                                    h.createdAt ? new Date(h.createdAt) : new Date(),
+                                    h.index,
+                                    h.images,
+                                    h.model
+                                );
+                            }
+                        }
+                    }
+                    afterHistory();
+                });
+            } else {
+                afterHistory();
+            }
+
+        }
+
+        function handleConfig(data) {
+
+            // The pane's session identity may have changed (new /
+            // resume / fork / attach): adopt the new id and keep the
+            // per-session toolbar mirrors current.
+            const pane = activePane();
+            const oldId = pane.id;
+            if (data.sessionId && pane.id !== data.sessionId) {
+                // Re-key ONLY when the pane has no id yet (startup /
+                // fresh pane) or a session change is genuinely in
+                // flight (typed /new, /resume, /fork, resend). A
+                // stale full config from a pane we left/closed (its
+                // ContextStats tokenization lags a running turn) must
+                // not flip the active pane's id — paneForMessage
+                // would then drop every message for the session the
+                // user switched to ("can't switch to the responding
+                // session").
+                if (pane.id === null || pendingSessionResponse) {
+                    pane.id = data.sessionId;
+                    pane.needsFreshHistory = false; // new session: no mid-turn gap from the old one
+                    refreshSidebarSessions();
+                    // The pane's session changed (typed /new, /resume,
+                    // fork, resend): release the old session's
+                    // attachment — the server keeps panes attached
+                    // until explicitly detached, and the old session
+                    // is no longer open. Only when no other pane
+                    // still has the old session open (detaching it
+                    // would orphan that pane's event stream).
+                    sendSessionDetach(oldId);
+                }
+            }
+            applyPaneMeta(pane, data);
+            applyServerConfig(data);
+            // The resend message must carry the (possibly new) session
+            // id, which config just adopted — flushing from history
+            // would use the stale pre-fork id.
+            if (resendAwaitingHistory) flushPendingResend();
+
+        }
+
+        function handleContext(data) {
+
+            updateContextInfo(data);
+            updateCurrentSessionLabel(data.sessionLabel);
+
+        }
+
+        function handleDeleteApproval(data) {
+
+            showDeleteApproval(data);
+
+        }
         // ── Image attachments (vision input) ──
         // Mirrors the server's limits (internal/server/server.go
         // validateImageInputs).
@@ -4744,10 +4902,7 @@
             }
             const dir = dirInput.value;
             if (!dir) return;
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
-                showToast('Not connected', 'error');
-                return;
-            }
+            if (!ensureConnected()) return;
             // The working dir is workspace-global; the sessionId scopes the
             // cancel-then-lock to the requesting pane.
             ws.send(JSON.stringify({ type: 'config', workingDir: dir, sessionId: activePane().id }));
@@ -4972,10 +5127,7 @@
         }
 
         function newSession() {
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
-                showToast('Not connected', 'error');
-                return;
-            }
+            if (!ensureConnected()) return;
             if (resendAwaitingHistory) {
                 showToast('Resend already in progress', 'info');
                 return;
@@ -5001,10 +5153,7 @@
         }
 
         async function deleteSession(id, label) {
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
-                showToast('Not connected', 'error');
-                return;
-            }
+            if (!ensureConnected()) return;
             if (!id) return;
             if (resendAwaitingHistory) {
                 showToast('Resend already in progress', 'info');
@@ -5059,10 +5208,7 @@
         }
 
         function resumeSession(id) {
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
-                showToast('Not connected', 'error');
-                return;
-            }
+            if (!ensureConnected()) return;
             if (!id) return;
             if (resendAwaitingHistory) {
                 showToast('Resend already in progress', 'info');
@@ -6007,14 +6153,6 @@
         if (getNotificationPref() !== 'off') {
             requestNotificationPermission();
         }
-
-        // Delete approval: always notify since it requires user action
-        const _origShowDeleteApproval = showDeleteApproval;
-        showDeleteApproval = function _showDeleteApprovalNotify(data) {
-            _origShowDeleteApproval.call(null, data);
-            const paths = (data.paths || []).join(', ');
-            sendNotification('GoGen — Approval needed', `File delete requested: ${paths}`, 'gogen-delete-approval');
-        };
 
         // Create the initial pane (the server's default session). Its session
         // id arrives in the connect handshake's config and is adopted by the

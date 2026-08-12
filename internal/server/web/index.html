@@ -18,7 +18,7 @@
         <button type="button" id="settings-btn" title="Settings">⚙</button>
     </div>
     <div id="main-panes">
-        <div id="chat-pane" class="pane active">
+        <div class="pane active">
             <div id="sidebar">
                 <!-- Working directory: read-only display in project mode,
                      editable input + button only in global mode (app.js
@@ -46,7 +46,7 @@
                 <div id="messages" tabindex="-1"></div>
                 <button type="button" id="scroll-bottom-btn">↓ New messages</button>
                 <div id="composer-toolbar">
-                    <div id="tb-model-picker" class="tb-group">
+                    <div class="tb-group">
                         <button type="button" id="tb-model-btn" class="tb-btn" title="Select model">— <span class="tb-arrow">▾</span></button>
                         <div id="tb-model-popover" class="tb-popover">
                             <div class="tb-popover-section">
@@ -291,7 +291,7 @@
                         </select>
                     </div>
                 </div>
-                <div class="setting-row" id="accent-setting-row">
+                <div class="setting-row">
                     <div>
                         <label>Accent color</label>
                         <input type="color" id="accent-color-input" value="#569cd6" aria-label="Accent color">
