@@ -359,7 +359,10 @@ func handleTodo(_ context.Context, a *Agent, args map[string]interface{}) (strin
 		return tm.ListTodos(), nil
 	case "done":
 		id, err := intArgOptional(args, "id")
-		if err != nil || id == 0 {
+		if err != nil {
+			return "", err
+		}
+		if id == 0 {
 			return "", fmt.Errorf("missing required argument %q", "id")
 		}
 		out, err := tm.DoneTodo(id)
@@ -370,7 +373,10 @@ func handleTodo(_ context.Context, a *Agent, args map[string]interface{}) (strin
 		return out, nil
 	case "remove":
 		id, err := intArgOptional(args, "id")
-		if err != nil || id == 0 {
+		if err != nil {
+			return "", err
+		}
+		if id == 0 {
 			return "", fmt.Errorf("missing required argument %q", "id")
 		}
 		out, err := tm.RemoveTodo(id)

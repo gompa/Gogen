@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -894,6 +895,20 @@ func intArgOptional(args map[string]interface{}, key string) (int, error) {
 		return v, nil
 	case int64:
 		return int(v), nil
+	case string:
+		// Models sometimes quote numeric arguments (e.g. "id": "3").
+		// Coerce a string that parses as a plain integer; anything else
+		// (fractions, exponents, non-numeric text) still errors rather
+		// than silently becoming 0.
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return 0, fmt.Errorf("argument %q must be an integer", key)
+		}
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			return 0, fmt.Errorf("argument %q must be an integer", key)
+		}
+		return n, nil
 	default:
 		return 0, fmt.Errorf("argument %q must be an integer", key)
 	}
