@@ -1,4 +1,4 @@
-.PHONY: fmt tidy outdated update test test-debug vet staticcheck gocyclo vuln build-nocgo lint-web check
+.PHONY: fmt tidy outdated update test test-debug vet staticcheck gocyclo vuln build-nocgo lint-web test-web check
 
 fmt:
 	@unformatted=$$(gofmt -l .); \
@@ -63,7 +63,25 @@ build-nocgo:
 lint-web:
 	./scripts/lint-web.sh
 
+# Runs the hand-maintained web UI regression tests (scripts/test_*.js):
+# jsdom harnesses that load the REAL index.html + app.js (imports stubbed)
+# and drive tab switching, background-compact state, and queued
+# delete-approval Esc handling, plus the standalone state-machine tests.
+# Zero-dependency (plain node + jsdom from /tmp/gogen-jsdom); skipped when
+# node is unavailable so `make check` stays green on machines without it.
+test-web:
+	@if ! command -v node >/dev/null 2>&1; then \
+		echo "test-web: node not found — skipping web UI tests"; \
+		exit 0; \
+	fi
+	@fail=0; for f in scripts/test_*.js; do \
+		echo "== $$f"; \
+		if ! node "$$f"; then fail=1; fi; \
+	done; \
+	if [ $$fail -ne 0 ]; then echo "test-web: FAILED"; exit 1; fi; \
+	echo "test-web: all web UI tests passed"
+
 # Local full check (sequential even under make -j).
 # Does not auto-update deps — use 'make update' for that.
 check:
-	$(MAKE) -j1 fmt tidy test test-debug vet staticcheck vuln build-nocgo lint-web
+	$(MAKE) -j1 fmt tidy test test-debug vet staticcheck vuln build-nocgo lint-web test-web
