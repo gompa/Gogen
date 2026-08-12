@@ -599,7 +599,15 @@
             // catalog entry, which can still carry the cleared model.
             if (tbModelBtn) {
                 const name = model || '—';
-                tbModelBtn.innerHTML = name + ' <span class="tb-arrow">▾</span>';
+                // Model ids come from the provider catalog / user config:
+                // build the label with textContent (never innerHTML) so a
+                // crafted id cannot inject markup into the toolbar.
+                tbModelBtn.textContent = '';
+                tbModelBtn.appendChild(document.createTextNode(name + ' '));
+                const arrow = document.createElement('span');
+                arrow.className = 'tb-arrow';
+                arrow.textContent = '▾';
+                tbModelBtn.appendChild(arrow);
                 // Hover tooltip: models.dev description of the current model.
                 if (description) {
                     tbModelBtn.title = description;
@@ -1260,6 +1268,13 @@
                 case 'response':
                     pane.pendingSessionResponse = false;
                     pane.ignoreTurnEndsFor = null;
+                    // A response completes the pane's pending operation. The
+                    // active pane's handler clears the compacting flag here;
+                    // a compact that finishes while this pane is in the
+                    // background must do the same, or the restored state on
+                    // focus would block future compacts and mis-handle the
+                    // next normal response (toast + duplicate system message).
+                    pane.compacting = false;
                     // An error reply to the pane's own session change (e.g. a
                     // fork/new from a resend that failed) must cancel a
                     // pending resend like the active pane's Error branch does;
