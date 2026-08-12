@@ -23,7 +23,7 @@ func TestBuiltinToolNamesMatchSchemasAndHandlers(t *testing.T) {
 		"write_file",
 		"execute_command",
 		"replace_in_file",
-		"delete_file",
+		"delete",
 		"patch_file",
 		"show_diff",
 		"search_code",

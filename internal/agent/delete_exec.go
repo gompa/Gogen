@@ -31,10 +31,10 @@ func (e *Executor) DeleteFile(ctx context.Context, path string) (string, error) 
 			return "", err
 		}
 		if len(entries) > 0 {
-			return "", fmt.Errorf("directory %s is not empty (%d entries); delete_file only removes files and empty directories", path, len(entries))
+			return "", fmt.Errorf("directory %s is not empty (%d entries); delete only removes files and empty directories", path, len(entries))
 		}
 	}
-	if err := e.requireDeleteApproval(ctx, []string{path}, "delete_file"); err != nil {
+	if err := e.requireDeleteApproval(ctx, []string{path}, "delete"); err != nil {
 		return "", err
 	}
 	if err := os.Remove(secure); err != nil {

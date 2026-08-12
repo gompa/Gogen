@@ -399,7 +399,7 @@ The agent has access to the following tools:
 | `write_file` | Create a new file (refuses existing paths) |
 | `execute_command` | Run a shell command (with safety guardrails) |
 | `replace_in_file` | Replace a literal string in a file (optional `replace_all`) |
-| `delete_file` | Delete a file or empty directory (requires approval; non-empty directories refused) |
+| `delete` | Delete a file or empty directory (requires approval; non-empty directories refused) |
 | `patch_file` | Apply surgical unified diff(s) (preferred; `dry_run`, `fuzzy`) |
 | `show_diff` | Show git diff (working tree or path) |
 | `search_code` | Regex/literal search across the codebase (optional `context_lines`) |

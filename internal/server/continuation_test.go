@@ -263,7 +263,7 @@ func TestCancelFromNewConnectionStopsHeadlessTurn(t *testing.T) {
 // "not approved" tool result instead of hanging.
 func TestApprovalAutoDeniedOnDetach(t *testing.T) {
 	dir := t.TempDir()
-	// delete_file Lstats the target before asking for approval, so the file
+	// delete Lstats the target before asking for approval, so the file
 	// must exist for the approval request to fire.
 	victim := filepath.Join(dir, "victim.txt")
 	if err := os.WriteFile(victim, []byte("data"), 0o644); err != nil {
@@ -272,7 +272,7 @@ func TestApprovalAutoDeniedOnDetach(t *testing.T) {
 	stub := newBlockingStub()
 	stub.firstTools = []llm.ToolCall{{
 		ID:   "call_del",
-		Name: "delete_file",
+		Name: "delete",
 		Args: map[string]interface{}{"path": "victim.txt"},
 	}}
 	s, a, _ := newContinuationServer(t, stub, dir)

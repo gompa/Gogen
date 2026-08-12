@@ -243,7 +243,7 @@ func handlePatchFile(ctx context.Context, a *Agent, args map[string]interface{})
 	return a.Executor.PatchFile(ctx, diff, dryRun, fuzzy)
 }
 
-func handleDeleteFile(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleDelete(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
 	path, err := stringArg(args, "path")
 	if err != nil {
 		return "", err

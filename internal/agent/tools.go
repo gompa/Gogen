@@ -181,11 +181,11 @@ var builtinToolDefs = []ToolDef{
 		MutatesFS: true,
 	},
 	{
-		Definition: toolDef("delete_file", "Delete a file or EMPTY directory (requires approval); not for replacing content — edit in place. Non-empty directories are refused.",
+		Definition: toolDef("delete", "Delete a file or EMPTY directory (requires approval); not for replacing content — edit in place. Non-empty directories are refused.",
 			toolSchema(map[string]interface{}{
 				"path": toolProp("string", "File path"),
 			}, "path")),
-		Handler:   handleDeleteFile,
+		Handler:   handleDelete,
 		MutatesFS: true,
 	},
 	{

@@ -202,7 +202,7 @@ func runSinglePrompt(ctx context.Context, a *agent.Agent, prompt string, cfg *co
 	if strings.EqualFold(cfg.DeleteApproval, "off") {
 		a.Executor.RequireDeleteApproval = false
 	} else if a.Executor.RequireDeleteApproval {
-		fmt.Fprintf(os.Stderr, "Note: delete_file requires approval (delete_approval: %s) and is blocked in single-prompt mode; set GOGEN_DELETE_APPROVAL=off to allow deletes.\n", cfg.DeleteApproval)
+		fmt.Fprintf(os.Stderr, "Note: delete requires approval (delete_approval: %s) and is blocked in single-prompt mode; set GOGEN_DELETE_APPROVAL=off to allow deletes.\n", cfg.DeleteApproval)
 	}
 
 	// Start a fresh session: clear any restored conversation state.

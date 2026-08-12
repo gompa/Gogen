@@ -39,13 +39,13 @@ func startHoldWSServer(t *testing.T, s *Server) *httptest.Server {
 }
 
 // startDeleteApprovalTurn begins a turn whose first round returns a
-// delete_file tool call, waits for the broadcast delete_approval, and
+// delete tool call, waits for the broadcast delete_approval, and
 // returns the approval message.
 func startDeleteApprovalTurn(t *testing.T, stub *blockingStub, conn *websocket.Conn, path string) WSMessage {
 	t.Helper()
 	stub.firstTools = []llm.ToolCall{{
 		ID:   "call_del",
-		Name: "delete_file",
+		Name: "delete",
 		Args: map[string]interface{}{"path": path},
 	}}
 	if err := conn.WriteJSON(WSMessage{Type: "message", Content: "delete it"}); err != nil {
