@@ -244,6 +244,9 @@
             if (pendingDeleteApprovals.length) {
                 // More approvals queued — show the next one.
                 renderDeleteApproval(pendingDeleteApprovals[0]);
+                // The keydown listener was removed above; re-arm it so Esc
+                // keeps resolving queued approvals too.
+                deleteOverlay.addEventListener('keydown', deleteApprovalEsc);
             } else {
                 inputArea.disabled = false;
                 sendBtn.disabled = false;
