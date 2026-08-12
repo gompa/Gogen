@@ -3,8 +3,8 @@ package agent
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -208,11 +208,13 @@ func TestBackgroundJobReapedAfterRetention(t *testing.T) {
 // TestFinishedJobCapReapsOldest verifies the finished-job cap: when a job
 // finishes over the cap, the OLDEST finished jobs are reaped immediately
 // (their status becomes "unknown"), so a burst of short-lived jobs cannot
-// pile up during the retention window. Finish order is recorded from each
-// job's done channel (process-exit order) instead of assuming the sleep
-// durations serialize reliably on every platform (wall-clock order drifted
-// on macOS CI); the cap must reap the first two finishers and keep the last
-// three registered.
+// pile up during the retention window. Finish order is taken from each
+// job's finishedAt — the same timestamp the cap sorts by — instead of
+// assuming the sleep durations serialize reliably (wall-clock order drifted
+// on macOS CI, and on Windows the sleeps are effectively instantaneous, so
+// processes exit within milliseconds of each other and goroutine wake-up
+// order diverges from exit order). The cap must reap the first two
+// finishers and keep the last three registered.
 func TestFinishedJobCapReapsOldest(t *testing.T) {
 	exec := NewExecutor(t.TempDir())
 	a := NewAgent(nil, exec, nil)
@@ -238,51 +240,63 @@ func TestFinishedJobCapReapsOldest(t *testing.T) {
 		jobs = append(jobs, job)
 	}
 
-	// Record the finish order from the done channels (closed when each
-	// process exits), so the assertions match the cap's own ordering rather
-	// than depending on the sleeps' wall-clock precision.
-	var orderMu sync.Mutex
-	finishOrder := make([]string, 0, len(jobs))
+	// Wait until every process has exited (done closes in the wait
+	// goroutine after cmd.Wait returns).
+	allDone := make(chan struct{}, len(jobs))
 	for _, job := range jobs {
 		job := job
 		go func() {
 			<-job.done
-			orderMu.Lock()
-			finishOrder = append(finishOrder, job.ID)
-			orderMu.Unlock()
+			allDone <- struct{}{}
 		}()
 	}
 	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		orderMu.Lock()
-		settled := len(finishOrder) == len(jobs)
-		orderMu.Unlock()
-		if settled {
-			break
+	for i := 0; i < len(jobs); i++ {
+		select {
+		case <-allDone:
+		case <-time.After(time.Until(deadline)):
+			t.Fatalf("only %d of %d jobs finished within the deadline", i, len(jobs))
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
-	orderMu.Lock()
-	finished := append([]string(nil), finishOrder...)
-	orderMu.Unlock()
-	if len(finished) != len(jobs) {
-		t.Fatalf("only %d of %d jobs finished within the deadline", len(finished), len(jobs))
+
+	// Build the finish order from finishedAt — set under job.mu immediately
+	// before done closes, and the exact key enforceFinishedJobCap sorts by —
+	// so the assertion matches the cap's ordering even when processes exit
+	// within milliseconds of each other (Windows: sleeps are effectively
+	// instantaneous, so exit order follows spawn order, not sleep duration).
+	type finisher struct {
+		id string
+		at time.Time
 	}
+	finished := make([]finisher, 0, len(jobs))
+	for _, job := range jobs {
+		job.mu.Lock()
+		at := job.finishedAt
+		job.mu.Unlock()
+		finished = append(finished, finisher{id: job.ID, at: at})
+	}
+	sort.Slice(finished, func(i, j int) bool { return finished[i].at.Before(finished[j].at) })
 
 	// The cap reaps as jobs finish: the first finisher is reaped when the
 	// fourth finisher's enforcement runs, and the second finisher when the
 	// fifth's does. Wait until BOTH reaps have been processed before
 	// asserting the survivors.
+	settled := false
 	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		_, err0 := a.BackgroundJobStatus(finished[0])
-		_, err1 := a.BackgroundJobStatus(finished[1])
+		_, err0 := a.BackgroundJobStatus(finished[0].id)
+		_, err1 := a.BackgroundJobStatus(finished[1].id)
 		if err0 != nil && err1 != nil && strings.Contains(err0.Error(), "unknown background job") && strings.Contains(err1.Error(), "unknown background job") {
+			settled = true
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	for i, id := range finished {
+	if !settled {
+		t.Fatal("cap reaping did not settle within 5s")
+	}
+	for i, f := range finished {
+		id := f.id
 		s, err := a.BackgroundJobStatus(id)
 		if i < 2 {
 			// The first two finishers exceed the cap: reaped immediately.

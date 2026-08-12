@@ -198,17 +198,37 @@ func TestTurnContinuesAfterDisconnect(t *testing.T) {
 	// from the (cancelled) request context, StreamProcessInput would abort
 	// and the assistant reply would never be appended.
 	stub.releaseN(1)
+	// Wait for the headless turn to FULLY complete. Persistence alone is not
+	// enough: StreamProcessInput flushes the reply to the store BEFORE the
+	// turn goroutine's deferred cleanup runs, and that cleanup is what
+	// clears turnActive (turn_end broadcast → setTurnActive(false) →
+	// unlock). A fresh attach in the window between the flush and the
+	// cleanup would still see turnActive=true — under -race or a loaded
+	// runner the goroutine can be descheduled there for long enough to hit
+	// it. The runtime may also be orphan-evicted right after the turn ends
+	// (no attached clients); the attach then reloads the session from disk,
+	// which reports turnActive=false by construction.
 	waitFor(t, 10*time.Second, func() bool {
 		snap, err := store.LoadInWorkingDir(dir, a.SessionID)
 		if err != nil {
 			return false
 		}
+		found := false
 		for _, m := range snap.Messages {
 			if m.Role == "assistant" && m.Content == "headless-done" {
-				return true
+				found = true
+				break
 			}
 		}
-		return false
+		if !found {
+			return false
+		}
+		rt, ok := s.registry.get(a.SessionID)
+		if !ok {
+			return true // completed turn's runtime was orphan-evicted; attach reloads from disk
+		}
+		active, _ := rt.turnState()
+		return !active
 	})
 
 	// A fresh connection re-attaches: session_state arrives, then history
