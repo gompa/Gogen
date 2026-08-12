@@ -12,7 +12,10 @@ var (
 	ErrDeleteApprovalRequired = errors.New("delete blocked: approval is required")
 )
 
-// DeleteFile removes a file after user approval when required.
+// DeleteFile removes a file, or an EMPTY directory, after user approval
+// when required. Non-empty directories are refused: recursive deletion is
+// deliberately out of scope — delete the contents first, or use
+// execute_command's guarded shell for a bulk removal.
 func (e *Executor) DeleteFile(ctx context.Context, path string) (string, error) {
 	secure, err := e.SecurePath(path)
 	if err != nil {
@@ -23,7 +26,13 @@ func (e *Executor) DeleteFile(ctx context.Context, path string) (string, error) 
 		return "", err
 	}
 	if info.IsDir() {
-		return "", fmt.Errorf("path is a directory; delete_file only removes files")
+		entries, err := os.ReadDir(secure)
+		if err != nil {
+			return "", err
+		}
+		if len(entries) > 0 {
+			return "", fmt.Errorf("directory %s is not empty (%d entries); delete_file only removes files and empty directories", path, len(entries))
+		}
 	}
 	if err := e.requireDeleteApproval(ctx, []string{path}, "delete_file"); err != nil {
 		return "", err
