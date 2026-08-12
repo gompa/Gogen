@@ -58,7 +58,7 @@ type Store struct {
 // StoreOptions configures retention for persisted sessions.
 type StoreOptions struct {
 	MaxCount   int // keep at most this many sessions (0 = config.DefaultSessionMaxCount)
-	MaxAgeDays int // drop sessions older than this many days (0 = config.DefaultSessionMaxAgeDays)
+	MaxAgeDays int // drop sessions older than this many days (0 = config.DefaultSessionMaxAgeDays, negative = keep forever)
 }
 
 // NewStore creates a session store with default retention.
@@ -89,6 +89,11 @@ func (s *Store) SetAutoPrune(enabled bool) {
 func NewStoreWithOptions(enabled bool, opts StoreOptions) *Store {
 	maxCount := config.Effective(opts.MaxCount, config.DefaultSessionMaxCount)
 	maxAge := config.Effective(opts.MaxAgeDays, config.DefaultSessionMaxAgeDays)
+	if opts.MaxAgeDays < 0 {
+		// Negative disables age-based retention ("keep sessions forever");
+		// 0 still means the default via config.Effective.
+		maxAge = -1
+	}
 	return &Store{enabled: enabled, maxCount: maxCount, maxAgeDays: maxAge, createdCache: make(map[string]time.Time), autoPrune: true}
 }
 

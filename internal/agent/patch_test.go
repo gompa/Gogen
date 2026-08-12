@@ -134,11 +134,11 @@ func TestApplyPatchHunksFuzzyPastEOF(t *testing.T) {
 		oldLines: []string{"func main() {", "}"},
 		newLines: []string{"func main() {", "\t// hi", "}"},
 	}}
-	_, _, err := applyPatchHunks(original, hunks, false)
+	_, _, _, err := applyPatchHunks(original, hunks, false, true)
 	if err == nil {
 		t.Fatal("expected strict apply to fail with stale line numbers")
 	}
-	got, shifts, err := applyPatchHunks(original, hunks, true)
+	got, _, shifts, err := applyPatchHunks(original, hunks, true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -666,7 +666,7 @@ func TestApplyPatchHunksFuzzyAmbiguousRelocationRefused(t *testing.T) {
 		oldLines: []string{"func one() {", "}"},
 		newLines: []string{"func one() {", "\t// hi", "}"},
 	}}
-	_, _, err := applyPatchHunks(original, hunks, true)
+	_, _, _, err := applyPatchHunks(original, hunks, true, true)
 	if err == nil {
 		t.Fatal("expected ambiguous fuzzy relocation to fail")
 	}
@@ -676,7 +676,7 @@ func TestApplyPatchHunksFuzzyAmbiguousRelocationRefused(t *testing.T) {
 
 	// The same hunk against a single matching block still relocates cleanly.
 	single := []string{"func one() {   ", "}"}
-	got, shifts, err := applyPatchHunks(single, hunks, true)
+	got, _, shifts, err := applyPatchHunks(single, hunks, true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -870,7 +870,7 @@ func TestApplyPatchHunksPrefersFuzzyAtHintOverDistantExact(t *testing.T) {
 		oldLines: []string{"func b() {", "}"},
 		newLines: []string{"func b() {", "\t// changed", "}"},
 	}}
-	got, shifts, err := applyPatchHunks(original, hunks, true)
+	got, _, shifts, err := applyPatchHunks(original, hunks, true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -900,7 +900,7 @@ func TestApplyPatchHunksShiftMessageReportsActualLocation(t *testing.T) {
 		oldLines: []string{"func main() {", "}"},
 		newLines: []string{"func main() {", "\t// hi", "}"},
 	}}
-	_, shifts, err := applyPatchHunks(original, hunks, true)
+	_, _, shifts, err := applyPatchHunks(original, hunks, true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1253,5 +1253,160 @@ func TestPatchFailStreakIgnoresNonMismatchErrors(t *testing.T) {
 		t.Fatal("expected mismatch patch to fail again")
 	} else if !strings.Contains(err.Error(), "failed 2 times in a row") {
 		t.Fatalf("expected streak hint after two mismatches, got: %v", err)
+	}
+}
+
+// TestParseUnifiedDiffDroppedOldHeader: a "+++ " header inside a hunk body
+// (the next file's header with its "--- " dropped) must start a new file
+// section instead of overwriting the current file's newName and merging the
+// two files' hunks into one patchFile.
+func TestParseUnifiedDiffDroppedOldHeader(t *testing.T) {
+	diff := "" +
+		"--- a/foo.txt\n" +
+		"+++ b/foo.txt\n" +
+		"@@ -1 +1 @@\n" +
+		"-x\n" +
+		"+y\n" +
+		"+++ b/bar.txt\n" + // --- header for bar.txt was dropped
+		"@@ -1 +1 @@\n" +
+		"-a\n" +
+		"+b\n"
+	files, err := parseUnifiedDiff(diff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("expected 2 patchFiles, got %d: %+v", len(files), files)
+	}
+	if files[0].oldName != "a/foo.txt" || files[0].newName != "b/foo.txt" {
+		t.Fatalf("file 0 headers wrong: %+v", files[0])
+	}
+	if files[1].oldName != "" || files[1].newName != "b/bar.txt" {
+		t.Fatalf("file 1 headers wrong: %+v", files[1])
+	}
+	if len(files[0].hunks) != 1 || len(files[1].hunks) != 1 {
+		t.Fatalf("expected one hunk per file, got %d and %d", len(files[0].hunks), len(files[1].hunks))
+	}
+}
+
+// TestParseUnifiedDiffRepeatedPlusPlusSameFile: a repeated "+++ " for the
+// current file between hunks keeps collecting hunks into the same section
+// (the model re-emitted the header rather than starting a new file).
+func TestParseUnifiedDiffRepeatedPlusPlusSameFile(t *testing.T) {
+	diff := "" +
+		"--- a/foo.txt\n" +
+		"+++ b/foo.txt\n" +
+		"@@ -1,1 +1,2 @@\n" +
+		" one\n" +
+		"+two\n" +
+		"+++ b/foo.txt\n" + // duplicate header for the same file
+		"@@ -2,1 +2,2 @@\n" +
+		" two\n" +
+		"+three\n"
+	files, err := parseUnifiedDiff(diff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("expected 1 patchFile, got %d: %+v", len(files), files)
+	}
+	if len(files[0].hunks) != 2 {
+		t.Fatalf("expected 2 hunks merged into one file, got %d", len(files[0].hunks))
+	}
+}
+
+// TestApplyPatchHunksTrailingNewline covers the trailing-newline state:
+// a file without a final newline keeps that state when the last line is
+// untouched or carries the marker, and gains a newline when a normal line
+// is appended at EOF.
+func TestApplyPatchHunksTrailingNewline(t *testing.T) {
+	cases := []struct {
+		name             string
+		original         []string
+		originalTrailing bool
+		hunks            []patchHunk
+		wantOut          []string
+		wantNoNewline    bool
+	}{
+		{
+			name:             "preserve no trailing newline when last line untouched",
+			original:         []string{"line1", "line3"},
+			originalTrailing: false,
+			hunks: []patchHunk{{
+				oldStart: 1,
+				oldLines: []string{"line1"},
+				newLines: []string{"line1", "line2"},
+			}},
+			wantOut:       []string{"line1", "line2", "line3"},
+			wantNoNewline: true,
+		},
+		{
+			name:             "marker on added line at EOF removes trailing newline",
+			original:         []string{"line1", "line2"},
+			originalTrailing: true,
+			hunks: []patchHunk{{
+				oldStart:     2,
+				oldLines:     []string{"line2"},
+				newLines:     []string{"line2b"},
+				newNoNewline: true,
+			}},
+			wantOut:       []string{"line1", "line2b"},
+			wantNoNewline: true,
+		},
+		{
+			name:             "appending a normal line at EOF adds trailing newline",
+			original:         []string{"line1"},
+			originalTrailing: false,
+			hunks: []patchHunk{{
+				oldStart: 1,
+				oldLines: []string{"line1"},
+				newLines: []string{"line1", "line2"},
+			}},
+			wantOut:       []string{"line1", "line2"},
+			wantNoNewline: false,
+		},
+		{
+			name:             "insertion before EOF keeps original trailing state",
+			original:         []string{"a", "b"},
+			originalTrailing: false,
+			hunks: []patchHunk{{
+				oldStart: 1,
+				oldLines: nil,
+				newLines: []string{"x"},
+			}},
+			wantOut:       []string{"x", "a", "b"},
+			wantNoNewline: true,
+		},
+		{
+			name:             "deleting the file tail newline-terminates the previous line",
+			original:         []string{"a", "b"},
+			originalTrailing: false,
+			hunks: []patchHunk{{
+				oldStart: 2,
+				oldLines: []string{"b"},
+				newLines: nil,
+			}},
+			wantOut:       []string{"a"},
+			wantNoNewline: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, noNewline, _, err := applyPatchHunks(tc.original, tc.hunks, true, tc.originalTrailing)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if noNewline != tc.wantNoNewline {
+				t.Fatalf("noNewline = %v, want %v (got %q)", noNewline, tc.wantNoNewline, got)
+			}
+			if len(got) != len(tc.wantOut) {
+				t.Fatalf("got %q, want %q", got, tc.wantOut)
+			}
+			for i := range tc.wantOut {
+				if got[i] != tc.wantOut[i] {
+					t.Fatalf("line %d = %q, want %q", i, got[i], tc.wantOut[i])
+				}
+			}
+		})
 	}
 }

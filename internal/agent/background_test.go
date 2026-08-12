@@ -46,9 +46,10 @@ func TestBackgroundCommandLifecycle(t *testing.T) {
 	if !strings.Contains(status, "hello-background") {
 		t.Fatalf("expected output in status, got: %s", status)
 	}
-	// A reaped job reports unknown (the reaper removes it from the registry).
-	// Wait briefly for the reaper, then allow either outcome: the reaper may
-	// not have run yet, in which case the status is still FINISHED.
+	// The default retention window (5m) keeps the finished job registered,
+	// so the status is FINISHED. A job whose window already elapsed (a very
+	// slow runner, or a test that shortened bgRetain) reports "unknown"
+	// instead — both are correct reaper outcomes.
 	if s, err := a.BackgroundJobStatus(id); err != nil && !strings.Contains(err.Error(), "unknown background job") {
 		t.Fatalf("unexpected error after finish: %v", err)
 	} else if err == nil && !strings.Contains(s, "FINISHED") {
@@ -91,7 +92,7 @@ func TestBackgroundJobCancel(t *testing.T) {
 	for time.Now().Before(deadline) {
 		status, err = a.BackgroundJobStatus(id)
 		if err != nil && strings.Contains(err.Error(), "unknown background job") {
-			// Reaped after cancel — also acceptable.
+			// Reaped (retention/cap) after cancel — also acceptable.
 			return
 		}
 		if err != nil {
@@ -158,5 +159,99 @@ func TestCloseKillsBackgroundJobs(t *testing.T) {
 	status, err := a.BackgroundJobStatus(id)
 	if err == nil && !strings.Contains(status, "CANCELLED") {
 		t.Fatalf("unexpected status after Close: %s", status)
+	}
+}
+
+// TestBackgroundJobReapedAfterRetention verifies the reaper: a finished job
+// stays registered for the retention window (status FINISHED, so the model
+// can still poll exit code + output), then is removed (status "unknown"), so
+// a long-lived session cannot accumulate finished jobs and their output
+// tails without bound.
+func TestBackgroundJobReapedAfterRetention(t *testing.T) {
+	exec := NewExecutor(t.TempDir())
+	a := NewAgent(nil, exec, nil)
+	defer a.Close()
+	a.bgRetain = 50 * time.Millisecond
+
+	id, err := a.StartBackgroundCommand("echo reaped-soon")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	// The job must first be reported FINISHED (retention window active)...
+	for time.Now().Before(deadline) {
+		s, err := a.BackgroundJobStatus(id)
+		if err != nil {
+			t.Fatalf("status before reaping: %v", err)
+		}
+		if strings.Contains(s, "FINISHED") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// ...then reaped after the window: status becomes "unknown".
+	for time.Now().Before(deadline) {
+		_, err := a.BackgroundJobStatus(id)
+		if err != nil && strings.Contains(err.Error(), "unknown background job") {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("job was not reaped within the retention window")
+}
+
+// TestFinishedJobCapReapsOldest verifies the finished-job cap: when a job
+// finishes over the cap, the OLDEST finished jobs are reaped immediately
+// (their status becomes "unknown"), so a burst of short-lived jobs cannot
+// pile up during the retention window. Finish order is forced with distinct
+// sleep durations: the longest sleep finishes last and is the most recent
+// finisher, so it must survive.
+func TestFinishedJobCapReapsOldest(t *testing.T) {
+	exec := NewExecutor(t.TempDir())
+	a := NewAgent(nil, exec, nil)
+	defer a.Close()
+	a.bgMaxFinished = 3
+
+	// Finish order: job 5 (sleep 0.01) first, ..., job 1 (sleep 0.05) last.
+	// Cap enforcement when job 2 finishes reaps job 5; when job 1 finishes
+	// it reaps job 4 — jobs 1-3 stay registered.
+	sleeps := []string{"0.05", "0.04", "0.03", "0.02", "0.01"}
+	ids := make([]string, len(sleeps))
+	for i, s := range sleeps {
+		id, err := a.StartBackgroundCommand("sleep " + s)
+		if err != nil {
+			t.Fatalf("start %d: %v", i, err)
+		}
+		ids[i] = id
+	}
+
+	// Wait until every job has settled (finished or reaped).
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		settled := true
+		for _, id := range ids {
+			if s, err := a.BackgroundJobStatus(id); err == nil && strings.Contains(s, "RUNNING") {
+				settled = false
+			}
+		}
+		if settled {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for i, id := range ids {
+		s, err := a.BackgroundJobStatus(id)
+		if i < 3 {
+			// Jobs 1-3 are the most recent finishers: still registered.
+			if err != nil || !strings.Contains(s, "FINISHED") {
+				t.Fatalf("job %d should still be registered as finished; status=%q err=%v", i+1, s, err)
+			}
+		} else {
+			// Jobs 4-5 finished first: reaped by the cap.
+			if err == nil || !strings.Contains(err.Error(), "unknown background job") {
+				t.Fatalf("job %d should have been reaped; status=%q err=%v", i+1, s, err)
+			}
+		}
 	}
 }

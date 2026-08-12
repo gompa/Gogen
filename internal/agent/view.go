@@ -40,7 +40,12 @@ func (a *Agent) prepareMessages(ctx context.Context, h *llm.StreamHandlers) []ll
 				if a.PinManager != nil {
 					pinned = a.PinManager.PinnedSet()
 				}
-				compacted, newPins, err := a.Context.CompactPinned(ctx, a.systemPromptPrefix(), a.Messages, pinned)
+				// Pass the cached per-message counts so the summarization
+				// request can be sized without re-tokenizing the middle.
+				a.statsMu.RLock()
+				counts := append([]int(nil), a.tokenCounts...)
+				a.statsMu.RUnlock()
+				compacted, newPins, err := a.Context.CompactPinned(ctx, a.systemPromptPrefix(), a.Messages, counts, pinned)
 				if err == nil {
 					// Compute the post-compaction counts BEFORE publishing —
 					// the conversation just shrank, so counting it is cheap —
@@ -88,10 +93,21 @@ func (a *Agent) prepareMessages(ctx context.Context, h *llm.StreamHandlers) []ll
 // canonical history on the wire (the view minus a.Messages). CompactPinned
 // prepends these to the summarization request so the conversation prefix is
 // byte-identical to the previous turn and provider prompt caching applies.
+// Built without copying the history: the prefix is either empty (the history
+// already carries a system message that buildSystemView enriches in place)
+// or the single prepended system message.
 func (a *Agent) systemPromptPrefix() []llm.Message {
 	if len(a.Messages) == 0 {
 		return nil
 	}
-	view := buildSystemView(a.Messages, a.WorkingDir, a.ProjectFilePath, a.ProjectGuidelines, a.ensureProjectProfile(), a.Mode)
-	return view[:len(view)-len(a.Messages)]
+	for _, m := range a.Messages {
+		if m.Role == "system" {
+			return nil
+		}
+	}
+	return []llm.Message{{
+		Role: "system",
+		Content: SystemPrompt(a.WorkingDir) +
+			buildSystemSuffix(a.ProjectFilePath, a.ProjectGuidelines, a.ensureProjectProfile(), a.Mode),
+	}}
 }

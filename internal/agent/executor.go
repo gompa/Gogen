@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -186,13 +187,20 @@ func (e *Executor) readWithRegexSearch(secure string, offset, limit int, search 
 					break
 				}
 			}
-			for sc.Scan() {
-				lineNum++
+			// Count the remaining lines for the "of Z lines" header. For
+			// large files the drain would read the entire rest of the file
+			// just to report a total — defeating the offset/limit design —
+			// so it is skipped and the header reports a lower bound.
+			totalLines := -1
+			if info, err := f.Stat(); err == nil && info.Size() <= searchMaxFileBytes {
+				for sc.Scan() {
+					lineNum++
+				}
+				totalLines = lineNum
 			}
 			if err := sc.Err(); err != nil {
-				return "", err
+				return "", scannerError(err)
 			}
-			totalLines := lineNum
 
 			selected := append(before, after...)
 			startLine := matchLine - len(before)
@@ -204,9 +212,16 @@ func (e *Executor) readWithRegexSearch(secure string, offset, limit int, search 
 				body = formatWithLineNumbers(selected, startLine)
 			}
 
-			out := fmt.Sprintf("Lines %d-%d of %d (matched %q at line %d)\n%s",
-				startLine, startLine+len(selected)-1, totalLines, search, matchLine,
-				body)
+			out := ""
+			if totalLines < 0 {
+				out = fmt.Sprintf("Lines %d-%d of %d+ (matched %q at line %d; file larger than %s, total line count omitted)\n%s",
+					startLine, startLine+len(selected)-1, lineNum, search, matchLine,
+					formatByteSize(searchMaxFileBytes), body)
+			} else {
+				out = fmt.Sprintf("Lines %d-%d of %d (matched %q at line %d)\n%s",
+					startLine, startLine+len(selected)-1, totalLines, search, matchLine,
+					body)
+			}
 			if header != "" {
 				out = header + out
 			}
@@ -219,12 +234,23 @@ func (e *Executor) readWithRegexSearch(secure string, offset, limit int, search 
 		}
 	}
 	if err := sc.Err(); err != nil {
-		return "", err
+		return "", scannerError(err)
 	}
 	if lineNum == 0 {
 		return "File is empty", nil
 	}
 	return "", fmt.Errorf("pattern %q not found in file (%d lines)", search, lineNum)
+}
+
+// scannerError translates opaque bufio.Scanner failures into actionable
+// messages. A single line longer than the scanner buffer cap (10 MB) fails
+// the whole scan with bufio.ErrTooLong; report it as a size limit instead of
+// the raw scanner error.
+func scannerError(err error) error {
+	if errors.Is(err, bufio.ErrTooLong) {
+		return fmt.Errorf("file contains a line longer than the 10 MB scanner limit; read_file search cannot scan it")
+	}
+	return err
 }
 
 func (e *Executor) readWithLineRange(secure string, offset, limit int, lineNumbers bool, header string) (string, error) {
@@ -275,7 +301,10 @@ func (e *Executor) readWithLineRange(secure string, offset, limit int, lineNumbe
 		return "", err
 	}
 	totalLines := lineNum
-	if totalLines == 0 {
+	// Offset past the last line (start >= 1, so this also covers empty
+	// files, where totalLines == 0): report it instead of returning an
+	// empty result that is indistinguishable from an empty file.
+	if start > totalLines {
 		msg := fmt.Sprintf("File has %d lines; offset %d is past end.", totalLines, start)
 		if header != "" {
 			return header + msg, nil

@@ -83,6 +83,15 @@ type Agent struct {
 	// closes (Close) or individually via background_job (action=cancel).
 	bgMu   sync.Mutex
 	bgJobs map[string]*BackgroundJob
+	// bgRetain is how long a finished background job stays registered for
+	// status polling before the reaper removes it (0 = the
+	// defaultBackgroundJobRetain window). Read only from the job's wait
+	// goroutine; tests set it before starting jobs.
+	bgRetain time.Duration
+	// bgMaxFinished caps how many finished jobs stay registered at once
+	// (0 = defaultMaxFinishedBackgroundJobs); when a job finishes over the
+	// cap, the oldest finished jobs are reaped immediately.
+	bgMaxFinished int
 
 	// statsMu serializes the agent state that ContextStats/SnapshotMessages
 	// read without the session turnMu: Messages, the cached token counts
@@ -520,7 +529,10 @@ func (a *Agent) CompactHistory(ctx context.Context) error {
 	if len(a.Messages) <= a.Context.Settings.CompactKeepRecentMessages+1 {
 		return fmt.Errorf("not enough history to compact (%d messages)", len(a.Messages))
 	}
-	compacted, newPins, err := a.Context.CompactPinned(ctx, a.systemPromptPrefix(), a.Messages, pinnedSet(a.PinManager))
+	a.statsMu.RLock()
+	cachedCounts := append([]int(nil), a.tokenCounts...)
+	a.statsMu.RUnlock()
+	compacted, newPins, err := a.Context.CompactPinned(ctx, a.systemPromptPrefix(), a.Messages, cachedCounts, pinnedSet(a.PinManager))
 	if err != nil {
 		return err
 	}

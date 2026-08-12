@@ -458,6 +458,13 @@ func prefixRelPaths(body, relPrefix string) string {
 			b.WriteByte('\n')
 			continue
 		}
+		// ripgrep's context separator ("--") is not a path; pass it through
+		// unchanged so compactSearchOutput still recognizes it.
+		if line == "--" {
+			b.WriteString(line)
+			b.WriteByte('\n')
+			continue
+		}
 		idx := strings.IndexByte(line, ':')
 		if idx <= 0 {
 			b.WriteString(filepath.ToSlash(filepath.Join(relPrefix, line)))
@@ -508,7 +515,11 @@ func (e *Executor) searchWithGo(ctx context.Context, searchRoot, relPrefix, patt
 	err := walkSearchableFiles(ctx, searchRoot, relPrefix, pattern, glob, func(path, rel string, re *regexp.Regexp) bool {
 		limit := searchMaxMatches - len(matches)
 		if limit <= 0 {
-			return false
+			// Match cap reached: stop the walk (visit returning true is
+			// converted to errSearchWalkStop and swallowed by the walker)
+			// and report the truncation so the footer is emitted.
+			truncated = true
+			return true
 		}
 		reader, closer, binary, err := openSearchableFile(path)
 		if err != nil {
@@ -560,7 +571,11 @@ func (e *Executor) searchWithGoMatches(ctx context.Context, searchRoot, relPrefi
 	err := walkSearchableFiles(ctx, searchRoot, relPrefix, pattern, glob, func(path, rel string, re *regexp.Regexp) bool {
 		limit := searchMaxMatches - len(matches)
 		if limit <= 0 {
-			return false
+			// Match cap reached: stop the walk (visit returning true is
+			// converted to errSearchWalkStop and swallowed by the walker)
+			// and report the truncation to callers.
+			truncated = true
+			return true
 		}
 		reader, closer, binary, err := openSearchableFile(path)
 		if err != nil {
@@ -652,66 +667,111 @@ func compileSearchPattern(pattern string) (*regexp.Regexp, error) {
 // which already includes the binary probe), finds matches, and emits results
 // with context lines (contextLines > 0). The context-free case is handled by
 // scanFileMatches.
+//
+// The scan is streaming: only a ring of the last contextLines lines plus the
+// match list are held in memory, instead of buffering the whole file. A line
+// j is emitted once no future match can mark it: a match at m marks lines
+// m-contextLines..m+contextLines, so once the reader is past j+contextLines
+// (j has left the ring), its status is final and is computed from the matches
+// seen so far. Output is byte-identical to the two-pass buffered version,
+// and the scan stops right after the matchLimit-th window is emitted.
 func scanFileSinglePass(r io.Reader, relPath string, re *regexp.Regexp, contextLines, matchLimit int) ([]string, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), searchMaxFileBytes)
 
-	// Context-lines path: store lines to support before/after context.
-	var lines []string
+	c := contextLines
+	if c < 0 {
+		c = 0
+	}
+	ring := make([]string, c)
+	ringPos := 0
+	ringFull := false
+	var matchNums []int
+	var out []string
 	lineNum := 0
+	// lo is a sliding pointer over the sorted matchNums; emitted line
+	// numbers are strictly increasing, so it only moves forward.
+	lo := 0
+
+	// emit reports line j if it lies inside a match window; by the time it
+	// is called, every match that can affect j has already been recorded.
+	// The ':' separator is used for every emitted line, matching the original
+	// two-pass formatter (whose '-' branch was unreachable: any unmarked
+	// line in a window was set to ':').
+	emit := func(j int, line string) {
+		for lo < len(matchNums) && matchNums[lo] < j-c {
+			lo++
+		}
+		if lo >= len(matchNums) || matchNums[lo] > j+c {
+			return
+		}
+		out = append(out, fmt.Sprintf("%s:%d:%s", relPath, j, line))
+	}
+
+	if c == 0 {
+		// No context requested: emit match lines as they are found.
+		for scanner.Scan() {
+			lineNum++
+			if re.MatchString(scanner.Text()) {
+				matchNums = append(matchNums, lineNum)
+				emit(lineNum, scanner.Text())
+				if len(matchNums) >= matchLimit {
+					break
+				}
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			return nil, err
+		}
+		if len(matchNums) == 0 {
+			return nil, nil
+		}
+		return out, nil
+	}
+
 	for scanner.Scan() {
 		lineNum++
-		lines = append(lines, scanner.Text())
+		line := scanner.Text()
+		if re.MatchString(line) && len(matchNums) < matchLimit {
+			// Stop collecting at matchLimit, like the buffered reference:
+			// later matches must neither extend the emitted windows nor
+			// delay the stop past the last needed window.
+			matchNums = append(matchNums, lineNum)
+		}
+		if ringFull {
+			// Line lineNum-c just left the ring; the next match is at the
+			// earliest line lineNum+1, whose window starts at
+			// lineNum+1-c > lineNum-c, so its status is final.
+			emit(lineNum-c, ring[ringPos])
+		}
+		ring[ringPos] = line
+		ringPos++
+		if ringPos == c {
+			ringPos = 0
+			ringFull = true
+		}
+		if len(matchNums) >= matchLimit && ringFull && lineNum-c >= matchNums[len(matchNums)-1]+c {
+			// Every line through the last needed window has been emitted;
+			// the rest of the file cannot add matches or context.
+			break
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
-	if len(lines) == 0 {
-		return nil, nil
-	}
-
-	// Find matching line numbers in a single pass over stored lines.
-	matchNums := make([]int, 0, matchLimit)
-	for i, line := range lines {
-		if re.MatchString(line) {
-			matchNums = append(matchNums, i+1)
-			if len(matchNums) >= matchLimit {
-				break
-			}
+	// EOF: flush the remaining ring lines (oldest first); with no future
+	// matches, their status is final.
+	if ringFull {
+		for i := 0; i < c; i++ {
+			emit(lineNum-c+1+i, ring[(ringPos+i)%c])
+		}
+	} else {
+		for i := 0; i < ringPos; i++ {
+			emit(i+1, ring[i])
 		}
 	}
 	if len(matchNums) == 0 {
 		return nil, nil
-	}
-
-	// Use a byte slice (1-indexed) instead of a map for the emit-mask.
-	// 0 = skip, ':' = match line, '-' = context line.
-	want := make([]byte, len(lines)+1)
-	for _, n := range matchNums {
-		start := n - contextLines
-		if start < 1 {
-			start = 1
-		}
-		end := n + contextLines
-		if end > len(lines) {
-			end = len(lines)
-		}
-		for i := start; i <= end; i++ {
-			if i == n || want[i] == 0 {
-				want[i] = ':'
-			} else if want[i] != ':' {
-				want[i] = '-'
-			}
-		}
-	}
-
-	var out []string
-	for lineNum = 1; lineNum <= len(lines); lineNum++ {
-		sep := want[lineNum]
-		if sep == 0 {
-			continue
-		}
-		out = append(out, fmt.Sprintf("%s%c%d%c%s", relPath, sep, lineNum, sep, lines[lineNum-1]))
 	}
 	return out, nil
 }
@@ -732,9 +792,16 @@ var binaryProbePool = sync.Pool{
 // over the whole file — the probe bytes followed by the rest — so the caller
 // reads the file exactly once. The previous design probed with a separate
 // open (isBinaryFile) and then opened the file again for the scan, doubling
-// file opens on slow filesystems whenever ripgrep was unavailable. The probe
-// bytes are copied out of the pooled buffer because the returned reader
-// outlives the pool's ownership of the buffer.
+// file opens on slow filesystems whenever ripgrep was unavailable.
+//
+// The caller always receives a valid closer (the open file) and owns the
+// close, binary or not, so callers can defer Close unconditionally.
+//
+// The probe bytes are copied out of the pooled buffer before it is returned
+// to the pool: the returned reader outlives the pool's ownership of the
+// buffer, and another search goroutine may reuse the buffer as soon as it is
+// Put. The Put is deferred so it runs only after this function's last read
+// of the buffer (the NUL scan and the copy-out), on every return path.
 func openSearchableFile(path string) (reader io.Reader, closer io.Closer, binary bool, err error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -742,12 +809,11 @@ func openSearchableFile(path string) (reader io.Reader, closer io.Closer, binary
 	}
 	bp := binaryProbePool.Get().(*[]byte)
 	buf := *bp
+	defer binaryProbePool.Put(bp)
 	n, _ := f.Read(buf)
-	binaryProbePool.Put(bp)
 	for i := 0; i < n; i++ {
 		if buf[i] == 0 {
-			_ = f.Close()
-			return nil, nil, true, nil
+			return nil, f, true, nil
 		}
 	}
 	probe := make([]byte, n)

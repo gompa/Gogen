@@ -158,6 +158,12 @@ func (s *Server) wsUpgrader() websocket.Upgrader {
 		CheckOrigin: func(r *http.Request) bool {
 			return checkWSOrigin(r, allowed)
 		},
+		// permessage-deflate: the browser negotiates it automatically, and a
+		// full-session history payload (multi-MB of repetitive JSON —
+		// reasoning blocks, code, tool results) shrinks ~10x on the wire.
+		// Go test clients don't request compression by default, so existing
+		// tests are unaffected.
+		EnableCompression: true,
 	}
 }
 
@@ -487,7 +493,6 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	defer u.cleanup()
 	conn := u.conn
 	ws := u.ws
-	msgLimiter := newWSMessageLimiter()
 
 	// The connection's pane: the session it is currently attached to and the
 	// default target for messages without a sessionId. Lifecycle ops
@@ -509,7 +514,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Attach this connection as a viewer of the session.
-	s.attachSession(ws, r, pane)
+	s.attachSession(ws, r, pane, true)
 	// Teardown detaches the connection from EVERY session it is attached to
 	// (the current pane plus any background panes) — WITHOUT cancelling any
 	// turn (the turn is owned by the runtime, so disconnecting never kills
@@ -539,10 +544,6 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 			if err := conn.ReadJSON(&msg); err != nil {
 				close(incoming)
 				return
-			}
-			if !msgLimiter.Allow() {
-				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: rate limit exceeded"})
-				continue
 			}
 			// Complete delete approvals here so they never sit behind a
 			// main-loop turnMu.Lock() (the stream holds turnMu while waiting
@@ -779,7 +780,7 @@ func wsHandleAttach(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntim
 		_ = ws.writeJSON(WSMessage{Type: "session_removed", SessionID: msg.SessionID, Content: err.Error()})
 	} else {
 		s.switchPane(ws, pane, rt2)
-		s.attachSession(ws, r, rt2)
+		s.attachSession(ws, r, rt2, !msg.NoHistory)
 	}
 }
 
@@ -885,10 +886,27 @@ func (s *Server) resolveRuntime(id string) *sessionRuntime {
 // connect handshake; N panes do not serialize N tokenizations). A reconnect
 // mid-turn therefore gets session_state immediately, the live stream events,
 // and the completed history when the turn ends.
-func (s *Server) attachSession(ws *wsConn, r *http.Request, rt *sessionRuntime) {
+//
+// sendHistory selects the payload shape: a full attach (true, used by the
+// connect handshake and the active pane) includes the history snapshot +
+// rewind so the client can rebuild the transcript; a lightweight re-register
+// (false) skips it. The client uses the lightweight form for BACKGROUND panes
+// on reconnect, whose transcript re-derives from a full attach when focused —
+// the (potentially multi-MB) snapshot would be discarded client-side, so it
+// is neither built nor sent.
+func (s *Server) attachSession(ws *wsConn, r *http.Request, rt *sessionRuntime, sendHistory bool) {
 	rt.attach(ws)
 	s.sendSessionState(ws, rt)
 	go func() {
+		if !sendHistory {
+			// Lightweight re-register: no history snapshot, no rewind. The
+			// session_state sent above already told the client whether the
+			// session is mid-turn; the config frames below refresh the
+			// pane's toolbar/context mirrors.
+			_ = ws.writeJSON(agentConfigMsgBasic(rt.agent))
+			_ = ws.writeJSON(agentConfigMsg(r.Context(), rt))
+			return
+		}
 		// Snapshot and send history FIRST, without the turn lock. A running
 		// turn holds turnMu for its ENTIRE duration (startTurn defers the
 		// unlock), so taking turnMu.RLock here would leave a mid-turn page
@@ -948,7 +966,6 @@ func (s *Server) HandleWSEditor(w http.ResponseWriter, r *http.Request) {
 	defer u.cleanup()
 	conn := u.conn
 	ws := u.ws
-	msgLimiter := newWSMessageLimiter()
 
 	incoming := make(chan WSMessage, 8)
 	go func() {
@@ -957,10 +974,6 @@ func (s *Server) HandleWSEditor(w http.ResponseWriter, r *http.Request) {
 			if err := conn.ReadJSON(&msg); err != nil {
 				close(incoming)
 				return
-			}
-			if !msgLimiter.Allow() {
-				_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: rate limit exceeded"})
-				continue
 			}
 			incoming <- msg
 		}

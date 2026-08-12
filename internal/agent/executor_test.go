@@ -238,3 +238,37 @@ func TestExecuteCommandNoSinkMatchesReturnedOutput(t *testing.T) {
 		t.Fatalf("unexpected output: %q", out)
 	}
 }
+
+// TestLargeFileSearchSkipsTotalDrain verifies readWithRegexSearch skips the
+// end-of-file drain for files larger than searchMaxFileBytes and reports a
+// lower-bound total instead of reading the whole tail just to count lines.
+func TestLargeFileSearchSkipsTotalDrain(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "big.log")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("needle-here\n"); err != nil {
+		t.Fatal(err)
+	}
+	chunk := strings.Repeat("x\n", 4096)
+	for i := 0; i < 128; i++ {
+		if _, err := f.WriteString(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.Close()
+
+	exec := NewExecutor(dir)
+	out, err := exec.ReadFileRange(path, 0, 10, "needle-here", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "total line count omitted") {
+		t.Fatalf("expected lower-bound header for large file, got: %q", out)
+	}
+	if !strings.Contains(out, "needle-here") {
+		t.Fatalf("expected match content in output, got: %q", out)
+	}
+}

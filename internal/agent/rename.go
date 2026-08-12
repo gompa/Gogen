@@ -75,22 +75,29 @@ func (e *Executor) renameWithAST(ctx context.Context, searchRoot, relPrefix, glo
 			return nil
 		}
 
-		// Apply renames
-		re := regexp.MustCompile(`\b` + regexp.QuoteMeta(oldName) + `\b`)
-		lines := strings.Split(string(content), "\n")
+		// Refs are non-overlapping identifier spans sorted by Start; splice
+		// exactly those spans into the file. Replacing whole lines with a
+		// word-boundary regex would also rename unrelated occurrences of the
+		// identifier (string literals, comments, doc text) on the same line,
+		// making the AST path no more precise than the text fallback.
+		var b strings.Builder
+		b.Grow(len(content))
+		last := 0
+		replaced := 0
 		linesChangedSet := make(map[int]struct{})
-
-		// Deduplicate refs by line number so each line is replaced exactly once.
 		for _, ref := range refs {
-			if ref.Line-1 < len(lines) {
-				if _, seen := linesChangedSet[ref.Line]; !seen {
-					linesChangedSet[ref.Line] = struct{}{}
-					lines[ref.Line-1] = re.ReplaceAllString(lines[ref.Line-1], newName)
-				}
+			if ref.Start < last || ref.End > len(content) || ref.Start > ref.End {
+				// Defensive: malformed spans must never corrupt output.
+				continue
 			}
+			b.Write(content[last:ref.Start])
+			b.WriteString(newName)
+			last = ref.End
+			replaced++
+			linesChangedSet[ref.Line] = struct{}{}
 		}
-
-		newContent := strings.Join(lines, "\n")
+		b.Write(content[last:])
+		newContent := b.String()
 		if !dryRun {
 			if err := ioutil.WriteFileAtomic(path, []byte(newContent), defaultFilePerm); err != nil {
 				return err
@@ -104,7 +111,7 @@ func (e *Executor) renameWithAST(ctx context.Context, searchRoot, relPrefix, glo
 		changes = append(changes, FileChange{
 			Path:         rel,
 			LinesChanged: linesChanged,
-			Count:        len(refs),
+			Count:        replaced,
 		})
 
 		return nil

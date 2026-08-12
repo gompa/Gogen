@@ -279,3 +279,32 @@ func TestMergedToolHandlersRejectUnknownActions(t *testing.T) {
 		}
 	}
 }
+
+// TestReadFileRangeOffsetPastEnd pins the past-EOF behavior of offset reads:
+// an offset beyond the last line must report it (the previous behavior
+// returned an empty result that was indistinguishable from an empty file).
+func TestReadFileRangeOffsetPastEnd(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "lines.txt"), []byte("one\ntwo\nthree\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "empty.txt"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := NewExecutor(dir)
+	out, err := exec.ReadFileRange("lines.txt", 4, 0, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "File has 3 lines; offset 4 is past end.") {
+		t.Fatalf("expected past-end message, got %q", out)
+	}
+	out, err = exec.ReadFileRange("empty.txt", 1, 0, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "File has 0 lines; offset 1 is past end.") {
+		t.Fatalf("expected past-end message for empty file, got %q", out)
+	}
+}

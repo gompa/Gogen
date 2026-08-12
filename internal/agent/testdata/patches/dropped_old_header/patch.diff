@@ -1,0 +1,9 @@
+--- a/foo.txt
++++ b/foo.txt
+@@ -1 +1 @@
+-x
++y
++++ b/bar.txt
+@@ -1 +1 @@
+-a
++b

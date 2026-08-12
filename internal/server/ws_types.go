@@ -130,6 +130,13 @@ type WSMessage struct {
 	MessageIndex int            `json:"messageIndex,omitempty"`
 	Sessions     []SessionEntry `json:"sessions,omitempty"`
 	History      []HistoryEntry `json:"history,omitempty"`
+	// NoHistory requests a lightweight session_attach: the server skips the
+	// full history snapshot (and rewind) and sends only session_state +
+	// config + context. The client uses it to re-register BACKGROUND panes
+	// on reconnect — their transcript re-derives from a full attach when
+	// focused, so the (potentially multi-MB) history payload would be
+	// discarded client-side. Absent/false = full attach (unchanged).
+	NoHistory bool `json:"noHistory,omitempty"`
 	// ContentPos / ThinkingPos / ArgsPos are cumulative character offsets
 	// within the current round's content / thinking / tool-args streams,
 	// stamped on stream / thinking_token / tool_call_delta frames. A client

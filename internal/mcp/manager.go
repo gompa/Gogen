@@ -199,10 +199,18 @@ func (c *Client) readLoop() {
 		}
 		c.mu.Unlock()
 		if !ok {
-			skipped++
-			if skipped > mcpMaxSkippedResponses {
-				c.failPending(fmt.Errorf("mcp: too many unmatched responses; server may be broken"))
-				return
+			// A response whose ID was never issued is garbage on the wire.
+			// A response to a call that already timed out is late but valid
+			// (call() removes the pending entry on timeout) and must not
+			// count toward the unmatched-response limit — otherwise a slow
+			// server replying to many timed-out requests would trip the
+			// limit and kill the connection.
+			if resp.ID > c.nextID.Load() {
+				skipped++
+				if skipped > mcpMaxSkippedResponses {
+					c.failPending(fmt.Errorf("mcp: too many unmatched responses; server may be broken"))
+					return
+				}
 			}
 			continue
 		}

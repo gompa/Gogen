@@ -61,7 +61,13 @@ func (s *Store) prune(workingDir string, keepIDs ...string) {
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].updated.After(items[j].updated) })
 
-	cutoff := time.Now().UTC().AddDate(0, 0, -s.maxAgeDays)
+	// A negative maxAgeDays disables age-based retention ("keep forever");
+	// the count-based budget still applies.
+	agePrune := s.maxAgeDays >= 0
+	var cutoff time.Time
+	if agePrune {
+		cutoff = time.Now().UTC().AddDate(0, 0, -s.maxAgeDays)
+	}
 	otherBudget := s.maxCount - len(keep)
 	if otherBudget < 0 {
 		otherBudget = 0
@@ -72,7 +78,7 @@ func (s *Store) prune(workingDir string, keepIDs ...string) {
 		if _, ok := keep[it.id]; ok {
 			continue
 		}
-		expired := it.updated.Before(cutoff)
+		expired := agePrune && it.updated.Before(cutoff)
 		if expired || others >= otherBudget {
 			toDelete = append(toDelete, it.id)
 			continue

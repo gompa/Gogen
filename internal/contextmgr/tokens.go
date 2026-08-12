@@ -37,9 +37,12 @@ func (m *Manager) TokenCounts(messages []llm.Message) []int {
 		return nil
 	}
 	count := messageCounterFor()
+	// One memo per pass: repeated strings (system prompt, tool-call names and
+	// IDs, repeated argument values) encode once instead of once per message.
+	memo := make(map[string]int)
 	counts := make([]int, len(messages))
 	for i := range messages {
-		counts[i] = computeMessageTokens(messages[i], count) + imageTokenEstimate(messages[i])
+		counts[i] = computeMessageTokens(messages[i], count, memo) + imageTokenEstimate(messages[i])
 	}
 	return counts
 }
@@ -47,7 +50,7 @@ func (m *Manager) TokenCounts(messages []llm.Message) []int {
 // ComputeMessageTokens returns the estimated token count for a single message
 // using the cl100k_base tokenizer when available, falling back to a bytes/4 heuristic.
 func ComputeMessageTokens(msg llm.Message) int {
-	return computeMessageTokens(msg, messageCounterFor()) + imageTokenEstimate(msg)
+	return computeMessageTokens(msg, messageCounterFor(), nil) + imageTokenEstimate(msg)
 }
 
 func sortedToolArgKeys(args map[string]interface{}) []string {
@@ -68,9 +71,10 @@ func (m *Manager) EstimateTokens(messages []llm.Message) int {
 		return 0
 	}
 	count := messageCounterFor()
+	memo := make(map[string]int)
 	total := 0
 	for i := range messages {
-		total += computeMessageTokens(messages[i], count) + imageTokenEstimate(messages[i])
+		total += computeMessageTokens(messages[i], count, memo) + imageTokenEstimate(messages[i])
 	}
 	return total
 }
@@ -125,29 +129,42 @@ func heuristicCountString(s string) int {
 // string through count: content, reasoning, refusal, each tool call's
 // name/id/arguments, and the tool-call id. Both the exact and heuristic
 // strategies share this single walk, so what gets counted can never drift
-// between them.
-func computeMessageTokens(msg llm.Message, count messageCounter) int {
+// between them. When memo is non-nil, repeated strings are counted once per
+// pass and the result reused — token counts are a pure function of the
+// string, so this is exact.
+func computeMessageTokens(msg llm.Message, count messageCounter, memo map[string]int) int {
+	c := count
+	if memo != nil {
+		c = func(s string) int {
+			if v, ok := memo[s]; ok {
+				return v
+			}
+			v := count(s)
+			memo[s] = v
+			return v
+		}
+	}
 	tokens := 4 // role/message framing overhead
-	tokens += count(msg.Content)
-	tokens += count(msg.Reasoning)
-	tokens += count(msg.Refusal)
+	tokens += c(msg.Content)
+	tokens += c(msg.Reasoning)
+	tokens += c(msg.Refusal)
 	for _, tc := range msg.ToolCalls {
 		tokens += 4
-		tokens += count(tc.Name)
-		tokens += count(tc.ID)
+		tokens += c(tc.Name)
+		tokens += c(tc.ID)
 		if tc.ArgsStr != "" {
-			tokens += count(tc.ArgsStr)
+			tokens += c(tc.ArgsStr)
 		} else {
 			for _, k := range sortedToolArgKeys(tc.Args) {
 				v := tc.Args[k]
-				tokens += count(k)
-				tokens += count(fmt.Sprint(v))
+				tokens += c(k)
+				tokens += c(fmt.Sprint(v))
 				tokens += 2
 			}
 		}
 	}
 	if msg.ToolCallID != "" {
-		tokens += count(msg.ToolCallID)
+		tokens += c(msg.ToolCallID)
 	}
 	return tokens
 }

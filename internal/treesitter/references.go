@@ -6,10 +6,16 @@ import (
 	"strings"
 )
 
-// Reference is a symbol usage location in a source file.
+// Reference is a symbol usage location in a source file. Start and End are
+// byte offsets of the identifier within the file, allowing callers to
+// replace exactly the identifier span (a string literal or comment on the
+// same line must not be renamed). They are zero when the backend cannot
+// provide them (stub builds).
 type Reference struct {
-	Line int
-	Text string
+	Line  int
+	Start int
+	End   int
+	Text  string
 }
 
 // FindSymbolReferences locates identifier occurrences matching symbol in a source file.
@@ -35,18 +41,22 @@ func FormatReferenceMatches(relPath string, refs []Reference) []string {
 
 func sortReferences(refs []Reference) {
 	sort.Slice(refs, func(i, j int) bool {
-		return refs[i].Line < refs[j].Line
+		if refs[i].Start != refs[j].Start {
+			return refs[i].Start < refs[j].Start
+		}
+		return refs[i].End < refs[j].End
 	})
 }
 
 func dedupeReferences(refs []Reference) []Reference {
-	seen := make(map[int]struct{}, len(refs))
+	seen := make(map[[2]int]struct{}, len(refs))
 	out := make([]Reference, 0, len(refs))
 	for _, r := range refs {
-		if _, ok := seen[r.Line]; ok {
+		key := [2]int{r.Start, r.End}
+		if _, ok := seen[key]; ok {
 			continue
 		}
-		seen[r.Line] = struct{}{}
+		seen[key] = struct{}{}
 		out = append(out, r)
 	}
 	return out

@@ -138,8 +138,10 @@ func TestTruncateRuneSafe(t *testing.T) {
 // TestTruncateToolResultRuneSafe verifies the context-window truncation keeps
 // valid UTF-8 when the cut would otherwise split a multi-byte rune.
 func TestTruncateToolResultRuneSafe(t *testing.T) {
-	m := NewManager(&stubProvider{}, Settings{MaxToolResultBytes: 8})
-	got := m.TruncateToolResult("日本語のテキスト結果が長すぎる")
+	// max must fit the truncation marker; the marker-omission corner
+	// (max smaller than the marker) is covered by TestTruncateToolResult.
+	m := NewManager(&stubProvider{}, Settings{MaxToolResultBytes: 100})
+	got := m.TruncateToolResult(strings.Repeat("日本語のテキスト結果が長すぎる", 3))
 	if !strings.Contains(got, "truncated") {
 		t.Fatal("expected truncation marker")
 	}
@@ -151,8 +153,10 @@ func TestTruncateToolResultRuneSafe(t *testing.T) {
 // TestEnsureToolResultsCappedRuneSafe verifies the sticky capping rewrite also
 // produces valid UTF-8 for multi-byte tool output.
 func TestEnsureToolResultsCappedRuneSafe(t *testing.T) {
-	m := NewManager(&stubProvider{}, Settings{MaxToolResultBytes: 8})
-	msgs := []llm.Message{{Role: "tool", Content: "日本語のテキスト結果が長すぎる", ToolCallID: "c1"}}
+	// max must fit the truncation marker; the marker-omission corner
+	// (max smaller than the marker) is covered by TestTruncateToolResult.
+	m := NewManager(&stubProvider{}, Settings{MaxToolResultBytes: 100})
+	msgs := []llm.Message{{Role: "tool", Content: strings.Repeat("日本語のテキスト結果が長すぎる", 3), ToolCallID: "c1"}}
 	if !m.EnsureToolResultsCapped(msgs) {
 		t.Fatal("expected truncation")
 	}
@@ -164,11 +168,21 @@ func TestEnsureToolResultsCappedRuneSafe(t *testing.T) {
 func TestTruncateToolResult(t *testing.T) {
 	m := NewManager(&stubProvider{}, Settings{MaxToolResultBytes: 10})
 	got := m.TruncateToolResult("0123456789012345")
+	// max=10 is smaller than the marker itself: the marker is omitted and
+	// the result is exactly max bytes (previously the marker was appended
+	// anyway, exceeding the cap).
+	if got != "0123456789" {
+		t.Fatalf("expected exact-cap cut without marker, got %q", got)
+	}
+
+	m = NewManager(&stubProvider{}, Settings{MaxToolResultBytes: 100})
+	content := strings.Repeat("0123456789", 20) // 200 bytes
+	got = m.TruncateToolResult(content)
 	if !strings.Contains(got, "truncated") {
 		t.Fatalf("expected truncation marker, got %q", got)
 	}
-	if len(got) < 10 {
-		t.Fatalf("expected truncated prefix, got %q", got)
+	if len(got) > 100 {
+		t.Fatalf("capped result exceeds max: %d bytes", len(got))
 	}
 }
 
@@ -253,7 +267,7 @@ func TestCompactPreservesHeadAndTail(t *testing.T) {
 	if out[0].Content != "fix auth" {
 		t.Fatalf("head mismatch: %q", out[0].Content)
 	}
-	if !strings.Contains(out[1].Content, summaryPrefix) {
+	if !strings.Contains(out[1].Content, SummaryPrefix) {
 		t.Fatalf("expected summary message, got %q", out[1].Content)
 	}
 	if out[3].Content != "add tests" {
@@ -262,7 +276,9 @@ func TestCompactPreservesHeadAndTail(t *testing.T) {
 }
 
 func TestEnsureToolResultsCappedSticky(t *testing.T) {
-	m := NewManager(&stubProvider{}, Settings{MaxToolResultBytes: 5})
+	// max must fit the truncation marker; the marker-omission corner
+	// (max smaller than the marker) is covered by TestTruncateToolResult.
+	m := NewManager(&stubProvider{}, Settings{MaxToolResultBytes: 64})
 	big := strings.Repeat("x", 4000)
 	msgs := []llm.Message{
 		{Role: "user", Content: "task"},

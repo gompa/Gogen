@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
 )
 
@@ -23,10 +24,14 @@ func NewPinManager() *PinManager {
 	return &PinManager{pinned: make(map[int]struct{})}
 }
 
-// PinLastUser pins the most recent user message so it survives compaction.
+// PinLastUser pins the most recent real user message so it survives
+// compaction. Compaction summaries are skipped (see
+// contextmgr.IsCompactionSummary): legacy sessions stored them as user-role
+// messages, and pinning one would preserve a recap instead of the actual
+// last user message.
 func (p *PinManager) PinLastUser(messages []llm.Message) {
 	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" {
+		if messages[i].Role == "user" && !contextmgr.IsCompactionSummary(messages[i].Content) {
 			p.pinned[i] = struct{}{}
 			return
 		}

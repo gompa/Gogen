@@ -63,8 +63,10 @@ func findSymbolReferences(path string, content []byte, symbol string) ([]Referen
 			}
 			line := int(cap.Node.StartPosition().Row) + 1
 			refs = append(refs, Reference{
-				Line: line,
-				Text: lineTextAt(content, line),
+				Line:  line,
+				Start: int(cap.Node.StartByte()),
+				End:   int(cap.Node.EndByte()),
+				Text:  lineTextAt(content, line),
 			})
 			if len(refs) >= maxReferencesPerFile {
 				sortReferences(refs)

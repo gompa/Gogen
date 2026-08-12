@@ -35,7 +35,7 @@ func TestCompactSummaryRequestUsesConversationPrefix(t *testing.T) {
 		{Role: "assistant", Content: "a3"},
 		{Role: "user", Content: "tail"},
 	}
-	out, _, err := m.CompactPinned(context.Background(), viewPrefix, msgs, nil)
+	out, _, err := m.CompactPinned(context.Background(), viewPrefix, msgs, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,13 +265,13 @@ func TestCompactRefusesTinyMiddle(t *testing.T) {
 		{Role: "assistant", Content: "a2"},
 		{Role: "user", Content: "tail"},
 	}
-	if _, _, err := m.CompactPinned(context.Background(), nil, msgs, nil); err == nil {
+	if _, _, err := m.CompactPinned(context.Background(), nil, msgs, nil, nil); err == nil {
 		t.Fatal("expected compaction of a tiny middle to be refused")
 	}
 
 	// Same history with the guard lifted compacts normally.
 	m.minMiddleTokens = 0
-	if _, _, err := m.CompactPinned(context.Background(), nil, msgs, nil); err != nil {
+	if _, _, err := m.CompactPinned(context.Background(), nil, msgs, nil, nil); err != nil {
 		t.Fatalf("expected compaction to succeed with guard lifted: %v", err)
 	}
 
@@ -282,7 +282,7 @@ func TestCompactRefusesTinyMiddle(t *testing.T) {
 		{Role: "user", Content: strings.Repeat("substantial middle content ", 120)}, // ~1.5k tokens
 		{Role: "assistant", Content: strings.Repeat("and assistant replies ", 120)},
 	}, msgs[3:]...)
-	if _, _, err := big.CompactPinned(context.Background(), nil, bigMsgs, nil); err != nil {
+	if _, _, err := big.CompactPinned(context.Background(), nil, bigMsgs, nil, nil); err != nil {
 		t.Fatalf("expected compaction of a substantial middle to succeed: %v", err)
 	}
 }

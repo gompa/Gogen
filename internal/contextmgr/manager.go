@@ -12,7 +12,11 @@ import (
 	"gogen/internal/llm"
 )
 
-const summaryPrefix = "[Session summary — earlier conversation condensed]\n"
+// SummaryPrefix marks messages produced by compaction. Summaries are stored
+// as assistant-role messages today; the prefix also identifies legacy
+// user-role summaries, which must never be treated as real user messages
+// (firstUserIndex, PinManager).
+const SummaryPrefix = "[Session summary — earlier conversation condensed]\n"
 const maxSummarizeDepth = 8
 
 // defaultMinMiddleTokens is the smallest middle (estimated tokens) worth
@@ -250,6 +254,12 @@ func TruncateRuneSafe(s string, max int) string {
 	return s[:max]
 }
 
+// truncateToolResult caps content to max bytes and appends a truncation
+// marker. The marker's length is reserved up front so the capped result fits
+// within max bytes (the previous behavior returned max + marker, exceeding
+// the budget). When max is smaller than the marker itself, the marker is
+// omitted rather than exceeding the cap; the result is then exactly max
+// bytes and will not be re-truncated on a later pass.
 func truncateToolResult(content string, max int) string {
 	if max <= 0 || len(content) <= max {
 		return content
@@ -257,7 +267,11 @@ func truncateToolResult(content string, max int) string {
 	if strings.Contains(content, toolResultTruncationMarker) {
 		return content
 	}
-	return TruncateRuneSafe(content, max) + fmt.Sprintf("\n… truncated (%d chars total)", len(content))
+	marker := fmt.Sprintf("\n… truncated (%d chars total)", len(content))
+	if len(marker) >= max {
+		return TruncateRuneSafe(content, max)
+	}
+	return TruncateRuneSafe(content, max-len(marker)) + marker
 }
 
 // ContextSnapshot summarizes context window usage for display.
@@ -415,7 +429,7 @@ func (m *Manager) EnsureToolResultsCapped(messages []llm.Message) bool {
 // Compact replaces the middle of canonical history with an LLM-generated summary.
 // It preserves the first user message and the most recent CompactKeepRecentMessages entries.
 func (m *Manager) Compact(ctx context.Context, messages []llm.Message) ([]llm.Message, error) {
-	out, _, err := m.CompactPinned(ctx, nil, messages, nil)
+	out, _, err := m.CompactPinned(ctx, nil, messages, nil, nil)
 	return out, err
 }
 
@@ -425,7 +439,13 @@ func (m *Manager) Compact(ctx context.Context, messages []llm.Message) ([]llm.Me
 // history on the wire (nil when none). It is prepended to the summarization
 // request so the conversation prefix stays byte-identical to the last turn
 // and the provider's prompt cache covers the bulk of the request.
-func (m *Manager) CompactPinned(ctx context.Context, viewPrefix, messages []llm.Message, pinned map[int]struct{}) ([]llm.Message, map[int]struct{}, error) {
+//
+// counts, when non-nil, carries per-message token counts for a prefix of
+// messages (the agent's cached counts). When it covers the region being
+// compacted, the summarization request is sized from those counts instead of
+// re-tokenizing the middle with the tokenizer — the most expensive part of a
+// compaction on large histories.
+func (m *Manager) CompactPinned(ctx context.Context, viewPrefix, messages []llm.Message, counts []int, pinned map[int]struct{}) ([]llm.Message, map[int]struct{}, error) {
 	m.mu.RLock()
 	keep := m.Settings.CompactKeepRecentMessages
 	m.mu.RUnlock()
@@ -450,22 +470,42 @@ func (m *Manager) CompactPinned(ctx context.Context, viewPrefix, messages []llm.
 	middle := messages[headIdx+1 : tailStart]
 	tail := cloneMessages(messages[tailStart:])
 
+	// Cached per-message counts (a prefix of messages) let the middle be
+	// sized without re-tokenizing it. knownTokens covers everything from
+	// messages[0] up to the tail start — the entire messages-derived portion
+	// of the summarization request (pre-head, first user message, middle) —
+	// and falls back to -1 (unknown) when the cache does not reach tailStart.
+	knownTokens := -1
+	if counts != nil && len(counts) >= tailStart {
+		knownTokens = 0
+		for i := 0; i < tailStart; i++ {
+			knownTokens += counts[i]
+		}
+	}
+
 	// Refuse to summarize a trivially small middle: asking a model to recap
 	// one or two short messages produces an echo of those messages (a
 	// conversation reply) rather than a summary — worse than not compacting.
-	if m.EstimateTokens(middle) < m.minMiddleTokens {
+	middleTokens := -1
+	if counts != nil && len(counts) >= tailStart {
+		middleTokens = 0
+		for i := headIdx + 1; i < tailStart; i++ {
+			middleTokens += counts[i]
+		}
+	}
+	if middleTokens < 0 {
+		middleTokens = m.EstimateTokens(middle)
+	}
+	if middleTokens < m.minMiddleTokens {
 		return nil, nil, fmt.Errorf("not enough history to compact (%d messages in the middle)", len(middle))
 	}
 
-	// The summarization request carries the wire prefix plus everything up to
-	// the tail start (pre-head, first user message, and the middle to
-	// summarize). The instruction tells the model to summarize only the
-	// middle; head and tail are preserved verbatim by construction below.
-	ctxPrefix := make([]llm.Message, 0, len(viewPrefix)+headIdx+1)
-	ctxPrefix = append(ctxPrefix, viewPrefix...)
-	ctxPrefix = append(ctxPrefix, messages[:headIdx+1]...)
-
-	summary, err := m.summarizeMiddle(ctx, ctxPrefix, middle)
+	// The summarization request carries the wire prefix (viewPrefix), the
+	// messages before the middle (pre-head + the preserved first user
+	// message), and the middle to summarize; the instruction tells the model
+	// to summarize only the middle — head and tail are preserved verbatim by
+	// construction below.
+	summary, err := m.summarizeMiddle(ctx, viewPrefix, messages[:headIdx+1], middle, knownTokens)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -477,7 +517,7 @@ func (m *Manager) CompactPinned(ctx context.Context, viewPrefix, messages []llm.
 	compact = append(compact, head...)
 	compact = append(compact, llm.Message{
 		Role:    "assistant",
-		Content: summaryPrefix + summary,
+		Content: SummaryPrefix + summary,
 	})
 	compact = append(compact, tail...)
 
@@ -538,13 +578,22 @@ func copyIntSet(in map[int]struct{}) map[int]struct{} {
 	return out
 }
 
+// IsCompactionSummary reports whether content is a compaction summary
+// message. Summaries are stored as assistant-role messages today; the check
+// also covers legacy user-role summaries, which must not be treated as real
+// user messages (firstUserIndex, PinManager).
+func IsCompactionSummary(content string) bool {
+	return strings.HasPrefix(content, SummaryPrefix)
+}
+
 // firstUserIndex returns the index of the first real user message (skipping
-// compaction summaries, which are stored as user-role messages prefixed with
-// summaryPrefix) and whether one exists. ok is false when the conversation
-// has no user message at all — callers must not compact in that case.
+// compaction summaries — stored as assistant-role messages prefixed with
+// SummaryPrefix today, user-role in legacy sessions) and whether one exists.
+// ok is false when the conversation has no user message at all — callers
+// must not compact in that case.
 func firstUserIndex(messages []llm.Message) (int, bool) {
 	for i, msg := range messages {
-		if msg.Role == "user" && !strings.HasPrefix(msg.Content, summaryPrefix) {
+		if msg.Role == "user" && !IsCompactionSummary(msg.Content) {
 			return i, true
 		}
 	}
@@ -552,13 +601,19 @@ func firstUserIndex(messages []llm.Message) (int, bool) {
 }
 
 // summarizeMiddle produces a summary of the middle of the conversation.
-// ctxPrefix is the wire context that precedes the middle on the request
-// (system/enrichment messages plus pre-head and the first user message); the
-// preferred path sends ctxPrefix + middle + summaryInstruction as one request
-// so the provider prompt cache covers the conversation prefix. When the
-// request would not fit in the context window, it falls back to the legacy
+// viewPrefix is the wire context that precedes canonical history
+// (system/enrichment messages) and prefix is messages[:headIdx+1] (pre-head
+// plus the preserved first user message); the preferred path sends
+// viewPrefix + prefix + middle + summaryInstruction as one request so the
+// provider prompt cache covers the conversation prefix. When the request
+// would not fit in the context window, it falls back to the legacy
 // flattened-text recursive summarization.
-func (m *Manager) summarizeMiddle(ctx context.Context, ctxPrefix, middle []llm.Message) (string, error) {
+//
+// knownTokens, when non-negative, is the cached token count of prefix+middle
+// (the messages-derived portion of the request); only the wire prefix and
+// the instruction are then tokenized fresh, avoiding a full re-tokenization
+// of the middle on every compaction.
+func (m *Manager) summarizeMiddle(ctx context.Context, viewPrefix, prefix, middle []llm.Message, knownTokens int) (string, error) {
 	if len(middle) == 0 {
 		return "", nil
 	}
@@ -566,22 +621,33 @@ func (m *Manager) summarizeMiddle(ctx context.Context, ctxPrefix, middle []llm.M
 	budget := m.summaryRequestBudgetLocked()
 	m.mu.RUnlock()
 
-	req := make([]llm.Message, 0, len(ctxPrefix)+len(middle)+1)
+	instruction := llm.Message{Role: "system", Content: summaryInstruction}
+	req := make([]llm.Message, 0, len(viewPrefix)+len(prefix)+len(middle)+1)
 	// Summarization requests must not carry user images: the summary model
 	// may not support vision, and image bytes are irrelevant to a recap.
-	req = append(req, stripImages(ctxPrefix)...)
+	req = append(req, stripImages(viewPrefix)...)
+	req = append(req, stripImages(prefix)...)
 	req = append(req, stripImages(middle)...)
 	// Trailing SYSTEM-role instruction: a task directive, not a chat turn
 	// (a trailing user message made models continue the conversation instead
 	// of summarizing). The conversation prefix stays byte-identical, so the
 	// provider prompt cache still covers the bulk of the request.
-	req = append(req, llm.Message{Role: "system", Content: summaryInstruction})
-	// Tokenize the request exactly once and reuse the count for the budget
+	req = append(req, instruction)
+	// Count the request exactly once and reuse the count for the budget
 	// check and both debuglog entries. (The map literal passed to
 	// debuglog.Write is evaluated eagerly even when debug logging is off, so
 	// a second EstimateTokens call here would duplicate the full
 	// tokenization of the conversation prefix on every compaction.)
-	reqTokens := m.EstimateTokens(req)
+	reqTokens := knownTokens
+	if reqTokens < 0 {
+		reqTokens = m.EstimateTokens(req)
+	} else {
+		// knownTokens covers prefix+middle (cached counts exclude image
+		// estimates, matching the stripped request); only the wire prefix
+		// and the one-message instruction need fresh counts.
+		reqTokens += m.EstimateTokens(stripImages(viewPrefix))
+		reqTokens += m.EstimateTokens([]llm.Message{instruction})
+	}
 	if reqTokens <= budget {
 		debuglog.Write("contextmgr/summarize", "continuation-summary request", "", map[string]interface{}{
 			"path":           "primary",

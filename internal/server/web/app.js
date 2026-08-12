@@ -139,11 +139,11 @@
         }
 
         function matchSlashCommands(value) {
-            if (!value.startsWith('/')) return [];
-            const token = value.split(/\s/, 1)[0].toLowerCase();
-            // Don't suggest once the user has typed args.
-            if (/\s/.test(value)) return [];
-            return SLASH_COMMANDS.filter((c) => c.name.startsWith(token));
+            // Don't suggest once the user has typed args. Without whitespace
+            // the whole value IS the command token, so the split form would
+            // just be value.toLowerCase() — drop it.
+            if (!value.startsWith('/') || /\s/.test(value)) return [];
+            return SLASH_COMMANDS.filter((c) => c.name.startsWith(value.toLowerCase()));
         }
 
         function renderSlashSuggest() {
@@ -535,10 +535,10 @@
             if (turns > 0 || prompt > 0 || currentModelPricing) {
                 lines.push('── Session ──');
                 if (turns > 0 || prompt > 0) {
-                    lines.push(`Total: ${fmtTokK(prompt + completion)} · ${turns} turns`);
-                    lines.push(`Prompt: ${fmtTokK(prompt)}`);
-                    lines.push(`Completion: ${fmtTokK(completion)}`);
-                    lines.push(`Cached: ${fmtTokK(cached)}`);
+                    lines.push(`Total: ${formatTokenCount(prompt + completion, '0')} · ${turns} turns`);
+                    lines.push(`Prompt: ${formatTokenCount(prompt, '0')}`);
+                    lines.push(`Completion: ${formatTokenCount(completion, '0')}`);
+                    lines.push(`Cached: ${formatTokenCount(cached, '0')}`);
                     if (cached > 0 && prompt > 0) lines.push(`Cache hit: ${Math.round((cached / prompt) * 100)}% of session prompt`);
                 }
                 if (currentModelPricing) {
@@ -583,8 +583,8 @@
             if (workingDirConfig) workingDirConfig.style.display = isGlobalMode ? '' : 'none';
         }
 
-        function formatTokenCount(n) {
-            if (!n || n <= 0) return '—';
+        function formatTokenCount(n, zeroText = '—') {
+            if (!n || n <= 0) return zeroText;
             if (n < 1000) return String(n);
             const whole = Math.floor(n / 1000);
             const frac = Math.floor((n % 1000) / 100);
@@ -1921,6 +1921,11 @@
             ws.send(JSON.stringify({ type: 'cancel', sessionId: activePane().id }));
             setTurnActive(false);
             abortInFlightUI(null);
+            // The trailing cancelled + turn_end frames for the old turn are
+            // consumed by suppressTurnEnds, so they can no longer reset the
+            // page title for us — do it here (covers the cancel-button path,
+            // which previously relied on the trailing turn_end for this).
+            updateTitle('idle');
         }
 
         function clearPendingResend() {
@@ -2291,6 +2296,11 @@
         // --- Input-area progress indicator (replaces textarea during streaming) ---
         let currentProgressPhase = null;
 
+        // True when focus was in the chat textarea when the progress
+        // indicator replaced it. Only then is focus restored on hide, so a
+        // turn end/cancel can't yank the user out of the terminal/Monaco/modals.
+        let progressFocusOwner = false;
+
         /**
          * Show/update the progress indicator in the input area.
          * Phase: 'thinking' | 'streaming' | 'tool' | null
@@ -2299,12 +2309,24 @@
         function setInputProgress(phase, label) {
             if (!inputProgress) return;
             if (phase == null) {
-                // Hide progress, restore textarea
+                // Hide progress, restore textarea. Refocus only when the
+                // textarea owned focus when the indicator appeared AND no
+                // modal is open — never steal focus from elsewhere.
                 inputProgress.classList.remove('active');
                 inputArea.style.display = '';
-                inputArea.focus();
+                if (progressFocusOwner &&
+                    !document.querySelector('[id$="-overlay"].active, [id$="-overlay"].open')) {
+                    inputArea.focus();
+                }
+                progressFocusOwner = false;
                 currentProgressPhase = null;
                 return;
+            }
+            // Capture once, when the indicator first replaces the textarea
+            // (repeated same-phase updates must not re-evaluate it: the
+            // textarea is hidden by then, so activeElement is no longer it).
+            if (currentProgressPhase === null) {
+                progressFocusOwner = (document.activeElement === inputArea);
             }
             currentProgressPhase = phase;
             inputArea.style.display = 'none';
@@ -2318,6 +2340,13 @@
                 labelEl.textContent = label || phase;
             }
         }
+
+        // If the user focuses anywhere else while the indicator is up (the
+        // terminal, Monaco, a modal, the sidebar), the textarea no longer
+        // owns the next focus restore.
+        document.addEventListener('focusin', () => {
+            if (currentProgressPhase !== null) progressFocusOwner = false;
+        });
 
         function finalizeThinking() {
             if (!currentThinkingDiv) return;
@@ -2388,18 +2417,6 @@
                 scheduleThinkingRender();
             }
         });
-
-        // Refresh relative timestamps every 30 seconds
-        setInterval(() => {
-            document.querySelectorAll('.message[data-created-at]').forEach(el => {
-                const t = el.querySelector('.message-time');
-                if (t) {
-                    const date = new Date(el.dataset.createdAt);
-                    if (isNaN(date.getTime())) return;
-                    t.textContent = formatRelativeTime(date);
-                }
-            });
-        }, 30000);
 
         function formatToolArgs(args) {
             if (!args || typeof args !== 'object') return '';
@@ -3841,8 +3858,11 @@
                 // session_state + history + config + context per pane. The
                 // active pane's transcript rebuilds from its attach response;
                 // background panes just re-register (their transcript
-                // re-derives when focused). Panes with no session yet (first
-                // load) get their state from the connect handshake.
+                // re-derives when focused) and request NO history — the
+                // full snapshot would be discarded client-side, so the
+                // server neither builds nor sends it (noHistory). Panes
+                // with no session yet (first load) get their state from the
+                // connect handshake.
                 //
                 // The server re-points its per-connection "current pane" at
                 // EVERY attach, so the ACTIVE pane is attached LAST:
@@ -3852,7 +3872,7 @@
                 const activeP = activePane();
                 for (const pane of panes.values()) {
                     if (pane.id && pane !== activeP) {
-                        ws.send(JSON.stringify({ type: 'session_attach', sessionId: pane.id }));
+                        ws.send(JSON.stringify({ type: 'session_attach', sessionId: pane.id, noHistory: true }));
                     }
                 }
                 if (activeP && activeP.id) {
@@ -4652,15 +4672,11 @@
         }
         sendBtn.onclick = sendMessage;
 
-        cancelBtn.onclick = () => {
-            if (!ws || ws.readyState !== WebSocket.OPEN) return;
-            if (!turnActive) return;
-            if (!activePane() || !activePane().id) return;
-            ws.send(JSON.stringify({ type: 'cancel', sessionId: activePane().id }));
-            // Tear down immediately; server also emits cancelled + turn_end.
-            abortInFlightUI(null);
-            setTurnActive(false);
-        };
+        // Route through the same guarded path as send-while-busy / resend /
+        // delete-of-active: the trailing cancelled + turn_end frames for the
+        // cancelled turn are consumed by suppressTurnEnds instead of being
+        // processed against whatever UI state follows (the cancel race).
+        cancelBtn.onclick = cancelActiveTurn;
 
         inputArea.addEventListener('input', updateSlashSuggest);
 
@@ -5424,8 +5440,17 @@
             if (!messagesScrollable()) return;
             // Any wheel-up leaves the bottom; the recovery machinery (scroll
             // back down, maybeRepinNearBottom, the jump button) re-engages
-            // follow.
-            if (e.deltaY < 0) unpinFromBottom();
+            // follow. Wheels over nested scrollable children (Monaco diff
+            // viewers, tool results, diff fallbacks) scroll that content,
+            // not the chat — skip them so reading a diff card can't silently
+            // un-pin the chat (a diff-edge wheel that chains to the chat
+            // still un-pins via the scroll event it generates below).
+            if (e.deltaY < 0) {
+                const t = e.target;
+                const inNested = t && typeof t.closest === 'function'
+                    && t.closest(NESTED_SCROLLER_SELECTOR);
+                if (!inNested) unpinFromBottom();
+            }
         }, { passive: true });
         // Capture-phase wheel takeover for Monaco diff viewers: Firefox's
         // wheel chaining over Monaco can swallow edge wheels, trapping the
@@ -5727,16 +5752,6 @@
 
         // === Context tooltip ===
         const contextTooltip = document.getElementById('context-tooltip');
-        const fmtTokK = (n) => {
-            if (!n || n <= 0) return '0';
-            if (n < 1000) return String(n);
-            if (n < 10000) {
-                const w = Math.floor(n / 1000);
-                const f = Math.floor((n % 1000) / 100);
-                return f === 0 ? `${w}k` : `${w}.${f}k`;
-            }
-            return `${Math.floor(n / 1000)}k`;
-        };
         const fmtCost = (usd) => {
             if (usd < 0.01) return `$${usd.toFixed(4)}`;
             if (usd < 1) return `$${usd.toFixed(3)}`;

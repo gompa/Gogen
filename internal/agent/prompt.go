@@ -62,12 +62,13 @@ or features. Omit unimplemented/roadmap items.`
 // and per ContextStats probe. The produced view is byte-identical to the old
 // pipeline: the base system prompt, then the profile suffix, then the project
 // rules header, then the plan-mode suffix, all on the leading system message.
-func buildSystemView(messages []llm.Message, workingDir, projectFilePath, guidelines, projectProfile string, mode Mode) []llm.Message {
-	if len(messages) == 0 {
-		return messages
-	}
-	// Suffixes in the same order enrichSystemPrompt applied them.
+// buildSystemSuffix returns the project-profile / project-rules / plan-mode
+// suffix text that buildSystemView folds into the leading system message.
+// Split out so systemPromptPrefix can construct the wire prefix without
+// copying the whole message history.
+func buildSystemSuffix(projectFilePath, guidelines, projectProfile string, mode Mode) string {
 	var suffix strings.Builder
+	// Suffixes in the same order enrichSystemPrompt applied them.
 	if projectProfile != "" {
 		suffix.WriteString("\n\nProject profile (auto-detected):\n" + projectProfile)
 	}
@@ -77,24 +78,32 @@ func buildSystemView(messages []llm.Message, workingDir, projectFilePath, guidel
 	if mode == ModePlan {
 		suffix.WriteString(planModePromptSuffix)
 	}
+	return suffix.String()
+}
+
+func buildSystemView(messages []llm.Message, workingDir, projectFilePath, guidelines, projectProfile string, mode Mode) []llm.Message {
+	if len(messages) == 0 {
+		return messages
+	}
+	suffix := buildSystemSuffix(projectFilePath, guidelines, projectProfile, mode)
 
 	// History already carries a system message (unusual — canonical history
 	// is user/assistant/tool): keep the list and fold the suffixes into that
 	// first system message, matching the old pipeline exactly.
 	for i := range messages {
 		if messages[i].Role == "system" {
-			if suffix.Len() == 0 {
+			if suffix == "" {
 				return messages
 			}
 			out := append([]llm.Message(nil), messages...)
-			out[i].Content += suffix.String()
+			out[i].Content += suffix
 			return out
 		}
 	}
 
 	// No system message: prepend one with the full content in one copy.
 	content := SystemPrompt(workingDir)
-	content += suffix.String()
+	content += suffix
 	out := make([]llm.Message, 0, len(messages)+1)
 	out = append(out, llm.Message{Role: "system", Content: content})
 	out = append(out, messages...)

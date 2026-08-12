@@ -17,6 +17,13 @@ import (
 // regression net for the parseUnifiedDiff state-machine refactor and any
 // future LLM-output parsing change.
 //
+// normalizeEOL maps CRLF and bare CR to LF, matching the normalization
+// splitLinesPreserveTrailing applies to original file contents.
+func normalizeEOL(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	return strings.ReplaceAll(s, "\r", "\n")
+}
+
 // Layout: testdata/patches/<name>/patch.diff plus orig/<path> (pre-image
 // contents, one per --- header, path without the a/ prefix) and want/<path>
 // (post-image contents, path without the b/ prefix). A newName of /dev/null
@@ -47,15 +54,22 @@ func TestPatchFixtures(t *testing.T) {
 			for _, pf := range files {
 				oldPath := strings.TrimPrefix(pf.oldName, "a/")
 				newPath := strings.TrimPrefix(pf.newName, "b/")
+				if oldPath == "" {
+					// A section with only a +++ header (the --- was dropped)
+					// modifies the file named by the new header.
+					oldPath = newPath
+				}
 				var orig []string
+				origTrailing := true
 				if oldPath != "/dev/null" {
 					origB, err := os.ReadFile(filepath.Join(dir, "orig", filepath.FromSlash(oldPath)))
 					if err != nil {
 						t.Fatalf("orig/%s: %v", oldPath, err)
 					}
+					origTrailing = strings.HasSuffix(string(origB), "\n")
 					orig = splitLinesPreserveTrailing(string(origB))
 				}
-				got, _, err := applyPatchHunks(orig, pf.hunks, true)
+				got, outNoNewline, _, err := applyPatchHunks(orig, pf.hunks, true, origTrailing)
 				if err != nil {
 					t.Fatalf("%s: applyPatchHunks: %v", pf.newName, err)
 				}
@@ -69,14 +83,13 @@ func TestPatchFixtures(t *testing.T) {
 				if err != nil {
 					t.Fatalf("want/%s: %v", newPath, err)
 				}
-				want := splitLinesPreserveTrailing(string(wantB))
-				if len(got) != len(want) {
-					t.Fatalf("%s: got %d lines, want %d:\n got: %q\nwant: %q", newPath, len(got), len(want), got, want)
-				}
-				for i := range got {
-					if got[i] != want[i] {
-						t.Fatalf("%s: line %d: got %q, want %q", newPath, i+1, got[i], want[i])
-					}
+				// Compare the joined output byte-for-byte (after EOL
+				// normalization) so the trailing-newline state — which a
+				// line-slice comparison cannot see — is asserted too.
+				gotStr := joinLinesPreserveTrailing(got, !outNoNewline)
+				wantStr := normalizeEOL(string(wantB))
+				if gotStr != wantStr {
+					t.Fatalf("%s: got %q, want %q", newPath, gotStr, wantStr)
 				}
 			}
 		})

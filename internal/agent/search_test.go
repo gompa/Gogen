@@ -2,10 +2,15 @@ package agent
 
 import (
 	"context"
+	"fmt"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -298,4 +303,185 @@ func TestReplaceInTreeSingleFile(t *testing.T) {
 	if string(edit) != "new\n" {
 		t.Fatalf("edit.txt = %q, want new", edit)
 	}
+}
+
+// TestScanFileSinglePassMatchesBufferedReference is a differential test: the
+// streaming scanner must produce byte-identical output to the old two-pass
+// buffered algorithm (store all lines, mark windows, emit) for every
+// combination of matches, context widths, and match limits.
+func TestScanFileSinglePassMatchesBufferedReference(t *testing.T) {
+	// Reference implementation of the two-pass buffered algorithm.
+	reference := func(lines []string, re *regexp.Regexp, contextLines, matchLimit int) []string {
+		var matchNums []int
+		for i, line := range lines {
+			if re.MatchString(line) {
+				matchNums = append(matchNums, i+1)
+				if len(matchNums) >= matchLimit {
+					break
+				}
+			}
+		}
+		if len(matchNums) == 0 {
+			return nil
+		}
+		want := make([]byte, len(lines)+1)
+		for _, n := range matchNums {
+			start := n - contextLines
+			if start < 1 {
+				start = 1
+			}
+			end := n + contextLines
+			if end > len(lines) {
+				end = len(lines)
+			}
+			for i := start; i <= end; i++ {
+				if i == n || want[i] == 0 {
+					want[i] = ':'
+				} else if want[i] != ':' {
+					want[i] = '-'
+				}
+			}
+		}
+		var out []string
+		for i := 1; i <= len(lines); i++ {
+			if want[i] != 0 {
+				out = append(out, fmt.Sprintf("%s%c%d%c%s", "f.txt", want[i], i, want[i], lines[i-1]))
+			}
+		}
+		return out
+	}
+
+	rng := rand.New(rand.NewSource(42))
+	for trial := 0; trial < 500; trial++ {
+		n := rng.Intn(50) + 1
+		lines := make([]string, n)
+		for i := range lines {
+			lines[i] = fmt.Sprintf("x%d", rng.Intn(6)) // x0..x5, so x1/x3 match
+		}
+		re := regexp.MustCompile(`x[13]`)
+		c := rng.Intn(4)
+		limit := rng.Intn(5) + 1
+
+		input := strings.Join(lines, "\n") + "\n"
+		got, err := scanFileSinglePass(strings.NewReader(input), "f.txt", re, c, limit)
+		if err != nil {
+			t.Fatalf("trial %d: %v", trial, err)
+		}
+		want := reference(lines, re, c, limit)
+		if !reflect.DeepEqual(got, want) {
+			detail := ""
+			max := len(got)
+			if len(want) > max {
+				max = len(want)
+			}
+			for i := 0; i < max; i++ {
+				var g, w string
+				if i < len(got) {
+					g = got[i]
+				}
+				if i < len(want) {
+					w = want[i]
+				}
+				detail += fmt.Sprintf("  [%d] got=%q want=%q\n", i, g, w)
+			}
+			t.Fatalf("trial %d (lines=%d, context=%d, limit=%d):\n got: %q\nwant: %q\n%s",
+				trial, n, c, limit, got, want, detail)
+		}
+	}
+}
+
+func TestPrefixRelPathsPassesSeparatorsThrough(t *testing.T) {
+	got := prefixRelPaths("a.go:1:line\n--\nb.go:2:other", "sub")
+	want := "sub/a.go:1:line\n--\nsub/b.go:2:other"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+// TestSearchCodeGoFallbackSkipsBinaryFiles pins the binary-file handling of
+// the Go fallback: a binary file in the tree must be skipped without
+// crashing (openSearchableFile returns a nil reader for binaries, and the
+// walker must not close a nil closer).
+func TestSearchCodeGoFallbackSkipsBinaryFiles(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("needle alpha\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b.dat"), []byte("abc\x00def\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "c.txt"), []byte("needle beta\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", "/nonexistent") // hide rg so the Go fallback runs
+	executor := NewExecutor(dir)
+	out, err := executor.SearchCode(context.Background(), "needle", "", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "a.txt") || !strings.Contains(out, "c.txt") {
+		t.Fatalf("expected text-file matches, got %q", out)
+	}
+	if strings.Contains(out, "b.dat") {
+		t.Fatalf("binary file must not be reported as a match: %q", out)
+	}
+}
+
+// TestSearchCodeGoFallbackTruncatesAtMatchCap pins the cap behavior of the
+// Go fallback: once searchMaxMatches accumulate, the walk stops and the
+// result carries the truncation footer (previously the walk kept going and
+// the footer was missing).
+func TestSearchCodeGoFallbackTruncatesAtMatchCap(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < 3; i++ {
+		var b strings.Builder
+		for j := 0; j < 100; j++ {
+			fmt.Fprintf(&b, "needle %d-%d\n", i, j)
+		}
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%d.txt", i)), []byte(b.String()), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", "/nonexistent") // hide rg so the Go fallback runs
+	executor := NewExecutor(dir)
+	out, err := executor.SearchCode(context.Background(), "needle", "", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(out, "needle"); got != searchMaxMatches {
+		t.Fatalf("expected exactly %d matches, got %d", searchMaxMatches, got)
+	}
+	if !strings.Contains(out, "… truncated") {
+		t.Fatalf("expected truncation footer, got %q", out)
+	}
+}
+
+// TestSearchCodeGoFallbackConcurrent hammers the Go fallback from several
+// goroutines so the shared binary-probe buffer pool is exercised under the
+// race detector (make test runs go test -race). It catches use-after-Put
+// races in openSearchableFile, where a pooled buffer was returned before the
+// NUL scan and the copy-out finished.
+func TestSearchCodeGoFallbackConcurrent(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < 500; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%03d.txt", i)), []byte("alpha beta gamma\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", "/nonexistent") // hide rg so the Go fallback runs
+	executor := NewExecutor(dir)
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 5; i++ {
+				if _, err := executor.SearchCode(context.Background(), "alpha", "", "*.txt", 0); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }

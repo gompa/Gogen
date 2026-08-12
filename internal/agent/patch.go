@@ -26,6 +26,10 @@ type patchHunk struct {
 	newLines []string
 	oldCount int // declared line counts from the hunk header
 	newCount int
+	// newNoNewline records that the last added line of this hunk carries a
+	// "\ No newline at end of file" marker: the patched file's final line
+	// has no trailing newline when this hunk reaches the end of the file.
+	newNoNewline bool
 }
 
 type patchPlan struct {
@@ -267,15 +271,17 @@ func (e *Executor) planPatch(pf patchFile, fuzzy bool) (patchPlan, string, error
 	}
 
 	var original []string
+	originalTrailing := true
 	if !isCreate {
 		data, err := os.ReadFile(secure)
 		if err != nil {
 			return patchPlan{}, target, fmt.Errorf("read: %w", err)
 		}
+		originalTrailing = strings.HasSuffix(string(data), "\n")
 		original = splitLinesPreserveTrailing(string(data))
 	}
 
-	updated, shifts, err := applyPatchHunks(original, pf.hunks, fuzzy)
+	updated, outNoNewline, shifts, err := applyPatchHunks(original, pf.hunks, fuzzy, originalTrailing)
 	if err != nil {
 		// applyPatchHunks failures are context mismatches, ambiguous fuzzy
 		// relocations, or stale line numbers — all stale-diff failures.
@@ -290,7 +296,7 @@ func (e *Executor) planPatch(pf patchFile, fuzzy bool) (patchPlan, string, error
 	return patchPlan{
 		target:     target,
 		secure:     secure,
-		updated:    joinLinesPreserveTrailing(updated),
+		updated:    joinLinesPreserveTrailing(updated, !outNoNewline),
 		create:     isCreate,
 		hunkShifts: shifts,
 	}, label, nil
@@ -472,7 +478,22 @@ func (p *diffParser) handleHunkBodyLine(i int) (patchParseState, error) {
 		if p.current == nil {
 			return stateHunkBody, fmt.Errorf("malformed diff: +++ before ---")
 		}
-		p.current.newName = strings.TrimSpace(strings.TrimPrefix(p.lines[i], "+++ "))
+		name := strings.TrimSpace(strings.TrimPrefix(p.lines[i], "+++ "))
+		if name == p.current.newName {
+			// A repeated +++ for the same file (the model re-emitted the
+			// header between hunks): keep collecting hunks into the
+			// current section.
+			return stateFileHeader, nil
+		}
+		// The current file's own +++ was consumed in header state before
+		// any hunk, so a +++ with a different name in hunk-body state can
+		// only be the next file's header with its --- dropped. Flush the
+		// current file (its completed hunk stays with it) and start a new
+		// section carrying only the newName; overwriting newName in place
+		// would merge the next file's hunks into this file and patch the
+		// wrong target.
+		p.flushFile()
+		p.current = &patchFile{newName: name}
 		return stateFileHeader, nil
 	case strings.HasPrefix(p.lines[i], "@@"):
 		p.flushHunk()
@@ -492,6 +513,17 @@ func (p *diffParser) handleHunkBodyLine(i int) (patchParseState, error) {
 		}
 		return stateHunkBody, nil
 	case p.lines[i] == `\ No newline at end of file`:
+		// The marker applies to the hunk body line above it: after an added
+		// line it says the new file's final line has no trailing newline;
+		// after a context line it applies to both sides. A marker after a
+		// removed line only describes the old file and does not affect the
+		// patched output.
+		if p.hunk != nil && i > 0 {
+			switch prev := p.lines[i-1]; {
+			case strings.HasPrefix(prev, "+"), strings.HasPrefix(prev, " "):
+				p.hunk.newNoNewline = true
+			}
+		}
 		return stateHunkBody, nil
 	case len(p.lines[i]) == 0:
 		// Empty lines in a hunk body are treated as empty context lines.
@@ -745,8 +777,18 @@ func parseDiffLineCount(part string) (int, error) {
 	return start, err
 }
 
-func applyPatchHunks(original []string, hunks []patchHunk, fuzzy bool) (outLines []string, hunkShifts []string, err error) {
+// applyPatchHunks applies hunks to original. originalTrailing reports
+// whether the original file's final line ends with a newline; the returned
+// outNoNewline reports the same property for the patched output, which
+// joinLinesPreserveTrailing uses to reproduce git's trailing-newline
+// semantics (a file that lacked a final newline must not gain one, and a
+// "\ No newline at end of file" marker on the last added line must be
+// honored). Only the final output line can lack a newline, so each step
+// re-derives the flag from whichever chunk contributes the final line of
+// the rebuilt output.
+func applyPatchHunks(original []string, hunks []patchHunk, fuzzy bool, originalTrailing bool) (outLines []string, outNoNewline bool, hunkShifts []string, err error) {
 	out := append([]string(nil), original...)
+	outNoNewline = !originalTrailing
 	lineDelta := 0
 	for hi, h := range hunks {
 		start := h.oldStart - 1 + lineDelta
@@ -765,6 +807,11 @@ func applyPatchHunks(original []string, hunks []patchHunk, fuzzy bool) (outLines
 				newOut = append(newOut, out[:start]...)
 				newOut = append(newOut, h.newLines...)
 				newOut = append(newOut, out[start:]...)
+				if start == len(out) {
+					// Insertion at EOF: the last added line becomes the
+					// file's final line.
+					outNoNewline = h.newNoNewline
+				}
 				out = newOut
 				lineDelta += len(h.newLines)
 			}
@@ -773,9 +820,9 @@ func applyPatchHunks(original []string, hunks []patchHunk, fuzzy bool) (outLines
 		inBounds := start <= len(out) && start+n <= len(out)
 		if !inBounds && !fuzzy {
 			if start > len(out) {
-				return nil, nil, fmt.Errorf("hunk %d/%d starts at line %d but file has %d lines", hi+1, len(hunks), h.oldStart, len(out)-lineDelta)
+				return nil, false, nil, fmt.Errorf("hunk %d/%d starts at line %d but file has %d lines", hi+1, len(hunks), h.oldStart, len(out)-lineDelta)
 			}
-			return nil, nil, fmt.Errorf("hunk %d/%d extends past end of file (line %d)", hi+1, len(hunks), h.oldStart+n-1)
+			return nil, false, nil, fmt.Errorf("hunk %d/%d extends past end of file (line %d)", hi+1, len(hunks), h.oldStart+n-1)
 		}
 		hint := start
 		if hint > len(out) {
@@ -790,10 +837,10 @@ func applyPatchHunks(original []string, hunks []patchHunk, fuzzy bool) (outLines
 		matched, ambiguous := findHunkMatch(out, h.oldLines, hint, fuzzy)
 		if matched < 0 {
 			if ambiguous {
-				return nil, nil, fmt.Errorf("hunk %d/%d context is ambiguous: fuzzy matching found multiple candidate locations; re-read the file and regenerate the diff with more surrounding context",
+				return nil, false, nil, fmt.Errorf("hunk %d/%d context is ambiguous: fuzzy matching found multiple candidate locations; re-read the file and regenerate the diff with more surrounding context",
 					hi+1, len(hunks))
 			}
-			return nil, nil, formatHunkMismatch(hi+1, len(hunks), hint+1, actual, h.oldLines, fuzzy)
+			return nil, false, nil, formatHunkMismatch(hi+1, len(hunks), hint+1, actual, h.oldLines, fuzzy)
 		}
 		// Track hunk relocation when fuzzy matching found the hunk at a
 		// different position than the diff headers indicated. The shift is
@@ -815,10 +862,20 @@ func applyPatchHunks(original []string, hunks []patchHunk, fuzzy bool) (outLines
 		newOut = append(newOut, out[:start]...)
 		newOut = append(newOut, replacement...)
 		newOut = append(newOut, out[end:]...)
+		if end < len(out) {
+			// The tail survives: the file's final line is unchanged.
+		} else if len(replacement) > 0 {
+			// The hunk reaches EOF and supplies the new final line.
+			outNoNewline = h.newNoNewline
+		} else {
+			// Pure deletion of the file tail: the new final line is
+			// out[start-1], a mid-file line, hence newline-terminated.
+			outNoNewline = false
+		}
 		out = newOut
 		lineDelta += len(replacement) - n
 	}
-	return out, hunkShifts, nil
+	return out, outNoNewline, hunkShifts, nil
 }
 
 // findHunkMatch locates oldLines within lines. Returns the start index, or -1
@@ -894,7 +951,17 @@ func findHunkLocationWith(lines, oldLines []string, hint int, cmp func([]string,
 		return hint, 1, true
 	}
 	best, bestDist, count := -1, 0, 0
+	first := oldLines[:1]
 	for i := 0; i <= len(lines)-n; i++ {
+		// Lossless candidate filter: a window can match only if its first
+		// line matches oldLines[0] under the same comparator (both
+		// comparators are element-wise), so windows whose first line cannot
+		// match are skipped without paying the full window comparison. This
+		// keeps the exact-match and fuzzy-relocation scans near-linear for
+		// typical patches instead of O(file lines x hunk lines) per hunk.
+		if !cmp(lines[i:i+1], first) {
+			continue
+		}
 		if !cmp(lines[i:i+n], oldLines) {
 			continue
 		}
@@ -959,9 +1026,16 @@ func splitLinesPreserveTrailing(s string) []string {
 	return lines
 }
 
-func joinLinesPreserveTrailing(lines []string) string {
+// joinLinesPreserveTrailing joins lines, appending a trailing newline only
+// when trailing is true, so files that end without a newline keep that state
+// after patching (matching git apply rather than unconditionally adding one).
+func joinLinesPreserveTrailing(lines []string, trailing bool) string {
 	if len(lines) == 0 {
 		return ""
 	}
-	return strings.Join(lines, "\n") + "\n"
+	s := strings.Join(lines, "\n")
+	if trailing {
+		s += "\n"
+	}
+	return s
 }

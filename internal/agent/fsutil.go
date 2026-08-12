@@ -112,6 +112,15 @@ func resolveExecutorPath(workingDir, path string) (string, error) {
 // (from root), the model intended an absolute-like path; we return the correct
 // resolution by treating the suffix as the intended absolute path.
 func fixDoubledWorkingDirPath(absPath, workingDir string) (string, bool) {
+	// A real file at the literal joined path is authoritative: the model
+	// passed a genuine relative path (e.g. WD=/a/b with path "a/b/x" that
+	// really exists at /a/b/a/b/x), and rewriting it to the doubled-prefix
+	// candidate would silently target a different file. The heuristic only
+	// fires when the literal path does not exist — the accidental-doubling
+	// case it exists for.
+	if _, err := os.Stat(absPath); err == nil {
+		return "", false
+	}
 	wd, err := filepath.Abs(workingDir)
 	if err != nil {
 		return "", false

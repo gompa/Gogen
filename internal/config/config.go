@@ -45,6 +45,9 @@ const (
 // NOTE on explicit zeros: this rule applies only where 0 is not a meaningful
 // setting (session retention counts, ...). Some settings deliberately treat 0
 // as meaningful and deliberately do NOT go through Effective:
+//   - session retention (session.StoreOptions.MaxAgeDays): a NEGATIVE value
+//     disables age-based pruning ("keep sessions forever"); 0 still means
+//     the default via Effective;
 //   - contextmgr.Settings: compact_threshold 0 disables auto-compaction,
 //     max_tool_result_bytes 0 removes the truncation cap, compact_reserve_tokens
 //     0 reserves nothing — only negative values fall back to defaults;
@@ -115,7 +118,7 @@ type Config struct {
 	WebApprovalHoldSecs int
 
 	SessionMaxCount   int // max saved sessions per working dir (0 = default 50)
-	SessionMaxAgeDays int // delete sessions older than N days (0 = default 30)
+	SessionMaxAgeDays int // delete sessions older than N days (0 = default 30, negative = keep forever)
 
 	WebFetch          string // on, off
 	WebSearch         string // on, off

@@ -261,7 +261,7 @@ These can be set in `.gogen/gogen.conf` only — there is no CLI flag or environ
 |----------|---------|-------------|
 | `GOGEN_SESSION_PERSIST` | on | Set to `off` to disable session save/resume |
 | `GOGEN_SESSION_MAX_COUNT` | `50` | Max saved sessions per working directory |
-| `GOGEN_SESSION_MAX_AGE_DAYS` | `30` | Auto-delete sessions older than N days |
+| `GOGEN_SESSION_MAX_AGE_DAYS` | `30` | Auto-delete sessions older than N days (negative = keep forever) |
 
 `GOGEN_SESSION_MAX_COUNT` and `GOGEN_SESSION_MAX_AGE_DAYS` can also be set in `.gogen/gogen.conf` (`session_max_count`, `session_max_age_days`); env vars take precedence.
 

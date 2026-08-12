@@ -1,0 +1,7 @@
+--- a/file.txt
++++ b/file.txt
+@@ -1,2 +1,2 @@
+ line1
+-line2
++line2b
+\ No newline at end of file

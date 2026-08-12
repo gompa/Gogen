@@ -4,14 +4,13 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"time"
 
 	"golang.org/x/time/rate"
 )
 
 const (
 	defaultMaxWSConns    = 32
-	defaultWSMsgRate     = 10 // messages per second per connection
-	defaultWSMsgBurst    = 20
 	authCookieName       = "gogen_web_token"
 	authCookieMaxAgeSecs = 7 * 24 * 60 * 60
 )
@@ -47,10 +46,6 @@ func (r *rateLimitState) releaseConn() {
 	}
 }
 
-func newWSMessageLimiter() *rate.Limiter {
-	return rate.NewLimiter(rate.Limit(defaultWSMsgRate), defaultWSMsgBurst)
-}
-
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -63,6 +58,7 @@ func clientIP(r *http.Request) string {
 type ipLimiter struct {
 	mu       sync.Mutex
 	limiters map[string]*rate.Limiter
+	lastUsed map[string]time.Time
 	rate     rate.Limit
 	burst    int
 }
@@ -70,6 +66,7 @@ type ipLimiter struct {
 func newIPLimiter(perSec float64, burst int) *ipLimiter {
 	return &ipLimiter{
 		limiters: make(map[string]*rate.Limiter),
+		lastUsed: make(map[string]time.Time),
 		rate:     rate.Limit(perSec),
 		burst:    burst,
 	}
@@ -78,20 +75,31 @@ func newIPLimiter(perSec float64, burst int) *ipLimiter {
 func (l *ipLimiter) allow(ip string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	now := time.Now()
 	lim, ok := l.limiters[ip]
 	if !ok {
 		lim = rate.NewLimiter(l.rate, l.burst)
 		l.limiters[ip] = lim
 		// Opportunistic prune to avoid unbounded growth.
 		if len(l.limiters) > 10_000 {
-			// Evict one random entry instead of clearing the whole map,
-			// so existing rate limit state for other IPs is preserved.
-			for oldIP := range l.limiters {
-				delete(l.limiters, oldIP)
-				break
+			// Evict the least-recently-used entry: a random eviction (map
+			// iteration order) can drop a limiter that is actively
+			// throttling an IP, granting it a fresh burst. The scan is
+			// O(map size) but only runs once per new IP over the cap.
+			var oldest string
+			var oldestTime time.Time
+			for k, t := range l.lastUsed {
+				if oldest == "" || t.Before(oldestTime) {
+					oldest, oldestTime = k, t
+				}
+			}
+			if oldest != "" {
+				delete(l.limiters, oldest)
+				delete(l.lastUsed, oldest)
 			}
 		}
 	}
+	l.lastUsed[ip] = now
 	return lim.Allow()
 }
 

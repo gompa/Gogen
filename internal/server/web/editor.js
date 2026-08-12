@@ -187,14 +187,31 @@ export function connectEditorSocket() {
   };
 }
 
-function wsRequest(type, payload = {}) {
+// Per-request timeout so a request can never hang forever when the server
+// never replies (stuck fs/git op). Slow operations (git, search, replace,
+// write) pass the longer window. A timed-out request may still complete
+// server-side; callers just stop waiting and surface the error.
+const WS_REQUEST_TIMEOUT_MS = 15000;
+const WS_REQUEST_SLOW_TIMEOUT_MS = 30000;
+
+function wsRequest(type, payload = {}, timeoutMs = WS_REQUEST_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     if (!wsRef || wsRef.readyState !== WebSocket.OPEN) {
       reject(new Error('not connected'));
       return;
     }
     const requestId = `ed-${++reqCounter}`;
-    pendingReqs.set(requestId, { resolve, reject });
+    const timer = setTimeout(() => {
+      pendingReqs.delete(requestId);
+      reject(new Error(`editor request timed out (${type})`));
+    }, timeoutMs);
+    // Wrap resolve/reject so the timer is cleared whichever way the request
+    // settles (reply dispatch or onclose); handleServerMessage/onclose stay
+    // unchanged.
+    pendingReqs.set(requestId, {
+      resolve: (v) => { clearTimeout(timer); resolve(v); },
+      reject: (e) => { clearTimeout(timer); reject(e); },
+    });
     wsRef.send(JSON.stringify({ type, requestId, ...payload }));
   });
 }
@@ -1100,35 +1117,30 @@ function updateDiffStat() {
   updateUndoRedoButtons();
 }
 
+// Oldest clean (non-dirty) non-active tab that may be evicted to make room,
+// or null when every other tab has unsaved edits. Dirty tabs are NEVER
+// evicted silently — that would discard unsaved edits (closeTab and the
+// beforeunload guard both treat them as requiring confirmation).
+function findEvictionVictim() {
+  let victim = null;
+  let oldest = Infinity;
+  for (const p of openOrder) {
+    if (p === activePath) continue;
+    if (isDirty(p)) continue;
+    const b = buffers.get(p);
+    const t = b ? b.lastUsed : 0;
+    if (t < oldest) {
+      oldest = t;
+      victim = p;
+    }
+  }
+  return victim;
+}
+
 async function enforceTabCap() {
   while (openOrder.length > GOGEN_UI.maxOpenTabs) {
-    let victim = null;
-    let oldest = Infinity;
-    // First pass: only consider clean (non-dirty) tabs
-    for (const p of openOrder) {
-      if (p === activePath) continue;
-      if (isDirty(p)) continue;
-      const b = buffers.get(p);
-      const t = b ? b.lastUsed : 0;
-      if (t < oldest) {
-        oldest = t;
-        victim = p;
-      }
-    }
-    // Second pass: if no clean tab can be evicted, fall back to oldest dirty tab
-    if (!victim) {
-      oldest = Infinity;
-      for (const p of openOrder) {
-        if (p === activePath) continue;
-        const b = buffers.get(p);
-        const t = b ? b.lastUsed : 0;
-        if (t < oldest) {
-          oldest = t;
-          victim = p;
-        }
-      }
-    }
-    if (!victim) break;
+    const victim = findEvictionVictim();
+    if (!victim) break; // all remaining tabs are dirty — keep them
     disposeBuffer(victim);
   }
 }
@@ -1220,6 +1232,13 @@ async function openFile(path, line, endLine) {
   if (buffers.has(path)) {
     activatePath(path);
   } else {
+    // Opening would exceed the tab cap with no clean tab to evict — refuse
+    // up front instead of creating the buffer and then discarding a dirty
+    // tab's edits to make room.
+    if (openOrder.length >= GOGEN_UI.maxOpenTabs && !findEvictionVictim()) {
+      toast(`All ${GOGEN_UI.maxOpenTabs} tabs have unsaved changes — save or close one first`, 'info');
+      return;
+    }
     let data;
     try {
       data = await wsRequest('fs_read', { path });
@@ -1285,7 +1304,7 @@ async function savePath(path) {
   const b = buffers.get(path);
   if (!b) return false;
   try {
-    await wsRequest('fs_write', { path, content: b.model.getValue() });
+    await wsRequest('fs_write', { path, content: b.model.getValue() }, WS_REQUEST_SLOW_TIMEOUT_MS);
     b.savedVersionId = b.model.getAlternativeVersionId();
     updateDirtyIndicators();
     await refreshGitStatus();
@@ -1329,7 +1348,7 @@ async function openUnstagedDiff(path) {
   activePath = path;
   showDiffPane();
   try {
-    const data = await wsRequest('git_file_diff', { path });
+    const data = await wsRequest('git_file_diff', { path }, WS_REQUEST_SLOW_TIMEOUT_MS);
     const lang = data.language || 'plaintext';
     const original = monaco.editor.createModel(data.original || '', lang);
     const modified = monaco.editor.createModel(data.modified || '', lang);
@@ -1397,7 +1416,7 @@ async function refreshGitStatus() {
   if (!list) return;
   list.innerHTML = '';
   try {
-    const data = await wsRequest('git_status', {});
+    const data = await wsRequest('git_status', {}, WS_REQUEST_SLOW_TIMEOUT_MS);
     const entries = data.gitEntries || [];
     if (!entries.length) {
       list.textContent = 'Working tree clean';
@@ -1452,7 +1471,7 @@ async function runFindInFiles(pattern) {
   const gen = ++searchGen;
   results.textContent = 'Searching…';
   try {
-    const data = await wsRequest('fs_search', { pattern: q });
+    const data = await wsRequest('fs_search', { pattern: q }, WS_REQUEST_SLOW_TIMEOUT_MS);
     if (gen !== searchGen) return;
     const matches = data.matches || [];
     results.innerHTML = '';
@@ -1511,7 +1530,7 @@ async function runReplaceAll(searchPattern, replacement, scopePath) {
   try {
     const payload = { pattern: q, replacement: r };
     if (scopePath) payload.path = scopePath;
-    const data = await wsRequest('fs_replace', payload);
+    const data = await wsRequest('fs_replace', payload, WS_REQUEST_SLOW_TIMEOUT_MS);
     if (gen !== searchGen) return;
     if (data.replaced && data.replaced > 0) {
       toast(`Replaced ${data.replaced} occurrence(s) in ${data.fileCount || '?'} file(s)`, 'success');
@@ -1728,7 +1747,7 @@ export function setupEditorUI() {
     const replacement = $('find-in-files-replace-input')?.value || '';
     if (!search.trim()) { toast('Search pattern is empty', 'error'); return; }
     try {
-      const data = await wsRequest('fs_search', { pattern: search, ...(scopePath ? { path: scopePath } : {}) });
+      const data = await wsRequest('fs_search', { pattern: search, ...(scopePath ? { path: scopePath } : {}) }, WS_REQUEST_SLOW_TIMEOUT_MS);
       const matches = data.matches || [];
       if (!matches.length) { toast('No matches found', 'info'); return; }
       const confirmed = await showReplacePreview(matches, search, replacement, scopeLabel);

@@ -3,6 +3,7 @@
 package streamutil
 
 import (
+	"strings"
 	"sync"
 	"time"
 )
@@ -31,7 +32,11 @@ type TokenBatcher struct {
 
 type seg struct {
 	think bool
-	text  string
+	// chunks accumulates token strings without copying; the segment text is
+	// joined once at flush time. Appending to a single string (text += token)
+	// would copy the whole accumulated segment per token — quadratic under
+	// backpressure when a stalled send callback lets a segment grow large.
+	chunks []string
 }
 
 // NewTokenBatcher creates a batcher that flushes every interval.
@@ -83,10 +88,11 @@ func (b *TokenBatcher) Flush() {
 	b.mu.Unlock()
 
 	for _, s := range segs {
-		if s.text == "" {
+		text := strings.Join(s.chunks, "")
+		if text == "" {
 			continue
 		}
-		b.send(s.think, s.text)
+		b.send(s.think, text)
 	}
 }
 
@@ -121,9 +127,9 @@ func (b *TokenBatcher) appendLocked(think bool, text string) {
 	}
 	n := len(b.segs)
 	if n > 0 && b.segs[n-1].think == think {
-		b.segs[n-1].text += text
+		b.segs[n-1].chunks = append(b.segs[n-1].chunks, text)
 	} else {
-		b.segs = append(b.segs, seg{think: think, text: text})
+		b.segs = append(b.segs, seg{think: think, chunks: []string{text}})
 	}
 	b.scheduleFlushLocked()
 }
