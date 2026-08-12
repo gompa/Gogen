@@ -142,6 +142,16 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 	return s
 }
 
+// SetDefaultModel updates the workspace default model that new session
+// providers are seeded from. Called by the web startup validation goroutine
+// (runWeb) once ValidateRestoredModel has resolved the effective model
+// (possibly auto-selected or cleared), so a session created mid-validation
+// never reads a half-updated seed. Synchronized on the workspace with
+// session creation (ProviderFactory reads DefaultModel).
+func (s *Server) SetDefaultModel(name string) {
+	s.ws.SetDefaultModel(name)
+}
+
 // newSessionRuntimeFor builds a session runtime carrying the server's
 // configured approval-hold window (see web_approval_hold_secs / F2).
 func (s *Server) newSessionRuntimeFor(a *agent.Agent) *sessionRuntime {

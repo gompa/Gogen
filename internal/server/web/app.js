@@ -5710,15 +5710,22 @@
             // actually move the chat fire on #messages and still pass.
             const t = e.target;
             if (t && typeof t.closest === 'function' && t.closest(NESTED_SCROLLER_SELECTOR)) return;
+            // Programmatic smartScroll()/pinToBottom() set ignoreScrollEvent and
+            // defer the reset by one frame. The flag is only meaningful at the
+            // moment the event is dispatched (scroll events run as tasks before
+            // the next rendering update's rAF callbacks), so classify HERE,
+            // synchronously. Checking it later inside the throttled rAF let the
+            // flag's own clear-rAF run first — the chat then treated its own
+            // programmatic scroll as a user scroll and could wrongly unpin
+            // (stickToBottom = false) when a diff card grew asynchronously
+            // after the scroll (Monaco mount/resize, colorize, image loads).
+            // User-initiated scrolls (wheel, trackpad, scrollbar drag) reach
+            // this point with the flag clear and are measured below as before.
+            if (ignoreScrollEvent) return;
             if (_scrollPending) return;
             _scrollPending = true;
             requestAnimationFrame(() => {
                 _scrollPending = false;
-                // Programmatic smartScroll()/pinToBottom() set ignoreScrollEvent
-                // and defer the reset by one frame, so their own scroll events
-                // are skipped here. User-initiated scrolls (wheel, trackpad,
-                // scrollbar drag) reach this point with the flag clear.
-                if (ignoreScrollEvent) return;
                 const d = distanceFromBottom();
                 if (d > NEAR_BOTTOM_PX) {
                     // Clearly away from bottom (scrollbar drag, etc.)

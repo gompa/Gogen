@@ -27,7 +27,7 @@ func Merge(pf *ProjectFile, flags FlagOverrides) *config.Config {
 		WorkingDir:                mergeString("GOGEN_WORKING_DIR", file.WorkingDir, def.WorkingDir),
 		ContextLimit:              mergeInt("GOGEN_CONTEXT_LIMIT", file.ContextLimit, def.ContextLimit),
 		CompactThreshold:          mergeFloatOpt("GOGEN_COMPACT_THRESHOLD", file.CompactThreshold, def.CompactThreshold),
-		CompactKeepRecentMessages: mergeIntOpt("GOGEN_COMPACT_KEEP_RECENT_MESSAGES", file.CompactKeepRecentMessages, def.CompactKeepRecentMessages),
+		CompactKeepRecentMessages: mergeCompactKeepRecentMessages(file, def.CompactKeepRecentMessages),
 		MaxToolResultBytes:        mergeIntOpt("GOGEN_MAX_TOOL_RESULT_BYTES", file.MaxToolResultBytes, def.MaxToolResultBytes),
 		CompactReserveTokens:      mergeIntOpt("GOGEN_COMPACT_RESERVE_TOKENS", file.CompactReserveTokens, def.CompactReserveTokens),
 		CommandSafetyMode:         mergeString("GOGEN_COMMAND_SAFETY", file.CommandSafety, def.CommandSafetyMode),
@@ -113,6 +113,31 @@ func mergeMCPServers(file FileConfig) []config.MCPServerConfig {
 		return out
 	}
 	return nil
+}
+
+// mergeCompactKeepRecentMessages merges the compact_keep_recent_messages
+// setting, honoring the pre-rename spellings for back-compat:
+// GOGEN_KEEP_RECENT_MESSAGES (env) and keep_recent_messages (file, already
+// aliased onto CompactKeepRecentMessages by parseYAMLFrontMatter). The
+// renamed key/env win when both are present; the legacy env var logs a
+// deprecation warning instead of being silently dropped.
+func mergeCompactKeepRecentMessages(file FileConfig, def int) int {
+	if v, ok := envInt("GOGEN_COMPACT_KEEP_RECENT_MESSAGES", def); ok {
+		return v
+	}
+	if v, ok := os.LookupEnv("GOGEN_KEEP_RECENT_MESSAGES"); ok {
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			log.Printf("warning: GOGEN_KEEP_RECENT_MESSAGES=%q is not a valid integer; using default %d", v, def)
+			return def
+		}
+		log.Printf("warning: GOGEN_KEEP_RECENT_MESSAGES is deprecated; use GOGEN_COMPACT_KEEP_RECENT_MESSAGES (value %d used)", n)
+		return n
+	}
+	if file.CompactKeepRecentMessages != nil {
+		return *file.CompactKeepRecentMessages
+	}
+	return def
 }
 
 func cloneStringMap(in map[string]string) map[string]string {

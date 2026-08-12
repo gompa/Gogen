@@ -37,8 +37,18 @@ type Workspace struct {
 
 	// Model is the workspace default model: new providers are seeded
 	// with it. set_model never mutates it — each pane's model lives on its
-	// own provider instance.
+	// own provider instance. The field is written once at construction and
+	// again by the web startup validation goroutine (runWeb after
+	// ValidateRestoredModel resolves the effective model, possibly
+	// auto-selecting a sole model or clearing a stale one), while
+	// ProviderFactory reads it concurrently when new sessions are created —
+	// a plain field access raced those readers (data race under -race).
+	// Production access must go through DefaultModel/SetDefaultModel; the
+	// field stays exported only so existing tests can read it directly.
 	Model string
+	// modelMu guards Model. Leaf lock: never held while acquiring another
+	// workspace lock; provider construction reads it under RLock.
+	modelMu sync.RWMutex
 	// ThinkingLevel is the workspace-level default thinking level new
 	// sessions start with (per-session afterwards).
 	ThinkingLevel string
@@ -93,6 +103,33 @@ func (ws *Workspace) SetWorkingDir(dir string) {
 	ws.wdMu.Lock()
 	ws.WorkingDir = dir
 	ws.wdMu.Unlock()
+}
+
+// DefaultModel returns the workspace default model new session providers
+// are seeded from. Thread-safe: read by provider construction on any
+// connection's read loop while the web startup validation goroutine may
+// update it after resolving the effective model.
+func (ws *Workspace) DefaultModel() string {
+	if ws == nil {
+		return ""
+	}
+	ws.modelMu.RLock()
+	defer ws.modelMu.RUnlock()
+	return ws.Model
+}
+
+// SetDefaultModel updates the workspace default model. Called after startup
+// model validation (runWeb) so new sessions seed from the resolved model —
+// including "" when validation cleared a stale restored model, so a new
+// pane's first turn surfaces the "no model selected" gap instead of
+// inheriting an invalid model.
+func (ws *Workspace) SetDefaultModel(name string) {
+	if ws == nil {
+		return
+	}
+	ws.modelMu.Lock()
+	ws.Model = name
+	ws.modelMu.Unlock()
 }
 
 // fsMutatingTools are agent tools that mutate the working tree. They take the
@@ -237,8 +274,8 @@ func newWorkspaceFromAgent(a *agent.Agent, cfg *config.Config) *Workspace {
 			p := llm.NewOpenAIProviderWithResolver(cfg.OpenAIKey, cfg.OpenAIModel, cfg.OpenAIURL, wd, ws.Resolver)
 			p.SetPromptCacheKey(llm.ProjectPromptCacheKey(wd))
 			p.SetPreserveReasoningMode(cfg.PreserveReasoning)
-			if ws.Model != "" {
-				_ = p.SetModel(ws.Model)
+			if m := ws.DefaultModel(); m != "" {
+				_ = p.SetModel(m)
 			}
 			p.SetThinkingLevel(ws.ThinkingLevel)
 			return p

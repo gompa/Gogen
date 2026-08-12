@@ -71,7 +71,12 @@ func runWeb(ctx context.Context, a *agent.Agent, cfg *config.Config, restoredMod
 	}()
 	go func() {
 		a.ValidateRestoredModel(context.Background(), restoredModel)
-		cfg.OpenAIModel = a.Provider.ModelName()
+		// Publish the resolved model on the workspace (mutex-guarded) so new
+		// sessions created while validation is still running seed from the
+		// effective model — auto-selected sole model, or "" when a stale
+		// restored model was cleared. Never write cfg.OpenAIModel here: the
+		// provider factory reads it concurrently on session creation.
+		s.SetDefaultModel(a.CurrentModel())
 	}()
 	if err := <-errCh; err != nil {
 		log.Printf("web server error: %v", err)

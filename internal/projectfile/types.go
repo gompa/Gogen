@@ -54,6 +54,10 @@ type FileConfig struct {
 	CommandSandbox            string           `yaml:"command_sandbox"`
 	CommandTimeoutSecs        int              `yaml:"command_timeout_secs"`
 	PreserveReasoning         string           `yaml:"preserve_reasoning"`
+	// KeepRecentMessages is the pre-rename spelling of
+	// compact_keep_recent_messages, accepted for back-compat with a
+	// deprecation warning and cleared by parseYAMLFrontMatter after aliasing.
+	KeepRecentMessages *int `yaml:"keep_recent_messages"`
 }
 
 // ProjectFile is a loaded combined config + guidelines file.

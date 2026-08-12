@@ -39,6 +39,80 @@ func TestParseFrontMatter(t *testing.T) {
 	}
 }
 
+// The pre-rename keep_recent_messages key must keep working (value AND
+// explicit 0), with the current key winning when both are present, and the
+// legacy field must be cleared after parsing so it never leaks elsewhere.
+func TestParseLegacyKeepRecentMessagesKey(t *testing.T) {
+	pf, err := ParseContent("GOGEN.md", "---\nkeep_recent_messages: 20\n---\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pf.Config.CompactKeepRecentMessages == nil || *pf.Config.CompactKeepRecentMessages != 20 {
+		t.Fatalf("legacy key not aliased: CompactKeepRecentMessages = %v, want 20", pf.Config.CompactKeepRecentMessages)
+	}
+	if pf.Config.KeepRecentMessages != nil {
+		t.Fatalf("legacy field not cleared after aliasing: %v", *pf.Config.KeepRecentMessages)
+	}
+
+	// Explicit 0 under the legacy key is a real setting and must survive.
+	pfZero, err := ParseContent("GOGEN.md", "---\nkeep_recent_messages: 0\n---\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pfZero.Config.CompactKeepRecentMessages == nil || *pfZero.Config.CompactKeepRecentMessages != 0 {
+		t.Fatalf("legacy explicit 0 lost: CompactKeepRecentMessages = %v, want 0", pfZero.Config.CompactKeepRecentMessages)
+	}
+
+	// Current key wins when both are present.
+	pfBoth, err := ParseContent("GOGEN.md", "---\nkeep_recent_messages: 5\ncompact_keep_recent_messages: 8\n---\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pfBoth.Config.CompactKeepRecentMessages == nil || *pfBoth.Config.CompactKeepRecentMessages != 8 {
+		t.Fatalf("current key should win: CompactKeepRecentMessages = %v, want 8", pfBoth.Config.CompactKeepRecentMessages)
+	}
+
+	// The alias also applies to pure-YAML .conf files.
+	cfg, err := ParseConfigFile("gogen.conf", "keep_recent_messages: 3\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Config.CompactKeepRecentMessages == nil || *cfg.Config.CompactKeepRecentMessages != 3 {
+		t.Fatalf(".conf legacy key not aliased: CompactKeepRecentMessages = %v, want 3", cfg.Config.CompactKeepRecentMessages)
+	}
+
+	// End-to-end through Merge: the aliased value reaches the runtime config.
+	merged := Merge(pf, FlagOverrides{})
+	if merged.CompactKeepRecentMessages != 20 {
+		t.Fatalf("Merge did not carry the aliased legacy value: %d, want 20", merged.CompactKeepRecentMessages)
+	}
+}
+
+// The legacy key must not be re-emitted by --save-config regeneration: the
+// writer renders a separate projection struct, but the aliased parse result
+// must also not carry the stale field forward.
+func TestParseLegacyKeyNotWritten(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "gogen.conf")
+	cfg := Merge(&ProjectFile{Config: FileConfig{}}, FlagOverrides{})
+	cfg.CompactKeepRecentMessages = 4
+	if err := SaveConfig(cfgPath, "", cfg, "", WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	// The generated config legitimately contains compact_keep_recent_messages;
+	// only the bare legacy key (a line of its own) must not appear.
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, "keep_recent_messages:") {
+			t.Fatalf("legacy key leaked into saved config:\n%s", text)
+		}
+	}
+}
+
 func TestParseMissingClosingDelimiter(t *testing.T) {
 	_, err := ParseContent("GOGEN.md", "---\ncommand_safety: off\n# no close")
 	if err == nil {

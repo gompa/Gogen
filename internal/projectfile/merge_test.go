@@ -69,6 +69,48 @@ func TestMergeIntOptPreservesExplicitZero(t *testing.T) {
 	}
 }
 
+// The pre-rename GOGEN_KEEP_RECENT_MESSAGES env var must keep working, with
+// the renamed env var winning when both are set.
+func TestMergeLegacyKeepRecentEnv(t *testing.T) {
+	t.Setenv("GOGEN_KEEP_RECENT_MESSAGES", "7")
+	cfg := Merge(nil, FlagOverrides{})
+	if cfg.CompactKeepRecentMessages != 7 {
+		t.Fatalf("legacy env not honored: %d, want 7", cfg.CompactKeepRecentMessages)
+	}
+
+	t.Setenv("GOGEN_COMPACT_KEEP_RECENT_MESSAGES", "9")
+	cfgBoth := Merge(nil, FlagOverrides{})
+	if cfgBoth.CompactKeepRecentMessages != 9 {
+		t.Fatalf("renamed env should win: %d, want 9", cfgBoth.CompactKeepRecentMessages)
+	}
+}
+
+// An invalid legacy env value falls back to the default with a warning,
+// matching the renamed env's behavior.
+func TestMergeLegacyKeepRecentEnvInvalid(t *testing.T) {
+	t.Setenv("GOGEN_KEEP_RECENT_MESSAGES", "bogus")
+	os.Unsetenv("GOGEN_COMPACT_KEEP_RECENT_MESSAGES")
+	cfg := Merge(nil, FlagOverrides{})
+	if cfg.CompactKeepRecentMessages != 12 {
+		t.Fatalf("invalid legacy env should fall back to default: %d, want 12", cfg.CompactKeepRecentMessages)
+	}
+}
+
+// The file key aliasing flows through Merge: a project file using the legacy
+// key reaches the runtime config even when the new env var is unset.
+func TestMergeLegacyKeepRecentFileKey(t *testing.T) {
+	os.Unsetenv("GOGEN_COMPACT_KEEP_RECENT_MESSAGES")
+	os.Unsetenv("GOGEN_KEEP_RECENT_MESSAGES")
+	pf, err := ParseContent("GOGEN.md", "---\nkeep_recent_messages: 20\n---\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Merge(pf, FlagOverrides{})
+	if cfg.CompactKeepRecentMessages != 20 {
+		t.Fatalf("legacy file key not honored through Merge: %d, want 20", cfg.CompactKeepRecentMessages)
+	}
+}
+
 func TestMergeFloatOptPreservesExplicitZero(t *testing.T) {
 	os.Unsetenv("GOGEN_TEST_OPTF")
 	zero := 0.0

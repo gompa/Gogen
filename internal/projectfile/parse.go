@@ -3,6 +3,7 @@ package projectfile
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 
@@ -173,7 +174,25 @@ func parseYAMLFrontMatter(yamlText string) (FileConfig, error) {
 	if err := validateMCPServers(cfg.MCPServers); err != nil {
 		return FileConfig{}, err
 	}
+	cfg.applyLegacyKeyAliases()
 	return cfg, nil
+}
+
+// applyLegacyKeyAliases maps pre-rename keys onto their current fields so
+// existing project files keep working after a rename, with a deprecation
+// warning instead of the setting being silently dropped (yaml.Unmarshal
+// ignores unknown keys). The current key wins when both are present.
+// Aliased values are cleared so they never leak into other paths (e.g. a
+// --save-config regeneration, which renders a separate projection struct).
+func (cfg *FileConfig) applyLegacyKeyAliases() {
+	if cfg.KeepRecentMessages == nil {
+		return
+	}
+	log.Printf("warning: keep_recent_messages is deprecated; use compact_keep_recent_messages instead")
+	if cfg.CompactKeepRecentMessages == nil {
+		cfg.CompactKeepRecentMessages = cfg.KeepRecentMessages
+	}
+	cfg.KeepRecentMessages = nil
 }
 
 // validateMCPServers enforces the required fields on each MCP server entry.

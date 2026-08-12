@@ -159,6 +159,10 @@ auto-compaction); values outside that range fall back to `0.85`.
 Note that disabling auto-compaction means the full conversation is sent to the
 model each turn, so it will eventually exceed the model's context window.
 
+The legacy `keep_recent_messages` key (and `GOGEN_KEEP_RECENT_MESSAGES` env
+var) is still accepted and mapped onto `compact_keep_recent_messages` with a
+deprecation warning, so existing project files keep working after the rename.
+
 `--save-config` writes pure YAML (no `---` front-matter markers). `on`/`off`
 values may be emitted quoted (`"on"`), which parses identically; secrets
 (`openai_api_key`, MCP server `env`) are omitted unless

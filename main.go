@@ -106,6 +106,18 @@ func handleSaveConfigFlag(opts cliFlags, isGlobalMode bool, workingDir string, c
 }
 
 func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "\nError: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// run executes the selected mode (single prompt, web, or TUI) and returns an
+// error for the single-prompt path. All deferred cleanup (agent close,
+// session flush, MCP shutdown, profiling stop) is registered here so it runs
+// on both the success and error paths; main only translates a returned error
+// into a non-zero exit code.
+func run() error {
 	opts, workingDir := parseCLIOptions()
 
 	profiling.Start()
@@ -147,7 +159,7 @@ func main() {
 	}
 
 	if handleSaveConfigFlag(opts, isGlobalMode, workingDir, cfg, pf) {
-		return
+		return nil
 	}
 
 	if cfg.OpenAIKey == "" {
@@ -178,22 +190,23 @@ func main() {
 
 	if opts.prompt != "" {
 		go a.ValidateRestoredModel(context.Background(), restoredModel)
-		runSinglePrompt(ctx, a, opts.prompt, cfg)
-		return
+		return runSinglePrompt(ctx, a, opts.prompt, cfg)
 	}
 
 	if opts.web {
 		runWeb(ctx, a, cfg, restoredModel)
-		return
+		return nil
 	}
 
 	// Default: TUI mode.
 	runTUI(ctx, a, cfg, restoredModel)
+	return nil
 }
 
-// runSinglePrompt processes one user prompt and exits.
+// runSinglePrompt processes one user prompt. It returns the error so the
+// caller can exit non-zero after the deferred cleanup in run has executed.
 // It uses the already-initialized agent and config but skips the TUI/web.
-func runSinglePrompt(ctx context.Context, a *agent.Agent, prompt string, cfg *config.Config) {
+func runSinglePrompt(ctx context.Context, a *agent.Agent, prompt string, cfg *config.Config) error {
 	// In single-prompt mode there is no interactive approval modal, so a
 	// delete that requires approval would be blocked (safely) by the
 	// ErrDeleteApprovalRequired error. Only skip the approval check when the
@@ -233,12 +246,12 @@ func runSinglePrompt(ctx context.Context, a *agent.Agent, prompt string, cfg *co
 
 	_, err := a.StreamProcessInput(ctx, prompt, handlers)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "\nError: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 	if !cfg.CLIVerbose {
 		fmt.Println(final.String())
 	}
+	return nil
 }
 
 // generateToken returns a cryptographically random 32-byte hex string.

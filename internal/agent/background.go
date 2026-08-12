@@ -148,8 +148,6 @@ func (a *Agent) BackgroundJobStatus(jobID string) (string, error) {
 		return fmt.Sprintf("Job %s was CANCELLED after %s.\nCommand: %s\n%s", job.ID, elapsed, job.Command, formatJobOutput(job)), nil
 	case exitErr == nil:
 		exitCode = 0
-	case errors.Is(exitErr, context.DeadlineExceeded):
-		return fmt.Sprintf("Job %s TIMED OUT after %s.\nCommand: %s\n%s", job.ID, elapsed, job.Command, formatJobOutput(job)), nil
 	default:
 		var ee *exec.ExitError
 		if errors.As(exitErr, &ee) {
