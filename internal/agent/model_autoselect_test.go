@@ -57,6 +57,9 @@ func modelsServer(t *testing.T, ids ...string) *httptest.Server {
 func failingModelsServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Fail fast: openai-go retries 5xx with exponential backoff, which
+		// would make every catalog probe in this test sleep ~1.2s.
+		w.Header().Set("x-should-retry", "false")
 		http.Error(w, "catalog unavailable", http.StatusInternalServerError)
 	}))
 	t.Cleanup(srv.Close)

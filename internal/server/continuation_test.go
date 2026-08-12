@@ -145,6 +145,26 @@ func readUntil(t *testing.T, conn *websocket.Conn, timeout time.Duration, match 
 	}
 }
 
+// configAfterClear reads the config frames that follow a clear_chat and
+// returns the first one belonging to a session other than oldID. The attach
+// handshake emits config frames for the ORIGINAL session asynchronously (the
+// full config with context stats trails the basic one), so they can still be
+// in the send queue when /new's clear_chat + config are enqueued; clients key
+// configs by sessionId, and tests must skip the stale ones instead of
+// assuming the first config after clear_chat is the new session's.
+func configAfterClear(t *testing.T, conn *websocket.Conn, oldID string) WSMessage {
+	t.Helper()
+	var cfg WSMessage
+	for i := 0; i < 3; i++ {
+		cfg = readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" })
+		if cfg.SessionID != oldID {
+			return cfg
+		}
+	}
+	t.Fatalf("no config for a fresh session after clear_chat (last config sessionId = %q)", cfg.SessionID)
+	return WSMessage{}
+}
+
 // TestTurnContinuesAfterDisconnect is the headline continuation test: the
 // client drops mid-turn, the turn completes headless (the stub is released
 // only AFTER HandleWS has returned, proving the turn context is no longer

@@ -220,8 +220,8 @@ func TestSessionAttachLoadsInactiveSession(t *testing.T) {
 		t.Fatalf("send: %v", err)
 	}
 	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "user_acked" })
-	if got := rt.agent.MessageCount(); got != 2 {
-		t.Fatalf("disk-session message count = %d, want 2 (message routed to attached pane)", got)
+	if got := userMessageCount(rt.agent); got != 2 {
+		t.Fatalf("disk-session user message count = %d, want 2 (message routed to attached pane)", got)
 	}
 }
 
@@ -327,10 +327,7 @@ func TestTypedNewOverWS(t *testing.T) {
 		t.Fatalf("send /new: %v", err)
 	}
 	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "clear_chat" })
-	cfg := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" })
-	if cfg.SessionID == "" || cfg.SessionID == origID {
-		t.Fatalf("config sessionId = %q, want a fresh session", cfg.SessionID)
-	}
+	cfg := configAfterClear(t, conn, origID)
 	if _, ok := s.registry.get(cfg.SessionID); !ok {
 		t.Fatal("typed /new did not register the new session")
 	}
@@ -341,11 +338,33 @@ func TestTypedNewOverWS(t *testing.T) {
 	if err := conn.WriteJSON(WSMessage{Type: "message", Content: "hi"}); err != nil {
 		t.Fatalf("send: %v", err)
 	}
-	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "user_acked" })
-	rt, _ := s.registry.get(cfg.SessionID)
-	if got := rt.agent.MessageCount(); got != 1 {
-		t.Fatalf("new session message count = %d, want 1 (message routed to new default)", got)
+	acked := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "user_acked" })
+	if acked.SessionID != cfg.SessionID {
+		t.Fatalf("user_acked sessionId = %q, want %q (message routed to new default)", acked.SessionID, cfg.SessionID)
 	}
+	rt, _ := s.registry.get(cfg.SessionID)
+	// Count USER messages only: the user message is appended before
+	// user_acked fires, but the assistant reply is appended asynchronously by
+	// the stream goroutine, so MessageCount() races it (it may already
+	// include the mock's "ok" reply by the time we read it).
+	if got := userMessageCount(rt.agent); got != 1 {
+		t.Fatalf("new session user message count = %d, want 1 (message routed to new default)", got)
+	}
+}
+
+// userMessageCount returns the number of user-role messages in the agent's
+// conversation. Unlike MessageCount, it is stable immediately after a
+// user_acked frame: StreamProcessInput appends the user message before
+// OnStart fires, while the assistant reply is appended later by the turn's
+// stream goroutine.
+func userMessageCount(a *agent.Agent) int {
+	n := 0
+	for _, m := range a.SnapshotMessages() {
+		if m.Role == "user" {
+			n++
+		}
+	}
+	return n
 }
 
 func TestSessionDeleteEvictsAndReplacesCurrent(t *testing.T) {

@@ -54,6 +54,29 @@ func TestSearchCodeMatches(t *testing.T) {
 	}
 }
 
+// TestParseRgMatchesNormalizesWindowsPaths pins the Windows shape of
+// ripgrep output: rg prints backslash paths (".\internal\target.go") for a
+// root search on Windows, and parseRgMatches must normalize them to the same
+// forward-slash workspace-relative paths the Go fallback emits — otherwise
+// search results (and consumers like find-definition) see OS-specific paths.
+// The input is built with the platform's native separator so the test
+// exercises the real rg shape on every OS (on Unix the path passes through
+// unchanged; on Windows it must be converted).
+func TestParseRgMatchesNormalizesWindowsPaths(t *testing.T) {
+	in := filepath.FromSlash("./internal/target.go") + ":3:var TargetNeedle = 2"
+	got := parseRgMatches(in, "")
+	want := []SearchMatch{{Path: filepath.ToSlash(filepath.FromSlash("./internal/target.go")), Line: 3, Text: "var TargetNeedle = 2"}}
+	if len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("parseRgMatches = %+v, want %+v", got, want)
+	}
+	// With a relPrefix the path is joined and normalized as before.
+	got = parseRgMatches(filepath.FromSlash("./a.go")+":1:var A = 1", "pkg")
+	want = []SearchMatch{{Path: "pkg/a.go", Line: 1, Text: "var A = 1"}}
+	if len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("parseRgMatches with prefix = %+v, want %+v", got, want)
+	}
+}
+
 func TestSearchCodeRejectsDashPattern(t *testing.T) {
 	dir := t.TempDir()
 	executor := NewExecutor(dir)

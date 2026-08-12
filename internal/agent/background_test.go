@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -141,24 +142,27 @@ func TestCloseKillsBackgroundJobs(t *testing.T) {
 	exec := NewExecutor(dir)
 	a := NewAgent(nil, exec, nil)
 
-	id, err := a.StartBackgroundCommand("sleep 30; echo done > " + filepath.Join(dir, "marker"))
+	marker := filepath.Join(dir, "marker")
+	id, err := a.StartBackgroundCommand("sleep 30; echo done > " + marker)
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	a.Close()
-	// The job must be cancelled (not allowed to complete its sleep and write
-	// the marker).
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(filepath.Join(dir, "marker")); err == nil {
-			t.Fatal("background job survived Agent.Close and completed its work")
-		}
-		time.Sleep(20 * time.Millisecond)
+	job := a.bgJobs[id]
+	if job == nil {
+		t.Fatal("started job not registered")
 	}
-	// The job should now be reaped or reported cancelled.
-	status, err := a.BackgroundJobStatus(id)
-	if err == nil && !strings.Contains(status, "CANCELLED") {
-		t.Fatalf("unexpected status after Close: %s", status)
+	a.Close()
+	// The job must be killed promptly: its wait goroutine closes done as
+	// soon as the killed process exits (Close cancels the command context,
+	// which SIGKILLs the whole process group).
+	select {
+	case <-job.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background job survived Agent.Close")
+	}
+	// The kill must have cut the sleep short: the marker is never written.
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("background job survived Agent.Close and completed its work")
 	}
 }
 
@@ -204,53 +208,91 @@ func TestBackgroundJobReapedAfterRetention(t *testing.T) {
 // TestFinishedJobCapReapsOldest verifies the finished-job cap: when a job
 // finishes over the cap, the OLDEST finished jobs are reaped immediately
 // (their status becomes "unknown"), so a burst of short-lived jobs cannot
-// pile up during the retention window. Finish order is forced with distinct
-// sleep durations: the longest sleep finishes last and is the most recent
-// finisher, so it must survive.
+// pile up during the retention window. Finish order is recorded from each
+// job's done channel (process-exit order) instead of assuming the sleep
+// durations serialize reliably on every platform (wall-clock order drifted
+// on macOS CI); the cap must reap the first two finishers and keep the last
+// three registered.
 func TestFinishedJobCapReapsOldest(t *testing.T) {
 	exec := NewExecutor(t.TempDir())
 	a := NewAgent(nil, exec, nil)
 	defer a.Close()
 	a.bgMaxFinished = 3
 
-	// Finish order: job 5 (sleep 0.01) first, ..., job 1 (sleep 0.05) last.
-	// Cap enforcement when job 2 finishes reaps job 5; when job 1 finishes
-	// it reaps job 4 — jobs 1-3 stay registered.
 	sleeps := []string{"0.05", "0.04", "0.03", "0.02", "0.01"}
-	ids := make([]string, len(sleeps))
+	jobs := make([]*BackgroundJob, 0, len(sleeps))
 	for i, s := range sleeps {
 		id, err := a.StartBackgroundCommand("sleep " + s)
 		if err != nil {
 			t.Fatalf("start %d: %v", i, err)
 		}
-		ids[i] = id
+		// Read the job under bgMu: the cap can reap finished jobs (delete
+		// from bgJobs) as soon as the first sleep completes, racing a bare
+		// map read from the test goroutine.
+		a.bgMu.Lock()
+		job := a.bgJobs[id]
+		a.bgMu.Unlock()
+		if job == nil {
+			t.Fatalf("started job %s not registered", id)
+		}
+		jobs = append(jobs, job)
 	}
 
-	// Wait until every job has settled (finished or reaped).
+	// Record the finish order from the done channels (closed when each
+	// process exits), so the assertions match the cap's own ordering rather
+	// than depending on the sleeps' wall-clock precision.
+	var orderMu sync.Mutex
+	finishOrder := make([]string, 0, len(jobs))
+	for _, job := range jobs {
+		job := job
+		go func() {
+			<-job.done
+			orderMu.Lock()
+			finishOrder = append(finishOrder, job.ID)
+			orderMu.Unlock()
+		}()
+	}
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		settled := true
-		for _, id := range ids {
-			if s, err := a.BackgroundJobStatus(id); err == nil && strings.Contains(s, "RUNNING") {
-				settled = false
-			}
-		}
+		orderMu.Lock()
+		settled := len(finishOrder) == len(jobs)
+		orderMu.Unlock()
 		if settled {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	for i, id := range ids {
+	orderMu.Lock()
+	finished := append([]string(nil), finishOrder...)
+	orderMu.Unlock()
+	if len(finished) != len(jobs) {
+		t.Fatalf("only %d of %d jobs finished within the deadline", len(finished), len(jobs))
+	}
+
+	// The cap reaps as jobs finish: the first finisher is reaped when the
+	// fourth finisher's enforcement runs, and the second finisher when the
+	// fifth's does. Wait until BOTH reaps have been processed before
+	// asserting the survivors.
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		_, err0 := a.BackgroundJobStatus(finished[0])
+		_, err1 := a.BackgroundJobStatus(finished[1])
+		if err0 != nil && err1 != nil && strings.Contains(err0.Error(), "unknown background job") && strings.Contains(err1.Error(), "unknown background job") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for i, id := range finished {
 		s, err := a.BackgroundJobStatus(id)
-		if i < 3 {
-			// Jobs 1-3 are the most recent finishers: still registered.
-			if err != nil || !strings.Contains(s, "FINISHED") {
-				t.Fatalf("job %d should still be registered as finished; status=%q err=%v", i+1, s, err)
+		if i < 2 {
+			// The first two finishers exceed the cap: reaped immediately.
+			if err == nil || !strings.Contains(err.Error(), "unknown background job") {
+				t.Fatalf("job %s (finisher %d) should have been reaped; status=%q err=%v", id, i+1, s, err)
 			}
 		} else {
-			// Jobs 4-5 finished first: reaped by the cap.
-			if err == nil || !strings.Contains(err.Error(), "unknown background job") {
-				t.Fatalf("job %d should have been reaped; status=%q err=%v", i+1, s, err)
+			// The last three finishers are within the cap: still registered.
+			if err != nil || !strings.Contains(s, "FINISHED") {
+				t.Fatalf("job %s (finisher %d) should still be registered as finished; status=%q err=%v", id, i+1, s, err)
 			}
 		}
 	}

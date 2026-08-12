@@ -30,10 +30,7 @@ func TestNewSessionCreatesAndReKeys(t *testing.T) {
 	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "response" })
 	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "clear_chat" })
 	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "history" })
-	cfg := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" })
-	if cfg.SessionID == "" || cfg.SessionID == sessionA {
-		t.Fatalf("session_new config sessionId = %q, want a fresh session != %q", cfg.SessionID, sessionA)
-	}
+	cfg := configAfterClear(t, conn, sessionA)
 	sessionB := cfg.SessionID
 	if _, ok := s.registry.get(sessionB); !ok {
 		t.Fatal("session_new did not register the new session")
@@ -46,8 +43,8 @@ func TestNewSessionCreatesAndReKeys(t *testing.T) {
 	}
 	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "user_acked" })
 	rt, _ := s.registry.get(sessionB)
-	if got := rt.agent.MessageCount(); got != 1 {
-		t.Fatalf("new session message count = %d, want 1", got)
+	if got := userMessageCount(rt.agent); got != 1 {
+		t.Fatalf("new session user message count = %d, want 1", got)
 	}
 }
 
@@ -84,10 +81,7 @@ func TestTypedNewRoutesThroughRegistry(t *testing.T) {
 	}
 	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "clear_chat" })
 	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "history" })
-	cfg := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" })
-	if cfg.SessionID == "" || cfg.SessionID == sessionA {
-		t.Fatalf("typed /new config sessionId = %q, want a fresh session != %q", cfg.SessionID, sessionA)
-	}
+	cfg := configAfterClear(t, conn, sessionA)
 	if _, ok := s.registry.get(cfg.SessionID); !ok {
 		t.Fatal("typed /new did not register the new session")
 	}

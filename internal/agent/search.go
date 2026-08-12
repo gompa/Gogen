@@ -390,6 +390,11 @@ func parseRgMatches(text, relPrefix string) []SearchMatch {
 		if !ok {
 			continue
 		}
+		// Normalize to forward slashes on every platform: rg prints
+		// backslash paths on Windows for a root search (e.g.
+		// ".\internal\target.go"), while the Go fallback always emits
+		// workspace-relative slash paths.
+		path = filepath.ToSlash(path)
 		if relPrefix != "" {
 			path = filepath.ToSlash(filepath.Join(relPrefix, path))
 		}

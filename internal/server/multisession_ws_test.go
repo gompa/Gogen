@@ -32,7 +32,7 @@ func TestTwoSessionsStreamConcurrently(t *testing.T) {
 		t.Fatalf("send session_new: %v", err)
 	}
 	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "clear_chat" })
-	cfgB := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" })
+	cfgB := configAfterClear(t, conn, sessionA)
 	sessionB := cfgB.SessionID
 	if sessionB == "" || sessionB == sessionA {
 		t.Fatalf("session_new config sessionId = %q, want a fresh session != %q", sessionB, sessionA)
