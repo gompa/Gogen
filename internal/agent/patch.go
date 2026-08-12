@@ -410,6 +410,12 @@ func (p *diffParser) handleFileHeaderLine(i int) (patchParseState, error) {
 	switch {
 	case strings.HasPrefix(p.lines[i], "diff --git "):
 		p.flushFile()
+	case isContextRangeHeader(p.lines[i]) || isContextSeparator(p.lines[i]):
+		// Context-format (diff -c) constructs between sections mean the
+		// model switched diff formats. Fail loudly with a format-specific
+		// message; the generic header-state fallthrough would otherwise
+		// skip the range header and yield a confusing "no patches found".
+		return stateFileHeader, contextFormatError(p.lines[i])
 	case isGitPreamble(p.lines[i]):
 		// git metadata between file sections — skip.
 	case strings.HasPrefix(p.lines[i], "--- "):
@@ -458,6 +464,13 @@ func (p *diffParser) handleHunkBodyLine(i int) (patchParseState, error) {
 	case strings.HasPrefix(p.lines[i], "diff --git "):
 		p.flushFile()
 		return stateFileHeader, nil
+	case isContextRangeHeader(p.lines[i]) || isContextSeparator(p.lines[i]):
+		// A context-format range header or section separator inside a hunk
+		// body means the model switched to diff -c mid-patch. Fail loudly:
+		// the old-side header would otherwise be a "malformed hunk line"
+		// and the new-side header a spurious "--- " file header or removed
+		// line, both silently corrupting or confusingly failing the patch.
+		return stateHunkBody, contextFormatError(p.lines[i])
 	// "--- "/"+++ " are file headers ONLY outside a hunk (or after a
 	// hunk that has consumed its declared line counts). A hunk's own
 	// removed/added lines can themselves start with "-- "/"++ " — e.g.
@@ -676,6 +689,60 @@ func isPatchDelimiterMarker(line string) bool {
 		}
 	}
 	return true
+}
+
+// isContextRangeHeader reports whether line is a context-format (diff -c)
+// hunk range header: "*** 30,34 ****" / "*** 16,20 ***" for the old side and
+// "--- 30,34 ----" for the new side. Models sometimes switch to context
+// format (or emit a context diff outright); the parser only accepts unified
+// format, so these must fail loudly with a format-specific message instead
+// of being absorbed as a file header ("--- 30,34 ----"), a removed line, or
+// a patch delimiter. The trailing star/dash runs are required so a file
+// literally named "30,34" (a "--- 30,34" header) still parses.
+func isContextRangeHeader(line string) bool {
+	var rest string
+	switch {
+	case strings.HasPrefix(line, "***") && strings.Contains(line[3:], "***"):
+		// Old side: "*** 30,34 ****" or "*** 16,20 ***".
+		rest = strings.TrimSpace(strings.TrimPrefix(line, "***"))
+		rest = strings.TrimSuffix(rest, "****")
+		rest = strings.TrimSuffix(rest, "***")
+		rest = strings.TrimSpace(rest)
+	case strings.HasPrefix(line, "--- ") && strings.HasSuffix(line, "----"):
+		// New side: "--- 30,34 ----".
+		rest = strings.TrimSpace(strings.TrimPrefix(line, "--- "))
+		rest = strings.TrimSuffix(rest, "----")
+		rest = strings.TrimSpace(rest)
+	default:
+		return false
+	}
+	if rest == "" {
+		return false
+	}
+	for _, r := range rest {
+		if (r < '0' || r > '9') && r != ',' {
+			return false
+		}
+	}
+	return true
+}
+
+// isContextSeparator reports whether line is the context-format (diff -c)
+// section separator: a run of 15 asterisks ("***************"). Unified
+// format never produces an unprefixed all-star line (a star-only context
+// line would carry a leading space, a removed/added line a -/+ prefix), so
+// an all-star run is an unambiguous switch-to-context-format signal that
+// must fail loudly instead of silently ending the patch like a "***"
+// delimiter marker.
+func isContextSeparator(line string) bool {
+	return len(line) >= 15 && strings.Trim(line, "*") == ""
+}
+
+// contextFormatError explains a context-format (diff -c) construct in an
+// actionable way: the parser only accepts unified format, so the model must
+// regenerate the diff instead of retrying the same format.
+func contextFormatError(line string) error {
+	return fmt.Errorf("diff uses context format (diff -c) at %q: patch_file only accepts unified format ('--- a/x'/'+++ b/x' headers with '@@ -start,count +start,count @@' hunks). Regenerate the diff in unified format", line)
 }
 
 // isBareCodeFence reports whether line is a bare markdown code fence

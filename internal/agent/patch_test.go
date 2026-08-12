@@ -455,20 +455,114 @@ func TestParseUnifiedDiffStartMarkerPreambleSkipped(t *testing.T) {
 	}
 }
 
-func TestParseUnifiedDiffContextFormatRangeHeadersStillRejected(t *testing.T) {
+func TestParseUnifiedDiffContextFormatRangeHeadersRejected(t *testing.T) {
 	// diff -c range headers ("*** 16,20 ***", "*** 104,110 ****") are NOT
 	// delimiter markers: they mean the model switched to context format, and
-	// the patch must keep failing loudly instead of silently dropping diff
-	// structure (regression guard for the marker-tolerance fix).
-	for _, header := range []string{"*** 16,20 ***", "*** 104,110 ****"} {
+	// the patch must keep failing loudly — with a format-specific message —
+	// instead of silently dropping diff structure (regression guard for the
+	// marker-tolerance fix).
+	for _, header := range []string{"*** 16,20 ***", "*** 104,110 ****", "--- 30,34 ----"} {
 		diff := "--- a/main.go\n+++ b/main.go\n@@ -1,2 +1,2 @@\n package main\n" + header + "\n+// x\n"
 		_, err := parseUnifiedDiff(diff)
 		if err == nil {
 			t.Fatalf("expected context-format header %q to be rejected, got nil", header)
 		}
-		if !strings.Contains(err.Error(), "malformed hunk line") {
-			t.Fatalf("expected malformed hunk line error for %q, got: %v", header, err)
+		if !strings.Contains(err.Error(), "context format") || !strings.Contains(err.Error(), "unified format") {
+			t.Fatalf("expected context-format error for %q, got: %v", header, err)
 		}
+	}
+}
+
+func TestParseUnifiedDiffContextFormatSectionRejected(t *testing.T) {
+	// A full context-format diff (diff -c) must fail with the format error,
+	// not the confusing "no patches found in diff": the "*** path" file
+	// header is skipped as preamble, "--- path" parses as a file header,
+	// and the "***************" separator signals the format switch.
+	diff := "" +
+		"*** main.go\t2024-01-01 12:00:00\n" +
+		"--- main.go\t2024-01-01 12:00:00\n" +
+		"***************\n" +
+		"*** 30,34 ****\n" +
+		"  line1\n" +
+		"- removed\n" +
+		"--- 30,34 ----\n" +
+		"  line1\n" +
+		"+ added\n"
+	_, err := parseUnifiedDiff(diff)
+	if err == nil {
+		t.Fatal("expected context-format diff to be rejected, got nil")
+	}
+	if !strings.Contains(err.Error(), "context format") {
+		t.Fatalf("expected context-format error, got: %v", err)
+	}
+
+	// The bare separator alone must also fail loudly (mixed formats).
+	mixed := "--- a/main.go\n+++ b/main.go\n@@ -1,2 +1,2 @@\n package main\n***************\n"
+	_, err = parseUnifiedDiff(mixed)
+	if err == nil {
+		t.Fatal("expected context-format separator to be rejected, got nil")
+	}
+	if !strings.Contains(err.Error(), "context format") {
+		t.Fatalf("expected context-format error, got: %v", err)
+	}
+}
+
+func TestParseUnifiedDiffContextFormatHeaderInHeaderStateRejected(t *testing.T) {
+	// A context-format range header between file sections used to be
+	// skipped as stray text (then "no patches found in diff"); it must now
+	// fail with the format-specific message.
+	diff := "" +
+		"--- a/a.txt\n" +
+		"+++ b/a.txt\n" +
+		"@@ -1,1 +1,2 @@\n" +
+		" one\n" +
+		"+two\n" +
+		"*** 30,34 ****\n" +
+		"--- a/b.txt\n" +
+		"+++ b/b.txt\n"
+	_, err := parseUnifiedDiff(diff)
+	if err == nil {
+		t.Fatal("expected context-format range header to be rejected, got nil")
+	}
+	if !strings.Contains(err.Error(), "context format") {
+		t.Fatalf("expected context-format error, got: %v", err)
+	}
+}
+
+func TestParseUnifiedDiffContextHeaderLookalikesStayUnified(t *testing.T) {
+	// Lines that merely look like context-format constructs must keep
+	// parsing as unified content: delimiter markers with letters, added
+	// "***" lines, a file literally named "30,34" (no trailing "----"),
+	// and star runs under the 15-star separator length.
+	diff := "" +
+		"--- a/notes.md\n" +
+		"+++ b/notes.md\n" +
+		"@@ -1,2 +1,3 @@\n" +
+		" title\n" +
+		"+*** horizontal rule\n" +
+		" 30,34\n" +
+		"*** End Patch\n"
+	files, err := parseUnifiedDiff(diff)
+	if err != nil {
+		t.Fatalf("lookalikes must not be rejected: %v", err)
+	}
+	if len(files) != 1 || len(files[0].hunks) != 1 {
+		t.Fatalf("files=%d hunks=%d want 1 and 1", len(files), len(files[0].hunks))
+	}
+	h := files[0].hunks[0]
+	if len(h.newLines) != 3 || h.newLines[1] != "*** horizontal rule" {
+		t.Fatalf("newLines=%#v", h.newLines)
+	}
+
+	// "--- 30,34" (no trailing "----") is a file header for a file named
+	// "30,34", not a context-format new-side header.
+	lookalike := "--- 30,34\n+++ b/30,34\n@@ -1,1 +1,1 @@\n-x\n"
+	files, err = parseUnifiedDiff(lookalike)
+	if err != nil {
+		t.Fatalf("--- header without ---- must stay a file header: %v", err)
+	}
+	if len(files) != 1 || files[0].oldName != "30,34" {
+		t.Fatalf("oldName=%q want 30,34", files[0].oldName)
 	}
 }
 
