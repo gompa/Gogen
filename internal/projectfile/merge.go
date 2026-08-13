@@ -41,15 +41,16 @@ func Merge(pf *ProjectFile, flags FlagOverrides) *config.Config {
 		MCP:                       mergeString("GOGEN_MCP", file.MCP, def.MCP),
 		DebugCompareMessages:      mergeBool("GOGEN_DEBUG_COMPARE_MESSAGES", file.DebugCompareMessages, def.DebugCompareMessages),
 		MCPServers:                mergeMCPServers(file),
+		OpenAIProviders:           mergeOpenAIProviders(file),
 		TestCommand:               mergeString("", file.TestCommand, ""),
 		LintCommand:               mergeString("", file.LintCommand, ""),
-		WebBind:                   mergeString("GOGEN_WEB_BIND", "", def.WebBind),
+		WebBind:                   mergeString("GOGEN_WEB_BIND", file.WebBind, def.WebBind),
 		WebAllowedOrigins:         mergeString("GOGEN_WEB_ALLOWED_ORIGINS", "", def.WebAllowedOrigins),
 		WebAuthToken:              mergeString("GOGEN_WEB_TOKEN", file.WebAuthToken, def.WebAuthToken),
 		WebTLSCertFile:            mergeString("GOGEN_WEB_TLS_CERT", file.WebTLSCertFile, def.WebTLSCertFile),
 		WebTLSKeyFile:             mergeString("GOGEN_WEB_TLS_KEY", file.WebTLSKeyFile, def.WebTLSKeyFile),
 		SessionMaxCount:           mergeInt("GOGEN_SESSION_MAX_COUNT", file.SessionMaxCount, def.SessionMaxCount),
-		SessionMaxAgeDays:         mergeInt("GOGEN_SESSION_MAX_AGE_DAYS", file.SessionMaxAgeDays, def.SessionMaxAgeDays),
+		SessionMaxAgeDays:         mergeIntKeepNegative("GOGEN_SESSION_MAX_AGE_DAYS", file.SessionMaxAgeDays, def.SessionMaxAgeDays),
 		WebMaxActiveSessions:      mergeInt("GOGEN_WEB_MAX_ACTIVE_SESSIONS", file.WebMaxActiveSessions, def.WebMaxActiveSessions),
 		WebApprovalHoldSecs:       mergeInt("GOGEN_WEB_APPROVAL_HOLD_SECS", file.WebApprovalHoldSecs, def.WebApprovalHoldSecs),
 		WebFetch:                  mergeString("GOGEN_WEB_FETCH", file.WebFetch, def.WebFetch),
@@ -61,6 +62,13 @@ func Merge(pf *ProjectFile, flags FlagOverrides) *config.Config {
 		CommandSandbox:            mergeString("GOGEN_COMMAND_SANDBOX", file.CommandSandbox, def.CommandSandbox),
 		CommandTimeoutSecs:        mergeInt("GOGEN_COMMAND_TIMEOUT_SECS", file.CommandTimeoutSecs, def.CommandTimeoutSecs),
 		PreserveReasoning:         mergeString("GOGEN_PRESERVE_REASONING", file.PreserveReasoning, def.PreserveReasoning),
+		Board:                     mergeString("GOGEN_BOARD", file.Board, def.Board),
+		Subagent:                  mergeString("GOGEN_SUBAGENT", file.Subagent, def.Subagent),
+		SubagentMaxDepth:          mergeInt("GOGEN_SUBAGENT_MAX_DEPTH", file.SubagentMaxDepth, def.SubagentMaxDepth),
+		SubagentModel:             mergeString("GOGEN_SUBAGENT_MODEL", file.SubagentModel, def.SubagentModel),
+		BoardStartPrompt:          mergeString("GOGEN_BOARD_START_PROMPT", file.BoardStartPrompt, def.BoardStartPrompt),
+		SystemPrompt:              mergeString("GOGEN_SYSTEM_PROMPT", file.SystemPrompt, def.SystemPrompt),
+		SubagentPrompt:            mergeString("GOGEN_SUBAGENT_PROMPT", file.SubagentPrompt, def.SubagentPrompt),
 	}
 
 	if flags.WorkingDir != "" {
@@ -108,6 +116,38 @@ func mergeMCPServers(file FileConfig) []config.MCPServerConfig {
 				Command: s.Command,
 				Args:    append([]string(nil), s.Args...),
 				Env:     cloneStringMap(s.Env),
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// mergeOpenAIProviders merges the registered OpenAI-compatible provider
+// list: the GOGEN_OPENAI_PROVIDERS JSON env var wins when set, otherwise the
+// file's openai_providers list is used (converted to config entries).
+// An explicitly empty env value clears the list.
+func mergeOpenAIProviders(file FileConfig) []config.OpenAIProviderConfig {
+	if _, ok := os.LookupEnv("GOGEN_OPENAI_PROVIDERS"); ok {
+		raw := os.Getenv("GOGEN_OPENAI_PROVIDERS")
+		if strings.TrimSpace(raw) == "" {
+			return nil
+		}
+		var providers []config.OpenAIProviderConfig
+		if err := json.Unmarshal([]byte(raw), &providers); err != nil {
+			log.Printf("warning: GOGEN_OPENAI_PROVIDERS is not a valid JSON array; ignoring it: %v", err)
+			return nil
+		}
+		return providers
+	}
+	if file.OpenAIProviders != nil {
+		out := make([]config.OpenAIProviderConfig, len(file.OpenAIProviders))
+		for i, p := range file.OpenAIProviders {
+			out[i] = config.OpenAIProviderConfig{
+				Name:    p.Name,
+				BaseURL: p.BaseURL,
+				APIKey:  p.APIKey,
+				Model:   p.Model,
 			}
 		}
 		return out
@@ -208,6 +248,21 @@ func mergeString(envKey string, fileVal, def string) string {
 func mergeInt(envKey string, fileVal, def int) int {
 	if v, ok := envInt(envKey, def); ok {
 		return v
+	}
+	return config.Effective(fileVal, def)
+}
+
+// mergeIntKeepNegative is mergeInt for the one field where a negative value
+// is meaningful: session_max_age_days -1 = "keep sessions forever" (the
+// store's retention sentinel). config.Effective would map any value <= 0 to
+// the default, which would silently convert a persisted -1 back to the
+// default on the next start.
+func mergeIntKeepNegative(envKey string, fileVal, def int) int {
+	if v, ok := envInt(envKey, def); ok {
+		return v
+	}
+	if fileVal < 0 {
+		return fileVal
 	}
 	return config.Effective(fileVal, def)
 }

@@ -48,7 +48,7 @@ func deleteApprovalRequired(ctx context.Context) bool {
 }
 
 func (e *Executor) deleteApprovalRequired(ctx context.Context) bool {
-	if !e.RequireDeleteApproval {
+	if !e.DeleteApprovalRequired() {
 		return false
 	}
 	return deleteApprovalRequired(ctx)

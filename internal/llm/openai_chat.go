@@ -34,16 +34,18 @@ func (p *OpenAIProvider) clientForModel(ctx context.Context) *openai.Client {
 	model := p.model
 	p.modelsMu.RUnlock()
 
-	// Catalog-based discovery (OpenCode only): a bounded listModels fetch
-	// populates modelClient with the exact model → endpoint mapping. The
-	// modelsCache TTL and the modelsFetch single-flight make repeat misses
-	// cheap, and the failure backoff (modelsFetchFailedAt) stops a dead
-	// endpoint from being re-probed on every request. Do not hold modelsMu
-	// across network I/O; bound the fetch so a hung OpenCode endpoint cannot
-	// stall the first chat request indefinitely. The caller's context is
-	// threaded through so Ctrl+C aborts an in-flight catalog fetch instead of
-	// waiting out the timeout.
-	if p.zenClient != nil {
+	// Catalog-based discovery (OpenCode, or multi-profile providers): a
+	// bounded listModels fetch populates modelClient with the exact model →
+	// endpoint mapping. The modelsCache TTL and the modelsFetch single-flight
+	// make repeat misses cheap, and the failure backoff (modelsFetchFailedAt)
+	// stops a dead endpoint from being re-probed on every request. Do not
+	// hold modelsMu across network I/O; bound the fetch so a hung endpoint
+	// cannot stall the first chat request indefinitely. The caller's context
+	// is threaded through so Ctrl+C aborts an in-flight catalog fetch instead
+	// of waiting out the timeout. OpenCode is detected from the CURRENT
+	// profile set (hasOpenCodeProfile) in addition to the legacy frozen
+	// zenClient, so discovery stays live-correct after SetProfiles.
+	if p.zenClient != nil || p.hasMultipleProfiles() || p.hasOpenCodeProfile() {
 		if !p.catalogFetchOnBackoff() {
 			fetchCtx, cancel := context.WithTimeout(ctx, modelsCatalogTimeout)
 			_, _ = p.listModels(fetchCtx)
@@ -55,13 +57,13 @@ func (p *OpenAIProvider) clientForModel(ctx context.Context) *openai.Client {
 		if ok {
 			return c
 		}
-		// Model is not listed on either endpoint — fall through to the
-		// deterministic fallback (models.dev, then primary client).
+		// Model is not listed on any endpoint — fall through to the
+		// deterministic fallback (models.dev, then the default client).
 	}
 
 	chosen := p.inferOpenCodeEndpoint(model)
 	if chosen == nil {
-		chosen = &p.client
+		chosen = p.fallbackClient()
 	}
 
 	p.modelsMu.Lock()
@@ -81,11 +83,35 @@ func (p *OpenAIProvider) clientForModel(ctx context.Context) *openai.Client {
 // inferOpenCodeEndpoint picks the client that should serve model on OpenCode
 // without a catalog fetch, using the models.dev registry (in-memory/disk
 // cached; never blocks on the network). Go takes precedence: a model listed
-// on both the Go and Zen catalogs routes to the Go endpoint. Returns nil when
-// nothing can be determined (cold registry, model unknown, or the provider is
-// not OpenCode), in which case the caller falls back to the primary client.
+// on both the Go and Zen catalogs routes to the Go endpoint. Resolution is
+// profile-derived: the CURRENT registered OpenCode profiles' zen/go clients
+// are used, so SetProfiles swapping the endpoint set never routes through
+// stale construction-time clients. Returns nil when nothing can be
+// determined (cold registry, model unknown, or no OpenCode profile is
+// registered), in which case the caller falls back to the default client.
 func (p *OpenAIProvider) inferOpenCodeEndpoint(model string) *openai.Client {
-	if p.modelInfo == nil || model == "" || p.goClient == nil || p.zenClient == nil {
+	if p.modelInfo == nil || model == "" {
+		return nil
+	}
+	p.modelsMu.RLock()
+	profiles := p.profiles
+	p.modelsMu.RUnlock()
+	if len(profiles) > 0 {
+		for _, prof := range profiles {
+			if prof.zenStream == nil || prof.goStream == nil {
+				continue // not an OpenCode profile
+			}
+			if _, _, _, _, err := p.modelInfo.Resolve(openCodeGoBaseURL, model); err == nil {
+				return prof.goStream
+			}
+			if _, _, _, _, err := p.modelInfo.Resolve(openCodeZenBaseURL, model); err == nil {
+				return prof.zenStream
+			}
+		}
+		return nil
+	}
+	// Direct-constructed (test) shape: legacy frozen fields.
+	if p.goClient == nil || p.zenClient == nil {
 		return nil
 	}
 	if _, _, _, _, err := p.modelInfo.Resolve(openCodeGoBaseURL, model); err == nil {

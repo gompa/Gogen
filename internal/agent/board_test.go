@@ -1,0 +1,463 @@
+package agent
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+
+	"gogen/internal/contextmgr"
+	"gogen/internal/llm"
+)
+
+func newTestBoard(t *testing.T) *BoardManager {
+	t.Helper()
+	return NewBoardManager(t.TempDir(), false)
+}
+
+// TestBoardLifecycle covers add → list → show → claim → move → comment →
+// block → done and the persisted file layout (index.json + one file per
+// ticket).
+func TestBoardLifecycle(t *testing.T) {
+	m := newTestBoard(t)
+
+	out, err := m.Add("Fix parser crash", "make go test pass", "high", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "#1") {
+		t.Fatalf("add output = %q, want #1", out)
+	}
+	// One ticket file + index.json.
+	entries, _ := os.ReadDir(m.dir)
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 files (index + ticket), got %d", len(entries))
+	}
+
+	list, err := m.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(list, "Fix parser crash") || !strings.Contains(list, "1 pending") {
+		t.Fatalf("list = %q", list)
+	}
+
+	show, err := m.Show("1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(show, "high") || !strings.Contains(show, "make go test pass") {
+		t.Fatalf("show = %q", show)
+	}
+
+	if _, err := m.Claim("1", "agent-a"); err != nil {
+		t.Fatal(err)
+	}
+	// A second claim by someone else must fail.
+	if _, err := m.Claim("1", "agent-b"); err == nil {
+		t.Fatal("second claim should fail")
+	}
+	// Claiming by the same assignee is idempotent.
+	if _, err := m.Claim("1", "agent-a"); err != nil {
+		t.Fatalf("re-claim by same assignee: %v", err)
+	}
+
+	if _, err := m.Move("1", "in_review", "agent-a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Comment("1", "ready for review", "agent-a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Block("1", "waiting on upstream fix", "user"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Done("1", "user"); err != nil {
+		t.Fatal(err)
+	}
+
+	show, err = m.Show("1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Status: done", "claimed", "moved to in_review", "ready for review", "blocked: waiting on upstream fix", "marked done"} {
+		if !strings.Contains(show, want) {
+			t.Fatalf("show missing %q:\n%s", want, show)
+		}
+	}
+
+	// Reload from disk: a fresh manager must see the same board.
+	m2 := NewBoardManager(m.dir, false)
+	m2.dir = m.dir // same dir (NewBoardManager would use the parent's .gogen)
+	list2, err := m2.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(list2, "1 done") {
+		t.Fatalf("reloaded list = %q", list2)
+	}
+}
+
+// TestBoardClaimAssignsInProgressCard verifies claiming a card that was
+// moved to in_progress without an assignee (drag-drop / Move) records the
+// assignment instead of silently no-op'ing — the agent must not believe it
+// claimed a card that has no assignee.
+func TestBoardClaimAssignsInProgressCard(t *testing.T) {
+	m := newTestBoard(t)
+	if _, err := m.Add("pre-moved", "", "", "user"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Move("1", "in_progress", "user"); err != nil {
+		t.Fatal(err)
+	}
+	out, err := m.Claim("1", "agent-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "Claimed board item #1") {
+		t.Fatalf("claim output = %q", out)
+	}
+	show, err := m.Show("1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(show, "Assignee: agent-a") || !strings.Contains(show, "claimed") {
+		t.Fatalf("claim not recorded on pre-moved card:\n%s", show)
+	}
+	// A second agent still cannot take an assigned card.
+	if _, err := m.Claim("1", "agent-b"); err == nil {
+		t.Fatal("second claim by another agent should fail")
+	}
+}
+
+// TestBoardValidation covers unknown columns, missing items, and empty
+// required fields.
+func TestBoardValidation(t *testing.T) {
+	m := newTestBoard(t)
+	if _, err := m.Add("   ", "", "", "user"); err == nil {
+		t.Fatal("empty title should fail")
+	}
+	if _, err := m.Add("ok", "", "", "user"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Move("1", "nonsense", "user"); err == nil {
+		t.Fatal("unknown column should fail")
+	}
+	if _, err := m.Show("99"); err == nil {
+		t.Fatal("missing item should fail")
+	}
+	if _, err := m.Block("1", "  ", "user"); err == nil {
+		t.Fatal("empty block reason should fail")
+	}
+	if _, err := m.Comment("1", "  ", "user"); err == nil {
+		t.Fatal("empty comment should fail")
+	}
+	if _, err := m.Done("99", "user"); err == nil {
+		t.Fatal("done on missing item should fail")
+	}
+}
+
+// TestBoardClaimConcurrency verifies concurrent claims on the same ticket
+// from different agents serialize: exactly one assignee wins (run under
+// -race).
+func TestBoardClaimConcurrency(t *testing.T) {
+	m := newTestBoard(t)
+	if _, err := m.Add("contested", "", "", "user"); err != nil {
+		t.Fatal(err)
+	}
+	const workers = 8
+	var wg sync.WaitGroup
+	errs := make([]error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = m.Claim("1", fmt.Sprintf("agent-%d", i))
+		}(i)
+	}
+	wg.Wait()
+	successes := 0
+	for _, err := range errs {
+		if err == nil {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("expected exactly 1 successful claim, got %d", successes)
+	}
+	show, err := m.Show("1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(show, "in_progress") {
+		t.Fatalf("ticket should be in_progress:\n%s", show)
+	}
+}
+
+// TestBoardItemCap verifies the 200-ticket cap (D4).
+func TestBoardItemCap(t *testing.T) {
+	m := newTestBoard(t)
+	for i := 0; i < 200; i++ {
+		if _, err := m.Add(fmt.Sprintf("item %d", i), "", "", "user"); err != nil {
+			t.Fatalf("add %d: %v", i, err)
+		}
+	}
+	if _, err := m.Add("overflow", "", "", "user"); err == nil {
+		t.Fatal("201st item should fail")
+	}
+}
+
+// TestBoardActivityCap verifies the activity log caps at 50 entries per
+// ticket (D4).
+func TestBoardActivityCap(t *testing.T) {
+	m := newTestBoard(t)
+	if _, err := m.Add("chatty", "", "", "user"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 60; i++ {
+		if _, err := m.Comment("1", fmt.Sprintf("note %d", i), "user"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := os.ReadFile(m.itemPath("1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var item BoardItem
+	if err := json.Unmarshal(data, &item); err != nil {
+		t.Fatal(err)
+	}
+	if len(item.Activity) != 50 {
+		t.Fatalf("activity entries = %d, want 50", len(item.Activity))
+	}
+	if item.Activity[0].Text != "note 10" {
+		t.Fatalf("oldest kept entry = %q, want note 10 (oldest dropped)", item.Activity[0].Text)
+	}
+}
+
+// TestBoardCorruptIndexRebuild verifies a corrupt index.json is rebuilt from
+// the ticket files (status is authoritative on the tickets).
+func TestBoardCorruptIndexRebuild(t *testing.T) {
+	m := newTestBoard(t)
+	if _, err := m.Add("a", "", "", "user"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Add("b", "", "", "user"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Move("2", "in_progress", "agent"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(m.indexPath(), []byte("{corrupt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	list, err := m.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(list, "a") || !strings.Contains(list, "b") {
+		t.Fatalf("rebuilt list = %q", list)
+	}
+	show, err := m.Show("2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(show, "in_progress") {
+		t.Fatalf("status lost in rebuild:\n%s", show)
+	}
+	// Next add continues after the max existing id.
+	out, err := m.Add("c", "", "", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "#3") {
+		t.Fatalf("add after rebuild = %q, want #3", out)
+	}
+}
+
+// TestParseIntIDRejectsEmpty pins the empty-id guard: an empty id must
+// error (it would otherwise parse as 0 with no error), so the index rebuild
+// path skips empty-named files instead of adding a bogus "" entry to the
+// column order.
+func TestParseIntIDRejectsEmpty(t *testing.T) {
+	if _, err := parseIntID(""); err == nil {
+		t.Fatal("empty id should error")
+	}
+	if _, err := parseIntID("12"); err != nil {
+		t.Fatalf("numeric id should parse: %v", err)
+	}
+	if _, err := parseIntID("12a"); err == nil {
+		t.Fatal("non-numeric id should error")
+	}
+}
+
+// TestBoardGlobalDir verifies the global-mode board root (D3).
+func TestBoardGlobalDir(t *testing.T) {
+	m := NewBoardManager("/some/project", true)
+	if m.dir == filepath.Join("/some/project", ".gogen", "board") {
+		t.Fatal("global mode must not use the project board dir")
+	}
+	if !strings.Contains(m.dir, "board") {
+		t.Fatalf("global board dir = %q", m.dir)
+	}
+	m2 := NewBoardManager("/other/project", false)
+	if m2.dir != filepath.Join("/other/project", ".gogen", "board") {
+		t.Fatalf("project board dir = %q", m2.dir)
+	}
+}
+
+// TestBoardChangedHook verifies the on-board-changed hook fires after every
+// successful board mutation through the agent tool with the mutation's
+// output message (the web server broadcasts board_state + a success toast
+// from it) and does NOT fire for read-only actions or failed mutations.
+func TestBoardChangedHook(t *testing.T) {
+	prov := llm.NewMockProvider()
+	exec := NewExecutor(t.TempDir())
+	a := NewAgent(prov, exec, contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 128000}))
+	a.SetBoardEnabled(true)
+	bm := NewBoardManager(t.TempDir(), false)
+	a.SetBoardManager(bm)
+
+	var fired []string
+	a.SetOnBoardChanged(func(msg string) { fired = append(fired, msg) })
+
+	// Read-only: no fire.
+	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{"action": "list"}}); err != nil {
+		t.Fatal(err)
+	}
+	// Failed mutation: no fire.
+	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{"action": "move", "id": "99", "column": "done"}}); err == nil {
+		t.Fatal("expected error for missing item")
+	}
+	if len(fired) != 0 {
+		t.Fatalf("hook fired %d times for read/failed calls, want 0", len(fired))
+	}
+
+	// Mutations: each fires exactly once with its output message.
+	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{"action": "add", "title": "hook test"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{"action": "claim", "id": "1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{"action": "done", "id": "1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fired) != 3 {
+		t.Fatalf("hook fired %d times, want 3", len(fired))
+	}
+	for i, want := range []string{"Added board item #1: hook test", "Claimed board item #1: hook test", "Board item #1 is done: hook test"} {
+		if fired[i] != want {
+			t.Fatalf("hook message %d = %q, want %q", i, fired[i], want)
+		}
+	}
+}
+
+// TestBoardDelete verifies the remove action: the ticket file and index
+// entry are gone, the list no longer shows it, and deleting a missing card
+// errors.
+func TestBoardDelete(t *testing.T) {
+	m := newTestBoard(t)
+	if _, err := m.Add("doomed", "", "", "user"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Add("keeper", "", "", "user"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Move("1", "in_progress", "agent"); err != nil {
+		t.Fatal(err)
+	}
+	out, err := m.Delete("1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "Removed board item #1") {
+		t.Fatalf("delete output = %q", out)
+	}
+	// File gone, index clean, list shows only the survivor.
+	if _, err := os.Stat(m.itemPath("1")); !os.IsNotExist(err) {
+		t.Fatalf("ticket file still exists (err=%v)", err)
+	}
+	list, err := m.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(list, "doomed") || !strings.Contains(list, "keeper") {
+		t.Fatalf("list after delete = %q", list)
+	}
+	if _, err := m.Delete("1"); err == nil {
+		t.Fatal("deleting a missing card should fail")
+	}
+	// A fresh manager (reload from disk) agrees.
+	m2 := NewBoardManager(t.TempDir(), false)
+	m2.dir = m.dir
+	list2, err := m2.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(list2, "doomed") {
+		t.Fatalf("reloaded list still shows deleted card: %q", list2)
+	}
+}
+
+// TestBoardToolGating verifies the MCP-style zero-trace gating: with the
+// feature off the board tool is absent from llmTools/AllowedToolNames and
+// executeTool returns "unknown tool"; with it on (and a manager attached) it
+// is exposed and runs; in plan mode it stays available (D7).
+func TestBoardToolGating(t *testing.T) {
+	prov := llm.NewMockProvider()
+	exec := NewExecutor(t.TempDir())
+	a := NewAgent(prov, exec, contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 128000}))
+
+	// Off: no trace anywhere.
+	for _, def := range a.llmTools() {
+		if def.Name == "board" {
+			t.Fatal("board tool must not be exposed when disabled")
+		}
+	}
+	if _, ok := a.AllowedToolNames()["board"]; ok {
+		t.Fatal("board must not be allowed when disabled")
+	}
+	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{"action": "list"}}); err == nil || !strings.Contains(err.Error(), "unknown tool") {
+		t.Fatalf("expected unknown tool error, got %v", err)
+	}
+
+	// On: exposed, callable, and available in plan mode.
+	a.SetBoardEnabled(true)
+	a.SetBoardManager(NewBoardManager(t.TempDir(), false))
+	found := false
+	for _, def := range a.llmTools() {
+		if def.Name == "board" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("board tool should be exposed when enabled")
+	}
+	if _, ok := a.AllowedToolNames()["board"]; !ok {
+		t.Fatal("board should be allowed when enabled")
+	}
+	out, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{"action": "list"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "Board is empty") {
+		t.Fatalf("list output = %q", out)
+	}
+	a.SetMode(ModePlan)
+	if _, ok := a.AllowedToolNames()["board"]; !ok {
+		t.Fatal("board should stay allowed in plan mode (D7)")
+	}
+	if err := a.checkPlanMode("board"); err != nil {
+		t.Fatalf("plan mode should allow board (D7): %v", err)
+	}
+	out, err = a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{"action": "add", "title": "plan-mode card"}})
+	if err != nil {
+		t.Fatalf("board mutation in plan mode should work (D7): %v", err)
+	}
+	if !strings.Contains(out, "#1") {
+		t.Fatalf("add output = %q", out)
+	}
+}

@@ -60,7 +60,7 @@ func (t *TUI) Run(ctx context.Context) {
 	m.ctx = ctx
 
 	p := tea.NewProgram(
-		&m,
+		m,
 		tea.WithContext(ctx),
 		tea.WithMouseCellMotion(),
 	)

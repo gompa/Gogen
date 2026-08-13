@@ -37,9 +37,9 @@ func TestWorkingDirChangeRequiresGlobalMode(t *testing.T) {
 		if err := conn.WriteJSON(WSMessage{Type: "config", WorkingDir: newDir, SessionID: sid}); err != nil {
 			t.Fatalf("send config: %v", err)
 		}
-		resp := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "response" })
-		if !strings.Contains(resp.Content, "global mode") {
-			t.Fatalf("rejection response = %q, want global-mode error", resp.Content)
+		resp := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "notice" })
+		if resp.Kind != "workspace" || resp.Success || !strings.Contains(resp.Content, "global mode") {
+			t.Fatalf("rejection notice = %+v, want workspace error about global mode", resp)
 		}
 		if got := s.ws.GetWorkingDir(); got == newDir {
 			t.Fatalf("working dir changed to %q despite project mode", got)

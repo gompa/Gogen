@@ -124,7 +124,7 @@ func TestExecuteCommandUsesWorkingDir(t *testing.T) {
 func TestExecuteCommandBwrapMissingErrors(t *testing.T) {
 	dir := t.TempDir()
 	exec := NewExecutor(dir)
-	exec.Sandbox = "bwrap"
+	exec.SetSandbox("bwrap")
 	// Force LookPath failure by using a PATH without bwrap.
 	t.Setenv("PATH", dir)
 
@@ -140,7 +140,7 @@ func TestExecuteCommandBwrapMissingErrors(t *testing.T) {
 func TestExecuteCommandUnknownSandboxErrors(t *testing.T) {
 	dir := t.TempDir()
 	exec := NewExecutor(dir)
-	exec.Sandbox = "docker"
+	exec.SetSandbox("docker")
 
 	_, err := exec.ExecuteCommand(context.Background(), "echo hi")
 	if err == nil {

@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"fmt"
 	"strings"
 	"sync"
 
@@ -9,22 +8,58 @@ import (
 )
 
 // systemPromptTemplateOnce caches the template body once. Per-working-
-// directory prompts are not cached: sprintf with a single %s is cheap, and
-// long-lived processes that change working directories would otherwise grow an
-// unbounded map.
+// directory prompts are not cached: template substitution is cheap, and
+// long-lived processes that change working directories would otherwise grow
+// an unbounded map.
 var systemPromptTemplateOnce sync.Once
 var systemPromptTmpl string
 
-// SystemPrompt returns the default agent system prompt.
-func SystemPrompt(workingDir string) string {
+// systemPromptCfg holds the user-configured system prompt template
+// ("" = the built-in default). Package state like the web/treesitter config
+// setters: applied at startup (applyRuntimeConfig) and live from the web
+// settings modal.
+var systemPromptCfg struct {
+	mu   sync.Mutex
+	tmpl string
+}
+
+// ConfigureSystemPrompt sets the user-configured system prompt template
+// ("" restores the built-in default). The template may contain the
+// {working_dir} placeholder; the project profile, project rules, and
+// plan-mode suffixes always append after it.
+func ConfigureSystemPrompt(tmpl string) {
+	systemPromptCfg.mu.Lock()
+	systemPromptCfg.tmpl = tmpl
+	systemPromptCfg.mu.Unlock()
+}
+
+func configuredSystemPrompt() string {
+	systemPromptCfg.mu.Lock()
+	defer systemPromptCfg.mu.Unlock()
+	return systemPromptCfg.tmpl
+}
+
+// DefaultSystemPromptTemplate returns the built-in system prompt template
+// (with the {working_dir} placeholder) — the settings modal's "system
+// prompt" field is pre-populated with it, and SystemPrompt resolves against
+// it so the default text can never be baked into a config file.
+func DefaultSystemPromptTemplate() string {
 	systemPromptTemplateOnce.Do(func() {
 		systemPromptTmpl = systemPromptTemplate()
 	})
-	return fmt.Sprintf(systemPromptTmpl, workingDir)
+	return systemPromptTmpl
+}
+
+// SystemPrompt returns the effective agent system prompt: the configured
+// template (empty, or equal to the built-in default → built-in) with the
+// {working_dir} placeholder substituted.
+func SystemPrompt(workingDir string) string {
+	tmpl := ResolvePromptTemplate(configuredSystemPrompt(), DefaultSystemPromptTemplate())
+	return strings.ReplaceAll(tmpl, "{working_dir}", workingDir)
 }
 
 func systemPromptTemplate() string {
-	return `You are GoGen, a coding agent working in the local repository at %s.
+	return `You are GoGen, a coding agent working in the local repository at {working_dir}.
 
 You have tools for: exploring, searching, editing, shell, git, web, and task tracking,
 plus any mcp_* tools.

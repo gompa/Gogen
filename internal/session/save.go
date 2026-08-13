@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
+	"strings"
 	"time"
 
 	"gogen/internal/agent"
@@ -78,6 +80,7 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 		Oneshot:        snap.Oneshot,
 		TokenCounts:    snap.TokenCounts,
 		ContextLimit:   snap.ContextLimit,
+		ParentID:       snap.ParentID,
 	}
 	data, err := json.Marshal(out)
 	if err != nil {
@@ -103,7 +106,13 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 	// fresh here. This lets a cache-miss full save read index.json once
 	// instead of twice.
 	label := sessionLabel(snap.Messages, snap.Label, snap.LabelRenamed)
-	s.updateIndex(snap.WorkingDir, id, out.Created, out.Updated, len(snap.Messages), label, snap.Oneshot, snap.LabelRenamed, preloadedIdx)
+	s.updateIndex(snap.WorkingDir, id, out.Created, out.Updated, len(snap.Messages), label, snap.Oneshot, snap.LabelRenamed, snap.ParentID, preloadedIdx)
+	// Per-parent transcript cap (D2): nested sessions are exempt from the
+	// global retention counts but capped per parent (keep the most recent
+	// 10 children; oldest pruned at child save time).
+	if snap.ParentID != "" {
+		s.pruneNestedSiblings(snap.WorkingDir, id, snap.ParentID)
+	}
 	// Prune every 3 saves to avoid repeated directory scans on every write.
 	if s.autoPrune && s.saveCount%3 == 0 {
 		s.prune(snap.WorkingDir, id)
@@ -373,6 +382,7 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 		Messages:       f.Messages,
 		TokenCounts:    f.TokenCounts,
 		ContextLimit:   f.ContextLimit,
+		ParentID:       f.ParentID,
 	}, nil
 }
 
@@ -462,6 +472,7 @@ func (s *Store) Delete(workingDir, id string) error {
 			delete(s.createdCache, id)
 			s.removeFromIndex(workingDir, id)
 			s.invalidateListCache(workingDir)
+			s.deleteNestedChildren(workingDir, id)
 			return nil
 		}
 		return err
@@ -472,6 +483,134 @@ func (s *Store) Delete(workingDir, id string) error {
 	}
 	delete(s.createdCache, id)
 	// Remove from index and invalidate in-memory cache.
+	s.removeFromIndex(workingDir, id)
+	s.invalidateListCache(workingDir)
+	// Cascade: deleting a parent removes its nested (subagent) children
+	// (D2). Children are not in the flat list, so this is the only way they
+	// are ever deleted as a group.
+	s.deleteNestedChildren(workingDir, id)
+	return nil
+}
+
+// maxNestedPerParent is the transcript cap for nested (subagent) sessions
+// per parent (D2): children are exempt from the global session retention
+// counts but capped here, oldest first.
+const maxNestedPerParent = 10
+
+// nestedChildrenLocked returns the ids of saved sessions whose ParentID is
+// parentID, most-recently-updated first. Callers must hold s.mu. Falls back
+// to scanning session files when no index exists.
+func (s *Store) nestedChildrenLocked(workingDir, parentID string) []string {
+	idx := s.readIndex(workingDir)
+	if idx != nil {
+		var entries []sessionIndexEntry
+		for _, e := range idx.Entries {
+			if e.ParentID == parentID {
+				entries = append(entries, e)
+			}
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Updated.After(entries[j].Updated) })
+		ids := make([]string, len(entries))
+		for i, e := range entries {
+			ids[i] = e.ID
+		}
+		return ids
+	}
+	names, err := s.sessionFiles(workingDir)
+	if err != nil {
+		return nil
+	}
+	type childMeta struct {
+		id      string
+		updated time.Time
+	}
+	var metas []childMeta
+	var ids []string
+	for _, name := range names {
+		id := strings.TrimSuffix(name, ".json")
+		data, err := os.ReadFile(s.path(workingDir, id))
+		if err != nil {
+			continue
+		}
+		var meta struct {
+			ParentID string    `json:"parentID"`
+			Updated  time.Time `json:"updated"`
+		}
+		if err := json.Unmarshal(data, &meta); err != nil || meta.ParentID != parentID {
+			continue
+		}
+		metas = append(metas, childMeta{id: id, updated: meta.Updated})
+	}
+	// Mirror the index path's ordering: most-recently-updated first, so the
+	// per-parent cap prunes the OLDEST children (name order from ReadDir is
+	// id-sorted, which would prune the wrong siblings).
+	sort.Slice(metas, func(i, j int) bool { return metas[i].updated.After(metas[j].updated) })
+	for _, meta := range metas {
+		ids = append(ids, meta.id)
+	}
+	return ids
+}
+
+// deleteNestedChildren removes every saved session whose ParentID is id —
+// recursively, so grandchildren (subagent_max_depth >= 2) are not orphaned
+// when their parent child is deleted. Callers must hold s.mu (Delete does).
+func (s *Store) deleteNestedChildren(workingDir, parentID string) {
+	s.deleteNestedChildrenRec(workingDir, parentID, map[string]bool{})
+}
+
+func (s *Store) deleteNestedChildrenRec(workingDir, parentID string, visited map[string]bool) {
+	for _, id := range s.nestedChildrenLocked(workingDir, parentID) {
+		if visited[id] {
+			continue // corrupt ParentID cycle — never loop
+		}
+		visited[id] = true
+		if err := s.deleteSessionFile(workingDir, id); err != nil {
+			log.Printf("warning: failed to delete nested session %s: %v", id, err)
+		}
+		s.deleteNestedChildrenRec(workingDir, id, visited)
+	}
+}
+
+// pruneNestedSiblings keeps at most maxNestedPerParent children for a
+// parent, deleting the oldest siblings beyond the cap. Called at child save
+// time (Save holds s.mu); the just-saved child (keepID) is always kept.
+func (s *Store) pruneNestedSiblings(workingDir, keepID, parentID string) {
+	siblings := s.nestedChildrenLocked(workingDir, parentID)
+	var victims []string
+	for _, id := range siblings {
+		if id == keepID {
+			continue
+		}
+		victims = append(victims, id)
+	}
+	// Index order is most-recently-updated first; the oldest are the tail.
+	for len(victims) >= maxNestedPerParent {
+		victim := victims[len(victims)-1]
+		victims = victims[:len(victims)-1]
+		if err := s.deleteSessionFile(workingDir, victim); err != nil {
+			log.Printf("warning: failed to prune nested session %s: %v", victim, err)
+		}
+	}
+}
+
+// deleteSessionFile removes one session's file, delta, index entry, and
+// created-cache entry. Callers must hold s.mu.
+func (s *Store) deleteSessionFile(workingDir, id string) error {
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
+	path := s.path(workingDir, id)
+	if err := ensureUnderSessionsDir(workingDir, path, s.globalDir); err != nil {
+		return err
+	}
+	err := os.Remove(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if cerr := s.clearDeltaFile(workingDir, id); cerr != nil && !os.IsNotExist(cerr) {
+		log.Printf("warning: failed to remove delta for session %s: %v", id, cerr)
+	}
+	delete(s.createdCache, id)
 	s.removeFromIndex(workingDir, id)
 	s.invalidateListCache(workingDir)
 	return nil

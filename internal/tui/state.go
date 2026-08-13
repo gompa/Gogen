@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"strings"
+	"sync"
 
 	"gogen/internal/agent"
 	"gogen/internal/config"
@@ -33,6 +34,7 @@ const (
 	ModalModels
 	ModalHelp
 	ModalCompletion
+	ModalSubagents
 )
 
 // modelChangedMsg is sent by the TUI runner when a background agent state
@@ -107,6 +109,13 @@ type Model struct {
 	historyIdx   int
 	historyDraft string
 
+	// Nested (subagent) sessions finished in this process (TUI children are
+	// ephemeral; the /subagents modal lists them). Guarded because the
+	// spawner records from the agent's turn goroutine while the modal
+	// renders on the tea loop.
+	subagentMu sync.Mutex
+	subagents  []subagentRecord
+
 	// Context stats
 	contextStats agent.TurnContext
 	contextLine  string
@@ -158,8 +167,9 @@ type Model struct {
 	statusMsg          string // transient message (e.g. "Copied N chars")
 }
 
-// NewModel creates a new TUI model.
-func NewModel(a *agent.Agent, cfg *config.Config) Model {
+// NewModel creates a new TUI model. Returns a pointer: Model contains a
+// mutex (the subagent list guard), so values must not be copied.
+func NewModel(a *agent.Agent, cfg *config.Config) *Model {
 	ta := textarea.New()
 	ta.Placeholder = "Type a message or command..."
 	ta.ShowLineNumbers = false
@@ -238,9 +248,23 @@ func NewModel(a *agent.Agent, cfg *config.Config) Model {
 			m.contextStats = stats
 			m.contextLine = agent.FormatContextBrief(stats)
 		}
+		// Nested sessions run on this TUI's agent (feature-gated by the
+		// subagent flag; the spawner itself is harmless when the tool is
+		// not exposed).
+		if cfg != nil && cfg.SubagentEnabled() {
+			a.SetSubagentSpawner(&tuiSubagentSpawner{cfg: cfg, m: &m})
+		}
 	}
 
-	return m
+	return &m
+}
+
+// recordSubagent appends a finished nested session to the /subagents list
+// (called from the spawner on the agent's turn goroutine).
+func (m *Model) recordSubagent(r subagentRecord) {
+	m.subagentMu.Lock()
+	m.subagents = append(m.subagents, r)
+	m.subagentMu.Unlock()
 }
 
 func (m *Model) SetSize(width, height int) {

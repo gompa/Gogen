@@ -249,12 +249,22 @@ func (a *Agent) formatSessionList() (string, []SessionInfo, error) {
 	if err != nil {
 		return "", nil, err
 	}
-	if len(list) == 0 {
-		return "No saved sessions.", list, nil
+	// Nested (subagent) sessions are excluded from the flat /resume list:
+	// they are only reachable through their parent's sidebar row (D2).
+	// A fresh slice (not list[:0]): the caller may keep using `list`
+	// afterwards, and reusing the backing array would silently corrupt it.
+	flat := make([]SessionInfo, 0, len(list))
+	for _, s := range list {
+		if s.ParentID == "" {
+			flat = append(flat, s)
+		}
+	}
+	if len(flat) == 0 {
+		return "No saved sessions.", flat, nil
 	}
 	var b strings.Builder
 	b.WriteString("Saved sessions:\n")
-	for _, s := range list {
+	for _, s := range flat {
 		fmt.Fprintf(&b, "  %s  (%d msgs)", s.ID, s.MessageCount)
 		if s.Label != "" {
 			fmt.Fprintf(&b, "  \"%s\"", s.Label)
@@ -265,12 +275,24 @@ func (a *Agent) formatSessionList() (string, []SessionInfo, error) {
 		b.WriteByte('\n')
 	}
 	b.WriteString("\nUse: resume <id>  |  resume latest  |  resume del <id>")
-	return b.String(), list, nil
+	return b.String(), flat, nil
 }
 
 // FormatSessionListForUI returns saved sessions without the slash-command help text.
 func (a *Agent) FormatSessionListForUI() (string, []SessionInfo, error) {
 	return a.formatSessionList()
+}
+
+// SessionListAll returns every saved session for the agent's working dir —
+// INCLUDING nested (subagent) sessions. The web sidebar uses it so persisted
+// children render under their parent row after a page reload / late attach
+// (subagent_started/finished events are not replayed to connecting clients).
+// The flat /resume list (formatSessionList) keeps excluding them.
+func (a *Agent) SessionListAll() ([]SessionInfo, error) {
+	if a.SessionStore == nil {
+		return nil, nil
+	}
+	return a.SessionStore.List(a.WorkingDir)
 }
 
 // ForkMessages returns a copy of messages up to (and including) the fork

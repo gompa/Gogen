@@ -21,19 +21,19 @@
 # --- Temporary planning / review docs ---
 /PLAN.md
 /CODE_REVIEW*.md
-/CODE_DUPLICATION_PLAN.md
-/LOGIC_ISSUES_PLAN.md
-/STREAMING_JUMPING_ANALYSIS.md
 
 # --- Scratch work ---
 # tmp/ holds ad-hoc probes and repro scripts; not part of the module surface.
 /tmp/
 
 # --- Project configuration ---
-# .gogen/ directory: track guidelines (.md) and config template, ignore local artifacts
+# .gogen/ holds local runtime state (config, models cache, sessions, board);
+# not tracked.
 /.gogen/gogen.conf
 /.gogen/models.json
 /.gogen/sessions/
+/.gogen/board/
+/.gogen/gogen.md
 /.gogen/todos.json.migrated
 
 # --- Editor / IDE ---

@@ -8,12 +8,42 @@ import (
 )
 
 // llmTools returns the tool definitions exposed to the model: the built-in
-// tools plus any registered MCP server tools.
+// tools, the feature-gated board tool when enabled, plus any registered MCP
+// server tools. Feature tools are appended conditionally (MCP-style) so they
+// have zero registry trace when their feature is off.
+//
+// A registered MCP tool whose name collides with a builtin or feature tool
+// SHADOWS it here (its definition is the one the model sees): executeTool
+// prefers the registry on name collisions too, so what the model sees and
+// what actually executes always agree — and the model never sees duplicate
+// definitions for one name (several APIs reject those).
 func (a *Agent) llmTools() []llm.Tool {
-	tools := BuiltinTools()
+	var mcpDefs []llm.Tool
+	mcpNames := make(map[string]struct{})
 	if a.MCPRegistry != nil {
-		tools = append(tools, a.MCPRegistry.Definitions()...)
+		mcpDefs = a.MCPRegistry.Definitions()
+		for _, t := range mcpDefs {
+			mcpNames[t.Name] = struct{}{}
+		}
 	}
+	tools := make([]llm.Tool, 0, len(BuiltinTools())+2+len(mcpDefs))
+	for _, t := range BuiltinTools() {
+		if _, shadowed := mcpNames[t.Name]; shadowed {
+			continue // the MCP definition is appended below
+		}
+		tools = append(tools, t)
+	}
+	if a.BoardEnabled() && a.BoardManager() != nil {
+		if _, shadowed := mcpNames["board"]; !shadowed {
+			tools = append(tools, boardToolDef())
+		}
+	}
+	if a.SubagentsEnabled() && a.SubagentSpawner() != nil {
+		if _, shadowed := mcpNames["subagent"]; !shadowed {
+			tools = append(tools, subagentToolDef())
+		}
+	}
+	tools = append(tools, mcpDefs...)
 	return tools
 }
 

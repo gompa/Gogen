@@ -192,6 +192,44 @@ type Agent struct {
 	toolMu       sync.RWMutex
 	toolHandlers map[string]ToolHandler
 
+	// Feature flags, live-toggleable from the web settings modal (config WS
+	// message). The atomic stores publish the toggle to every concurrent
+	// reader: llmTools/AllowedToolNames consult BoardEnabled/SubagentsEnabled
+	// per turn, and the toggle handler rebuilds toolHandlers under toolMu so
+	// executeTool's map lookup is the gate. subagentMaxDepth bounds nesting
+	// (main agent = depth 0; default 1 = subagents cannot spawn subagents).
+	boardEnabled     atomic.Bool
+	subagentsEnabled atomic.Bool
+	subagentMaxDepth atomic.Int32
+
+	// boardManager is the shared project board (one instance per workspace
+	// in web mode, per agent in TUI/CLI). Set when the board feature is
+	// enabled; the nil-guard mirrors the MCP registry contract.
+	boardManager atomic.Pointer[BoardManager]
+
+	// spawnerMu guards spawner (the nested-session runner installed once at
+	// startup by the server/TUI). Reads happen per turn (llmTools,
+	// executeTool), so the guard keeps the write/read race-free.
+	spawnerMu sync.RWMutex
+	spawner   SubagentSpawner
+	// subagentDepth is this agent's nesting depth (main agent = 0; the
+	// spawner sets depth+1 on children). Bounds spawning against
+	// SubagentMaxDepth (default 1 = subagents cannot spawn subagents).
+	subagentDepth atomic.Int32
+	// parentID is non-empty for nested (subagent) sessions: persisted into
+	// the session snapshot so the store can exclude them from the flat
+	// list, cascade-delete them with the parent, and cap them per parent.
+	parentID atomic.Value // string
+
+	// boardHookMu guards boardHook: the web server installs it so agent
+	// board mutations broadcast a fresh board_state AND a success notice
+	// (toast) to every client — the user sees agent-triggered board
+	// changes even when they didn't initiate them. The callback receives
+	// the mutation's output message ("Moved board item #1 to in_progress…").
+	// Nil in TUI/CLI.
+	boardHookMu sync.RWMutex
+	boardHook   func(msg string)
+
 	// patchFailStreak counts consecutive patch_file failures so the agent loop
 	// can steer the model away from retrying the same stale diff indefinitely.
 	patchFailStreak atomic.Int32
@@ -237,6 +275,119 @@ func (a *Agent) SetProjectContext(path, guidelines, testCommand, lintCommand str
 
 func (a *Agent) SetMCPRegistry(reg MCPToolRegistry) {
 	a.MCPRegistry = reg
+}
+
+// SetBoardEnabled toggles the project kanban board feature for this agent.
+// The web server publishes live toggles to every session agent; per-turn
+// tool derivation (llmTools/AllowedToolNames) reads the value atomically.
+func (a *Agent) SetBoardEnabled(on bool) {
+	a.boardEnabled.Store(on)
+}
+
+// BoardEnabled reports whether the board tool is registered for this agent.
+func (a *Agent) BoardEnabled() bool {
+	return a.boardEnabled.Load()
+}
+
+// SetSubagentsEnabled toggles the subagent tool for this agent (see
+// SetBoardEnabled for the live-toggle contract).
+func (a *Agent) SetSubagentsEnabled(on bool) {
+	a.subagentsEnabled.Store(on)
+}
+
+// SubagentsEnabled reports whether the subagent tool is registered for this
+// agent.
+func (a *Agent) SubagentsEnabled() bool {
+	return a.subagentsEnabled.Load()
+}
+
+// SetSubagentMaxDepth sets the maximum subagent nesting depth (main agent =
+// depth 0). Values <= 0 fall back to the config default.
+func (a *Agent) SetSubagentMaxDepth(depth int) {
+	a.subagentMaxDepth.Store(int32(depth))
+}
+
+// SubagentMaxDepth returns the effective maximum subagent nesting depth.
+func (a *Agent) SubagentMaxDepth() int {
+	if d := int(a.subagentMaxDepth.Load()); d > 0 {
+		return d
+	}
+	return config.DefaultSubagentMaxDepth
+}
+
+// SetBoardManager attaches the shared project board manager. The web server
+// sets the same manager on every session agent (so claims serialize);
+// TUI/CLI sets a per-agent manager. nil detaches.
+func (a *Agent) SetBoardManager(m *BoardManager) {
+	a.boardManager.Store(m)
+}
+
+// BoardManager returns the attached board manager (nil when the board
+// feature is disabled or not wired).
+func (a *Agent) BoardManager() *BoardManager {
+	return a.boardManager.Load()
+}
+
+// SetSubagentSpawner installs the nested-session runner (nil detaches).
+// Called once at startup by the web server and TUI runner; the subagent tool
+// stays gated on SubagentsEnabled regardless.
+func (a *Agent) SetSubagentSpawner(s SubagentSpawner) {
+	a.spawnerMu.Lock()
+	a.spawner = s
+	a.spawnerMu.Unlock()
+}
+
+// SubagentSpawner returns the installed nested-session runner (nil when
+// subagents are unavailable in this mode).
+func (a *Agent) SubagentSpawner() SubagentSpawner {
+	a.spawnerMu.RLock()
+	defer a.spawnerMu.RUnlock()
+	return a.spawner
+}
+
+// SetSubagentDepth sets this agent's nesting depth (0 = main agent). The
+// spawner sets depth+1 on children it creates.
+func (a *Agent) SetSubagentDepth(depth int) {
+	a.subagentDepth.Store(int32(depth))
+}
+
+// SubagentDepth returns this agent's nesting depth (0 = main agent).
+func (a *Agent) SubagentDepth() int {
+	return int(a.subagentDepth.Load())
+}
+
+// SetParentID marks this session as a nested (subagent) child of parentID
+// (empty clears the mark).
+func (a *Agent) SetParentID(parentID string) {
+	a.parentID.Store(parentID)
+}
+
+// ParentID returns the parent session id for nested (subagent) sessions
+// (empty for top-level sessions).
+func (a *Agent) ParentID() string {
+	v, _ := a.parentID.Load().(string)
+	return v
+}
+
+// SetOnBoardChanged installs a callback invoked after every successful board
+// mutation made through this agent's board tool; it receives the mutation's
+// output message. The web server uses it to broadcast a fresh board_state and
+// a success notice (toast) to all clients. nil detaches.
+func (a *Agent) SetOnBoardChanged(h func(msg string)) {
+	a.boardHookMu.Lock()
+	a.boardHook = h
+	a.boardHookMu.Unlock()
+}
+
+// notifyBoardChanged fires the installed board-change hook with the
+// mutation's output message, if any hook is installed.
+func (a *Agent) notifyBoardChanged(msg string) {
+	a.boardHookMu.RLock()
+	h := a.boardHook
+	a.boardHookMu.RUnlock()
+	if h != nil {
+		h(msg)
+	}
 }
 
 // SaveConfig writes the effective configuration to the project file.
@@ -418,6 +569,11 @@ func (a *Agent) SetWorkingDir(dir string) {
 	}
 	if a.TodoManager != nil {
 		a.TodoManager.SetWorkingDir(dir)
+	}
+	if bm := a.BoardManager(); bm != nil {
+		// Global mode keeps the global board; project mode re-points to the
+		// new working dir's .gogen/board (D3).
+		bm.SetWorkingDir(dir)
 	}
 }
 
@@ -860,7 +1016,7 @@ func stringArgOptional(args map[string]interface{}, key string) (string, error) 
 }
 
 func (a *Agent) toolContext(ctx context.Context) context.Context {
-	if a.Executor != nil && !a.Executor.RequireDeleteApproval {
+	if a.Executor != nil && !a.Executor.DeleteApprovalRequired() {
 		ctx = ContextWithDeleteApprovalRequired(ctx, false)
 	}
 	return ctx

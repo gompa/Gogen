@@ -58,6 +58,14 @@
         const paletteInput = document.getElementById('command-palette-input');
         const paletteList = document.getElementById('command-palette-list');
         const toastHost = document.getElementById('toast-host');
+        // Conversation TOC rail (one dot per user prompt) and its hover
+        // preview tooltip. Elements always exist in index.html; the rail is
+        // hidden until the first user message renders (.has-dots).
+        const tocRail = document.getElementById('toc-rail');
+        const tocDots = document.getElementById('toc-dots');
+        const tocTooltip = document.getElementById('toc-tooltip');
+        const tocTooltipLabel = document.getElementById('toc-tooltip-label');
+        const tocTooltipBody = document.getElementById('toc-tooltip-body');
         // Toolbar elements
         const tbModelBtn = document.getElementById('tb-model-btn');
         const tbModelPopover = document.getElementById('tb-model-popover');
@@ -220,6 +228,9 @@
                     await initMonaco();
                     await refreshExplorer();
                 }
+                if (btn.dataset.pane === 'board') {
+                    requestBoardState();
+                }
             });
         });
 
@@ -343,62 +354,150 @@
         // Non-interactive placeholder row for the model list when there is
         // nothing to show (catalog not loaded yet, or the filter matched
         // nothing).
-        function appendEmptyModelRow(text) {
+        function appendEmptyModelRow(listEl, text) {
             const empty = document.createElement('div');
             empty.className = 'tb-model-row';
             empty.textContent = text;
             empty.style.color = 'var(--fg-muted)';
             empty.style.fontSize = '0.82em';
             empty.style.cursor = 'default';
-            tbModelList.appendChild(empty);
+            listEl.appendChild(empty);
         }
 
-        function renderToolbarModelList(models, current) {
-            if (!tbModelList) return;
-            tbModelList.innerHTML = '';
+        // Group header row: the registered provider profile that serves the
+        // models below it (models without a provider tag belong to the
+        // implicit default profile).
+        function appendModelGroupHeader(listEl, name) {
+            const header = document.createElement('div');
+            header.className = 'tb-model-group';
+            header.textContent = name || 'default';
+            listEl.appendChild(header);
+        }
+
+        // buildModelRow renders one model row: description tooltip,
+        // context-limit chip, and the current-model check. onSelect receives
+        // (id, active, event); the caller decides what selecting means.
+        function buildModelRow(m, current, onSelect) {
+            const active = m.id === current || m.current;
+            const row = document.createElement('button');
+            row.className = 'tb-model-row' + (active ? ' active' : '');
+            row.type = 'button';
+            // Hover tooltip: models.dev description of this model.
+            if (m.description) row.title = m.description;
+            const label = document.createElement('span');
+            label.textContent = m.id;
+            row.appendChild(label);
+            if (m.contextLimit) {
+                const limit = document.createElement('span');
+                limit.className = 'tb-model-limit';
+                limit.textContent = formatTokenCount(m.contextLimit);
+                row.appendChild(limit);
+            }
+            if (active) {
+                const check = document.createElement('span');
+                check.className = 'tb-check';
+                check.textContent = '✓';
+                row.appendChild(check);
+            }
+            row.addEventListener('click', (e) => {
+                e.stopPropagation();
+                onSelect(m.id, active, e);
+            });
+            return row;
+        }
+
+        // Shared model-list renderer: grouped by provider, search-filtered,
+        // with the current-model check. Used by the toolbar model popover
+        // (renderToolbarModelList) AND the settings modal's subagent model
+        // picker so both stay identical. extraRows (if any) are appended
+        // before the catalog rows (the picker's "Inherit" row).
+        function renderModelList(listEl, query, filterLabel, models, current, onSelect, extraRows) {
+            if (!listEl) return;
+            listEl.innerHTML = '';
+            for (const el of extraRows || []) listEl.appendChild(el);
             if (!models || models.length === 0) {
-                appendEmptyModelRow('No models loaded');
+                appendEmptyModelRow(listEl, 'No models loaded');
                 return;
             }
-            const q = modelFilterQuery;
+            const q = query;
             const filtered = q ? models.filter((m) => m.id.toLowerCase().includes(q)) : models;
             if (filtered.length === 0) {
-                appendEmptyModelRow(`No models match "${tbModelFilter ? tbModelFilter.value : q}"`);
+                appendEmptyModelRow(listEl, `No models match "${filterLabel}"`);
                 return;
             }
+            // Group by provider: the server pushes models in profile order
+            // (default first), so consecutive grouping matches the catalog.
+            let lastProvider = null;
             for (const m of filtered) {
-                const active = m.id === current || m.current;
-                const row = document.createElement('button');
-                row.className = 'tb-model-row' + (active ? ' active' : '');
-                row.type = 'button';
-                // Hover tooltip: models.dev description of this model.
-                if (m.description) row.title = m.description;
-                const label = document.createElement('span');
-                label.textContent = m.id;
-                row.appendChild(label);
-                if (m.contextLimit) {
-                    const limit = document.createElement('span');
-                    limit.className = 'tb-model-limit';
-                    limit.textContent = formatTokenCount(m.contextLimit);
-                    row.appendChild(limit);
+                const provider = m.provider || 'default';
+                if (provider !== lastProvider) {
+                    appendModelGroupHeader(listEl, provider);
+                    lastProvider = provider;
                 }
-                if (active) {
-                    const check = document.createElement('span');
-                    check.className = 'tb-check';
-                    check.textContent = '✓';
-                    row.appendChild(check);
-                }
-                row.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    if (m.id === current) { closeModelPopover(); return; }
-                    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-                    // set_model is per-session: the sessionId scopes it
-                    // to the requesting pane's provider only.
-                    ws.send(JSON.stringify({ type: 'set_model', model: m.id, sessionId: activePane().id }));
-                    closeModelPopover();
-                });
-                tbModelList.appendChild(row);
+                listEl.appendChild(buildModelRow(m, current, onSelect));
             }
+        }
+
+        // Toolbar wrapper: behavior unchanged (per-session set_model +
+        // popover close), just routed through the shared renderer.
+        function renderToolbarModelList(models, current) {
+            if (!tbModelList) return;
+            renderModelList(tbModelList, modelFilterQuery, tbModelFilter ? tbModelFilter.value : modelFilterQuery, models, current, (id, active) => {
+                if (active) { closeModelPopover(); return; }
+                if (!ws || ws.readyState !== WebSocket.OPEN) return;
+                // set_model is per-session: the sessionId scopes it
+                // to the requesting pane's provider only.
+                ws.send(JSON.stringify({ type: 'set_model', model: id, sessionId: activePane().id }));
+                closeModelPopover();
+            });
+        }
+
+        // ── Subagent model picker (Agent settings tab) ──
+        // Reuses the toolbar's model-list rendering (same grouping, filter,
+        // rows). The first row is the "inherit" option: empty value =
+        // subagents use the parent's model. Selections round-trip through
+        // the runtime-config channel (configFields: ["subagentModel"]) so
+        // the server persists and re-broadcasts the value to every tab.
+        let subagentModelValue = ''; // server-pushed current value ('' = inherit)
+        let subagentModelQuery = ''; // modal filter input state
+        const subagentModelFilter = document.getElementById('subagent-model-filter');
+        const subagentModelList = document.getElementById('subagent-model-list');
+
+        subagentModelFilter?.addEventListener('input', () => {
+            subagentModelQuery = subagentModelFilter.value.trim().toLowerCase();
+            renderSubagentModelPicker();
+        });
+
+        function renderSubagentModelPicker() {
+            if (!subagentModelList) return;
+            const current = subagentModelValue || '';
+            // The "Inherit (parent's model)" row: the empty value,
+            // highlighted when no default is configured.
+            const inherit = document.createElement('button');
+            inherit.type = 'button';
+            inherit.className = 'tb-model-row' + (current === '' ? ' active' : '');
+            inherit.textContent = 'Inherit (parent\u2019s model)';
+            if (current === '') {
+                const check = document.createElement('span');
+                check.className = 'tb-check';
+                check.textContent = '✓';
+                inherit.appendChild(check);
+            }
+            inherit.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (current !== '') selectSubagentModel('');
+            });
+            renderModelList(subagentModelList, subagentModelQuery,
+                subagentModelFilter ? subagentModelFilter.value : subagentModelQuery,
+                availableModels, current, (id, active) => {
+                    if (!active) selectSubagentModel(id);
+                }, [inherit]);
+        }
+
+        function selectSubagentModel(id) {
+            subagentModelValue = id || '';
+            renderSubagentModelPicker();
+            sendRuntimeConfig({ subagentModel: { prop: 'subagentModel', value: subagentModelValue } });
         }
 
         // ── Toolbar: thinking level chips ──
@@ -760,6 +859,10 @@
                 }
             }
             updateContextInfo(data);
+            applyFeatureSettings(data);
+            applyRuntimeSettings(data);
+            applyProviderSettings(data);
+            applyMCPSettings(data);
 
             if (data.sessionId) {
                 sessionInfoDiv.textContent = data.sessionId;
@@ -771,9 +874,61 @@
             }
         }
 
+        // ── Feature settings (board / subagents) ──
+        // Server-backed: the settings-modal controls and the board tab
+        // visibility follow the config push (data.board / data.subagent /
+        // data.subagentMaxDepth), so every tab stays in sync without
+        // localStorage. Toggling board off while the board pane is the
+        // active view falls back to chat; the board data is untouched.
+        function applyFeatureSettings(data) {
+            const boardOn = data.board === 'on';
+            const subagentOn = data.subagent === 'on';
+            const boardTab = document.getElementById('board-tab');
+            const wasVisible = boardTab && !boardTab.hidden;
+            if (boardTab && boardTab.hidden === boardOn) boardTab.hidden = !boardOn;
+            const boardSel = document.getElementById('board-enabled-select');
+            if (boardSel && boardSel.value !== (boardOn ? 'on' : 'off')) boardSel.value = boardOn ? 'on' : 'off';
+            // The board agent prompt is meaningful only while the board
+            // feature is on (like the subagent model picker).
+            const boardPromptRow = document.getElementById('board-prompt-row');
+            if (boardPromptRow) boardPromptRow.hidden = !boardOn;
+            const subSel = document.getElementById('subagent-enabled-select');
+            if (subSel && subSel.value !== (subagentOn ? 'on' : 'off')) subSel.value = subagentOn ? 'on' : 'off';
+            const depthInput = document.getElementById('subagent-depth-input');
+            if (depthInput && data.subagentMaxDepth > 0 && String(depthInput.value) !== String(data.subagentMaxDepth)) {
+                depthInput.value = String(data.subagentMaxDepth);
+            }
+            if (boardOn && !wasVisible) requestBoardState();
+            if (!boardOn) {
+                const boardPane = document.getElementById('board-pane');
+                if (boardPane && boardPane.classList.contains('active')) switchMainPane('chat');
+            }
+            // The subagent model picker is meaningful only while subagents
+            // are enabled.
+            const subModelPicker = document.getElementById('subagent-model-picker');
+            if (subModelPicker) subModelPicker.hidden = !subagentOn;
+            if (subagentOn && !subModelPicker.hidden && settingsOverlay.classList.contains('active')
+                && (!availableModels || availableModels.length === 0)
+                && ws && ws.readyState === WebSocket.OPEN) {
+                // Just enabled while the modal is open: fetch the catalog so
+                // the picker is not stuck on "No models loaded".
+                ws.send(JSON.stringify({ type: 'list_models' }));
+            }
+        }
+
+        // Sends a feature-setting change over the existing config WS message
+        // (the same channel the server uses to push config to us).
+        function sendFeatureConfig(fields) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            const pane = activePane();
+            ws.send(JSON.stringify(Object.assign({ type: 'config', sessionId: pane ? pane.id || '' : '' }, fields)));
+        }
+
         function clearChat() {
             disposeChatEditors();
             messagesDiv.innerHTML = '';
+            hideTocTooltip();
+            rebuildToc();
             enableFollow();
             msgIdxCounter = 0;
 
@@ -863,6 +1018,11 @@
         // Count of cancel→turn_end pairs to ignore so a cancelled turn's turn_end
         // cannot clobber an in-flight resend/send (pendingSessionResponse / turnActive).
         let suppressTurnEnds = 0;
+        // Error text of the most recent turn's failed model reply (a `response`
+        // message whose content starts with "Error:"). Consumed by setTurnActive
+        // to fire an error-specific turn-end notification instead of the generic
+        // "Agent finished responding." one; cleared when a new turn starts.
+        let lastTurnError = null;
         let ws;
         let reconnectTimer;
         let wasDisconnected = false;
@@ -941,6 +1101,11 @@
             document.getElementById('input-area').classList.toggle('turn-active', turnActive);
             if (!active) {
                 toolsStartedThisTurn = false;
+            } else {
+                // A new turn (or round) must not inherit the previous turn's
+                // error: the turn-end notification reflects only the current
+                // turn's outcome.
+                lastTurnError = null;
             }
             // Keep the active pane object's mirror current (badges,
             // afterHistory's "resuming…" restore). clearChat passes noMirror
@@ -963,7 +1128,14 @@
             // silent state restores (pane focus, session_state replay).
             _prevTurnActive = turnActive;
             if (wasActive && !turnActive && suppressTurnEnds === 0 && !silent) {
-                sendNotification('GoGen', 'Agent finished responding.', 'gogen-turn-end');
+                if (lastTurnError) {
+                    // The model stopped on an error: say so in the notification
+                    // instead of the misleading "Agent finished responding.".
+                    sendNotification('GoGen — Error', lastTurnError, 'gogen-turn-error');
+                    lastTurnError = null;
+                } else {
+                    sendNotification('GoGen', 'Agent finished responding.', 'gogen-turn-end');
+                }
             }
         }
 
@@ -2182,6 +2354,10 @@
                 ensureUserResendActions(msgDiv);
             }
             messagesDiv.appendChild(msgDiv);
+            // Every user bubble is created here (live sends, resend, history
+            // replay, attach fallback), so this single hook keeps the TOC
+            // rail in sync with the transcript.
+            if (role === 'user') appendTocDot(msgDiv);
             smartScroll();
             return msgDiv;
         }
@@ -3962,6 +4138,23 @@
                 // sessionId) and messages for the active pane run the normal
                 // handler below; background-pane messages update that pane's
                 // state only (the transcript re-derives when focused).
+                // Subagent events are sidebar-global: a child of ANY pane
+                // this connection is attached to updates the nested rows,
+                // regardless of which pane is focused.
+                if (data.type === 'subagent_started' || data.type === 'subagent_finished') {
+                    handleSubagentEvent(data);
+                    return;
+                }
+                // Delete approvals are global UI (a modal overlay): show
+                // them even for sessions without an open pane — board-started
+                // agents are background-attached to the initiating tab, so
+                // their approvals pop the modal while the user stays on the
+                // board. The response carries the sessionId, so routing by
+                // pane is not needed (and paneForMessage would drop it).
+                if (data.type === 'delete_approval') {
+                    handleDeleteApproval(data);
+                    return;
+                }
                 const msgPane = paneForMessage(data);
                 if (!msgPane) return; // stale message for a closed session
                 if (msgPane !== activePane()) {
@@ -4045,7 +4238,42 @@
             config: handleConfig,
             context: handleContext,
             delete_approval: handleDeleteApproval,
+            board_state: handleBoardState,
+            notice: handleNotice,
+            provider_test: handleProviderTest,
+            mcp_test: handleMCPTest,
         };
+
+        function handleProviderTest(data) {
+            const res = data.providerTest;
+            if (!res) return;
+            if (res.ok) {
+                const models = res.models || [];
+                const first = models.length > 0 ? ' (' + models[0].id + ')' : '';
+                showProviderTest(
+                    '✓ Connected — ' + models.length + ' model' + (models.length === 1 ? '' : 's') + ' in ' + res.latencyMs + ' ms' + first,
+                    'success'
+                );
+            } else {
+                showProviderTest('✗ Failed: ' + (res.error || 'unknown error'), 'error');
+            }
+        }
+
+        function handleMCPTest(data) {
+            const res = data.mcpTestResult;
+            if (!res) return;
+            if (res.ok) {
+                const tools = res.tools || [];
+                const names = tools.slice(0, 5).map((t) => t.name).join(', ');
+                const suffix = names ? ' (' + names + (tools.length > 5 ? ', …' : '') + ')' : '';
+                showMCPTest(
+                    '✓ Connected — ' + tools.length + ' tool' + (tools.length === 1 ? '' : 's') + ' in ' + res.latencyMs + ' ms' + suffix,
+                    'success'
+                );
+            } else {
+                showMCPTest('✗ Failed: ' + (res.error || 'unknown error'), 'error');
+            }
+        }
 
         function handleCompacting(data) {
 
@@ -4529,6 +4757,10 @@
             } else if (data.content && String(data.content).startsWith('Error:')) {
                 showToast(data.content, 'error');
                 appendMessage('system', data.content);
+                // Remember the stop reason so the turn-end notification (sent
+                // when turn_end arrives right after this response) reports the
+                // error instead of "Agent finished responding.".
+                lastTurnError = data.content;
             } else {
                 appendMessage('assistant', data.content);
             }
@@ -4544,6 +4776,9 @@
             }
             if (data.models) {
                 updateModelSelect(data.models, data.model);
+                // The settings modal's subagent model picker renders from
+                // the same catalog — refresh it when the modal is open.
+                if (settingsOverlay.classList.contains('active')) renderSubagentModelPicker();
             } else if (data.model) {
                 updateModelInfo(data.model, availableModels.find((m) => m.id === data.model)?.description);
             }
@@ -4612,6 +4847,10 @@
                     setTurnActive(true, { silent: true });
                     setInputProgress('thinking', 'Resuming\u2026');
                 }
+                // Refresh the TOC active dot once the transcript is rebuilt:
+                // the replay path pins (updateTocActive in pinToBottom), the
+                // fallback path has no scroll event to trigger it.
+                updateTocActive();
                 // NOTE: the resend message is flushed from the config
                 // handler, which adopts the new session id first (the
                 // server sends history before config).
@@ -4698,6 +4937,365 @@
             showDeleteApproval(data);
 
         }
+
+        // ── Nested (subagent) sessions ──
+        // Children render as indented rows under their parent (D2). They
+        // are attachable: clicking a nested row opens the child as a normal
+        // pane (live transcript + Cancel), which is the escape hatch for a
+        // subagent stuck in a loop.
+        const nestedSessions = new Map(); // id → {id, parentId, label, job, running, success, summary}
+
+        function handleSubagentEvent(data) {
+            if (data.type === 'subagent_started') {
+                nestedSessions.set(data.subagentId, {
+                    id: data.subagentId,
+                    parentId: data.subagentParent,
+                    label: data.subagentLabel || 'subagent',
+                    job: data.subagentJob || '',
+                    running: true,
+                    success: false,
+                    summary: '',
+                });
+            } else if (data.type === 'subagent_finished') {
+                const rec = nestedSessions.get(data.subagentId);
+                if (rec) {
+                    rec.running = false;
+                    rec.success = !!data.subagentSuccess;
+                    rec.summary = data.subagentSummary || '';
+                }
+            }
+            renderSessionList(lastSessions || []);
+        }
+
+        // Append nested rows for parentId after its row. Sources: the live
+        // subagent_started/finished event records (running/summary state,
+        // children not yet saved) plus — after a page reload or a late
+        // attach, when the events are gone — the persisted children in the
+        // sessions payload (the server now includes them). A child that is
+        // open as a pane in this tab is skipped: its open-pane row already
+        // shows it, and rendering it twice would duplicate the row.
+        function appendNestedRows(parentId) {
+            const rendered = new Set();
+            // Open-pane session ids (panes is keyed by pane key, not by
+            // session id, so derive the id set once here).
+            const openIds = new Set();
+            for (const p of panes.values()) if (p.id) openIds.add(p.id);
+            for (const rec of nestedSessions.values()) {
+                if (rec.parentId !== parentId) continue;
+                if (openIds.has(rec.id)) continue;
+                sessionListDiv.appendChild(buildNestedSessionRow(rec));
+                rendered.add(rec.id);
+            }
+            for (const s of lastSessions || []) {
+                if (!s.parentId || s.parentId !== parentId) continue;
+                if (rendered.has(s.id) || openIds.has(s.id)) continue;
+                sessionListDiv.appendChild(buildNestedSessionRow({
+                    id: s.id,
+                    parentId: s.parentId,
+                    label: s.label || s.id,
+                    job: '',
+                    running: !!s.active,
+                    success: !s.active,
+                    summary: s.active ? '' : (s.messageCount ? s.messageCount + ' msgs' : ''),
+                }));
+            }
+        }
+
+        function buildNestedSessionRow(rec) {
+            const row = document.createElement('div');
+            row.className = 'session-row nested' + (rec.running ? ' busy' : '');
+            row.dataset.sessionId = rec.id;
+            const content = document.createElement('div');
+            content.className = 'session-row-content';
+            const title = document.createElement('div');
+            title.className = 'session-row-title';
+            title.textContent = (rec.running ? '⏳ ' : (rec.success ? '✅ ' : '❌ ')) + rec.label;
+            const meta = document.createElement('div');
+            meta.className = 'session-row-meta';
+            meta.textContent = rec.running ? 'responding' : (rec.summary ? rec.summary.slice(0, 80) : 'done');
+            content.appendChild(title);
+            content.appendChild(meta);
+            content.title = rec.job || rec.label;
+            // Attachable (D2): clicking opens the child as a pane.
+            content.onclick = () => { openSessionPane(rec.id); };
+            row.appendChild(content);
+            return row;
+        }
+
+        // ── Kanban board tab ──
+        // Server-backed like the feature toggles: the tab renders from
+        // board_state broadcasts (server→client) and sends board_op
+        // messages (client→server) for list/add/move/comment/done. The
+        // server re-broadcasts after every mutation — including agent
+        // board-tool calls — so the board stays live while agents work.
+        let lastBoardState = null;
+        let boardDragId = null;
+        // Set while a board "Start agent" op is in flight; cleared when the
+        // ticket's board_state shows the agentSession link (the sidebar then
+        // refreshes so the new session row appears).
+        let pendingBoardStartId = null;
+
+        function handleBoardState(data) {
+            if (data.boardState) {
+                lastBoardState = data.boardState;
+                renderBoard();
+                if (pendingBoardStartId) {
+                    const item = (data.boardState.items || []).find((i) => i.id === pendingBoardStartId);
+                    if (item && item.agentSession) {
+                        pendingBoardStartId = null;
+                        requestSessionList();
+                    }
+                }
+            }
+        }
+
+        // ── Notice channel (non-chat UI feedback) ──
+        // "notice" messages toast and NEVER touch the chat transcript or
+        // stream state — no finalizeThinking/endStream/appendMessage here,
+        // so a notice arriving mid-stream can never split the in-flight
+        // assistant bubble. Kind scopes follow-ups.
+        function handleNotice(data) {
+            if (data.success) {
+                if (data.content) showToast(data.content, 'success');
+                return;
+            }
+            showToast(data.content || 'Operation failed', 'error');
+            // Failed board ops resync the board — but only while the tab
+            // is visible: a rejected op when the feature is disabled must
+            // not re-trigger another op (toast/resync loop).
+            if (data.kind === 'board' && boardTabVisible()) requestBoardState();
+        }
+
+        function boardTabVisible() {
+            const t = document.getElementById('board-tab');
+            return !!t && !t.hidden;
+        }
+
+        function requestBoardState() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            ws.send(JSON.stringify({ type: 'board_op', boardOp: { action: 'list' } }));
+        }
+
+        function sendBoardOp(op) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            ws.send(JSON.stringify({ type: 'board_op', boardOp: op }));
+        }
+
+        function renderBoard() {
+            const colsDiv = document.getElementById('board-columns');
+            if (!colsDiv) return;
+            colsDiv.innerHTML = '';
+            const snap = lastBoardState;
+            if (!snap) return;
+            const byColumn = new Map();
+            for (const col of snap.columns) byColumn.set(col, []);
+            for (const item of snap.items || []) {
+                const list = byColumn.get(item.status) || byColumn.get('backlog');
+                if (list) list.push(item);
+            }
+            for (const col of snap.columns) {
+                colsDiv.appendChild(buildBoardColumn(col, byColumn.get(col) || []));
+            }
+        }
+
+        function buildBoardColumn(name, items) {
+            const col = document.createElement('div');
+            col.className = 'board-column';
+            col.dataset.column = name;
+            const header = document.createElement('div');
+            header.className = 'board-column-header';
+            const title = document.createElement('span');
+            title.className = 'board-column-title';
+            title.textContent = name.replace('_', ' ');
+            const count = document.createElement('span');
+            count.className = 'board-column-count';
+            count.textContent = String(items.length);
+            header.append(title, count);
+            col.appendChild(header);
+            const body = document.createElement('div');
+            body.className = 'board-column-body';
+            for (const item of items) body.appendChild(buildBoardCard(item));
+            // Drop target for the whole column (cards are dragged onto it).
+            col.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                col.classList.add('drag-over');
+            });
+            col.addEventListener('dragleave', () => col.classList.remove('drag-over'));
+            col.addEventListener('drop', (e) => {
+                e.preventDefault();
+                col.classList.remove('drag-over');
+                if (boardDragId && name !== currentCardColumn(boardDragId)) {
+                    sendBoardOp({ action: 'move', id: boardDragId, column: name });
+                }
+                boardDragId = null;
+            });
+            col.appendChild(body);
+            return col;
+        }
+
+        function currentCardColumn(id) {
+            const snap = lastBoardState;
+            if (!snap) return null;
+            const item = (snap.items || []).find((i) => i.id === id);
+            return item ? item.status : null;
+        }
+
+        function buildBoardCard(item) {
+            const card = document.createElement('div');
+            card.className = 'board-card';
+            card.draggable = true;
+            card.dataset.itemId = item.id;
+            card.addEventListener('dragstart', (e) => {
+                boardDragId = item.id;
+                if (e.dataTransfer) e.dataTransfer.setData('text/plain', item.id);
+            });
+            card.addEventListener('dragend', () => { boardDragId = null; });
+            // Remove button: hover-revealed trashcan with a two-step inline
+            // confirm (click once → "Remove?" highlighted; click again →
+            // delete; Esc/click elsewhere cancels). No modal needed for a
+            // card, mirroring the session rows' hover-reveal ✕.
+            const removeBtn = document.createElement('button');
+            removeBtn.type = 'button';
+            removeBtn.className = 'board-card-remove';
+            removeBtn.title = 'Remove card';
+            removeBtn.textContent = '🗑';
+            let removeArmed = false;
+            removeBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (!removeArmed) {
+                    removeArmed = true;
+                    removeBtn.classList.add('armed');
+                    removeBtn.textContent = 'Remove?';
+                    return;
+                }
+                sendBoardOp({ action: 'remove', id: item.id });
+                removeArmed = false;
+                removeBtn.classList.remove('armed');
+                removeBtn.textContent = '🗑';
+            });
+            card.addEventListener('click', (e) => {
+                if (e.target.closest('.board-card-detail') || e.target === removeBtn) return;
+                // Clicking anywhere else cancels a pending remove confirm.
+                if (removeArmed) {
+                    removeArmed = false;
+                    removeBtn.classList.remove('armed');
+                    removeBtn.textContent = '🗑';
+                    return;
+                }
+                detail.hidden = !detail.hidden;
+            });
+            card.appendChild(removeBtn);
+            const title = document.createElement('div');
+            title.className = 'board-card-title';
+            title.textContent = `#${item.id} ${item.title}`;
+            card.appendChild(title);
+            const meta = document.createElement('div');
+            meta.className = 'board-card-meta';
+            const frags = [];
+            if (item.priority) {
+                const prio = document.createElement('span');
+                prio.className = 'board-prio prio-' + item.priority;
+                prio.textContent = item.priority;
+                frags.push(prio);
+            }
+            if (item.assignee) {
+                const who = document.createElement('span');
+                who.className = 'board-assignee';
+                who.textContent = item.assignee;
+                frags.push(who);
+            }
+            for (const f of frags) meta.appendChild(f);
+            card.appendChild(meta);
+            // Start / open agent button: the first click starts a dedicated
+            // agent session for the ticket (the user stays on the board);
+            // once the ticket's board_state carries agentSession, the
+            // button becomes "Open agent" and switches to the chat tab with
+            // the session attached. Hidden for done cards; disabled while
+            // another actor (an agent via the board tool) holds the ticket.
+            const startBtn = document.createElement('button');
+            startBtn.type = 'button';
+            startBtn.className = 'board-card-start';
+            if (item.status === 'done') {
+                startBtn.hidden = true;
+            } else if (item.agentSession) {
+                startBtn.textContent = 'Open agent';
+                startBtn.title = 'Open the agent session working on this ticket';
+                startBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    switchMainPane('chat');
+                    openSessionPane(item.agentSession);
+                });
+            } else {
+                startBtn.textContent = '▶ Start';
+                if (item.assignee) {
+                    startBtn.disabled = true;
+                    startBtn.title = 'Claimed by ' + item.assignee;
+                } else {
+                    startBtn.title = 'Start an agent for this ticket';
+                    startBtn.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        // Optimistic disable: the board_state re-render after
+                        // the claim flips this card to "Open agent" (a failed
+                        // start resyncs the board and re-enables it).
+                        startBtn.disabled = true;
+                        pendingBoardStartId = item.id;
+                        sendBoardOp({ action: 'start', id: item.id });
+                    });
+                }
+            }
+            card.appendChild(startBtn);
+            // Click expands the detail (description + activity) inline.
+            const detail = document.createElement('div');
+            detail.className = 'board-card-detail';
+            detail.hidden = true;
+            if (item.description) {
+                const d = document.createElement('div');
+                d.className = 'board-card-desc';
+                d.textContent = item.description;
+                detail.appendChild(d);
+            }
+            if (item.activity && item.activity.length) {
+                const acts = document.createElement('div');
+                acts.className = 'board-card-activity';
+                for (const act of item.activity.slice(-10)) {
+                    const row = document.createElement('div');
+                    row.className = 'board-activity-row';
+                    row.textContent = `${act.at ? new Date(act.at).toLocaleString() : ''} ${act.by}: ${act.text}`;
+                    acts.appendChild(row);
+                }
+                detail.appendChild(acts);
+            }
+            card.appendChild(detail);
+            return card;
+        }
+
+        function initBoardTab() {
+            const addBtn = document.getElementById('board-add-btn');
+            if (!addBtn) return;
+            addBtn.addEventListener('click', () => {
+                const form = document.getElementById('board-add-form');
+                if (form) form.hidden = !form.hidden;
+            });
+            const form = document.getElementById('board-add-form');
+            if (!form) return;
+            form.addEventListener('submit', (e) => {
+                e.preventDefault();
+                const title = document.getElementById('board-add-title');
+                const desc = document.getElementById('board-add-desc');
+                const prio = document.getElementById('board-add-prio');
+                if (!title || !title.value.trim()) return;
+                sendBoardOp({
+                    action: 'add',
+                    title: title.value.trim(),
+                    description: desc ? desc.value.trim() : '',
+                    priority: prio ? prio.value : '',
+                });
+                title.value = '';
+                if (desc) desc.value = '';
+                form.hidden = true;
+            });
+        }
+
         // ── Image attachments (vision input) ──
         // Mirrors the server's limits (internal/server/server.go
         // validateImageInputs).
@@ -4970,6 +5568,9 @@
                 rows.push({ pane, entry });
             }
             for (const s of list) {
+                // Nested (subagent) rows render under their parent below,
+                // never as flat rows.
+                if (s.parentId) continue;
                 if (!openIds.has(s.id)) rows.push({ pane: null, entry: s });
             }
             if (!rows.length) {
@@ -4981,6 +5582,10 @@
             }
             for (const r of rows) {
                 sessionListDiv.appendChild(buildSessionRow(r.pane, r.entry, act));
+                // Nested (subagent) rows render directly under their parent
+                // (live events + persisted children from the payload).
+                const parentId = r.pane ? r.pane.id : (r.entry ? r.entry.id : '');
+                if (parentId) appendNestedRows(parentId);
             }
         }
 
@@ -5511,6 +6116,7 @@
                 return;
             }
             if (e.key === 'Escape') {
+                hideTocTooltip();
                 if (terminalMoreMenu && !terminalMoreMenu.hidden) {
                     e.preventDefault();
                     terminalMoreMenu.hidden = true;
@@ -5619,6 +6225,7 @@
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
             requestAnimationFrame(() => { ignoreScrollEvent = false; });
             scrollBottomBtn.classList.remove('visible');
+            updateTocActive();
         }
 
         // Unpin as soon as the user scrolls up — don't wait for >120px distance,
@@ -5726,6 +6333,9 @@
             _scrollPending = true;
             requestAnimationFrame(() => {
                 _scrollPending = false;
+                // A user scroll moves the hovered dot away from the fixed
+                // tooltip's anchor — dismiss the preview.
+                hideTocTooltip();
                 const d = distanceFromBottom();
                 if (d > NEAR_BOTTOM_PX) {
                     // Clearly away from bottom (scrollbar drag, etc.)
@@ -5748,6 +6358,7 @@
                 // 8 < d <= NEAR_BOTTOM_PX: leave stickToBottom alone so a small
                 // upward scroll after wheel-unpin is not immediately re-pinned.
                 updateScrollBottomBtn();
+                updateTocActive(d);
             });
         });
         scrollBottomBtn.addEventListener('click', () => {
@@ -5785,6 +6396,7 @@
                 _repinRafPending = false;
                 if (stickToBottom) smartScroll();
                 else maybeRepinNearBottom();
+                updateTocActive();
             });
         }
         window.addEventListener('gogen-colorized', scheduleRepinIfPinned);
@@ -5803,6 +6415,8 @@
             new ResizeObserver(() => {
                 scheduleRepinIfPinned();
                 if (!stickToBottom) updateScrollBottomBtn();
+                updateTocActive();
+                syncTocRailBox();
             }).observe(messagesDiv);
         }
 
@@ -5838,6 +6452,250 @@
                 requestAnimationFrame(() => { ignoreScrollEvent = false; });
             });
         }
+
+        // === Conversation TOC rail ===
+        // One dot per user prompt (ChatGPT-style) between the sidebar and
+        // the chat. Dots mirror the transcript: every user bubble is created
+        // by appendMessageAtTime, so a dot is appended there (O(1) per
+        // prompt) and the rail is rebuilt from scratch on clearChat (pane
+        // switch, /new, compaction re-fetch, rewind). The active dot follows
+        // the prompt currently in view; clicking a dot jumps to its prompt;
+        // hovering shows a preview tooltip (fixed-position so the rail's
+        // overflow never clips it). On mobile the rail is hidden by CSS.
+        let lastTocActive = -1;
+        let tocHideTimer = null;
+        const TOC_TOOLTIP_HIDE_MS = 120; // debounce: sliding across dots must not flicker
+        const TOC_PREVIEW_MAX_CHARS = 300;
+
+        function appendTocDot(msgDiv) {
+            if (!tocRail || !tocDots || !msgDiv) return;
+            const i = tocDots.children.length;
+            const dot = document.createElement('button');
+            dot.type = 'button';
+            dot.className = 'toc-dot';
+            dot.dataset.tocItemIndex = String(i);
+            dot.setAttribute('aria-label', `Prompt ${i + 1}`);
+            dot.addEventListener('mouseenter', () => showTocTooltip(dot, msgDiv, i));
+            dot.addEventListener('mouseleave', scheduleHideTocTooltip);
+            dot.addEventListener('focus', () => showTocTooltip(dot, msgDiv, i));
+            dot.addEventListener('blur', scheduleHideTocTooltip);
+            dot.addEventListener('click', () => {
+                unpinFromBottom();
+                hideTocTooltip();
+                msgDiv.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            });
+            tocDots.appendChild(dot);
+            tocRail.classList.add('has-dots');
+            if (!replayInProgress) updateTocActive();
+        }
+
+        function rebuildToc() {
+            if (!tocRail || !tocDots) return;
+            tocDots.innerHTML = '';
+            lastTocActive = -1;
+            for (const m of messagesDiv.querySelectorAll('.message.user')) appendTocDot(m);
+            const hasDots = tocDots.children.length > 0;
+            tocRail.classList.toggle('has-dots', hasDots);
+            if (!hasDots) hideTocRail();
+            updateTocActive();
+        }
+
+        // Highlight the dot of the prompt currently in view: the last user
+        // message whose top is above the upper-third line of the chat
+        // viewport; while pinned at the bottom (or within the re-pin
+        // threshold) the last prompt wins. Also keeps the active dot visible
+        // inside the scrollable rail (minimal scroll, only when the active
+        // dot changes, so streaming never churns the rail).
+        function updateTocActive(d) {
+            const users = messagesDiv.querySelectorAll('.message.user');
+            const dots = tocDots ? tocDots.children : null;
+            if (!users.length || !dots || !dots.length) return;
+            if (d === undefined) d = distanceFromBottom();
+            let active = users.length - 1;
+            if (!stickToBottom && d > NEAR_BOTTOM_PX) {
+                const viewTop = messagesDiv.getBoundingClientRect().top;
+                const probe = viewTop + messagesDiv.clientHeight * 0.35;
+                active = 0;
+                // Messages are in document order: the first one below the
+                // probe line means everything after it is too — stop early.
+                for (let i = 0; i < users.length; i++) {
+                    if (users[i].getBoundingClientRect().top <= probe) active = i;
+                    else break;
+                }
+            }
+            // Nothing changed — skip the class pass and rail auto-scroll so
+            // streaming never churns the DOM (active stays put while pinned).
+            if (active === lastTocActive) return;
+            const n = Math.min(dots.length, users.length);
+            for (let i = 0; i < n; i++) {
+                const on = i === active;
+                dots[i].classList.toggle('active', on);
+                if (on) dots[i].setAttribute('data-toc-active', '');
+                else dots[i].removeAttribute('data-toc-active');
+            }
+            if (active !== lastTocActive && active < dots.length) {
+                lastTocActive = active;
+                const dot = dots[active];
+                // offsetTop is relative to the nearest positioned ancestor;
+                // dot and column share it, so the difference is the dot's
+                // offset within the column.
+                const relTop = dot.offsetTop - tocDots.offsetTop;
+                if (relTop < tocDots.scrollTop) {
+                    tocDots.scrollTop = relTop;
+                } else if (relTop + dot.offsetHeight > tocDots.scrollTop + tocDots.clientHeight) {
+                    tocDots.scrollTop = relTop + dot.offsetHeight - tocDots.clientHeight;
+                }
+            }
+        }
+
+        function showTocTooltip(dot, msgDiv, i) {
+            if (!tocTooltip) return;
+            clearTimeout(tocHideTimer);
+            tocHideTimer = null;
+            const raw = (msgDiv && msgDiv.dataset.rawContent) || '';
+            tocTooltipLabel.textContent = `Prompt ${i + 1}`;
+            tocTooltipBody.textContent = raw.length > TOC_PREVIEW_MAX_CHARS
+                ? raw.slice(0, TOC_PREVIEW_MAX_CHARS) + '…'
+                : (raw || '(image attachment)');
+            tocTooltip.style.display = 'block';
+            // Position after un-hiding so offsetWidth/offsetHeight measure
+            // the real size. Fixed coordinates from the dot's viewport rect
+            // — immune to the rail's overflow clipping. The rail sits on
+            // the right edge of the chat pane, so the preview opens to the
+            // LEFT of the dot and flips to the right when the left side has
+            // no room (clamped to the viewport in both directions).
+            const r = dot.getBoundingClientRect();
+            const w = tocTooltip.offsetWidth;
+            const h = tocTooltip.offsetHeight;
+            let left = r.left - w - 8;
+            if (left < 8) left = r.right + 8;
+            left = Math.max(8, Math.min(left, window.innerWidth - w - 8));
+            const top = Math.max(8, Math.min(r.top + r.height / 2 - h / 2, window.innerHeight - h - 8));
+            tocTooltip.style.left = left + 'px';
+            tocTooltip.style.top = top + 'px';
+        }
+
+        function hideTocTooltip() {
+            clearTimeout(tocHideTimer);
+            tocHideTimer = null;
+            if (tocTooltip) tocTooltip.style.display = 'none';
+        }
+
+        function scheduleHideTocTooltip() {
+            if (!tocTooltip) return;
+            clearTimeout(tocHideTimer);
+            tocHideTimer = setTimeout(hideTocTooltip, TOC_TOOLTIP_HIDE_MS);
+        }
+
+        // The rail overlays the chat, so it must stay aligned with the
+        // #messages box: it must never cover the composer toolbar, the
+        // input row, or the scroll-to-bottom button (whose positions flex
+        // with the terminal strip and window size). Re-synced on every
+        // #messages box change (ResizeObserver) and at init.
+        function syncTocRailBox() {
+            const container = tocRail ? tocRail.parentElement : null;
+            if (!container || !tocDots) return;
+            const cRect = container.getBoundingClientRect();
+            const mRect = messagesDiv.getBoundingClientRect();
+            // Keep the strip clear of the #messages scrollbar. Classic
+            // scrollbars take layout space (offsetWidth - clientWidth is the
+            // scrollbar width); overlay-scrollbar platforms (macOS default,
+            // etc.) report 0 but still float a scrollbar over the right
+            // edge. Reserve a minimum 16px gutter either way so the rail
+            // (and its hover zone) can never cover the scrollbar strip and
+            // swallow its clicks.
+            const gutter = Math.max(16, messagesDiv.offsetWidth - messagesDiv.clientWidth);
+            tocRail.style.top = (mRect.top - cRect.top) + 'px';
+            tocRail.style.height = mRect.height + 'px';
+            tocRail.style.right = gutter + 'px';
+            // Viewport-space hover zone (clientX/clientY are viewport
+            // absolute, so no container math needed here).
+            tocZone = { right: mRect.right - gutter, top: mRect.top, bottom: mRect.top + mRect.height };
+        }
+
+        let tocRailHideTimer = null;
+        let tocZone = null;
+        const TOC_RAIL_HIDE_MS = 150; // debounce: leaving the strip hides the rail
+        const TOC_ZONE_WIDTH = 40; // matches the rail width
+
+        function showTocRail() {
+            if (!tocRail.classList.contains('has-dots')) return;
+            clearTimeout(tocRailHideTimer);
+            tocRailHideTimer = null;
+            tocRail.classList.add('toc-hover');
+        }
+
+        function hideTocRail() {
+            clearTimeout(tocRailHideTimer);
+            tocRailHideTimer = null;
+            tocRail.classList.remove('toc-hover');
+            // The pointer left the strip — its fixed-position preview would
+            // point at nothing.
+            hideTocTooltip();
+        }
+
+        function scheduleHideTocRail() {
+            if (!tocRail) return;
+            clearTimeout(tocRailHideTimer);
+            tocRailHideTimer = setTimeout(hideTocRail, TOC_RAIL_HIDE_MS);
+        }
+
+        function initToc() {
+            if (!tocRail || !tocDots || !tocTooltip) return;
+            const container = tocRail.parentElement;
+            // Wheel over the rail scrolls the dot list; at the boundaries
+            // the wheel is chained to the chat below (manual: the rail is
+            // an overlay, not a sibling, so native chaining would not reach
+            // #messages).
+            tocRail.addEventListener('wheel', (e) => {
+                const overflows = tocDots.scrollHeight > tocDots.clientHeight;
+                if (!overflows) return;
+                const delta = e.deltaMode === 1 ? e.deltaY * 16
+                    : e.deltaMode === 2 ? e.deltaY * tocDots.clientHeight
+                    : e.deltaY;
+                if ((delta < 0 && tocDots.scrollTop <= 0) ||
+                    (delta > 0 && tocDots.scrollTop + tocDots.clientHeight >= tocDots.scrollHeight - 1)) {
+                    // At a boundary: chain the wheel to the chat below (the
+                    // rail overlays #messages now) instead of swallowing it.
+                    // Wheel-up also leaves the bottom, matching the chat's
+                    // own unpin behavior.
+                    if (delta < 0) unpinFromBottom();
+                    messagesDiv.scrollTop += delta;
+                    return;
+                }
+                e.preventDefault();
+                tocDots.scrollTop += delta;
+            }, { passive: false });
+            // Hover reveal via coordinates, NOT pointer events: the rail has
+            // pointer-events:none while hidden (otherwise the chat below it
+            // would be unclickable), so a mouseenter on the rail itself can
+            // never fire. Watch mousemove over the chat container instead:
+            // the pointer is in the right-edge strip → show; elsewhere →
+            // schedule hide. The rail's own mouseleave covers the pointer
+            // leaving the window.
+            if (container) {
+                container.addEventListener('mousemove', (e) => {
+                    if (!tocRail.classList.contains('has-dots') || !tocZone) return;
+                    const inZone = e.clientX >= tocZone.right - TOC_ZONE_WIDTH
+                        && e.clientX < tocZone.right
+                        && e.clientY >= tocZone.top && e.clientY < tocZone.bottom;
+                    if (inZone) showTocRail();
+                    else scheduleHideTocRail();
+                }, { passive: true });
+            }
+            tocRail.addEventListener('mouseleave', scheduleHideTocRail);
+            // Keyboard: Tab-focusing a dot (visibility:hidden removes dots
+            // from the tab order, so this only fires while visible) keeps
+            // the rail shown while focus is inside it.
+            tocRail.addEventListener('focusin', showTocRail);
+            tocRail.addEventListener('focusout', scheduleHideTocRail);
+            // The hovered dot moves when the list scrolls; a fixed tooltip
+            // anchored to the old spot would mislead.
+            tocDots.addEventListener('scroll', () => hideTocTooltip());
+            window.addEventListener('resize', () => hideTocTooltip());
+            syncTocRailBox();
+        }
+        initToc();
 
         // === Collapsible sidebar toggle ===
         const sidebarToggle = document.getElementById('sidebar-toggle');
@@ -5963,8 +6821,47 @@
         const settingsOverlay = document.getElementById('settings-overlay');
         const themeSelect = document.getElementById('theme-select');
 
-        settingsBtn.addEventListener('click', () => {
+        // Settings sections are tabbed (sidebar): showSettingsTab reveals
+        // one .settings-group panel at a time. The last-used tab persists
+        // per browser (localStorage); opening the modal from a screen with
+        // a natural settings home (chat/editor/board) auto-selects that tab
+        // instead — the screen the user is on wins on open.
+        const SETTINGS_TAB_STORAGE = 'gogen-settings-tab';
+        const SCREEN_TO_SETTINGS_TAB = { chat: 'chat', editor: 'editor', board: 'agent' };
+        let settingsTab = localStorage.getItem(SETTINGS_TAB_STORAGE) || 'chat';
+
+        function showSettingsTab(tab) {
+            const panel = document.getElementById('settings-tab-' + tab);
+            if (!panel) tab = 'chat'; // stale localStorage value — fall back
+            settingsTab = tab;
+            try { localStorage.setItem(SETTINGS_TAB_STORAGE, tab); } catch (e) { /* private mode */ }
+            document.querySelectorAll('.settings-tab-btn').forEach((btn) => {
+                const on = btn.dataset.tab === tab;
+                btn.classList.toggle('active', on);
+                btn.setAttribute('aria-selected', on ? 'true' : 'false');
+            });
+            document.querySelectorAll('.settings-group[role="tabpanel"]').forEach((p) => {
+                p.hidden = p.id !== 'settings-tab-' + tab;
+            });
+        }
+
+        function openSettings() {
+            const pane = document.querySelector('.main-tab.active')?.dataset.pane;
+            showSettingsTab(SCREEN_TO_SETTINGS_TAB[pane] || settingsTab);
             openModal(settingsOverlay);
+            // The subagent model picker (Agent tab) needs the model catalog;
+            // fetch it on open — the reply refreshes the toolbar picker too
+            // (shared list_models flow, server-cached).
+            if (document.getElementById('subagent-enabled-select')?.value === 'on'
+                && ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'list_models' }));
+            }
+        }
+
+        settingsBtn.addEventListener('click', openSettings);
+        document.querySelector('.settings-sidebar')?.addEventListener('click', (e) => {
+            const btn = e.target.closest('.settings-tab-btn');
+            if (btn && btn.dataset.tab) showSettingsTab(btn.dataset.tab);
         });
         document.getElementById('settings-close-btn')?.addEventListener('click', () => {
             closeModal(settingsOverlay);
@@ -5972,6 +6869,386 @@
         settingsOverlay.addEventListener('click', (e) => {
             if (e.target === settingsOverlay) closeModal(settingsOverlay);
         });
+
+        // === Feature settings: server-backed toggles (config WS message) ===
+        // Unlike the localStorage preferences above, these round-trip to the
+        // server: the toggle applies live to every session and is persisted
+        // to .gogen/gogen.conf. The select state follows the config push
+        // (applyFeatureSettings), so multiple tabs stay in sync.
+        const boardEnabledSelect = document.getElementById('board-enabled-select');
+        const subagentEnabledSelect = document.getElementById('subagent-enabled-select');
+        const subagentDepthInput = document.getElementById('subagent-depth-input');
+        if (boardEnabledSelect) {
+            boardEnabledSelect.addEventListener('change', () => {
+                sendFeatureConfig({ board: boardEnabledSelect.value });
+            });
+        }
+        if (subagentEnabledSelect) {
+            subagentEnabledSelect.addEventListener('change', () => {
+                sendFeatureConfig({ subagent: subagentEnabledSelect.value });
+            });
+        }
+        if (subagentDepthInput) {
+            subagentDepthInput.addEventListener('change', () => {
+                const n = parseInt(subagentDepthInput.value, 10);
+                if (!Number.isFinite(n) || n < 1) {
+                    subagentDepthInput.value = '1';
+                    return;
+                }
+                const clamped = Math.min(n, 10);
+                subagentDepthInput.value = String(clamped);
+                sendFeatureConfig({ subagentMaxDepth: clamped });
+            });
+        }
+
+        // === Runtime config options: server-backed (config WS message) ===
+        // The settings-modal options below round-trip through the config
+        // message's ConfigFields mechanism: a change sends { type: 'config',
+        // configFields: [name], <prop>: value }, the server applies it (live
+        // or restart-staged) and pushes the current values back, which keeps
+        // every tab in sync. prop overrides the WSMessage property when it
+        // differs from the ConfigFields name (contextLimitConfig).
+        const RUNTIME_CONTROLS = [
+            // Security
+            { id: 'command-safety-select', field: 'commandSafety' },
+            { id: 'command-allowlist-input', field: 'commandAllowlist' },
+            { id: 'delete-approval-select', field: 'deleteApproval' },
+            { id: 'command-sandbox-select', field: 'commandSandbox' },
+            { id: 'command-timeout-input', field: 'commandTimeoutSecs' },
+            // Context
+            { id: 'context-limit-input', field: 'contextLimit', prop: 'contextLimitConfig' },
+            { id: 'compact-threshold-input', field: 'compactThreshold' },
+            { id: 'compact-keep-input', field: 'compactKeepRecentMessages' },
+            { id: 'max-tool-bytes-input', field: 'maxToolResultBytes' },
+            { id: 'compact-reserve-input', field: 'compactReserveTokens' },
+            { id: 'preserve-reasoning-select', field: 'preserveReasoning' },
+            // Tools
+            { id: 'web-fetch-select', field: 'webFetch' },
+            { id: 'web-search-select', field: 'webSearch' },
+            { id: 'web-search-backend-select', field: 'webSearchBackend' },
+            { id: 'web-search-api-key-input', field: 'webSearchApiKey' },
+            { id: 'web-allowed-domains-input', field: 'webAllowedDomains' },
+            { id: 'web-fetch-mode-select', field: 'webFetchMode' },
+            { id: 'treesitter-select', field: 'treesitter' },
+            { id: 'treesitter-langs-input', field: 'treesitterLangs' },
+            // Sessions
+            { id: 'session-max-count-input', field: 'sessionMaxCount' },
+            { id: 'session-max-age-input', field: 'sessionMaxAgeDays' },
+            { id: 'approval-hold-input', field: 'webApprovalHoldSecs' },
+            // Server (restart-staged)
+            { id: 'web-bind-input', field: 'webBind' },
+            { id: 'web-allowed-origins-input', field: 'webAllowedOrigins' },
+            { id: 'web-auth-token-input', field: 'webAuthToken' },
+            { id: 'web-tls-cert-input', field: 'webTLSCertFile' },
+            { id: 'web-tls-key-input', field: 'webTLSKeyFile' },
+            { id: 'web-max-active-input', field: 'webMaxActiveSessions' },
+            { id: 'mcp-select', field: 'mcp' },
+            // Prompts (configurable templates; settings Agent group)
+            { id: 'board-start-prompt-input', field: 'boardStartPrompt' },
+            { id: 'system-prompt-input', field: 'systemPrompt' },
+            { id: 'subagent-prompt-input', field: 'subagentPrompt' },
+        ];
+
+        // Sends one or more runtime-config changes: { field: {prop, value} }.
+        function sendRuntimeConfig(changes) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            const payload = { type: 'config', configFields: [] };
+            for (const field of Object.keys(changes)) {
+                payload.configFields.push(field);
+                const { prop, value } = changes[field];
+                payload[prop] = value;
+            }
+            ws.send(JSON.stringify(payload));
+        }
+
+        function wireRuntimeControl(ctrl) {
+            const el = document.getElementById(ctrl.id);
+            if (!el) return;
+            el.addEventListener('change', () => {
+                let value = el.value;
+                if (el.type === 'number') {
+                    const n = parseInt(el.value, 10);
+                    if (!Number.isFinite(n)) return;
+                    value = n;
+                }
+                sendRuntimeConfig({ [ctrl.field]: { prop: ctrl.prop || ctrl.field, value } });
+            });
+        }
+        RUNTIME_CONTROLS.forEach(wireRuntimeControl);
+
+        // "Reset to default" for the prompt templates: send the explicit
+        // empty value; the server resolves it back to the built-in default
+        // and the next push re-populates the textarea with it.
+        const PROMPT_RESET_BUTTONS = [
+            { id: 'board-prompt-reset-btn', field: 'boardStartPrompt' },
+            { id: 'system-prompt-reset-btn', field: 'systemPrompt' },
+            { id: 'subagent-prompt-reset-btn', field: 'subagentPrompt' },
+        ];
+        for (const b of PROMPT_RESET_BUTTONS) {
+            const el = document.getElementById(b.id);
+            if (!el) continue;
+            el.addEventListener('click', () => sendRuntimeConfig({ [b.field]: { prop: b.field, value: '' } }));
+        }
+
+        // Applies the runtime-config values from the server push to the
+        // controls, updates the secret placeholders, and renders the
+        // restart banner. Values not present in the push are left as-is.
+        function applyRuntimeSettings(data) {
+            for (const ctrl of RUNTIME_CONTROLS) {
+                const el = document.getElementById(ctrl.id);
+                if (!el) continue;
+                const v = data[ctrl.prop || ctrl.field];
+                if (v === undefined) continue;
+                if (el.type === 'number') {
+                    if (String(el.value) !== String(v)) el.value = String(v);
+                } else if (el.value !== String(v)) {
+                    el.value = String(v);
+                }
+            }
+            const searchKeyEl = document.getElementById('web-search-api-key-input');
+            if (searchKeyEl) searchKeyEl.placeholder = data.webSearchApiKeySet ? 'API key (blank keeps stored)' : 'API key';
+            const authTokenEl = document.getElementById('web-auth-token-input');
+            if (authTokenEl) authTokenEl.placeholder = data.webAuthTokenSet ? 'Token set (blank keeps stored)' : 'Auth token';
+            const banner = document.getElementById('restart-banner');
+            if (banner) {
+                if (Array.isArray(data.restartRequired) && data.restartRequired.length > 0) {
+                    banner.textContent = '⚠ Restart gogen for these to take effect: ' + data.restartRequired.join(', ');
+                    banner.hidden = false;
+                } else {
+                    banner.hidden = true;
+                }
+            }
+            // Subagent default model: the server pushes the current value
+            // ("" = inherit, included even when empty so a clear by another
+            // tab syncs here too).
+            if (data.subagentModel !== undefined) {
+                subagentModelValue = data.subagentModel || '';
+                if (settingsOverlay.classList.contains('active')) renderSubagentModelPicker();
+            }
+        }
+
+        // === MCP test: server-backed (test_mcp WS message) ===
+        // The configured server list follows the config push (applyMCPSettings);
+        // row Test buttons probe a saved server by name (stored command/args/
+        // env resolved server-side), the form probes a typed command/args/env
+        // before adding it to the config file by hand. Never registers anything.
+        const mcpServerListEl = document.getElementById('mcp-server-list');
+        const mcpTestNameInput = document.getElementById('mcp-test-name');
+        const mcpTestCommandInput = document.getElementById('mcp-test-command');
+        const mcpTestArgsInput = document.getElementById('mcp-test-args');
+        const mcpTestEnvInput = document.getElementById('mcp-test-env');
+        const mcpTestBtn = document.getElementById('mcp-test-btn');
+        const mcpTestResult = document.getElementById('mcp-test-result');
+
+        function renderMCPServerList(servers) {
+            if (!mcpServerListEl || !Array.isArray(servers)) return;
+            mcpServerListEl.innerHTML = '';
+            if (servers.length === 0) {
+                mcpServerListEl.textContent = 'No MCP servers configured (mcp_servers in the config file).';
+                mcpServerListEl.className = 'settings-note';
+                return;
+            }
+            mcpServerListEl.className = 'mcp-server-list';
+            for (const s of servers) {
+                const row = document.createElement('div');
+                row.className = 'provider-row';
+                const info = document.createElement('span');
+                info.className = 'provider-row-info';
+                info.textContent = s.name + '  ·  ' + s.command + (s.args && s.args.length ? '  ' + s.args.join(' ') : '') + (s.envSet ? '  ·  env •••' : '');
+                row.appendChild(info);
+                const actions = document.createElement('span');
+                actions.className = 'provider-row-actions';
+                const testBtn = document.createElement('button');
+                testBtn.type = 'button';
+                testBtn.textContent = 'Test';
+                testBtn.title = 'Test connectivity and list tools';
+                testBtn.addEventListener('click', () => {
+                    showMCPTest('Testing ' + s.name + '…', '');
+                    sendMCPTest({ name: s.name });
+                });
+                actions.appendChild(testBtn);
+                row.appendChild(actions);
+                mcpServerListEl.appendChild(row);
+            }
+        }
+
+        function showMCPTest(text, kind) {
+            if (!mcpTestResult) return;
+            mcpTestResult.textContent = text;
+            mcpTestResult.className = 'settings-note' + (kind ? ' ' + kind : '');
+        }
+
+        function sendMCPTest(req) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            ws.send(JSON.stringify({ type: 'test_mcp', mcpTest: req }));
+        }
+
+        // "KEY=VALUE KEY2=VALUE2" → { KEY: VALUE, KEY2: VALUE2 } (invalid
+        // parts silently dropped).
+        function parseEnvInput(raw) {
+            const env = {};
+            for (const part of String(raw || '').trim().split(/\s+/)) {
+                if (!part) continue;
+                const eq = part.indexOf('=');
+                if (eq <= 0) continue;
+                env[part.slice(0, eq)] = part.slice(eq + 1);
+            }
+            return env;
+        }
+
+        function applyMCPSettings(data) {
+            if (Array.isArray(data.mcpServers)) {
+                renderMCPServerList(data.mcpServers);
+            }
+        }
+
+        if (mcpTestBtn) {
+            mcpTestBtn.addEventListener('click', () => {
+                showMCPTest('Testing…', '');
+                const rawArgs = mcpTestArgsInput.value.trim();
+                sendMCPTest({
+                    name: mcpTestNameInput.value.trim(),
+                    command: mcpTestCommandInput.value.trim(),
+                    args: rawArgs ? rawArgs.split(/\s+/) : [],
+                    env: parseEnvInput(mcpTestEnvInput.value),
+                });
+            });
+        }
+
+        // === Providers: server-backed list (config WS message) ===
+        // The list follows the config push (applyProviderSettings); the
+        // add/edit/delete/test actions round-trip through provider_save /
+        // provider_delete / test_provider. Keys are never pushed — only the
+        // apiKeySet flag — and the storage warning renders the actual config
+        // file path from the server.
+        const providerListEl = document.getElementById('provider-list');
+        const providerWarningPath = document.getElementById('provider-config-path');
+        const providerNameInput = document.getElementById('provider-name');
+        const providerBaseURLInput = document.getElementById('provider-base-url');
+        const providerKeyInput = document.getElementById('provider-api-key');
+        const providerModelInput = document.getElementById('provider-model');
+        const providerAddBtn = document.getElementById('provider-add-btn');
+        const providerTestBtn = document.getElementById('provider-test-btn');
+        const providerTestResult = document.getElementById('provider-test-result');
+
+        function sendProviderOp(type, fields) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            ws.send(JSON.stringify({ type, providerOp: fields }));
+        }
+
+        function showProviderTest(text, kind) {
+            if (!providerTestResult) return;
+            providerTestResult.textContent = text;
+            providerTestResult.className = 'settings-note' + (kind ? ' ' + kind : '');
+        }
+
+        function renderProviderList(providers) {
+            if (!providerListEl || !Array.isArray(providers)) return;
+            providerListEl.innerHTML = '';
+            for (const p of providers) {
+                const row = document.createElement('div');
+                row.className = 'provider-row';
+                const info = document.createElement('span');
+                info.className = 'provider-row-info';
+                info.textContent = p.name + (p.baseUrl ? '  ·  ' + p.baseUrl : '') + (p.apiKeySet ? '  ·  key •••' : '');
+                row.appendChild(info);
+                const actions = document.createElement('span');
+                actions.className = 'provider-row-actions';
+                const testBtn = document.createElement('button');
+                testBtn.type = 'button';
+                testBtn.textContent = 'Test';
+                testBtn.title = 'Test connectivity and list models';
+                testBtn.addEventListener('click', () => {
+                    showProviderTest('Testing ' + p.name + '…', '');
+                    sendProviderOp('test_provider', { name: p.name, baseUrl: p.baseUrl, model: p.model });
+                });
+                actions.appendChild(testBtn);
+                const editBtn = document.createElement('button');
+                editBtn.type = 'button';
+                editBtn.textContent = 'Edit';
+                editBtn.addEventListener('click', () => {
+                    providerNameInput.value = p.name;
+                    providerBaseURLInput.value = p.baseUrl || '';
+                    providerKeyInput.value = '';
+                    providerModelInput.value = p.model || '';
+                    providerKeyInput.placeholder = p.apiKeySet ? 'API key (blank keeps stored)' : 'API key';
+                    providerNameInput.focus();
+                });
+                actions.appendChild(editBtn);
+                const delBtn = document.createElement('button');
+                delBtn.type = 'button';
+                delBtn.textContent = 'Delete';
+                delBtn.disabled = !p.deletable;
+                if (p.deletable) {
+                    delBtn.title = 'Remove this provider';
+                    delBtn.addEventListener('click', () => {
+                        if (!confirm('Delete provider "' + p.name + '"? Its models will disappear from the picker.')) return;
+                        showProviderTest('', '');
+                        sendProviderOp('provider_delete', { name: p.name });
+                    });
+                } else {
+                    delBtn.title = 'The default profile is built from the legacy config fields';
+                }
+                actions.appendChild(delBtn);
+                row.appendChild(actions);
+                providerListEl.appendChild(row);
+            }
+        }
+
+        // Last-seen provider list (JSON): a change means a provider was
+        // added/edited/deleted, so the model catalog must be re-fetched —
+        // the picker's availableModels is otherwise a stale snapshot.
+        let lastProvidersJson = null;
+
+        function applyProviderSettings(data) {
+            if (Array.isArray(data.providers)) {
+                const json = JSON.stringify(data.providers);
+                if (json !== lastProvidersJson) {
+                    lastProvidersJson = json;
+                    // Re-request the aggregated catalog so the new provider's
+                    // models appear in the picker (and deleted ones drop).
+                    modelsRequested = false;
+                    ensureModelsLoaded();
+                }
+                renderProviderList(data.providers);
+            }
+            if (data.configFilePath && providerWarningPath) {
+                providerWarningPath.textContent = data.configFilePath;
+            }
+        }
+
+        function testProviderForm() {
+            const name = providerNameInput.value.trim();
+            const baseUrl = providerBaseURLInput.value.trim();
+            const model = providerModelInput.value.trim();
+            showProviderTest('Testing…', '');
+            // Testing a saved provider by name uses its stored key; the
+            // add-form test carries the typed endpoint (key included).
+            sendProviderOp('test_provider', { name, baseUrl, apiKey: providerKeyInput.value, model });
+        }
+
+        if (providerAddBtn) {
+            providerAddBtn.addEventListener('click', () => {
+                const name = providerNameInput.value.trim();
+                if (!name) {
+                    showToast('Provider name is required', 'error');
+                    return;
+                }
+                const baseUrl = providerBaseURLInput.value.trim();
+                const apiKey = providerKeyInput.value;
+                const model = providerModelInput.value.trim();
+                sendProviderOp('provider_save', { name, baseUrl, apiKey, model });
+                providerKeyInput.value = '';
+                providerKeyInput.placeholder = 'API key (blank keeps stored)';
+                showProviderTest('', '');
+            });
+        }
+        if (providerTestBtn) {
+            providerTestBtn.addEventListener('click', testProviderForm);
+        }
+
+        // === Kanban board tab (drag-and-drop) ===
+        initBoardTab();
 
         // === Theme: detect system preference, allow override ===
         const prefersDark = window.matchMedia('(prefers-color-scheme: dark)');

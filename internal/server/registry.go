@@ -80,6 +80,25 @@ type sessionRuntime struct {
 	// "resume to continue" row). Nil for runtimes built outside a registry
 	// (unit tests): the orphan checks then no-op.
 	registry *sessionRegistry
+
+	// parentID is non-empty for nested (subagent) runtimes: the sidebar
+	// renders them under their parent, cap eviction skips them, and delete
+	// approvals route to the parent's clients when no child client is
+	// attached (D6).
+	parentID string
+	// nested marks subagent child runtimes (parentID non-empty). Nested
+	// runtimes are exempt from the active-session cap eviction: evicting a
+	// running child mid-task would strand the parent's waiting tool call.
+	nested bool
+	// approverOverride replaces the default deleteApprover when non-nil
+	// (the subagent spawner installs the D6 forwarding approver; the board
+	// start installs a deny-when-unattended approver).
+	approverOverride agent.DeleteApprover
+	// turnErrorHook is invoked by startTurn's error path with the turn's
+	// error (nil when no hook is installed — the normal case). The board
+	// start installs it so a failed first turn is commented on the ticket
+	// instead of failing silently in an unattended session.
+	turnErrorHook func(err error)
 }
 
 // pendingApproval is one in-flight delete-approval request: the channel the
@@ -641,6 +660,13 @@ func (r *sessionRegistry) register(id string, rt *sessionRuntime) []string {
 	for i := len(r.order) - 1; len(r.agents) >= r.maxActive && i > 0; i-- {
 		victimID := r.order[i]
 		victim := r.agents[victimID]
+		// Nested (subagent) runtimes are exempt from the cap: evicting a
+		// running child would strand the parent's waiting tool call, and a
+		// finished child is unregistered by its spawner within the same
+		// tool call.
+		if victim.nested {
+			continue
+		}
 		if active, _ := victim.turnState(); active {
 			continue
 		}
@@ -899,7 +925,10 @@ func (s *Server) ShutdownSessions() {
 // session: it cancels the in-flight turn only when THIS connection owns
 // it (interrupt semantics — typing a new message replaces your own turn). A
 // second connection attached to the same session never cancels a turn
-// it does not own; it waits and gets the standard busy rejection.
+// it does not own; it waits and gets the standard busy rejection. Returns
+// false when the runtime is busy or was evicted; the caller drops the
+// message and notifies the client on its own channel (see errAgentBusy —
+// UI-channel handlers must not emit the busy rejection as a "response").
 func (rt *sessionRuntime) acquireTurnForHandler(ws *wsConn) bool {
 	if rt.ownsTurn(ws) {
 		rt.stream.cancelInFlight()
@@ -909,7 +938,6 @@ func (rt *sessionRuntime) acquireTurnForHandler(ws *wsConn) bool {
 			rt.stream.cancelInFlight()
 		}
 		if !rt.tryAcquireTurn(wsStreamDrainWait) {
-			_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
 			return false
 		}
 	}

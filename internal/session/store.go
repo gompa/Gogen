@@ -42,6 +42,9 @@ type file struct {
 	Oneshot        bool            `json:"oneshot,omitempty"`
 	TokenCounts    []int           `json:"tokenCounts,omitempty"`
 	ContextLimit   int             `json:"contextLimit,omitempty"`
+	// ParentID marks nested (subagent) sessions; the flat session list
+	// excludes them and deleting the parent cascades.
+	ParentID string `json:"parentID,omitempty"`
 }
 
 type Store struct {
@@ -83,6 +86,39 @@ func (s *Store) SetAutoPrune(enabled bool) {
 	s.mu.Lock()
 	s.autoPrune = enabled
 	s.mu.Unlock()
+}
+
+// SetRetention updates the session retention options at runtime (the web
+// settings modal session_max_count / session_max_age_days). The same
+// normalization as NewStoreWithOptions applies: 0 = the config default,
+// negative maxAgeDays = keep sessions forever. Callers must re-prune after
+// a change that reduces capacity (the web handler uses its registry-aware
+// pruneSessions).
+func (s *Store) SetRetention(maxCount, maxAgeDays int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if maxAgeDays < 0 {
+		// Negative disables age-based retention ("keep sessions forever").
+		s.maxAgeDays = maxAgeDays
+	} else {
+		s.maxAgeDays = config.Effective(maxAgeDays, config.DefaultSessionMaxAgeDays)
+	}
+	s.maxCount = config.Effective(maxCount, config.DefaultSessionMaxCount)
+}
+
+// MaxCount returns the current max-session count (runtime-safe read).
+func (s *Store) MaxCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.maxCount
+}
+
+// MaxAgeDays returns the current max session age in days (-1 = keep
+// sessions forever; runtime-safe read).
+func (s *Store) MaxAgeDays() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.maxAgeDays
 }
 
 // NewStoreWithOptions creates a session store with custom retention.

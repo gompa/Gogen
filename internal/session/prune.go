@@ -44,6 +44,12 @@ func (s *Store) prune(workingDir string, keepIDs ...string) {
 	idx := s.readIndex(workingDir)
 	if idx != nil && len(idx.Entries) > 0 {
 		for _, e := range idx.Entries {
+			// Nested (subagent) sessions are exempt from the global
+			// retention counts: they are bounded by the per-parent cap
+			// (maxNestedPerParent) and cascade-deleted with their parent.
+			if e.ParentID != "" {
+				continue
+			}
 			items = append(items, item{id: e.ID, updated: e.Updated})
 		}
 	} else {
@@ -53,6 +59,9 @@ func (s *Store) prune(workingDir string, keepIDs ...string) {
 			return
 		}
 		for _, l := range legacy {
+			if l.parentID != "" {
+				continue // nested — bounded by the per-parent cap, not here
+			}
 			items = append(items, item{id: l.id, updated: l.updated.UTC()})
 		}
 	}
@@ -92,6 +101,11 @@ func (s *Store) prune(workingDir string, keepIDs ...string) {
 		_ = os.Remove(path)
 		delete(s.createdCache, id)
 		_ = s.clearDeltaFile(workingDir, id)
+		// Cascade: a pruned parent's nested children would otherwise be
+		// orphaned — invisible in the flat list (ParentID non-empty) and
+		// never touched again (the per-parent cap only runs on child
+		// saves, and explicit Delete never happens).
+		s.deleteNestedChildren(workingDir, id)
 	}
 	if len(toDelete) > 0 {
 		s.removeFromIndexBatch(workingDir, toDelete)

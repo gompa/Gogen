@@ -808,7 +808,7 @@ func TestPatchFileReportsRelocationWarning(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := NewExecutor(dir)
-	exec.RequireDeleteApproval = false
+	exec.SetDeleteApproval(false)
 	diff := "--- a/main.go\n+++ b/main.go\n@@ -20,2 +20,3 @@\n func main() {\n+// hi\n }\n"
 	msg, err := exec.PatchFile(context.Background(), diff, false, true)
 	if err != nil {
@@ -827,7 +827,7 @@ func TestPatchFailStreakSteersRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := NewExecutor(dir)
-	exec.RequireDeleteApproval = false
+	exec.SetDeleteApproval(false)
 	a := NewAgent(nil, exec, nil)
 
 	badDiff := "--- a/main.go\n+++ b/main.go\n@@ -1,4 +1,5 @@\n package wrong\n\n+// x\n func main() {\n }\n"
@@ -901,7 +901,7 @@ func TestPatchFileSingleTrailingBlankApplies(t *testing.T) {
 		"+two\n" +
 		"\n"
 	exec := NewExecutor(dir)
-	exec.RequireDeleteApproval = false
+	exec.SetDeleteApproval(false)
 	if _, err := exec.PatchFile(context.Background(), diff, false, true); err != nil {
 		t.Fatal(err)
 	}
@@ -933,7 +933,7 @@ func TestPatchFileSingleTrailingBlankDoesNotDeleteBlankAtEOF(t *testing.T) {
 		"-two\n" +
 		"\n"
 	exec := NewExecutor(dir)
-	exec.RequireDeleteApproval = false
+	exec.SetDeleteApproval(false)
 	if _, err := exec.PatchFile(context.Background(), diff, false, true); err != nil {
 		t.Fatal(err)
 	}
@@ -1045,7 +1045,7 @@ func TestPatchFileMissingPlusPlusHeaderFallsBackToOldName(t *testing.T) {
 		" one\n" +
 		"+two\n"
 	exec := NewExecutor(dir)
-	exec.RequireDeleteApproval = false
+	exec.SetDeleteApproval(false)
 	if _, err := exec.PatchFile(context.Background(), diff, false, true); err != nil {
 		t.Fatalf("patch without +++ header: %v", err)
 	}
@@ -1163,7 +1163,7 @@ func TestPatchFileRemovesLineStartingWithDoubleDash(t *testing.T) {
 		"--- comment\n" +
 		" FROM t\n"
 	exec := NewExecutor(dir)
-	exec.RequireDeleteApproval = false
+	exec.SetDeleteApproval(false)
 	if _, err := exec.PatchFile(context.Background(), diff, false, true); err != nil {
 		t.Fatalf("patch: %v", err)
 	}
@@ -1245,7 +1245,7 @@ func TestPatchFileUnderDeclaredHunkThenNewFile(t *testing.T) {
 		" alpha\n" +
 		"+beta\n"
 	exec := NewExecutor(dir)
-	exec.RequireDeleteApproval = false
+	exec.SetDeleteApproval(false)
 	if _, err := exec.PatchFile(context.Background(), diff, false, true); err != nil {
 		t.Fatalf("PatchFile: %v", err)
 	}
@@ -1312,7 +1312,7 @@ func TestPatchFailStreakIgnoresNonMismatchErrors(t *testing.T) {
 	// not a stale diff) must NOT produce "failed N times in a row".
 	dir := t.TempDir()
 	exec := NewExecutor(dir)
-	exec.RequireDeleteApproval = false
+	exec.SetDeleteApproval(false)
 	a := NewAgent(nil, exec, nil)
 
 	// The target file does not exist — planPatch fails with a read error.

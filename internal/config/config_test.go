@@ -118,6 +118,72 @@ func TestWebToolsEnabled(t *testing.T) {
 	}
 }
 
+func TestBoardEnabledOptIn(t *testing.T) {
+	if ((*Config)(nil)).BoardEnabled() {
+		t.Fatal("nil config should not enable board")
+	}
+	def := Defaults()
+	if def.BoardEnabled() {
+		t.Fatal("default board should be off")
+	}
+	for _, on := range []string{"on", "ON", "1", "true"} {
+		c := Config{Board: on}
+		if !c.BoardEnabled() {
+			t.Fatalf("Board=%q should enable", on)
+		}
+	}
+	for _, off := range []string{"", "off", "0", "false", "maybe"} {
+		c := Config{Board: off}
+		if c.BoardEnabled() {
+			t.Fatalf("Board=%q should not enable", off)
+		}
+	}
+}
+
+func TestSubagentEnabledOptIn(t *testing.T) {
+	if ((*Config)(nil)).SubagentEnabled() {
+		t.Fatal("nil config should not enable subagents")
+	}
+	def := Defaults()
+	if def.SubagentEnabled() {
+		t.Fatal("default subagent should be off")
+	}
+	for _, on := range []string{"on", "ON", "1", "true"} {
+		c := Config{Subagent: on}
+		if !c.SubagentEnabled() {
+			t.Fatalf("Subagent=%q should enable", on)
+		}
+	}
+	for _, off := range []string{"", "off", "0", "false", "maybe"} {
+		c := Config{Subagent: off}
+		if c.SubagentEnabled() {
+			t.Fatalf("Subagent=%q should not enable", off)
+		}
+	}
+}
+
+func TestSubagentDepth(t *testing.T) {
+	if got := ((*Config)(nil)).SubagentDepth(); got != DefaultSubagentMaxDepth {
+		t.Fatalf("nil config depth = %d, want default %d", got, DefaultSubagentMaxDepth)
+	}
+	zero := Config{}
+	if got := zero.SubagentDepth(); got != DefaultSubagentMaxDepth {
+		t.Fatalf("zero depth = %d, want default %d", got, DefaultSubagentMaxDepth)
+	}
+	neg := Config{SubagentMaxDepth: -3}
+	if got := neg.SubagentDepth(); got != DefaultSubagentMaxDepth {
+		t.Fatalf("negative depth = %d, want default %d", got, DefaultSubagentMaxDepth)
+	}
+	three := Config{SubagentMaxDepth: 3}
+	if got := three.SubagentDepth(); got != 3 {
+		t.Fatalf("depth 3 = %d, want 3", got)
+	}
+	def := Defaults()
+	if got := def.SubagentDepth(); got != DefaultSubagentMaxDepth {
+		t.Fatalf("defaults depth = %d, want %d", got, DefaultSubagentMaxDepth)
+	}
+}
+
 func TestConfigDefaults(t *testing.T) {
 	d := Defaults()
 	if d.CompactThreshold != 0.85 {

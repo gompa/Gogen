@@ -23,7 +23,13 @@ import (
 // preserved. The session store stays internal to setup: main never reads it
 // after construction.
 func newAgent(cfg *config.Config, isGlobalMode bool) (*agent.Agent, string) {
-	provider := llm.NewOpenAIProvider(cfg.OpenAIKey, cfg.OpenAIModel, cfg.OpenAIURL, cfg.WorkingDir)
+	// The provider carries ALL registered OpenAI-compatible profiles (the
+	// legacy fields form the implicit default profile), so the TUI's /models
+	// list and the web model picker both aggregate every endpoint, and each
+	// model routes to its owning endpoint.
+	provider := llm.NewOpenAIProviderWithProfiles(
+		llm.ProviderProfiles(cfg.OpenAIKey, cfg.OpenAIModel, cfg.OpenAIURL, cfg.OpenAIProviders),
+		cfg.OpenAIModel, cfg.WorkingDir, nil)
 
 	// Derive a stable prompt-cache key from the working directory so
 	// provider-side prefix caches survive sequential requests.
@@ -39,10 +45,10 @@ func newAgent(cfg *config.Config, isGlobalMode bool) (*agent.Agent, string) {
 	})
 
 	exec := agent.NewExecutorWithGuard(cfg.WorkingDir, agent.NewCommandGuard(cfg.CommandSafetyMode, agent.ParseAllowlist(cfg.CommandAllowlist)))
-	exec.RequireDeleteApproval = !strings.EqualFold(cfg.DeleteApproval, "off")
-	exec.Sandbox = cfg.CommandSandbox
+	exec.SetDeleteApproval(!strings.EqualFold(cfg.DeleteApproval, "off"))
+	exec.SetSandbox(cfg.CommandSandbox)
 	if cfg.CommandTimeoutSecs > 0 {
-		exec.CommandTimeout = time.Duration(cfg.CommandTimeoutSecs) * time.Second
+		exec.SetCommandTimeout(time.Duration(cfg.CommandTimeoutSecs) * time.Second)
 	}
 	if isGlobalMode {
 		// In global mode, relax the path boundary to the user's home directory.
@@ -54,6 +60,18 @@ func newAgent(cfg *config.Config, isGlobalMode bool) (*agent.Agent, string) {
 	a.TodoManager = agent.NewTodoManager(cfg.WorkingDir)
 	a.PinManager = agent.NewPinManager()
 	a.DebugCompareMessages = cfg.DebugCompareMessages
+	// Feature flags: seeded from startup config (TUI/CLI path; the web
+	// server re-seeds from its workspace on every NewSessionAgent and
+	// supports live toggles via the config WS message).
+	a.SetBoardEnabled(cfg.BoardEnabled())
+	a.SetSubagentsEnabled(cfg.SubagentEnabled())
+	a.SetSubagentMaxDepth(cfg.SubagentDepth())
+	if cfg.BoardEnabled() {
+		// Project board: per-process manager rooted at the working dir
+		// (global mode → the global board dir). Re-pointed on /dir changes
+		// via AfterWorkingDirChange.
+		a.SetBoardManager(agent.NewBoardManager(cfg.WorkingDir, isGlobalMode))
+	}
 	if cfg.DebugCompareMessages && !agent.ViewDriftCompiledIn() {
 		fmt.Fprintf(os.Stderr, "GOGEN_DEBUG_COMPARE_MESSAGES requires a debug build (-tags debug); ignoring\n")
 		a.DebugCompareMessages = false

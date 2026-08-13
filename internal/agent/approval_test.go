@@ -74,7 +74,7 @@ func TestDeleteApprovalOff(t *testing.T) {
 	}
 
 	exec := NewExecutor(dir)
-	exec.RequireDeleteApproval = false
+	exec.SetDeleteApproval(false)
 	_, err := exec.DeleteFile(context.Background(), "remove.txt")
 	if err != nil {
 		t.Fatal(err)

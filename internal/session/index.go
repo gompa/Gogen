@@ -27,6 +27,9 @@ type sessionIndexEntry struct {
 	// so List can keep a deliberate rename authoritative without re-reading
 	// the session file.
 	LabelRenamed bool `json:"labelRenamed,omitempty"`
+	// ParentID marks nested (subagent) sessions so the flat list can
+	// exclude them without re-reading every session file.
+	ParentID string `json:"parentID,omitempty"`
 }
 
 // sessionIndex is the on-disk index of session metadata for fast listing.
@@ -78,8 +81,9 @@ func (s *Store) sessionFiles(workingDir string) ([]string, error) {
 
 // legacySession is one entry from a legacy (no-index) session directory scan.
 type legacySession struct {
-	id      string
-	updated time.Time
+	id       string
+	updated  time.Time
+	parentID string // non-empty for nested (subagent) sessions
 }
 
 // legacySessionUpdated scans the session files in workingDir's store
@@ -101,14 +105,15 @@ func (s *Store) legacySessionUpdated(workingDir string) ([]legacySession, error)
 			continue
 		}
 		var meta struct {
-			Updated time.Time `json:"updated"`
+			Updated  time.Time `json:"updated"`
+			ParentID string    `json:"parentID"`
 		}
 		if err := json.Unmarshal(data, &meta); err != nil || meta.Updated.IsZero() {
 			continue
 		}
 		// Delta-aware timestamp (see sessionUpdatedAt): delta-only updates
 		// would otherwise under-rank next to full-save timestamps.
-		out = append(out, legacySession{id: id, updated: s.sessionUpdatedAt(workingDir, id, meta.Updated)})
+		out = append(out, legacySession{id: id, updated: s.sessionUpdatedAt(workingDir, id, meta.Updated), parentID: meta.ParentID})
 	}
 	return out, nil
 }
@@ -183,6 +188,7 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 				UpdatedAt:    e.Updated.UTC().Format(time.RFC3339Nano),
 				MessageCount: e.MessageCount,
 				Label:        e.Label,
+				ParentID:     e.ParentID,
 			}
 		}
 		listCacheMu.Lock()
@@ -226,11 +232,12 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 				UpdatedAt:    updated.UTC().Format(time.RFC3339Nano),
 				MessageCount: len(f.Messages),
 				Label:        lbl,
+				ParentID:     f.ParentID,
 			},
 			updated: updated,
 		})
 		idx.Entries = append(idx.Entries, sessionIndexEntry{
-			ID: id, Updated: updated, Oneshot: f.Oneshot, MessageCount: len(f.Messages), Label: lbl,
+			ID: id, Updated: updated, Oneshot: f.Oneshot, MessageCount: len(f.Messages), Label: lbl, ParentID: f.ParentID,
 		})
 	}
 	// Persist the index for next time (best-effort).
@@ -397,8 +404,9 @@ func (s *Store) mutateIndexWith(workingDir string, createIfMissing bool, preload
 // preloaded, when non-nil, is a caller-supplied index (see mutateIndexWith);
 // Save passes the index it already loaded for Created recovery so a full save
 // reads index.json at most once. labelRenamed mirrors the session file's
-// rename marker so List can keep deliberate renames authoritative.
-func (s *Store) updateIndex(workingDir, id string, created, updated time.Time, msgCount int, label string, oneshot, labelRenamed bool, preloaded *sessionIndex) {
+// rename marker so List can keep deliberate renames authoritative. parentID
+// marks nested (subagent) sessions for flat-list exclusion.
+func (s *Store) updateIndex(workingDir, id string, created, updated time.Time, msgCount int, label string, oneshot, labelRenamed bool, parentID string, preloaded *sessionIndex) {
 	s.mutateIndexWith(workingDir, true, preloaded, func(idx *sessionIndex) bool {
 		found := false
 		for i, e := range idx.Entries {
@@ -411,13 +419,14 @@ func (s *Store) updateIndex(workingDir, id string, created, updated time.Time, m
 				idx.Entries[i].MessageCount = msgCount
 				idx.Entries[i].Label = label
 				idx.Entries[i].LabelRenamed = labelRenamed
+				idx.Entries[i].ParentID = parentID
 				found = true
 				break
 			}
 		}
 		if !found {
 			idx.Entries = append(idx.Entries, sessionIndexEntry{
-				ID: id, Created: created, Updated: updated, Oneshot: oneshot, MessageCount: msgCount, Label: label, LabelRenamed: labelRenamed,
+				ID: id, Created: created, Updated: updated, Oneshot: oneshot, MessageCount: msgCount, Label: label, LabelRenamed: labelRenamed, ParentID: parentID,
 			})
 		}
 		return true

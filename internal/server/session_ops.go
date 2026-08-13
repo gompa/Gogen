@@ -168,6 +168,27 @@ func (s *Server) sessionNew(ws *wsConn, pane **sessionRuntime) (agent.SessionCom
 	return agent.SessionCommandResult{Output: out, Action: agent.SessionActionClearChat}, true, nil
 }
 
+// registerSeededSession creates a fresh session agent from a snapshot
+// (nil = empty), renames it, registers it, persists it, and prunes the
+// store. Used by the board start path: the session file must exist even if
+// the first turn never runs. Unlike createNewSession it does NOT touch the
+// connection's pane — no setDefault, no switchPane, no attach — so the
+// started session runs headless until the user opens it.
+func (s *Server) registerSeededSession(snap *agent.SessionSnapshot, label string) (*sessionRuntime, []string) {
+	newID := session.NewID()
+	a := s.ws.NewSessionAgent(snap, newID)
+	if label != "" {
+		a.RenameSession(label)
+	}
+	rt := s.newSessionRuntimeFor(a)
+	evicted := s.registry.register(newID, rt)
+	// Persist now: the session file must exist even when the first turn
+	// never runs (model missing, immediate failure).
+	a.FlushSession()
+	s.pruneSessions(evicted...)
+	return rt, evicted
+}
+
 // createNewSession registers a fresh session and switches the pane to it.
 // Returns the new runtime.
 func (s *Server) createNewSession(ws *wsConn, pane **sessionRuntime) *sessionRuntime {

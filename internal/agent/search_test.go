@@ -328,6 +328,28 @@ func TestReplaceInTreeSingleFile(t *testing.T) {
 	}
 }
 
+// TestReplaceInTreeEmptyPatternRejected locks in the up-front empty-pattern
+// guard: an empty regex matches at every position (zero-width), which would
+// rewrite every scanned file. It must error and leave files untouched.
+func TestReplaceInTreeEmptyPatternRejected(t *testing.T) {
+	dir := t.TempDir()
+	content := "foo bar\n"
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exec := NewExecutor(dir)
+	if _, _, err := exec.ReplaceInTree(context.Background(), "", "X", "", ""); err == nil {
+		t.Fatal("expected error for empty search pattern")
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != content {
+		t.Fatalf("file was modified: got %q, want %q", data, content)
+	}
+}
+
 // TestScanFileSinglePassMatchesBufferedReference is a differential test: the
 // streaming scanner must produce byte-identical output to the old two-pass
 // buffered algorithm (store all lines, mark windows, emit) for every

@@ -16,9 +16,10 @@ import (
 // fakeMCPRegistry is a minimal MCPToolRegistry for eligibility tests.
 type fakeMCPRegistry struct {
 	names map[string]struct{}
+	defs  []llm.Tool // optional definitions (tool-collision tests)
 }
 
-func (f *fakeMCPRegistry) Definitions() []llm.Tool        { return nil }
+func (f *fakeMCPRegistry) Definitions() []llm.Tool        { return f.defs }
 func (f *fakeMCPRegistry) ToolNames() map[string]struct{} { return f.names }
 func (f *fakeMCPRegistry) CallTool(context.Context, string, map[string]interface{}) (string, error) {
 	return "", nil

@@ -1,0 +1,438 @@
+package server
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"gogen/internal/agent"
+	"gogen/internal/config"
+	"gogen/internal/contextmgr"
+	"gogen/internal/llm"
+	"gogen/internal/session"
+)
+
+// TestSubagentSpawnEndToEnd drives the full server spawner: a child session
+// runtime is created, registered under the parent, runs a real turn against
+// a mock provider, persists with ParentID, and the parent receives the
+// report. The child is excluded from the flat saved-session list.
+func TestSubagentSpawnEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, a, store := newContinuationServer(t, stub, dir)
+	// Children get their own provider via the workspace factory: serve a
+	// canned response.
+	s.ws.ProviderFactory = func() llm.LLMProvider {
+		p := llm.NewMockProvider()
+		p.StreamResults = []*llm.StreamResult{{Content: "subagent report here"}}
+		return p
+	}
+	// The server installed the spawner at construction; enable the feature
+	// (a real server would do this via the config WS toggle).
+	a.SetSubagentsEnabled(true)
+
+	sp := &subagentSpawner{s: s}
+	report, err := sp.Spawn(context.Background(), a, "investigate the parser\nand report back", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(report, "subagent report here") {
+		t.Fatalf("report = %q", report)
+	}
+
+	// The child persisted with ParentID and is excluded from the flat list.
+	list, err := store.List(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("store list = %+v, want exactly the nested child", list)
+	}
+	if list[0].ParentID != a.SessionID {
+		t.Fatalf("child ParentID = %q, want %q", list[0].ParentID, a.SessionID)
+	}
+	_, flat, err := a.FormatSessionListForUI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(flat) != 0 {
+		t.Fatalf("flat session list should exclude the nested child, got %+v", flat)
+	}
+}
+
+// TestSubagentParentCancelPropagates verifies the parent-cancellation
+// contract: when the parent's context dies mid-spawn, Spawn returns the
+// context error and the child runtime is unregistered.
+func TestSubagentParentCancelPropagates(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, a, _ := newContinuationServer(t, stub, dir)
+	// A provider that blocks until the context is cancelled.
+	s.ws.ProviderFactory = func() llm.LLMProvider {
+		return &blockingProvider{}
+	}
+	a.SetSubagentsEnabled(true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := (&subagentSpawner{s: s}).Spawn(ctx, a, "long job", "", 0)
+		done <- err
+	}()
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "context canceled") {
+			t.Fatalf("spawn error = %v, want context canceled", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("spawn did not return after parent cancel")
+	}
+	// The child runtime was removed from the registry.
+	if _, ok := s.registry.get(a.SessionID); !ok {
+		t.Fatal("parent runtime missing")
+	}
+}
+
+// TestSubagentChildPaneGetsTerminalFrames verifies a pane attached to a
+// running subagent receives the normal terminal frames (cancelled +
+// turn_end) when the child's turn ends. Without them the pane stays stuck
+// in the "responding"/busy state forever — the client only clears
+// turnActive on cancelled/turn_end/session_state, and the spawner
+// unregisters the child runtime right after the turn.
+func TestSubagentChildPaneGetsTerminalFrames(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, a, _ := newContinuationServer(t, stub, dir)
+	s.ws.ProviderFactory = func() llm.LLMProvider {
+		return &blockingProvider{} // blocks until cancelled
+	}
+	a.SetSubagentsEnabled(true)
+	srv := startWSServer(t, s)
+	defer srv.Close()
+
+	conn := dialWS(t, srv, "/ws")
+	defer conn.Close()
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := (&subagentSpawner{s: s}).Spawn(ctx, a, "long job", "", 0)
+		done <- err
+	}()
+
+	// The parent's clients get the subagent_started event carrying the
+	// child id (the sidebar row's attach target).
+	started := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "subagent_started" })
+	if started.SubagentID == "" {
+		t.Fatal("subagent_started without a child id")
+	}
+
+	// Attach a second connection to the child pane, then cancel the child
+	// from that pane (the documented escape hatch for a stuck subagent).
+	childConn := dialWS(t, srv, "/ws")
+	defer childConn.Close()
+	readUntil(t, childConn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+	if err := childConn.WriteJSON(WSMessage{Type: "session_attach", SessionID: started.SubagentID}); err != nil {
+		t.Fatalf("attach child: %v", err)
+	}
+	state := readUntil(t, childConn, 5*time.Second, func(m WSMessage) bool {
+		return m.Type == "session_state" && m.SessionID == started.SubagentID
+	})
+	if !state.TurnActive {
+		t.Fatal("child pane should attach to a running turn")
+	}
+
+	if err := childConn.WriteJSON(WSMessage{Type: "cancel", SessionID: started.SubagentID}); err != nil {
+		t.Fatalf("cancel child: %v", err)
+	}
+	// The child pane must receive the terminal pair: cancelled, then
+	// turn_end — the frames the client needs to leave the busy state.
+	readUntil(t, childConn, 5*time.Second, func(m WSMessage) bool {
+		return m.Type == "cancelled" && m.SessionID == started.SubagentID
+	})
+	readUntil(t, childConn, 5*time.Second, func(m WSMessage) bool {
+		return m.Type == "turn_end" && m.SessionID == started.SubagentID
+	})
+	// The spawner unregisters the finished child; its pane must be closed
+	// with session_detached (the eviction-style notification) so a typed
+	// message can never be silently dropped on a gone runtime.
+	readUntil(t, childConn, 5*time.Second, func(m WSMessage) bool {
+		return m.Type == "session_detached" && m.SessionID == started.SubagentID
+	})
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "context canceled") {
+			t.Fatalf("spawn error = %v, want context canceled", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("spawn did not return after child cancel")
+	}
+}
+
+// TestSubagentChildInheritsParentModel verifies a child spawned without an
+// explicit model argument inherits the PARENT's per-session model (the
+// provider factory seeds the workspace default, which may differ).
+func TestSubagentChildInheritsParentModel(t *testing.T) {
+	dir := t.TempDir()
+	parentProv := llm.NewMockProvider()
+	exec := agent.NewExecutor(dir)
+	ctxMgr := contextmgr.NewManager(parentProv, contextmgr.Settings{ContextLimit: 128000})
+	a := agent.NewAgent(parentProv, exec, ctxMgr)
+	a.SessionStore = session.NewStore(true)
+	s := NewServer(a, &config.Config{})
+	// The workspace default was the parent's model at construction
+	// ("mock-model"); now the parent switches models per-session.
+	if err := parentProv.SetModel("parent-model"); err != nil {
+		t.Fatal(err)
+	}
+	var created []*llm.MockProvider
+	s.ws.ProviderFactory = func() llm.LLMProvider {
+		p := llm.NewMockProvider()
+		p.Model = "default-model"
+		p.Models = []llm.ModelInfo{
+			{ID: "default-model", ContextLimit: 128000},
+			{ID: "parent-model", ContextLimit: 128000},
+		}
+		p.StreamResults = []*llm.StreamResult{{Content: "report"}}
+		created = append(created, p)
+		return p
+	}
+	a.SetSubagentsEnabled(true)
+
+	if _, err := (&subagentSpawner{s: s}).Spawn(context.Background(), a, "job", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if len(created) != 1 {
+		t.Fatalf("child providers created = %d, want 1", len(created))
+	}
+	if got := created[0].ModelName(); got != "parent-model" {
+		t.Fatalf("child model = %q, want parent-model", got)
+	}
+}
+
+// TestSubagentConfiguredModelWinsOverInheritance verifies the configured
+// default subagent model (settings modal / config key) beats parent-model
+// inheritance: a parent that switched models per-session still spawns a
+// child on the configured model.
+func TestSubagentConfiguredModelWinsOverInheritance(t *testing.T) {
+	dir := t.TempDir()
+	parentProv := llm.NewMockProvider()
+	exec := agent.NewExecutor(dir)
+	ctxMgr := contextmgr.NewManager(parentProv, contextmgr.Settings{ContextLimit: 128000})
+	a := agent.NewAgent(parentProv, exec, ctxMgr)
+	a.SessionStore = session.NewStore(true)
+	s := NewServer(a, &config.Config{})
+	if err := parentProv.SetModel("parent-model"); err != nil {
+		t.Fatal(err)
+	}
+	// The user configured a default subagent model.
+	r := s.ws.GetRuntimeConfig()
+	r.SubagentModel = "configured-model"
+	s.ws.SetRuntimeConfig(r)
+	var created []*llm.MockProvider
+	s.ws.ProviderFactory = func() llm.LLMProvider {
+		p := llm.NewMockProvider()
+		p.Model = "default-model"
+		p.Models = []llm.ModelInfo{
+			{ID: "default-model", ContextLimit: 128000},
+			{ID: "parent-model", ContextLimit: 128000},
+			{ID: "configured-model", ContextLimit: 128000},
+		}
+		p.StreamResults = []*llm.StreamResult{{Content: "report"}}
+		created = append(created, p)
+		return p
+	}
+	a.SetSubagentsEnabled(true)
+
+	if _, err := (&subagentSpawner{s: s}).Spawn(context.Background(), a, "job", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if len(created) != 1 {
+		t.Fatalf("child providers created = %d, want 1", len(created))
+	}
+	if got := created[0].ModelName(); got != "configured-model" {
+		t.Fatalf("child model = %q, want configured-model (beats parent inheritance)", got)
+	}
+}
+
+// TestSubagentConfiguredModelFallbackToDefault verifies that a configured
+// subagent model that is no longer selectable on the child (provider removed
+// or catalog changed) falls back to the workspace default instead of failing
+// the spawn — the same fail-open contract as the inheritance branch.
+func TestSubagentConfiguredModelFallbackToDefault(t *testing.T) {
+	dir := t.TempDir()
+	parentProv := llm.NewMockProvider()
+	exec := agent.NewExecutor(dir)
+	ctxMgr := contextmgr.NewManager(parentProv, contextmgr.Settings{ContextLimit: 128000})
+	a := agent.NewAgent(parentProv, exec, ctxMgr)
+	a.SessionStore = session.NewStore(true)
+	s := NewServer(a, &config.Config{})
+	r := s.ws.GetRuntimeConfig()
+	r.SubagentModel = "vanished-model"
+	s.ws.SetRuntimeConfig(r)
+	var created []*llm.MockProvider
+	s.ws.ProviderFactory = func() llm.LLMProvider {
+		p := llm.NewMockProvider()
+		p.Model = "default-model"
+		p.Models = []llm.ModelInfo{{ID: "default-model", ContextLimit: 128000}}
+		p.StreamResults = []*llm.StreamResult{{Content: "report"}}
+		created = append(created, p)
+		return p
+	}
+	a.SetSubagentsEnabled(true)
+
+	if _, err := (&subagentSpawner{s: s}).Spawn(context.Background(), a, "job", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if len(created) != 1 {
+		t.Fatalf("child providers created = %d, want 1", len(created))
+	}
+	if got := created[0].ModelName(); got != "default-model" {
+		t.Fatalf("child model = %q, want default-model fallback", got)
+	}
+}
+
+// TestSubagentChildModelFallbackToDefault verifies that when the parent's
+// model cannot be selected on the child (no longer listed), the spawn falls
+// back to the workspace default instead of failing.
+func TestSubagentChildModelFallbackToDefault(t *testing.T) {
+	dir := t.TempDir()
+	parentProv := llm.NewMockProvider()
+	exec := agent.NewExecutor(dir)
+	ctxMgr := contextmgr.NewManager(parentProv, contextmgr.Settings{ContextLimit: 128000})
+	a := agent.NewAgent(parentProv, exec, ctxMgr)
+	a.SessionStore = session.NewStore(true)
+	s := NewServer(a, &config.Config{})
+	if err := parentProv.SetModel("parent-model"); err != nil {
+		t.Fatal(err)
+	}
+	var created []*llm.MockProvider
+	s.ws.ProviderFactory = func() llm.LLMProvider {
+		p := llm.NewMockProvider()
+		p.Model = "default-model"
+		p.Models = []llm.ModelInfo{{ID: "default-model", ContextLimit: 128000}}
+		p.StreamResults = []*llm.StreamResult{{Content: "report"}}
+		created = append(created, p)
+		return p
+	}
+	a.SetSubagentsEnabled(true)
+
+	if _, err := (&subagentSpawner{s: s}).Spawn(context.Background(), a, "job", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if len(created) != 1 {
+		t.Fatalf("child providers created = %d, want 1", len(created))
+	}
+	if got := created[0].ModelName(); got != "default-model" {
+		t.Fatalf("child model = %q, want default-model fallback", got)
+	}
+}
+
+// TestSubagentExplicitModelArgWins verifies the tool's explicit model
+// argument beats both the workspace default and the parent's model.
+func TestSubagentExplicitModelArgWins(t *testing.T) {
+	dir := t.TempDir()
+	parentProv := llm.NewMockProvider()
+	exec := agent.NewExecutor(dir)
+	ctxMgr := contextmgr.NewManager(parentProv, contextmgr.Settings{ContextLimit: 128000})
+	a := agent.NewAgent(parentProv, exec, ctxMgr)
+	a.SessionStore = session.NewStore(true)
+	s := NewServer(a, &config.Config{})
+	if err := parentProv.SetModel("parent-model"); err != nil {
+		t.Fatal(err)
+	}
+	var created []*llm.MockProvider
+	s.ws.ProviderFactory = func() llm.LLMProvider {
+		p := llm.NewMockProvider()
+		p.Model = "default-model"
+		p.Models = []llm.ModelInfo{
+			{ID: "default-model", ContextLimit: 128000},
+			{ID: "explicit-model", ContextLimit: 128000},
+		}
+		p.StreamResults = []*llm.StreamResult{{Content: "report"}}
+		created = append(created, p)
+		return p
+	}
+	a.SetSubagentsEnabled(true)
+
+	if _, err := (&subagentSpawner{s: s}).Spawn(context.Background(), a, "job", "explicit-model", 0); err != nil {
+		t.Fatal(err)
+	}
+	if len(created) != 1 {
+		t.Fatalf("child providers created = %d, want 1", len(created))
+	}
+	if got := created[0].ModelName(); got != "explicit-model" {
+		t.Fatalf("child model = %q, want explicit-model", got)
+	}
+}
+
+// TestSessionsPayloadIncludesNested verifies the sidebar sessions payload
+// includes persisted nested (subagent) children with their parentId, so a
+// page reload / late attach can still render them under their parent (the
+// subagent_started/finished events are not replayed to connecting clients).
+func TestSessionsPayloadIncludesNested(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, a, _ := newContinuationServer(t, stub, dir)
+	s.ws.ProviderFactory = func() llm.LLMProvider {
+		p := llm.NewMockProvider()
+		p.StreamResults = []*llm.StreamResult{{Content: "subagent report here"}}
+		return p
+	}
+	a.SetSubagentsEnabled(true)
+	srv := startWSServer(t, s)
+	defer srv.Close()
+
+	conn := dialWS(t, srv, "/ws")
+	defer conn.Close()
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+
+	if _, err := (&subagentSpawner{s: s}).Spawn(context.Background(), a, "job", "", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := conn.WriteJSON(WSMessage{Type: "list_sessions"}); err != nil {
+		t.Fatalf("list_sessions: %v", err)
+	}
+	msg := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "sessions" })
+	found := false
+	for _, e := range msg.Sessions {
+		if e.ParentID == a.SessionID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("sessions payload missing nested child of %s: %+v", a.SessionID, msg.Sessions)
+	}
+}
+
+// blockingProvider streams nothing and blocks until ctx is done.
+type blockingProvider struct{}
+
+func (p *blockingProvider) Name() string { return "blocking" }
+func (p *blockingProvider) ModelName() string {
+	return "blocking-model"
+}
+func (p *blockingProvider) SetModel(string) error { return nil }
+func (p *blockingProvider) SetThinkingLevel(string) {
+}
+func (p *blockingProvider) ListModels(context.Context) ([]llm.ModelInfo, error) {
+	return nil, nil
+}
+func (p *blockingProvider) GenerateResponse(context.Context, []llm.Message, map[string]struct{}, []llm.Tool) (llm.Response, error) {
+	return llm.Response{}, nil
+}
+func (p *blockingProvider) GenerateResponseStream(ctx context.Context, _ []llm.Message, _ map[string]struct{}, _ []llm.Tool, h *llm.StreamHandlers) (*llm.StreamResult, error) {
+	if h != nil && h.OnStreamOpened != nil {
+		h.OnStreamOpened()
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (p *blockingProvider) ModelContextLimit(context.Context) (int, error) { return 1000, nil }

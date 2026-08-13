@@ -174,6 +174,9 @@ func parseYAMLFrontMatter(yamlText string) (FileConfig, error) {
 	if err := validateMCPServers(cfg.MCPServers); err != nil {
 		return FileConfig{}, err
 	}
+	if err := validateOpenAIProviders(cfg.OpenAIProviders); err != nil {
+		return FileConfig{}, err
+	}
 	cfg.applyLegacyKeyAliases()
 	return cfg, nil
 }
@@ -202,6 +205,20 @@ func validateMCPServers(servers []MCPServerEntry) error {
 	for i, s := range servers {
 		if s.Name == "" || s.Command == "" {
 			return fmt.Errorf("mcp_servers[%d] requires name and command", i)
+		}
+	}
+	return nil
+}
+
+// validateOpenAIProviders enforces the required fields on each provider
+// entry. Typed YAML decoding handles structure and scalar types; this
+// catches empty name values, which decode without error. An empty base URL
+// is valid (the official OpenAI endpoint) and an empty API key is valid
+// for local endpoints that need none.
+func validateOpenAIProviders(providers []OpenAIProviderEntry) error {
+	for i, p := range providers {
+		if p.Name == "" {
+			return fmt.Errorf("openai_providers[%d] requires name", i)
 		}
 	}
 	return nil

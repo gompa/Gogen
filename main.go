@@ -213,8 +213,8 @@ func runSinglePrompt(ctx context.Context, a *agent.Agent, prompt string, cfg *co
 	// user explicitly opted out via delete_approval: off; otherwise warn so
 	// the block is not surprising.
 	if strings.EqualFold(cfg.DeleteApproval, "off") {
-		a.Executor.RequireDeleteApproval = false
-	} else if a.Executor.RequireDeleteApproval {
+		a.Executor.SetDeleteApproval(false)
+	} else if a.Executor.DeleteApprovalRequired() {
 		fmt.Fprintf(os.Stderr, "Note: delete requires approval (delete_approval: %s) and is blocked in single-prompt mode; set GOGEN_DELETE_APPROVAL=off to allow deletes.\n", cfg.DeleteApproval)
 	}
 
@@ -268,6 +268,8 @@ func applyRuntimeConfig(cfg *config.Config) {
 	agent.ConfigureWebFetch(cfg.WebFetchEnabled(), cfg.WebFetchMode, cfg.WebAllowedDomains)
 	agent.ConfigureWebSearchEnabled(cfg.WebSearchEnabled())
 	agent.ConfigureWebSearch(cfg.WebSearchBackend, cfg.WebSearchAPIKey)
+	agent.ConfigureSystemPrompt(cfg.SystemPrompt)
+	agent.ConfigureSubagentPrompt(cfg.SubagentPrompt)
 	if cfg.DebugLog != "" || cfg.DebugSession != "" {
 		debuglog.Configure(cfg.DebugLog, cfg.DebugSession)
 	}

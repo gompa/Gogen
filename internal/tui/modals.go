@@ -25,6 +25,8 @@ func (m *Model) renderModal() string {
 		return m.renderHelpModal()
 	case ModalCompletion:
 		return m.renderCompletionModal()
+	case ModalSubagents:
+		return m.renderSubagentsModal()
 	}
 	return ""
 }
@@ -42,6 +44,57 @@ func (m *Model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleHelpKey(msg)
 	case ModalCompletion:
 		return m.handleCompletionKey(msg)
+	case ModalSubagents:
+		return m.handleSubagentsKey(msg)
+	}
+	return m, nil
+}
+
+// renderSubagentsModal lists the nested (subagent) sessions finished in
+// this process, with their final reports.
+func (m *Model) renderSubagentsModal() string {
+	m.subagentMu.Lock()
+	list := append([]subagentRecord(nil), m.subagents...)
+	m.subagentMu.Unlock()
+	if len(list) == 0 {
+		return renderBorderedModal([]styleLine{
+			{text: "Subagents", highlight: true},
+			{text: "", highlight: false},
+			{text: "No subagents have run in this session.", highlight: false},
+			{text: "", highlight: false},
+			{text: "Press esc to close", highlight: false},
+		})
+	}
+	lines := []styleLine{{text: "Subagents", highlight: true}, {text: "", highlight: false}}
+	for i, r := range list {
+		status := "✅"
+		if r.err != nil {
+			status = "❌"
+		}
+		lines = append(lines, styleLine{text: status + " " + r.label, highlight: false})
+		summary := r.report
+		if r.err != nil {
+			summary = r.err.Error()
+		}
+		if len(summary) > 120 {
+			summary = summary[:120] + "…"
+		}
+		if summary != "" {
+			lines = append(lines, styleLine{text: "  " + summary, highlight: false})
+		}
+		if i < len(list)-1 {
+			lines = append(lines, styleLine{text: "", highlight: false})
+		}
+	}
+	lines = append(lines, styleLine{text: "", highlight: false}, styleLine{text: "Press esc to close", highlight: false})
+	return renderBorderedModal(lines)
+}
+
+// handleSubagentsKey closes the subagents modal on esc.
+func (m *Model) handleSubagentsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.modal = ModalNone
 	}
 	return m, nil
 }

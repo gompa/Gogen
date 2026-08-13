@@ -10,9 +10,13 @@ import (
 )
 
 type ModelEntry struct {
-	ID               string  `json:"id"`
-	ContextLimit     int     `json:"contextLimit,omitempty"`
-	Current          bool    `json:"current,omitempty"`
+	ID           string `json:"id"`
+	ContextLimit int    `json:"contextLimit,omitempty"`
+	Current      bool   `json:"current,omitempty"`
+	// Provider is the registered provider profile name serving this model
+	// ("default" for the legacy single endpoint); the picker groups models
+	// by it.
+	Provider         string  `json:"provider,omitempty"`
 	InputPricePer1M  float64 `json:"inputPricePer1M,omitempty"`
 	OutputPricePer1M float64 `json:"outputPricePer1M,omitempty"`
 	CachedPricePer1M float64 `json:"cachedPricePer1M,omitempty"`
@@ -36,6 +40,9 @@ type SessionEntry struct {
 	// return to the saved list), so active here means genuinely live —
 	// open in another tab, or a headless turn still running.
 	Active bool `json:"active,omitempty"`
+	// ParentID is non-empty for nested (subagent) sessions; the client
+	// renders them as indented rows under their parent.
+	ParentID string `json:"parentId,omitempty"`
 	// Label is now the full first user message — CSS text-overflow: ellipsis
 	// handles dynamic truncation on the client side.
 }
@@ -44,6 +51,87 @@ type HistoryToolCall struct {
 	ID   string                 `json:"id"`
 	Name string                 `json:"name"`
 	Args map[string]interface{} `json:"args,omitempty"`
+}
+
+// BoardOpRequest is one kanban-tab operation sent client→server as a
+// "board_op" message: list (no mutation) or add/claim/move/comment/done/
+// remove. After a successful mutation the server broadcasts a fresh
+// board_state to every client.
+type BoardOpRequest struct {
+	Action      string `json:"action,omitempty"`
+	ID          string `json:"id,omitempty"`
+	Title       string `json:"title,omitempty"`
+	Description string `json:"description,omitempty"`
+	Priority    string `json:"priority,omitempty"`
+	Column      string `json:"column,omitempty"`
+	Text        string `json:"text,omitempty"`
+}
+
+// ProviderEntry is one registered OpenAI-compatible provider in the config
+// push: name, base URL, optional default model, and whether a key is
+// stored — the key itself is NEVER pushed to the client.
+type ProviderEntry struct {
+	Name      string `json:"name"`
+	BaseURL   string `json:"baseUrl"`
+	Model     string `json:"model,omitempty"`
+	APIKeySet bool   `json:"apiKeySet"`
+	// Deletable is false for the implicit default profile (built from the
+	// legacy config fields), which cannot be deleted.
+	Deletable bool `json:"deletable"`
+}
+
+// ProviderOpRequest is one provider-list operation sent client→server via
+// provider_save / provider_delete / test_provider.
+type ProviderOpRequest struct {
+	Name    string `json:"name,omitempty"`
+	BaseURL string `json:"baseUrl,omitempty"`
+	APIKey  string `json:"apiKey,omitempty"`
+	Model   string `json:"model,omitempty"`
+}
+
+// ProviderTestResult is the test_provider reply: connectivity + model
+// catalog check against a throwaway provider that is never registered or
+// wired to a session.
+type ProviderTestResult struct {
+	OK        bool         `json:"ok"`
+	LatencyMs int64        `json:"latencyMs,omitempty"`
+	Models    []ModelEntry `json:"models,omitempty"`
+	Error     string       `json:"error,omitempty"`
+}
+
+// MCPTestRequest carries one MCP server test (test_mcp, client→server):
+// either a registered server name (stored command/args/env resolved
+// server-side) or the raw command/args/env to probe (add form).
+type MCPTestRequest struct {
+	Name    string            `json:"name,omitempty"`
+	Command string            `json:"command,omitempty"`
+	Args    []string          `json:"args,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+}
+
+// MCPTestResult is the test_mcp reply: connectivity + tools/list check
+// against a throwaway stdio process that is never registered.
+type MCPTestResult struct {
+	OK        bool          `json:"ok"`
+	LatencyMs int64         `json:"latencyMs,omitempty"`
+	Tools     []MCPTestTool `json:"tools,omitempty"`
+	Error     string        `json:"error,omitempty"`
+}
+
+// MCPTestTool is one tool exposed by a probed MCP server.
+type MCPTestTool struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+}
+
+// MCPEntry is one configured MCP server in the config push: name, command,
+// args, and whether env values are set — the env values themselves are
+// never pushed.
+type MCPEntry struct {
+	Name    string   `json:"name"`
+	Command string   `json:"command"`
+	Args    []string `json:"args,omitempty"`
+	EnvSet  bool     `json:"envSet,omitempty"`
 }
 
 type HistoryEntry struct {
@@ -124,6 +212,124 @@ type WSMessage struct {
 	SessionID             string       `json:"sessionId,omitempty"`
 	SessionAction         string       `json:"sessionAction,omitempty"`
 	SessionLabel          string       `json:"sessionLabel,omitempty"`
+	// Board and Subagent are the live feature-flag states ("on"/"off").
+	// Server→client config pushes carry the current state (the settings
+	// modal initializes and stays in sync from them); client→server config
+	// messages carry the requested values from the modal toggles. Empty
+	// means "not provided" in either direction.
+	Board    string `json:"board,omitempty"`
+	Subagent string `json:"subagent,omitempty"`
+	// SubagentMaxDepth is the live subagent nesting-depth limit (0 = not
+	// provided in client→server messages; the server normalizes <= 0 to the
+	// config default when seeding agents).
+	SubagentMaxDepth int `json:"subagentMaxDepth,omitempty"`
+	// SubagentModel is the live default model for spawned subagents
+	// (client→server value inside ConfigFields; server→client current value
+	// in config pushes). A POINTER so config pushes always carry it —
+	// including the empty "inherit" state a clear by one tab must
+	// broadcast to every other tab — while non-config messages omit it
+	// entirely (no per-token overhead).
+	SubagentModel *string `json:"subagentModel,omitempty"`
+	// BoardStartPrompt / SystemPrompt / SubagentPrompt are the configurable
+	// prompt templates (settings modal "Agent" group). Pushed server→client
+	// as the RESOLVED effective templates (empty config → built-in default),
+	// so the fields are pre-populated with what will actually be used;
+	// client→server carries the user's edits ("" = reset to the built-in
+	// default).
+	BoardStartPrompt string `json:"boardStartPrompt,omitempty"`
+	SystemPrompt     string `json:"systemPrompt,omitempty"`
+	SubagentPrompt   string `json:"subagentPrompt,omitempty"`
+	// BoardOp carries a kanban-tab operation (client→server "board_op").
+	BoardOp *BoardOpRequest `json:"boardOp,omitempty"`
+	// BoardState carries the full board snapshot (server→client
+	// "board_state" broadcasts; the kanban tab renders from it).
+	BoardState *agent.BoardSnapshot `json:"boardState,omitempty"`
+	// Providers is the registered OpenAI-compatible provider list pushed in
+	// config messages (name, baseUrl, model, apiKeySet — never the keys).
+	Providers []ProviderEntry `json:"providers,omitempty"`
+	// ConfigFilePath is where the effective config is persisted (project
+	// .gogen/gogen.conf vs global config) — drives the provider-key storage
+	// warning in the settings modal.
+	ConfigFilePath string `json:"configFilePath,omitempty"`
+	// ProviderOp carries a provider-list operation (provider_save /
+	// provider_delete / test_provider, client→server).
+	ProviderOp *ProviderOpRequest `json:"providerOp,omitempty"`
+	// ProviderTest carries the test_provider reply (server→client).
+	ProviderTest *ProviderTestResult `json:"providerTest,omitempty"`
+	// MCPTest carries a test_mcp request (client→server).
+	MCPTest *MCPTestRequest `json:"mcpTest,omitempty"`
+	// MCPTestResult carries the test_mcp reply (server→client).
+	MCPTestResult *MCPTestResult `json:"mcpTestResult,omitempty"`
+	// MCPServers is the configured MCP server list pushed in config
+	// messages (name, command, args, envSet — never env values).
+	MCPServers []MCPEntry `json:"mcpServers,omitempty"`
+	// ConfigFields names the config options being set in a client→server
+	// "config" message (runtime-config branch). Values are applied ONLY for
+	// the listed fields, so explicit empty/zero values are legal (e.g.
+	// clearing the command allowlist, resetting context_limit to 0 = auto).
+	ConfigFields []string `json:"configFields,omitempty"`
+
+	// Runtime-config values (settings modal). Sent client→server inside a
+	// "config" message whose ConfigFields names them; pushed server→client
+	// in every config message (current values, except the two *Set flags
+	// and RestartRequired below).
+	CommandSafetyMode         string  `json:"commandSafety,omitempty"`
+	CommandAllowlist          string  `json:"commandAllowlist,omitempty"`
+	DeleteApproval            string  `json:"deleteApproval,omitempty"`
+	CommandSandbox            string  `json:"commandSandbox,omitempty"`
+	CommandTimeoutSecs        int     `json:"commandTimeoutSecs,omitempty"`
+	ContextLimitConfig        int     `json:"contextLimitConfig,omitempty"` // 0 = auto (provider resolution)
+	CompactThreshold          float64 `json:"compactThreshold,omitempty"`
+	CompactKeepRecentMessages int     `json:"compactKeepRecentMessages,omitempty"`
+	MaxToolResultBytes        int     `json:"maxToolResultBytes,omitempty"`
+	CompactReserveTokens      int     `json:"compactReserveTokens,omitempty"`
+	WebFetch                  string  `json:"webFetch,omitempty"`
+	WebSearch                 string  `json:"webSearch,omitempty"`
+	WebSearchBackend          string  `json:"webSearchBackend,omitempty"`
+	WebSearchAPIKey           string  `json:"webSearchApiKey,omitempty"` // client→server only
+	WebSearchAPIKeySet        bool    `json:"webSearchApiKeySet,omitempty"`
+	WebAllowedDomains         string  `json:"webAllowedDomains,omitempty"`
+	WebFetchMode              string  `json:"webFetchMode,omitempty"`
+	TreeSitter                string  `json:"treesitter,omitempty"`
+	TreeSitterLangs           string  `json:"treesitterLangs,omitempty"`
+	PreserveReasoning         string  `json:"preserveReasoning,omitempty"`
+	SessionMaxCount           int     `json:"sessionMaxCount,omitempty"`
+	SessionMaxAgeDays         int     `json:"sessionMaxAgeDays,omitempty"`
+	WebApprovalHoldSecs       int     `json:"webApprovalHoldSecs,omitempty"`
+	// Restart-staged options (A0b): persisted, applied on the next start.
+	WebBind              string `json:"webBind,omitempty"`
+	WebAllowedOrigins    string `json:"webAllowedOrigins,omitempty"`
+	WebAuthToken         string `json:"webAuthToken,omitempty"` // client→server only
+	WebAuthTokenSet      bool   `json:"webAuthTokenSet,omitempty"`
+	WebTLSCertFile       string `json:"webTLSCertFile,omitempty"`
+	WebTLSKeyFile        string `json:"webTLSKeyFile,omitempty"`
+	WebMaxActiveSessions int    `json:"webMaxActiveSessions,omitempty"`
+	MCP                  string `json:"mcp,omitempty"`
+	// RestartRequired lists restart-staged settings whose staged value
+	// differs from the running process (server→client); the settings modal
+	// renders the "restart to take effect" banner from it.
+	RestartRequired []string `json:"restartRequired,omitempty"`
+	// Subagent event fields (subagent_started / subagent_finished): the
+	// sidebar renders nested rows from these.
+	SubagentID      string `json:"subagentId,omitempty"`
+	SubagentLabel   string `json:"subagentLabel,omitempty"`
+	SubagentJob     string `json:"subagentJob,omitempty"`
+	SubagentParent  string `json:"subagentParent,omitempty"`
+	SubagentSuccess bool   `json:"subagentSuccess,omitempty"`
+	SubagentSummary string `json:"subagentSummary,omitempty"`
+	// Kind scopes a "notice" message to the UI surface that produced it
+	// ("board", "settings", "workspace", "model", "sessions", "models", …).
+	// The client uses it for kind-based follow-ups (e.g. resync the board
+	// after a failed board op) without per-feature message types.
+	//
+	// MESSAGE-TYPE CONTRACT: "response" is the CONVERSATION channel — it
+	// renders into the chat transcript and finalizes in-flight stream state
+	// (typed commands, session commands, turn outcomes). "notice" is the
+	// UI-FEEDBACK channel — it only toasts and NEVER touches chat/stream
+	// state (board ops, settings toggles, working-dir input, model picker,
+	// sidebar refreshes). Handlers must pick by that rule: UI-channel
+	// errors must go out as notice, never as response.
+	Kind string `json:"kind,omitempty"`
 	// TurnActive describes a session's in-flight turn; sent in session_state
 	// replies so a reconnecting client can render "resuming…".
 	TurnActive   bool           `json:"turnActive,omitempty"`

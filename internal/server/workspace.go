@@ -3,10 +3,10 @@ package server
 import (
 	"context"
 	"sync"
+	"time"
 
 	"gogen/internal/agent"
 	"gogen/internal/config"
-	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
 	"gogen/internal/modelinfo"
 	"gogen/internal/session"
@@ -53,6 +53,37 @@ type Workspace struct {
 	// sessions start with (per-session afterwards).
 	ThinkingLevel string
 
+	// Live feature flags for the board and subagent features. The web
+	// settings toggle (config WS message) writes these while
+	// NewSessionAgent reads them concurrently at session creation — a plain
+	// field access raced those readers (data race under -race). Production
+	// access must go through the Get*/Set* accessors; the fields stay
+	// exported only so existing tests can read them directly.
+	featureMu        sync.RWMutex
+	BoardEnabled     bool
+	SubagentEnabled  bool
+	SubagentMaxDepth int
+
+	// boardManager is the single shared project board for this workspace
+	// (all session agents share one instance, so claims and moves serialize
+	// in-process). Created when the board feature is enabled; kept (with its
+	// data) when disabled so re-enabling restores the board.
+	boardManagerMu sync.RWMutex
+	boardManager   *agent.BoardManager
+
+	// BoardChangedHook is invoked after any board mutation made through a
+	// session agent's board tool, with the mutation's output message; the
+	// web server sets it to broadcast a fresh board_state and a success
+	// notice (toast) to every client. Set once at construction (before
+	// any session is created), read at session creation — plain field, like
+	// MCPRegistry.
+	BoardChangedHook func(msg string)
+
+	// SubagentSpawner runs nested sessions for session agents. The web
+	// server installs it at construction (it needs the registry); set once
+	// before any session is created, read at session creation.
+	SubagentSpawner agent.SubagentSpawner
+
 	// ProviderFactory creates a per-session provider. It must seed the
 	// provider with the workspace Model + ThinkingLevel so a new pane's
 	// first turn never fails requireModelSelected.
@@ -72,6 +103,27 @@ type Workspace struct {
 	// existing tests can read it directly.
 	wdMu       sync.RWMutex
 	WorkingDir string
+
+	// OpenAIProviders is the live registered OpenAI-compatible provider list
+	// (the additional profiles beyond the implicit default built from the
+	// legacy config fields). The web provider_save/provider_delete handlers
+	// write it while the provider factory reads it concurrently at session
+	// creation — a plain field access raced those readers (data race under
+	// -race). Production access must go through Get/SetOpenAIProviders; the
+	// field stays exported only so existing tests can read it directly.
+	providerMu      sync.RWMutex
+	OpenAIProviders []config.OpenAIProviderConfig
+
+	// runtime is the live-adjustable config overlay (the web settings
+	// modal): seeded from the startup config at construction and updated by
+	// the runtime-config WS handler. It is the source of truth for the
+	// settings push, for new-session seeding (NewSessionAgent), and for
+	// persistence (effectiveConfig); the runtime TARGETS (executor,
+	// process globals, per-session context managers, session store) are
+	// applied separately by the handler. OpenAIProviders is NOT read from
+	// here — ws.OpenAIProviders is authoritative (see above).
+	runtimeMu sync.RWMutex
+	runtime   config.Config
 
 	// fsMu serializes filesystem-mutating operations across sessions:
 	// editor writes (fs_write/fs_replace/fs_apply_patch) and agent tools
@@ -122,7 +174,9 @@ func (ws *Workspace) DefaultModel() string {
 // model validation (runWeb) so new sessions seed from the resolved model —
 // including "" when validation cleared a stale restored model, so a new
 // pane's first turn surfaces the "no model selected" gap instead of
-// inheriting an invalid model.
+// inheriting an invalid model. Also called by the settings modal's
+// default-profile save (provider_save) so a live default-model edit seeds
+// new sessions immediately, like the base-URL/key edits.
 func (ws *Workspace) SetDefaultModel(name string) {
 	if ws == nil {
 		return
@@ -171,73 +225,221 @@ func wrapToolHandlers(handlers map[string]agent.ToolHandler, fsMu *sync.RWMutex)
 	return out
 }
 
+// GetBoardEnabled returns the live board feature flag (see featureMu).
+func (ws *Workspace) GetBoardEnabled() bool {
+	ws.featureMu.RLock()
+	defer ws.featureMu.RUnlock()
+	return ws.BoardEnabled
+}
+
+// SetBoardEnabled updates the live board feature flag. The web settings
+// toggle calls this for the workspace; session agents are swept separately.
+func (ws *Workspace) SetBoardEnabled(on bool) {
+	ws.featureMu.Lock()
+	ws.BoardEnabled = on
+	ws.featureMu.Unlock()
+}
+
+// GetSubagentEnabled returns the live subagent feature flag (see featureMu).
+func (ws *Workspace) GetSubagentEnabled() bool {
+	ws.featureMu.RLock()
+	defer ws.featureMu.RUnlock()
+	return ws.SubagentEnabled
+}
+
+// SetSubagentEnabled updates the live subagent feature flag. The web
+// settings toggle calls this for the workspace; session agents are swept
+// separately.
+func (ws *Workspace) SetSubagentEnabled(on bool) {
+	ws.featureMu.Lock()
+	ws.SubagentEnabled = on
+	ws.featureMu.Unlock()
+}
+
+// GetSubagentMaxDepth returns the live subagent nesting-depth limit.
+func (ws *Workspace) GetSubagentMaxDepth() int {
+	ws.featureMu.RLock()
+	defer ws.featureMu.RUnlock()
+	return ws.SubagentMaxDepth
+}
+
+// SetSubagentMaxDepth updates the live subagent nesting-depth limit.
+func (ws *Workspace) SetSubagentMaxDepth(depth int) {
+	ws.featureMu.Lock()
+	ws.SubagentMaxDepth = depth
+	ws.featureMu.Unlock()
+}
+
+// GetBoardManager returns the shared project board manager (nil when the
+// board feature has never been enabled).
+func (ws *Workspace) GetBoardManager() *agent.BoardManager {
+	ws.boardManagerMu.RLock()
+	defer ws.boardManagerMu.RUnlock()
+	return ws.boardManager
+}
+
+// ensureBoardManager returns the shared board manager, creating it (rooted
+// at the current working dir / global board dir) on first use. Callers that
+// enable the board feature must call this before seeding session agents.
+func (ws *Workspace) ensureBoardManager() *agent.BoardManager {
+	ws.boardManagerMu.Lock()
+	defer ws.boardManagerMu.Unlock()
+	if ws.boardManager == nil {
+		ws.boardManager = agent.NewBoardManager(ws.GetWorkingDir(), ws.GlobalMode)
+	}
+	return ws.boardManager
+}
+
+// providerListFromConfig returns a copy of the config's registered provider
+// list (nil-safe; the workspace seeds its live list from it at
+// construction).
+func providerListFromConfig(cfg *config.Config) []config.OpenAIProviderConfig {
+	if cfg == nil {
+		return nil
+	}
+	return append([]config.OpenAIProviderConfig(nil), cfg.OpenAIProviders...)
+}
+
+// runtimeSeed returns the initial live-adjustable config overlay: a copy of
+// the startup config (nil-safe — zero config for tests).
+func runtimeSeed(cfg *config.Config) config.Config {
+	if cfg == nil {
+		return config.Config{}
+	}
+	return *cfg
+}
+
+// GetRuntimeConfig returns a copy of the live-adjustable config overlay.
+// Thread-safe: read by the provider factory, session creation, the config
+// push, and persistence while the settings modal may update it.
+func (ws *Workspace) GetRuntimeConfig() config.Config {
+	if ws == nil {
+		return config.Config{}
+	}
+	ws.runtimeMu.RLock()
+	defer ws.runtimeMu.RUnlock()
+	return ws.runtime
+}
+
+// SetRuntimeConfig replaces the live-adjustable config overlay (the
+// runtime-config WS handler builds a modified copy and swaps it in).
+// Thread-safe.
+func (ws *Workspace) SetRuntimeConfig(c config.Config) {
+	if ws == nil {
+		return
+	}
+	ws.runtimeMu.Lock()
+	ws.runtime = c
+	ws.runtimeMu.Unlock()
+}
+
+// ApprovalHold returns the configured approval-hold window (0 = deny
+// pending approvals immediately when the last client detaches). Reads the
+// live runtime overlay (web_approval_hold_secs).
+func (ws *Workspace) ApprovalHold() time.Duration {
+	if ws == nil {
+		return 0
+	}
+	secs := ws.GetRuntimeConfig().WebApprovalHoldSecs
+	if secs <= 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
+}
+
+// GetOpenAIProviders returns a copy of the live registered provider list
+// (the additional profiles beyond the implicit default). Thread-safe: read
+// by the provider factory at session creation while the web settings modal
+// may update it.
+func (ws *Workspace) GetOpenAIProviders() []config.OpenAIProviderConfig {
+	if ws == nil {
+		return nil
+	}
+	ws.providerMu.RLock()
+	defer ws.providerMu.RUnlock()
+	return append([]config.OpenAIProviderConfig(nil), ws.OpenAIProviders...)
+}
+
+// SetOpenAIProviders replaces the live registered provider list
+// (provider_save/provider_delete). Thread-safe.
+func (ws *Workspace) SetOpenAIProviders(providers []config.OpenAIProviderConfig) {
+	if ws == nil {
+		return
+	}
+	ws.providerMu.Lock()
+	ws.OpenAIProviders = append([]config.OpenAIProviderConfig(nil), providers...)
+	ws.providerMu.Unlock()
+}
+
+// providerProfiles returns the registered OpenAI-compatible provider list
+// for the provider factory: the implicit default profile from the workspace
+// runtime overlay's legacy fields (live-editable via provider_save
+// "default"), followed by the live additional providers (in order — profile
+// order is the duplicate-model-ID precedence).
+func (ws *Workspace) providerProfiles() []llm.ProviderProfile {
+	r := ws.GetRuntimeConfig()
+	// The live additional-provider list (ws.OpenAIProviders) is
+	// authoritative — the runtime overlay's OpenAIProviders copy goes stale
+	// (provider_save writes the workspace store, never the overlay).
+	return llm.ProviderProfiles(r.OpenAIKey, r.OpenAIModel, r.OpenAIURL, ws.GetOpenAIProviders())
+}
+
+// subagentDepthFrom resolves the effective nesting-depth default for a
+// possibly-nil config (NewServer tolerates nil configs in tests).
+func subagentDepthFrom(cfg *config.Config) int {
+	if cfg == nil {
+		return config.DefaultSubagentMaxDepth
+	}
+	return cfg.SubagentDepth()
+}
+
+// buildToolHandlers returns the agent tool handler map for the workspace:
+// the builtin handlers wrapped with the workspace fsMu (so concurrent
+// sessions serialize file mutations). The feature-gated tools (board,
+// subagent) are deliberately NOT in the map — the agent package routes them
+// explicitly in executeTool under the atomic feature flags, so a live
+// toggle needs no handler-map rebuild.
+func (ws *Workspace) buildToolHandlers() map[string]agent.ToolHandler {
+	handlers := wrapToolHandlers(agent.BuiltinToolHandlers(), &ws.fsMu)
+	return handlers
+}
+
 // NewSessionAgent creates a fresh session agent from the workspace: a new
 // per-session provider + context manager, sharing the workspace executor,
 // store, MCP registry, and fsMu-wrapped tool handlers. When snap is non-nil
 // the agent is restored from it under the given id (multi-session plan §2,
-// session agent factory).
+// session agent factory). The wiring lives in agent.NewSessionAgent (shared
+// with the TUI subagent spawner, D9); this wrapper supplies the
+// workspace-specific pieces: the provider factory, the fsMu wrap, and the
+// live feature flags.
 func (ws *Workspace) NewSessionAgent(snap *agent.SessionSnapshot, id string) *agent.Agent {
-	settings := contextmgr.DefaultSettings()
-	if ws.Config != nil {
-		settings = contextmgr.Settings{
-			ContextLimit:              ws.Config.ContextLimit,
-			CompactThreshold:          ws.Config.CompactThreshold,
-			CompactKeepRecentMessages: ws.Config.CompactKeepRecentMessages,
-			MaxToolResultBytes:        ws.Config.MaxToolResultBytes,
-			CompactReserveTokens:      ws.Config.CompactReserveTokens,
-		}
+	// The session seeds its context-manager settings from the LIVE runtime
+	// overlay (not the immutable startup config), so a settings-modal
+	// context change applies to sessions created afterwards too.
+	runtimeCfg := ws.GetRuntimeConfig()
+	opts := agent.SessionAgentOptions{
+		Provider:             ws.ProviderFactory(),
+		Executor:             ws.Exec,
+		Store:                ws.Store,
+		Config:               &runtimeCfg,
+		GlobalMode:           ws.GlobalMode,
+		ProjectFilePath:      ws.ProjectFilePath,
+		ProjectGuidelines:    ws.ProjectGuidelines,
+		TestCommand:          ws.TestCommand,
+		LintCommand:          ws.LintCommand,
+		WorkingDir:           ws.GetWorkingDir(),
+		MCPRegistry:          ws.MCPRegistry,
+		ToolHandlers:         ws.buildToolHandlers(),
+		DebugCompareMessages: ws.DebugCompareMessages,
+		ThinkingLevel:        agent.ThinkingLevel(ws.ThinkingLevel),
+		BoardEnabled:         ws.GetBoardEnabled(),
+		SubagentsEnabled:     ws.GetSubagentEnabled(),
+		SubagentMaxDepth:     ws.GetSubagentMaxDepth(),
+		BoardManager:         ws.GetBoardManager(),
+		SubagentSpawner:      ws.SubagentSpawner,
 	}
-	provider := ws.ProviderFactory()
-	ctxMgr := contextmgr.NewManager(provider, settings)
-	a := agent.NewAgent(provider, ws.Exec, ctxMgr)
-	a.GlobalMode = ws.GlobalMode
-	a.SetProjectContext(ws.ProjectFilePath, ws.ProjectGuidelines, ws.TestCommand, ws.LintCommand)
-	// The workspace dir is authoritative for the agent's own WorkingDir and
-	// the shared executor: NewAgent seeds both from the executor, which may
-	// lag ws.WorkingDir in the window between a client's working-dir change
-	// (handleWSConfig updates ws.WorkingDir first) and the per-session sweep
-	// (applyWorkingDirToAll). Seeding here closes the gap so a session
-	// created in that window is consistent from birth — the sweep's
-	// SetWorkingDir for it later is then a no-op.
-	workingDir := ws.GetWorkingDir()
-	a.SetWorkingDir(workingDir)
-	a.TodoManager = agent.NewTodoManager(workingDir)
-	a.PinManager = agent.NewPinManager()
-	a.DebugCompareMessages = ws.DebugCompareMessages
-	a.SessionStore = ws.Store
-	a.SessionID = id
-	a.SetMCPRegistry(ws.MCPRegistry)
-	a.SetToolHandlers(wrapToolHandlers(agent.BuiltinToolHandlers(), &ws.fsMu))
-	if snap != nil {
-		a.RestoreSession(*snap, id)
-		// D1: model is per-session — a resumed session keeps its saved model
-		// (RestoreSessionLocal already calls Provider.SetModel(snap.Model));
-		// never overwrite it with the workspace default. Validate the saved
-		// model asynchronously via the runtime owner after registration (see
-		// loadOrCreateRuntime / sessionFork): the runtime broadcasts the
-		// refresh to attached clients, and requireModelSelected surfaces the
-		// gap on the first turn when the provider no longer lists the model.
-		// A restored session keeps its saved thinking level
-		// (RestoreSessionLocal restores it and syncs the provider). Seed the
-		// workspace default only when the snapshot predates the level field
-		// — and NEVER before the restore: SetThinkingLevel flushes, and a
-		// flush before the restore writes an EMPTY snapshot over the
-		// session's real file, wiping its persisted messages and index label
-		// (the "closing an open session turns its title into a hash" bug —
-		// merely opening a saved session corrupted its on-disk state until
-		// the next flush with restored content).
-		if snap.ThinkingLevel == "" {
-			if level := agent.NormalizeThinkingLevel(ws.ThinkingLevel); level != "" {
-				a.SetThinkingLevel(level)
-			}
-		}
-	} else {
-		// Fresh session: seed the workspace default thinking level so a
-		// new pane's first turn does not start at the "off" default.
-		if level := agent.NormalizeThinkingLevel(ws.ThinkingLevel); level != "" {
-			a.SetThinkingLevel(level)
-		}
-	}
+	a := agent.NewSessionAgent(opts, snap, id)
+	a.SetOnBoardChanged(ws.BoardChangedHook)
 	return a
 }
 
@@ -260,6 +462,16 @@ func newWorkspaceFromAgent(a *agent.Agent, cfg *config.Config) *Workspace {
 		Model:                a.CurrentModel(),
 		ThinkingLevel:        string(a.ThinkingLevel),
 		WorkingDir:           a.Executor.GetWorkingDir(),
+		BoardEnabled:         cfg != nil && cfg.BoardEnabled(),
+		SubagentEnabled:      cfg != nil && cfg.SubagentEnabled(),
+		SubagentMaxDepth:     subagentDepthFrom(cfg),
+		OpenAIProviders:      providerListFromConfig(cfg),
+		runtime:              runtimeSeed(cfg),
+	}
+	if cfg != nil && cfg.BoardEnabled() {
+		// The workspace owns the single board manager; session agents are
+		// seeded from it in NewSessionAgent.
+		ws.boardManager = agent.NewBoardManager(ws.WorkingDir, ws.GlobalMode)
 	}
 	if st, ok := a.SessionStore.(*session.Store); ok {
 		ws.Store = st
@@ -268,12 +480,16 @@ func newWorkspaceFromAgent(a *agent.Agent, cfg *config.Config) *Workspace {
 	if _, ok := a.Provider.(*llm.OpenAIProvider); ok {
 		// Production path (main.go): every session gets a fresh provider
 		// seeded with the workspace default model + thinking level, sharing
-		// the workspace models.dev resolver (E6, D1).
+		// the workspace models.dev resolver (E6, D1). The provider carries
+		// ALL registered OpenAI-compatible profiles (the legacy fields form
+		// the implicit default), so every model in the picker routes to its
+		// owning endpoint.
 		ws.ProviderFactory = func() llm.LLMProvider {
 			wd := ws.GetWorkingDir()
-			p := llm.NewOpenAIProviderWithResolver(cfg.OpenAIKey, cfg.OpenAIModel, cfg.OpenAIURL, wd, ws.Resolver)
+			r := ws.GetRuntimeConfig()
+			p := llm.NewOpenAIProviderWithProfiles(ws.providerProfiles(), r.OpenAIModel, wd, ws.Resolver)
 			p.SetPromptCacheKey(llm.ProjectPromptCacheKey(wd))
-			p.SetPreserveReasoningMode(cfg.PreserveReasoning)
+			p.SetPreserveReasoningMode(r.PreserveReasoning)
 			if m := ws.DefaultModel(); m != "" {
 				_ = p.SetModel(m)
 			}

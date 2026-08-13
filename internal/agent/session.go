@@ -34,6 +34,10 @@ type SessionSnapshot struct {
 	Messages       []llm.Message
 	TokenCounts    []int // pre-computed token counts per message (nil if unavailable)
 	ContextLimit   int   // resolved context window size (0 = unknown)
+	// ParentID is non-empty for nested (subagent) sessions. Nested sessions
+	// are excluded from the flat saved list, cascade-deleted with their
+	// parent, and capped per parent (D2).
+	ParentID string
 }
 
 // SessionPersister stores and loads agent sessions.
@@ -57,6 +61,10 @@ type SessionInfo struct {
 	UpdatedAt    string
 	MessageCount int
 	Label        string
+	// ParentID is non-empty for nested (subagent) sessions; the sidebar
+	// renders them under their parent and the flat saved-session list
+	// excludes them.
+	ParentID string
 }
 
 // RestoreSessionLocal loads messages, mode, and model from a snapshot without
@@ -97,6 +105,10 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 	if a.TodoManager != nil {
 		a.TodoManager.Replace(snap.Todos)
 	}
+	// Nested (subagent) sessions keep their parent link across restore so
+	// the store's flat-list exclusion / cascade / per-parent cap stay
+	// consistent when a child pane is reopened.
+	a.SetParentID(snap.ParentID)
 	a.clearTurnUsage()
 	a.statsMu.Lock()
 	a.UsageAccum = UsageAccumulator{}
@@ -501,6 +513,7 @@ func (a *Agent) persistFullSnapshot(st persistState, count int, skipTokenCounts 
 		Todos:          st.meta.todos,
 		Messages:       st.msgs,
 		ContextLimit:   a.ContextLimit(),
+		ParentID:       a.ParentID(),
 	}
 	if len(st.tokenCounts) == len(st.msgs) {
 		snap.TokenCounts = st.tokenCounts

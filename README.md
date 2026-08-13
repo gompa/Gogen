@@ -11,6 +11,8 @@ GoGen is a self-hosted, terminal or web-based coding assistant that can explore,
 - **Safe Edits** — Prefers unified diffs (`patch_file`) over full file rewrites; syntax error detection after edits
 - **Command Execution** — Run shell commands with configurable safety modes (blocklist / allowlist / off); `execute_command` can also run commands **in the background** (returns a job id pollable/cancellable via `background_job` with `action=status` / `action=cancel`)
 - **Vision Input** — Paste or attach images in the web UI; they are sent to vision-capable models as image content alongside your prompt
+- **Project Board** — Opt-in kanban board (`.gogen/board/`, one file per ticket) with items available for agents to fix; full drag-and-drop board tab in the web UI and a `board` tool (list/show/add/claim/move/block/comment/done). Live-toggleable from the web settings modal (`board: on`); the board tab is hidden while disabled
+- **Subagents** — Opt-in `subagent` tool that spawns a nested agent session for a job and reports back. Children appear as attachable nested rows in the web sidebar (open one to watch or Cancel a stuck subagent) and in the TUI's `/subagents` modal; transcripts persist under their parent (capped at 10 per parent). `subagent_max_depth` (default 1) controls nesting — by default subagents cannot spawn subagents
 - **Human-in-the-Loop** — Requires explicit approval for destructive actions (file deletes)
 - **Context Management** — Auto-compacts conversation history when nearing token limits to stay within model context windows
 - **Project Config** — Separate `.gogen/gogen.conf` (YAML) for settings and `.gogen/gogen.md` (or `GOGEN.md`) for guidelines. Precedence: **env > CLI flags > .conf > defaults**.
@@ -114,6 +116,7 @@ While in the TUI:
 | `/mode` | Show current mode |
 | `/context` | Show context window usage (tokens used, limit, compact threshold) |
 | `/new` | Start a fresh session; previous session is saved to disk |
+| `/subagents` | Show nested (subagent) sessions that ran in this session, with their final reports (when `subagent: on`) |
 | `/resume` | List saved sessions (with message count and label) |
 | `/resume <id>` | Restore a saved session |
 | `/resume latest` | Restore the most recent session other than the current one |
@@ -136,6 +139,14 @@ mcp_servers:
   - name: fetch
     command: npx
     args: ["-y", "@modelcontextprotocol/server-fetch"]
+board: on          # project kanban board (board tool + web board tab)
+subagent: on       # subagent tool (nested sessions)
+subagent_max_depth: 2  # max nesting; 1 (default) = subagents cannot spawn subagents
+web_bind: 0.0.0.0:8080  # web listen address (restart-staged; also GOGEN_WEB_BIND / --host)
+# Configurable prompt templates ("" = the built-in default):
+board_start_prompt: "You have been assigned board ticket #{id}: {title}..."  # board "Start agent" prompt
+system_prompt: "You are a coding agent in {working_dir}..."                  # replaces the base system prompt
+subagent_prompt: "You are a subagent...\n\nJob:\n{job}"                      # wraps subagent jobs
 ```
 
 Config values follow a strict schema (typed yaml.v3 decoding): unknown keys are
@@ -258,6 +269,13 @@ These can be set in `.gogen/gogen.conf` only — there is no CLI flag or environ
 |----------|---------|-------------|
 | `GOGEN_MCP` | off | Set to `on` to enable MCP (also set `mcp: on` in project config) |
 | `GOGEN_MCP_SERVERS` | *(empty)* | JSON array of `{name, command, args, env}` (overrides file) |
+| `GOGEN_BOARD` | off | Set to `on` to enable the project kanban board (board tool + web board tab; live-toggleable from the web settings modal) |
+| `GOGEN_SUBAGENT` | off | Set to `on` to enable the subagent tool (nested sessions) |
+| `GOGEN_SUBAGENT_MAX_DEPTH` | `1` | Maximum subagent nesting depth (main agent = depth 0); `1` = subagents cannot spawn subagents; values ≤ 0 fall back to the default |
+| `GOGEN_SUBAGENT_MODEL` | *(empty)* | Default model for spawned subagents (empty = inherit the parent's model; the tool's explicit `model` argument always wins) |
+| `GOGEN_BOARD_START_PROMPT` | *(empty)* | Template for the agent started from a board ticket (`{id}` `{title}` `{description}` `{priority}` `{context}`; empty = built-in default) |
+| `GOGEN_SYSTEM_PROMPT` | *(empty)* | Custom system prompt template (`{working_dir}`; replaces the built-in base prompt; project rules and plan mode still apply; empty = built-in default) |
+| `GOGEN_SUBAGENT_PROMPT` | *(empty)* | Template wrapping subagent jobs (`{job}`; empty = built-in default) |
 
 ### Session persistence
 
@@ -281,7 +299,7 @@ These can be set in `.gogen/gogen.conf` only — there is no CLI flag or environ
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GOGEN_WEB_BIND` | `127.0.0.1:8081` | Listen address for `--web` (e.g. `0.0.0.0:8080` to accept remote connections) |
+| `GOGEN_WEB_BIND` | `127.0.0.1:8081` | Listen address for `--web` (e.g. `0.0.0.0:8080` to accept remote connections); also `web_bind` in `.gogen/gogen.conf` (restart-staged — the settings modal's web-bind field persists it for the next start) |
 | `GOGEN_WEB_TOKEN` | *(empty)* | Required for non-loopback binds; auto-generated and printed when `--web --host` is used without one |
 | `GOGEN_WEB_ALLOWED_ORIGINS` | *(empty)* | Comma-separated host allowlist for WebSocket CORS; empty uses localhost defaults |
 | `GOGEN_WEB_TLS_CERT` | *(empty)* | Path to PEM certificate file for TLS |
@@ -330,6 +348,47 @@ working-directory input is hidden.
   still running server-side (it disappears when that turn finishes).
 - The editor runs on its own socket, so saving a file is never blocked by a
   streaming turn (only by the brief moment a tool actually writes).
+
+### Board and subagents in the web UI
+
+- The settings modal's **Agent** group toggles the **Project board** and
+  **Subagents** features live (no restart). The toggles are server-backed —
+  they persist to `.gogen/gogen.conf` and every tab stays in sync via the
+  config push. The settings modal is organized into sidebar sections
+  (Editor, Chat, Global, Agent, Security, Context, Tools, Sessions, Server,
+  MCP, Providers); opening it auto-selects the section matching the screen
+  you are on (Chat, Editor, or Board → Agent), and manual choices are
+  remembered per browser.
+- With `board: on`, a **Board** tab appears next to Chat/Editor: a kanban
+  view (backlog, ready, in_progress, in_review, blocked, done) with
+  drag-and-drop moves, a "New card" form (title, acceptance criteria,
+  priority), and inline card detail (description + activity log). Agent
+  board-tool mutations re-render the board live. The tab is hidden while the
+  feature is off. Each card has a **▶ Start** button that claims the ticket
+  and starts a dedicated agent session seeded with the ticket (the ticket
+  carries the session id, shown as the card's assignee); the button becomes
+  **Open agent** and switches to the chat tab with the session attached. The
+  started session runs headless until then — it survives closing the tab,
+  and its delete approvals pop the approval modal right on the board (the
+  initiating tab is background-attached; if the tab is closed, approvals are
+  denied until you open the session). The prompt template is editable in the
+  settings modal's Agent group (`board_start_prompt`).
+- With `subagent: on`, spawned subagents appear as **nested rows** under
+  their parent session in the sidebar (⏳ running / ✅ done / ❌ failed).
+  Clicking a nested row opens the child as a normal pane — live transcript,
+  Cancel button, and ✕ close all work per-session, which is the escape hatch
+  for a subagent stuck in a loop. The Agent tab's **Default subagent model**
+  picker (same grouped list as the toolbar) sets which model spawned
+  subagents use — empty means inherit the parent's model, and a subagent
+  tool call's explicit `model` argument always wins. The setting is
+  server-backed: it persists to `.gogen/gogen.conf` and applies to both web
+  and TUI subagents (`subagent_model` / `GOGEN_SUBAGENT_MODEL`).
+  The **System prompt** and **Subagent prompt** textareas in the same group
+  customize the base system prompt and the subagent job wrapper
+  (`system_prompt` / `subagent_prompt`); all three prompt fields are
+  pre-populated with the effective templates and a "Reset to default" button
+  restores the built-in. A value equal to the built-in default is treated as
+  unset, so the default text is never baked into the config file.
 
 ### Web tools (web_fetch / web_search)
 
@@ -418,6 +477,8 @@ The agent has access to the following tools:
 | `rename_symbol` | Rename a symbol across files (AST or text fallback) |
 | `call_graph` | Call relationships / impact analysis for a symbol (`direction=impact`) |
 | `todo` | Manage todo items: add/list/done/remove/clear |
+| `board` | Project kanban board (when `board: on`): list/show/add/claim/move/block/comment/done/remove (remove deletes a card entirely). Available in plan mode too — the board is the coordination exception |
+| `subagent` | Spawn a nested agent session for a job (when `subagent: on`); the final report returns as the tool result. Subagents cannot spawn subagents by default (`subagent_max_depth`) |
 | `session_rename` | Rename the current session |
 | `context_pin_last` | Pin the last user message to survive compaction |
 

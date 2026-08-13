@@ -193,21 +193,98 @@ func TestMergeToolArgsDeltaCumulativeAndReplay(t *testing.T) {
 	t.Parallel()
 
 	// Cumulative snapshots (not deltas): each chunk re-sends from the start.
-	got := mergeToolArgsDelta(`{"path"`, `{"path":"x.go"}`)
+	got := mergeToolArgsDelta(`{"path"`, `{"path":"x.go"}`, false)
 	if got != `{"path":"x.go"}` {
 		t.Fatalf("cumulative: got %q", got)
 	}
 
 	// Full-object replay after complete JSON → "invalid character '{' after top-level value"
-	got = mergeToolArgsDelta(`{"pattern":"foo"}`, `{"pattern":"foo"}`)
+	got = mergeToolArgsDelta(`{"pattern":"foo"}`, `{"pattern":"foo"}`, false)
 	if got != `{"pattern":"foo"}` {
 		t.Fatalf("replay: got %q", got)
 	}
 
 	// True delta still concatenates.
-	got = mergeToolArgsDelta(`{"path":"`, `x.go"}`)
+	got = mergeToolArgsDelta(`{"path":"`, `x.go"}`, false)
 	if got != `{"path":"x.go"}` {
 		t.Fatalf("delta: got %q", got)
+	}
+}
+
+// TestMergeToolArgsDeltaCompleteFlag pins the cached completeness verdict
+// (tcAccum.argsFinalized) driving the replay-ignore decision without
+// re-validation, and that the cheap structural gate fallback (flag
+// unavailable — direct callers, tests) produces identical results.
+func TestMergeToolArgsDeltaCompleteFlag(t *testing.T) {
+	t.Parallel()
+
+	// Differently-formatted full-object replay after a complete object is
+	// ignored whether completeness comes from the cached flag or from the
+	// fallback structural gate + authoritative check.
+	for _, complete := range []bool{true, false} {
+		got := mergeToolArgsDelta(`{"pattern":"foo"}`, `{"pattern": "foo"}`, complete)
+		if got != `{"pattern":"foo"}` {
+			t.Fatalf("complete=%v: got %q, want replay ignored", complete, got)
+		}
+	}
+
+	// Trailing whitespace after a complete object is still recognized.
+	got := mergeToolArgsDelta(`{"pattern":"foo"} `, `{"pattern":"foo"}`, false)
+	if got != `{"pattern":"foo"} ` {
+		t.Fatalf("trailing-ws replay: got %q", got)
+	}
+
+	// A non-replay fragment after a complete object is appended, not dropped
+	// (parity with the pre-cache behavior; only identical or '{'-prefixed
+	// fragments are treated as replays).
+	got = mergeToolArgsDelta(`{"pattern":"foo"}`, `,"recursive":true}`, true)
+	if got != `{"pattern":"foo"},"recursive":true}` {
+		t.Fatalf("continuation after complete: got %q", got)
+	}
+
+	// An incomplete buffer never triggers the replay branch: appended.
+	got = mergeToolArgsDelta(`{"pattern":"fo`, `o"}`, false)
+	if got != `{"pattern":"foo"}` {
+		t.Fatalf("delta: got %q", got)
+	}
+}
+
+// TestMergeToolCallDeltaFinalizesCompleteFirstFragment pins that an
+// accumulator created with a complete arguments blob is finalized at
+// creation: argsFinalized must be authoritative from the first fragment, so a
+// subsequent differently-formatted full-object replay is ignored instead of
+// being spliced on (which would corrupt ArgsStr and make
+// toolAccumsStreamComplete report the stream incomplete forever).
+func TestMergeToolCallDeltaFinalizesCompleteFirstFragment(t *testing.T) {
+	t.Parallel()
+	m := make(map[int]int)
+	var accums []tcAccum
+
+	accums, _ = mergeToolCallDelta(deltaTool(0, "a", "read_file", `{"path":"a"}`), accums, m)
+	if len(accums) != 1 {
+		t.Fatalf("got %d accums", len(accums))
+	}
+	if !accums[0].argsFinalized {
+		t.Fatal("expected argsFinalized=true for single-chunk complete args")
+	}
+
+	// Differently-formatted replay of the finished blob must be ignored.
+	accums, _ = mergeToolCallDelta(deltaTool(0, "", "", `{"path": "a"}`), accums, m)
+	if accums[0].ArgsStr != `{"path":"a"}` {
+		t.Fatalf("args = %q, want replay ignored", accums[0].ArgsStr)
+	}
+	if !accums[0].argsFinalized {
+		t.Fatal("replay should keep finalized flag set")
+	}
+
+	// A non-replay fragment after the finished blob is appended (parity with
+	// pre-cache behavior) and invalidates the flag for re-evaluation.
+	accums, _ = mergeToolCallDelta(deltaTool(0, "", "", `,"offset":10}`), accums, m)
+	if accums[0].ArgsStr != `{"path":"a"},"offset":10}` {
+		t.Fatalf("args = %q, want continuation appended", accums[0].ArgsStr)
+	}
+	if accums[0].argsFinalized {
+		t.Fatal("expected flag invalidated after buffer grew with a non-replay fragment")
 	}
 }
 
@@ -302,5 +379,82 @@ func TestCompleteJSONObject(t *testing.T) {
 		if got := completeJSONObject(s); got != want {
 			t.Fatalf("completeJSONObject(%q) = %v, want %v", s, got, want)
 		}
+	}
+}
+
+// BenchmarkMergeToolCallDeltaTrueDeltaStream measures the per-fragment cost of
+// streaming a multi-KB, brace-heavy arguments blob (patch_file-style) as true
+// deltas through the accumulator. Every intermediate fragment ends with a '}'
+// inside the diff string — the worst case for a naive per-fragment
+// "is the buffer complete JSON?" check, which would re-scan and re-parse the
+// whole growing buffer (O(n²) over the stream) because a '}' inside a quoted
+// string is indistinguishable from the real closing brace without a
+// string-aware scan. Per-fragment work must be O(1) plus one final
+// validation, and allocations must stay flat regardless of the '}'-heavy
+// content.
+func BenchmarkMergeToolCallDeltaTrueDeltaStream(b *testing.B) {
+	frags := []string{`{"file_path":"internal/llm/tool_call_accum.go","diff":"--- a/x`}
+	for i := 0; i < 128; i++ {
+		frags = append(frags, `\n+func f() {\n+}\n+func f() {\n+}`)
+	}
+	frags = append(frags, `"}`)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		m := make(map[int]int)
+		var accums []tcAccum
+		accums, _ = mergeToolCallDelta(deltaTool(0, "a", "patch_file", ""), accums, m)
+		for _, f := range frags {
+			accums, _ = mergeToolCallDelta(deltaTool(0, "", "", f), accums, m)
+		}
+		if !toolAccumsStreamComplete(accums) {
+			b.Fatal("stream did not complete")
+		}
+	}
+}
+
+// TestArgsStructurallyCompleteUnicodeWhitespace pins the whitespace
+// definition of the structural gate: it must match strings.TrimSpace
+// (unicode.IsSpace), so a complete object padded with non-ASCII whitespace
+// (e.g. NBSP) is recognized — an ASCII-only gate would keep argsFinalized
+// false forever and let a full-object replay be spliced onto the buffer it
+// was meant to ignore.
+func TestArgsStructurallyCompleteUnicodeWhitespace(t *testing.T) {
+	t.Parallel()
+	complete := []string{
+		"{}",
+		"  {a: 1}  ",
+		"\n\t{ \"a\": 1 }\r\n",
+		"\u00a0{\"a\": 1}\u00a0", // NBSP padding: unicode whitespace, not ASCII
+	}
+	for _, s := range complete {
+		if !argsStructurallyComplete(s) {
+			t.Fatalf("argsStructurallyComplete(%q) = false, want true", s)
+		}
+	}
+	incomplete := []string{
+		"", "{", "}", " {", "} ", "{a", "a}", "\u00a0{", "}\u00a0", "\u00a0{\"a\": 1",
+	}
+	for _, s := range incomplete {
+		if argsStructurallyComplete(s) {
+			t.Fatalf("argsStructurallyComplete(%q) = true, want false", s)
+		}
+	}
+}
+
+// TestToolAccumFinalizesWithUnicodeWhitespace runs the full finalization
+// path on an NBSP-padded complete arguments blob: it must be recognized as
+// complete (argsFinalized), and a subsequent full-object replay must be
+// ignored so the accumulated buffer stays authoritative.
+func TestToolAccumFinalizesWithUnicodeWhitespace(t *testing.T) {
+	acc := &tcAccum{ArgsStr: "\u00a0{\"a\": 1}\u00a0"}
+	acc.maybeFinalizeArgs()
+	if !acc.argsFinalized {
+		t.Fatal("NBSP-padded complete args should finalize")
+	}
+	merged := mergeToolArgsDelta(acc.ArgsStr, `{"a": 1}`, acc.argsFinalized)
+	if merged != acc.ArgsStr {
+		t.Fatalf("replay after finalize = %q, want unchanged %q", merged, acc.ArgsStr)
 	}
 }

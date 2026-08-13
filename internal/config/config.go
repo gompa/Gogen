@@ -36,6 +36,9 @@ const (
 	// DefaultWebMaxActiveSessions is the default cap on concurrently active
 	// web sessions.
 	DefaultWebMaxActiveSessions = 8
+	// DefaultSubagentMaxDepth is the default maximum subagent nesting depth
+	// (main agent = depth 0). 1 means subagents cannot spawn subagents.
+	DefaultSubagentMaxDepth = 1
 )
 
 // Effective returns v when v > 0, else def. It is the single "0 = unset, use
@@ -69,6 +72,20 @@ type MCPServerConfig struct {
 	Env     map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
 }
 
+// OpenAIProviderConfig describes one registered OpenAI-compatible API
+// endpoint: a base URL, an optional API key, and an optional default model.
+// The legacy OpenAIKey/OpenAIModel/OpenAIURL fields form the implicit
+// "default" profile; entries in Config.OpenAIProviders are additional
+// registered providers whose models are aggregated into the web model
+// picker and routed per model. Tags cover both the JSON env-var form
+// (GOGEN_OPENAI_PROVIDERS) and the YAML project-file form.
+type OpenAIProviderConfig struct {
+	Name    string `json:"name" yaml:"name"`
+	BaseURL string `json:"baseUrl" yaml:"base_url"`
+	APIKey  string `json:"apiKey,omitempty" yaml:"api_key,omitempty"`
+	Model   string `json:"model,omitempty" yaml:"model,omitempty"`
+}
+
 type Config struct {
 	OpenAIKey   string
 	OpenAIModel string
@@ -93,6 +110,10 @@ type Config struct {
 	DebugSession    string
 	MCP             string
 	MCPServers      []MCPServerConfig
+	// OpenAIProviders lists additional registered OpenAI-compatible API
+	// providers (see OpenAIProviderConfig). Empty means only the legacy
+	// OpenAIKey/OpenAIModel/OpenAIURL default profile exists.
+	OpenAIProviders []OpenAIProviderConfig
 
 	// DebugCompareMessages enables view-fingerprint comparison across turns (GOGEN_DEBUG_COMPARE_MESSAGES).
 	// Only effective in binaries built with `-tags debug`; ignored otherwise.
@@ -133,6 +154,37 @@ type Config struct {
 	// PreserveReasoning controls chat_template_kwargs.preserve_reasoning for
 	// self-hosted OpenAI-compatible servers: auto (probe /props), on, off.
 	PreserveReasoning string
+
+	// Board enables the project-wide kanban board feature ("on"/"off";
+	// default off). When disabled the board tool is not registered and the
+	// web board tab is hidden.
+	Board string
+	// Subagent enables the subagent tool that spawns nested sessions
+	// ("on"/"off"; default off). When disabled the tool is not registered.
+	Subagent string
+	// SubagentMaxDepth is the maximum subagent nesting depth (main agent =
+	// depth 0). The default 1 means subagents cannot spawn subagents; a
+	// higher value re-enables nesting up to the configured depth. Values
+	// <= 0 fall back to the default.
+	SubagentMaxDepth int
+	// SubagentModel is the default model for spawned subagents. Empty
+	// (the default) means subagents inherit the parent session's model;
+	// an explicit tool-call model argument always wins over this value.
+	SubagentModel string
+
+	// BoardStartPrompt is the template for prompts given to agents started
+	// from a board ticket ("" = the built-in default). Placeholders:
+	// {id} {title} {description} {priority} {context}.
+	BoardStartPrompt string
+	// SystemPrompt is a custom system prompt template ("" = the built-in
+	// default). The {working_dir} placeholder is substituted with the
+	// working directory; the project profile, project rules, and plan-mode
+	// suffixes always append after it.
+	SystemPrompt string
+	// SubagentPrompt is the template wrapping subagent jobs ("" = the
+	// built-in default). The {job} placeholder is substituted with the
+	// tool call's job text.
+	SubagentPrompt string
 }
 
 // Defaults returns built-in default configuration values.
@@ -174,6 +226,9 @@ func Defaults() Config {
 		CommandSandbox:            "off",
 		CommandTimeoutSecs:        DefaultCommandTimeoutSecs,
 		PreserveReasoning:         "auto",
+		Board:                     "off",
+		Subagent:                  "off",
+		SubagentMaxDepth:          DefaultSubagentMaxDepth,
 	}
 }
 
@@ -204,6 +259,28 @@ func configOff(v string) bool {
 // Opt-in: servers in project config are not started unless mcp is explicitly enabled.
 func (c *Config) MCPEnabled() bool {
 	return c != nil && configOn(c.MCP)
+}
+
+// BoardEnabled reports whether the project kanban board feature is active.
+// Opt-in: the board tool is not registered and the web board tab is hidden
+// unless board is explicitly enabled.
+func (c *Config) BoardEnabled() bool {
+	return c != nil && configOn(c.Board)
+}
+
+// SubagentEnabled reports whether the subagent tool is active.
+// Opt-in: the tool is not registered unless subagent is explicitly enabled.
+func (c *Config) SubagentEnabled() bool {
+	return c != nil && configOn(c.Subagent)
+}
+
+// SubagentDepth returns the effective maximum subagent nesting depth
+// (main agent = depth 0). Values <= 0 fall back to DefaultSubagentMaxDepth.
+func (c *Config) SubagentDepth() int {
+	if c == nil || c.SubagentMaxDepth <= 0 {
+		return DefaultSubagentMaxDepth
+	}
+	return c.SubagentMaxDepth
 }
 
 // TreeSitterEnabled reports whether tree-sitter checks are active.

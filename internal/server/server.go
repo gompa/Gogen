@@ -18,6 +18,8 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	"gogen/internal/mcp"
+	"gogen/internal/projectfile"
 	sesspkg "gogen/internal/session"
 	"gogen/internal/streamutil"
 
@@ -77,6 +79,16 @@ type Server struct {
 	connLimiter    *rateLimitState
 	upgradeLimiter *ipLimiter
 	staticAssets   staticAssetCache // lazily gzip-compressed embedded assets
+
+	// providerTestBuilder builds a throwaway provider for test_provider
+	// (never registered, never wired to a session). Defaults to a real
+	// OpenAIProvider; tests inject a mock builder.
+	providerTestBuilder func(op ProviderOpRequest, workingDir string) (llm.LLMProvider, error)
+
+	// mcpTestFn probes one MCP stdio server for test_mcp (never registers
+	// anything). Defaults to mcp.TestServer; tests inject a stub so no real
+	// process is spawned.
+	mcpTestFn func(ctx context.Context, server config.MCPServerConfig) ([]llm.Tool, error)
 }
 
 func NewServer(a *agent.Agent, cfg *config.Config) *Server {
@@ -107,11 +119,7 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 	if a.SessionID == "" {
 		a.SessionID = sesspkg.NewID()
 	}
-	hold := time.Duration(0)
-	if cfg != nil {
-		hold = cfg.ApprovalHold()
-	}
-	rt := newSessionRuntimeWithHold(a, hold)
+	rt := newSessionRuntimeWithHold(a, ws.ApprovalHold())
 	reg.register(a.SessionID, rt)
 	// In web mode the registry is the sole pruner: Save's
 	// internal auto-prune protects only one session and could delete another
@@ -122,7 +130,7 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 	// Wrap FS-mutating tools with the workspace filesystem lock:
 	// a streaming turn no longer blocks editor saves except during the actual
 	// mutation window of a tool.
-	a.SetToolHandlers(wrapToolHandlers(agent.BuiltinToolHandlers(), &ws.fsMu))
+	a.SetToolHandlers(ws.buildToolHandlers())
 	s := &Server{
 		ws:             ws,
 		registry:       reg,
@@ -134,11 +142,40 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 		connLimiter:    newRateLimitState(defaultMaxWSConns),
 		upgradeLimiter: newIPLimiter(5, 10), // 5 upgrades/sec/IP, burst 10
 	}
+	s.providerTestBuilder = func(op ProviderOpRequest, workingDir string) (llm.LLMProvider, error) {
+		return llm.NewOpenAIProvider(op.APIKey, op.Model, op.BaseURL, workingDir), nil
+	}
+	s.mcpTestFn = mcp.TestServer
 	// Background model validation for a restored default session runs after
 	// the server starts; push the result to the session's clients so the
 	// toolbar does not keep showing a model that was cleared or replaced by
 	// the validation.
 	a.OnModelChanged = func() { s.pushConfigForAgent(a) }
+	// Agent board-tool mutations broadcast a fresh board_state so every open
+	// kanban tab stays live, plus a success notice (toast) so the user sees
+	// agent-triggered changes even when they didn't initiate them (the
+	// initial agent, and every session created later via NewSessionAgent).
+	ws.BoardChangedHook = func(msg string) {
+		s.broadcastBoardState()
+		s.broadcastBoardNotice(msg)
+	}
+	a.SetOnBoardChanged(ws.BoardChangedHook)
+	// The initial agent carries the same live feature flags as the
+	// workspace (seeded from cfg at construction), but it must use the
+	// WORKSPACE's single shared board manager — not the per-process manager
+	// setup.go created for it. Two managers over the same board directory
+	// would split the in-process serialization (claims/moves/NextID) between
+	// the first session and every later session + the web board tab.
+	// Re-seeding here also keeps the initial agent consistent when
+	// NewServer is fed an agent built outside newAgent (tests/embeds).
+	a.SetBoardEnabled(ws.GetBoardEnabled())
+	a.SetSubagentsEnabled(ws.GetSubagentEnabled())
+	a.SetSubagentMaxDepth(ws.GetSubagentMaxDepth())
+	a.SetBoardManager(ws.GetBoardManager())
+	// The subagent spawner needs the registry, so it is installed after the
+	// server is constructed; NewSessionAgent seeds it on every later session.
+	ws.SubagentSpawner = &subagentSpawner{s: s}
+	a.SetSubagentSpawner(ws.SubagentSpawner)
 	return s
 }
 
@@ -153,13 +190,11 @@ func (s *Server) SetDefaultModel(name string) {
 }
 
 // newSessionRuntimeFor builds a session runtime carrying the server's
-// configured approval-hold window (see web_approval_hold_secs / F2).
+// configured approval-hold window (see web_approval_hold_secs / F2). Reads
+// the live runtime overlay, so a settings-modal change applies to runtimes
+// created afterwards.
 func (s *Server) newSessionRuntimeFor(a *agent.Agent) *sessionRuntime {
-	hold := time.Duration(0)
-	if s.config != nil {
-		hold = s.config.ApprovalHold()
-	}
-	return newSessionRuntimeWithHold(a, hold)
+	return newSessionRuntimeWithHold(a, s.ws.ApprovalHold())
 }
 
 func (s *Server) wsUpgrader() websocket.Upgrader {
@@ -200,7 +235,19 @@ func agentConfigMsgBasic(a *agent.Agent) WSMessage {
 	// per-model chips and a hover tooltip.
 	msg.ReasoningEfforts = a.CurrentModelEfforts()
 	msg.ModelDescription = a.CurrentModelDescription()
+	// Live feature flags: the settings modal renders and toggles these.
+	msg.Board = onOff(a.BoardEnabled())
+	msg.Subagent = onOff(a.SubagentsEnabled())
+	msg.SubagentMaxDepth = a.SubagentMaxDepth()
 	return msg
+}
+
+// onOff renders a boolean as the config-WS "on"/"off" spelling.
+func onOff(v bool) string {
+	if v {
+		return "on"
+	}
+	return "off"
 }
 
 // pushConfigForAgent broadcasts a fresh config snapshot for a session agent
@@ -214,7 +261,9 @@ func (s *Server) pushConfigForAgent(a *agent.Agent) {
 		return
 	}
 	if rt, ok := s.registry.get(a.SessionID); ok {
-		rt.broadcast(agentConfigMsgBasic(a))
+		msg := agentConfigMsgBasic(a)
+		s.decorateConfig(&msg)
+		rt.broadcast(msg)
 	}
 }
 
@@ -244,16 +293,17 @@ func fillModelPricing(a *agent.Agent, msg *WSMessage) {
 }
 
 func sessionEntries(list []agent.SessionInfo, active map[string]bool) []SessionEntry {
-	out := make([]SessionEntry, len(list))
-	for i, s := range list {
-		out[i] = SessionEntry{
+	out := make([]SessionEntry, 0, len(list))
+	for _, s := range list {
+		out = append(out, SessionEntry{
 			ID:           s.ID,
 			UpdatedAt:    s.UpdatedAt,
 			MessageCount: s.MessageCount,
 			Label:        s.Label,
 			Oneshot:      s.Oneshot,
+			ParentID:     s.ParentID,
 			Active:       active[s.ID],
-		}
+		})
 	}
 	return out
 }
@@ -356,6 +406,7 @@ func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, rt *
 		resp.Sessions = sessionEntries(result.Sessions, s.registry.activeSet())
 	}
 	cfg = agentConfigMsgBasic(a)
+	s.decorateConfig(&cfg)
 	if len(result.History) > 0 {
 		history = append([]llm.Message(nil), result.History...)
 	}
@@ -416,6 +467,7 @@ func (s *Server) modelEntries(models []llm.ModelInfo) []ModelEntry {
 			ID:               m.ID,
 			ContextLimit:     m.ContextLimit,
 			Current:          m.Current,
+			Provider:         m.Provider,
 			InputPricePer1M:  m.InputPricePer1M,
 			OutputPricePer1M: m.OutputPricePer1M,
 			CachedPricePer1M: m.CachedPricePer1M,
@@ -652,6 +704,11 @@ var wsHandlers = map[string]wsMessageHandler{
 	"set_thinking_level": wsHandleSetThinkingLevel,
 	"config":             wsHandleConfig,
 	"cancel":             wsHandleCancel,
+	"board_op":           wsHandleBoardOp,
+	"provider_save":      wsHandleProviderSave,
+	"provider_delete":    wsHandleProviderDelete,
+	"test_provider":      wsHandleTestProvider,
+	"test_mcp":           wsHandleTestMCP,
 	"session_attach":     wsHandleAttach,
 	"session_detach":     wsHandleDetach,
 	"session_close":      wsHandleClose,
@@ -913,8 +970,12 @@ func (s *Server) attachSession(ws *wsConn, r *http.Request, rt *sessionRuntime, 
 			// session_state sent above already told the client whether the
 			// session is mid-turn; the config frames below refresh the
 			// pane's toolbar/context mirrors.
-			_ = ws.writeJSON(agentConfigMsgBasic(rt.agent))
-			_ = ws.writeJSON(agentConfigMsg(r.Context(), rt))
+			basic := agentConfigMsgBasic(rt.agent)
+			full := agentConfigMsg(r.Context(), rt)
+			s.decorateConfig(&basic)
+			s.decorateConfig(&full)
+			_ = ws.writeJSON(basic)
+			_ = ws.writeJSON(full)
 			return
 		}
 		// Snapshot and send history FIRST, without the turn lock. A running
@@ -943,8 +1004,12 @@ func (s *Server) attachSession(ws *wsConn, r *http.Request, rt *sessionRuntime, 
 		// identity/toolbar state immediately instead of when the turn ends.
 		// Only the context-stats badge may lag (tokenization of a freshly
 		// restored session runs in agentConfigMsg below).
-		_ = ws.writeJSON(agentConfigMsgBasic(rt.agent))
-		_ = ws.writeJSON(agentConfigMsg(r.Context(), rt))
+		basic := agentConfigMsgBasic(rt.agent)
+		full := agentConfigMsg(r.Context(), rt)
+		s.decorateConfig(&basic)
+		s.decorateConfig(&full)
+		_ = ws.writeJSON(basic)
+		_ = ws.writeJSON(full)
 	}()
 }
 
@@ -1008,10 +1073,18 @@ func (s *Server) handleWSListSessions(ws *wsConn, rt *sessionRuntime) {
 	// read loop like handleWSListModels, so a slow store cannot block chat,
 	// FS, or editor messages behind the sidebar.
 	go func() {
-		_, sessions, listErr := rt.agent.FormatSessionListForUI()
+		// The full list — INCLUDING nested (subagent) sessions — so the
+		// sidebar renders persisted children under their parent row after a
+		// page reload / late attach (subagent_started/finished events are
+		// not replayed to connecting clients). The client skips nested
+		// entries when building flat rows and groups them under parents.
+		sessions, listErr := rt.agent.SessionListAll()
 		if listErr != nil {
-			_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", listErr)})
+			writeNoticeError(ws, "sessions", fmt.Sprintf("Error: %v", listErr))
 			return
+		}
+		if sessions == nil {
+			sessions = []agent.SessionInfo{}
 		}
 		// The reply deliberately carries NO SessionID: the sessions payload
 		// is connection-scoped sidebar state (the full saved list), not a
@@ -1059,7 +1132,7 @@ func (s *Server) handleWSListModels(ws *wsConn, ctx context.Context, rt *session
 	go func() {
 		models, err := rt.agent.ListModels(ctx)
 		if err != nil {
-			_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", err)})
+			writeNoticeError(ws, "models", fmt.Sprintf("Error: %v", err))
 			return
 		}
 		// CurrentModel reads under the provider's own modelsMu (the same
@@ -1083,22 +1156,27 @@ func (s *Server) handleWSSetModel(ws *wsConn, ctx context.Context, rt *sessionRu
 	// SelectModel surfaces the same error under the lock — no regression.
 	_, _ = rt.agent.ListModels(ctx)
 	if !rt.acquireTurnForHandler(ws) {
+		// UI-channel handler (model picker): the busy rejection must NOT
+		// render into the chat transcript — it toasts as a model notice.
+		writeNoticeError(ws, "model", errAgentBusy)
 		return
 	}
 	a := rt.agent
 	err := a.SelectModel(ctx, msg.Model)
 	cfg := agentConfigMsgBasic(a)
 	fillModelPricing(a, &cfg)
+	s.decorateConfig(&cfg)
 	rt.turnMu.Unlock()
 	if err != nil {
-		_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", err)})
+		writeNoticeError(ws, "model", fmt.Sprintf("Error: %v", err))
 		return
 	}
 	// Model is per-session: SelectModel above applied to this pane's
-	// provider only. The workspace default (ws.Model) is fixed at startup and
-	// never mutated here, and no other session's provider is touched, so two
-	// panes can run different models concurrently. The config echo goes
-	// to this pane only (its own Mode/ThinkingLevel/Model).
+	// provider only. The workspace default (ws.Model) is only mutated by the
+	// settings modal's default-profile save (provider_save), never here, and
+	// no other session's provider is touched, so two panes can run different
+	// models concurrently. The config echo goes to this pane only (its own
+	// Mode/ThinkingLevel/Model).
 	// Tokenization + echo off the read loop: ContextStats on a large
 	// uncached session takes seconds, and the read loop serializes every
 	// message (including pane switches).
@@ -1111,6 +1189,8 @@ func (s *Server) handleWSSetModel(ws *wsConn, ctx context.Context, rt *sessionRu
 
 func (s *Server) handleWSSetMode(ws *wsConn, ctx context.Context, rt *sessionRuntime, msg WSMessage) {
 	if !rt.acquireTurnForHandler(ws) {
+		// UI-channel handler (mode picker): busy rejection as a notice.
+		writeNoticeError(ws, "mode", errAgentBusy)
 		return
 	}
 	a := rt.agent
@@ -1120,6 +1200,7 @@ func (s *Server) handleWSSetMode(ws *wsConn, ctx context.Context, rt *sessionRun
 		a.SetMode(m)
 		modeSet = true
 		cfg = agentConfigMsgBasic(a)
+		s.decorateConfig(&cfg)
 	}
 	rt.turnMu.Unlock()
 	if modeSet {
@@ -1135,6 +1216,9 @@ func (s *Server) handleWSSetMode(ws *wsConn, ctx context.Context, rt *sessionRun
 
 func (s *Server) handleWSSetThinkingLevel(ws *wsConn, ctx context.Context, rt *sessionRuntime, msg WSMessage) {
 	if !rt.acquireTurnForHandler(ws) {
+		// UI-channel handler (thinking-level picker): busy rejection as a
+		// notice.
+		writeNoticeError(ws, "thinking", errAgentBusy)
 		return
 	}
 	a := rt.agent
@@ -1144,6 +1228,7 @@ func (s *Server) handleWSSetThinkingLevel(ws *wsConn, ctx context.Context, rt *s
 	cfg := agentConfigMsgBasic(a)
 	rt.turnMu.Unlock()
 	fillModelPricing(a, &cfg)
+	s.decorateConfig(&cfg)
 	// Echo off the read loop (tokenization can take seconds on a large
 	// uncached session; the read loop serializes every message).
 	go func() {
@@ -1171,23 +1256,42 @@ func (s *Server) isValidThinkingLevel(a *agent.Agent, v string) bool {
 }
 
 func (s *Server) handleWSConfig(ws *wsConn, ctx context.Context, pane **sessionRuntime, msg WSMessage) {
+	// The config message carries independent settings. The working-dir
+	// branch keeps its historical global-mode gate; the feature-flag
+	// branches (Board / Subagent / SubagentMaxDepth) are project settings
+	// and work in ANY mode — the whole point of the settings modal; the
+	// runtime-config branch (ConfigFields) applies the settings-modal
+	// options (live or restart-staged, see handleWSRuntimeConfig).
+	if msg.WorkingDir != "" {
+		s.handleWSWorkingDir(ws, ctx, pane, msg)
+	}
+	if msg.Board != "" || msg.Subagent != "" || msg.SubagentMaxDepth != 0 {
+		s.handleWSFeatureFlags(ws, msg)
+	}
+	if len(msg.ConfigFields) > 0 {
+		s.handleWSRuntimeConfig(ws, msg)
+	}
+}
+
+// handleWSWorkingDir handles the working-dir branch of the config message.
+func (s *Server) handleWSWorkingDir(ws *wsConn, ctx context.Context, pane **sessionRuntime, msg WSMessage) {
 	// Changing the working directory is only allowed in global mode: in
 	// project mode the server is scoped to one project directory and
 	// sessions persist under it, so re-pointing the workspace would orphan
 	// sessions and escape the project boundary. The TUI's /dir command is a
 	// separate path (not web mode) and is unaffected.
 	if !s.ws.GlobalMode {
-		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: changing the working directory is only allowed in global mode (start gogen with --global)"})
+		writeNoticeError(ws, "workspace", "Error: changing the working directory is only allowed in global mode (start gogen with --global)")
 		return
 	}
 	absDir, err := filepath.Abs(msg.WorkingDir)
 	if err != nil {
-		_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: invalid path: %v", err)})
+		writeNoticeError(ws, "workspace", fmt.Sprintf("Error: invalid path: %v", err))
 		return
 	}
 	info, err := os.Stat(absDir)
 	if err != nil || !info.IsDir() {
-		_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("Error: directory does not exist: %s", absDir)})
+		writeNoticeError(ws, "workspace", fmt.Sprintf("Error: directory does not exist: %s", absDir))
 		return
 	}
 	// The working dir is workspace-global. Interrupt the pane's own turn
@@ -1222,7 +1326,7 @@ func (s *Server) handleWSConfig(ws *wsConn, ctx context.Context, pane **sessionR
 			// config echo would hang on the lock. Send the skip report and
 			// let the next config request or the turn end re-sync the client.
 			if len(skipped) > 0 {
-				_ = ws.writeJSON(WSMessage{Type: "response", Content: workingDirSkipMessage(absDir, skipped)})
+				writeNoticeError(ws, "workspace", workingDirSkipMessage(absDir, skipped))
 			}
 			return
 		}
@@ -1230,11 +1334,321 @@ func (s *Server) handleWSConfig(ws *wsConn, ctx context.Context, pane **sessionR
 		paneRT.turnMu.RUnlock()
 		accum := a.SnapshotUsageAccum()
 		applyContextStats(&cfg, a.ContextStats(ctx), &accum)
-		_ = ws.writeJSON(WSMessage{Type: "config", WorkingDir: absDir, Model: cfg.Model, ContextLimit: cfg.ContextLimit, UsedTokens: cfg.UsedTokens, UsedSource: cfg.UsedSource, UsedPercent: cfg.UsedPercent, CompactAt: cfg.CompactAt, MessageCount: cfg.MessageCount, NearCompact: cfg.NearCompact, WarnNearCompact: cfg.WarnNearCompact, ToolTruncated: cfg.ToolTruncated, Mode: cfg.Mode, GlobalMode: cfg.GlobalMode})
+		echo := WSMessage{Type: "config", WorkingDir: absDir, Model: cfg.Model, ContextLimit: cfg.ContextLimit, UsedTokens: cfg.UsedTokens, UsedSource: cfg.UsedSource, UsedPercent: cfg.UsedPercent, CompactAt: cfg.CompactAt, MessageCount: cfg.MessageCount, NearCompact: cfg.NearCompact, WarnNearCompact: cfg.WarnNearCompact, ToolTruncated: cfg.ToolTruncated, Mode: cfg.Mode, GlobalMode: cfg.GlobalMode, Board: cfg.Board, Subagent: cfg.Subagent, SubagentMaxDepth: cfg.SubagentMaxDepth}
+		s.decorateConfig(&echo)
+		_ = ws.writeJSON(echo)
 		if len(skipped) > 0 {
-			_ = ws.writeJSON(WSMessage{Type: "response", Content: workingDirSkipMessage(absDir, skipped)})
+			writeNoticeError(ws, "workspace", workingDirSkipMessage(absDir, skipped))
 		}
 	}(*pane)
+}
+
+// parseOnOff parses a config-WS on/off value. ok is false for anything that
+// is not a recognized on/off/1/0/true/false spelling.
+func parseOnOff(v string) (on, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "on", "1", "true":
+		return true, true
+	case "off", "0", "false":
+		return false, true
+	}
+	return false, false
+}
+
+// handleWSFeatureFlags handles the Board / Subagent / SubagentMaxDepth
+// branches of the config message (the live settings-modal toggles). Any
+// invalid value rejects the whole request with an error reply; on success
+// the workspace flags are updated, every live session agent is swept, the
+// effective config is persisted (durability — activation is the sweep), and
+// a fresh config push is broadcast to all clients so every tab updates
+// instantly.
+func (s *Server) handleWSFeatureFlags(ws *wsConn, msg WSMessage) {
+	var board, boardSet bool
+	var subagent, subagentSet bool
+	if msg.Board != "" {
+		var ok bool
+		board, ok = parseOnOff(msg.Board)
+		if !ok {
+			writeNoticeError(ws, "settings", fmt.Sprintf("Error: invalid board value %q (want on or off)", msg.Board))
+			return
+		}
+		boardSet = true
+	}
+	if msg.Subagent != "" {
+		var ok bool
+		subagent, ok = parseOnOff(msg.Subagent)
+		if !ok {
+			writeNoticeError(ws, "settings", fmt.Sprintf("Error: invalid subagent value %q (want on or off)", msg.Subagent))
+			return
+		}
+		subagentSet = true
+	}
+	if msg.SubagentMaxDepth < 0 {
+		writeNoticeError(ws, "settings", "Error: subagentMaxDepth must be >= 0")
+		return
+	}
+	if boardSet {
+		s.ws.SetBoardEnabled(board)
+	}
+	if subagentSet {
+		s.ws.SetSubagentEnabled(subagent)
+	}
+	if msg.SubagentMaxDepth > 0 {
+		s.ws.SetSubagentMaxDepth(msg.SubagentMaxDepth)
+	}
+	// Sweep + persist + broadcast OFF the read loop: the persistence is a
+	// file write and the broadcast fans out to every attached socket.
+	go func() {
+		s.applyFeatureFlagsToAll()
+		if s.config != nil {
+			s.persistConfig(s.effectiveConfig())
+		}
+		s.broadcastConfigAll()
+	}()
+}
+
+// effectiveConfig returns the config snapshot used for persistence: the
+// startup config with every live-mutable value overlaid (feature flags,
+// registered provider list, runtime overlay incl. restart-staged settings).
+// A later single-field persist must never revert an earlier live change.
+// Returns nil when the server has no startup config (tests).
+func (s *Server) effectiveConfig() *config.Config {
+	if s == nil || s.config == nil {
+		return nil
+	}
+	out := *s.config
+	r := s.ws.GetRuntimeConfig()
+	// Live-adjustable fields: the runtime overlay wins (it is seeded from
+	// the startup config, so unchanged fields persist their original
+	// values).
+	out.OpenAIKey = r.OpenAIKey
+	out.OpenAIModel = r.OpenAIModel
+	out.OpenAIURL = r.OpenAIURL
+	out.ContextLimit = r.ContextLimit
+	out.CompactThreshold = r.CompactThreshold
+	out.CompactKeepRecentMessages = r.CompactKeepRecentMessages
+	out.MaxToolResultBytes = r.MaxToolResultBytes
+	out.CompactReserveTokens = r.CompactReserveTokens
+	out.CommandSafetyMode = r.CommandSafetyMode
+	out.CommandAllowlist = r.CommandAllowlist
+	out.DeleteApproval = r.DeleteApproval
+	out.CommandSandbox = r.CommandSandbox
+	out.CommandTimeoutSecs = r.CommandTimeoutSecs
+	out.TreeSitter = r.TreeSitter
+	out.TreeSitterLangs = r.TreeSitterLangs
+	out.WebFetch = r.WebFetch
+	out.WebSearch = r.WebSearch
+	out.WebSearchBackend = r.WebSearchBackend
+	out.WebSearchAPIKey = r.WebSearchAPIKey
+	out.WebAllowedDomains = r.WebAllowedDomains
+	out.WebFetchMode = r.WebFetchMode
+	out.PreserveReasoning = r.PreserveReasoning
+	out.SessionMaxCount = r.SessionMaxCount
+	out.SessionMaxAgeDays = r.SessionMaxAgeDays
+	out.WebApprovalHoldSecs = r.WebApprovalHoldSecs
+	// Restart-staged settings (applied on the next start).
+	out.WebBind = r.WebBind
+	out.WebAllowedOrigins = r.WebAllowedOrigins
+	out.WebAuthToken = r.WebAuthToken
+	out.WebTLSCertFile = r.WebTLSCertFile
+	out.WebTLSKeyFile = r.WebTLSKeyFile
+	out.WebMaxActiveSessions = r.WebMaxActiveSessions
+	out.MCP = r.MCP
+	out.MCPServers = r.MCPServers
+	// Feature flags + provider list live in their own workspace stores.
+	out.Board = onOff(s.ws.GetBoardEnabled())
+	out.Subagent = onOff(s.ws.GetSubagentEnabled())
+	out.SubagentMaxDepth = s.ws.GetSubagentMaxDepth()
+	out.SubagentModel = r.SubagentModel
+	out.BoardStartPrompt = r.BoardStartPrompt
+	out.SystemPrompt = r.SystemPrompt
+	out.SubagentPrompt = r.SubagentPrompt
+	out.OpenAIProviders = s.ws.GetOpenAIProviders()
+	return &out
+}
+
+// applyFeatureFlagsToAll syncs the workspace feature flags to every live
+// session agent so the board / subagent tools appear or disappear
+// immediately. The flag stores are atomic and per-turn tool derivation
+// (llmTools/AllowedToolNames/executeTool) reads them, so no turn locks and
+// no handler-map rebuild are needed; a running turn is never interrupted.
+func (s *Server) applyFeatureFlagsToAll() {
+	board := s.ws.GetBoardEnabled()
+	subagent := s.ws.GetSubagentEnabled()
+	depth := s.ws.GetSubagentMaxDepth()
+	// Enabling the board creates the shared manager (data from a previous
+	// enable persists; disabling keeps it so re-enabling restores the
+	// board).
+	var bm *agent.BoardManager
+	if board {
+		bm = s.ws.ensureBoardManager()
+	}
+	for _, id := range s.registry.activeIDs() {
+		rt, ok := s.registry.get(id)
+		if !ok {
+			continue
+		}
+		a := rt.agent
+		a.SetBoardEnabled(board)
+		a.SetSubagentsEnabled(subagent)
+		a.SetSubagentMaxDepth(depth)
+		a.SetBoardManager(bm)
+	}
+}
+
+// broadcastConfigAll pushes a fresh config snapshot to every attached client
+// of every live session (the settings modal syncs across tabs from these).
+func (s *Server) broadcastConfigAll() {
+	for _, id := range s.registry.activeIDs() {
+		if rt, ok := s.registry.get(id); ok {
+			msg := agentConfigMsgBasic(rt.agent)
+			s.decorateConfig(&msg)
+			rt.broadcast(msg)
+		}
+	}
+}
+
+// decorateConfig fills the workspace-level config fields on a config
+// message: the registered provider list (never the keys), the config file
+// path the storage warning renders, the live runtime-config values the
+// settings modal displays, and the restart-pending list for the banner.
+// Cheap accessor reads; safe without the session turn lock.
+func (s *Server) decorateConfig(msg *WSMessage) {
+	if s == nil || msg == nil {
+		return
+	}
+	msg.Providers = s.providerEntries()
+	msg.ConfigFilePath = s.configFilePath()
+	r := s.ws.GetRuntimeConfig()
+	msg.CommandSafetyMode = r.CommandSafetyMode
+	msg.CommandAllowlist = r.CommandAllowlist
+	msg.DeleteApproval = r.DeleteApproval
+	msg.CommandSandbox = r.CommandSandbox
+	msg.CommandTimeoutSecs = r.CommandTimeoutSecs
+	msg.ContextLimitConfig = r.ContextLimit
+	msg.CompactThreshold = r.CompactThreshold
+	msg.CompactKeepRecentMessages = r.CompactKeepRecentMessages
+	msg.MaxToolResultBytes = r.MaxToolResultBytes
+	msg.CompactReserveTokens = r.CompactReserveTokens
+	msg.WebFetch = r.WebFetch
+	msg.WebSearch = r.WebSearch
+	msg.WebSearchBackend = r.WebSearchBackend
+	msg.WebSearchAPIKeySet = r.WebSearchAPIKey != ""
+	msg.WebAllowedDomains = r.WebAllowedDomains
+	msg.WebFetchMode = r.WebFetchMode
+	msg.TreeSitter = r.TreeSitter
+	msg.TreeSitterLangs = r.TreeSitterLangs
+	msg.PreserveReasoning = r.PreserveReasoning
+	msg.SubagentModel = &r.SubagentModel
+	msg.BoardStartPrompt = agent.ResolvePromptTemplate(r.BoardStartPrompt, agent.DefaultBoardStartPrompt)
+	msg.SystemPrompt = agent.ResolvePromptTemplate(r.SystemPrompt, agent.DefaultSystemPromptTemplate())
+	msg.SubagentPrompt = agent.ResolvePromptTemplate(r.SubagentPrompt, agent.DefaultSubagentPrompt)
+	msg.SessionMaxCount = r.SessionMaxCount
+	msg.SessionMaxAgeDays = r.SessionMaxAgeDays
+	msg.WebApprovalHoldSecs = r.WebApprovalHoldSecs
+	msg.WebBind = r.WebBind
+	msg.WebAllowedOrigins = r.WebAllowedOrigins
+	msg.WebAuthTokenSet = r.WebAuthToken != ""
+	msg.WebTLSCertFile = r.WebTLSCertFile
+	msg.WebTLSKeyFile = r.WebTLSKeyFile
+	msg.WebMaxActiveSessions = r.WebMaxActiveSessions
+	msg.MCP = r.MCP
+	msg.MCPServers = s.mcpEntries()
+	msg.RestartRequired = s.restartPendingFields()
+}
+
+// providerEntries projects the registered provider list for the client: the
+// implicit default profile (built from the legacy config fields, live-
+// editable but not deletable) followed by the live additional providers.
+// Keys are never pushed — only the apiKeySet flag.
+func (s *Server) providerEntries() []ProviderEntry {
+	out := make([]ProviderEntry, 0, 1+len(s.ws.GetOpenAIProviders()))
+	r := s.ws.GetRuntimeConfig()
+	def := ProviderEntry{
+		Name:      "default",
+		BaseURL:   r.OpenAIURL,
+		Model:     r.OpenAIModel,
+		APIKeySet: r.OpenAIKey != "",
+	}
+	out = append(out, def)
+	for _, p := range s.ws.GetOpenAIProviders() {
+		out = append(out, ProviderEntry{
+			Name:      p.Name,
+			BaseURL:   p.BaseURL,
+			Model:     p.Model,
+			APIKeySet: p.APIKey != "",
+			Deletable: true,
+		})
+	}
+	return out
+}
+
+// configFilePath returns where the effective config is persisted: the
+// project .gogen/gogen.conf in project mode, the global config file in
+// global mode. Drives the provider-key storage warning in the settings UI.
+func (s *Server) configFilePath() string {
+	if s.ws.GlobalMode {
+		return projectfile.GlobalConfigPath()
+	}
+	return projectfile.DefaultSavePath(s.ws.GetWorkingDir())
+}
+
+// persistConfig writes the effective config so a live toggle survives a
+// restart. Project mode writes .gogen/gogen.conf; global mode writes the
+// global config file. The write is best-effort (log on failure) — the live
+// toggle is already applied to the running process.
+//
+// Secrets (openai_api_key, MCP server env) are preserved when the EXISTING
+// file already contains them: the toggle rewrite must never drop a key the
+// user stored in the file (IncludeSecrets=false would rewrite the file
+// without it). Keys that only ever came from the environment stay out of
+// the file, exactly as before.
+func (s *Server) persistConfig(cfg *config.Config) {
+	var err error
+	if s.ws.GlobalMode {
+		err = projectfile.SaveGlobalConfig(cfg, projectfile.WriteOptions{
+			IncludeSecrets: projectfile.ConfigFileHasSecrets(projectfile.GlobalConfigPath()),
+		})
+	} else {
+		path := projectfile.DefaultSavePath(s.ws.GetWorkingDir())
+		includeSecrets := projectfile.ConfigFileHasSecrets(path)
+		if !includeSecrets {
+			// The user's config may live in a .md front matter with no
+			// .gogen/gogen.conf yet: creating a key-less .conf here would
+			// shadow the .md's key (a .conf takes precedence on load).
+			if cfgPath, ok := projectfile.DiscoverConfigPath(s.ws.GetWorkingDir()); ok {
+				includeSecrets = projectfile.ConfigFileHasSecrets(cfgPath)
+			}
+		}
+		err = projectfile.SaveConfig(path, "", cfg, "", projectfile.WriteOptions{
+			IncludeSecrets: includeSecrets,
+		})
+	}
+	if err != nil {
+		log.Printf("config save failed: %v", err)
+	}
+}
+
+// persistConfigForced writes the effective config with secrets forced on.
+// Provider saves through the UI always persist their API keys (the user
+// entered them explicitly and expects them stored); projectfile writes the
+// file 0600 in that case. Side effect: any legacy openai_api_key that only
+// came from the environment is also persisted on this write — accepted,
+// since the user just opted into storing provider keys.
+func (s *Server) persistConfigForced(cfg *config.Config) {
+	if s == nil || s.ws == nil || cfg == nil {
+		return
+	}
+	var err error
+	if s.ws.GlobalMode {
+		err = projectfile.SaveGlobalConfig(cfg, projectfile.WriteOptions{IncludeSecrets: true})
+	} else {
+		path := projectfile.DefaultSavePath(s.ws.GetWorkingDir())
+		err = projectfile.SaveConfig(path, "", cfg, "", projectfile.WriteOptions{IncludeSecrets: true})
+	}
+	if err != nil {
+		log.Printf("config save failed: %v", err)
+	}
 }
 
 // applyWorkingDirToAll syncs a workspace working-dir change to every session
@@ -1317,7 +1731,9 @@ func (s *Server) handleWSCompact(ws *wsConn, r *http.Request, rt *sessionRuntime
 			rt.stream.cancelInFlight()
 		}
 		if !rt.tryAcquireTurn(wsStreamDrainWait) {
-			_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
+			// /compact is a typed chat command: the busy rejection is its
+			// reply on the conversation channel.
+			_ = ws.writeJSON(WSMessage{Type: "response", Content: errAgentBusy})
 			return
 		}
 	}
@@ -1372,6 +1788,9 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 		_, _ = rt.agent.ListModels(r.Context())
 	}
 	if !s.acquireTurnForHandler(ws, rt) {
+		// Busy rejection on the CONVERSATION channel: the user typed a chat
+		// message (or a chat command) and the error is its reply.
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: errAgentBusy})
 		return
 	}
 
@@ -1379,6 +1798,7 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 	modeOut, modeHandled := a.HandleModeCommand(msg.Content)
 	if modeHandled {
 		modeCfg := agentConfigMsgBasic(a)
+		s.decorateConfig(&modeCfg)
 		rt.turnMu.Unlock()
 		// Tokenization + echo off the read loop (large uncached sessions
 		// take seconds; the read loop serializes every message).
@@ -1398,6 +1818,7 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 			cfg := agentConfigMsg(r.Context(), rt)
 			_, thinking := a.ModeAndThinkingLevel()
 			cfg.ThinkingLevel = string(thinking)
+			s.decorateConfig(&cfg)
 			_ = ws.writeJSON(cfg)
 			_ = ws.writeJSON(WSMessage{Type: "response", Content: out})
 		}(thinkOut)
@@ -1427,6 +1848,7 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 	if sel, isModels := agent.ParseModelsCommand(msg.Content); isModels && sel != "" {
 		out, _, modelErr := a.HandleModelsCommand(r.Context(), msg.Content)
 		cfg := agentConfigMsgBasic(a)
+		s.decorateConfig(&cfg)
 		rt.turnMu.Unlock()
 		// Echo off the read loop (tokenization can take seconds on a large
 		// uncached session; the read loop serializes every message). Both
@@ -1516,10 +1938,21 @@ func (s *Server) preprocessWSUserMessage(ws *wsConn, r *http.Request, rt *sessio
 	return images, false
 }
 
+// errAgentBusy is the rejection sent when a handler cannot acquire the
+// session turn lock because another client's turn is still running. Each
+// caller emits it on its OWN channel: the chat path (handleWSUserMessage,
+// handleWSCompact) writes it as a "response" (conversation channel — the
+// error is the reply to a typed message), while UI-channel handlers
+// (set_model / set_mode / set_thinking_level / board start) write it as a
+// notice — per the message-type contract, UI errors must never render into
+// the chat transcript.
+const errAgentBusy = "Error: agent is busy with another client"
+
 // acquireTurnForHandler takes the session turn lock for a message handler,
 // waiting briefly and re-cancelling once when the previous turn is still
 // draining. Returns false when the runtime is busy or was evicted; the
-// caller drops the message. On success the caller owns rt.turnMu.
+// caller drops the message and notifies the client on its own channel (see
+// errAgentBusy). On success the caller owns rt.turnMu.
 func (s *Server) acquireTurnForHandler(ws *wsConn, rt *sessionRuntime) bool {
 	if !rt.tryAcquireTurn(wsTurnAcquireWait) {
 		// Cancel may have timed out while a tool was still exiting; wait once
@@ -1529,7 +1962,6 @@ func (s *Server) acquireTurnForHandler(ws *wsConn, rt *sessionRuntime) bool {
 			rt.stream.cancelInFlight()
 		}
 		if !rt.tryAcquireTurn(wsStreamDrainWait) {
-			_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: agent is busy with another client"})
 			return false
 		}
 	}
@@ -1582,7 +2014,13 @@ func (rt *sessionRuntime) startTurn(owner *wsConn, content string, images []llm.
 		defer func() { done <- nil }()
 		defer rt.setTurnActive(false, time.Time{}, nil)
 		defer rt.broadcast(WSMessage{Type: "turn_end", SessionID: rt.agent.SessionID})
-		ctx := agent.ContextWithDeleteApprover(turnCtx, rt.deleteApprover())
+		// An installed approverOverride (subagent D6 forwarding, board start
+		// deny-when-unattended) replaces the default per-session approver.
+		approver := rt.deleteApprover()
+		if rt.approverOverride != nil {
+			approver = rt.approverOverride
+		}
+		ctx := agent.ContextWithDeleteApprover(turnCtx, approver)
 		// write fans out to every attached socket and tags the source
 		// sessionId. A write failure detaches that socket (broadcast does it);
 		// it NEVER cancels the LLM call — the turn belongs to the session and
@@ -1642,6 +2080,9 @@ func (rt *sessionRuntime) startTurn(owner *wsConn, content string, images []llm.
 			write(WSMessage{Type: "stream_end"})
 			write(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", err)})
 			log.Printf("stream error: %v", err)
+			if rt.turnErrorHook != nil {
+				rt.turnErrorHook(err)
+			}
 			return
 		}
 		if persistErr != nil {

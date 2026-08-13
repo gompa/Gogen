@@ -28,6 +28,39 @@ func TestReplaceInFileReplaceAll(t *testing.T) {
 	}
 }
 
+// TestReplaceInFileEmptySearchRejected guards against empty-search corruption:
+// strings.Count/Index/ReplaceAll treat "" as "match at every position", which
+// would rewrite the file (interleaving the replacement between every rune in
+// replace-all mode, or silently prepending in single mode). An empty search
+// must error up front and leave the file untouched.
+func TestReplaceInFileEmptySearchRejected(t *testing.T) {
+	for _, replaceAll := range []bool{false, true} {
+		name := "single"
+		if replaceAll {
+			name = "replace_all"
+		}
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "a.txt")
+			content := "foo bar foo\n"
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			exec := NewExecutor(dir)
+			if _, err := exec.ReplaceInFile("a.txt", "", "X", replaceAll); err == nil {
+				t.Fatal("expected error for empty search string")
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != content {
+				t.Fatalf("file was modified: got %q, want %q", got, content)
+			}
+		})
+	}
+}
+
 func TestPatchFileFuzzyRelocatesHunk(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "main.go")
@@ -47,7 +80,7 @@ func TestPatchFileFuzzyRelocatesHunk(t *testing.T) {
 		" }\n"
 
 	exec := NewExecutor(dir)
-	exec.RequireDeleteApproval = false
+	exec.SetDeleteApproval(false)
 	_, err := exec.PatchFile(context.Background(), diff, false, false)
 	if err == nil {
 		t.Fatal("expected strict patch to fail when header line is stale")
@@ -80,7 +113,7 @@ func TestPatchFileValidatesAllBeforeWrite(t *testing.T) {
 		"--- a/bad.go\n+++ b/bad.go\n@@ -1 +1,2 @@\n package missing\n+// bad\n"
 
 	exec := NewExecutor(dir)
-	exec.RequireDeleteApproval = false
+	exec.SetDeleteApproval(false)
 	_, err := exec.PatchFile(context.Background(), diff, false, false)
 	if err == nil {
 		t.Fatal("expected failure")
@@ -135,7 +168,7 @@ func TestPatchFileCRLFLineEndings(t *testing.T) {
 		" }\r\n"
 
 	exec := NewExecutor(dir)
-	exec.RequireDeleteApproval = false
+	exec.SetDeleteApproval(false)
 	_, err := exec.PatchFile(context.Background(), diff, false, true)
 	if err != nil {
 		t.Fatal(err)
@@ -168,7 +201,7 @@ func TestPatchFileOnDiskCRLF(t *testing.T) {
 		" }\n"
 
 	exec := NewExecutor(dir)
-	exec.RequireDeleteApproval = false
+	exec.SetDeleteApproval(false)
 	_, err := exec.PatchFile(context.Background(), diff, false, false)
 	if err != nil {
 		t.Fatal(err)
@@ -226,7 +259,7 @@ func TestPatchFileTrailingWhitespaceTolerance(t *testing.T) {
 
 	// Should fail without fuzzy (exact mismatch on trailing spaces).
 	exec := NewExecutor(dir)
-	exec.RequireDeleteApproval = false
+	exec.SetDeleteApproval(false)
 	_, err := exec.PatchFile(context.Background(), diff, false, false)
 	if err == nil {
 		t.Fatal("expected strict patch to fail when context has trailing whitespace")
@@ -273,7 +306,7 @@ func TestPatchFileRejectsDuplicateTarget(t *testing.T) {
 		" }\n"
 
 	exec := NewExecutor(dir)
-	exec.RequireDeleteApproval = false
+	exec.SetDeleteApproval(false)
 	_, err := exec.PatchFile(context.Background(), diff, false, false)
 	if err == nil {
 		t.Fatal("expected error for duplicate patch target")

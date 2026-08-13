@@ -124,6 +124,12 @@ func GlobalSessionDir() string {
 	return filepath.Join(GlobalDataDir(), "sessions")
 }
 
+// GlobalBoardDir returns the directory for the project board in global mode
+// (one board shared across working dirs, mirroring GlobalSessionDir).
+func GlobalBoardDir() string {
+	return filepath.Join(GlobalDataDir(), "board")
+}
+
 // GlobalModelsCachePath returns the path for the models.dev registry cache in global mode.
 func GlobalModelsCachePath() string {
 	return filepath.Join(GlobalDataDir(), "models.json")

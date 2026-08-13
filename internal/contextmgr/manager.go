@@ -94,11 +94,26 @@ type Manager struct {
 }
 
 func NewManager(provider llm.LLMProvider, settings Settings) *Manager {
-	// 0 is meaningful for these fields (see Settings docs): compact_threshold
-	// 0 disables auto-compaction, compact_keep_recent_messages 0 keeps no recent
-	// messages on compaction, max_tool_result_bytes 0 removes the truncation
-	// cap, compact_reserve_tokens 0 reserves no tokens. Only negative values
-	// are invalid and fall back to defaults.
+	settings = normalizeSettings(settings)
+	manual := 0
+	if settings.ContextLimit > 0 {
+		manual = settings.ContextLimit
+	}
+	return &Manager{
+		Settings:           settings,
+		Provider:           provider,
+		minMiddleTokens:    defaultMinMiddleTokens,
+		manualContextLimit: manual,
+	}
+}
+
+// normalizeSettings clamps invalid values to defaults. 0 is meaningful for
+// these fields (see Settings docs): compact_threshold 0 disables
+// auto-compaction, compact_keep_recent_messages 0 keeps no recent messages on
+// compaction, max_tool_result_bytes 0 removes the truncation cap,
+// compact_reserve_tokens 0 reserves no tokens. Only negative values are
+// invalid and fall back to defaults.
+func normalizeSettings(settings Settings) Settings {
 	def := DefaultSettings()
 	if settings.CompactThreshold < 0 || settings.CompactThreshold > 1 {
 		settings.CompactThreshold = def.CompactThreshold
@@ -112,16 +127,47 @@ func NewManager(provider llm.LLMProvider, settings Settings) *Manager {
 	if settings.CompactReserveTokens < 0 {
 		settings.CompactReserveTokens = def.CompactReserveTokens
 	}
-	manual := 0
+	return settings
+}
+
+// UpdateSettings replaces the context-management settings at runtime (the
+// web settings modal). Zero values are meaningful and pass through unchanged
+// (same semantics as NewManager); a ContextLimit of 0 returns to provider
+// resolution. All reads are internally synchronized (m.mu), so a running
+// turn sees the new settings on its next snapshot/compact check.
+//
+// The ContextLimit's manual/resolved distinction is preserved when the
+// incoming value is UNCHANGED (the per-field settings push sends each
+// session's current values back for fields it does not touch): a
+// provider-resolved limit (set via SetContextLimit on restore) must not
+// become a manual pin — that would stop RefreshAfterModelChange from
+// re-resolving for a new model — and a manual pin must not silently become
+// auto. Only an explicitly changed value re-derives the state: > 0 pins a
+// manual limit, 0 returns to provider resolution.
+func (m *Manager) UpdateSettings(settings Settings) {
+	settings = normalizeSettings(settings)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	limitChanged := settings.ContextLimit != m.Settings.ContextLimit
+	m.Settings = settings
+	if !limitChanged {
+		return
+	}
+	m.manualContextLimit = 0
+	// A manual limit is resolved by construction; 0 returns to provider
+	// resolution (EnsureContextLimit re-probes on the next turn).
+	m.limitResolved = settings.ContextLimit > 0
 	if settings.ContextLimit > 0 {
-		manual = settings.ContextLimit
+		m.manualContextLimit = settings.ContextLimit
 	}
-	return &Manager{
-		Settings:           settings,
-		Provider:           provider,
-		minMiddleTokens:    defaultMinMiddleTokens,
-		manualContextLimit: manual,
-	}
+}
+
+// SettingsSnapshot returns a copy of the current settings (web settings
+// modal display). Internally synchronized.
+func (m *Manager) SettingsSnapshot() Settings {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.Settings
 }
 
 // RefreshAfterModelChange updates the context limit for the newly selected model.

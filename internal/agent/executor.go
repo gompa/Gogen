@@ -27,13 +27,24 @@ const (
 const defaultCommandTimeout = time.Duration(config.DefaultCommandTimeoutSecs) * time.Second
 
 type Executor struct {
-	wdMu                  sync.RWMutex
-	WorkingDir            string // read via GetWorkingDir; write via SetWorkingDir
-	Commands              *CommandGuard
-	RequireDeleteApproval bool
-	CommandTimeout        time.Duration // 0 = default 2 minutes
-	Sandbox               string        // off, bwrap
-	PathBoundary          string        // if non-empty, overrides WorkingDir for SecurePath checks
+	wdMu         sync.RWMutex
+	WorkingDir   string // read via GetWorkingDir; write via SetWorkingDir
+	PathBoundary string // if non-empty, overrides WorkingDir for SecurePath checks
+
+	// The security/execution settings below are UNEXPORTED and readable or
+	// writable ONLY through the accessor/setter pairs below. liveMu guards
+	// them for runtime reads and writes (the web settings modal's live
+	// toggles); construction-time configuration (setup.go, main.go, tests)
+	// goes through the same setters, so no code path can bypass the mutex.
+	// Keeping the fields unexported makes the discipline structural: a
+	// direct field write that would race a concurrent read cannot compile.
+	// CommandGuard is immutable once built, so accessors may return the
+	// pointer after unlocking.
+	guard          *CommandGuard
+	deleteApproval bool
+	cmdTimeout     time.Duration // 0 = default 2 minutes
+	sandboxMode    string        // off, bwrap
+	liveMu         sync.RWMutex
 }
 
 func NewExecutor(wd string) *Executor {
@@ -45,13 +56,98 @@ func NewExecutorWithGuard(wd string, guard *CommandGuard) *Executor {
 		guard = NewCommandGuard("blocklist", nil)
 	}
 	return &Executor{
-		WorkingDir:            wd,
-		Commands:              guard,
-		RequireDeleteApproval: true,
-		CommandTimeout:        defaultCommandTimeout,
-		Sandbox:               "off",
-		PathBoundary:          "",
+		WorkingDir:     wd,
+		guard:          guard,
+		deleteApproval: true,
+		cmdTimeout:     defaultCommandTimeout,
+		sandboxMode:    "off",
+		PathBoundary:   "",
 	}
+}
+
+// SetCommandGuard replaces the command guard at runtime (web settings modal
+// command_safety / command_allowlist). The new guard is built atomically and
+// swapped; in-flight checks use the old guard.
+func (e *Executor) SetCommandGuard(mode string, allowlist []string) {
+	e.liveMu.Lock()
+	e.guard = NewCommandGuard(mode, allowlist)
+	e.liveMu.Unlock()
+}
+
+// commandGuard returns the current command guard (nil-safe).
+func (e *Executor) commandGuard() *CommandGuard {
+	e.liveMu.RLock()
+	defer e.liveMu.RUnlock()
+	return e.guard
+}
+
+// SetDeleteApproval toggles whether destructive file operations require
+// approval (web settings modal delete_approval).
+func (e *Executor) SetDeleteApproval(required bool) {
+	e.liveMu.Lock()
+	e.deleteApproval = required
+	e.liveMu.Unlock()
+}
+
+// DeleteApprovalRequired reports whether delete approval is currently
+// required (runtime-safe read).
+func (e *Executor) DeleteApprovalRequired() bool {
+	e.liveMu.RLock()
+	defer e.liveMu.RUnlock()
+	return e.deleteApproval
+}
+
+// SetCommandTimeout sets the maximum duration for command execution
+// (web settings modal command_timeout_secs; <= 0 = the default).
+func (e *Executor) SetCommandTimeout(timeout time.Duration) {
+	e.liveMu.Lock()
+	e.cmdTimeout = timeout
+	e.liveMu.Unlock()
+}
+
+// commandTimeout returns the current command timeout (0 = default).
+func (e *Executor) commandTimeout() time.Duration {
+	e.liveMu.RLock()
+	defer e.liveMu.RUnlock()
+	return e.cmdTimeout
+}
+
+// SetSandbox sets the command sandbox mode (web settings modal
+// command_sandbox: off / bwrap).
+func (e *Executor) SetSandbox(mode string) {
+	e.liveMu.Lock()
+	e.sandboxMode = mode
+	e.liveMu.Unlock()
+}
+
+// sandbox returns the current sandbox mode.
+func (e *Executor) sandbox() string {
+	e.liveMu.RLock()
+	defer e.liveMu.RUnlock()
+	return e.sandboxMode
+}
+
+// CommandGuardMode returns the current command guard's mode ("blocklist",
+// "allowlist", "off"; "" when no guard is set). Runtime-safe read — the web
+// settings push and tests use it.
+func (e *Executor) CommandGuardMode() string {
+	if g := e.commandGuard(); g != nil {
+		return g.Mode
+	}
+	return ""
+}
+
+// SandboxMode returns the current sandbox mode ("off", "bwrap").
+// Runtime-safe read.
+func (e *Executor) SandboxMode() string {
+	return e.sandbox()
+}
+
+// CommandTimeoutDuration returns the current command execution timeout
+// (0 = the default). Runtime-safe read, used by the web settings push and
+// tests.
+func (e *Executor) CommandTimeoutDuration() time.Duration {
+	return e.commandTimeout()
 }
 
 // GetWorkingDir returns the current working directory.
@@ -390,7 +486,7 @@ func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	timeout := e.CommandTimeout
+	timeout := e.commandTimeout()
 	if timeout <= 0 {
 		timeout = defaultCommandTimeout
 	}
@@ -442,8 +538,8 @@ func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, 
 // it so the guard and sandbox rules apply identically to foreground and
 // background commands.
 func (e *Executor) BuildCommand(ctx context.Context, command string) (*exec.Cmd, error) {
-	if e.Commands != nil {
-		if err := e.Commands.Check(command); err != nil {
+	if g := e.commandGuard(); g != nil {
+		if err := g.Check(command); err != nil {
 			return nil, err
 		}
 	}
@@ -528,7 +624,7 @@ func (w *commandOutputWriter) String() string {
 }
 
 func (e *Executor) buildShellCommand(ctx context.Context, command string) (*exec.Cmd, error) {
-	sandbox := strings.ToLower(strings.TrimSpace(e.Sandbox))
+	sandbox := strings.ToLower(strings.TrimSpace(e.sandbox()))
 	switch sandbox {
 	case "", "off":
 		return exec.CommandContext(ctx, "sh", "-c", command), nil
@@ -566,11 +662,14 @@ func (e *Executor) buildShellCommand(ctx context.Context, command string) (*exec
 			"sh", "-c", command,
 		), nil
 	default:
-		return nil, fmt.Errorf("unknown command_sandbox %q (use \"off\" or \"bwrap\")", e.Sandbox)
+		return nil, fmt.Errorf("unknown command_sandbox %q (use \"off\" or \"bwrap\")", e.sandbox())
 	}
 }
 
 func (e *Executor) ReplaceInFile(path string, search string, replace string, replaceAll bool) (string, error) {
+	if search == "" {
+		return "", fmt.Errorf("search string must not be empty")
+	}
 	secure, err := e.SecurePath(path)
 	if err != nil {
 		return "", err

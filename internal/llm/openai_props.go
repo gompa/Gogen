@@ -50,7 +50,9 @@ func (p *OpenAIProvider) applyChatCompletionExtras(ctx context.Context, params *
 	case "off":
 		return
 	case "on":
-		if strings.TrimSpace(p.baseURL) == "" {
+		// The live default endpoint (SetProfiles may have replaced it): the
+		// kwargs must reach the endpoint the request actually goes to.
+		if strings.TrimSpace(p.defaultBaseURL()) == "" {
 			return
 		}
 	default: // auto
@@ -106,23 +108,28 @@ func (p *OpenAIProvider) acceptedReasoningEfforts() []string {
 	return p.ModelReasoningEfforts(p.currentModel())
 }
 
-// templateSupportsPreserveReasoning probes llama.cpp GET /props once and caches
-// chat_template_caps.supports_preserve_reasoning. Failures / missing caps → false.
+// templateSupportsPreserveReasoning probes llama.cpp GET /props once per
+// endpoint and caches chat_template_caps.supports_preserve_reasoning. The
+// probe hits the CURRENT model's owning profile (with multiple registered
+// providers, /props must be asked of the endpoint that actually serves the
+// request). Failures / missing caps → false.
 func (p *OpenAIProvider) templateSupportsPreserveReasoning(ctx context.Context) bool {
+	baseURL := p.propsBaseURLForCurrentModel()
 	p.propsMu.Lock()
-	if p.propsChecked {
+	if p.propsChecked && p.propsBaseURL == baseURL {
 		v := p.propsPreserveReasoning
 		p.propsMu.Unlock()
 		return v
 	}
 	p.propsMu.Unlock()
 
-	supported := p.probePreserveReasoning(ctx)
+	supported := p.probePreserveReasoning(ctx, baseURL)
 
 	p.propsMu.Lock()
 	// Another goroutine may have filled the cache while we probed.
-	if !p.propsChecked {
+	if !p.propsChecked || p.propsBaseURL != baseURL {
 		p.propsChecked = true
+		p.propsBaseURL = baseURL
 		p.propsPreserveReasoning = supported
 	}
 	v := p.propsPreserveReasoning
@@ -130,17 +137,32 @@ func (p *OpenAIProvider) templateSupportsPreserveReasoning(ctx context.Context) 
 	return v
 }
 
+// propsBaseURLForCurrentModel returns the base URL of the endpoint that
+// serves the currently selected model: the model's owning profile when the
+// catalog has been fetched, else the default profile's base URL.
+func (p *OpenAIProvider) propsBaseURLForCurrentModel() string {
+	p.modelsMu.RLock()
+	info := p.modelProfile[p.model]
+	p.modelsMu.RUnlock()
+	if info.baseURL != "" {
+		return info.baseURL
+	}
+	return p.defaultBaseURL()
+}
+
 func (p *OpenAIProvider) invalidatePropsCaps() {
 	p.propsMu.Lock()
 	p.propsChecked = false
+	p.propsBaseURL = ""
 	p.propsPreserveReasoning = false
 	p.propsMu.Unlock()
 }
 
-// probePreserveReasoning GETs /props and reads supports_preserve_reasoning.
-// Returns false on any error, non-200, or missing capability key.
-func (p *OpenAIProvider) probePreserveReasoning(ctx context.Context) bool {
-	propsURL := llamaPropsURL(p.baseURL)
+// probePreserveReasoning GETs /props on baseURL and reads
+// supports_preserve_reasoning. Returns false on any error, non-200, or
+// missing capability key.
+func (p *OpenAIProvider) probePreserveReasoning(ctx context.Context, baseURL string) bool {
+	propsURL := llamaPropsURL(baseURL)
 	if propsURL == "" {
 		return false
 	}

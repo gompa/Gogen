@@ -2,7 +2,10 @@ package projectfile
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
+
+	"gogen/internal/config"
 )
 
 func TestMergeBoolAcceptsOnOffVariants(t *testing.T) {
@@ -148,5 +151,208 @@ func TestMergePreservesExplicitZeros(t *testing.T) {
 	if cfgAbsent.CompactThreshold != 0.85 || cfgAbsent.CompactKeepRecentMessages != 12 || cfgAbsent.MaxToolResultBytes != 262144 || cfgAbsent.CompactReserveTokens != 4000 {
 		t.Fatalf("absent keys should fall back to defaults: threshold=%v keep=%d max=%d reserve=%d",
 			cfgAbsent.CompactThreshold, cfgAbsent.CompactKeepRecentMessages, cfgAbsent.MaxToolResultBytes, cfgAbsent.CompactReserveTokens)
+	}
+}
+
+// session_max_age_days -1 is the "keep sessions forever" sentinel: unlike
+// every other int option (where <= 0 means "use the default"), a negative
+// file value must survive Merge so the store keeps its retention sentinel
+// across restarts.
+func TestMergePreservesNegativeSessionMaxAgeDays(t *testing.T) {
+	os.Unsetenv("GOGEN_SESSION_MAX_AGE_DAYS")
+	pf := &ProjectFile{Config: FileConfig{SessionMaxAgeDays: -1}}
+	if got := Merge(pf, FlagOverrides{}).SessionMaxAgeDays; got != -1 {
+		t.Fatalf("file -1 merged to %d, want -1 (keep forever)", got)
+	}
+	pfAbsent := &ProjectFile{Config: FileConfig{}}
+	if got := Merge(pfAbsent, FlagOverrides{}).SessionMaxAgeDays; got != config.DefaultSessionMaxAgeDays {
+		t.Fatalf("absent key merged to %d, want default %d", got, config.DefaultSessionMaxAgeDays)
+	}
+	// The env override still wins (and a positive env value is unchanged).
+	t.Setenv("GOGEN_SESSION_MAX_AGE_DAYS", "30")
+	if got := Merge(pf, FlagOverrides{}).SessionMaxAgeDays; got != 30 {
+		t.Fatalf("env 30 merged to %d, want 30", got)
+	}
+}
+
+// The board/subagent feature flags follow the opt-in MCP pattern: env >
+// file > defaults, with GOGEN_SUBAGENT_MAX_DEPTH falling back to the default
+// when unset/zero.
+func TestMergeBoardSubagentFlags(t *testing.T) {
+	for _, env := range []string{"GOGEN_BOARD", "GOGEN_SUBAGENT", "GOGEN_SUBAGENT_MAX_DEPTH"} {
+		os.Unsetenv(env)
+	}
+
+	// Defaults: both off, depth default 1.
+	cfg := Merge(nil, FlagOverrides{})
+	if cfg.BoardEnabled() || cfg.SubagentEnabled() {
+		t.Fatalf("defaults should be off: board=%q subagent=%q", cfg.Board, cfg.Subagent)
+	}
+	if cfg.SubagentDepth() != config.DefaultSubagentMaxDepth {
+		t.Fatalf("default depth = %d, want %d", cfg.SubagentDepth(), config.DefaultSubagentMaxDepth)
+	}
+
+	// File values.
+	pf := &ProjectFile{Config: FileConfig{Board: "on", Subagent: "on", SubagentMaxDepth: 3}}
+	cfgFile := Merge(pf, FlagOverrides{})
+	if !cfgFile.BoardEnabled() || !cfgFile.SubagentEnabled() {
+		t.Fatalf("file flags not honored: board=%q subagent=%q", cfgFile.Board, cfgFile.Subagent)
+	}
+	if cfgFile.SubagentDepth() != 3 {
+		t.Fatalf("file depth = %d, want 3", cfgFile.SubagentDepth())
+	}
+
+	// Env overrides file.
+	t.Setenv("GOGEN_BOARD", "off")
+	t.Setenv("GOGEN_SUBAGENT", "off")
+	t.Setenv("GOGEN_SUBAGENT_MAX_DEPTH", "5")
+	cfgEnv := Merge(pf, FlagOverrides{})
+	if cfgEnv.BoardEnabled() || cfgEnv.SubagentEnabled() {
+		t.Fatalf("env off should override file on: board=%q subagent=%q", cfgEnv.Board, cfgEnv.Subagent)
+	}
+	if cfgEnv.SubagentDepth() != 5 {
+		t.Fatalf("env depth = %d, want 5", cfgEnv.SubagentDepth())
+	}
+
+	// Invalid depth env falls back to default.
+	t.Setenv("GOGEN_SUBAGENT_MAX_DEPTH", "bogus")
+	cfgBad := Merge(nil, FlagOverrides{})
+	if cfgBad.SubagentDepth() != config.DefaultSubagentMaxDepth {
+		t.Fatalf("invalid env depth = %d, want default %d", cfgBad.SubagentDepth(), config.DefaultSubagentMaxDepth)
+	}
+}
+
+// --save-config must round-trip the new keys so a live toggle survives a
+// restart.
+func TestSaveConfigRoundTripsBoardSubagent(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "gogen.conf")
+	cfg := config.Defaults()
+	cfg.Board = "on"
+	cfg.Subagent = "on"
+	cfg.SubagentMaxDepth = 4
+	cfg.SubagentModel = "gpt-4o-mini"
+	if err := SaveConfig(cfgPath, "", &cfg, "", WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	pf, err := Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged := Merge(pf, FlagOverrides{})
+	if !merged.BoardEnabled() || !merged.SubagentEnabled() {
+		t.Fatalf("round-trip lost flags: board=%q subagent=%q", merged.Board, merged.Subagent)
+	}
+	if merged.SubagentDepth() != 4 {
+		t.Fatalf("round-trip depth = %d, want 4", merged.SubagentDepth())
+	}
+	if merged.SubagentModel != "gpt-4o-mini" {
+		t.Fatalf("round-trip subagent_model = %q, want gpt-4o-mini", merged.SubagentModel)
+	}
+}
+
+// TestMergeSubagentModelPrecedence pins the subagent default model merge:
+// empty (default) = inherit, file value applies, env overrides file.
+func TestMergeSubagentModelPrecedence(t *testing.T) {
+	os.Unsetenv("GOGEN_SUBAGENT_MODEL")
+	if got := Merge(nil, FlagOverrides{}).SubagentModel; got != "" {
+		t.Fatalf("default subagent_model = %q, want empty (inherit)", got)
+	}
+	pf := &ProjectFile{Config: FileConfig{SubagentModel: "llama3.1"}}
+	if got := Merge(pf, FlagOverrides{}).SubagentModel; got != "llama3.1" {
+		t.Fatalf("file subagent_model = %q, want llama3.1", got)
+	}
+	t.Setenv("GOGEN_SUBAGENT_MODEL", "qwen2.5")
+	if got := Merge(pf, FlagOverrides{}).SubagentModel; got != "qwen2.5" {
+		t.Fatalf("env subagent_model = %q, want qwen2.5", got)
+	}
+}
+
+// TestMergePromptTemplates pins the configurable prompt template merge:
+// empty = the built-in default, file value applies, env overrides file.
+func TestMergePromptTemplates(t *testing.T) {
+	os.Unsetenv("GOGEN_BOARD_START_PROMPT")
+	os.Unsetenv("GOGEN_SYSTEM_PROMPT")
+	os.Unsetenv("GOGEN_SUBAGENT_PROMPT")
+	if got := Merge(nil, FlagOverrides{}).BoardStartPrompt; got != "" {
+		t.Fatalf("default board_start_prompt = %q, want empty (built-in)", got)
+	}
+	pf := &ProjectFile{Config: FileConfig{
+		BoardStartPrompt: "board {title}",
+		SystemPrompt:     "sys {working_dir}",
+		SubagentPrompt:   "sub {job}",
+	}}
+	cfg := Merge(pf, FlagOverrides{})
+	if cfg.BoardStartPrompt != "board {title}" || cfg.SystemPrompt != "sys {working_dir}" || cfg.SubagentPrompt != "sub {job}" {
+		t.Fatalf("file prompt templates = %+v", cfg)
+	}
+	t.Setenv("GOGEN_SYSTEM_PROMPT", "env {working_dir}")
+	if got := Merge(pf, FlagOverrides{}).SystemPrompt; got != "env {working_dir}" {
+		t.Fatalf("env system_prompt = %q, want env value", got)
+	}
+}
+
+// ConfigFileHasSecrets must detect stored secrets in every config file
+// shape the toggle persist can rewrite: .conf, the plain-YAML global config
+// (config.yaml — no front matter), and front-matter .md files. Missing it
+// would silently drop openai_api_key / MCP envs on a live toggle.
+func TestConfigFileHasSecrets(t *testing.T) {
+	dir := t.TempDir()
+	confPath := filepath.Join(dir, "gogen.conf")
+	if err := os.WriteFile(confPath, []byte("openai_api_key: sk-conf\nopenai_model: m\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !ConfigFileHasSecrets(confPath) {
+		t.Fatal(".conf with a key should report secrets")
+	}
+
+	yamlPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(yamlPath, []byte("openai_api_key: sk-yaml\nopenai_model: m\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !ConfigFileHasSecrets(yamlPath) {
+		t.Fatal("plain-YAML global config with a key should report secrets")
+	}
+
+	mdPath := filepath.Join(dir, "GOGEN.md")
+	md := "---\nopenai_api_key: sk-md\nopenai_model: m\n---\n# rules\n"
+	if err := os.WriteFile(mdPath, []byte(md), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !ConfigFileHasSecrets(mdPath) {
+		t.Fatal("front-matter .md with a key should report secrets")
+	}
+
+	envPath := filepath.Join(dir, "env.conf")
+	if err := os.WriteFile(envPath, []byte("openai_model: m\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if ConfigFileHasSecrets(envPath) {
+		t.Fatal("config without secrets should report none")
+	}
+	if ConfigFileHasSecrets(filepath.Join(dir, "missing.conf")) {
+		t.Fatal("missing config should report no secrets")
+	}
+
+	mcpPath := filepath.Join(dir, "mcp.conf")
+	mcp := "mcp: on\nmcp_servers:\n  - name: fetch\n    command: npx\n    args: [\"-y\", \"@modelcontextprotocol/server-fetch\"]\n    env:\n      TOKEN: secret\n"
+	if err := os.WriteFile(mcpPath, []byte(mcp), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !ConfigFileHasSecrets(mcpPath) {
+		t.Fatal("MCP server env should report secrets")
+	}
+}
+
+// An existing but unparseable config is conservatively treated as having
+// secrets so a toggle rewrite cannot drop a key from a file it cannot read.
+func TestConfigFileHasSecretsUnparseableAssumesSecrets(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "broken.conf")
+	if err := os.WriteFile(path, []byte("{not yaml"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !ConfigFileHasSecrets(path) {
+		t.Fatal("unparseable existing config should conservatively report secrets")
 	}
 }

@@ -104,6 +104,10 @@ type ModelInfo struct {
 	ID           string
 	ContextLimit int
 	Current      bool
+	// Provider is the name of the registered provider profile that serves
+	// this model ("default" for the legacy single-endpoint configuration).
+	// The web model picker groups models by it.
+	Provider string
 	// Description is the models.dev model description; empty when the model is
 	// unknown or the registry has no entry.
 	Description string

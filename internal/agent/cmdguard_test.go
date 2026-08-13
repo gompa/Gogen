@@ -65,7 +65,7 @@ func TestPatchFileRejectsMismatch(t *testing.T) {
 		" }\n"
 
 	exec := NewExecutor(dir)
-	exec.RequireDeleteApproval = false
+	exec.SetDeleteApproval(false)
 	msg, err := exec.PatchFile(context.Background(), diff, false, false)
 	if err == nil {
 		t.Fatal("expected mismatch error")

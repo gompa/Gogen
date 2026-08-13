@@ -98,35 +98,86 @@ func SaveGlobalConfig(cfg *config.Config, opts WriteOptions) error {
 // kept, no truncation cap, no reserved tokens), so an explicit 0 must survive
 // regeneration. All other fields follow the file convention that an empty or
 // zero value means "use the default", so they may be omitted when empty.
+// Options added by the runtime-config / feature-flag work additionally omit
+// their key when the value equals the built-in default (buildConfigYAML
+// normalizes them): a config file never bakes in a default.
 type configYAML struct {
-	OpenAIAPIKey              string                   `yaml:"openai_api_key,omitempty"`
-	OpenAIModel               string                   `yaml:"openai_model"`
-	OpenAIBaseURL             string                   `yaml:"openai_base_url"`
-	WorkingDir                string                   `yaml:"working_dir"`
-	ContextLimit              int                      `yaml:"context_limit"`
-	CompactThreshold          float64                  `yaml:"compact_threshold"`
-	CompactKeepRecentMessages int                      `yaml:"compact_keep_recent_messages"`
-	MaxToolResultBytes        int                      `yaml:"max_tool_result_bytes"`
-	CompactReserveTokens      int                      `yaml:"compact_reserve_tokens"`
-	CommandSafety             string                   `yaml:"command_safety"`
-	CommandAllowlist          string                   `yaml:"command_allowlist,omitempty"`
-	DeleteApproval            string                   `yaml:"delete_approval"`
-	TreeSitter                string                   `yaml:"treesitter"`
-	TreeSitterLangs           string                   `yaml:"treesitter_langs,omitempty"`
-	TestCommand               string                   `yaml:"test_command,omitempty"`
-	LintCommand               string                   `yaml:"lint_command,omitempty"`
-	CLIVerbose                bool                     `yaml:"cli_verbose"`
-	DebugLog                  string                   `yaml:"debug_log,omitempty"`
-	DebugSession              string                   `yaml:"debug_session,omitempty"`
-	MCP                       string                   `yaml:"mcp"`
-	PreserveReasoning         string                   `yaml:"preserve_reasoning,omitempty"`
-	MCPServers                []config.MCPServerConfig `yaml:"mcp_servers,omitempty"`
+	OpenAIAPIKey              string                        `yaml:"openai_api_key,omitempty"`
+	OpenAIModel               string                        `yaml:"openai_model"`
+	OpenAIBaseURL             string                        `yaml:"openai_base_url"`
+	WorkingDir                string                        `yaml:"working_dir"`
+	ContextLimit              int                           `yaml:"context_limit"`
+	CompactThreshold          float64                       `yaml:"compact_threshold"`
+	CompactKeepRecentMessages int                           `yaml:"compact_keep_recent_messages"`
+	MaxToolResultBytes        int                           `yaml:"max_tool_result_bytes"`
+	CompactReserveTokens      int                           `yaml:"compact_reserve_tokens"`
+	CommandSafety             string                        `yaml:"command_safety"`
+	CommandAllowlist          string                        `yaml:"command_allowlist,omitempty"`
+	DeleteApproval            string                        `yaml:"delete_approval"`
+	CommandSandbox            string                        `yaml:"command_sandbox,omitempty"`
+	CommandTimeoutSecs        int                           `yaml:"command_timeout_secs,omitempty"`
+	TreeSitter                string                        `yaml:"treesitter"`
+	TreeSitterLangs           string                        `yaml:"treesitter_langs,omitempty"`
+	TestCommand               string                        `yaml:"test_command,omitempty"`
+	LintCommand               string                        `yaml:"lint_command,omitempty"`
+	CLIVerbose                bool                          `yaml:"cli_verbose"`
+	DebugLog                  string                        `yaml:"debug_log,omitempty"`
+	DebugSession              string                        `yaml:"debug_session,omitempty"`
+	MCP                       string                        `yaml:"mcp"`
+	PreserveReasoning         string                        `yaml:"preserve_reasoning,omitempty"`
+	Board                     string                        `yaml:"board,omitempty"`
+	Subagent                  string                        `yaml:"subagent,omitempty"`
+	SubagentMaxDepth          int                           `yaml:"subagent_max_depth,omitempty"`
+	SubagentModel             string                        `yaml:"subagent_model,omitempty"`
+	BoardStartPrompt          string                        `yaml:"board_start_prompt,omitempty"`
+	SystemPrompt              string                        `yaml:"system_prompt,omitempty"`
+	SubagentPrompt            string                        `yaml:"subagent_prompt,omitempty"`
+	SessionMaxCount           int                           `yaml:"session_max_count,omitempty"`
+	SessionMaxAgeDays         int                           `yaml:"session_max_age_days,omitempty"`
+	WebMaxActiveSessions      int                           `yaml:"web_max_active_sessions,omitempty"`
+	WebApprovalHoldSecs       int                           `yaml:"web_approval_hold_secs,omitempty"`
+	WebBind                   string                        `yaml:"web_bind,omitempty"`
+	WebAllowedOrigins         string                        `yaml:"web_allowed_origins,omitempty"`
+	WebAuthToken              string                        `yaml:"web_auth_token,omitempty"`
+	WebTLSCertFile            string                        `yaml:"web_tls_cert_file,omitempty"`
+	WebTLSKeyFile             string                        `yaml:"web_tls_key_file,omitempty"`
+	MCPServers                []config.MCPServerConfig      `yaml:"mcp_servers,omitempty"`
+	OpenAIProviders           []config.OpenAIProviderConfig `yaml:"openai_providers,omitempty"`
+}
+
+// omitDefaultString returns "" when v equals the built-in default def, so
+// the yaml omitempty tag drops the key entirely. Used for options added by
+// the runtime-config / feature-flag work: a config file must never bake in
+// a default value, so future default changes reach users who did not
+// customize without them editing anything (the same rule preserve_reasoning
+// already follows). Reload of an omitted key resolves to the same default
+// via the merge path, so omission is transparent today. Legacy fields keep
+// their historical always-write convention.
+func omitDefaultString(v, def string) string {
+	if v == def {
+		return ""
+	}
+	return v
+}
+
+// omitDefaultInt is omitDefaultString for int fields (0 = omitted by
+// omitempty). Negative sentinel values (session_max_age_days -1 = keep
+// sessions forever) differ from the default and are preserved.
+func omitDefaultInt(v, def int) int {
+	if v == def {
+		return 0
+	}
+	return v
 }
 
 // buildConfigYAML renders the effective config as a YAML document. Secrets
-// (openai_api_key, MCP server env) are included only when opts.IncludeSecrets
-// is set; preserve_reasoning is omitted when it is the default "auto".
+// (openai_api_key, web_auth_token, MCP server env, provider api_key) are
+// included only when opts.IncludeSecrets is set; preserve_reasoning is
+// omitted when it is the default "auto"; the runtime-config / feature-flag
+// options are omitted when they equal their built-in default
+// (omitDefaultString / omitDefaultInt).
 func buildConfigYAML(cfg *config.Config, opts WriteOptions) (string, error) {
+	def := config.Defaults()
 	out := configYAML{
 		OpenAIModel:               cfg.OpenAIModel,
 		OpenAIBaseURL:             cfg.OpenAIURL,
@@ -139,6 +190,8 @@ func buildConfigYAML(cfg *config.Config, opts WriteOptions) (string, error) {
 		CommandSafety:             cfg.CommandSafetyMode,
 		CommandAllowlist:          cfg.CommandAllowlist,
 		DeleteApproval:            cfg.DeleteApproval,
+		CommandSandbox:            omitDefaultString(cfg.CommandSandbox, def.CommandSandbox),
+		CommandTimeoutSecs:        omitDefaultInt(cfg.CommandTimeoutSecs, def.CommandTimeoutSecs),
 		TreeSitter:                cfg.TreeSitter,
 		TreeSitterLangs:           cfg.TreeSitterLangs,
 		TestCommand:               cfg.TestCommand,
@@ -147,10 +200,45 @@ func buildConfigYAML(cfg *config.Config, opts WriteOptions) (string, error) {
 		DebugLog:                  cfg.DebugLog,
 		DebugSession:              cfg.DebugSession,
 		MCP:                       cfg.MCP,
+		Board:                     omitDefaultString(cfg.Board, def.Board),
+		Subagent:                  omitDefaultString(cfg.Subagent, def.Subagent),
+		SubagentMaxDepth:          omitDefaultInt(cfg.SubagentMaxDepth, def.SubagentMaxDepth),
+		SubagentModel:             cfg.SubagentModel,
+		BoardStartPrompt:          cfg.BoardStartPrompt,
+		SystemPrompt:              cfg.SystemPrompt,
+		SubagentPrompt:            cfg.SubagentPrompt,
+		SessionMaxCount:           omitDefaultInt(cfg.SessionMaxCount, def.SessionMaxCount),
+		SessionMaxAgeDays:         omitDefaultInt(cfg.SessionMaxAgeDays, def.SessionMaxAgeDays),
+		WebMaxActiveSessions:      omitDefaultInt(cfg.WebMaxActiveSessions, def.WebMaxActiveSessions),
+		WebApprovalHoldSecs:       omitDefaultInt(cfg.WebApprovalHoldSecs, def.WebApprovalHoldSecs),
+		WebBind:                   omitDefaultString(cfg.WebBind, def.WebBind),
+		WebAllowedOrigins:         cfg.WebAllowedOrigins,
+		WebTLSCertFile:            cfg.WebTLSCertFile,
+		WebTLSKeyFile:             cfg.WebTLSKeyFile,
 		MCPServers:                cfg.MCPServers,
+		OpenAIProviders:           cfg.OpenAIProviders,
 	}
 	if opts.IncludeSecrets && cfg.OpenAIKey != "" {
 		out.OpenAIAPIKey = cfg.OpenAIKey
+	}
+	if opts.IncludeSecrets && cfg.WebAuthToken != "" {
+		// The auth token is a secret (like openai_api_key): persisted only
+		// with --save-config-secrets / a forced provider save.
+		out.WebAuthToken = cfg.WebAuthToken
+	}
+	if !opts.IncludeSecrets && len(cfg.OpenAIProviders) > 0 {
+		// Copy without api_key so provider keys are never persisted without
+		// --save-config-secrets. The slice shares its backing array with
+		// cfg, so a fresh copy is required.
+		out.OpenAIProviders = make([]config.OpenAIProviderConfig, len(cfg.OpenAIProviders))
+		for i, p := range cfg.OpenAIProviders {
+			out.OpenAIProviders[i] = config.OpenAIProviderConfig{
+				Name:    p.Name,
+				BaseURL: p.BaseURL,
+				Model:   p.Model,
+				// APIKey intentionally empty: persisted only with --save-config-secrets.
+			}
+		}
 	}
 	if mode := strings.ToLower(strings.TrimSpace(cfg.PreserveReasoning)); mode != "" && mode != "auto" {
 		out.PreserveReasoning = mode

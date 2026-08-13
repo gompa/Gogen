@@ -3,6 +3,8 @@ package llm
 import (
 	"encoding/json"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/openai/openai-go"
 )
@@ -14,9 +16,12 @@ type tcAccum struct {
 	ArgsStr string
 	Started bool
 	// argsFinalized is cached once ArgsStr is verified to be a complete JSON
-	// object via toolArgsFullyReceived. Reset to false whenever ArgsStr grows.
-	// The cheap brace-depth pre-check avoids re-validating an incomplete
-	// buffer on every streamed argument fragment.
+	// object via toolArgsFullyReceived. Set at accumulator creation and reset
+	// to false whenever ArgsStr grows; applyToolCallDelta passes it to
+	// mergeToolArgsDelta so full-object replays are ignored without
+	// re-validating the buffer. The cheap structural pre-check
+	// (argsStructurallyComplete) avoids re-validating an incomplete buffer on
+	// every streamed argument fragment.
 	argsFinalized bool
 }
 
@@ -66,24 +71,30 @@ func mergeToolCallDelta(
 		// non-empty ID means a distinct call — do not append onto the prior one.
 		if tc.ID != "" && tcAccums[mapIdx].ID != "" && tc.ID != tcAccums[mapIdx].ID {
 			tcIndexMap[tcIdx] = len(tcAccums)
-			tcAccums = append(tcAccums, tcAccum{
-				Index:   tcIdx,
-				ID:      tc.ID,
-				Name:    tc.Function.Name,
-				ArgsStr: tc.Function.Arguments,
-			})
-			return tcAccums, len(tcAccums) - 1
+			return appendToolCallAccum(tcAccums, tcIdx, tc)
 		}
 		return applyToolCallDelta(tcAccums, mapIdx, tc)
 	}
 
 	tcIndexMap[tcIdx] = len(tcAccums)
+	return appendToolCallAccum(tcAccums, tcIdx, tc)
+}
+
+// appendToolCallAccum appends a fresh accumulator for a new tool call and
+// runs the completion check immediately, so argsFinalized is authoritative
+// from the first fragment: a single-chunk complete arguments blob must be
+// recognized as such, otherwise a subsequent differently-formatted replay
+// would be spliced onto it. The check is O(1) for the common incomplete
+// first fragment.
+func appendToolCallAccum(tcAccums []tcAccum, idx int, tc openai.ChatCompletionChunkChoiceDeltaToolCall) ([]tcAccum, int) {
 	tcAccums = append(tcAccums, tcAccum{
-		Index:   tcIdx,
+		Index:   idx,
 		ID:      tc.ID,
 		Name:    tc.Function.Name,
 		ArgsStr: tc.Function.Arguments,
 	})
+	acc := &tcAccums[len(tcAccums)-1]
+	acc.maybeFinalizeArgs()
 	return tcAccums, len(tcAccums) - 1
 }
 
@@ -96,7 +107,9 @@ func applyToolCallDelta(tcAccums []tcAccum, idx int, tc openai.ChatCompletionChu
 		acc.Name = tc.Function.Name
 	}
 	if tc.Function.Arguments != "" {
-		merged := mergeToolArgsDelta(acc.ArgsStr, tc.Function.Arguments)
+		// Pass the cached completeness verdict so the replay-ignore branch
+		// does not re-validate the accumulated buffer on every fragment.
+		merged := mergeToolArgsDelta(acc.ArgsStr, tc.Function.Arguments, acc.argsFinalized)
 		if merged != acc.ArgsStr {
 			// Buffer grew/replaced: invalidate the finalized cache so it is
 			// re-evaluated lazily by maybeFinalizeArgs.
@@ -109,22 +122,65 @@ func applyToolCallDelta(tcAccums []tcAccum, idx int, tc openai.ChatCompletionChu
 }
 
 // maybeFinalizeArgs runs the expensive json.Unmarshal validity check exactly
-// once per accumulator and only when the (trimmed) buffer structurally looks
-// like a complete single JSON object. While braces are still open — the
-// common streaming case — the cheap O(n) brace-depth scan returns early and
-// no JSON validation runs. This preserves toolArgsFullyReceived semantics
-// while avoiding O(n^2) re-validation of an incomplete growing buffer.
+// once per accumulator and only when the raw buffer structurally looks like a
+// complete single JSON object (argsStructurallyComplete — an O(1) check on
+// the leading/trailing bytes). While braces are still open — the common
+// streaming case — it returns before the O(n) TrimSpace copy, so no JSON
+// validation runs and no per-fragment copy of the growing buffer is made.
+// This preserves toolArgsFullyReceived semantics while avoiding O(n²)
+// re-validation of an incomplete growing buffer.
 func (a *tcAccum) maybeFinalizeArgs() {
 	if a.argsFinalized {
 		return
 	}
-	s := strings.TrimSpace(a.ArgsStr)
-	if s == "" || s[0] != '{' || s[len(s)-1] != '}' {
+	// Cheap O(1) gate on the raw bytes before the O(n) TrimSpace: only a
+	// buffer that starts with '{' and ends with '}' (modulo surrounding
+	// whitespace) can be a complete single JSON object. True-delta streams
+	// close the object only with the final fragment, so this early-returns
+	// on every non-final fragment without copying or parsing.
+	if !argsStructurallyComplete(a.ArgsStr) {
 		return
 	}
+	s := strings.TrimSpace(a.ArgsStr)
 	if completeJSONObject(s) {
 		a.argsFinalized = toolArgsFullyReceived(a.ArgsStr)
 	}
+}
+
+// argsStructurallyComplete reports whether s starts with '{' and ends with
+// '}' modulo surrounding whitespace, examining only the leading and trailing
+// whitespace runs (O(1) for typical fragments). It is a necessary — not
+// sufficient — condition for s to be a complete single JSON object;
+// callers must still run the authoritative toolArgsFullyReceived check. Used
+// to gate the O(n) TrimSpace + json.Unmarshal validation so it runs at most
+// once per accumulator instead of on every streamed argument fragment.
+//
+// Whitespace is defined with unicode.IsSpace — the same set strings.TrimSpace
+// trims — so this gate and the authoritative check can never disagree: an
+// ASCII-only definition would miss a buffer with leading/trailing non-ASCII
+// whitespace (e.g. NBSP), keep argsFinalized false forever, and let a
+// full-object replay be spliced onto the buffer it was meant to ignore.
+func argsStructurallyComplete(s string) bool {
+	if s == "" {
+		return false
+	}
+	i := 0
+	for i < len(s) {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if !unicode.IsSpace(r) {
+			break
+		}
+		i += size
+	}
+	j := len(s)
+	for j > i {
+		r, size := utf8.DecodeLastRuneInString(s[:j])
+		if !unicode.IsSpace(r) {
+			break
+		}
+		j -= size
+	}
+	return i < j && s[i] == '{' && s[j-1] == '}'
 }
 
 // completeJSONObject reports whether s is a single JSON object spanning the
@@ -141,7 +197,19 @@ func completeJSONObject(s string) bool {
 // mergeToolArgsDelta combines streamed argument fragments.
 // Providers may send true deltas, cumulative snapshots, or full-object replays;
 // naive concatenation of the latter two yields "invalid character '{' ..." errors.
-func mergeToolArgsDelta(existing, delta string) string {
+//
+// existingComplete is the caller's cached verdict on whether existing is a
+// complete, validated JSON object (see tcAccum.argsFinalized), maintained by
+// the accumulator so this hot path never re-validates the growing buffer.
+// When the flag is unavailable (direct callers, tests), the function falls
+// back to a two-stage structural gate — an O(1) raw-brace check
+// (argsStructurallyComplete) followed by the string-aware completeJSONObject
+// scan — before the authoritative toolArgsFullyReceived check. The scan is
+// what distinguishes a fragment boundary landing right after a '}' inside a
+// quoted string from the object's real closing brace, so the full TrimSpace
+// + json.Unmarshal runs at most once per streamed arguments blob instead of
+// per fragment.
+func mergeToolArgsDelta(existing, delta string, existingComplete bool) string {
 	if delta == "" {
 		return existing
 	}
@@ -156,9 +224,9 @@ func mergeToolArgsDelta(existing, delta string) string {
 	if delta == existing {
 		return existing
 	}
-	// Already-complete JSON followed by another object start — ignore the replay
-	// (common when servers re-emit the finished arguments blob).
-	if toolArgsFullyReceived(existing) {
+	// Already-complete JSON followed by another object start — ignore the
+	// replay (common when servers re-emit the finished arguments blob).
+	if existingComplete || (argsStructurallyComplete(existing) && completeJSONObject(strings.TrimSpace(existing)) && toolArgsFullyReceived(existing)) {
 		trimmed := strings.TrimSpace(delta)
 		if trimmed == strings.TrimSpace(existing) || strings.HasPrefix(trimmed, "{") {
 			return existing

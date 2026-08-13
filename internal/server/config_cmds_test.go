@@ -70,16 +70,17 @@ func TestSetModelDoesNotDeadlock(t *testing.T) {
 	sid := a.SessionID
 
 	// The blocking stub's provider has no models, so SelectModel errors; the
-	// assertion is the no-deadlock/error-response shape and that a
-	// subsequent session_new still works.
+	// assertion is the no-deadlock/error-notice shape (set_model errors go
+	// out on the notice channel, never "response") and that a subsequent
+	// session_new still works.
 	if err := conn.WriteJSON(WSMessage{Type: "set_model", Model: "nope", SessionID: sid}); err != nil {
 		t.Fatalf("send set_model: %v", err)
 	}
 	// SelectModel on the stub errors ("no models available"); the handler
-	// must reply with an error response — promptly (no deadlock).
-	resp := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "response" })
-	if resp.Content == "" {
-		t.Fatal("set_model error response empty")
+	// must reply with a model error notice — promptly (no deadlock).
+	resp := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "notice" })
+	if resp.Kind != "model" || resp.Success || resp.Content == "" {
+		t.Fatalf("set_model error notice = %+v, want model error", resp)
 	}
 	// The session must still be usable afterwards.
 	if err := conn.WriteJSON(WSMessage{Type: "session_new"}); err != nil {

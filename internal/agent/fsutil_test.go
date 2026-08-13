@@ -147,7 +147,7 @@ func TestPatchFileApply(t *testing.T) {
 		" }\n"
 
 	exec := NewExecutor(dir)
-	exec.RequireDeleteApproval = false
+	exec.SetDeleteApproval(false)
 	msg, err := exec.PatchFile(context.Background(), diff, false, false)
 	if err != nil {
 		t.Fatal(err)
@@ -174,7 +174,7 @@ func TestPatchFileCreatesNewFile(t *testing.T) {
 		"+world\n"
 
 	exec := NewExecutor(dir)
-	exec.RequireDeleteApproval = false
+	exec.SetDeleteApproval(false)
 	if _, err := exec.PatchFile(context.Background(), diff, false, false); err != nil {
 		t.Fatal(err)
 	}

@@ -72,6 +72,24 @@ func (m Mode) AllowsTool(name string) bool {
 	return ok
 }
 
+// allowsTool reports whether name may run in the agent's current mode,
+// covering the static builtin set plus the dynamic feature tools. D7: the
+// board tool is plan-mode unrestricted (the coordination exception, like
+// todo) — an agent may update the board in plan mode so it can mark items
+// for review.
+func (a *Agent) allowsTool(name string) bool {
+	if a.Mode != ModePlan {
+		return true
+	}
+	if _, ok := planModeAllowedTools[name]; ok {
+		return true
+	}
+	if name == "board" && a.BoardEnabled() && a.BoardManager() != nil {
+		return true
+	}
+	return false
+}
+
 func (a *Agent) SetMode(m Mode) {
 	// Written under statsMu so config snapshots (agentConfigMsgBasic) can
 	// read the mode WITHOUT the session turn lock — the web attach handshake
@@ -93,7 +111,7 @@ func (a *Agent) ModeAndThinkingLevel() (Mode, ThinkingLevel) {
 }
 
 func (a *Agent) checkPlanMode(toolName string) error {
-	if a.Mode == ModePlan && !a.Mode.AllowsTool(toolName) {
+	if a.Mode == ModePlan && !a.allowsTool(toolName) {
 		return fmt.Errorf("%w: tool %q is disabled; use /act to implement changes", ErrPlanModeBlocked, toolName)
 	}
 	if a.Mode == ModePlan && a.isMCPTool(toolName) {
@@ -110,9 +128,17 @@ func (a *Agent) isMCPTool(name string) bool {
 func (a *Agent) AllowedToolNames() map[string]struct{} {
 	out := make(map[string]struct{})
 	for _, name := range builtinToolNames {
-		if a.Mode.AllowsTool(name) {
+		if a.allowsTool(name) {
 			out[name] = struct{}{}
 		}
+	}
+	// Feature tools: the board tool is available in both modes (D7), the
+	// subagent tool only in act mode.
+	if a.BoardEnabled() && a.BoardManager() != nil && a.allowsTool("board") {
+		out["board"] = struct{}{}
+	}
+	if a.SubagentsEnabled() && a.SubagentSpawner() != nil && a.Mode != ModePlan {
+		out["subagent"] = struct{}{}
 	}
 	if a.Mode != ModePlan && a.MCPRegistry != nil {
 		for name := range a.MCPRegistry.ToolNames() {

@@ -52,6 +52,7 @@ var tuiCommands = []tuiCommand{
 	{match: exactAny("exit", "/exit", "quit", "/quit"), run: cmdExit},
 	{match: exactAny("compact", "/compact"), run: cmdCompact},
 	{match: exactAny("verbose", "/verbose"), run: cmdVerbose},
+	{match: exactAny("subagents", "/subagents"), run: cmdSubagents},
 	// Mode commands: mirror HandleModeCommand's accepted forms.
 	{match: exactAny("plan", "/plan", "act", "/act", "mode", "/mode"), run: cmdMode},
 	// Thinking command: mirror HandleThinkingCommand's accepted forms.
@@ -80,6 +81,12 @@ var tuiCommands = []tuiCommand{
 		return ok
 	}, run: cmdModels},
 	{match: func(input, trimmed string) bool { return strings.HasPrefix(trimmed, "dir ") }, run: cmdDir},
+}
+
+// cmdSubagents opens the nested-session (subagent) list modal.
+func cmdSubagents(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
+	m.modal = ModalSubagents
+	return true, false, nil
 }
 
 func cmdHelp(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {

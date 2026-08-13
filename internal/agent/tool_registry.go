@@ -40,6 +40,22 @@ func (a *Agent) SetToolHandlers(handlers map[string]ToolHandler) {
 	a.toolMu.Unlock()
 }
 
+// mcpRegistryHas reports whether the attached MCP registry exposes a tool
+// with the given name (nil-safe). Distinct from isMCPTool, which detects
+// the "mcp_" name prefix; this checks the actual registered tool set, so a
+// registry tool named "board" or "subagent" is visible here.
+func (a *Agent) mcpRegistryHas(name string) bool {
+	if a.MCPRegistry == nil {
+		return false
+	}
+	names := a.MCPRegistry.ToolNames()
+	if names == nil {
+		return false
+	}
+	_, ok := names[name]
+	return ok
+}
+
 func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error) {
 	if tc.ArgsError != "" {
 		return "", fmt.Errorf("invalid tool arguments: %s", tc.ArgsError)
@@ -51,12 +67,22 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error
 		return "", err
 	}
 	ctx = a.toolContext(ctx)
-	if a.MCPRegistry != nil {
-		if names := a.MCPRegistry.ToolNames(); names != nil {
-			if _, ok := names[tc.Name]; ok {
-				return a.MCPRegistry.CallTool(ctx, tc.Name, tc.Args)
-			}
-		}
+	// Feature-gated tools are routed explicitly (MCP-style): the board tool
+	// runs when the board feature is enabled (its manager serializes all
+	// mutations), the subagent tool when the feature is enabled. When a
+	// feature is off, the name falls through to the handler map and returns
+	// "unknown tool" naturally — a stale mid-turn call after a live toggle
+	// sees exactly that. A registry tool with the same name wins (explicit
+	// user configuration): the model-facing definition also prefers it (see
+	// llmTools), so what the model sees and what executes always agree.
+	if a.BoardEnabled() && tc.Name == "board" && !a.mcpRegistryHas("board") {
+		return handleBoard(ctx, a, tc.Args)
+	}
+	if a.SubagentsEnabled() && tc.Name == "subagent" && !a.mcpRegistryHas("subagent") {
+		return handleSubagent(ctx, a, tc.Args)
+	}
+	if a.mcpRegistryHas(tc.Name) {
+		return a.MCPRegistry.CallTool(ctx, tc.Name, tc.Args)
 	}
 	a.toolMu.RLock()
 	handlers := a.toolHandlers

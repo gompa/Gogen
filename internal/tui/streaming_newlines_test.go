@@ -7,7 +7,7 @@ import (
 	"gogen/internal/llm"
 )
 
-func newStreamTestModel() Model {
+func newStreamTestModel() *Model {
 	m := Model{
 		chatLines:           nil,
 		streamAssistantLine: -1,
@@ -19,7 +19,7 @@ func newStreamTestModel() Model {
 	// m.width stays 0, so setViewportContent() early-returns and the test
 	// exercises the incremental buildFromPrefix() path used during streaming.
 	m.resetStreamState(false)
-	return m
+	return &m
 }
 
 // hasBlankRenderedLine reports whether the viewport content (as produced by
@@ -63,7 +63,7 @@ func TestNoExtraNewlineBeforeToolCall(t *testing.T) {
 	m.handleStreamToken("\n")
 	m.handleStreamToolCall(0, "tc0", "read_file")
 
-	if hasBlankRenderedLine(&m) {
+	if hasBlankRenderedLine(m) {
 		t.Fatalf("blank line present between assistant text and tool call\n%s", m.wrappedContentString())
 	}
 }
@@ -88,7 +88,7 @@ func TestNoExtraNewlineBetweenRounds(t *testing.T) {
 	m.handleStreamRoundStart()
 	m.handleStreamToken("Done.")
 
-	if hasBlankRenderedLine(&m) {
+	if hasBlankRenderedLine(m) {
 		t.Fatalf("blank line present between rounds\n%s", m.wrappedContentString())
 	}
 }
@@ -102,7 +102,7 @@ func TestNoExtraNewlineAcrossManyAppends(t *testing.T) {
 	m.appendChatLine("line two")
 	m.appendChatLine("line three")
 
-	if hasBlankRenderedLine(&m) {
+	if hasBlankRenderedLine(m) {
 		t.Fatalf("blank line present across appends\n%s", m.wrappedContentString())
 	}
 
@@ -130,12 +130,12 @@ func TestNoBlankLinesFromWrappedThinking(t *testing.T) {
 		"Third.\n",
 	} {
 		m.handleStreamThinking(tok)
-		if hasBlankRenderedLine(&m) {
+		if hasBlankRenderedLine(m) {
 			t.Fatalf("blank line while streaming %q\n%s", tok, m.wrappedContentString())
 		}
 	}
 	m.closeThinkingBlock()
-	if hasBlankRenderedLine(&m) {
+	if hasBlankRenderedLine(m) {
 		t.Fatalf("blank line after closing thinking block\n%s", m.wrappedContentString())
 	}
 }
