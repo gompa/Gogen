@@ -244,6 +244,71 @@ func (m *Model) saveConfig(includeSecrets bool) error {
 	return nil
 }
 
+// deliveryRequestMsg requests a system message delivery (job completion
+// notice, scheduled reminder, subagent report). Producers send it via
+// m.program.Send from arbitrary goroutines; Update appends it to
+// pendingDeliveries and drains when the TUI is idle, so Messages is only
+// ever touched on the Update thread (via the streamCmd goroutine, the same
+// ownership contract as user input).
+type deliveryRequestMsg struct {
+	text string
+}
+
+// submitDeliveredText renders a system-delivered message as a user line and
+// runs a turn on it — the same flow as submitUserInput minus the input
+// history bookkeeping. Callers must ensure !m.streaming.
+func (m *Model) submitDeliveredText(text string) tea.Cmd {
+	m.appendChatLine(SystemStyle.Render(noticeLabel + " " + text))
+	m.streaming = true
+	m.resetStreamState(false)
+	startProgress := m.setProgress(progressThinking, "thinking")
+
+	streamCtx, cancelFn := context.WithCancel(m.ctx)
+	m.streamCancel = cancelFn
+
+	adapter := NewStreamAdapter(m.program)
+	a := m.agent
+	approver := m.makeDeleteApprover()
+
+	streamCmd := func() tea.Msg {
+		defer cancelFn()
+		_, err := a.StreamProcessInput(
+			agent.ContextWithDeleteApprover(streamCtx, approver),
+			text,
+			adapter.Handlers(),
+		)
+		if err != nil {
+			return streamErrorMsg{err: err}
+		}
+		// Return streamEndMsg directly so handleStreamEnd refreshes context
+		// stats synchronously after Messages are final.
+		return streamEndMsg{}
+	}
+	return tea.Batch(startProgress, streamCmd)
+}
+
+// drainDeliveries starts the next queued system delivery when the TUI is
+// idle. Returns nil when nothing is queued or a turn is running; the next
+// delivery (if any) drains at the next stream end.
+func (m *Model) drainDeliveries() tea.Cmd {
+	if m.streaming {
+		return nil
+	}
+	if m.deliveryDrops > 0 {
+		// Report overflow drops only at a drain boundary (never mid-stream,
+		// where an appended line would interleave with the stream's line
+		// bookkeeping).
+		m.appendChatLine(SystemStyle.Render(fmt.Sprintf("%d background message(s) dropped (delivery queue full).", m.deliveryDrops)))
+		m.deliveryDrops = 0
+	}
+	if len(m.pendingDeliveries) == 0 {
+		return nil
+	}
+	text := m.pendingDeliveries[0]
+	m.pendingDeliveries = m.pendingDeliveries[1:]
+	return m.submitDeliveredText(text)
+}
+
 // submitUserInput sends user input to the agent for processing.
 func (m *Model) submitUserInput(input string) tea.Cmd {
 	trimmed := strings.TrimSpace(input)

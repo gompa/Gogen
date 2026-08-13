@@ -10,6 +10,7 @@ import (
 	"gogen/internal/llm"
 	"gogen/internal/modelinfo"
 	"gogen/internal/session"
+	"gogen/internal/skills"
 )
 
 // Workspace is the shared, session-independent state of the web server
@@ -70,6 +71,19 @@ type Workspace struct {
 	// data) when disabled so re-enabling restores the board.
 	boardManagerMu sync.RWMutex
 	boardManager   *agent.BoardManager
+
+	// skillsManager is the shared skill discovery manager for this
+	// workspace. Skills is config-only in v1 (no live toggle): the manager
+	// is set once at construction and never reassigned, so plain-field
+	// reads at session creation are race-free.
+	skillsManager *skills.Manager
+
+	// jobNotices mirrors the config job_notices flag (config-only, set at
+	// construction). jobNoticeDeliverer is installed by NewServer (it needs
+	// the registry) and resolves a session id to its live runtime at fire
+	// time; NewSessionAgent installs the per-agent hook on top of it.
+	jobNotices         bool
+	jobNoticeDeliverer func(agentID, summary string)
 
 	// BoardChangedHook is invoked after any board mutation made through a
 	// session agent's board tool, with the mutation's output message; the
@@ -436,10 +450,21 @@ func (ws *Workspace) NewSessionAgent(snap *agent.SessionSnapshot, id string) *ag
 		SubagentsEnabled:     ws.GetSubagentEnabled(),
 		SubagentMaxDepth:     ws.GetSubagentMaxDepth(),
 		BoardManager:         ws.GetBoardManager(),
+		SkillsManager:        ws.skillsManager,
+		InstructionsEnabled:  runtimeCfg.AgentInstructionsEnabled(),
 		SubagentSpawner:      ws.SubagentSpawner,
 	}
 	a := agent.NewSessionAgent(opts, snap, id)
 	a.SetOnBoardChanged(ws.BoardChangedHook)
+	if ws.jobNotices && ws.jobNoticeDeliverer != nil {
+		// Job-completion notices: the hook resolves THIS session's live
+		// runtime at fire time (the deliverer is registry-backed), so a
+		// notice never targets a stale runtime.
+		sid := a.SessionID
+		a.SetJobNoticeHook(func(summary string) {
+			ws.jobNoticeDeliverer(sid, summary)
+		})
+	}
 	return a
 }
 
@@ -465,6 +490,7 @@ func newWorkspaceFromAgent(a *agent.Agent, cfg *config.Config) *Workspace {
 		BoardEnabled:         cfg != nil && cfg.BoardEnabled(),
 		SubagentEnabled:      cfg != nil && cfg.SubagentEnabled(),
 		SubagentMaxDepth:     subagentDepthFrom(cfg),
+		jobNotices:           cfg != nil && cfg.JobNoticesEnabled(),
 		OpenAIProviders:      providerListFromConfig(cfg),
 		runtime:              runtimeSeed(cfg),
 	}
@@ -472,6 +498,12 @@ func newWorkspaceFromAgent(a *agent.Agent, cfg *config.Config) *Workspace {
 		// The workspace owns the single board manager; session agents are
 		// seeded from it in NewSessionAgent.
 		ws.boardManager = agent.NewBoardManager(ws.WorkingDir, ws.GlobalMode)
+	}
+	if a.SkillsManager() != nil {
+		// The workspace shares the agent's skill manager (setup.go created
+		// it when skills is enabled); session agents are seeded from it in
+		// NewSessionAgent.
+		ws.skillsManager = a.SkillsManager()
 	}
 	if st, ok := a.SessionStore.(*session.Store); ok {
 		ws.Store = st

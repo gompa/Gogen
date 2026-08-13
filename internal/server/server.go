@@ -172,10 +172,32 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 	a.SetSubagentsEnabled(ws.GetSubagentEnabled())
 	a.SetSubagentMaxDepth(ws.GetSubagentMaxDepth())
 	a.SetBoardManager(ws.GetBoardManager())
+	a.SetSkillsManager(ws.skillsManager)
 	// The subagent spawner needs the registry, so it is installed after the
 	// server is constructed; NewSessionAgent seeds it on every later session.
-	ws.SubagentSpawner = &subagentSpawner{s: s}
+	ws.SubagentSpawner = &subagentSpawner{s: s, children: newChildRegistry()}
 	a.SetSubagentSpawner(ws.SubagentSpawner)
+	// A session leaving the registry takes its continuable subagent
+	// children with it (cancel + release): a child whose parent is gone
+	// cannot deliver report/completion anyway.
+	s.registry.evictHook = func(id string) {
+		if sp, ok := ws.SubagentSpawner.(*subagentSpawner); ok {
+			sp.cancelAll(id)
+		}
+	}
+	// Job-completion notices: the deliverer resolves a session id to its
+	// live runtime; NewSessionAgent installs per-agent hooks on top of it
+	// for later sessions, this install covers the initial agent.
+	if ws.jobNotices {
+		ws.jobNoticeDeliverer = func(id, summary string) {
+			if rt, ok := s.registry.get(id); ok {
+				rt.deliverToSession(summary)
+			}
+		}
+		a.SetJobNoticeHook(func(summary string) {
+			ws.jobNoticeDeliverer(a.SessionID, summary)
+		})
+	}
 	return s
 }
 
@@ -2014,6 +2036,18 @@ func (rt *sessionRuntime) startTurn(owner *wsConn, content string, images []llm.
 		defer func() { done <- nil }()
 		defer rt.setTurnActive(false, time.Time{}, nil)
 		defer rt.broadcast(WSMessage{Type: "turn_end", SessionID: rt.agent.SessionID})
+		// The runtime may have been evicted while the caller waited for the
+		// turn lock: close/delete/cap eviction proceed WITHOUT turnMu when
+		// the lock is held (the stuck-turn path), so an eviction can land
+		// after the caller's own evicted check. Starting the turn would
+		// stream into the void and persist a message into a torn-down
+		// session (the delivery worker's pop-then-start handoff is exactly
+		// this window). The defers above still run, so the early return is
+		// a clean no-op turn: turn state is reset, errCh is signaled, the
+		// stream handles are cleared, and the lock is released.
+		if rt.evicted.Load() {
+			return
+		}
 		// An installed approverOverride (subagent D6 forwarding, board start
 		// deny-when-unattended) replaces the default per-session approver.
 		approver := rt.deleteApprover()

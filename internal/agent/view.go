@@ -39,8 +39,40 @@ func (a *Agent) llmTools() []llm.Tool {
 		}
 	}
 	if a.SubagentsEnabled() && a.SubagentSpawner() != nil {
-		if _, shadowed := mcpNames["subagent"]; !shadowed {
-			tools = append(tools, subagentToolDef())
+		cs := a.continuableSpawner()
+		shadowed := map[string]bool{}
+		for _, name := range []string{"subagent", "subagent_fork", "list_agents", "send_message", "interrupt_agent", "report"} {
+			if _, ok := mcpNames[name]; ok {
+				shadowed[name] = true
+			}
+		}
+		if !shadowed["subagent"] {
+			tools = append(tools, subagentToolDef(cs != nil))
+		}
+		if cs != nil {
+			if !shadowed["subagent_fork"] {
+				tools = append(tools, subagentForkToolDef())
+			}
+			if !shadowed["list_agents"] {
+				tools = append(tools, listAgentsToolDef())
+			}
+			if !shadowed["send_message"] {
+				tools = append(tools, sendMessageToolDef())
+			}
+			if !shadowed["interrupt_agent"] {
+				tools = append(tools, interruptAgentToolDef())
+			}
+			// report is child-scoped: only nested agents with an installed
+			// report hook see it (a restored subagent session reopened by a
+			// user has ParentID but no hook, so it stays hidden).
+			if a.ParentID() != "" && a.ReportHook() != nil && !shadowed["report"] {
+				tools = append(tools, reportToolDef())
+			}
+		}
+	}
+	if a.SkillsEnabled() && a.SkillsManager() != nil {
+		if _, shadowed := mcpNames["skill"]; !shadowed {
+			tools = append(tools, skillsToolDef())
 		}
 	}
 	tools = append(tools, mcpDefs...)
@@ -113,7 +145,7 @@ func (a *Agent) prepareMessages(ctx context.Context, h *llm.StreamHandlers) []ll
 	// ArgsStabilized is persisted and we skip already-stable messages.
 	a.stabilizeToolArgs()
 
-	view = buildSystemView(view, a.WorkingDir, a.ProjectFilePath, a.ProjectGuidelines, a.ensureProjectProfile(), a.Mode)
+	view = buildSystemView(view, a.WorkingDir, a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode)
 
 	a.recordViewForDrift(view)
 	return view
@@ -138,6 +170,6 @@ func (a *Agent) systemPromptPrefix() []llm.Message {
 	return []llm.Message{{
 		Role: "system",
 		Content: SystemPrompt(a.WorkingDir) +
-			buildSystemSuffix(a.ProjectFilePath, a.ProjectGuidelines, a.ensureProjectProfile(), a.Mode),
+			buildSystemSuffix(a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode),
 	}}
 }

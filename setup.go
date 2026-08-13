@@ -12,6 +12,7 @@ import (
 	"gogen/internal/llm"
 	"gogen/internal/projectfile"
 	"gogen/internal/session"
+	"gogen/internal/skills"
 )
 
 // newAgent builds the provider, context manager, executor, agent, and
@@ -72,6 +73,19 @@ func newAgent(cfg *config.Config, isGlobalMode bool) (*agent.Agent, string) {
 		// via AfterWorkingDirChange.
 		a.SetBoardManager(agent.NewBoardManager(cfg.WorkingDir, isGlobalMode))
 	}
+	if cfg.SkillsEnabled() {
+		// Skills: per-process discovery manager (project .gogen/skills plus
+		// the global config dir; global mode → user root only).
+		a.SetSkillsManager(skills.NewManager(cfg.WorkingDir, isGlobalMode))
+		a.SetSkillsEnabled(true)
+	}
+	// Workspace instructions (AGENTS.md/CLAUDE.md): merged below the
+	// project guidelines at view-build time from the CURRENT working dir
+	// (agent.EffectiveGuidelines), so /dir and web workspace changes
+	// re-render them and the content is never baked into a saved
+	// .gogen/gogen.md.
+	a.SetInstructionsEnabled(cfg.AgentInstructionsEnabled())
+	a.RefreshWorkspaceInstructions(cfg.WorkingDir)
 	if cfg.DebugCompareMessages && !agent.ViewDriftCompiledIn() {
 		fmt.Fprintf(os.Stderr, "GOGEN_DEBUG_COMPARE_MESSAGES requires a debug build (-tags debug); ignoring\n")
 		a.DebugCompareMessages = false

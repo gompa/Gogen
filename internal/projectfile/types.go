@@ -74,6 +74,9 @@ type FileConfig struct {
 	BoardStartPrompt          string                `yaml:"board_start_prompt"`
 	SystemPrompt              string                `yaml:"system_prompt"`
 	SubagentPrompt            string                `yaml:"subagent_prompt"`
+	AgentInstructions         string                `yaml:"agent_instructions"`
+	Skills                    string                `yaml:"skills"`
+	JobNotices                string                `yaml:"job_notices"`
 	// KeepRecentMessages is the pre-rename spelling of
 	// compact_keep_recent_messages, accepted for back-compat with a
 	// deprecation warning and cleared by parseYAMLFrontMatter after aliasing.

@@ -19,8 +19,26 @@ import (
 // (D6). The child runs with its own turn lock and context window; the parent
 // tool call blocks until the child finishes (or the parent turn is
 // cancelled, which propagates).
+//
+// When the spawner also implements agent.ContinuableSubagentSpawner (it
+// does — see subagent_continuable.go), the subagent tool gains
+// run_in_background and the continuable tools; children then stay
+// registered past their main turn (held, retention-bounded) for messaging.
 type subagentSpawner struct {
 	s *Server
+
+	// children is the continuable-child registry (see
+	// subagent_continuable.go). Non-nil for every server spawner.
+	children *childRegistry
+	// retain bounds how long a finished continuable child stays registered
+	// (0 = defaultSubagentRetain). Tests shorten it.
+	retain time.Duration
+	// maxFinished caps finished continuable children per parent
+	// (0 = defaultMaxFinishedSubagents).
+	maxFinished int
+	// maxLive caps NON-finished continuable children per parent
+	// (0 = defaultMaxLiveSubagents).
+	maxLive int
 }
 
 // truncateReport bounds the tool result returned to the parent agent.
@@ -31,14 +49,20 @@ func truncateReport(report string, err error) string {
 	return agent.TruncateSubagentReport(report)
 }
 
-func (sp *subagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, job, model string, depth int) (string, error) {
+// newChildRuntime creates and registers a nested child runtime for parent:
+// fresh session agent (model selection, label, depth, parent link), D6
+// approval forwarding, registry registration, and the subagent_started
+// broadcast. Returns the child runtime, its label, and the RAW (unwrapped)
+// job. Shared by the foreground Spawn and the background SpawnBackground so
+// the two cannot drift.
+func (sp *subagentSpawner) newChildRuntime(ctx context.Context, parent *agent.Agent, job, model string, depth int) (*sessionRuntime, string, string, error) {
 	s := sp.s
 	if parent == nil {
-		return "", fmt.Errorf("subagent: parent agent is nil")
+		return nil, "", "", fmt.Errorf("subagent: parent agent is nil")
 	}
 	parentRt, ok := s.registry.get(parent.SessionID)
 	if !ok {
-		return "", fmt.Errorf("subagent: parent session is not live")
+		return nil, "", "", fmt.Errorf("subagent: parent session is not live")
 	}
 
 	childID := sesspkg.NewID()
@@ -47,7 +71,7 @@ func (sp *subagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, job, 
 	child.SetParentID(parent.SessionID)
 	if model != "" {
 		if err := child.SelectModel(ctx, model); err != nil {
-			return "", fmt.Errorf("subagent model: %w", err)
+			return nil, "", "", fmt.Errorf("subagent model: %w", err)
 		}
 	} else if m := s.ws.GetRuntimeConfig().SubagentModel; m != "" {
 		// The configured default subagent model (settings modal) beats
@@ -73,7 +97,6 @@ func (sp *subagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, job, 
 	// subagent_started event keep the original job the parent wrote; only
 	// the child's first message carries the wrapped job.
 	rawJob := job
-	job = agent.FormatSubagentJob(job)
 
 	childRt := newSessionRuntimeWithHold(child, sp.approvalHold())
 	childRt.parentID = parent.SessionID
@@ -92,6 +115,19 @@ func (sp *subagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, job, 
 	// runtimes are cap-exempt, so register never evicts.
 	s.registry.register(childID, childRt)
 
+	// The child-scoped report tool delivers progress messages into the live
+	// parent session via the delivery service (queued when the parent is
+	// busy). Installed on every child — foreground and background — so the
+	// tool is exposed for the child's whole lifetime (llmTools gates it on
+	// ParentID + hook).
+	child.SetReportHook(func(text string) error {
+		// Delivered immediately when the parent is live; queued for its
+		// next registration otherwise — a progress report must not be lost
+		// to a parent that merely went idle with no viewers.
+		s.registry.deliverToParent(parent.SessionID, fmt.Sprintf("[subagent %s] %s", label, text))
+		return nil
+	})
+
 	parentRt.broadcast(WSMessage{
 		Type:           "subagent_started",
 		SessionID:      parent.SessionID,
@@ -100,8 +136,19 @@ func (sp *subagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, job, 
 		SubagentJob:    truncateJob(rawJob),
 		SubagentParent: parent.SessionID,
 	})
+	return childRt, label, rawJob, nil
+}
 
-	report, err := sp.runChildTurn(ctx, childRt, job)
+func (sp *subagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, job, model string, depth int) (string, error) {
+	s := sp.s
+	childRt, label, rawJob, err := sp.newChildRuntime(ctx, parent, job, model, depth)
+	if err != nil {
+		return "", err
+	}
+	childID := childRt.agent.SessionID
+	parentRt, _ := s.registry.get(parent.SessionID) // still live: registered above
+
+	report, err := sp.runChildTurn(ctx, childRt, agent.FormatSubagentJob(rawJob))
 	success := err == nil
 
 	// The child is persisted by its turn (doPersist); unregistering keeps
@@ -157,7 +204,6 @@ func (sp *subagentSpawner) runChildTurn(parentCtx context.Context, rt *sessionRu
 		}
 	}()
 	errCh := rt.stream.begin(streamCancel)
-	rt.setTurnActive(true, time.Now(), nil)
 
 	write := func(v WSMessage) {
 		if streamCtx.Err() != nil {
@@ -187,10 +233,20 @@ func (sp *subagentSpawner) runChildTurn(parentCtx context.Context, rt *sessionRu
 	resCh := make(chan turnResult, 1)
 	go func() {
 		defer rt.turnMu.Unlock()
-		rt.turnMu.Lock()
 		defer rt.stream.end()
-		defer rt.setTurnActive(false, time.Time{}, nil)
 		defer func() { errCh <- nil }()
+		rt.turnMu.Lock()
+		// The runtime may have been released while we waited for the lock
+		// (close/delete/release evict without holding turnMu): nothing to
+		// stream to. The defers above still run, so the stream's cancel
+		// handle is cleared (begin already ran) and cancelInFlight's errCh
+		// wait is released instead of blocking until the drain timeout. The
+		// caller's evicted check handles the rest.
+		if rt.evicted.Load() {
+			resCh <- turnResult{err: fmt.Errorf("child runtime was released while starting")}
+			return
+		}
+		defer rt.setTurnActive(false, time.Time{}, nil)
 		// Terminal frame for the child's OWN attached clients (a pane
 		// opened to watch the subagent): without turn_end the pane stays
 		// stuck in the "responding"/busy state forever — the client only
@@ -198,6 +254,12 @@ func (sp *subagentSpawner) runChildTurn(parentCtx context.Context, rt *sessionRu
 		// unregisters the runtime right after this returns. Mirrors the
 		// normal startTurn tail (broadcast while the lock is still held).
 		defer rt.broadcast(WSMessage{Type: "turn_end", SessionID: child.SessionID})
+		// Publish the turn as active ONLY while holding the lock: a window
+		// with turnActive=true but turnMu free would let a delivery/attach
+		// turn start concurrently and clobber the active flag (or run ahead
+		// of the child's own job). Mirrors startTurn, whose caller holds
+		// the lock.
+		rt.setTurnActive(true, time.Now(), nil)
 		appCtx := agent.ContextWithDeleteApprover(streamCtx, rt.approverOverride)
 		out, err := child.StreamProcessInputWithImages(appCtx, job, nil, handlers)
 		if err != nil {
@@ -220,6 +282,12 @@ func (sp *subagentSpawner) runChildTurn(parentCtx context.Context, rt *sessionRu
 
 	select {
 	case res := <-resCh:
+		// The turn is over (natural completion or child error): cancel the
+		// stream context so the parent-cancel watcher goroutine above
+		// terminates. With a background child parentCtx is
+		// context.Background() and never fires, so without this the
+		// watcher leaks for every child that finishes naturally.
+		streamCancel()
 		// A cancelled parent turn surfaces as a child error; translate it
 		// so the parent agent sees a clear reason.
 		if parentCtx.Err() != nil && res.err == nil {

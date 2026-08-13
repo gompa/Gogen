@@ -228,13 +228,45 @@ const defaultBackgroundJobRetain = 5 * time.Minute
 // field overrides it (0 = this default).
 const defaultMaxFinishedBackgroundJobs = 32
 
+// maxJobNoticeCommandLen caps the command echoed in a job-completion
+// notice: long commands (and any secrets embedded in them) must not be
+// dumped into the transcript.
+const maxJobNoticeCommandLen = 120
+
+// jobExitSummary renders the one-line job-completion notice: id, truncated
+// command, and exit code (-1 for unusual failures such as I/O errors).
+// Called from the job's wait goroutine after exitErr is final.
+func jobExitSummary(job *BackgroundJob) string {
+	code := 0
+	if job.exitErr != nil {
+		var exitErr *exec.ExitError
+		if errors.As(job.exitErr, &exitErr) {
+			code = exitErr.ExitCode()
+		} else {
+			code = -1
+		}
+	}
+	cmd := job.Command
+	if len(cmd) > maxJobNoticeCommandLen {
+		// Truncate on a rune boundary: the byte-slice version could split
+		// a multi-byte character and emit invalid UTF-8 into the transcript.
+		cmd = string([]rune(cmd)[:maxJobNoticeCommandLen]) + "…"
+	}
+	return fmt.Sprintf("[job] %s (%s) exited with code %d", job.ID, cmd, code)
+}
+
 // onJobFinished runs in the job's wait goroutine once the process has
 // exited: it enforces the finished-job cap (reaping the oldest finished jobs
-// when the cap is exceeded) and arms the retention timer that reaps THIS job
-// once its result has been pollable long enough.
+// when the cap is exceeded), arms the retention timer that reaps THIS job
+// once its result has been pollable long enough, and — when the job finished
+// naturally (not cancelled) and a notice hook is installed — fires the
+// completion notice so the session is told without polling.
 func (a *Agent) onJobFinished(job *BackgroundJob) {
 	a.enforceFinishedJobCap(job)
 	a.armJobReaper(job)
+	if !job.cancelled.Load() {
+		a.fireJobNotice(jobExitSummary(job))
+	}
 }
 
 // enforceFinishedJobCap reaps the oldest finished jobs when more than

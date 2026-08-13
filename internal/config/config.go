@@ -185,6 +185,20 @@ type Config struct {
 	// built-in default). The {job} placeholder is substituted with the
 	// tool call's job text.
 	SubagentPrompt string
+	// AgentInstructions enables loading AGENTS.md / CLAUDE.md workspace
+	// instruction files ("on"/"off"; default off). When disabled the files
+	// are never read; when enabled they are appended BELOW the project
+	// guidelines (.gogen/gogen.md stays authoritative) with byte caps.
+	AgentInstructions string
+	// Skills enables the skill tool ("on"/"off"; default off). When
+	// disabled the tool is not registered. Config-only in v1 (env/file —
+	// no web settings toggle).
+	Skills string
+	// JobNotices enables background-job completion notices ("on"/"off";
+	// default off): when a background shell job finishes naturally, a
+	// summary is injected into the session as a user message and a turn
+	// runs on it. Config-only in v1 (env/file — no web settings toggle).
+	JobNotices string
 }
 
 // Defaults returns built-in default configuration values.
@@ -229,6 +243,9 @@ func Defaults() Config {
 		Board:                     "off",
 		Subagent:                  "off",
 		SubagentMaxDepth:          DefaultSubagentMaxDepth,
+		AgentInstructions:         "off",
+		Skills:                    "off",
+		JobNotices:                "off",
 	}
 }
 
@@ -272,6 +289,26 @@ func (c *Config) BoardEnabled() bool {
 // Opt-in: the tool is not registered unless subagent is explicitly enabled.
 func (c *Config) SubagentEnabled() bool {
 	return c != nil && configOn(c.Subagent)
+}
+
+// AgentInstructionsEnabled reports whether AGENTS.md/CLAUDE.md workspace
+// instruction files are loaded. Opt-in: the files are never read unless
+// agent_instructions is explicitly enabled.
+func (c *Config) AgentInstructionsEnabled() bool {
+	return c != nil && configOn(c.AgentInstructions)
+}
+
+// SkillsEnabled reports whether the skill tool is active. Opt-in: the tool
+// is not registered unless skills is explicitly enabled.
+func (c *Config) SkillsEnabled() bool {
+	return c != nil && configOn(c.Skills)
+}
+
+// JobNoticesEnabled reports whether background-job completion notices are
+// active. Opt-in: no notice hook is installed unless job_notices is
+// explicitly enabled.
+func (c *Config) JobNoticesEnabled() bool {
+	return c != nil && configOn(c.JobNotices)
 }
 
 // SubagentDepth returns the effective maximum subagent nesting depth

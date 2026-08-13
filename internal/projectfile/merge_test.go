@@ -178,6 +178,66 @@ func TestMergePreservesNegativeSessionMaxAgeDays(t *testing.T) {
 // The board/subagent feature flags follow the opt-in MCP pattern: env >
 // file > defaults, with GOGEN_SUBAGENT_MAX_DEPTH falling back to the default
 // when unset/zero.
+// TestMergeAgentInstructionsFlag pins the agent_instructions feature flag
+// merge: default off, file value applies, env overrides file.
+func TestMergeAgentInstructionsFlag(t *testing.T) {
+	os.Unsetenv("GOGEN_AGENT_INSTRUCTIONS")
+	if Merge(nil, FlagOverrides{}).AgentInstructionsEnabled() {
+		t.Fatal("agent_instructions should default off")
+	}
+	pf, err := ParseContent("GOGEN.md", "---\nagent_instructions: on\n---\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !Merge(pf, FlagOverrides{}).AgentInstructionsEnabled() {
+		t.Fatal("file agent_instructions: on should enable")
+	}
+	t.Setenv("GOGEN_AGENT_INSTRUCTIONS", "off")
+	if Merge(pf, FlagOverrides{}).AgentInstructionsEnabled() {
+		t.Fatal("env off should override file on")
+	}
+}
+
+// TestMergeSkillsFlag pins the skills feature flag merge: default off,
+// file value applies, env overrides file.
+func TestMergeSkillsFlag(t *testing.T) {
+	os.Unsetenv("GOGEN_SKILLS")
+	if Merge(nil, FlagOverrides{}).SkillsEnabled() {
+		t.Fatal("skills should default off")
+	}
+	pf, err := ParseContent("GOGEN.md", "---\nskills: on\n---\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !Merge(pf, FlagOverrides{}).SkillsEnabled() {
+		t.Fatal("file skills: on should enable")
+	}
+	t.Setenv("GOGEN_SKILLS", "off")
+	if Merge(pf, FlagOverrides{}).SkillsEnabled() {
+		t.Fatal("env off should override file on")
+	}
+}
+
+// TestMergeJobNoticesFlag pins the job_notices feature flag merge: default
+// off, file value applies, env overrides file.
+func TestMergeJobNoticesFlag(t *testing.T) {
+	os.Unsetenv("GOGEN_JOB_NOTICES")
+	if Merge(nil, FlagOverrides{}).JobNoticesEnabled() {
+		t.Fatal("job_notices should default off")
+	}
+	pf, err := ParseContent("GOGEN.md", "---\njob_notices: on\n---\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !Merge(pf, FlagOverrides{}).JobNoticesEnabled() {
+		t.Fatal("file job_notices: on should enable")
+	}
+	t.Setenv("GOGEN_JOB_NOTICES", "off")
+	if Merge(pf, FlagOverrides{}).JobNoticesEnabled() {
+		t.Fatal("env off should override file on")
+	}
+}
+
 func TestMergeBoardSubagentFlags(t *testing.T) {
 	for _, env := range []string{"GOGEN_BOARD", "GOGEN_SUBAGENT", "GOGEN_SUBAGENT_MAX_DEPTH"} {
 		os.Unsetenv(env)

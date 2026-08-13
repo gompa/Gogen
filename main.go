@@ -162,6 +162,12 @@ func run() error {
 		return nil
 	}
 
+	// Workspace instruction files (AGENTS.md / CLAUDE.md) are merged below
+	// the project guidelines at VIEW-BUILD time from the agent's current
+	// working dir (agent.EffectiveGuidelines), so a /dir or web workspace
+	// change re-renders them and the content is never baked into a saved
+	// .gogen/gogen.md.
+
 	if cfg.OpenAIKey == "" {
 		fmt.Fprintf(os.Stderr, "Warning: OPENAI_API_KEY is not set. Some endpoints may require an API key.\n")
 	}

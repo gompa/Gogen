@@ -61,7 +61,7 @@ func (a *Agent) wireViewForDebug() []llm.Message {
 		a.statsMu.Unlock()
 	}
 	a.stabilizeToolArgs()
-	view := buildSystemView(a.Messages, a.WorkingDir, a.ProjectFilePath, a.ProjectGuidelines, a.ensureProjectProfile(), a.Mode)
+	view := buildSystemView(a.Messages, a.WorkingDir, a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode)
 	return view
 }
 

@@ -49,6 +49,11 @@ let diffStatText = ''; // "+N −M" summary for the unstaged-diff pane
 let diffChangeCount = 0; // number of hunks in the unstaged-diff pane (nav buttons)
 let refDecorationIds = []; // range-highlight decorations from chat references
 const markerCounts = new Map(); // path -> { errors, warnings }
+// Paths of folders currently expanded in the editor's file tree. The tree is
+// rebuilt from scratch by refreshExplorer (socket reconnect, pane switch,
+// refresh button); only this set survives a rebuild — loadTree restores
+// expansion from it so a refresh never collapses folders the user opened.
+const expandedDirs = new Set();
 
 function $(id) {
   return document.getElementById(id);
@@ -1237,18 +1242,18 @@ async function openFile(path, line, endLine) {
     // tab's edits to make room.
     if (openOrder.length >= GOGEN_UI.maxOpenTabs && !findEvictionVictim()) {
       toast(`All ${GOGEN_UI.maxOpenTabs} tabs have unsaved changes — save or close one first`, 'info');
-      return;
+      return false;
     }
     let data;
     try {
       data = await wsRequest('fs_read', { path });
     } catch (err) {
       toast(`Cannot open ${basename(path)}: ${err.message || 'read failed'}`, 'error');
-      return;
+      return false;
     }
     if (data.error) {
       toast(`Cannot open ${basename(path)}: ${data.error}`, 'error');
-      return;
+      return false;
     }
     const model = monaco.editor.createModel(data.content || '', data.language || 'plaintext');
     buffers.set(path, {
@@ -1268,14 +1273,17 @@ async function openFile(path, line, endLine) {
     editor.focus();
     highlightRefRange(line, endLine);
   }
-  // Optional: switch to Editor pane when opening a file from chat
-  if (localStorage.getItem('gogen_file_click_behavior') === 'open-switch') {
-    switchToEditorPane();
-  }
+  return true;
 }
 
 export async function openFileAtLine(path, line, endLine) {
-  await openFile(path, line, endLine);
+  const ok = await openFile(path, line, endLine);
+  // "Open & switch to editor" applies to file references opened from chat
+  // (this is the chat entry point). Tree and find-in-files clicks call
+  // openFile directly and must never switch panes or re-render the tree.
+  if (ok && localStorage.getItem('gogen_file_click_behavior') === 'open-switch') {
+    switchToEditorPane();
+  }
 }
 
 /**
@@ -1394,9 +1402,11 @@ async function loadTree(path, container) {
         const open = child.style.display !== 'none';
         if (open) {
           child.style.display = 'none';
+          expandedDirs.delete(ent.path);
           return;
         }
         child.style.display = 'block';
+        expandedDirs.add(ent.path);
         if (!child.dataset.loaded) {
           child.dataset.loaded = '1';
           await loadTree(ent.path, child);
@@ -1404,6 +1414,13 @@ async function loadTree(path, container) {
       };
       container.appendChild(row);
       container.appendChild(child);
+      // Rebuilds (refreshExplorer) wipe the DOM, so re-expand folders the
+      // user had open and lazily load their children, same as a click.
+      if (expandedDirs.has(ent.path)) {
+        child.style.display = 'block';
+        child.dataset.loaded = '1';
+        await loadTree(ent.path, child);
+      }
     } else {
       row.onclick = () => openFile(ent.path);
       container.appendChild(row);
@@ -1451,13 +1468,21 @@ export function focusFindInFiles() {
 }
 
 function switchToEditorPane() {
+  const editorPane = $('editor-pane');
+  const alreadyActive = !!editorPane && editorPane.classList.contains('active');
   document.querySelectorAll('.main-tab').forEach((t) => {
     t.classList.toggle('active', t.dataset.pane === 'editor');
   });
   document.querySelectorAll('.pane').forEach((p) => {
     p.classList.toggle('active', p.id === 'editor-pane');
   });
-  initMonaco().then(() => refreshExplorer()).catch(() => {});
+  // Refresh the explorer only when actually entering the pane. Re-rendering
+  // while already active would rebuild the file tree from the root and
+  // collapse every expanded folder (openFile -> switchToEditorPane under the
+  // "Open & switch to editor" chat setting).
+  if (!alreadyActive) {
+    initMonaco().then(() => refreshExplorer()).catch(() => {});
+  }
 }
 
 async function runFindInFiles(pattern) {

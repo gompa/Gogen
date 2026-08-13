@@ -4,6 +4,7 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	"gogen/internal/skills"
 )
 
 // SessionAgentOptions carries the shared per-session agent wiring used by
@@ -48,6 +49,14 @@ type SessionAgentOptions struct {
 	// server passes its single workspace manager so all sessions share one;
 	// the TUI creates one per process.
 	BoardManager *BoardManager
+	// InstructionsEnabled mirrors the config agent_instructions flag; the
+	// agent renders the AGENTS.md/CLAUDE.md section from its working dir
+	// at construction and on every working-dir change.
+	InstructionsEnabled bool
+	// SkillsManager is the shared skill discovery manager (nil when
+	// disabled). Skills is config-only in v1: the flag and manager are set
+	// once at construction, never toggled live.
+	SkillsManager *skills.Manager
 	// SubagentSpawner runs nested sessions (nil when unavailable; the
 	// subagent tool additionally requires the feature flag).
 	SubagentSpawner SubagentSpawner
@@ -72,6 +81,10 @@ func NewSessionAgent(opts SessionAgentOptions, snap *SessionSnapshot, id string)
 	a := NewAgent(opts.Provider, opts.Executor, ctxMgr)
 	a.GlobalMode = opts.GlobalMode
 	a.SetProjectContext(opts.ProjectFilePath, opts.ProjectGuidelines, opts.TestCommand, opts.LintCommand)
+	// Enable instructions BEFORE SetWorkingDir below: the working-dir
+	// seeding refreshes the instruction section, and must happen with the
+	// flag already on.
+	a.SetInstructionsEnabled(opts.InstructionsEnabled)
 	// The workspace dir is authoritative for the agent's own WorkingDir and
 	// the shared executor: NewAgent seeds both from the executor, which may
 	// lag the workspace working dir in the window between a client's
@@ -93,6 +106,10 @@ func NewSessionAgent(opts SessionAgentOptions, snap *SessionSnapshot, id string)
 	a.SetSubagentsEnabled(opts.SubagentsEnabled)
 	a.SetSubagentMaxDepth(opts.SubagentMaxDepth)
 	a.SetBoardManager(opts.BoardManager)
+	a.SetSkillsManager(opts.SkillsManager)
+	if opts.SkillsManager != nil {
+		a.SetSkillsEnabled(true)
+	}
 	a.SetSubagentSpawner(opts.SubagentSpawner)
 	if snap != nil {
 		a.RestoreSession(*snap, id)

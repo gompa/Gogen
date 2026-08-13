@@ -412,6 +412,66 @@ func TestSessionsPayloadIncludesNested(t *testing.T) {
 	}
 }
 
+// TestSpawnParentEvictedWhileChildRuns pins the eviction window in the
+// foreground Spawn: when the parent session is torn down (close ✕, delete,
+// cap eviction, shutdown) while its subagent's turn is still running, the
+// child is cancelled through the parent context and Spawn must unwind with
+// an error — no panic (the post-turn broadcasts target the stale parent
+// runtime, a no-op once evicted) and no hang.
+func TestSpawnParentEvictedWhileChildRuns(t *testing.T) {
+	entered := make(chan struct{})
+	s, a := newContinuableServer(t, func() llm.LLMProvider {
+		p := llm.NewMockProvider()
+		// The child's turn blocks inside the provider until cancelled;
+		// entered fires when the child's stream actually opens (i.e. the
+		// child is registered and its turn is running).
+		p.OnStream = func(ctx context.Context, _ []llm.Message, h *llm.StreamHandlers) (*llm.StreamResult, error) {
+			if h != nil && h.OnStreamOpened != nil {
+				h.OnStreamOpened()
+			}
+			close(entered)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return p
+	})
+	sp := continuableSpawner(t, s)
+	a.SetSubagentsEnabled(true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := sp.Spawn(ctx, a, "long job", "", 0)
+		done <- err
+	}()
+
+	// Wait until the child's turn is running (registered + stream open),
+	// then tear the parent down the way session_close does.
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("child turn never started")
+	}
+	parentRt, ok := s.registry.get(a.SessionID)
+	if !ok {
+		t.Fatal("parent runtime missing")
+	}
+	s.registry.closeRuntime(parentRt)
+	// The parent's stream context dies with the turn (closeRuntime's
+	// cancelInFlight): release the spawn goroutine so the child turn
+	// unwinds through the parent context.
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("spawn must fail after the parent session was evicted")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("spawn did not unwind after parent eviction")
+	}
+}
+
 // blockingProvider streams nothing and blocks until ctx is done.
 type blockingProvider struct{}
 

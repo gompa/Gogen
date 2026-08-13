@@ -12,7 +12,10 @@ GoGen is a self-hosted, terminal or web-based coding assistant that can explore,
 - **Command Execution** — Run shell commands with configurable safety modes (blocklist / allowlist / off); `execute_command` can also run commands **in the background** (returns a job id pollable/cancellable via `background_job` with `action=status` / `action=cancel`)
 - **Vision Input** — Paste or attach images in the web UI; they are sent to vision-capable models as image content alongside your prompt
 - **Project Board** — Opt-in kanban board (`.gogen/board/`, one file per ticket) with items available for agents to fix; full drag-and-drop board tab in the web UI and a `board` tool (list/show/add/claim/move/block/comment/done). Live-toggleable from the web settings modal (`board: on`); the board tab is hidden while disabled
-- **Subagents** — Opt-in `subagent` tool that spawns a nested agent session for a job and reports back. Children appear as attachable nested rows in the web sidebar (open one to watch or Cancel a stuck subagent) and in the TUI's `/subagents` modal; transcripts persist under their parent (capped at 10 per parent). `subagent_max_depth` (default 1) controls nesting — by default subagents cannot spawn subagents
+- **Subagents** — Opt-in `subagent` tool that spawns a nested agent session for a job and reports back. Children appear as attachable nested rows in the web sidebar (open one to watch or Cancel a stuck subagent) and in the TUI's `/subagents` modal; transcripts persist under their parent (capped at 10 per parent). `subagent_max_depth` (default 1) controls nesting — by default subagents cannot spawn subagents. With `subagent: on` in web mode, the tool additionally accepts `run_in_background` and the continuable family is registered: `subagent_fork` (a child seeded with a deep copy of this session's history), `list_agents`, `send_message`, `interrupt_agent`, and the child-scoped `report`. Background children that are no longer running (finished or interrupted) stay interactable for a retention window, then their runtime is released (the saved session stays attachable); closing a parent session cancels its running children.
+- **Job Notices** — Opt-in `job_notices: on`: when a background command (`execute_command background=true`) finishes naturally, a one-line summary is injected into the session and a turn runs on it — no polling.
+- **Skills** — Opt-in `skills: on`: a `skill` tool lists and reads structured instructions from `<project>/.gogen/skills` (bundle dirs `SKILL.md` or flat `<name>.md`) and `~/.config/gogen/skills`.
+- **Workspace Instructions** — Opt-in `agent_instructions: on`: loads `AGENTS.md` / `CLAUDE.md` from the working directory up to the project root (`.git`/`.hg` marker), appended below the project guidelines with byte caps.
 - **Human-in-the-Loop** — Requires explicit approval for destructive actions (file deletes)
 - **Context Management** — Auto-compacts conversation history when nearing token limits to stay within model context windows
 - **Project Config** — Separate `.gogen/gogen.conf` (YAML) for settings and `.gogen/gogen.md` (or `GOGEN.md`) for guidelines. Precedence: **env > CLI flags > .conf > defaults**.
@@ -142,6 +145,9 @@ mcp_servers:
 board: on          # project kanban board (board tool + web board tab)
 subagent: on       # subagent tool (nested sessions)
 subagent_max_depth: 2  # max nesting; 1 (default) = subagents cannot spawn subagents
+job_notices: off   # notify the session when a background command finishes
+skills: off        # skill tool (list/read over .gogen/skills + ~/.config/gogen/skills)
+agent_instructions: off  # load AGENTS.md / CLAUDE.md workspace instruction files
 web_bind: 0.0.0.0:8080  # web listen address (restart-staged; also GOGEN_WEB_BIND / --host)
 # Configurable prompt templates ("" = the built-in default):
 board_start_prompt: "You have been assigned board ticket #{id}: {title}..."  # board "Start agent" prompt
@@ -276,6 +282,9 @@ These can be set in `.gogen/gogen.conf` only — there is no CLI flag or environ
 | `GOGEN_BOARD_START_PROMPT` | *(empty)* | Template for the agent started from a board ticket (`{id}` `{title}` `{description}` `{priority}` `{context}`; empty = built-in default) |
 | `GOGEN_SYSTEM_PROMPT` | *(empty)* | Custom system prompt template (`{working_dir}`; replaces the built-in base prompt; project rules and plan mode still apply; empty = built-in default) |
 | `GOGEN_SUBAGENT_PROMPT` | *(empty)* | Template wrapping subagent jobs (`{job}`; empty = built-in default) |
+| `GOGEN_JOB_NOTICES` | off | Set to `on` to notify the session when a background command finishes (injects a summary + runs a turn) |
+| `GOGEN_SKILLS` | off | Set to `on` to enable the skill tool (`skill` list/read over `.gogen/skills` + `~/.config/gogen/skills`) |
+| `GOGEN_AGENT_INSTRUCTIONS` | off | Set to `on` to load `AGENTS.md` / `CLAUDE.md` workspace instruction files (below the project guidelines) |
 
 ### Session persistence
 

@@ -24,6 +24,11 @@ const (
 	FocusViewport
 )
 
+// maxPendingDeliveries caps queued system deliveries (job notices,
+// subagent reports), mirroring the web delivery queue: overflow drops the
+// OLDEST delivery — a stale job notice is worse than none.
+const maxPendingDeliveries = 8
+
 // ModalKind identifies the active modal overlay.
 type ModalKind int
 
@@ -141,6 +146,14 @@ type Model struct {
 	approvalResult   chan bool
 	approvalUI       *approvalUIState
 	approvalInFlight bool
+
+	// System message deliveries (job notices, subagent reports) queued by
+	// program.Send(deliveryRequestMsg) from background goroutines; drained
+	// on the Update thread only when no turn is streaming.
+	pendingDeliveries []string
+	// deliveryDrops counts deliveries dropped on queue overflow; rendered
+	// as a system line at the next drain (never mid-stream).
+	deliveryDrops int
 
 	// Modal data
 	sessionList   []agent.SessionInfo

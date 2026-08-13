@@ -91,6 +91,18 @@ func (m *Model) handleMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case approvalRequestMsg:
 		return m.handleApprovalRequestMsg(msg)
 
+	// System message delivery (queue + drain when idle)
+	case deliveryRequestMsg:
+		if len(m.pendingDeliveries) >= maxPendingDeliveries {
+			// Overflow: drop the OLDEST queued delivery (freshness wins —
+			// a stale job notice is worse than none), mirroring the web
+			// delivery queue. The drop is reported at the next drain.
+			m.pendingDeliveries = m.pendingDeliveries[1:]
+			m.deliveryDrops++
+		}
+		m.pendingDeliveries = append(m.pendingDeliveries, msg.text)
+		return m, m.drainDeliveries()
+
 	// Pass mouse events to the viewport for wheel scrolling
 	case tea.MouseMsg:
 		return m.handleMouseMsg(msg)
@@ -242,12 +254,12 @@ func (m *Model) handleStreamRoundEndMsg() (tea.Model, tea.Cmd) {
 func (m *Model) handleStreamEndMsg() (tea.Model, tea.Cmd) {
 	// Always process – resets streaming state
 	m.handleStreamEnd()
-	return m, m.refocusInput()
+	return m, tea.Batch(m.refocusInput(), m.drainDeliveries())
 }
 
 func (m *Model) handleStreamErrorMsg(msg streamErrorMsg) (tea.Model, tea.Cmd) {
 	m.handleStreamError(msg.err)
-	return m, m.refocusInput()
+	return m, tea.Batch(m.refocusInput(), m.drainDeliveries())
 }
 
 func (m *Model) handleContextStatsMsg(msg contextStatsMsg) (tea.Model, tea.Cmd) {

@@ -399,6 +399,13 @@ func (s *Server) sessionDelete(ctx context.Context, ws *wsConn, pane **sessionRu
 		// ordering is unchanged.
 		s.registry.remove(id)
 		rt.broadcast(WSMessage{Type: "session_removed", SessionID: id})
+		// Session delete is an explicit teardown: the deleted session's
+		// background subagent children are cancelled and released.
+		s.registry.fireEvictHook(id)
+		// The file is gone, so the session can never be reopened: drop any
+		// queued deliveries for it (subagent completions/reports) instead
+		// of letting the queue linger in memory.
+		s.registry.clearParentDeliveries(id)
 		// Detach ALL attached clients, not just the requesting connection:
 		// the deleted session may be a BACKGROUND pane of this connection or
 		// a pane of another tab, and leaving any socket in the removed

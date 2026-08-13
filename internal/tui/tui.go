@@ -15,6 +15,11 @@ import (
 const assistantLabel = "GoGen:"
 const userLabel = "You:"
 
+// noticeLabel prefixes system-delivered messages (job notices, subagent
+// reports): they are injected as user messages in the transcript, but
+// rendering them as "You:" would imply the user typed them.
+const noticeLabel = "Notice:"
+
 // TUI runs the terminal UI.
 type TUI struct {
 	agent *agent.Agent
@@ -37,6 +42,17 @@ func New(a *agent.Agent, cfg *config.Config) *TUI {
 	// so the status bar re-renders even while the terminal is idle.
 	if a != nil {
 		a.OnModelChanged = t.ForceRender
+	}
+	// Job-completion notices: queue a delivery message on the tea loop
+	// (deliveryRequestMsg) so the notice renders and runs a turn at the
+	// next idle boundary. The program may not have started yet (a job
+	// finishing before Run) — then the notice is dropped (at-most-once).
+	if a != nil && cfg != nil && cfg.JobNoticesEnabled() {
+		a.SetJobNoticeHook(func(summary string) {
+			if p := t.program.Load(); p != nil {
+				p.Send(deliveryRequestMsg{text: summary})
+			}
+		})
 	}
 	return t
 }

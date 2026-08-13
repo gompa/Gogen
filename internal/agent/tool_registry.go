@@ -81,6 +81,33 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error
 	if a.SubagentsEnabled() && tc.Name == "subagent" && !a.mcpRegistryHas("subagent") {
 		return handleSubagent(ctx, a, tc.Args)
 	}
+	if a.SubagentsEnabled() && a.continuableSpawner() != nil {
+		switch tc.Name {
+		case "subagent_fork":
+			if !a.mcpRegistryHas("subagent_fork") {
+				return handleSubagentFork(ctx, a, tc.Args)
+			}
+		case "list_agents":
+			if !a.mcpRegistryHas("list_agents") {
+				return handleListAgents(ctx, a, tc.Args)
+			}
+		case "send_message":
+			if !a.mcpRegistryHas("send_message") {
+				return handleSendMessage(ctx, a, tc.Args)
+			}
+		case "interrupt_agent":
+			if !a.mcpRegistryHas("interrupt_agent") {
+				return handleInterruptAgent(ctx, a, tc.Args)
+			}
+		case "report":
+			if a.ParentID() != "" && a.ReportHook() != nil && !a.mcpRegistryHas("report") {
+				return handleReport(ctx, a, tc.Args)
+			}
+		}
+	}
+	if a.SkillsEnabled() && tc.Name == "skill" && !a.mcpRegistryHas("skill") {
+		return handleSkill(ctx, a, tc.Args)
+	}
 	if a.mcpRegistryHas(tc.Name) {
 		return a.MCPRegistry.CallTool(ctx, tc.Name, tc.Args)
 	}

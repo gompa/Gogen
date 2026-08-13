@@ -90,6 +90,30 @@ type sessionRuntime struct {
 	// runtimes are exempt from the active-session cap eviction: evicting a
 	// running child mid-task would strand the parent's waiting tool call.
 	nested bool
+	// held marks runtimes whose lifecycle must survive orphan eviction
+	// (background continuable subagents): with no clients and no running
+	// turn they would otherwise be evicted right after their turn ends.
+	// Set by the spawner, cleared when the runtime is released.
+	held atomic.Bool
+
+	// deliverMu guards pendingDeliver; deliverWorker gates the single
+	// delivery worker; deliverNotify wakes it at turn end (see deliver.go).
+	deliverMu      sync.Mutex
+	pendingDeliver []string
+	deliverWorker  atomic.Bool
+	deliverNotify  chan struct{}
+
+	// turnEndHook is invoked after every turn ends (setTurnActive
+	// active→false, turnMu still held). The continuable-subagent registry
+	// uses it to capture a send_message reply. Set once at child creation;
+	// never reassigned, so a plain field is race-free.
+	turnEndHook func()
+	// deliverStartHook is invoked by the delivery worker immediately before
+	// it starts a delivered turn (see deliver.go). The continuable-subagent
+	// registry uses it to arm reply capture exactly when a send_message
+	// delivery actually starts — not when it was queued. Set once at child
+	// creation; never reassigned.
+	deliverStartHook func()
 	// approverOverride replaces the default deleteApprover when non-nil
 	// (the subagent spawner installs the D6 forwarding approver; the board
 	// start installs a deny-when-unattended approver).
@@ -114,10 +138,11 @@ type pendingApproval struct {
 // initialized. The agent must be non-nil.
 func newSessionRuntime(a *agent.Agent) *sessionRuntime {
 	return &sessionRuntime{
-		agent:     a,
-		stream:    &wsConnStream{},
-		approvals: make(map[string]*pendingApproval),
-		clients:   make(map[*wsConn]struct{}),
+		agent:         a,
+		stream:        &wsConnStream{},
+		approvals:     make(map[string]*pendingApproval),
+		clients:       make(map[*wsConn]struct{}),
+		deliverNotify: make(chan struct{}, 1),
 	}
 }
 
@@ -489,13 +514,27 @@ func (rt *sessionRuntime) evictOrphanedIfPossible() {
 }
 
 // setTurnActive records whether a turn is running (session_state payload) and
-// which connection owns it.
+// which connection owns it. The active→false transition also wakes the
+// delivery worker (signalDeliveries): every turn runner calls this on exit,
+// so pending system messages are flushed exactly when a turn ends.
 func (rt *sessionRuntime) setTurnActive(active bool, startedAt time.Time, owner *wsConn) {
 	rt.stateMu.Lock()
 	rt.turnActive = active
 	rt.startedAt = startedAt
 	rt.turnOwner = owner
 	rt.stateMu.Unlock()
+	if !active {
+		rt.signalDeliveries()
+		rt.fireTurnEndHook()
+	}
+}
+
+// fireTurnEndHook invokes the runtime's turn-end hook, if any (called with
+// turnMu still held by the ending turn — the hook must not acquire it).
+func (rt *sessionRuntime) fireTurnEndHook() {
+	if rt.turnEndHook != nil {
+		rt.turnEndHook()
+	}
 }
 
 // turnState returns the current turn-active flag and start time.
@@ -591,6 +630,23 @@ type sessionRegistry struct {
 	agents    map[string]*sessionRuntime
 	order     []string // session ids in registration order (LRU eviction, §4)
 	maxActive int
+
+	// evictHook is invoked with a session id after its runtime is evicted
+	// (cap eviction, session close, delete, shutdown, child release) —
+	// deliberately NOT orphan eviction, see fireEvictHook. The web server
+	// wires it to cancel the session's background subagent children. Set
+	// once at construction; never reassigned.
+	evictHook func(sessionID string)
+
+	// parentDeliverMu guards parentDeliveries, the per-parent queue of
+	// system messages (background-subagent completion notices, reports,
+	// replies) for sessions whose runtime is not live. The spawner queues
+	// when the parent is evicted or closed while its children keep
+	// running; register() flushes the queue into the fresh runtime when
+	// the session is next loaded — "deliver once it is live again"
+	// (deliverToParent).
+	parentDeliverMu  sync.Mutex
+	parentDeliveries map[string][]string
 }
 
 func newSessionRegistry(maxActive int) *sessionRegistry {
@@ -598,8 +654,9 @@ func newSessionRegistry(maxActive int) *sessionRegistry {
 		maxActive = config.DefaultWebMaxActiveSessions
 	}
 	return &sessionRegistry{
-		agents:    make(map[string]*sessionRuntime),
-		maxActive: maxActive,
+		agents:           make(map[string]*sessionRuntime),
+		maxActive:        maxActive,
+		parentDeliveries: make(map[string][]string),
 	}
 }
 
@@ -699,7 +756,16 @@ func (r *sessionRegistry) register(id string, rt *sessionRuntime) []string {
 		// sweeps REGISTERED sessions — an unattended attachment here would
 		// leak the socket in the evicted runtime's clients set.
 		victim.detachAllClients()
+		// Cap eviction is an explicit teardown: the session's background
+		// subagent children are cancelled and released.
+		r.fireEvictHook(victimIDs[i])
 	}
+	// A session re-registered after eviction/close may have queued
+	// deliveries (background-subagent completions/reports queued while its
+	// runtime was not live); flush them into the fresh runtime now that
+	// the session is live again. Outside r.mu: deliverToSession can
+	// broadcast (bounded by the send-queue timeout).
+	r.flushParentDeliveries(id, rt)
 	return victimIDs
 }
 
@@ -746,6 +812,19 @@ func (r *sessionRegistry) evictRuntime(rt *sessionRuntime) {
 	rt.detachAllClients()
 }
 
+// fireEvictHook invokes the registry's eviction hook for id (the web server
+// wires it to cancel the session's background subagent children). Called by
+// the EXPLICIT teardown paths (session_close, delete, cap eviction,
+// shutdown, child release) — deliberately NOT by orphan eviction: a parent
+// that merely went idle with no viewers is reopened by id, and its children
+// keep running until then — their completion notices and reports are queued
+// (deliverToParent) and delivered once the parent session is live again.
+func (r *sessionRegistry) fireEvictHook(id string) {
+	if r.evictHook != nil {
+		r.evictHook(id)
+	}
+}
+
 // closeRuntime cancels any in-flight turn (draining it ≤ wsStreamDrainWait),
 // then evicts the runtime. Used by the explicit session_close message: the
 // user pressed ✕ on the pane — stop the session and put it back in the saved
@@ -762,6 +841,9 @@ func (r *sessionRegistry) closeRuntime(rt *sessionRuntime) {
 		defer rt.turnMu.Unlock()
 	}
 	r.evictRuntime(rt)
+	// Explicit close: the session is gone for good (until reopened) — its
+	// background subagent children are cancelled and released.
+	r.fireEvictHook(rt.agent.SessionID)
 }
 
 // evictOrphaned unregisters a runtime with no attached clients and no running
@@ -787,6 +869,18 @@ func (r *sessionRegistry) evictOrphaned(rt *sessionRuntime) {
 		return
 	}
 	if active, _ := rt.turnState(); active {
+		return
+	}
+	// A runtime with queued system deliveries is not idle: evicting it now
+	// would strand the delivery worker (the evicted flag makes it drop the
+	// queue). The worker's final turn-end re-check evicts once drained.
+	if rt.hasPendingDeliveries() {
+		return
+	}
+	// Held runtimes (background continuable subagents) are exempt from
+	// orphan eviction for their whole lifecycle; the spawner releases them
+	// explicitly.
+	if rt.held.Load() {
 		return
 	}
 	if !rt.turnMu.TryLock() {
@@ -918,6 +1012,9 @@ func (s *Server) ShutdownSessions() {
 		rt.agent.FlushPending()
 		// Kill background jobs so no command outlives the process.
 		rt.agent.Close()
+		// Shutdown is an explicit teardown: the session's background
+		// subagent children are cancelled and released.
+		s.registry.fireEvictHook(ids[i])
 	}
 }
 

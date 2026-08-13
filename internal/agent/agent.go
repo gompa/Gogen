@@ -15,6 +15,7 @@ import (
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
 	"gogen/internal/projectfile"
+	"gogen/internal/skills"
 )
 
 // persistMinInterval is the minimum time between debounced session writes.
@@ -207,6 +208,22 @@ type Agent struct {
 	// enabled; the nil-guard mirrors the MCP registry contract.
 	boardManager atomic.Pointer[BoardManager]
 
+	// skillsEnabled mirrors the config skills flag; skillsManager is the
+	// shared skill discovery manager (one per workspace in web mode, per
+	// agent in TUI/CLI). Both follow the board pattern: the tool is exposed
+	// only when the flag is on AND the manager is installed.
+	skillsEnabled atomic.Bool
+	skillsManager atomic.Pointer[skills.Manager]
+
+	// instructionsEnabled mirrors the config agent_instructions flag
+	// (config-only, set at construction). workspaceInstructions is the
+	// rendered AGENTS.md/CLAUDE.md section for the CURRENT working dir,
+	// refreshed on every working-dir change so the system prompt never
+	// carries a stale project's instructions.
+	instructionsEnabled   atomic.Bool
+	instructionsMu        sync.RWMutex
+	workspaceInstructions string
+
 	// spawnerMu guards spawner (the nested-session runner installed once at
 	// startup by the server/TUI). Reads happen per turn (llmTools,
 	// executeTool), so the guard keeps the write/read race-free.
@@ -229,6 +246,21 @@ type Agent struct {
 	// Nil in TUI/CLI.
 	boardHookMu sync.RWMutex
 	boardHook   func(msg string)
+
+	// jobNoticeHookMu guards jobNoticeHook: hosts install it so a
+	// background job finishing naturally delivers a notice into the
+	// session (job_notices feature). The callback receives a one-line
+	// summary ("[job] job-xxx (command) exited with code N"). Nil when the
+	// feature is off.
+	jobNoticeHookMu sync.RWMutex
+	jobNoticeHook   func(summary string)
+
+	// reportHookMu guards reportHook: the web spawner installs it on
+	// continuable children so the child-scoped report tool can deliver a
+	// progress message into the live parent session. Nil for non-children
+	// and TUI children (the report tool is gated on it).
+	reportHookMu sync.RWMutex
+	reportHook   func(text string) error
 
 	// patchFailStreak counts consecutive patch_file failures so the agent loop
 	// can steer the model away from retrying the same stale diff indefinitely.
@@ -301,6 +333,18 @@ func (a *Agent) SubagentsEnabled() bool {
 	return a.subagentsEnabled.Load()
 }
 
+// SetSkillsEnabled toggles the skill tool for this agent (see
+// SetBoardEnabled for the live-toggle contract; skills is config-only in
+// v1, so this is set at construction).
+func (a *Agent) SetSkillsEnabled(on bool) {
+	a.skillsEnabled.Store(on)
+}
+
+// SkillsEnabled reports whether the skill tool is registered for this agent.
+func (a *Agent) SkillsEnabled() bool {
+	return a.skillsEnabled.Load()
+}
+
 // SetSubagentMaxDepth sets the maximum subagent nesting depth (main agent =
 // depth 0). Values <= 0 fall back to the config default.
 func (a *Agent) SetSubagentMaxDepth(depth int) {
@@ -326,6 +370,69 @@ func (a *Agent) SetBoardManager(m *BoardManager) {
 // feature is disabled or not wired).
 func (a *Agent) BoardManager() *BoardManager {
 	return a.boardManager.Load()
+}
+
+// SetSkillsManager attaches the shared skill discovery manager (nil
+// detaches). The web server sets the same manager on every session agent;
+// TUI/CLI sets a per-agent manager. The skill tool stays gated on
+// SkillsEnabled regardless.
+func (a *Agent) SetSkillsManager(m *skills.Manager) {
+	a.skillsManager.Store(m)
+}
+
+// SkillsManager returns the attached skill manager (nil when skills are
+// disabled or not wired).
+func (a *Agent) SkillsManager() *skills.Manager {
+	return a.skillsManager.Load()
+}
+
+// SetInstructionsEnabled toggles AGENTS.md/CLAUDE.md loading for this
+// agent (config-only in v1; set at construction).
+func (a *Agent) SetInstructionsEnabled(on bool) {
+	a.instructionsEnabled.Store(on)
+}
+
+// InstructionsEnabled reports whether AGENTS.md/CLAUDE.md loading is on.
+func (a *Agent) InstructionsEnabled() bool {
+	return a.instructionsEnabled.Load()
+}
+
+// RefreshWorkspaceInstructions re-renders the AGENTS.md/CLAUDE.md section
+// from dir into workspaceInstructions. Called at construction and after
+// every working-dir change; no-op when the feature is off. Discovery
+// skips missing roots and unreadable files (never an error).
+func (a *Agent) RefreshWorkspaceInstructions(dir string) {
+	if !a.instructionsEnabled.Load() {
+		return
+	}
+	instr, err := projectfile.LoadInstructions(dir)
+	if err != nil {
+		log.Printf("warning: agent_instructions: %v", err)
+		return
+	}
+	a.instructionsMu.Lock()
+	a.workspaceInstructions = instr
+	a.instructionsMu.Unlock()
+}
+
+// EffectiveGuidelines returns the project guidelines with the workspace
+// instruction section appended below, rendered from the CURRENT working
+// dir. Thread-safe; used by the view builders (buildSystemView /
+// buildSystemSuffix).
+func (a *Agent) EffectiveGuidelines() string {
+	if !a.instructionsEnabled.Load() {
+		return a.ProjectGuidelines
+	}
+	a.instructionsMu.RLock()
+	instr := a.workspaceInstructions
+	a.instructionsMu.RUnlock()
+	if instr == "" {
+		return a.ProjectGuidelines
+	}
+	if a.ProjectGuidelines == "" {
+		return instr
+	}
+	return a.ProjectGuidelines + "\n\n" + instr
 }
 
 // SetSubagentSpawner installs the nested-session runner (nil detaches).
@@ -388,6 +495,55 @@ func (a *Agent) notifyBoardChanged(msg string) {
 	if h != nil {
 		h(msg)
 	}
+}
+
+// SetJobNoticeHook installs a callback invoked when a background job
+// (execute_command background=true) finishes naturally; it receives a
+// one-line summary. Hosts wire it to the message-delivery service so the
+// session is notified without polling. nil detaches.
+func (a *Agent) SetJobNoticeHook(h func(summary string)) {
+	a.jobNoticeHookMu.Lock()
+	a.jobNoticeHook = h
+	a.jobNoticeHookMu.Unlock()
+}
+
+// fireJobNotice invokes the installed job-notice hook, if any.
+func (a *Agent) fireJobNotice(summary string) {
+	a.jobNoticeHookMu.RLock()
+	h := a.jobNoticeHook
+	a.jobNoticeHookMu.RUnlock()
+	if h != nil {
+		h(summary)
+	}
+}
+
+// SetReportHook installs the child-scoped report hook (continuable
+// subagents only): delivering a progress message to the live parent
+// session. nil detaches (the report tool is then not registered).
+func (a *Agent) SetReportHook(h func(text string) error) {
+	a.reportHookMu.Lock()
+	a.reportHook = h
+	a.reportHookMu.Unlock()
+}
+
+// ReportHook returns the installed report hook (nil when this agent is not
+// a continuable child).
+func (a *Agent) ReportHook() func(text string) error {
+	a.reportHookMu.RLock()
+	defer a.reportHookMu.RUnlock()
+	return a.reportHook
+}
+
+// reportToParent delivers a progress message to the live parent session via
+// the installed hook.
+func (a *Agent) reportToParent(text string) error {
+	a.reportHookMu.RLock()
+	h := a.reportHook
+	a.reportHookMu.RUnlock()
+	if h == nil {
+		return fmt.Errorf("report is not available in this session")
+	}
+	return h(text)
 }
 
 // SaveConfig writes the effective configuration to the project file.
@@ -574,6 +730,17 @@ func (a *Agent) SetWorkingDir(dir string) {
 		// Global mode keeps the global board; project mode re-points to the
 		// new working dir's .gogen/board (D3).
 		bm.SetWorkingDir(dir)
+	}
+	if sm := a.SkillsManager(); sm != nil {
+		// Re-point the project skills root to the new working dir (the user
+		// root is unchanged).
+		sm.SetWorkingDir(dir)
+	}
+	if a.instructionsEnabled.Load() {
+		// Re-render the AGENTS.md/CLAUDE.md section for the new dir: the
+		// project guidelines body is unchanged, but the workspace
+		// instructions must never come from the previous project.
+		a.RefreshWorkspaceInstructions(dir)
 	}
 }
 

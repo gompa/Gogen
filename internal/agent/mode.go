@@ -87,6 +87,12 @@ func (a *Agent) allowsTool(name string) bool {
 	if name == "board" && a.BoardEnabled() && a.BoardManager() != nil {
 		return true
 	}
+	// D-skill: skill list/read are read-only, so the skill tool is
+	// plan-mode allowed like the board (the model can consult skills while
+	// planning).
+	if name == "skill" && a.SkillsEnabled() && a.SkillsManager() != nil {
+		return true
+	}
 	return false
 }
 
@@ -139,6 +145,18 @@ func (a *Agent) AllowedToolNames() map[string]struct{} {
 	}
 	if a.SubagentsEnabled() && a.SubagentSpawner() != nil && a.Mode != ModePlan {
 		out["subagent"] = struct{}{}
+		if a.continuableSpawner() != nil {
+			out["subagent_fork"] = struct{}{}
+			out["list_agents"] = struct{}{}
+			out["send_message"] = struct{}{}
+			out["interrupt_agent"] = struct{}{}
+			if a.ParentID() != "" && a.ReportHook() != nil {
+				out["report"] = struct{}{}
+			}
+		}
+	}
+	if a.SkillsEnabled() && a.SkillsManager() != nil && a.allowsTool("skill") {
+		out["skill"] = struct{}{}
 	}
 	if a.Mode != ModePlan && a.MCPRegistry != nil {
 		for name := range a.MCPRegistry.ToolNames() {

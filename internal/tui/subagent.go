@@ -70,6 +70,8 @@ func (sp *tuiSubagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, jo
 		SubagentsEnabled:     parent.SubagentsEnabled(),
 		SubagentMaxDepth:     parent.SubagentMaxDepth(),
 		BoardManager:         parent.BoardManager(),
+		SkillsManager:        parent.SkillsManager(),
+		InstructionsEnabled:  parent.InstructionsEnabled(),
 		SubagentSpawner:      sp, // nesting allowed up to the configured depth
 	}, nil, session.NewID())
 	child.SetSubagentDepth(depth + 1)
