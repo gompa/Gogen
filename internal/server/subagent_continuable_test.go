@@ -32,6 +32,12 @@ func newContinuableServer(t *testing.T, childProvider func() llm.LLMProvider) (*
 	s := NewServer(a, &config.Config{})
 	s.ws.ProviderFactory = childProvider
 	a.SetSubagentsEnabled(true)
+	// A delivered message is appended to the parent transcript BEFORE the
+	// delivery turn's final FlushSession lands (the write that persists
+	// the reply). Tests return as soon as they observe the message, so
+	// that write would race the test's TempDir removal ("directory not
+	// empty"); wait for the delivery machinery to go quiet first.
+	t.Cleanup(func() { waitForParentDeliveriesSettled(t, s, a) })
 	return s, a
 }
 
@@ -42,6 +48,31 @@ func continuableSpawner(t *testing.T, s *Server) *subagentSpawner {
 		t.Fatal("workspace spawner is not a *subagentSpawner")
 	}
 	return sp
+}
+
+// waitForParentDeliveriesSettled waits until the parent session's delivery
+// machinery is quiescent: no turn running, nothing queued, and the delivery
+// worker idle. The delivery turn appends its message to the transcript
+// before its final flush completes, so observing the message is not enough —
+// the disk write must land before the test's TempDir is removed, or the
+// cleanup sporadically fails with "directory not empty".
+func waitForParentDeliveriesSettled(t *testing.T, s *Server, a *agent.Agent) {
+	t.Helper()
+	rt, ok := s.registry.get(a.SessionID)
+	if !ok {
+		// The runtime was evicted, which only happens after its turn ended
+		// (and flushed): nothing can be in flight.
+		return
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		if active, _ := rt.turnState(); active {
+			return false
+		}
+		if rt.hasPendingDeliveries() {
+			return false
+		}
+		return !rt.deliverWorker.Load()
+	})
 }
 
 // TestBackgroundSpawnCompletionNotice drives the full background path: the
@@ -349,6 +380,13 @@ func TestChildReportDeliversToParent(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool {
 		return deliveredMessages(a, "progress from child")
 	})
+	// The report lands mid-turn, so the child's turn (and its final
+	// flush) is still in flight when the parent sees it. The completion
+	// notice is delivered only after that flush lands — wait for it so no
+	// session write outlives the test's temp dir.
+	waitFor(t, 5*time.Second, func() bool {
+		return deliveredMessages(a, "finished: done")
+	})
 }
 
 // TestChildCapReleasesOldest pins the per-parent finished cap: spawning
@@ -382,20 +420,20 @@ func TestChildCapReleasesOldest(t *testing.T) {
 			t.Fatalf("surviving child %s is not finished", c.id)
 		}
 	}
-	// Settle: wait for the retained children's completion flows (persist +
-	// parent notice) so no goroutine outlives the test's temp dir.
+	// Settle: each child's completion notice is enqueued/delivered only
+	// after its final flush lands, so waiting for all four notices
+	// (delivered into the parent transcript, or queued at the registry
+	// once the parent runtime was orphan-evicted) guarantees every child's
+	// session write has completed. The parent's own delivery-turn flush is
+	// covered by waitForParentDeliveriesSettled.
 	waitFor(t, 5*time.Second, func() bool {
-		for _, c := range sp.children.childrenOf(a.SessionID) {
-			if c.statusOf() != "finished" {
-				return false
-			}
-		}
-		return true
+		delivered := deliveredCount(a, "finished: done")
+		s.registry.parentDeliverMu.Lock()
+		queued := len(s.registry.parentDeliveries[a.SessionID])
+		s.registry.parentDeliverMu.Unlock()
+		return delivered+queued == 4
 	})
-	if parentRt, ok := s.registry.get(a.SessionID); ok {
-		waitFor(t, 5*time.Second, func() bool { return !parentRt.hasPendingDeliveries() })
-	}
-	time.Sleep(200 * time.Millisecond)
+	waitForParentDeliveriesSettled(t, s, a)
 }
 
 // TestLiveChildCapRefuses pins the live-child bound: spawning beyond

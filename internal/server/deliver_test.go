@@ -13,6 +13,18 @@ import (
 	"gogen/internal/session"
 )
 
+// deliveredCount reports how many user messages in the agent's snapshot
+// contain needle.
+func deliveredCount(a *agent.Agent, needle string) int {
+	n := 0
+	for _, m := range a.SnapshotMessages() {
+		if m.Role == "user" && strings.Contains(m.Content, needle) {
+			n++
+		}
+	}
+	return n
+}
+
 // deliveredMessages reports whether any user message in the agent's
 // snapshot contains needle.
 func deliveredMessages(a *agent.Agent, needle string) bool {
