@@ -46,7 +46,7 @@ function sessionRowClassAndMeta(s, panes, activePaneKey, explicitPane) {
 // Builds the row list for one render: open panes (client state) merged in
 // FIRST so an open session's row always exists (even before the server's
 // store lists it), then saved sessions in server order.
-function mergedRows(panes, sessions, activePaneKey) {
+function mergedRows(panes, sessions, activePaneKey, nestedParentIds) {
   const list = sessions || [];
   const rows = [];
   const openIds = new Set();
@@ -56,9 +56,25 @@ function mergedRows(panes, sessions, activePaneKey) {
     rows.push({ pane, entry });
   }
   for (const s of list) {
+    // Nested (subagent) rows render under their parent (appendNestedRows
+    // in app.js), never as flat rows.
+    if (s.parentId) continue;
     if (!openIds.has(s.id)) rows.push({ pane: null, entry: s });
   }
-  return rows.map(({ pane, entry }) => {
+  // A nested (subagent) child open as a pane renders under its parent, not
+  // as a flat open-pane row; it falls back to a flat row only when the
+  // parent's row is missing from this render. nestedParentIds models the
+  // live subagent_started/finished records (childId -> parentId).
+  const rowIds = new Set();
+  for (const r of rows) rowIds.add(r.pane ? r.pane.id : (r.entry ? r.entry.id : ''));
+  const flatRows = rows.filter((r) => {
+    const id = r.pane ? r.pane.id : (r.entry ? r.entry.id : '');
+    if (!r.pane || !id) return true;
+    const entry = list.find((s) => s.id === id);
+    const parentId = (nestedParentIds && nestedParentIds[id]) || (entry && entry.parentId) || '';
+    return !parentId || !rowIds.has(parentId);
+  });
+  return flatRows.map(({ pane, entry }) => {
     const s = entry || {
       id: pane ? pane.id : '',
       label: pane ? pane.label : '',
@@ -197,6 +213,57 @@ function assert(cond, msg) {
       && rows[0].title === 'live label'
       && rows[1].title === 'saved B',
     'merge: live pane label wins over server label, saved rows follow, got ' + JSON.stringify(rows));
+}
+
+// Nested (subagent) children: an open child stays under its parent — its
+// flat open-pane row is skipped (appendNestedRows renders it under the
+// parent instead), so opening a subagent does not make its row jump.
+{
+  const panes = new Map();
+  panes.set(0, { id: 'CHILD', label: 'subagent: fix bug', turnActive: true }); // active pane
+  const sessions = [
+    { id: 'PARENT', label: 'parent session', messageCount: 4 },
+    { id: 'CHILD', label: 'subagent: fix bug', messageCount: 1, parentId: 'PARENT' },
+  ];
+  const rows = mergedRows(panes, sessions, 0, { CHILD: 'PARENT' });
+  assert(rows.length === 1 && rows[0].id === 'PARENT',
+    'open nested child is not a flat row (stays under parent), got ' + JSON.stringify(rows));
+}
+
+// Nested child known only from the live event records (not yet persisted):
+// same result via the nestedParentIds map.
+{
+  const panes = new Map();
+  panes.set(0, { id: 'CHILD', label: 'subagent: fix bug', turnActive: false });
+  const sessions = [{ id: 'PARENT', messageCount: 4 }];
+  const rows = mergedRows(panes, sessions, 0, { CHILD: 'PARENT' });
+  assert(rows.length === 1 && rows[0].id === 'PARENT',
+    'live-only nested child is not a flat row, got ' + JSON.stringify(rows));
+}
+
+// Fallback: the child's parent row is missing from this render (fresh
+// parent unknown to the store / another tab) — the child keeps its flat
+// open-pane row so it never disappears from the sidebar.
+{
+  const panes = new Map();
+  panes.set(0, { id: 'CHILD', label: 'subagent: fix bug', turnActive: false });
+  const rows = mergedRows(panes, [], 0, { CHILD: 'PARENT' });
+  assert(rows.length === 1 && rows[0].id === 'CHILD' && rows[0].title === 'subagent: fix bug',
+    'nested child with missing parent row falls back to its flat row, got ' + JSON.stringify(rows));
+}
+
+// Saved nested children (not open) are excluded from the flat list: they
+// render under their parent via appendNestedRows.
+{
+  const panes = new Map();
+  panes.set(0, { id: 'PARENT', label: 'parent', turnActive: false });
+  const sessions = [
+    { id: 'PARENT', messageCount: 4 },
+    { id: 'CHILD', messageCount: 1, parentId: 'PARENT' },
+  ];
+  const rows = mergedRows(panes, sessions, 0);
+  assert(rows.length === 1 && rows[0].id === 'PARENT',
+    'saved nested child is not a flat row, got ' + JSON.stringify(rows));
 }
 
 if (failures > 0) {

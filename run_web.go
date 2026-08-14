@@ -12,7 +12,9 @@ import (
 )
 
 // runWeb runs the web server until the context is cancelled or Start fails.
-// It owns the server's session-sweep defer (ShutdownSessions); the
+// It returns Start's error so main can exit non-zero on a real failure
+// (e.g. the port is already bound); graceful context cancellation returns
+// nil. It owns the server's session-sweep defer (ShutdownSessions); the
 // agent-level defers (a.Close, a.FlushPending, MCP shutdown) stay in main so
 // the shutdown order is unchanged. MCP init itself is started by startMCP in
 // main before the mode branches.
@@ -78,8 +80,7 @@ func runWeb(ctx context.Context, a *agent.Agent, cfg *config.Config, restoredMod
 		// provider factory reads it concurrently on session creation.
 		s.SetDefaultModel(a.CurrentModel())
 	}()
-	if err := <-errCh; err != nil {
-		log.Printf("web server error: %v", err)
-	}
-	return nil
+	// Start returns nil on graceful context cancellation and a real error
+	// when the listener fails — propagate it to main's error path.
+	return <-errCh
 }

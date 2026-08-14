@@ -237,6 +237,12 @@ type Agent struct {
 	// the session snapshot so the store can exclude them from the flat
 	// list, cascade-delete them with the parent, and cap them per parent.
 	parentID atomic.Value // string
+	// subagentOutcome records the final outcome of a nested (subagent)
+	// session (nil for top-level sessions and children that have not
+	// finished). Persisted into the snapshot so the sidebar can render the
+	// true result after a reload/restart, when the subagent_started/
+	// finished events are not replayed.
+	subagentOutcome atomic.Value // *subagentOutcome
 
 	// boardHookMu guards boardHook: the web server installs it so agent
 	// board mutations broadcast a fresh board_state AND a success notice
@@ -279,6 +285,11 @@ type persistMeta struct {
 	oneshot  bool
 	profile  string
 	todos    *TodoList
+	// subagentStatus/subagentSummary mirror the recorded subagent outcome:
+	// writing it right after a turn's full save must force ANOTHER full
+	// save (deltas do not carry the outcome to the index).
+	subagentStatus  string
+	subagentSummary string
 }
 
 func NewAgent(provider llm.LLMProvider, executor *Executor, ctxMgr *contextmgr.Manager) *Agent {
@@ -474,6 +485,34 @@ func (a *Agent) SetParentID(parentID string) {
 func (a *Agent) ParentID() string {
 	v, _ := a.parentID.Load().(string)
 	return v
+}
+
+// subagentOutcome is the persisted final outcome of a nested (subagent)
+// session. Status is "" (unknown / not finished), "success", or "failed".
+type subagentOutcome struct {
+	Status  string
+	Summary string
+}
+
+// SetSubagentOutcome records the final outcome of a nested (subagent)
+// session. The spawner writes it at every terminal transition (natural
+// completion, cancellation, eviction) so the persisted snapshot carries the
+// truth across restarts; the sidebar reads it from the sessions payload
+// when the live subagent_started/finished events are gone. Empty status
+// means the child has not finished (or is not a subagent).
+func (a *Agent) SetSubagentOutcome(status, summary string) {
+	a.subagentOutcome.Store(&subagentOutcome{Status: status, Summary: summary})
+}
+
+// SubagentOutcome returns the recorded final outcome: the status ("" /
+// "success" / "failed") and the summary text.
+func (a *Agent) SubagentOutcome() (string, string) {
+	v := a.subagentOutcome.Load()
+	if v == nil {
+		return "", ""
+	}
+	o := v.(*subagentOutcome)
+	return o.Status, o.Summary
 }
 
 // SetOnBoardChanged installs a callback invoked after every successful board

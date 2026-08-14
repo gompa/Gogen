@@ -94,6 +94,26 @@ func (s *Server) loadOrCreateRuntime(id string) (*sessionRuntime, error) {
 	}
 	a := s.ws.NewSessionAgent(&snap, id)
 	rt := s.newSessionRuntimeFor(a)
+	// A re-attached nested (subagent) child restores its runtime-level
+	// parent link and privileges: the nested flag re-arms the
+	// active-session cap exemption, and the D6 delete-approval override
+	// routes to the parent's clients when the child has none attached
+	// (the parent is resolved lazily at approval time — it may not be
+	// live when the child is reopened). Without this, a child reopened
+	// after eviction/restart could be cap-evicted mid-task and headless
+	// delete approvals would hang instead of reaching the parent.
+	if p := a.ParentID(); p != "" {
+		rt.parentID = p
+		rt.nested = true
+		rt.approverOverride = func(ctx context.Context, req agent.DeleteRequest) (bool, error) {
+			if rt.clientCount() == 0 {
+				if parentRt, ok := s.registry.get(p); ok {
+					return parentRt.deleteApprover()(ctx, req)
+				}
+			}
+			return rt.deleteApprover()(ctx, req)
+		}
+	}
 	s.registry.register(id, rt)
 	// A concurrent attach (or resume) of the same session may have
 	// registered a runtime between our get above and this register —
@@ -382,9 +402,63 @@ func (s *Server) sessionDelete(ctx context.Context, ws *wsConn, pane **sessionRu
 		}
 		rt.agent.FlushSession()
 	}
+	// Nested (subagent) descendants — children, grandchildren, etc. — are
+	// drained with the same ordering as the root, whether or not the
+	// deleted session's own runtime is registered (orphan/cap eviction):
+	// the store's cascade delete removes their FILES, so their in-flight
+	// turns must flush BEFORE that delete — a late doPersist from a
+	// still-running child would recreate the file the cascade just removed
+	// (delete resurrection, same shape as the root guard above). They are
+	// evicted after the delete below.
+	descendants := s.registry.nestedDescendants(id, func(sid string) string {
+		if rt, ok := s.registry.get(sid); ok {
+			return rt.agent.ParentID()
+		}
+		if info := s.ws.Store.Info(s.ws.GetWorkingDir(), sid); info != nil {
+			return info.ParentID
+		}
+		return ""
+	})
+	for _, d := range descendants {
+		d.stream.cancelInFlight()
+		// Hold the child's turn lock across the flush + delete + eviction
+		// (same rationale as the root): a NEW turn cannot start on a child
+		// whose file is about to be cascade-deleted. TryLock: if the drain
+		// timed out (the cancelled turn's goroutine is still alive), that
+		// turn itself holds the lock, so no new turn can start anyway.
+		if held := d.turnMu.TryLock(); held {
+			defer d.turnMu.Unlock()
+		}
+		d.agent.FlushSession()
+	}
+	// A nested (subagent) child reports its deletion back to the parent
+	// session: the main agent must learn the child (and its transcript)
+	// is gone. Parent link + label come from the live runtime when the
+	// child is registered, else from the store's metadata index (Info
+	// reads no message payload).
+	var notifyParentID, notifyLabel string
+	if registered {
+		notifyParentID = rt.agent.ParentID()
+		notifyLabel = rt.agent.SessionLabelSnapshot()
+	} else if info := s.ws.Store.Info(s.ws.GetWorkingDir(), id); info != nil {
+		notifyParentID = info.ParentID
+		notifyLabel = info.Label
+	}
 	if err := s.ws.Store.Delete(s.ws.GetWorkingDir(), id); err != nil {
 		return agent.SessionCommandResult{}, true, err
 	}
+	if notifyParentID != "" {
+		if notifyLabel == "" {
+			notifyLabel = id
+		}
+		s.registry.deliverToParent(notifyParentID, fmt.Sprintf("[subagent %s] deleted by the user — its transcript is gone.", notifyLabel))
+	}
+	// The file is gone, so the session can never be reopened: drop any
+	// queued deliveries for it (subagent completions/reports) instead of
+	// letting the queue linger in memory. Runs on the unregistered path
+	// too — a parent orphan-evicted while its children kept running may
+	// have a queued notice here.
+	s.registry.clearParentDeliveries(id)
 	if registered {
 		// The file is gone: evict the runtime, then tell attached clients
 		// the session no longer exists and detach every one of them.
@@ -397,25 +471,24 @@ func (s *Server) sessionDelete(ctx context.Context, ws *wsConn, pane **sessionRu
 		// broadcast reaches every attached socket regardless (it writes to
 		// the clients set, not the registry), so client-visible message
 		// ordering is unchanged.
-		s.registry.remove(id)
-		rt.broadcast(WSMessage{Type: "session_removed", SessionID: id})
-		// Session delete is an explicit teardown: the deleted session's
-		// background subagent children are cancelled and released.
+		s.evictDeletedRuntime(rt)
+	} else {
+		// Explicit delete is a teardown even when the runtime is already
+		// gone (orphan/cap eviction): the deleted session's background
+		// subagent children are still tracked and must be cancelled and
+		// released NOW, instead of lingering until their retention timers.
 		s.registry.fireEvictHook(id)
-		// The file is gone, so the session can never be reopened: drop any
-		// queued deliveries for it (subagent completions/reports) instead
-		// of letting the queue linger in memory.
-		s.registry.clearParentDeliveries(id)
-		// Detach ALL attached clients, not just the requesting connection:
-		// the deleted session may be a BACKGROUND pane of this connection or
-		// a pane of another tab, and leaving any socket in the removed
-		// runtime's clients set would leak it — teardown's detachAll only
-		// sweeps REGISTERED sessions and would never reach this runtime.
-		// detach is idempotent and never cancels a turn (the turn was
-		// drained above); the requesting pane is re-homed by the
-		// wasCurrent / createNewSession path below.
-		rt.detachAllClients()
-	} else if wasCurrent && *pane != nil {
+	}
+	// Evict every registered descendant the cascade just removed from
+	// disk: their runtimes were drained (and flushed) BEFORE the store
+	// delete, so the eviction itself writes nothing and cannot resurrect
+	// the files. Same removal/notify ordering as the root. Runs on the
+	// unregistered-parent path too (the parent was orphan/cap-evicted
+	// while its background children kept running): without it, a child
+	// whose file the cascade just removed would stay live and resurrect
+	// the file on its next persist.
+	s.evictNestedDescendants(descendants)
+	if !registered && wasCurrent && *pane != nil {
 		// The runtime was evicted before this delete (cap eviction or an
 		// earlier delete) but is still the connection's pane: release the
 		// stale attachment so the dead socket cannot linger in its clients
@@ -432,6 +505,62 @@ func (s *Server) sessionDelete(ctx context.Context, ws *wsConn, pane **sessionRu
 		}, true, nil
 	}
 	return agent.SessionCommandResult{Output: fmt.Sprintf("Deleted session %s.", id)}, true, nil
+}
+
+// evictDeletedRuntime removes a deleted session's runtime from the registry
+// and detaches every attached client, AFTER the session's file is gone:
+// once the runtime is unregistered, a concurrent session_attach/resume of
+// the same id loads fresh from the store — the file is already gone, so the
+// load fails and the client gets session_removed — instead of attaching to
+// a dying-but-registered runtime. The broadcast reaches every attached
+// socket regardless (it writes to the clients set, not the registry), so
+// client-visible message ordering is unchanged. The session's background
+// jobs are killed too: with the session gone there is no owner left to
+// poll them. Callers must hold (or have drained) the runtime's turnMu.
+func (s *Server) evictDeletedRuntime(rt *sessionRuntime) {
+	id := rt.agent.SessionID
+	s.registry.remove(id)
+	rt.broadcast(WSMessage{Type: "session_removed", SessionID: id})
+	// Session delete is an explicit teardown: the deleted session's
+	// background subagent children are cancelled and released.
+	s.registry.fireEvictHook(id)
+	// Detach ALL attached clients, not just the requesting connection:
+	// the deleted session may be a BACKGROUND pane of this connection or
+	// a pane of another tab, and leaving any socket in the removed
+	// runtime's clients set would leak it — teardown's detachAll only
+	// sweeps REGISTERED sessions and would never reach this runtime.
+	// detach is idempotent and never cancels a turn (the turn was drained
+	// above); the requesting pane is re-homed by the wasCurrent /
+	// createNewSession path in sessionDelete.
+	rt.detachAllClients()
+	// Kill background jobs (execute_command background=true): with the
+	// session deleted there is no owner left to poll them.
+	rt.agent.Close()
+}
+
+// evictNestedDescendants removes the registered runtimes whose files the
+// store's cascade delete just removed: their turns were drained (and
+// flushed) BEFORE the delete, so this eviction writes nothing and cannot
+// resurrect the files. Same removal/notify ordering as evictDeletedRuntime.
+// Callers must hold (or have drained) each runtime's turnMu.
+func (s *Server) evictNestedDescendants(descendants []*sessionRuntime) {
+	for _, d := range descendants {
+		did := d.agent.SessionID
+		s.registry.remove(did)
+		d.broadcast(WSMessage{Type: "session_removed", SessionID: did})
+		s.registry.fireEvictHook(did)
+		d.detachAllClients()
+		// Kill background jobs so no command outlives the deleted session.
+		d.agent.Close()
+	}
+	// Final sweep: the cascade removed these files, so any file that still
+	// exists was recreated by a write that landed after the delete — the
+	// release path's outcome flush, the eviction's FlushPending, or a late
+	// turn flush racing the eviction. Remove the residue so no orphan
+	// outlives the delete. Store.Delete is a no-op on a missing file.
+	for _, d := range descendants {
+		_ = s.ws.Store.Delete(s.ws.GetWorkingDir(), d.agent.SessionID)
+	}
 }
 
 // createBootstrapSession registers a default session when the registry is

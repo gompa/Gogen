@@ -213,6 +213,57 @@ func TestSubagentForkCopiesMessages(t *testing.T) {
 	}
 }
 
+// TestForkPersistsFailedOutcome verifies a cancelled fork child is saved
+// with the failed outcome, so the sidebar renders the true result after a
+// reload/restart (same contract as Spawn/SpawnBackground).
+func TestForkPersistsFailedOutcome(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, a, store := newContinuationServer(t, stub, dir)
+	s.ws.ProviderFactory = func() llm.LLMProvider {
+		return &blockingProvider{}
+	}
+	sp := continuableSpawner(t, s)
+	// Fork requires a non-empty transcript (with an assistant message to
+	// fork from) to copy.
+	a.Messages = []llm.Message{
+		{Role: "user", Content: "original question"},
+		{Role: "assistant", Content: "original answer"},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := sp.Fork(ctx, a, "", 0)
+		done <- err
+	}()
+	// Wait for the fork child to register, then cancel mid-turn.
+	var forkID string
+	waitFor(t, 5*time.Second, func() bool {
+		for _, id := range s.registry.activeIDs() {
+			if id != a.SessionID {
+				forkID = id
+				return true
+			}
+		}
+		return false
+	})
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("fork did not return after cancel")
+	}
+	// The fork's session is saved with the failed outcome.
+	info := store.Info(dir, forkID)
+	if info == nil {
+		t.Fatal("fork session not persisted")
+	}
+	if info.SubagentStatus != "failed" {
+		t.Fatalf("fork outcome = %q, want failed", info.SubagentStatus)
+	}
+}
+
 // TestChildRetentionRelease pins the retention window: a finished child is
 // released (runtime evicted, child record dropped) after the window; the
 // saved session stays.

@@ -45,6 +45,12 @@ type file struct {
 	// ParentID marks nested (subagent) sessions; the flat session list
 	// excludes them and deleting the parent cascades.
 	ParentID string `json:"parentID,omitempty"`
+	// SubagentStatus records the final outcome of a nested (subagent)
+	// session: "" (unknown / not finished), "success", or "failed".
+	// Mirrored into the index so the sidebar can render the true outcome
+	// after a reload/restart, when the subagent events are not replayed.
+	SubagentStatus  string `json:"subagentStatus,omitempty"`
+	SubagentSummary string `json:"subagentSummary,omitempty"`
 }
 
 type Store struct {

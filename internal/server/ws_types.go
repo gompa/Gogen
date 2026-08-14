@@ -40,9 +40,24 @@ type SessionEntry struct {
 	// return to the saved list), so active here means genuinely live —
 	// open in another tab, or a headless turn still running.
 	Active bool `json:"active,omitempty"`
+	// TurnActive marks active sessions whose runtime currently has a
+	// running turn. The client uses it to distinguish a genuinely running
+	// session ("responding") from one that is merely registered-but-idle
+	// (open as a pane, or resumed from the store after a restart) — e.g.
+	// when rendering nested (subagent) rows after a reload, when the live
+	// subagent_started/finished events are gone.
+	TurnActive bool `json:"turnActive,omitempty"`
 	// ParentID is non-empty for nested (subagent) sessions; the client
 	// renders them as indented rows under their parent.
 	ParentID string `json:"parentId,omitempty"`
+	// SubagentStatus is the persisted final outcome of a nested (subagent)
+	// session: "" (unknown / not finished), "success", or "failed". The
+	// sidebar uses it when the live subagent_started/finished events are
+	// gone (reload / restart), so a failed child stays failed.
+	SubagentStatus string `json:"subagentStatus,omitempty"`
+	// SubagentSummary is the report/error summary written alongside
+	// SubagentStatus.
+	SubagentSummary string `json:"subagentSummary,omitempty"`
 	// Label is now the full first user message — CSS text-overflow: ellipsis
 	// handles dynamic truncation on the client side.
 }

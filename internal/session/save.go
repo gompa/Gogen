@@ -64,23 +64,25 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 	}
 	created, preloadedIdx := s.recoverCreated(id, path, snap.WorkingDir)
 	out := file{
-		Version:        version,
-		ID:             id,
-		Created:        created,
-		Updated:        time.Now().UTC(),
-		WorkingDir:     snap.WorkingDir,
-		Model:          snap.Model,
-		Mode:           snap.Mode,
-		ThinkingLevel:  snap.ThinkingLevel,
-		Label:          snap.Label,
-		LabelRenamed:   snap.LabelRenamed,
-		ProjectProfile: snap.ProjectProfile,
-		Todos:          snap.Todos,
-		Messages:       snap.Messages,
-		Oneshot:        snap.Oneshot,
-		TokenCounts:    snap.TokenCounts,
-		ContextLimit:   snap.ContextLimit,
-		ParentID:       snap.ParentID,
+		Version:         version,
+		ID:              id,
+		Created:         created,
+		Updated:         time.Now().UTC(),
+		WorkingDir:      snap.WorkingDir,
+		Model:           snap.Model,
+		Mode:            snap.Mode,
+		ThinkingLevel:   snap.ThinkingLevel,
+		Label:           snap.Label,
+		LabelRenamed:    snap.LabelRenamed,
+		ProjectProfile:  snap.ProjectProfile,
+		Todos:           snap.Todos,
+		Messages:        snap.Messages,
+		Oneshot:         snap.Oneshot,
+		TokenCounts:     snap.TokenCounts,
+		ContextLimit:    snap.ContextLimit,
+		ParentID:        snap.ParentID,
+		SubagentStatus:  snap.SubagentStatus,
+		SubagentSummary: snap.SubagentSummary,
 	}
 	data, err := json.Marshal(out)
 	if err != nil {
@@ -106,7 +108,7 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 	// fresh here. This lets a cache-miss full save read index.json once
 	// instead of twice.
 	label := sessionLabel(snap.Messages, snap.Label, snap.LabelRenamed)
-	s.updateIndex(snap.WorkingDir, id, out.Created, out.Updated, len(snap.Messages), label, snap.Oneshot, snap.LabelRenamed, snap.ParentID, preloadedIdx)
+	s.updateIndex(snap.WorkingDir, id, out.Created, out.Updated, len(snap.Messages), label, snap.Oneshot, snap.LabelRenamed, snap.ParentID, snap.SubagentStatus, snap.SubagentSummary, preloadedIdx)
 	// Per-parent transcript cap (D2): nested sessions are exempt from the
 	// global retention counts but capped per parent (keep the most recent
 	// 10 children; oldest pruned at child save time).
@@ -370,19 +372,21 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 	}
 
 	return agent.SessionSnapshot{
-		WorkingDir:     f.WorkingDir,
-		Model:          f.Model,
-		Mode:           f.Mode,
-		ThinkingLevel:  f.ThinkingLevel,
-		Oneshot:        f.Oneshot,
-		Label:          f.Label,
-		LabelRenamed:   f.LabelRenamed,
-		ProjectProfile: f.ProjectProfile,
-		Todos:          f.Todos,
-		Messages:       f.Messages,
-		TokenCounts:    f.TokenCounts,
-		ContextLimit:   f.ContextLimit,
-		ParentID:       f.ParentID,
+		WorkingDir:      f.WorkingDir,
+		Model:           f.Model,
+		Mode:            f.Mode,
+		ThinkingLevel:   f.ThinkingLevel,
+		Oneshot:         f.Oneshot,
+		Label:           f.Label,
+		LabelRenamed:    f.LabelRenamed,
+		ProjectProfile:  f.ProjectProfile,
+		Todos:           f.Todos,
+		Messages:        f.Messages,
+		TokenCounts:     f.TokenCounts,
+		ContextLimit:    f.ContextLimit,
+		ParentID:        f.ParentID,
+		SubagentStatus:  f.SubagentStatus,
+		SubagentSummary: f.SubagentSummary,
 	}, nil
 }
 

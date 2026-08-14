@@ -138,6 +138,16 @@ func (c *backgroundChild) isFinished() bool {
 	return c.status == "finished"
 }
 
+// isRunning reports whether the child's main job has not completed or been
+// interrupted yet. Takes c.mu: callers that already hold children.mu must
+// read the status through this helper (lock order children.mu → c.mu, same
+// as liveChildCount's isFinished call).
+func (c *backgroundChild) isRunning() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.status == "running"
+}
+
 // onTurnEnd is installed as the child runtime's turn-end hook: when a
 // send_message delivery's turn has ended, the child's last assistant reply
 // is injected into the parent conversation (delivery service; dropped when
@@ -259,6 +269,17 @@ func (sp *subagentSpawner) SpawnBackground(ctx context.Context, parent *agent.Ag
 
 	go func() {
 		report, runErr := sp.runChildTurn(context.Background(), childRt, agent.FormatSubagentJob(rawJob))
+		// A concurrent DELETE of the parent cascades the child's file away;
+		// a write that lands after that delete (the cancelled turn's final
+		// flush, or the release path's outcome flush) resurrects the child
+		// as an invisible orphan. When the runtime was evicted as part of
+		// the cascade and the parent's file is gone, sweep the orphan on
+		// EVERY exit path — the old finish-path-only check left interrupted
+		// and released children un-swept. (The eviction loop's own sweep
+		// covers the window before this check runs.)
+		if childRt.evicted.Load() && sp.s.ws.Store.Info(sp.s.ws.GetWorkingDir(), parent.SessionID) == nil {
+			_ = sp.s.ws.Store.Delete(sp.s.ws.GetWorkingDir(), child.id)
+		}
 		if childRt.evicted.Load() {
 			return // released while running (parent close / retention) — nothing to notify
 		}
@@ -273,11 +294,20 @@ func (sp *subagentSpawner) SpawnBackground(ctx context.Context, parent *agent.Ag
 			return
 		}
 		child.finish(report, runErr)
+		// Persist the final outcome on the child's snapshot (the events
+		// are not replayed after a reload/restart, so the saved session is
+		// what the sidebar falls back to).
+		success := runErr == nil
+		status := "success"
+		if !success {
+			status = "failed"
+		}
+		child.rt.agent.SetSubagentOutcome(status, truncateReport(report, runErr))
+		child.rt.agent.FlushSession()
 		// Enforce the per-parent finished cap NOW (spawn-time enforcement
 		// misses fast jobs that finish after their siblings spawned):
 		// release the oldest finished children beyond the cap.
 		sp.enforceChildCap(parent.SessionID)
-		success := runErr == nil
 		summary := truncateReport(report, runErr)
 		verb := "finished"
 		if !success {
@@ -352,8 +382,23 @@ func (sp *subagentSpawner) releaseChild(c *backgroundChild) {
 		return
 	}
 	c.released = true
+	releasedMidRun := c.isRunning()
 	delete(sp.children.children, c.id)
 	sp.children.mu.Unlock()
+	// A child released while its main job is running was cancelled
+	// (parent teardown / cap): record the failed outcome BEFORE the drain,
+	// so the cancelled turn's final flush persists it with the transcript.
+	// Finished children keep the outcome already written at completion;
+	// interrupted-idle children leave the status unset (still continuable).
+	if releasedMidRun {
+		c.rt.agent.SetSubagentOutcome("failed", "cancelled")
+		// Force the write: the cancelled turn's final flush may have
+		// already run (turn end racing the teardown), in which case the
+		// eviction's FlushPending would find the session clean and the
+		// outcome would be lost — the sidebar would render the cancelled
+		// child as done instead of failed.
+		c.rt.agent.FlushSession()
+	}
 	c.rt.stream.cancelInFlight() // no-op when idle
 	c.rt.held.Store(false)
 	sp.s.registry.evictRuntime(c.rt)
@@ -438,6 +483,22 @@ func (sp *subagentSpawner) Fork(ctx context.Context, parent *agent.Agent, job st
 
 	report, err := sp.runChildTurn(ctx, childRt, job)
 	success := err == nil
+	// Persist the final outcome (same contract as Spawn/SpawnBackground):
+	// the sidebar renders the persisted status after a reload/restart, when
+	// the subagent_started/finished events are gone.
+	status := "success"
+	if !success {
+		status = "failed"
+	}
+	childRt.agent.SetSubagentOutcome(status, truncateReport(report, err))
+	childRt.agent.FlushSession()
+	// A concurrent DELETE of the parent cascades the child's file away; if
+	// that delete won the race against the flush, the write resurrected the
+	// child — remove the orphan (best-effort: the delete path's own sweep
+	// covers the window before this check runs).
+	if childRt.evicted.Load() && s.ws.Store.Info(s.ws.GetWorkingDir(), parent.SessionID) == nil {
+		_ = s.ws.Store.Delete(s.ws.GetWorkingDir(), newID)
+	}
 	s.registry.remove(newID)
 	childRt.broadcast(WSMessage{Type: "session_detached", SessionID: newID})
 	parentRt.broadcast(WSMessage{

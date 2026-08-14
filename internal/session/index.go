@@ -30,6 +30,11 @@ type sessionIndexEntry struct {
 	// ParentID marks nested (subagent) sessions so the flat list can
 	// exclude them without re-reading every session file.
 	ParentID string `json:"parentID,omitempty"`
+	// SubagentStatus/SubagentSummary mirror the session file's recorded
+	// subagent outcome ("" / "success" / "failed") so the sessions payload
+	// can render it without re-reading the session file.
+	SubagentStatus  string `json:"subagentStatus,omitempty"`
+	SubagentSummary string `json:"subagentSummary,omitempty"`
 }
 
 // sessionIndex is the on-disk index of session metadata for fast listing.
@@ -183,12 +188,14 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 		out := make([]agent.SessionInfo, len(idx.Entries))
 		for i, e := range idx.Entries {
 			out[i] = agent.SessionInfo{
-				ID:           e.ID,
-				Oneshot:      e.Oneshot,
-				UpdatedAt:    e.Updated.UTC().Format(time.RFC3339Nano),
-				MessageCount: e.MessageCount,
-				Label:        e.Label,
-				ParentID:     e.ParentID,
+				ID:              e.ID,
+				Oneshot:         e.Oneshot,
+				UpdatedAt:       e.Updated.UTC().Format(time.RFC3339Nano),
+				MessageCount:    e.MessageCount,
+				Label:           e.Label,
+				ParentID:        e.ParentID,
+				SubagentStatus:  e.SubagentStatus,
+				SubagentSummary: e.SubagentSummary,
 			}
 		}
 		listCacheMu.Lock()
@@ -227,17 +234,20 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 		lbl := sessionLabel(f.Messages, f.Label, f.LabelRenamed)
 		items = append(items, item{
 			info: agent.SessionInfo{
-				ID:           id,
-				Oneshot:      f.Oneshot,
-				UpdatedAt:    updated.UTC().Format(time.RFC3339Nano),
-				MessageCount: len(f.Messages),
-				Label:        lbl,
-				ParentID:     f.ParentID,
+				ID:              id,
+				Oneshot:         f.Oneshot,
+				UpdatedAt:       updated.UTC().Format(time.RFC3339Nano),
+				MessageCount:    len(f.Messages),
+				Label:           lbl,
+				ParentID:        f.ParentID,
+				SubagentStatus:  f.SubagentStatus,
+				SubagentSummary: f.SubagentSummary,
 			},
 			updated: updated,
 		})
 		idx.Entries = append(idx.Entries, sessionIndexEntry{
 			ID: id, Updated: updated, Oneshot: f.Oneshot, MessageCount: len(f.Messages), Label: lbl, ParentID: f.ParentID,
+			SubagentStatus: f.SubagentStatus, SubagentSummary: f.SubagentSummary,
 		})
 	}
 	// Persist the index for next time (best-effort).
@@ -263,6 +273,9 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 // Uses the Updated field in each session JSON (not file mtime), so copied or
 // restored files cannot displace the true latest. Only the updated timestamp
 // is decoded — messages and other fields are skipped for a cheap scan.
+// Nested (subagent) sessions are excluded: they are not part of the flat
+// session list, so "resume latest" / the restart bootstrap must never land
+// on a child (D2 — children are reachable only through their parent).
 func (s *Store) LatestID(workingDir string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -272,6 +285,9 @@ func (s *Store) LatestID(workingDir string) (string, error) {
 		var latestID string
 		var latestUpdated time.Time
 		for _, e := range idx.Entries {
+			if e.ParentID != "" {
+				continue
+			}
 			if e.Updated.After(latestUpdated) {
 				latestUpdated = e.Updated
 				latestID = e.ID
@@ -294,6 +310,9 @@ func (s *Store) LatestID(workingDir string) (string, error) {
 	var latestID string
 	var latestUpdated time.Time
 	for _, l := range legacy {
+		if l.parentID != "" {
+			continue
+		}
 		if l.updated.After(latestUpdated) {
 			latestUpdated = l.updated
 			latestID = l.id
@@ -320,6 +339,40 @@ func (s *Store) readIndex(workingDir string) *sessionIndex {
 		return nil
 	}
 	return &idx
+}
+
+// Info returns the persisted metadata for one session, or nil when the
+// session has no index entry (or no index exists). Reads only the metadata
+// index — no session file or message payload is touched. Used by the web
+// server's delete path to discover a deleted session's parent link without
+// loading its transcript.
+func (s *Store) Info(workingDir, id string) *agent.SessionInfo {
+	if !s.enabled || id == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx := s.readIndex(workingDir)
+	if idx == nil {
+		return nil
+	}
+	for i := range idx.Entries {
+		e := &idx.Entries[i]
+		if e.ID != id {
+			continue
+		}
+		return &agent.SessionInfo{
+			ID:              e.ID,
+			Oneshot:         e.Oneshot,
+			UpdatedAt:       e.Updated.UTC().Format(time.RFC3339Nano),
+			MessageCount:    e.MessageCount,
+			Label:           e.Label,
+			ParentID:        e.ParentID,
+			SubagentStatus:  e.SubagentStatus,
+			SubagentSummary: e.SubagentSummary,
+		}
+	}
+	return nil
 }
 
 // loadRawLabel loads a session file and returns the full first user message.
@@ -405,8 +458,10 @@ func (s *Store) mutateIndexWith(workingDir string, createIfMissing bool, preload
 // Save passes the index it already loaded for Created recovery so a full save
 // reads index.json at most once. labelRenamed mirrors the session file's
 // rename marker so List can keep deliberate renames authoritative. parentID
-// marks nested (subagent) sessions for flat-list exclusion.
-func (s *Store) updateIndex(workingDir, id string, created, updated time.Time, msgCount int, label string, oneshot, labelRenamed bool, parentID string, preloaded *sessionIndex) {
+// marks nested (subagent) sessions for flat-list exclusion; subagentStatus/
+// subagentSummary mirror the recorded outcome so the sessions payload can
+// render it without re-reading the session file.
+func (s *Store) updateIndex(workingDir, id string, created, updated time.Time, msgCount int, label string, oneshot, labelRenamed bool, parentID, subagentStatus, subagentSummary string, preloaded *sessionIndex) {
 	s.mutateIndexWith(workingDir, true, preloaded, func(idx *sessionIndex) bool {
 		found := false
 		for i, e := range idx.Entries {
@@ -420,6 +475,8 @@ func (s *Store) updateIndex(workingDir, id string, created, updated time.Time, m
 				idx.Entries[i].Label = label
 				idx.Entries[i].LabelRenamed = labelRenamed
 				idx.Entries[i].ParentID = parentID
+				idx.Entries[i].SubagentStatus = subagentStatus
+				idx.Entries[i].SubagentSummary = subagentSummary
 				found = true
 				break
 			}
@@ -427,6 +484,7 @@ func (s *Store) updateIndex(workingDir, id string, created, updated time.Time, m
 		if !found {
 			idx.Entries = append(idx.Entries, sessionIndexEntry{
 				ID: id, Created: created, Updated: updated, Oneshot: oneshot, MessageCount: msgCount, Label: label, LabelRenamed: labelRenamed, ParentID: parentID,
+				SubagentStatus: subagentStatus, SubagentSummary: subagentSummary,
 			})
 		}
 		return true

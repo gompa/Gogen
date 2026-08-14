@@ -953,6 +953,56 @@ func (r *sessionRegistry) activeIDs() []string {
 	return out
 }
 
+// nestedDescendants returns the registered runtimes whose ParentID chain
+// reaches rootID — the nested children (and grandchildren, recursively)
+// whose files the store's cascade delete removes when rootID is deleted.
+// The root runtime itself is NOT included. Used by sessionDelete so live
+// child runtimes are drained and evicted alongside the file cascade: a
+// registered child that kept running would otherwise resurrect its deleted
+// file on the next persist.
+//
+// parentIDOf resolves ANY session id (registered or not) to its parent id:
+// sessionDelete supplies a resolver that checks the registry first and
+// falls back to the store's metadata index, so an unregistered intermediate
+// parent (evicted child whose grandchild was reopened) cannot hide a
+// descendant. Chains are walked with a visited set so a corrupt ParentID
+// cycle cannot loop.
+func (r *sessionRegistry) nestedDescendants(rootID string, parentIDOf func(id string) string) []*sessionRuntime {
+	ids := r.activeIDs()
+	byID := make(map[string]*sessionRuntime, len(ids))
+	for _, id := range ids {
+		if rt, ok := r.get(id); ok {
+			byID[id] = rt
+		}
+	}
+	var out []*sessionRuntime
+	for id, rt := range byID {
+		if id == rootID {
+			continue
+		}
+		if runtimeIsDescendantOf(rt.agent.ParentID(), rootID, parentIDOf, map[string]bool{}) {
+			out = append(out, rt)
+		}
+	}
+	return out
+}
+
+// runtimeIsDescendantOf reports whether a ParentID chain starting at
+// parentID reaches rootID. visited guards against corrupt cycles.
+func runtimeIsDescendantOf(parentID, rootID string, parentIDOf func(id string) string, visited map[string]bool) bool {
+	if parentID == "" {
+		return false
+	}
+	if parentID == rootID {
+		return true
+	}
+	if visited[parentID] {
+		return false // corrupt ParentID cycle — never loop
+	}
+	visited[parentID] = true
+	return runtimeIsDescendantOf(parentIDOf(parentID), rootID, parentIDOf, visited)
+}
+
 // detachAll removes the connection from every registered session it may be
 // attached to: the current pane plus any background panes opened via
 // session_attach. A killed tab cannot send session_detach for each pane, so

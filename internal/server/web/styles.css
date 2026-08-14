@@ -1152,6 +1152,7 @@
         .session-state-dot.amber { background: var(--amber); }
         .session-state-dot.blue { background: var(--accent); }
         .session-state-dot.violet { background: var(--violet); }
+        .session-state-dot.red { background: var(--error); }
         .session-row-del {
             flex-shrink: 0;
             background: none;

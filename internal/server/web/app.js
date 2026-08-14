@@ -4568,6 +4568,17 @@
             // background pane's ✕ calls requestSessionList mid-turn).
             // Finalizing would split the in-flight reply into a second
             // assistant bubble and stamp a fork button on a partial one.
+            // Prune stale nested (subagent) records the payload no longer
+            // lists (deleted elsewhere, or pruned by the per-parent cap):
+            // a FINISHED child is always persisted, so an absent record
+            // that is not running and not open as a pane is stale. Running
+            // children may not have hit their first save yet — keep them.
+            const payloadIds = new Set((data.sessions || []).map((s) => s.id));
+            for (const [id, rec] of nestedSessions) {
+                if (rec.running) continue;
+                if (findPaneBySession(id)) continue;
+                if (!payloadIds.has(id)) nestedSessions.delete(id);
+            }
             renderSessionList(data.sessions || []);
             if (data.contextLimit || data.usedTokens) { updateContextInfo(data); }
 
@@ -4634,6 +4645,29 @@
                 panes.delete(pane.key);
                 refreshSidebarSessions();
             }
+            // A nested (subagent) child deleted elsewhere must stop
+            // rendering under its parent too: drop its live-event record
+            // and the cached payload entry (the next sessions payload no
+            // longer lists it either).
+            let nestedChanged = false;
+            if (nestedSessions.delete(data.sessionId)) nestedChanged = true;
+            // Deleting a PARENT cascades to its nested children server-side
+            // (the store deletes their files recursively). Drop their
+            // records + payload entries here so no ghost rows survive; the
+            // server also broadcasts session_removed for each evicted child
+            // runtime, which re-runs this cleanup idempotently.
+            for (const [id, rec] of nestedSessions) {
+                if (rec.parentId === data.sessionId) {
+                    nestedSessions.delete(id);
+                    nestedChanged = true;
+                }
+            }
+            if (lastSessions) {
+                const before = lastSessions.length;
+                lastSessions = lastSessions.filter((s) => s.id !== data.sessionId && s.parentId !== data.sessionId);
+                if (lastSessions.length !== before) nestedChanged = true;
+            }
+            if (nestedChanged) refreshSidebarSessions();
             requestSessionList();
 
         }
@@ -4971,55 +5005,157 @@
         // subagent_started/finished event records (running/summary state,
         // children not yet saved) plus — after a page reload or a late
         // attach, when the events are gone — the persisted children in the
-        // sessions payload (the server now includes them). A child that is
-        // open as a pane in this tab is skipped: its open-pane row already
-        // shows it, and rendering it twice would duplicate the row.
-        function appendNestedRows(parentId) {
+        // sessions payload (the server now includes them). Children open as
+        // panes in this tab render here TOO (buildNestedSessionRow overlays
+        // their live pane state), so opening a subagent keeps its row under
+        // the parent — renderSessionList skips those children when it
+        // builds the flat open-pane rows. Nesting is recursive (depth >= 2):
+        // grandchildren render under their child rows, mirroring the
+        // server's recursive cascade.
+        function appendNestedRows(parentId, depth) {
+            if (depth > 16) return; // cycle guard (subagentMaxDepth max is 10)
             const rendered = new Set();
-            // Open-pane session ids (panes is keyed by pane key, not by
-            // session id, so derive the id set once here).
-            const openIds = new Set();
-            for (const p of panes.values()) if (p.id) openIds.add(p.id);
             for (const rec of nestedSessions.values()) {
                 if (rec.parentId !== parentId) continue;
-                if (openIds.has(rec.id)) continue;
                 sessionListDiv.appendChild(buildNestedSessionRow(rec));
                 rendered.add(rec.id);
             }
             for (const s of lastSessions || []) {
                 if (!s.parentId || s.parentId !== parentId) continue;
-                if (rendered.has(s.id) || openIds.has(s.id)) continue;
+                if (rendered.has(s.id)) continue;
+                // The payload carries the runtime's LIVE turn state
+                // (turnActive) and the child's PERSISTED outcome
+                // (subagentStatus/subagentSummary), so a registered-but-
+                // idle child (open as a pane, resumed after a restart) is
+                // never mistaken for running or failed, and a child that
+                // really failed stays failed. Status '' (not finished /
+                // legacy data) defaults to the green done state.
                 sessionListDiv.appendChild(buildNestedSessionRow({
                     id: s.id,
                     parentId: s.parentId,
                     label: s.label || s.id,
                     job: '',
-                    running: !!s.active,
-                    success: !s.active,
-                    summary: s.active ? '' : (s.messageCount ? s.messageCount + ' msgs' : ''),
+                    running: !!s.turnActive,
+                    success: s.subagentStatus !== 'failed',
+                    summary: s.subagentSummary || (s.turnActive ? '' : (s.messageCount ? s.messageCount + ' msgs' : '')),
                 }));
+                rendered.add(s.id);
             }
+            // Recursion: grandchildren render under their child rows too.
+            for (const id of rendered) appendNestedRows(id, (depth || 0) + 1);
         }
 
         function buildNestedSessionRow(rec) {
+            // Open child panes render their LIVE state here (running flag,
+            // current marker, label, close button) instead of moving to the
+            // flat open-panes section: the row stays under its parent.
+            const pane = findPaneBySession(rec.id);
+            const running = pane ? !!pane.turnActive : !!rec.running;
+            const label = pane && pane.label ? pane.label : rec.label;
+            const isCurrent = !!pane && pane === activePane();
             const row = document.createElement('div');
-            row.className = 'session-row nested' + (rec.running ? ' busy' : '');
+            row.className = 'session-row nested' + (running ? ' busy' : '') + (isCurrent ? ' current' : '');
             row.dataset.sessionId = rec.id;
             const content = document.createElement('div');
             content.className = 'session-row-content';
             const title = document.createElement('div');
             title.className = 'session-row-title';
-            title.textContent = (rec.running ? '⏳ ' : (rec.success ? '✅ ' : '❌ ')) + rec.label;
+            title.textContent = label;
             const meta = document.createElement('div');
             meta.className = 'session-row-meta';
-            meta.textContent = rec.running ? 'responding' : (rec.summary ? rec.summary.slice(0, 80) : 'done');
+            // Same colored-dot indicator as the flat rows: a running child
+            // shows the amber responding dot, a finished child a green done
+            // dot (or a red failed dot), followed by the summary when one
+            // exists. The dot's class carries the state color; the label
+            // text renders next to it (muted).
+            const frags = [];
+            let stateLabel = '';
+            let stateClass = '';
+            if (running) {
+                stateLabel = 'responding';
+                stateClass = 'amber';
+            } else if (rec.success) {
+                stateLabel = 'done';
+                stateClass = 'green';
+            } else {
+                stateLabel = 'failed';
+                stateClass = 'red';
+            }
+            const group = document.createElement('span');
+            group.className = 'session-state';
+            const dot = document.createElement('span');
+            dot.className = 'session-state-dot ' + stateClass;
+            dot.title = stateLabel;
+            dot.setAttribute('aria-label', stateLabel);
+            const stateText = document.createElement('span');
+            stateText.className = 'session-state-label';
+            stateText.textContent = stateLabel;
+            group.appendChild(dot);
+            group.appendChild(stateText);
+            frags.push(group);
+            if (!running && rec.summary) frags.push(rec.summary.slice(0, 80));
+            for (let i = 0; i < frags.length; i++) {
+                if (i > 0) meta.appendChild(document.createTextNode(' · '));
+                if (typeof frags[i] === 'string') {
+                    meta.appendChild(document.createTextNode(frags[i]));
+                } else {
+                    meta.appendChild(frags[i]);
+                }
+            }
             content.appendChild(title);
             content.appendChild(meta);
-            content.title = rec.job || rec.label;
-            // Attachable (D2): clicking opens the child as a pane.
-            content.onclick = () => { openSessionPane(rec.id); };
+            content.title = rec.job || label;
+            // Clicking focuses the open pane; otherwise it opens the child
+            // as a pane (the escape hatch for a stuck subagent).
+            content.onclick = () => { if (pane) focusPane(pane.key); else openSessionPane(rec.id); };
             row.appendChild(content);
+            // Same ✕ mechanics as the flat rows: an OPEN child's ✕ closes
+            // the pane (the session stays saved and returns to a nested
+            // row); a CLOSED child's ✕ deletes the session behind the
+            // standard confirm modal. Both report back to the parent
+            // agent server-side.
+            const closeBtn = document.createElement('button');
+            closeBtn.className = 'session-row-del';
+            closeBtn.textContent = '✕';
+            if (pane) {
+                closeBtn.title = 'Close session (stays saved)';
+                closeBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    closePane(pane.key);
+                };
+            } else {
+                closeBtn.title = 'Delete this session';
+                closeBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    deleteSession(rec.id, rec.label);
+                };
+            }
+            row.appendChild(closeBtn);
             return row;
+        }
+
+        // Parent id for a session that is a nested (subagent) child, or ''
+        // for a normal session. Mirrors appendNestedRows' sources: the live
+        // subagent_started/finished records first, then the persisted
+        // parentId in the sessions payload.
+        function nestedParentIdOf(id, list) {
+            const rec = nestedSessions.get(id);
+            if (rec && rec.parentId) return rec.parentId;
+            const entry = (list || []).find((s) => s.id === id);
+            return (entry && entry.parentId) || '';
+        }
+
+        // Reports whether id's row will render in this pass: as a flat row
+        // (id in rowIds) or as a nested row under a parent whose own chain
+        // reaches a flat row (appendNestedRows recurses through the whole
+        // chain). seen guards against corrupt ParentID cycles.
+        function nestedRowWillRender(id, list, rowIds, seen) {
+            if (rowIds.has(id)) return true;
+            if (seen.has(id)) return false;
+            seen.add(id);
+            const parentId = nestedParentIdOf(id, list);
+            if (!parentId) return false;
+            return nestedRowWillRender(parentId, list, rowIds, seen);
         }
 
         // ── Kanban board tab ──
@@ -5573,14 +5709,32 @@
                 if (s.parentId) continue;
                 if (!openIds.has(s.id)) rows.push({ pane: null, entry: s });
             }
-            if (!rows.length) {
+            // A nested (subagent) child open as a pane renders under its
+            // parent via appendNestedRows below, NOT as a flat open-pane
+            // row — opening a subagent must not make its row jump out of
+            // the parent. The child falls back to its flat open-pane row
+            // only when the parent's row is missing from this render (a
+            // parent session still unknown to this tab / the store).
+            const rowIds = new Set();
+            for (const r of rows) rowIds.add(r.pane ? r.pane.id : (r.entry ? r.entry.id : ''));
+            const flatRows = rows.filter((r) => {
+                const id = r.pane ? r.pane.id : (r.entry ? r.entry.id : '');
+                if (!r.pane || !id) return true;
+                const parentId = nestedParentIdOf(id, list);
+                // Skip the flat row when the child's row renders nested
+                // under a parent — including via a recursively nested
+                // ancestor (depth >= 2). Only a missing ancestor chain
+                // falls back to the flat open-pane row.
+                return !parentId || !nestedRowWillRender(parentId, list, rowIds, new Set());
+            });
+            if (!flatRows.length) {
                 const empty = document.createElement('div');
                 empty.className = 'session-list-empty';
                 empty.textContent = 'No sessions';
                 sessionListDiv.appendChild(empty);
                 return;
             }
-            for (const r of rows) {
+            for (const r of flatRows) {
                 sessionListDiv.appendChild(buildSessionRow(r.pane, r.entry, act));
                 // Nested (subagent) rows render directly under their parent
                 // (live events + persisted children from the payload).
@@ -5743,6 +5897,13 @@
             }
             const row = findSessionRow(pane.id);
             if (!row) return;
+            if (row.classList.contains('nested')) {
+                // Nested rows carry a job tooltip and a colored-dot state;
+                // rebuild the row instead of overwriting the title with the
+                // bare label.
+                refreshSidebarSessions();
+                return;
+            }
             const titleEl = row.querySelector('.session-row-title');
             if (titleEl.textContent === label) return; // already up-to-date
             titleEl.textContent = label;
@@ -5816,6 +5977,19 @@
             }
             pendingSessionResponse = true;
             ws.send(JSON.stringify({ type: 'session_delete', sessionId: id }));
+            // A deleted nested (subagent) child must stop rendering under
+            // its parent: drop its live-event record AND the cached payload
+            // entry now (a closed child has no attached pane, so no
+            // session_removed broadcast comes back to this tab; the server
+            // still reports the deletion to the parent agent, and the
+            // fresh list round-trip after the reply confirms the purge).
+            if (nestedSessions.delete(id)) {
+                if (lastSessions) {
+                    const idx = lastSessions.findIndex((s) => s.id === id);
+                    if (idx >= 0) lastSessions.splice(idx, 1);
+                }
+                refreshSidebarSessions();
+            }
         }
 
         // Custom confirm modal for session deletion (matches the other dialogs).

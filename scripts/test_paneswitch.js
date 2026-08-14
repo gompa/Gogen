@@ -347,9 +347,24 @@ function renderSessionList(list) {
     rows.push({ pane, entry });
   }
   for (const s of lastSessions) {
+    // Nested (subagent) rows render under their parent (appendNestedRows
+    // in app.js), never as flat rows.
+    if (s.parentId) continue;
     if (!openIds.has(s.id)) rows.push({ pane: null, entry: s });
   }
-  for (const r of rows) {
+  // A nested (subagent) child open as a pane renders under its parent, not
+  // as a flat open-pane row; it falls back to a flat row only when the
+  // parent's row is missing from this render.
+  const rowIds = new Set();
+  for (const r of rows) rowIds.add(r.pane ? r.pane.id : (r.entry ? r.entry.id : ''));
+  const flatRows = rows.filter((r) => {
+    const id = r.pane ? r.pane.id : (r.entry ? r.entry.id : '');
+    if (!r.pane || !id) return true;
+    const entry = lastSessions.find((s) => s.id === id);
+    const parentId = (entry && entry.parentId) || '';
+    return !parentId || !rowIds.has(parentId);
+  });
+  for (const r of flatRows) {
     const pane = r.pane;
     const entry = r.entry;
     const s = entry || {

@@ -412,6 +412,89 @@ func TestSessionsPayloadIncludesNested(t *testing.T) {
 	}
 }
 
+// TestSessionsPayloadTurnActive pins the turnActive field in the sessions
+// payload: a running child reports turnActive=true, while the same child
+// resumed from the store (the restart "switch to subagent" flow) reports
+// active=true but turnActive=false — the sidebar must render it as done,
+// not as running or failed.
+func TestSessionsPayloadTurnActive(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, a, _ := newContinuationServer(t, stub, dir)
+	s.ws.ProviderFactory = func() llm.LLMProvider {
+		return &blockingProvider{}
+	}
+	a.SetSubagentsEnabled(true)
+	srv := startWSServer(t, s)
+	defer srv.Close()
+
+	conn := dialWS(t, srv, "/ws")
+	defer conn.Close()
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+
+	// A running child: the payload must report turnActive.
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := (&subagentSpawner{s: s}).Spawn(ctx, a, "long job", "", 0)
+		done <- err
+	}()
+	var childID string
+	waitFor(t, 5*time.Second, func() bool {
+		for _, id := range s.registry.activeIDs() {
+			if id != a.SessionID {
+				childID = id
+				return true
+			}
+		}
+		return false
+	})
+	if err := conn.WriteJSON(WSMessage{Type: "list_sessions"}); err != nil {
+		t.Fatalf("list_sessions: %v", err)
+	}
+	msg := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "sessions" })
+	child := sessionPayloadEntry(msg.Sessions, childID)
+	if child == nil || !child.Active || !child.TurnActive {
+		t.Fatalf("running child payload = %+v, want active+turnActive", child)
+	}
+
+	// Stop the child turn (the spawn unwinds with an error) and let the
+	// session persist.
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("spawn did not return after cancel")
+	}
+
+	// Resume the child from the store — the restart "switch to subagent"
+	// flow: registered but idle, so active=true and turnActive=false.
+	if err := conn.WriteJSON(WSMessage{Type: "session_attach", SessionID: childID}); err != nil {
+		t.Fatalf("attach child: %v", err)
+	}
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool {
+		return m.Type == "session_state" && m.SessionID == childID
+	})
+	if err := conn.WriteJSON(WSMessage{Type: "list_sessions"}); err != nil {
+		t.Fatalf("list_sessions: %v", err)
+	}
+	msg = readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "sessions" })
+	child = sessionPayloadEntry(msg.Sessions, childID)
+	if child == nil || !child.Active || child.TurnActive {
+		t.Fatalf("resumed child payload = %+v, want active but NOT turnActive", child)
+	}
+}
+
+// sessionPayloadEntry returns the sessions payload entry for id.
+func sessionPayloadEntry(entries []SessionEntry, id string) *SessionEntry {
+	for i := range entries {
+		if entries[i].ID == id {
+			return &entries[i]
+		}
+	}
+	return nil
+}
+
 // TestSpawnParentEvictedWhileChildRuns pins the eviction window in the
 // foreground Spawn: when the parent session is torn down (close ✕, delete,
 // cap eviction, shutdown) while its subagent's turn is still running, the

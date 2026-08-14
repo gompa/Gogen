@@ -204,15 +204,18 @@ func (a *Agent) resumeLatestSession(ctx context.Context) (string, error) {
 	if len(list) == 0 {
 		return "", fmt.Errorf("no saved sessions")
 	}
-	if len(list) == 1 && list[0].ID == a.SessionID {
-		return "", fmt.Errorf("no other saved sessions to resume")
-	}
-	target := list[0].ID
+	// Nested (subagent) sessions are not part of the flat list: "resume
+	// latest" must never target a child (they are reachable only through
+	// their parent's sidebar row, D2).
+	target := ""
 	for _, s := range list {
-		if s.ID != a.SessionID {
+		if s.ID != a.SessionID && s.ParentID == "" {
 			target = s.ID
 			break
 		}
+	}
+	if target == "" {
+		return "", fmt.Errorf("no other saved sessions to resume")
 	}
 	return a.resumeSessionByID(ctx, target)
 }

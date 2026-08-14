@@ -1,11 +1,12 @@
 package session
 
 import (
+	"os"
 	"testing"
+	"time"
 
 	"gogen/internal/agent"
 	"gogen/internal/llm"
-	"os"
 )
 
 func nestedSnap(workingDir, id, parent string) agent.SessionSnapshot {
@@ -158,6 +159,121 @@ func TestNestedParentIDRoundTrip(t *testing.T) {
 	}
 	if loaded.ParentID != "parent" {
 		t.Fatalf("loaded ParentID = %q, want parent", loaded.ParentID)
+	}
+}
+
+// TestNestedLatestIDExcluded verifies "latest" never resolves to a nested
+// (subagent) child: the flat session list excludes children, so "resume
+// latest" and the restart bootstrap must land on the most recent TOP-LEVEL
+// session instead — a child that finished last must not become the default
+// session after a restart.
+func TestNestedLatestIDExcluded(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(true)
+	if err := s.Save("parent", agent.SessionSnapshot{
+		WorkingDir: dir,
+		Messages:   []llm.Message{{Role: "user", Content: "p"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond) // child strictly newer
+	if err := s.Save("child", agent.SessionSnapshot{
+		WorkingDir: dir,
+		ParentID:   "parent",
+		Messages:   []llm.Message{{Role: "user", Content: "c"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Precondition: the child really is the most recently updated session.
+	list, err := s.List(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if list[0].ID != "child" {
+		t.Fatalf("precondition: newest session = %q, want the child", list[0].ID)
+	}
+	latest, err := s.LatestID(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest != "parent" {
+		t.Fatalf("LatestID = %q, want the parent (nested children excluded)", latest)
+	}
+	// Only children on disk: no flat session exists → "" (bootstrap then
+	// falls back to a fresh session).
+	dir2 := t.TempDir()
+	if err := s.Save("child-only", agent.SessionSnapshot{
+		WorkingDir: dir2,
+		ParentID:   "gone",
+		Messages:   []llm.Message{{Role: "user", Content: "c"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	latest, err = s.LatestID(dir2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest != "" {
+		t.Fatalf("LatestID with only children = %q, want empty", latest)
+	}
+}
+
+// TestSubagentOutcomeRoundTrip verifies the recorded subagent outcome
+// (status + summary) survives save → load and reaches the metadata index
+// (what the sessions payload reads), including across a fresh store over
+// the same directory (restart simulation).
+func TestSubagentOutcomeRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(true)
+	if err := s.Save("parent", agent.SessionSnapshot{
+		WorkingDir: dir,
+		Messages:   []llm.Message{{Role: "user", Content: "p"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save("child", agent.SessionSnapshot{
+		WorkingDir:      dir,
+		ParentID:        "parent",
+		SubagentStatus:  "failed",
+		SubagentSummary: "boom",
+		Messages:        []llm.Message{{Role: "user", Content: "c"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Load round-trip.
+	loaded, err := s.LoadInWorkingDir(dir, "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.SubagentStatus != "failed" || loaded.SubagentSummary != "boom" {
+		t.Fatalf("loaded outcome = %q/%q, want failed/boom", loaded.SubagentStatus, loaded.SubagentSummary)
+	}
+	// Index round-trip: List and Info both carry the outcome.
+	list, err := s.List(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, si := range list {
+		if si.ID == "child" {
+			found = true
+			if si.SubagentStatus != "failed" || si.SubagentSummary != "boom" {
+				t.Fatalf("List outcome = %q/%q, want failed/boom", si.SubagentStatus, si.SubagentSummary)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("child missing from List")
+	}
+	info := s.Info(dir, "child")
+	if info == nil || info.SubagentStatus != "failed" || info.SubagentSummary != "boom" {
+		t.Fatalf("Info outcome = %+v, want failed/boom", info)
+	}
+	// Fresh store over the same directory (restart): the index persists.
+	s2 := NewStore(true)
+	info2 := s2.Info(dir, "child")
+	if info2 == nil || info2.SubagentStatus != "failed" {
+		t.Fatalf("Info after restart = %+v, want the persisted outcome", info2)
 	}
 }
 

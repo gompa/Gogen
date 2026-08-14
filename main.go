@@ -200,8 +200,7 @@ func run() error {
 	}
 
 	if opts.web {
-		runWeb(ctx, a, cfg, restoredModel)
-		return nil
+		return runWeb(ctx, a, cfg, restoredModel)
 	}
 
 	// Default: TUI mode.

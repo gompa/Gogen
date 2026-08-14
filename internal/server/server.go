@@ -314,17 +314,20 @@ func fillModelPricing(a *agent.Agent, msg *WSMessage) {
 	}
 }
 
-func sessionEntries(list []agent.SessionInfo, active map[string]bool) []SessionEntry {
+func sessionEntries(list []agent.SessionInfo, active, turnActive map[string]bool) []SessionEntry {
 	out := make([]SessionEntry, 0, len(list))
 	for _, s := range list {
 		out = append(out, SessionEntry{
-			ID:           s.ID,
-			UpdatedAt:    s.UpdatedAt,
-			MessageCount: s.MessageCount,
-			Label:        s.Label,
-			Oneshot:      s.Oneshot,
-			ParentID:     s.ParentID,
-			Active:       active[s.ID],
+			ID:              s.ID,
+			UpdatedAt:       s.UpdatedAt,
+			MessageCount:    s.MessageCount,
+			Label:           s.Label,
+			Oneshot:         s.Oneshot,
+			ParentID:        s.ParentID,
+			Active:          active[s.ID],
+			TurnActive:      turnActive[s.ID],
+			SubagentStatus:  s.SubagentStatus,
+			SubagentSummary: s.SubagentSummary,
 		})
 	}
 	return out
@@ -336,6 +339,27 @@ func (r *sessionRegistry) activeSet() map[string]bool {
 	out := make(map[string]bool, len(ids))
 	for _, id := range ids {
 		out[id] = true
+	}
+	return out
+}
+
+// turnActiveSet returns the ids of registered runtimes that currently have
+// a running turn. The sessions payload uses it so the client can tell a
+// genuinely running session ("responding") from one that is merely
+// registered-but-idle (open as a pane, or resumed from the store) — the
+// plain active set cannot. Ids are snapshotted under the registry lock and
+// each runtime's turn state read without it (no lock ordering with stateMu).
+func (r *sessionRegistry) turnActiveSet() map[string]bool {
+	ids := r.activeIDs()
+	out := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		rt, ok := r.get(id)
+		if !ok {
+			continue
+		}
+		if active, _ := rt.turnState(); active {
+			out[id] = true
+		}
 	}
 	return out
 }
@@ -425,7 +449,7 @@ func (s *Server) writeSessionCommandResult(ws *wsConn, ctx context.Context, rt *
 	// session until it's done" symptom.
 	if err == nil && len(result.Sessions) > 0 {
 		resp.Type = "sessions"
-		resp.Sessions = sessionEntries(result.Sessions, s.registry.activeSet())
+		resp.Sessions = sessionEntries(result.Sessions, s.registry.activeSet(), s.registry.turnActiveSet())
 	}
 	cfg = agentConfigMsgBasic(a)
 	s.decorateConfig(&cfg)
@@ -896,6 +920,18 @@ func wsHandleClose(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime
 	}
 	target.detach(ws)
 	if target.clientCount() == 0 {
+		// Closing a nested (subagent) child reports back to its parent
+		// session: the main agent must learn the child was stopped by the
+		// user (delivered as a system message once the parent is idle /
+		// its turn ends). Skipped when the runtime was already evicted —
+		// closeRuntime would be a no-op, so there is nothing to report.
+		if parentID := target.agent.ParentID(); parentID != "" && !target.evicted.Load() {
+			label := target.agent.SessionLabelSnapshot()
+			if label == "" {
+				label = target.agent.SessionID
+			}
+			s.registry.deliverToParent(parentID, fmt.Sprintf("[subagent %s] closed by the user — its session stays saved and can be reopened.", label))
+		}
 		s.registry.closeRuntime(target)
 	}
 }
@@ -1115,7 +1151,7 @@ func (s *Server) handleWSListSessions(ws *wsConn, rt *sessionRuntime) {
 		// the active pane — e.g. after another tab moved the global default.
 		_ = ws.writeJSON(WSMessage{
 			Type:     "sessions",
-			Sessions: sessionEntries(sessions, s.registry.activeSet()),
+			Sessions: sessionEntries(sessions, s.registry.activeSet(), s.registry.turnActiveSet()),
 		})
 	}()
 }

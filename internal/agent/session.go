@@ -38,6 +38,14 @@ type SessionSnapshot struct {
 	// are excluded from the flat saved list, cascade-deleted with their
 	// parent, and capped per parent (D2).
 	ParentID string
+	// SubagentStatus records the final outcome of a nested (subagent)
+	// session: "" (unknown / not finished), "success", or "failed".
+	// Persisted so the sidebar can render the true outcome after a
+	// reload/restart, when the subagent_started/finished events are gone.
+	SubagentStatus string
+	// SubagentSummary is the report/error summary written alongside
+	// SubagentStatus.
+	SubagentSummary string
 }
 
 // SessionPersister stores and loads agent sessions.
@@ -65,6 +73,12 @@ type SessionInfo struct {
 	// renders them under their parent and the flat saved-session list
 	// excludes them.
 	ParentID string
+	// SubagentStatus is the persisted final outcome of a nested (subagent)
+	// session: "" (unknown / not finished), "success", or "failed".
+	SubagentStatus string
+	// SubagentSummary is the report/error summary written alongside
+	// SubagentStatus.
+	SubagentSummary string
 }
 
 // RestoreSessionLocal loads messages, mode, and model from a snapshot without
@@ -107,8 +121,12 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 	}
 	// Nested (subagent) sessions keep their parent link across restore so
 	// the store's flat-list exclusion / cascade / per-parent cap stay
-	// consistent when a child pane is reopened.
+	// consistent when a child pane is reopened. The recorded outcome is
+	// restored too: without it, the first persist of a reopened child
+	// would write an empty status over the file's stored one, and the
+	// sidebar would lose the true result after the next restart.
 	a.SetParentID(snap.ParentID)
+	a.SetSubagentOutcome(snap.SubagentStatus, snap.SubagentSummary)
 	a.clearTurnUsage()
 	a.statsMu.Lock()
 	a.UsageAccum = UsageAccumulator{}
@@ -410,14 +428,17 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 	count := len(st.msgs)
 	st.profile = a.ensureProjectProfile()
 	st.model = a.CurrentModel()
+	subagentStatus, subagentSummary := a.SubagentOutcome()
 	st.meta = persistMeta{
-		label:    st.label,
-		mode:     st.mode,
-		model:    st.model,
-		thinking: st.thinking,
-		oneshot:  st.oneshot,
-		profile:  st.profile,
-		todos:    todoSnapshot(a.TodoManager),
+		label:           st.label,
+		mode:            st.mode,
+		model:           st.model,
+		thinking:        st.thinking,
+		oneshot:         st.oneshot,
+		profile:         st.profile,
+		todos:           todoSnapshot(a.TodoManager),
+		subagentStatus:  subagentStatus,
+		subagentSummary: subagentSummary,
 	}
 
 	// Safety: if the message list was truncated since last save (e.g.
@@ -501,19 +522,22 @@ func (a *Agent) capturePersistState() persistState {
 // counters. Returns false after recording the error; the caller then skips
 // the success bookkeeping.
 func (a *Agent) persistFullSnapshot(st persistState, count int, skipTokenCounts bool) bool {
+	subagentStatus, subagentSummary := a.SubagentOutcome()
 	snap := SessionSnapshot{
-		WorkingDir:     st.workingDir,
-		Model:          st.model,
-		Mode:           st.mode,
-		ThinkingLevel:  st.thinking,
-		Oneshot:        st.oneshot,
-		Label:          st.label,
-		LabelRenamed:   st.labelRenamed,
-		ProjectProfile: st.profile,
-		Todos:          st.meta.todos,
-		Messages:       st.msgs,
-		ContextLimit:   a.ContextLimit(),
-		ParentID:       a.ParentID(),
+		WorkingDir:      st.workingDir,
+		Model:           st.model,
+		Mode:            st.mode,
+		ThinkingLevel:   st.thinking,
+		Oneshot:         st.oneshot,
+		Label:           st.label,
+		LabelRenamed:    st.labelRenamed,
+		ProjectProfile:  st.profile,
+		Todos:           st.meta.todos,
+		Messages:        st.msgs,
+		ContextLimit:    a.ContextLimit(),
+		ParentID:        a.ParentID(),
+		SubagentStatus:  subagentStatus,
+		SubagentSummary: subagentSummary,
 	}
 	if len(st.tokenCounts) == len(st.msgs) {
 		snap.TokenCounts = st.tokenCounts

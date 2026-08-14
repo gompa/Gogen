@@ -151,6 +151,27 @@ func (sp *subagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, job, 
 	report, err := sp.runChildTurn(ctx, childRt, agent.FormatSubagentJob(rawJob))
 	success := err == nil
 
+	// Persist the final outcome on the child's snapshot so the sidebar can
+	// render the true result after a reload/restart (the subagent_started/
+	// finished events are not replayed to connecting clients). The turn's
+	// own flush already wrote the transcript; this full flush adds the
+	// outcome fields (persistMu serializes against any tail of the turn's
+	// write).
+	status := "success"
+	if !success {
+		status = "failed"
+	}
+	childRt.agent.SetSubagentOutcome(status, truncateReport(report, err))
+	childRt.agent.FlushSession()
+	// A concurrent DELETE of the parent cascades the child's file away;
+	// if that delete won the race against the flush above, the write
+	// resurrected the child. Detect it (runtime evicted as part of the
+	// cascade + parent's file gone) and remove the orphan so it cannot
+	// linger invisibly on disk (excluded from the flat list/prune/latest).
+	if childRt.evicted.Load() && s.ws.Store.Info(s.ws.GetWorkingDir(), parent.SessionID) == nil {
+		_ = s.ws.Store.Delete(s.ws.GetWorkingDir(), childID)
+	}
+
 	// The child is persisted by its turn (doPersist); unregistering keeps
 	// the registry clean — the saved session stays attachable via the
 	// sidebar row (ensureSessionRuntime reloads it).

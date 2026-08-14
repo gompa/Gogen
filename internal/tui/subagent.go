@@ -82,6 +82,15 @@ func (sp *tuiSubagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, jo
 	// list keeps the original job the parent wrote; only the child's first
 	// message carries the wrapped job.
 	report, err := child.StreamProcessInputWithImages(ctx, agent.FormatSubagentJob(job), nil, nil)
+	// Persist the final outcome on the child's snapshot (same contract as
+	// the web spawner): the sidebar reads it from the sessions payload
+	// when the live subagent events are gone.
+	status := "success"
+	if err != nil {
+		status = "failed"
+	}
+	child.SetSubagentOutcome(status, agent.TruncateSubagentReport(report))
+	child.FlushSession()
 	if sp.m != nil {
 		sp.m.recordSubagent(subagentRecord{label: label, report: agent.TruncateSubagentReport(report), err: err})
 	}
