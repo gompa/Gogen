@@ -4,18 +4,54 @@ package agent
 
 import (
 	"context"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
 )
 
-// These tests exercise the embedded POSIX interpreter (executor_run_windows.go)
-// with commands that need no external shell and only stock Windows binaries
-// (cmd.exe) or interpreter builtins, so they pass without git-bash/msys.
+// forceInterpreter makes every command in the test run through the embedded
+// interpreter, even on CI runners where git-bash puts a native sh on PATH —
+// the fallback must be exercised, not just the native path.
+func forceInterpreter(t *testing.T) {
+	t.Helper()
+	old := shellInterpreterForced
+	shellInterpreterForced = true
+	t.Cleanup(func() { shellInterpreterForced = old })
+}
+
+// TestWindowsShellGatePreference verifies the native-vs-interpreter gate:
+// forcing the interpreter disables the native shell, and without the force
+// the decision tracks whether sh is actually on PATH.
+func TestWindowsShellGatePreference(t *testing.T) {
+	forceInterpreter(t)
+	if nativeShellAvailable() {
+		t.Fatal("forced interpreter must disable the native shell")
+	}
+	shellInterpreterForced = false
+	_, err := exec.LookPath("sh")
+	if want := err == nil; nativeShellAvailable() != want {
+		t.Fatalf("nativeShellAvailable() = %v, want %v (sh on PATH: %v)", nativeShellAvailable(), want, err == nil)
+	}
+}
+
+// TestWindowsShellNativePath verifies the native sh path is used when one is
+// on PATH (skipped on a stock Windows box without git-bash/msys).
+func TestWindowsShellNativePath(t *testing.T) {
+	if !nativeShellAvailable() {
+		t.Skip("no native sh on PATH")
+	}
+	exec := NewExecutor(t.TempDir())
+	out, err := exec.ExecuteCommand(context.Background(), "echo native-ok")
+	if err != nil || !strings.Contains(out, "native-ok") {
+		t.Fatalf("native sh: out=%q err=%v", out, err)
+	}
+}
 
 // TestWindowsShellBuiltins verifies the interpreter's builtins cover the
 // shell constructs the agent's commands rely on.
 func TestWindowsShellBuiltins(t *testing.T) {
+	forceInterpreter(t)
 	exec := NewExecutor(t.TempDir())
 	out, err := exec.ExecuteCommand(context.Background(), "echo hello && printf 'world\n'")
 	if err != nil {
@@ -29,6 +65,7 @@ func TestWindowsShellBuiltins(t *testing.T) {
 // TestWindowsShellExternalCommand verifies external binaries are resolved
 // via PATH and exec'd natively (cmd.exe ships with every Windows install).
 func TestWindowsShellExternalCommand(t *testing.T) {
+	forceInterpreter(t)
 	exec := NewExecutor(t.TempDir())
 	out, err := exec.ExecuteCommand(context.Background(), "cmd /c echo external-ok")
 	if err != nil {
@@ -42,6 +79,7 @@ func TestWindowsShellExternalCommand(t *testing.T) {
 // TestWindowsShellExitStatus verifies non-zero exits surface as
 // "execution error: exit status N", matching the Unix sh path.
 func TestWindowsShellExitStatus(t *testing.T) {
+	forceInterpreter(t)
 	exec := NewExecutor(t.TempDir())
 	_, err := exec.ExecuteCommand(context.Background(), "exit 3")
 	if err == nil || !strings.Contains(err.Error(), "exit status 3") {
@@ -52,6 +90,7 @@ func TestWindowsShellExitStatus(t *testing.T) {
 // TestWindowsShellCommandNotFound verifies a missing binary reports the
 // shell's 127 exit status (like sh).
 func TestWindowsShellCommandNotFound(t *testing.T) {
+	forceInterpreter(t)
 	exec := NewExecutor(t.TempDir())
 	_, err := exec.ExecuteCommand(context.Background(), "definitely-not-a-real-command-xyz")
 	if err == nil || !strings.Contains(err.Error(), "exit status 127") {
@@ -63,6 +102,7 @@ func TestWindowsShellCommandNotFound(t *testing.T) {
 // command promptly instead of waiting it out, and that the kill reaches the
 // process tree (taskkill /T).
 func TestWindowsShellTimeoutKillsTree(t *testing.T) {
+	forceInterpreter(t)
 	exec := NewExecutor(t.TempDir())
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
@@ -80,6 +120,7 @@ func TestWindowsShellTimeoutKillsTree(t *testing.T) {
 // TestWindowsBackgroundJobInterp verifies background jobs run through the
 // embedded interpreter and stdin input works end-to-end (in-memory pipe).
 func TestWindowsBackgroundJobInterp(t *testing.T) {
+	forceInterpreter(t)
 	exec := NewExecutor(t.TempDir())
 	a := NewAgent(nil, exec, nil)
 	defer a.Close()
