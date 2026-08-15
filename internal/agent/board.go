@@ -54,11 +54,18 @@ type BoardItem struct {
 	// AgentSessionID is the session started for this ticket by the web
 	// board's "Start agent" button ("" = none). The "Open agent" button
 	// targets it; a stale id (session deleted) is reset by ResetAgent.
-	AgentSessionID string          `json:"agentSession,omitempty"`
-	CreatedAt      time.Time       `json:"created_at"`
-	UpdatedAt      time.Time       `json:"updated_at"`
-	DoneAt         time.Time       `json:"done_at,omitempty"`
-	Activity       []BoardActivity `json:"activity,omitempty"`
+	AgentSessionID string `json:"agentSession,omitempty"`
+	// Model is the per-ticket model chosen in the web board's "Start
+	// agent" popover ("" = the workspace default model).
+	Model string `json:"model,omitempty"`
+	// Prompt is the per-ticket prompt template for the agent started from
+	// this ticket ("" = the configured board_start_prompt template). The
+	// popover pre-fills from it; the start op is authoritative.
+	Prompt    string          `json:"prompt,omitempty"`
+	CreatedAt time.Time       `json:"created_at"`
+	UpdatedAt time.Time       `json:"updated_at"`
+	DoneAt    time.Time       `json:"done_at,omitempty"`
+	Activity  []BoardActivity `json:"activity,omitempty"`
 }
 
 // BoardSnapshot is the full board state for rendering (web UI / list).
@@ -437,6 +444,27 @@ func (m *BoardManager) ResetAgent(id, by string) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("Reset board item #%s for a fresh start", item.ID), nil
+}
+
+// SetStartOptions persists the model and prompt template chosen in the web
+// board's "Start agent" popover ("" clears back to the defaults: workspace
+// model / configured board_start_prompt). Silent by design — the claim
+// already logs the start, and the stored options only pre-fill the popover
+// on the next start.
+func (m *BoardManager) SetStartOptions(id, model, prompt string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.loadIndexLocked(); err != nil {
+		return err
+	}
+	item, err := m.loadItemLocked(id)
+	if err != nil {
+		return err
+	}
+	item.Model = strings.TrimSpace(model)
+	item.Prompt = strings.TrimSpace(prompt)
+	item.UpdatedAt = time.Now().UTC()
+	return m.saveItemLocked(item)
 }
 
 // Add creates a new ticket in the backlog column.

@@ -138,6 +138,15 @@ type OpenAIProvider struct {
 	propsBaseURL           string
 	propsPreserveReasoning bool
 
+	// effortsDerived caches per-model reasoning-effort options derived from
+	// llama.cpp /props (+ /apply-template) capability probes (see
+	// ProbeReasoningEfforts). Keyed by model ID; entries record the endpoint
+	// they were derived from. Cleared by SetProfiles (the endpoint set
+	// changed); NOT cleared by SetModel — each model is probed once and the
+	// result stays valid across switches back to it.
+	effortsMu      sync.Mutex
+	effortsDerived map[string]derivedEfforts
+
 	// preserveReasoningMode: auto (default, probe /props), on, off.
 	preserveReasoningMode string
 
@@ -281,10 +290,11 @@ func buildProfileClients(prof providerProfile) *providerProfile {
 // fallback client and routing always agree for constructor-built providers.
 func newOpenAIProvider(profiles []*providerProfile, model string, resolver *modelinfo.Resolver) *OpenAIProvider {
 	p := &OpenAIProvider{
-		model:       model,
-		modelClient: make(map[string]*openai.Client),
-		modelInfo:   resolver,
-		profiles:    profiles,
+		model:          model,
+		modelClient:    make(map[string]*openai.Client),
+		modelInfo:      resolver,
+		profiles:       profiles,
+		effortsDerived: make(map[string]derivedEfforts),
 	}
 	if len(profiles) > 0 {
 		def := profiles[0]
@@ -378,6 +388,7 @@ func (p *OpenAIProvider) SetProfiles(profiles []ProviderProfile) error {
 		}))
 	}
 	p.invalidatePropsCaps()
+	p.invalidateReasoningEfforts()
 	p.modelsMu.Lock()
 	p.profiles = built
 	p.profilesGen++
@@ -481,19 +492,69 @@ func (p *OpenAIProvider) ModelPricing(modelID string) (input, output, cached flo
 
 // ModelReasoningEfforts returns the effective reasoning-effort options for the
 // given model: its models.dev accepted set when the model is known (empty for
-// toggle/budget-only models, meaning no effort control), else
-// DefaultReasoningEfforts. Only cached map lookup — never blocks. This is the
-// same set applyThinkingLevel uses to gate the wire value.
+// toggle/budget-only models, meaning no effort control); else the set derived
+// from a llama.cpp capability probe when one has completed (empty when the
+// endpoint reported no effort support); else DefaultReasoningEfforts. Never
+// blocks — the models.dev registry and the derived cache are in-memory map
+// reads; the probe itself runs off the hot path via ProbeReasoningEfforts.
+// This is the same set applyThinkingLevel uses to gate the wire value.
 func (p *OpenAIProvider) ModelReasoningEfforts(modelID string) []string {
-	if p == nil || p.modelInfo == nil || modelID == "" {
-		return DefaultReasoningEfforts
+	efforts, _ := p.reasoningEffortResolution(modelID)
+	return efforts
+}
+
+// ReasoningEffortUnsupported reports whether the model definitively has NO
+// reasoning-effort control: a known models.dev entry with an empty accepted
+// set (toggle/budget-only), or a llama.cpp capability probe that reported no
+// support — with no source reporting support. Unknown or not-yet-probed
+// models are NOT unsupported (callers keep the DefaultReasoningEfforts
+// fallback). Never blocks. The client hides the thinking chips in this case.
+func (p *OpenAIProvider) ReasoningEffortUnsupported(modelID string) bool {
+	_, unsupported := p.reasoningEffortResolution(modelID)
+	return unsupported
+}
+
+// reasoningEffortResolution resolves the accepted reasoning-effort set and
+// the definitive no-support flag for one model. Precedence:
+//
+//  1. The models.dev accepted set when the model is known and non-empty.
+//  2. The llama.cpp capability-probe set when probed and non-empty (a runtime
+//     template that references reasoning_effort wins over a registry entry
+//     that declared none).
+//  3. "unsupported" when a source positively reported no effort control
+//     (registry known with an empty set, or a probe reporting no support)
+//     and no source reported support.
+//  4. DefaultReasoningEfforts otherwise (unknown / not yet probed).
+//
+// Never blocks: registry and derived-cache reads are in-memory map lookups.
+func (p *OpenAIProvider) reasoningEffortResolution(modelID string) (efforts []string, unsupported bool) {
+	if p == nil || modelID == "" {
+		return DefaultReasoningEfforts, false
 	}
-	for _, u := range p.modelsDevURLsFor(modelID) {
-		if _, _, efforts, _, err := p.modelInfo.Resolve(u, modelID); err == nil {
-			return efforts // known model: accepted set (possibly empty)
+	registryKnown := false
+	var registryEfforts []string
+	if p.modelInfo != nil {
+		for _, u := range p.modelsDevURLsFor(modelID) {
+			if _, _, efforts, _, err := p.modelInfo.Resolve(u, modelID); err == nil {
+				registryKnown = true
+				registryEfforts = efforts
+				break
+			}
 		}
 	}
-	return DefaultReasoningEfforts // unknown model
+	if registryKnown && len(registryEfforts) > 0 {
+		return append([]string(nil), registryEfforts...), false
+	}
+	p.effortsMu.Lock()
+	d, ok := p.effortsDerived[modelID]
+	p.effortsMu.Unlock()
+	if ok && d.probed && len(d.efforts) > 0 {
+		return append([]string(nil), d.efforts...), false
+	}
+	if (registryKnown && len(registryEfforts) == 0) || (ok && d.probed && len(d.efforts) == 0) {
+		return nil, true
+	}
+	return DefaultReasoningEfforts, false
 }
 
 // ModelDescription returns the models.dev description for the given model, or

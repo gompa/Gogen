@@ -2,8 +2,26 @@ package agent
 
 import (
 	"context"
+	"errors"
 
 	"gogen/internal/llm"
+)
+
+// toolRoundOutcome reports how the agent loop must continue after a tool
+// round.
+type toolRoundOutcome int
+
+const (
+	// toolRoundContinue: results were appended; the loop may call the model
+	// again.
+	toolRoundContinue toolRoundOutcome = iota
+	// toolRoundCancelled: the context was cancelled mid-round; the caller
+	// aborts with ctx.Err().
+	toolRoundCancelled
+	// toolRoundStopped: a patch_file failure ended the turn (marker-only
+	// diff or exhausted per-turn mismatch budget); the caller returns
+	// stopMsg to the host instead of calling the model again.
+	toolRoundStopped
 )
 
 // runTurn executes one model round: it checks the context, prepares the
@@ -64,12 +82,18 @@ func (a *Agent) runTurn(ctx context.Context, h *llm.StreamHandlers, first bool) 
 // runToolRound executes a round's tool calls: read-only eligible batches run
 // concurrently (bounded by maxParallelTools), everything else strictly
 // sequentially in model order so mutating tools stay serialized and results
-// append in the model's call order. Returns true when the context was
-// cancelled mid-execution — the caller must abort the turn (the tool
-// result protocol was already preserved for the next turn).
-func (a *Agent) runToolRound(ctx context.Context, h *llm.StreamHandlers, toolCalls []llm.ToolCall) bool {
+// append in the model's call order. Returns the round outcome and, for
+// toolRoundStopped, the final tool-result message to surface as the turn
+// outcome. On toolRoundCancelled the tool result protocol was already
+// preserved for the next turn.
+func (a *Agent) runToolRound(ctx context.Context, h *llm.StreamHandlers, toolCalls []llm.ToolCall) (toolRoundOutcome, string) {
 	if a.toolCallsParallelEligible(toolCalls) {
-		return a.executeToolCallsParallel(ctx, h, toolCalls)
+		// Mutating tools (patch_file included) are never parallel-eligible,
+		// so the patch-turn stop cannot occur on this path.
+		if a.executeToolCallsParallel(ctx, h, toolCalls) {
+			return toolRoundCancelled, ""
+		}
+		return toolRoundContinue, ""
 	}
 	for i, tc := range toolCalls {
 		if ctx.Err() != nil {
@@ -77,7 +101,7 @@ func (a *Agent) runToolRound(ctx context.Context, h *llm.StreamHandlers, toolCal
 			a.appendCanceledToolResults(toolCalls[i:])
 			finishStreamUI(h)
 			a.FlushSession()
-			return true
+			return toolRoundCancelled, ""
 		}
 		if h.OnToolCall != nil {
 			h.OnToolCall(tc)
@@ -89,14 +113,37 @@ func (a *Agent) runToolRound(ctx context.Context, h *llm.StreamHandlers, toolCal
 		// Attach the live-output sink (if any) to this tool call's
 		// context so shell tools can stream chunks to the UI as the
 		// command runs. The sink is per-tool so each command gets its
-		// own identity (id/name) in the handler.
+		// own identity (id/name) in the handler. read_image gets a
+		// per-tool image sink the same way: the handler only collects
+		// the image into the sink, and the synthetic user message is
+		// appended right after the tool result below, so the
+		// tool-call/result protocol is never violated.
 		toolCtx := ctx
+		imgSink := &imageSink{}
 		if h.OnToolOutput != nil {
 			toolCtx = ContextWithToolOutput(ctx, func(command, chunk string) {
 				h.OnToolOutput(tc.ID, tc.Name, command, chunk)
 			})
 		}
+		toolCtx = ContextWithImageSink(toolCtx, imgSink)
 		res, errTool := a.executeTool(toolCtx, tc)
+		if errors.Is(errTool, errPatchTurnStop) {
+			// The model is stuck in a patch retry loop: stop the turn. This
+			// call's result is appended normally; any remaining calls in the
+			// round get cancelled placeholders so the tool-call/result
+			// protocol stays valid, and the caller returns stopMsg to the
+			// host instead of letting the model write another attempt.
+			res = formatToolError(res, errTool)
+			if h.OnToolResult != nil {
+				h.OnToolResult(tc.ID, tc.Name, res, false)
+			}
+			a.appendToolResult(tc, res)
+			a.appendImageMessages(imgSink)
+			a.appendCanceledToolResults(toolCalls[i+1:])
+			finishStreamUI(h)
+			a.FlushSession()
+			return toolRoundStopped, res
+		}
 		if ctx.Err() != nil {
 			if errTool == nil {
 				res = "The operation was cancelled by the user."
@@ -109,10 +156,11 @@ func (a *Agent) runToolRound(ctx context.Context, h *llm.StreamHandlers, toolCal
 				h.OnToolResult(tc.ID, tc.Name, res, false)
 			}
 			a.appendToolResult(tc, res)
+			a.appendImageMessages(imgSink)
 			a.appendCanceledToolResults(toolCalls[i+1:])
 			finishStreamUI(h)
 			a.FlushSession()
-			return true
+			return toolRoundCancelled, ""
 		}
 		success := errTool == nil
 		if errTool != nil {
@@ -124,6 +172,7 @@ func (a *Agent) runToolRound(ctx context.Context, h *llm.StreamHandlers, toolCal
 		}
 
 		a.appendToolResult(tc, res)
+		a.appendImageMessages(imgSink)
 	}
-	return false
+	return toolRoundContinue, ""
 }

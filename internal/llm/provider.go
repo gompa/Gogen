@@ -136,8 +136,9 @@ type LLMProvider interface {
 
 // ReasoningEffortsProvider is implemented by providers that can report the
 // reasoning-effort values the current model accepts (from the models.dev
-// registry). It is optional: providers without it (test stubs, providers with
-// no registry data) fall back to DefaultReasoningEfforts.
+// registry, or derived from a llama.cpp /props capability probe for unknown
+// self-hosted models). It is optional: providers without it (test stubs,
+// providers with no registry data) fall back to DefaultReasoningEfforts.
 type ReasoningEffortsProvider interface {
 	// ModelReasoningEfforts returns the effective reasoning-effort options for
 	// modelID: the models.dev accepted set when the model is known (empty for

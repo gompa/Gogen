@@ -58,7 +58,7 @@ func wsHandleBoardOp(s *Server, ws *wsConn, r *http.Request, pane **sessionRunti
 		// Start a dedicated agent session for the ticket (headless; the
 		// user stays on the board). Handles its own board_state broadcast
 		// and notice.
-		s.wsHandleBoardStart(ws, pane, op)
+		s.wsHandleBoardStart(r.Context(), ws, pane, op)
 		return
 	default:
 		err = fmt.Errorf("unknown board op %q (want list, add, claim, move, comment, done, or remove)", op.Action)

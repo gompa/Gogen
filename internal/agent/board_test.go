@@ -461,3 +461,55 @@ func TestBoardToolGating(t *testing.T) {
 		t.Fatalf("add output = %q", out)
 	}
 }
+
+// TestSetStartOptions verifies the per-ticket start-option persistence
+// (model + prompt template chosen in the web "Start agent" popover):
+// stored on the ticket, surviving a reload from disk, and cleared by an
+// explicit empty write. The start op is authoritative — an empty value
+// resets the override.
+func TestSetStartOptions(t *testing.T) {
+	m := newTestBoard(t)
+	if _, err := m.Add("Fix parser crash", "make go test pass", "high", "user"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unknown ticket.
+	if err := m.SetStartOptions("99", "gpt-4o-mini", "custom"); err == nil {
+		t.Fatal("SetStartOptions on an unknown ticket should fail")
+	}
+
+	// Persist both options.
+	if err := m.SetStartOptions("1", "gpt-4o-mini", "custom {title}"); err != nil {
+		t.Fatal(err)
+	}
+	item, err := m.Item("1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.Model != "gpt-4o-mini" || item.Prompt != "custom {title}" {
+		t.Fatalf("stored start options = %q / %q, want gpt-4o-mini / custom {title}", item.Model, item.Prompt)
+	}
+
+	// Reload from disk: a fresh manager must see the same options.
+	m2 := NewBoardManager(m.dir, false)
+	m2.dir = m.dir // same dir (NewBoardManager would use the parent's .gogen)
+	item2, err := m2.Item("1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item2.Model != "gpt-4o-mini" || item2.Prompt != "custom {title}" {
+		t.Fatalf("reloaded start options = %q / %q", item2.Model, item2.Prompt)
+	}
+
+	// An explicit empty write clears back to the defaults.
+	if err := m.SetStartOptions("1", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	item, err = m.Item("1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.Model != "" || item.Prompt != "" {
+		t.Fatalf("cleared start options = %q / %q, want empty", item.Model, item.Prompt)
+	}
+}

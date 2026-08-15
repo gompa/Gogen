@@ -94,7 +94,7 @@ func (a *Agent) prepareMessages(ctx context.Context, h *llm.StreamHandlers) []ll
 		// mid-tool-loop can drop assistant tool-call messages
 		// whose results are still pending, confusing the LLM.
 		if len(a.Messages) > 0 && a.Messages[len(a.Messages)-1].Role == "user" {
-			if a.shouldCompactUsingCounts() {
+			if a.shouldCompactUsingCounts() && a.compactAttemptDue() {
 				if h != nil && h.OnCompacting != nil {
 					h.OnCompacting()
 				}
@@ -108,7 +108,10 @@ func (a *Agent) prepareMessages(ctx context.Context, h *llm.StreamHandlers) []ll
 				counts := append([]int(nil), a.tokenCounts...)
 				a.statsMu.RUnlock()
 				compacted, newPins, err := a.Context.CompactPinned(ctx, a.systemPromptPrefix(), a.Messages, counts, pinned)
-				if err == nil {
+				if err != nil {
+					// A failing summarization call must not be retried on every turn.
+					a.noteCompactFailure(err)
+				} else {
 					// Compute the post-compaction counts BEFORE publishing —
 					// the conversation just shrank, so counting it is cheap —
 					// and publish them atomically. A nil cache here would
@@ -126,6 +129,7 @@ func (a *Agent) prepareMessages(ctx context.Context, h *llm.StreamHandlers) []ll
 					// lastTurnUsage is no longer representative after compaction.
 					a.clearTurnUsage()
 					a.resetSaveTracking()
+					a.noteCompactSuccess()
 				}
 			}
 		}

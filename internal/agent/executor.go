@@ -179,8 +179,9 @@ func (e *Executor) ReadFileRawBytes(path string) ([]byte, error) {
 
 // ReadFileRange reads a file with optional 1-based line offset and line limit.
 // When search is non-empty, semantics change: the function jumps to the first
-// regex match, offset is treated as context lines around that match (default 10,
-// not a starting line number), and limit caps the total lines returned.
+// regex match, offset sets the context lines before the match (default 10, not
+// a starting line number), and limit caps the total lines returned (before +
+// match + after); the after-context gets whatever of the limit budget remains.
 func (e *Executor) ReadFileRange(path string, offset, limit int, search string, lineNumbers bool) (string, error) {
 	secure, header, err := e.validateAndCheckFile(path)
 	if err != nil {
@@ -239,15 +240,29 @@ func (e *Executor) readWithRegexSearch(secure string, offset, limit int, search 
 	if err != nil {
 		return "", fmt.Errorf("invalid search pattern: %w", err)
 	}
-	ctx := 10
+	// Search mode window: before-context + match + after-context. Deterministic
+	// precedence: offset > 0 sets the context lines before the match; limit > 0
+	// caps the total window (before + match + after), with the after-context
+	// getting whatever of the limit budget remains. Defaults to 10 lines on
+	// each side when neither is given.
+	ctxBefore, ctxAfter := 10, 10
 	if limit > 0 {
-		ctx = limit / 2
+		ctxBefore = limit / 2
 	}
 	if offset > 0 {
-		ctx = offset
+		ctxBefore = offset
 	}
-	if ctx < 1 {
-		ctx = 1
+	if limit > 0 {
+		if ctxBefore > limit-1 {
+			ctxBefore = limit - 1
+		}
+		if ctxBefore < 0 {
+			ctxBefore = 0
+		}
+		ctxAfter = limit - ctxBefore - 1
+		if ctxAfter < 0 {
+			ctxAfter = 0
+		}
 	}
 
 	f, err := os.Open(secure)
@@ -258,7 +273,10 @@ func (e *Executor) readWithRegexSearch(secure string, offset, limit int, search 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64*1024), 10*1024*1024)
 
-	ring := make([]string, ctx)
+	var ring []string
+	if ctxBefore > 0 {
+		ring = make([]string, ctxBefore)
+	}
 	ringPos := 0
 	ringFull := false
 	lineNum := 0
@@ -277,11 +295,17 @@ func (e *Executor) readWithRegexSearch(secure string, offset, limit int, search 
 			}
 			after := []string{line}
 			for sc.Scan() {
-				lineNum++
-				after = append(after, sc.Text())
-				if len(after) >= ctx+1 {
+				// Stop once the total window (before + match + after) reaches
+				// the limit, or once the after-context budget is filled when
+				// no limit is set.
+				if limit > 0 && len(before)+len(after) >= limit {
 					break
 				}
+				if len(after) >= ctxAfter+1 {
+					break
+				}
+				lineNum++
+				after = append(after, sc.Text())
 			}
 			// Count the remaining lines for the "of Z lines" header. For
 			// large files the drain would read the entire rest of the file
@@ -323,10 +347,12 @@ func (e *Executor) readWithRegexSearch(secure string, offset, limit int, search 
 			}
 			return out, nil
 		}
-		ring[ringPos] = line
-		ringPos = (ringPos + 1) % ctx
-		if ringPos == 0 {
-			ringFull = true
+		if ctxBefore > 0 {
+			ring[ringPos] = line
+			ringPos = (ringPos + 1) % ctxBefore
+			if ringPos == 0 {
+				ringFull = true
+			}
 		}
 	}
 	if err := sc.Err(); err != nil {
@@ -579,6 +605,17 @@ func (b *outputBuffer) append(p []byte, max int, after func()) {
 	}
 }
 
+// drain returns the accumulated bytes and clears the buffer. Used by the
+// background-job unread buffer so action=input can return exactly the output
+// produced since the previous read.
+func (b *outputBuffer) drain() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s := b.buf.String()
+	b.buf.Reset()
+	return s
+}
+
 // string returns the accumulated output.
 func (b *outputBuffer) string() string {
 	b.mu.Lock()
@@ -681,11 +718,20 @@ func (e *Executor) ReplaceInFile(path string, search string, replace string, rep
 	}
 
 	text := string(content)
+	count := strings.Count(text, search)
+	if count == 0 {
+		// Diagnose the miss: report the closest file line so the model can
+		// fix its search block (a typo or stale block from a previous read)
+		// in one retry instead of guessing.
+		return "", notFoundError(text, search)
+	}
+	if !replaceAll && count > 1 {
+		// Unique-match by default (mirrors Claude Code / dsh): replacing the
+		// first of N occurrences silently would be a wrong-edit gamble.
+		return "", fmt.Errorf("search string appears %d times; set replace_all=true to replace all occurrences, or include more surrounding context so the match is unique", count)
+	}
+
 	if replaceAll {
-		count := strings.Count(text, search)
-		if count == 0 {
-			return "", fmt.Errorf("search string not found in file")
-		}
 		newContent := strings.ReplaceAll(text, search, replace)
 		if err := ioutil.WriteFileAtomic(secure, []byte(newContent), defaultFilePerm); err != nil {
 			return "", err
@@ -695,13 +741,46 @@ func (e *Executor) ReplaceInFile(path string, search string, replace string, rep
 	}
 
 	idx := strings.Index(text, search)
-	if idx < 0 {
-		return "", fmt.Errorf("search string not found in file")
-	}
 	newContent := text[:idx] + replace + text[idx+len(search):]
 	if err := ioutil.WriteFileAtomic(secure, []byte(newContent), defaultFilePerm); err != nil {
 		return "", err
 	}
 	msg := "File updated successfully (1 occurrence replaced)"
 	return e.AppendSyntaxCheck(msg, path), nil
+}
+
+// notFoundError reports that search was not found in text, pointing at the
+// closest file line: the first line containing the search block's first
+// non-empty line, else the line with the longest common prefix.
+func notFoundError(text, search string) error {
+	first := ""
+	for _, ln := range strings.Split(search, "\n") {
+		if strings.TrimSpace(ln) != "" {
+			first = ln
+			break
+		}
+	}
+	lines := strings.Split(text, "\n")
+	if first == "" {
+		return fmt.Errorf("search string not found in file")
+	}
+	for i, ln := range lines {
+		if strings.Contains(ln, first) {
+			return fmt.Errorf("search string not found in file (closest match at line %d: %q)", i+1, ln)
+		}
+	}
+	bestLine, bestScore := 0, -1
+	for i, ln := range lines {
+		score := 0
+		for score < len(first) && score < len(ln) && first[score] == ln[score] {
+			score++
+		}
+		if score > bestScore {
+			bestLine, bestScore = i+1, score
+		}
+	}
+	if bestLine == 0 {
+		return fmt.Errorf("search string not found in file")
+	}
+	return fmt.Errorf("search string not found in file (closest match at line %d: %q)", bestLine, lines[bestLine-1])
 }

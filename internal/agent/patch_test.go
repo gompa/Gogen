@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1380,6 +1381,249 @@ func TestParseUnifiedDiffDroppedOldHeader(t *testing.T) {
 	}
 	if len(files[0].hunks) != 1 || len(files[1].hunks) != 1 {
 		t.Fatalf("expected one hunk per file, got %d and %d", len(files[0].hunks), len(files[1].hunks))
+	}
+}
+
+func TestDetectMarkerOnlyDiff(t *testing.T) {
+	tests := []struct {
+		name string
+		diff string
+		want bool
+	}{
+		{
+			name: "repeated end markers only",
+			diff: "*** End of diff\n*** End of diff\n*** End of diff\n",
+			want: true,
+		},
+		{
+			name: "end markers plus failure narration",
+			diff: "*** End of diff\n" +
+				"*** Wait — the patch did not fully apply cleanly:\n" +
+				"*** The old hunk did not reach the end of the file\n" +
+				"*** Removed one hunk and applied the remainder.\n" +
+				"*** End of diff\n",
+			want: true,
+		},
+		{
+			name: "bare stars plus markers",
+			diff: "***\n*** End of Patch\n***endpatch\n",
+			want: true,
+		},
+		{
+			name: "real diff with single trailing marker",
+			diff: "--- a/foo.txt\n+++ b/foo.txt\n@@ -1 +1 @@\n-x\n+y\n*** End of Patch\n",
+			want: false,
+		},
+		{
+			name: "real diff with embedded loop transcript",
+			diff: "--- a/foo.txt\n+++ b/foo.txt\n@@ -1 +1 @@\n-x\n+y\n*** End of diff\n" +
+				"*** Wait — the patch did not fully apply cleanly:\n" +
+				"*** Removed one hunk and applied the remainder.\n" +
+				"*** End of diff\n",
+			want: false, // has real content: polluted-but-valid diffs still apply
+		},
+		{
+			name: "two markers only",
+			diff: "*** End of diff\n*** End of diff\n",
+			want: false,
+		},
+		{
+			name: "start and end marker only",
+			diff: "*** Start Patch\n*** End Patch\n",
+			want: false, // start markers do not count, and <3 frames anyway
+		},
+		{
+			name: "context format range headers are not markers",
+			diff: "*** 30,34 ****\n*** 40,44 ***\n*** 50,54 ****\n",
+			want: false,
+		},
+		{
+			name: "crlf normalization",
+			diff: "*** End of diff\r\n*** End of diff\r\n*** End of diff\r\n",
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := detectMarkerOnlyDiff(tt.diff); got != tt.want {
+				t.Fatalf("detectMarkerOnlyDiff() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPatchTurnStopMarkerOnlyDiff(t *testing.T) {
+	dir := t.TempDir()
+	exec := NewExecutor(dir)
+	exec.SetDeleteApproval(false)
+	a := NewAgent(nil, exec, nil)
+
+	_, err := a.executeTool(context.Background(), llm.ToolCall{
+		Name: "patch_file",
+		Args: map[string]interface{}{"diff": "*** End of diff\n*** End of diff\n*** End of diff\n"},
+	})
+	if !errors.Is(err, errPatchTurnStop) {
+		t.Fatalf("marker-only diff must stop the turn with errPatchTurnStop, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "only patch markers") {
+		t.Fatalf("expected marker-only explanation in error, got: %v", err)
+	}
+
+	// A polluted diff that still contains real content must NOT be stopped:
+	// it applies (or fails) normally.
+	path := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(path, []byte("package main\n\nfunc main() {\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err = a.executeTool(context.Background(), llm.ToolCall{
+		Name: "patch_file",
+		Args: map[string]interface{}{"diff": "--- a/main.go\n+++ b/main.go\n@@ -1,4 +1,5 @@\n package main\n\n+// x\n func main() {\n }\n*** End of diff\n*** Wait — the patch did not fully apply cleanly:\n*** Removed one hunk and applied the remainder.\n"},
+	})
+	if errors.Is(err, errPatchTurnStop) {
+		t.Fatalf("polluted-but-valid diff must not stop the turn, got: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("expected the polluted diff to apply, got: %v", err)
+	}
+}
+
+func TestPatchTurnStopAfterThreeMismatches(t *testing.T) {
+	dir := t.TempDir()
+	exec := NewExecutor(dir)
+	exec.SetDeleteApproval(false)
+	a := NewAgent(nil, exec, nil)
+
+	path := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(path, []byte("package main\n\nfunc main() {\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Context mismatch: the hunk expects "package wrong" but the file has
+	// "package main".
+	badDiff := "--- a/main.go\n+++ b/main.go\n@@ -1,4 +1,5 @@\n package wrong\n\n+// x\n func main() {\n }\n"
+	patch := func() error {
+		_, err := a.executeTool(context.Background(), llm.ToolCall{
+			Name: "patch_file",
+			Args: map[string]interface{}{"diff": badDiff},
+		})
+		return err
+	}
+
+	if err := patch(); err == nil || errors.Is(err, errPatchTurnStop) {
+		t.Fatalf("strike 1 should be a normal mismatch error, got: %v", err)
+	}
+	if err := patch(); err == nil || errors.Is(err, errPatchTurnStop) {
+		t.Fatalf("strike 2 should be a normal mismatch error, got: %v", err)
+	}
+	if err := patch(); !errors.Is(err, errPatchTurnStop) {
+		t.Fatalf("strike 3 must stop the turn with errPatchTurnStop, got: %v", err)
+	}
+
+	// A success between failures resets the per-turn budget.
+	if err := patch(); !errors.Is(err, errPatchTurnStop) {
+		t.Fatalf("strike 3 still fires after budget exhausted, got: %v", err)
+	}
+	goodDiff := "--- a/main.go\n+++ b/main.go\n@@ -1,4 +1,5 @@\n package main\n\n+// x\n func main() {\n }\n"
+	if _, err := a.executeTool(context.Background(), llm.ToolCall{
+		Name: "patch_file",
+		Args: map[string]interface{}{"diff": goodDiff},
+	}); err != nil {
+		t.Fatalf("successful patch should reset the budget, got: %v", err)
+	}
+	if err := patch(); err == nil || errors.Is(err, errPatchTurnStop) {
+		t.Fatalf("after a success, strike 1 should be a normal mismatch error again, got: %v", err)
+	}
+}
+
+func TestPatchTurnStopDifferentDiffsDoNotStop(t *testing.T) {
+	dir := t.TempDir()
+	exec := NewExecutor(dir)
+	exec.SetDeleteApproval(false)
+	a := NewAgent(nil, exec, nil)
+
+	// Two files, two different failing diffs: the model is iterating, not
+	// looping — failures on different targets must never accumulate toward
+	// the turn stop.
+	pathA := filepath.Join(dir, "a.go")
+	if err := os.WriteFile(pathA, []byte("package a\n\nfunc A() {\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pathB := filepath.Join(dir, "b.go")
+	if err := os.WriteFile(pathB, []byte("package b\n\nfunc B() {\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	badDiffA := "--- a/a.go\n+++ b/a.go\n@@ -1,4 +1,5 @@\n package wrong\n\n+// x\n func A() {\n }\n"
+	badDiffB := "--- a/b.go\n+++ b/b.go\n@@ -1,4 +1,5 @@\n package wrong\n\n+// x\n func B() {\n }\n"
+	patch := func(diff string) error {
+		_, err := a.executeTool(context.Background(), llm.ToolCall{
+			Name: "patch_file",
+			Args: map[string]interface{}{"diff": diff},
+		})
+		return err
+	}
+
+	// Six alternating failures on two different diffs: no stop. The loop
+	// ends on badDiffB so the subsequent badDiffA streak starts with a
+	// fresh key.
+	for i := 0; i < 6; i++ {
+		diff := badDiffA
+		if i%2 == 1 {
+			diff = badDiffB
+		}
+		if err := patch(diff); errors.Is(err, errPatchTurnStop) {
+			t.Fatalf("different diffs must not accumulate strikes (attempt %d), got: %v", i, err)
+		}
+	}
+
+	// The same diff repeated three times still stops.
+	for i := 0; i < 3; i++ {
+		err := patch(badDiffA)
+		if i < 2 && errors.Is(err, errPatchTurnStop) {
+			t.Fatalf("strike %d must not stop yet, got: %v", i+1, err)
+		}
+		if i == 2 && !errors.Is(err, errPatchTurnStop) {
+			t.Fatalf("third identical failure must stop the turn, got: %v", err)
+		}
+	}
+}
+
+func TestRunToolRoundStoppedEndsTurn(t *testing.T) {
+	dir := t.TempDir()
+	exec := NewExecutor(dir)
+	exec.SetDeleteApproval(false)
+	a := NewAgent(nil, exec, nil)
+
+	// First call: marker-only diff (stops the turn). Second call: a valid
+	// diff that must never execute — it gets a cancelled placeholder.
+	outcome, stopMsg := a.runToolRound(context.Background(), &llm.StreamHandlers{}, []llm.ToolCall{
+		{ID: "c1", Name: "patch_file", Args: map[string]interface{}{"diff": "*** End of diff\n*** End of diff\n*** End of diff\n"}},
+		{ID: "c2", Name: "patch_file", Args: map[string]interface{}{"diff": "--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-a\n+b\n"}},
+	})
+	if outcome != toolRoundStopped {
+		t.Fatalf("expected toolRoundStopped, got %v", outcome)
+	}
+	if !strings.Contains(stopMsg, "only patch markers") {
+		t.Fatalf("expected marker-only explanation in stopMsg, got: %q", stopMsg)
+	}
+
+	// The tool-call/result protocol must stay valid: c1 has a real result,
+	// c2 has the cancelled placeholder.
+	var c1Result, c2Result string
+	for _, m := range a.Messages {
+		if m.Role != "tool" {
+			continue
+		}
+		switch m.ToolCallID {
+		case "c1":
+			c1Result = m.Content
+		case "c2":
+			c2Result = m.Content
+		}
+	}
+	if !strings.Contains(c1Result, "only patch markers") {
+		t.Fatalf("expected c1 result with stop explanation, got: %q", c1Result)
+	}
+	if c2Result != "Tool execution was skipped because the user cancelled the operation." {
+		t.Fatalf("expected c2 cancel placeholder, got: %q", c2Result)
 	}
 }
 

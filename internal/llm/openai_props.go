@@ -3,9 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"net/http"
-	"net/url"
 	"slices"
 	"strings"
 
@@ -68,9 +66,10 @@ func (p *OpenAIProvider) applyChatCompletionExtras(ctx context.Context, params *
 }
 
 // DefaultReasoningEfforts is the reasoning_effort value set used when the
-// current model has no models.dev entry (unknown/self-hosted endpoints). It is
-// the most common accepted set in the registry: the low/medium/high triple is
-// the mode of models.dev's per-model effort values (accepted by ~80%+ of the
+// current model has no models.dev entry and no llama.cpp capability probe has
+// derived a set (unknown/self-hosted endpoints). It is the most common
+// accepted set in the registry: the low/medium/high triple is the mode of
+// models.dev's per-model effort values (accepted by ~80%+ of the
 // effort-enabled models; high alone by 99%).
 var DefaultReasoningEfforts = []string{"low", "medium", "high"}
 
@@ -80,10 +79,11 @@ var DefaultReasoningEfforts = []string{"low", "medium", "high"}
 //
 // The configured value is sent verbatim — never translated — but only when the
 // current model accepts it. The accepted set comes from the models.dev
-// registry when the model is known (empty for toggle/budget-only models);
-// unknown/self-hosted models fall back to DefaultReasoningEfforts. A stored
-// value the model does not accept is omitted rather than rewritten (policy B:
-// it stays stored, inactive, and re-activates if a later model accepts it).
+// registry when the model is known (empty for toggle/budget-only models), from
+// a llama.cpp capability probe when one has completed, else
+// DefaultReasoningEfforts. A stored value the model does not accept is omitted
+// rather than rewritten (policy B: it stays stored, inactive, and re-activates
+// if a later model accepts it).
 func (p *OpenAIProvider) applyThinkingLevel(_ context.Context, params *openai.ChatCompletionNewParams) {
 	if p == nil || params == nil {
 		return
@@ -102,8 +102,9 @@ func (p *OpenAIProvider) applyThinkingLevel(_ context.Context, params *openai.Ch
 
 // acceptedReasoningEfforts returns the effective reasoning-effort options for
 // the current model: its models.dev accepted set when known (empty for
-// toggle-only/budget-only models), else DefaultReasoningEfforts. Never blocks
-// — registry lookups are in-memory/disk-cached map lookups.
+// toggle-only/budget-only models), else the llama.cpp /props-derived set when
+// one has been probed, else DefaultReasoningEfforts. Never blocks — registry
+// lookups and the derived cache are in-memory map reads.
 func (p *OpenAIProvider) acceptedReasoningEfforts() []string {
 	return p.ModelReasoningEfforts(p.currentModel())
 }
@@ -137,17 +138,23 @@ func (p *OpenAIProvider) templateSupportsPreserveReasoning(ctx context.Context) 
 	return v
 }
 
-// propsBaseURLForCurrentModel returns the base URL of the endpoint that
-// serves the currently selected model: the model's owning profile when the
-// catalog has been fetched, else the default profile's base URL.
-func (p *OpenAIProvider) propsBaseURLForCurrentModel() string {
+// propsBaseURLForModel returns the base URL of the endpoint that serves
+// modelID: the model's owning profile when the catalog has been fetched, else
+// the default profile's base URL.
+func (p *OpenAIProvider) propsBaseURLForModel(modelID string) string {
 	p.modelsMu.RLock()
-	info := p.modelProfile[p.model]
+	info := p.modelProfile[modelID]
 	p.modelsMu.RUnlock()
 	if info.baseURL != "" {
 		return info.baseURL
 	}
 	return p.defaultBaseURL()
+}
+
+// propsBaseURLForCurrentModel returns the base URL of the endpoint that
+// serves the currently selected model (see propsBaseURLForModel).
+func (p *OpenAIProvider) propsBaseURLForCurrentModel() string {
+	return p.propsBaseURLForModel(p.currentModel())
 }
 
 func (p *OpenAIProvider) invalidatePropsCaps() {
@@ -166,27 +173,8 @@ func (p *OpenAIProvider) probePreserveReasoning(ctx context.Context, baseURL str
 	if propsURL == "" {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(ctx, propsProbeTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, propsURL, nil)
-	if err != nil {
-		return false
-	}
-	if p.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+p.apiKey)
-	}
-
-	resp, err := propsHTTPClient.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return false
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
+	status, body, err := p.propsRequest(ctx, http.MethodGet, propsURL, "")
+	if err != nil || status != http.StatusOK {
 		return false
 	}
 	return parsePreserveReasoningCap(body)
@@ -204,18 +192,9 @@ func parsePreserveReasoningCap(body []byte) bool {
 
 // llamaPropsURL maps an OpenAI-compatible base URL (.../v1) to llama.cpp GET /props.
 func llamaPropsURL(baseURL string) string {
-	baseURL = strings.TrimSpace(baseURL)
-	if baseURL == "" {
+	base := llamaEndpointBase(baseURL)
+	if base == "" {
 		return ""
 	}
-	u, err := url.Parse(baseURL)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return ""
-	}
-	path := strings.TrimSuffix(u.Path, "/")
-	path = strings.TrimSuffix(path, "/v1")
-	u.Path = path + "/props"
-	u.RawQuery = ""
-	u.Fragment = ""
-	return u.String()
+	return base + "/props"
 }

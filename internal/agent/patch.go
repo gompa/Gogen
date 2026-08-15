@@ -73,6 +73,14 @@ func wrapPatchMismatch(err error) error {
 	return &patchMismatchError{err: err}
 }
 
+// errPatchTurnStop marks a patch_file failure after which the agent loop
+// must end the turn instead of letting the model retry. It fires when the
+// diff contains only patch framing with no content (a degenerate retry-loop
+// reply) or when the per-turn mismatch budget is exhausted. The wrapped
+// error message carries the user-visible explanation; the sentinel itself
+// is never shown verbatim.
+var errPatchTurnStop = errors.New("patch turn stopped")
+
 // PatchFile applies a unified diff to files under the working directory.
 // When dryRun is true, patches are validated but not written.
 // When fuzzy is true, hunks may be relocated when exact context no longer matches.
@@ -689,6 +697,74 @@ func isPatchDelimiterMarker(line string) bool {
 		}
 	}
 	return true
+}
+
+// isPatchEndMarker reports whether line is a model-added patch END
+// delimiter: "*** End of diff", "***endpatch", "*** End of Patch",
+// "***_END_OF_PATCH", or a bare "***". Start markers and other "***" text
+// are deliberately excluded: only end markers (and narration lines, see
+// isPatchNarrationLine) signal a degenerate marker-only reply, while a
+// "*** Start Patch" preamble is harmless and common.
+func isPatchEndMarker(line string) bool {
+	if !isPatchDelimiterMarker(line) {
+		return false
+	}
+	if strings.TrimSpace(line) == "***" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(line), "end")
+}
+
+// patchNarrationPhrases are status phrases patch tools print between failed
+// apply attempts. They never appear in a genuine unified diff, so their
+// presence marks a diff argument polluted with a previous patch session's
+// transcript.
+var patchNarrationPhrases = []string{
+	"did not fully apply cleanly",
+	"did not reach the end of the file",
+	"rest of the patch not applied",
+	"removed one hunk",
+	"hunk still not applied",
+	"unapplied hunks",
+	"assigned the panic",
+}
+
+// isPatchNarrationLine reports whether line is patch-session narration
+// (failure status lines quoted from a previous apply attempt) rather than
+// diff content.
+func isPatchNarrationLine(line string) bool {
+	l := strings.ToLower(line)
+	for _, p := range patchNarrationPhrases {
+		if strings.Contains(l, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// detectMarkerOnlyDiff reports whether diff consists of patch framing —
+// end delimiters ("*** End of diff" …) and failure narration — with no
+// actual patch content: no "--- " or "+++ " file headers and no "@@" hunk
+// headers. A model stuck in a patch retry loop eventually emits such diffs
+// (every hunk dropped, only the framing remains); executeTool treats the
+// reply as degenerate and stops the turn.
+func detectMarkerOnlyDiff(diff string) bool {
+	diff = strings.ReplaceAll(diff, "\r\n", "\n")
+	diff = strings.ReplaceAll(diff, "\r", "\n")
+	frames := 0
+	hasContent := false
+	for _, line := range strings.Split(diff, "\n") {
+		switch {
+		case strings.HasPrefix(line, "--- "), strings.HasPrefix(line, "+++ "), strings.HasPrefix(line, "@@"):
+			hasContent = true
+		default:
+			t := strings.TrimSpace(line)
+			if isPatchEndMarker(t) || isPatchNarrationLine(t) {
+				frames++
+			}
+		}
+	}
+	return frames >= 3 && !hasContent
 }
 
 // isContextRangeHeader reports whether line is a context-format (diff -c)

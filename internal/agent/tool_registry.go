@@ -121,6 +121,18 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error
 	if !ok {
 		return "", fmt.Errorf("unknown tool: %s", tc.Name)
 	}
+	// A patch_file diff that consists solely of patch framing — end
+	// delimiters ("*** End of diff" …) and failure narration, with no
+	// headers or hunks — is a degenerate retry-loop reply: the model has
+	// dropped every hunk and is re-emitting only framing text. Do not even
+	// attempt to apply it; errPatchTurnStop makes runToolRound end the turn
+	// so the model cannot loop again.
+	if tc.Name == "patch_file" {
+		if diff, ok := tc.Args["diff"].(string); ok && detectMarkerOnlyDiff(diff) {
+			return "", fmt.Errorf("%w: patch_file received a diff containing only patch markers and no patch content — the model appears stuck in a patch retry loop; stopping the turn. Re-read the target file(s) with read_file and regenerate the diff",
+				errPatchTurnStop)
+		}
+	}
 	res, err := h(ctx, a, tc.Args)
 	if tc.Name == "patch_file" {
 		// Only stale-diff failures (ErrPatchMismatch) count toward the
@@ -129,6 +141,24 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error
 		// diff" hint would be misleading. Success and non-mismatch errors
 		// both reset.
 		if err != nil && errors.Is(err, ErrPatchMismatch) {
+			// Per-turn hard stop, keyed on the failure: strikes accumulate
+			// only while the SAME diff keeps failing (same target, same
+			// mismatch). A model iterating across different files or diffs
+			// is making progress and must not be stopped — only a model
+			// re-sending the same broken diff is looping. errPatchTurnStop
+			// makes runToolRound end the turn instead of letting the model
+			// write another attempt.
+			key := res
+			if key == "" {
+				key = err.Error()
+			}
+			if prev, _ := a.patchStrikeKey.Load().(string); prev != key {
+				a.patchStrikeKey.Store(key)
+				a.patchTurnStrikes.Store(1)
+			} else if strikes := a.patchTurnStrikes.Add(1); strikes >= 3 {
+				return res, fmt.Errorf("%w: patch_file failed %d times in a row with the same diff; stopping the turn. Re-read the target file(s) with read_file (or search_code) and regenerate the diff from their current content",
+					errPatchTurnStop, strikes)
+			}
 			streak := a.patchFailStreak.Add(1)
 			if streak > 3 {
 				streak = 3 // keep the message from escalating forever
@@ -139,6 +169,8 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error
 			}
 		} else {
 			a.patchFailStreak.Store(0)
+			a.patchTurnStrikes.Store(0)
+			a.patchStrikeKey.Store("")
 		}
 	}
 	return res, err
@@ -255,8 +287,18 @@ func handleBackgroundJob(_ context.Context, a *Agent, args map[string]interface{
 		return a.BackgroundJobStatus(jobID)
 	case "cancel":
 		return a.CancelBackgroundJob(jobID)
+	case "input":
+		input, err := stringArg(args, "input")
+		if err != nil {
+			return "", err
+		}
+		appendNewline, err := boolArg(args, "append_newline", true)
+		if err != nil {
+			return "", err
+		}
+		return a.BackgroundJobInput(jobID, input, appendNewline)
 	default:
-		return "", fmt.Errorf("unknown background_job action %q (want status or cancel)", action)
+		return "", fmt.Errorf("unknown background_job action %q (want status, cancel, or input)", action)
 	}
 }
 

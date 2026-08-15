@@ -150,7 +150,10 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 	// the server starts; push the result to the session's clients so the
 	// toolbar does not keep showing a model that was cleared or replaced by
 	// the validation.
-	a.OnModelChanged = func() { s.pushConfigForAgent(a) }
+	a.OnModelChanged = func() {
+		s.pushConfigForAgent(a)
+		s.maybeProbeReasoningEfforts(context.Background(), a)
+	}
 	// Agent board-tool mutations broadcast a fresh board_state so every open
 	// kanban tab stays live, plus a success notice (toast) so the user sees
 	// agent-triggered changes even when they didn't initiate them (the
@@ -256,6 +259,7 @@ func agentConfigMsgBasic(a *agent.Agent) WSMessage {
 	// (in-memory lookups, never block), so the client can render the
 	// per-model chips and a hover tooltip.
 	msg.ReasoningEfforts = a.CurrentModelEfforts()
+	msg.ReasoningEffortsUnsupported = reasoningEffortsUnsupported(a)
 	msg.ModelDescription = a.CurrentModelDescription()
 	// Live feature flags: the settings modal renders and toggles these.
 	msg.Board = onOff(a.BoardEnabled())
@@ -270,6 +274,21 @@ func onOff(v bool) string {
 		return "on"
 	}
 	return "off"
+}
+
+// reasoningEffortsUnsupported reports whether the session's current model
+// definitively has no reasoning-effort control (a known models.dev entry with
+// no effort options, or a llama.cpp capability probe that reported no
+// support) — the client hides the thinking chips in that case. In-memory
+// lookup, never blocks.
+func reasoningEffortsUnsupported(a *agent.Agent) bool {
+	if a == nil || a.Provider == nil {
+		return false
+	}
+	if p, ok := a.Provider.(*llm.OpenAIProvider); ok {
+		return p.ReasoningEffortUnsupported(a.CurrentModel())
+	}
+	return false
 }
 
 // pushConfigForAgent broadcasts a fresh config snapshot for a session agent
@@ -287,6 +306,31 @@ func (s *Server) pushConfigForAgent(a *agent.Agent) {
 		s.decorateConfig(&msg)
 		rt.broadcast(msg)
 	}
+}
+
+// maybeProbeReasoningEfforts derives the session model's accepted
+// reasoning-effort values from a llama.cpp /props (+ /apply-template)
+// capability probe and pushes a fresh config when the derived set differs
+// from what clients are showing (the initial config echo carries the
+// fallback set). Runs in its own goroutine — bounded network I/O; the
+// provider caches per model, so repeat triggers are no-ops.
+func (s *Server) maybeProbeReasoningEfforts(ctx context.Context, a *agent.Agent) {
+	if a == nil || a.Provider == nil {
+		return
+	}
+	p, ok := a.Provider.(*llm.OpenAIProvider)
+	if !ok {
+		return
+	}
+	go func() {
+		changed, err := p.ProbeReasoningEfforts(ctx, a.CurrentModel())
+		if err != nil {
+			return // keep the fallback set; a later trigger retries
+		}
+		if changed {
+			s.pushConfigForAgent(a)
+		}
+	}()
 }
 
 // agentConfigMsg is an internally-synchronized basic snapshot plus
@@ -1034,6 +1078,10 @@ func (s *Server) attachSession(ws *wsConn, r *http.Request, rt *sessionRuntime, 
 			s.decorateConfig(&full)
 			_ = ws.writeJSON(basic)
 			_ = ws.writeJSON(full)
+			// Derive llama.cpp reasoning-effort options for the (possibly
+			// restored) model and push a correction when they differ from
+			// the fallback set the configs above carried.
+			s.maybeProbeReasoningEfforts(r.Context(), rt.agent)
 			return
 		}
 		// Snapshot and send history FIRST, without the turn lock. A running
@@ -1068,6 +1116,10 @@ func (s *Server) attachSession(ws *wsConn, r *http.Request, rt *sessionRuntime, 
 		s.decorateConfig(&full)
 		_ = ws.writeJSON(basic)
 		_ = ws.writeJSON(full)
+		// Derive llama.cpp reasoning-effort options for the (possibly
+		// restored) model and push a correction when they differ from the
+		// fallback set the configs above carried.
+		s.maybeProbeReasoningEfforts(r.Context(), rt.agent)
 	}()
 }
 
@@ -1243,6 +1295,11 @@ func (s *Server) handleWSSetModel(ws *wsConn, ctx context.Context, rt *sessionRu
 		applyContextStats(&cfg, a.ContextStats(ctx), &accum)
 		_ = ws.writeJSON(cfg)
 	}()
+	// llama.cpp endpoints: derive the new model's true reasoning-effort
+	// options from /props (+ /apply-template) and push a config update when
+	// they differ from the fallback the echo above carried (the provider
+	// caches per model, so repeat switches are no-ops).
+	s.maybeProbeReasoningEfforts(ctx, a)
 }
 
 func (s *Server) handleWSSetMode(ws *wsConn, ctx context.Context, rt *sessionRuntime, msg WSMessage) {
@@ -1820,6 +1877,7 @@ func (s *Server) handleWSCompact(ws *wsConn, r *http.Request, rt *sessionRuntime
 		if err := rt.agent.CompactHistory(r.Context()); err != nil {
 			_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: " + err.Error(), SessionID: rt.agent.SessionID})
 		} else {
+			rt.agent.FlushSession()
 			_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("History compacted (%d messages remaining).", rt.agent.MessageCount()), SessionID: rt.agent.SessionID})
 		}
 		_ = ws.writeJSON(contextMsg(r.Context(), rt.agent))

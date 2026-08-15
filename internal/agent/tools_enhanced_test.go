@@ -139,6 +139,116 @@ func TestReadFileRangeLineNumbersWithSearch(t *testing.T) {
 	}
 }
 
+// TestReadFileRangeSearchWindowCappedByLimit pins the search-mode window
+// semantics: limit caps the total lines returned (before + match + after), and
+// offset > 0 sets the context lines before the match while limit still caps the
+// total. Regression for the old ctx = limit/2 derivation, which returned
+// limit+1 lines for even limits and let offset silently override limit.
+func TestReadFileRangeSearchWindowCappedByLimit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "search.txt")
+	// 41 lines; the search match lives at line 21, with 20 lines on each side.
+	var lines []string
+	for i := 1; i <= 41; i++ {
+		lines = append(lines, fmt.Sprintf("line %02d", i))
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := NewExecutor(dir)
+	tests := []struct {
+		name      string
+		offset    int
+		limit     int
+		wantTotal int
+		wantFirst string
+		wantLast  string
+	}{
+		{
+			name:      "limit only, even limit caps at limit (was limit+1)",
+			offset:    0,
+			limit:     10,
+			wantTotal: 10,
+			wantFirst: "line 16", // 5 before + match
+			wantLast:  "line 25", // 4 after
+		},
+		{
+			name:      "even limit 2 caps at 2",
+			offset:    0,
+			limit:     2,
+			wantTotal: 2,
+			wantFirst: "line 20",
+			wantLast:  "line 21",
+		},
+		{
+			name:      "limit 1 returns only the match",
+			offset:    0,
+			limit:     1,
+			wantTotal: 1,
+			wantFirst: "line 21",
+			wantLast:  "line 21",
+		},
+		{
+			name:      "limit larger than file returns whole file",
+			offset:    0,
+			limit:     41,
+			wantTotal: 41,
+			wantFirst: "line 01",
+			wantLast:  "line 41",
+		},
+		{
+			name:      "offset sets before, limit caps total",
+			offset:    2,
+			limit:     10,
+			wantTotal: 10,
+			wantFirst: "line 19",
+			wantLast:  "line 28",
+		},
+		{
+			name:      "offset larger than limit budget is clamped",
+			offset:    20,
+			limit:     10,
+			wantTotal: 10,
+			wantFirst: "line 12", // 9 before + match
+			wantLast:  "line 21",
+		},
+		{
+			name:      "offset only keeps default 10 after",
+			offset:    20,
+			limit:     0,
+			wantTotal: 31, // 20 before + match + 10 after
+			wantFirst: "line 01",
+			wantLast:  "line 31",
+		},
+		{
+			name:      "defaults 10 before and after",
+			offset:    0,
+			limit:     0,
+			wantTotal: 21,
+			wantFirst: "line 11",
+			wantLast:  "line 31",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := exec.ReadFileRange(path, tc.offset, tc.limit, "^line 21$", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parts := strings.Split(out, "\n")
+			body := parts[1:] // first line is the "Lines X-Y of Z" header
+			if len(body) != tc.wantTotal {
+				t.Fatalf("window = %d lines, want %d\nout: %q", len(body), tc.wantTotal, out)
+			}
+			if body[0] != tc.wantFirst || body[len(body)-1] != tc.wantLast {
+				t.Fatalf("window = [%q .. %q], want [%q .. %q]\nout: %q",
+					body[0], body[len(body)-1], tc.wantFirst, tc.wantLast, out)
+			}
+		})
+	}
+}
+
 func TestReadFileRangeSizeWarning(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "big.txt")

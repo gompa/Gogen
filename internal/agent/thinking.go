@@ -65,8 +65,9 @@ func NormalizeThinkingLevel(s string) ThinkingLevel {
 
 // CurrentModelEfforts returns the reasoning-effort values the current model
 // accepts (without "off"): the models.dev registry set when the model is
-// known (empty for toggle/budget-only models), else llm.DefaultReasoningEfforts.
-// Never blocks.
+// known (empty for toggle/budget-only models), else the llama.cpp
+// /props-derived set when the provider has probed one, else
+// llm.DefaultReasoningEfforts. Never blocks.
 func (a *Agent) CurrentModelEfforts() []string {
 	if p, ok := a.Provider.(llm.ReasoningEffortsProvider); ok {
 		return p.ModelReasoningEfforts(a.CurrentModel())

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"sort"
 	"sync"
@@ -39,6 +40,18 @@ type BackgroundJob struct {
 	cancel context.CancelFunc
 	mu     sync.Mutex
 	output *boundedOutputWriter
+	// unread holds output produced since the last action=input drain, so
+	// input can return the delta since the previous read instead of the
+	// full tail. Fed by the same chunks as output (both buffers are written
+	// under their own locks); drained by BackgroundJobInput. action=status
+	// keeps showing the full tail.
+	unread *boundedOutputWriter
+	// stdin is the job's stdin pipe, created by cmd.StdinPipe before the
+	// process starts. stdinMu serializes writes so logical lines stay
+	// atomic; it also guards the pipe against being written while the wait
+	// goroutine's cmd.Wait is closing it.
+	stdin   io.WriteCloser
+	stdinMu sync.Mutex
 	// finishedAt is when the process exited; set under mu before done is
 	// closed. The finished-job cap uses it to reap the oldest finished jobs
 	// first.
@@ -74,6 +87,15 @@ func (a *Agent) StartBackgroundCommand(command string) (string, error) {
 		cancel()
 		return "", err
 	}
+	// Create the stdin pipe BEFORE cmd.Start (exec requires it): with the
+	// pipe in place, background_job action=input can feed interactive
+	// programs (REPLs, psql, dev servers). Without it cmd.Stdin is nil and
+	// the child reads from /dev/null.
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		cancel()
+		return "", fmt.Errorf("stdin pipe: %w", err)
+	}
 	job := &BackgroundJob{
 		ID:      newBackgroundJobID(),
 		Command: command,
@@ -81,9 +103,15 @@ func (a *Agent) StartBackgroundCommand(command string) (string, error) {
 		done:    make(chan struct{}),
 		cancel:  cancel,
 		output:  newBoundedOutputWriter(defaultBackgroundOutputCap),
+		unread:  newBoundedOutputWriter(defaultBackgroundUnreadCap),
+		stdin:   stdin,
 	}
-	cmd.Stdout = job.output
-	cmd.Stderr = job.output
+	// Every chunk lands in both the tail and the unread delta buffer. The
+	// MultiWriter preserves per-stream write order; each buffer is
+	// mutex-guarded, and stdout/stderr interleaving follows the child's
+	// write order exactly as the single-writer tail did.
+	cmd.Stdout = io.MultiWriter(job.output, job.unread)
+	cmd.Stderr = io.MultiWriter(job.output, job.unread)
 
 	a.bgMu.Lock()
 	if a.bgJobs == nil {
@@ -97,6 +125,7 @@ func (a *Agent) StartBackgroundCommand(command string) (string, error) {
 		delete(a.bgJobs, job.ID)
 		a.bgMu.Unlock()
 		cancel()
+		_ = stdin.Close()
 		return "", fmt.Errorf("execution error: %w", err)
 	}
 	go func() {
@@ -109,6 +138,65 @@ func (a *Agent) StartBackgroundCommand(command string) (string, error) {
 		a.onJobFinished(job)
 	}()
 	return job.ID, nil
+}
+
+// maxBackgroundInputBytes caps a single action=input write. The kernel pipe
+// buffer absorbs roughly 64 KB before a writer blocks, so a cap this small
+// bounds how long a write can wait behind a job that never reads stdin: the
+// write still blocks once the buffer fills (until the job reads or exits —
+// documented in the tool description), but never with more than a few
+// outstanding writes.
+const maxBackgroundInputBytes = 16 * 1024
+
+// defaultBackgroundUnreadCap bounds the per-job output delta retained for
+// action=input, mirroring the output tail cap so a long-running job cannot
+// grow memory without bound.
+const defaultBackgroundUnreadCap = 64 * 1024
+
+// BackgroundJobInput writes text to a running background job's stdin and
+// returns the output produced since the previous read (the delta), so REPL
+// loops can poll cheaply without re-reading the whole tail. The write is
+// serialized per job. Input is not a shell command: it goes to the process's
+// stdin, so the command guard deliberately does not apply.
+func (a *Agent) BackgroundJobInput(jobID, input string, appendNewline bool) (string, error) {
+	job := a.backgroundJob(jobID)
+	if job == nil {
+		return "", fmt.Errorf("unknown background job %q (jobs are scoped to this session; the session may have been closed)", jobID)
+	}
+	if len(input) > maxBackgroundInputBytes {
+		return "", fmt.Errorf("input is %d bytes; background_job input accepts at most %d bytes per call", len(input), maxBackgroundInputBytes)
+	}
+	select {
+	case <-job.done:
+		return "", fmt.Errorf("background job %s already finished", jobID)
+	default:
+	}
+	if job.stdin == nil {
+		return "", fmt.Errorf("background job %s has no stdin pipe", jobID)
+	}
+
+	payload := input
+	if appendNewline {
+		payload += "\n"
+	}
+	job.stdinMu.Lock()
+	defer job.stdinMu.Unlock()
+	n, err := job.stdin.Write([]byte(payload))
+	if err == nil && n < len(payload) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		if isStdinClosedErr(err) {
+			return "", fmt.Errorf("background job %s closed its stdin (the process exited)", jobID)
+		}
+		return "", fmt.Errorf("writing to background job %s stdin: %w", jobID, err)
+	}
+
+	delta := job.unread.drain()
+	if delta == "" {
+		return fmt.Sprintf("Sent %d bytes to job %s stdin. No new output since the last read.", len(payload), jobID), nil
+	}
+	return fmt.Sprintf("Sent %d bytes to job %s stdin.\nOutput:\n%s", len(payload), jobID, delta), nil
 }
 
 // backgroundJob returns the live job for id, or nil.

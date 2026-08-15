@@ -521,11 +521,14 @@ func (m *Manager) CompactPinned(ctx context.Context, viewPrefix, messages []llm.
 	// messages[0] up to the tail start — the entire messages-derived portion
 	// of the summarization request (pre-head, first user message, middle) —
 	// and falls back to -1 (unknown) when the cache does not reach tailStart.
+	// Cached counts include per-image estimates, but the request strips
+	// images; subtract them so image sessions don't overestimate into the
+	// fallback path.
 	knownTokens := -1
 	if counts != nil && len(counts) >= tailStart {
 		knownTokens = 0
 		for i := 0; i < tailStart; i++ {
-			knownTokens += counts[i]
+			knownTokens += counts[i] - imageTokenEstimate(messages[i])
 		}
 	}
 
@@ -536,11 +539,14 @@ func (m *Manager) CompactPinned(ctx context.Context, viewPrefix, messages []llm.
 	if counts != nil && len(counts) >= tailStart {
 		middleTokens = 0
 		for i := headIdx + 1; i < tailStart; i++ {
-			middleTokens += counts[i]
+			middleTokens += counts[i] - imageTokenEstimate(messages[i])
 		}
 	}
 	if middleTokens < 0 {
 		middleTokens = m.EstimateTokens(middle)
+		for _, msg := range middle {
+			middleTokens -= imageTokenEstimate(msg)
+		}
 	}
 	if middleTokens < m.minMiddleTokens {
 		return nil, nil, fmt.Errorf("not enough history to compact (%d messages in the middle)", len(middle))
@@ -688,8 +694,8 @@ func (m *Manager) summarizeMiddle(ctx context.Context, viewPrefix, prefix, middl
 	if reqTokens < 0 {
 		reqTokens = m.EstimateTokens(req)
 	} else {
-		// knownTokens covers prefix+middle (cached counts exclude image
-		// estimates, matching the stripped request); only the wire prefix
+		// knownTokens covers prefix+middle with image estimates already
+		// subtracted (matching the stripped request); only the wire prefix
 		// and the one-message instruction need fresh counts.
 		reqTokens += m.EstimateTokens(stripImages(viewPrefix))
 		reqTokens += m.EstimateTokens([]llm.Message{instruction})
@@ -701,7 +707,16 @@ func (m *Manager) summarizeMiddle(ctx context.Context, viewPrefix, prefix, middl
 			"requestTokens":  reqTokens,
 			"budget":         budget,
 		})
-		return m.summarizeRequest(ctx, req)
+		summary, err := m.summarizeRequest(ctx, req)
+		if err == nil {
+			return summary, nil
+		}
+		debuglog.Write("contextmgr/summarize", "continuation-summary request failed; using flattened-text fallback", "", map[string]interface{}{
+			"path":           "fallback-after-error",
+			"error":          err.Error(),
+			"middleMessages": len(middle),
+		})
+		return m.summarizeMessagesDepth(ctx, middle, 0)
 	}
 	debuglog.Write("contextmgr/summarize", "summary request exceeds window; using flattened-text fallback", "", map[string]interface{}{
 		"path":           "fallback",
@@ -927,13 +942,14 @@ func writeMessageForSummary(b *strings.Builder, msg llm.Message, maxToolBytes in
 // assistant model attribution (web UI chips) from preserved bubbles.
 func cloneMessage(msg llm.Message) llm.Message {
 	out := llm.Message{
-		Role:       msg.Role,
-		Content:    msg.Content,
-		Reasoning:  msg.Reasoning,
-		Refusal:    msg.Refusal,
-		ToolCallID: msg.ToolCallID,
-		CreatedAt:  msg.CreatedAt,
-		Model:      msg.Model,
+		Role:           msg.Role,
+		Content:        msg.Content,
+		Reasoning:      msg.Reasoning,
+		Refusal:        msg.Refusal,
+		ToolCallID:     msg.ToolCallID,
+		CreatedAt:      msg.CreatedAt,
+		Model:          msg.Model,
+		ArgsStabilized: msg.ArgsStabilized,
 	}
 	if len(msg.Images) > 0 {
 		out.Images = make([]llm.ImageInput, len(msg.Images))
@@ -949,6 +965,9 @@ func cloneMessage(msg llm.Message) llm.Message {
 					out.ToolCalls[i].Args[k] = cloneArgValue(v)
 				}
 			}
+			// ArgsStr is copied verbatim, so ArgsJSONValid stays truthful;
+			// carrying it avoids re-stabilizing preserved tool calls next turn.
+			out.ToolCalls[i].ArgsJSONValid = msg.ToolCalls[i].ArgsJSONValid
 		}
 	}
 	return out

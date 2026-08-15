@@ -104,6 +104,8 @@ func cmdCompact(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 		m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Compact failed: %v", err)))
 	} else {
 		m.appendChatLine(SystemStyle.Render(fmt.Sprintf("History compacted (%d messages remaining).", len(m.agent.Messages))))
+		m.agent.FlushSession()
+		m.checkPersistError()
 	}
 	return true, false, nil
 }

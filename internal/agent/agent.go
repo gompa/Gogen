@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -95,6 +94,13 @@ type Agent struct {
 	// cap, the oldest finished jobs are reaped immediately.
 	bgMaxFinished int
 
+	// sessionImages counts read_image attachments in this session. Atomic:
+	// read_image handlers run concurrently in parallel read-only batches,
+	// so the claim (reserveImageSlot) is a CAS loop. Enforces the soft
+	// per-session cap (maxSessionImages) on image bytes — the most
+	// expensive content in context, resent on every API request.
+	sessionImages atomic.Int32
+
 	// statsMu serializes the agent state that ContextStats/SnapshotMessages
 	// read without the session turnMu: Messages, the cached token counts
 	// (tokenCounts), the API-usage baseline (lastTurnUsage,
@@ -171,6 +177,11 @@ type Agent struct {
 	// detect the list moved under it and skip publishing stale counts.
 	tokenCounts []int
 	countsEpoch uint64
+
+	// Auto-compaction failure backoff (guarded by statsMu): doubles per
+	// failure (30s → 10min cap), reset on success.
+	compactBackoffUntil time.Time
+	compactBackoffDelay time.Duration
 
 	// ThinkingLevel controls how much reasoning/thinking the model should use.
 	// When "off", no thinking parameter is sent to the API.
@@ -271,6 +282,19 @@ type Agent struct {
 	// patchFailStreak counts consecutive patch_file failures so the agent loop
 	// can steer the model away from retrying the same stale diff indefinitely.
 	patchFailStreak atomic.Int32
+
+	// patchTurnStrikes counts consecutive patch_file mismatch failures within
+	// a single turn so the agent loop can hard-stop a model stuck in a patch
+	// retry loop. Reset at the start of every turn; reaching the limit aborts
+	// the turn (runToolRound returns toolRoundStopped), unlike
+	// patchFailStreak which only decorates the error with advice.
+	patchTurnStrikes atomic.Int32
+
+	// patchStrikeKey remembers the failure report of the last patch_file
+	// mismatch so patchTurnStrikes only accumulates while the SAME diff keeps
+	// failing (same target, same mismatch). A model iterating across
+	// different files or diffs is making progress and must not be stopped.
+	patchStrikeKey atomic.Value // string
 }
 
 // persistMeta is the set of session fields that only the full snapshot path
@@ -717,6 +741,7 @@ func (a *Agent) shouldCompactUsingCounts() bool {
 	counts := a.tokenCounts
 	msgs := a.Messages
 	complete := counts != nil && len(counts) == len(msgs)
+	baselineTokens, baselineMsgCount := a.apiBaselinePromptTokens, a.apiBaselineMsgCount
 	a.statsMu.RUnlock()
 	if !complete {
 		return a.Context.ShouldCompact(msgs)
@@ -731,7 +756,48 @@ func (a *Agent) shouldCompactUsingCounts() bool {
 	for _, c := range counts {
 		total += c
 	}
+	// Use the provider's exact prompt_tokens for messages in the last request
+	// (cl100k misjudges other tokenizers); estimate only the suffix appended
+	// since. Cleared by clearTurnUsage after a compaction.
+	if baselineTokens > 0 && baselineMsgCount > 0 && baselineMsgCount <= len(counts) {
+		local := 0
+		for _, c := range counts[baselineMsgCount:] {
+			local += c
+		}
+		total = baselineTokens + local
+	}
 	return total >= a.Context.CompactBudget()
+}
+
+// compactAttemptDue reports whether the auto-compaction failure backoff has expired.
+func (a *Agent) compactAttemptDue() bool {
+	a.statsMu.RLock()
+	defer a.statsMu.RUnlock()
+	return time.Now().After(a.compactBackoffUntil)
+}
+
+// noteCompactFailure records a failed auto-compaction and backs off the next attempt exponentially.
+func (a *Agent) noteCompactFailure(err error) {
+	log.Printf("auto-compaction failed (backing off): %v", err)
+	a.statsMu.Lock()
+	if a.compactBackoffDelay == 0 {
+		a.compactBackoffDelay = 30 * time.Second
+	} else {
+		a.compactBackoffDelay *= 2
+		if a.compactBackoffDelay > 10*time.Minute {
+			a.compactBackoffDelay = 10 * time.Minute
+		}
+	}
+	a.compactBackoffUntil = time.Now().Add(a.compactBackoffDelay)
+	a.statsMu.Unlock()
+}
+
+// noteCompactSuccess resets the auto-compaction failure backoff.
+func (a *Agent) noteCompactSuccess() {
+	a.statsMu.Lock()
+	a.compactBackoffUntil = time.Time{}
+	a.compactBackoffDelay = 0
+	a.statsMu.Unlock()
 }
 
 // ConsumePersistError returns and clears the last session save failure, if any.
@@ -889,7 +955,7 @@ func (a *Agent) CompactHistory(ctx context.Context) error {
 	if a.Context == nil {
 		return fmt.Errorf("context management is not configured")
 	}
-	if len(a.Messages) <= a.Context.Settings.CompactKeepRecentMessages+1 {
+	if len(a.Messages) <= a.Context.CompactKeepRecentMessages()+1 {
 		return fmt.Errorf("not enough history to compact (%d messages)", len(a.Messages))
 	}
 	a.statsMu.RLock()
@@ -978,6 +1044,10 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 	if h == nil {
 		h = &llm.StreamHandlers{}
 	}
+	// Per-turn patch retry budget: a model that fails patch_file three times
+	// in a row within this turn is looping; the turn is stopped instead of
+	// letting it retry indefinitely.
+	a.patchTurnStrikes.Store(0)
 	for first := true; ; first = false {
 		result, err := a.runTurn(ctx, h, first)
 		if err != nil {
@@ -1040,7 +1110,14 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 			Model:     result.Model,
 		})
 
-		if a.runToolRound(ctx, h, result.ToolCalls) {
+		switch outcome, stopMsg := a.runToolRound(ctx, h, result.ToolCalls); outcome {
+		case toolRoundStopped:
+			// A patch_file failure ended the turn (marker-only diff or the
+			// per-turn mismatch budget was exhausted): return the final tool
+			// result as the turn outcome so the host shows why the turn
+			// ended without calling the model again.
+			return stopMsg, nil
+		case toolRoundCancelled:
 			return "", ctx.Err()
 		}
 		a.persistSession()
@@ -1087,10 +1164,19 @@ func (a *Agent) toolCallsParallelEligible(toolCalls []llm.ToolCall) bool {
 // interrupted calls read as cancelled.
 func (a *Agent) executeToolCallsParallel(ctx context.Context, h *llm.StreamHandlers, toolCalls []llm.ToolCall) bool {
 	type execResult struct {
-		res string
-		err error
+		res  string
+		err  error
+		done bool // true when the tool returned a result (before batch cancellation)
 	}
 	results := make([]execResult, len(toolCalls))
+	// Per-tool-call image sinks, mirroring the sequential path: read_image
+	// handlers collect images into their call's sink, and each sink is
+	// drained right after its tool result below, in model order, so the
+	// transcript reads tool(result) → user(image) for every call.
+	sinks := make([]*imageSink, len(toolCalls))
+	for i := range sinks {
+		sinks[i] = &imageSink{}
+	}
 
 	if ctx.Err() != nil {
 		return true
@@ -1118,8 +1204,21 @@ func (a *Agent) executeToolCallsParallel(ctx context.Context, h *llm.StreamHandl
 				return
 			}
 			defer func() { <-sem }()
-			res, err := a.executeTool(ctx, toolCalls[i])
-			results[i] = execResult{res: res, err: err}
+			// Attach the live-output sink (if any) to this call's context,
+			// exactly like the sequential path in runToolRound, so read-only
+			// commands and searches running in parallel stream intermediate
+			// chunks to the UI tagged with this call's identity (id/name).
+			// The per-call image sink is layered on top as before.
+			tc := toolCalls[i]
+			toolCtx := ctx
+			if h.OnToolOutput != nil {
+				toolCtx = ContextWithToolOutput(ctx, func(command, chunk string) {
+					h.OnToolOutput(tc.ID, tc.Name, command, chunk)
+				})
+			}
+			toolCtx = ContextWithImageSink(toolCtx, sinks[i])
+			res, err := a.executeTool(toolCtx, tc)
+			results[i] = execResult{res: res, err: err, done: true}
 		}(i)
 	}
 	wg.Wait()
@@ -1127,18 +1226,17 @@ func (a *Agent) executeToolCallsParallel(ctx context.Context, h *llm.StreamHandl
 	cancelled := ctx.Err() != nil
 	for i, tc := range toolCalls {
 		res, errTool := results[i].res, results[i].err
-		if cancelled {
-			if errTool == nil {
-				res = "The operation was cancelled by the user."
-			} else if errors.Is(errTool, context.Canceled) {
-				res = "The operation was cancelled by the user."
-			} else {
-				res = formatToolError(res, errTool)
-			}
+		// Mirror runToolRound's per-call semantics: a tool that completed
+		// before the cancellation keeps its real result; only a call that
+		// was interrupted (returned context.Canceled) or never ran (still
+		// waiting to start when the batch finished) reads as cancelled.
+		if errTool == context.Canceled || (cancelled && !results[i].done) {
+			res = "The operation was cancelled by the user."
 			if h.OnToolResult != nil {
 				h.OnToolResult(tc.ID, tc.Name, res, false)
 			}
 			a.appendToolResult(tc, res)
+			a.appendImageMessages(sinks[i])
 			continue
 		}
 		success := errTool == nil
@@ -1149,6 +1247,7 @@ func (a *Agent) executeToolCallsParallel(ctx context.Context, h *llm.StreamHandl
 			h.OnToolResult(tc.ID, tc.Name, res, success)
 		}
 		a.appendToolResult(tc, res)
+		a.appendImageMessages(sinks[i])
 	}
 	return cancelled
 }

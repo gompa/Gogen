@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"sort"
@@ -309,5 +310,249 @@ func TestFinishedJobCapReapsOldest(t *testing.T) {
 				t.Fatalf("job %s (finisher %d) should still be registered as finished; status=%q err=%v", id, i+1, s, err)
 			}
 		}
+	}
+}
+
+// TestBackgroundJobInputEcho verifies the stdin pipe end-to-end: input
+// written to a running job reaches the process, and the process's response
+// appears in the job output.
+func TestBackgroundJobInputEcho(t *testing.T) {
+	exec := NewExecutor(t.TempDir())
+	a := NewAgent(nil, exec, nil)
+	defer a.Close()
+
+	id, err := a.StartBackgroundCommand("sh -c 'while read line; do echo \"got: $line\"; done'")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	out, err := a.BackgroundJobInput(id, "hello", true)
+	if err != nil {
+		t.Fatalf("input: %v", err)
+	}
+	if !strings.Contains(out, "Sent 6 bytes to job "+id) {
+		t.Fatalf("input ack = %q", out)
+	}
+
+	// The echoed line must appear in the job output (poll the tail; status
+	// never drains).
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		s, err := a.BackgroundJobStatus(id)
+		if err != nil {
+			t.Fatalf("status: %v", err)
+		}
+		if strings.Contains(s, "got: hello") {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("echoed line never appeared in job output")
+}
+
+// TestBackgroundJobInputAppendNewline verifies append_newline=false: a line
+// reader must NOT complete on the payload (no trailing newline), and the
+// next newline-terminated input completes the same read with both payloads
+// concatenated.
+func TestBackgroundJobInputAppendNewline(t *testing.T) {
+	exec := NewExecutor(t.TempDir())
+	a := NewAgent(nil, exec, nil)
+	defer a.Close()
+
+	id, err := a.StartBackgroundCommand("sh -c 'IFS= read -r line; echo \"got:$line\"'")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if _, err := a.BackgroundJobInput(id, "Z", false); err != nil {
+		t.Fatalf("input: %v", err)
+	}
+	// Without a trailing newline the read must stay blocked: the job is
+	// still running and has produced no output.
+	deadline := time.Now().Add(10 * time.Second)
+	time.Sleep(300 * time.Millisecond)
+	s, err := a.BackgroundJobStatus(id)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	// "got:Z" would only appear in the OUTPUT section; the command string
+	// contains "got:$line", which must not trigger the assertion.
+	if strings.Contains(s, "FINISHED") || strings.Contains(s, "got:Z") {
+		t.Fatalf("append_newline=false terminated the read: %q", s)
+	}
+	// The next input carries the newline: the same read completes with both
+	// payloads ("Z" + "Y\n" → "got:ZY").
+	if _, err := a.BackgroundJobInput(id, "Y", true); err != nil {
+		t.Fatalf("input 2: %v", err)
+	}
+	for time.Now().Before(deadline) {
+		s, err := a.BackgroundJobStatus(id)
+		if err != nil {
+			t.Fatalf("status: %v", err)
+		}
+		if strings.Contains(s, "got:ZY") {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("expected read to complete as got:ZY; last status: %s", s)
+}
+
+// TestBackgroundJobInputDelta verifies the unread-buffer semantics: the
+// first input returns everything produced so far; later inputs return only
+// output produced since the last drain.
+func TestBackgroundJobInputDelta(t *testing.T) {
+	exec := NewExecutor(t.TempDir())
+	a := NewAgent(nil, exec, nil)
+	defer a.Close()
+
+	id, err := a.StartBackgroundCommand("sh -c 'echo marker; sleep 30'")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	// Wait until the marker is in the output tail (status shows the tail
+	// and does not drain, so the marker stays unread for the first input).
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		s, err := a.BackgroundJobStatus(id)
+		if err != nil {
+			t.Fatalf("status: %v", err)
+		}
+		// The command string also contains "marker"; only the Output
+		// section proves the echo actually ran.
+		if strings.Contains(s, "Output:\nmarker") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	delta1, err := a.BackgroundJobInput(id, "x", false)
+	if err != nil {
+		t.Fatalf("input 1: %v", err)
+	}
+	if !strings.Contains(delta1, "marker") {
+		t.Fatalf("first delta = %q, want the marker (output since job start)", delta1)
+	}
+
+	delta2, err := a.BackgroundJobInput(id, "y", false)
+	if err != nil {
+		t.Fatalf("input 2: %v", err)
+	}
+	if strings.Contains(delta2, "marker") {
+		t.Fatalf("second delta = %q, marker reappeared (drain failed)", delta2)
+	}
+}
+
+// TestBackgroundJobInputFinished verifies input to a finished job fails
+// with a clear error.
+func TestBackgroundJobInputFinished(t *testing.T) {
+	exec := NewExecutor(t.TempDir())
+	a := NewAgent(nil, exec, nil)
+	defer a.Close()
+
+	id, err := a.StartBackgroundCommand("echo done")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		s, err := a.BackgroundJobStatus(id)
+		if err != nil {
+			t.Fatalf("status: %v", err)
+		}
+		if strings.Contains(s, "FINISHED") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := a.BackgroundJobInput(id, "x", false); err == nil || !strings.Contains(err.Error(), "already finished") {
+		t.Fatalf("expected already-finished error, got %v", err)
+	}
+}
+
+// TestBackgroundJobInputOversized verifies the per-write size cap.
+func TestBackgroundJobInputOversized(t *testing.T) {
+	exec := NewExecutor(t.TempDir())
+	a := NewAgent(nil, exec, nil)
+	defer a.Close()
+
+	id, err := a.StartBackgroundCommand("sleep 5")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if _, err := a.BackgroundJobInput(id, strings.Repeat("x", maxBackgroundInputBytes+1), false); err == nil || !strings.Contains(err.Error(), "at most") {
+		t.Fatalf("expected size-cap error, got %v", err)
+	}
+}
+
+// TestBackgroundJobInputStdinClosed verifies the EPIPE translation: writing
+// to a job whose process closed its stdin reports "closed its stdin" (the
+// process may still be running, so the done-channel check cannot catch it).
+func TestBackgroundJobInputStdinClosed(t *testing.T) {
+	exec := NewExecutor(t.TempDir())
+	a := NewAgent(nil, exec, nil)
+	defer a.Close()
+
+	// exec 0<&- closes the child's stdin immediately; the shell then keeps
+	// running (sleep), so the job is alive while its stdin is gone.
+	id, err := a.StartBackgroundCommand("sh -c 'exec 0<&-; sleep 3'")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		_, err := a.BackgroundJobInput(id, "x", false)
+		if err != nil && strings.Contains(err.Error(), "closed its stdin") {
+			return
+		}
+		if err != nil && !strings.Contains(err.Error(), "closed its stdin") {
+			t.Fatalf("unexpected input error: %v", err)
+		}
+		// The first write may succeed before the shell closes fd 0; retry
+		// until the pipe is provably closed.
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("stdin close was never observed")
+}
+
+// TestBackgroundJobInputUnknown verifies the unknown-job error.
+func TestBackgroundJobInputUnknown(t *testing.T) {
+	exec := NewExecutor(t.TempDir())
+	a := NewAgent(nil, exec, nil)
+	defer a.Close()
+
+	if _, err := a.BackgroundJobInput("job-nope", "x", false); err == nil || !strings.Contains(err.Error(), "unknown background job") {
+		t.Fatalf("expected unknown-job error, got %v", err)
+	}
+}
+
+// TestBackgroundJobToolInput verifies the background_job handler routes the
+// input action (schema enum + arg parsing), including the missing-input
+// error.
+func TestBackgroundJobToolInput(t *testing.T) {
+	exec := NewExecutor(t.TempDir())
+	a := NewAgent(nil, exec, nil)
+	defer a.Close()
+
+	id, err := a.StartBackgroundCommand("sleep 5")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	out, err := handleBackgroundJob(context.Background(), a, map[string]interface{}{
+		"action":         "input",
+		"job_id":         id,
+		"input":          "hi",
+		"append_newline": false,
+	})
+	if err != nil {
+		t.Fatalf("input via handler: %v", err)
+	}
+	if !strings.Contains(out, "Sent 2 bytes to job "+id) {
+		t.Fatalf("handler output = %q", out)
+	}
+
+	if _, err := handleBackgroundJob(context.Background(), a, map[string]interface{}{
+		"action": "input",
+		"job_id": id,
+	}); err == nil || !strings.Contains(err.Error(), "missing required argument") {
+		t.Fatalf("expected missing-input error, got %v", err)
 	}
 }

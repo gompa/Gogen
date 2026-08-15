@@ -80,6 +80,13 @@ type BoardOpRequest struct {
 	Priority    string `json:"priority,omitempty"`
 	Column      string `json:"column,omitempty"`
 	Text        string `json:"text,omitempty"`
+	// Model is the per-ticket model chosen in the "Start agent" popover
+	// ("" = workspace default model). start only.
+	Model string `json:"model,omitempty"`
+	// Prompt is the per-ticket prompt template for the started agent
+	// ("" = the configured board_start_prompt template; the stored ticket
+	// override is cleared). start only.
+	Prompt string `json:"prompt,omitempty"`
 }
 
 // ProviderEntry is one registered OpenAI-compatible provider in the config
@@ -187,9 +194,17 @@ type WSMessage struct {
 	OutputPricePer1M float64 `json:"outputPricePer1M,omitempty"`
 	CachedPricePer1M float64 `json:"cachedPricePer1M,omitempty"`
 	// ReasoningEfforts are the reasoning_effort values the current model
-	// accepts (models.dev); empty means unknown or no effort control, and
-	// clients fall back to the default set for chips.
+	// accepts (models.dev, or a llama.cpp /props-derived set); empty means
+	// unknown or no effort control. Clients fall back to the default set for
+	// chips when empty and ReasoningEffortsUnsupported is absent.
 	ReasoningEfforts []string `json:"reasoningEfforts,omitempty"`
+	// ReasoningEffortsUnsupported is true when the current model definitively
+	// has NO reasoning-effort control (a known models.dev entry with no
+	// effort options, or a llama.cpp capability probe that reported no
+	// support): clients hide the thinking chips entirely. Omitted when false
+	// (JSON omitempty); an absent flag with empty ReasoningEfforts means
+	// "unknown", not "no support" — clients keep the default chip set.
+	ReasoningEffortsUnsupported bool `json:"reasoningEffortsUnsupported,omitempty"`
 	// ModelDescription is the models.dev description of the current model;
 	// empty means unknown. Shown as a hover tooltip in the client.
 	ModelDescription string `json:"modelDescription,omitempty"`

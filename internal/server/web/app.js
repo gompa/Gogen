@@ -72,6 +72,7 @@
         const tbModelList = document.getElementById('tb-model-list');
         const tbModelFilter = document.getElementById('tb-model-filter');
         const tbThinkingGrid = document.getElementById('tb-thinking-grid');
+        const tbThinkingSection = document.getElementById('tb-thinking-section');
         const nearCompactBanner = document.getElementById('near-compact-banner');
         const ncbCompactBtn = document.getElementById('ncb-compact-btn');
         const ncbDismissBtn = document.getElementById('ncb-dismiss-btn');
@@ -334,6 +335,14 @@
             if (tbModePopoverOpen && !tbModePicker.contains(e.target)) {
                 closeModePopover();
             }
+            // Board "Start agent" popover: close on any outside click (the
+            // card's Start button stops propagation, so clicking it while
+            // the popover is open never reaches here — mirroring the
+            // toolbar popovers).
+            if (boardStartPopoverOpen) {
+                const pop = document.getElementById('board-start-popover');
+                if (pop && !pop.contains(e.target)) closeBoardStartPopover();
+            }
         });
 
         tbModelFilter?.addEventListener('input', () => {
@@ -505,7 +514,9 @@
         // Values outside the defaults (e.g. a model's "max" from models.dev)
         // derive their label by title-casing. Chips are rendered from the
         // ACTIVE model's accepted values (config reasoningEfforts); unknown
-        // models fall back to the default set.
+        // models fall back to the default set. The Off chip is always
+        // rendered: the level is off (or empty) whenever no other chip is
+        // selected, and the server then omits reasoning_effort entirely.
         const THINKING_LABELS = { off: 'Off', low: 'L', medium: 'M', high: 'H' };
         const DEFAULT_THINKING_EFFORTS = ['low', 'medium', 'high'];
 
@@ -513,25 +524,51 @@
             return THINKING_LABELS[value] || (value ? value[0].toUpperCase() + value.slice(1) : value);
         }
 
-        function renderThinkingChips(level, efforts) {
+        function renderThinkingChips(level, efforts, unsupported) {
             if (!tbThinkingGrid) return;
             tbThinkingGrid.innerHTML = '';
+            if (unsupported) {
+                // The model definitively has no reasoning-effort control (a
+                // known toggle-only models.dev entry, or a llama.cpp /props
+                // probe that reported no support): hide the chips entirely —
+                // there is nothing to select and nothing would be sent.
+                if (tbThinkingSection) tbThinkingSection.hidden = true;
+                return;
+            }
+            if (tbThinkingSection) tbThinkingSection.hidden = false;
+            const off = !level || level === 'off';
+            // Explicit Off chip: the "no reasoning_effort sent" state.
+            // Active when the level is off/empty. A stored level the model
+            // does not accept (policy B) renders as NO active chip — the
+            // parameter is omitted, so the chips read the truth: nothing
+            // selected = nothing sent.
+            const offChip = document.createElement('button');
+            offChip.className = 'tb-thinking-chip' + (off ? ' active' : '');
+            offChip.type = 'button';
+            offChip.textContent = thinkingLabel('off');
+            offChip.title = off ? 'No reasoning_effort sent' : 'Click to disable reasoning (no reasoning_effort sent)';
+            offChip.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (!ws || ws.readyState !== WebSocket.OPEN) return;
+                if (off) return; // already off
+                ws.send(JSON.stringify({ type: 'set_thinking_level', thinkingLevel: 'off', sessionId: activePane().id }));
+            });
+            tbThinkingGrid.appendChild(offChip);
             const values = (Array.isArray(efforts) && efforts.length > 0) ? efforts : DEFAULT_THINKING_EFFORTS;
             for (const value of values) {
+                if (value === 'off') continue; // the Off chip above owns that state
                 const chip = document.createElement('button');
                 const label = thinkingLabel(value);
                 chip.className = 'tb-thinking-chip' + (value === level ? ' active' : '');
                 chip.type = 'button';
                 chip.textContent = label;
-                chip.title = value === level ? 'Click to clear (no reasoning_effort sent)' : value;
+                chip.title = value;
                 chip.addEventListener('click', (e) => {
                     e.stopPropagation();
                     if (!ws || ws.readyState !== WebSocket.OPEN) return;
                     // Toggle: clicking the active chip deselects (sends
                     // 'off' → parameter omitted); clicking another chip
-                    // switches to that value. A stored level the model does
-                    // not accept is never an active chip (policy B), so it
-                    // can only be switched, not toggled off.
+                    // switches to that value.
                     const next = value === level ? 'off' : value;
                     ws.send(JSON.stringify({ type: 'set_thinking_level', thinkingLevel: next, sessionId: activePane().id }));
                 });
@@ -731,6 +768,11 @@
             updateModelInfo(modelId, active && active.description);
             // Populate toolbar model list
             renderToolbarModelList(availableModels, modelId);
+            // The board "Start agent" popover renders from the same
+            // catalog — refresh it while open so a late list_models reply
+            // is not stuck on "No models loaded" (same pattern as the
+            // settings subagent picker).
+            if (boardStartPopoverOpen) renderBoardStartModelList();
             // Extract pricing for the active model
             currentModelPricing = modelPricing(
                 active && active.inputPricePer1M,
@@ -836,7 +878,7 @@
                 cfgPane.reasoningEfforts = data.reasoningEfforts || [];
                 cfgPane.modelDescription = data.modelDescription || '';
             }
-            renderThinkingChips(data.thinkingLevel, data.reasoningEfforts);
+            renderThinkingChips(data.thinkingLevel, data.reasoningEfforts, data.reasoningEffortsUnsupported);
             updateModelInfo(data.model, data.modelDescription);
             updateModeInfo(data.mode);
             // The server omits globalMode when false (JSON omitempty), so
@@ -1210,6 +1252,7 @@
                 contextEstAdded: 0,
                 mode: 'act',
                 thinkingLevel: 'off',
+                reasoningEffortsUnsupported: false,
                 model: '',
                 _notifiedBusy: false,
             };
@@ -1348,6 +1391,16 @@
             pane.thinkingLevel = data.thinkingLevel || pane.thinkingLevel;
             pane.reasoningEfforts = data.reasoningEfforts || pane.reasoningEfforts;
             pane.modelDescription = data.modelDescription || pane.modelDescription;
+            // The unsupported flag is omitted when false (JSON omitempty): a
+            // config echo for a DIFFERENT model without the flag means the
+            // new model is supported or unknown — a stale "unsupported" from
+            // the previous model must not linger. Read pane.model BEFORE the
+            // update below so the comparison sees the previous model.
+            if (data.reasoningEffortsUnsupported !== undefined) {
+                pane.reasoningEffortsUnsupported = !!data.reasoningEffortsUnsupported;
+            } else if (data.model && data.model !== pane.model) {
+                pane.reasoningEffortsUnsupported = false;
+            }
             pane.model = data.model || pane.model;
             if (data.sessionLabel) pane.label = data.sessionLabel;
         }
@@ -1523,7 +1576,9 @@
             // Mode/thinking/model are per-session; restore the toolbar to
             // this pane's last-known values.
             if (pane.mode) updateModeInfo(pane.mode);
-            if (pane.thinkingLevel) renderThinkingChips(pane.thinkingLevel, pane.reasoningEfforts);
+            if (pane.thinkingLevel || pane.reasoningEffortsUnsupported) {
+                renderThinkingChips(pane.thinkingLevel, pane.reasoningEfforts, pane.reasoningEffortsUnsupported);
+            }
             if (pane.model) updateModelInfo(pane.model, pane.modelDescription);
             if (sessionInfoDiv) sessionInfoDiv.textContent = pane.id || '';
             refreshSidebarSessions();
@@ -5170,6 +5225,21 @@
         // ticket's board_state shows the agentSession link (the sidebar then
         // refreshes so the new session row appears).
         let pendingBoardStartId = null;
+        // Per-ticket "Start agent" popover state: the open popover's
+        // selections (model, edited prompt template, whether the prompt
+        // editor is expanded). The popover element is a singleton appended
+        // to <body>, so a board re-render while the user is mid-choice
+        // closes it without losing anything — nothing is sent until Start.
+        let boardStartPopoverOpen = false;
+        let boardStartState = null; // { item, model, prompt, promptOpen, filterQuery }
+        // The anchor element (the card's Start button) the open popover is
+        // positioned under; re-read on scroll/resize to keep the popover
+        // glued to its card. Null while closed.
+        let boardStartAnchor = null;
+        // Effective board_start_prompt template from the last config push
+        // ("" = built-in default); the popover's prompt editor pre-fills
+        // from it.
+        let boardStartPromptValue = '';
 
         function handleBoardState(data) {
             if (data.boardState) {
@@ -5218,6 +5288,10 @@
         }
 
         function renderBoard() {
+            // A board_state re-render rebuilds every card; the floating
+            // popover's anchor would be gone. Close it — nothing is sent
+            // until Start, so no input is lost.
+            closeBoardStartPopover();
             const colsDiv = document.getElementById('board-columns');
             if (!colsDiv) return;
             colsDiv.innerHTML = '';
@@ -5342,12 +5416,13 @@
             }
             for (const f of frags) meta.appendChild(f);
             card.appendChild(meta);
-            // Start / open agent button: the first click starts a dedicated
-            // agent session for the ticket (the user stays on the board);
-            // once the ticket's board_state carries agentSession, the
-            // button becomes "Open agent" and switches to the chat tab with
-            // the session attached. Hidden for done cards; disabled while
-            // another actor (an agent via the board tool) holds the ticket.
+            // Start / open agent button: the first click opens the per-ticket
+            // "Start agent" popover (model picker + pen-icon prompt editor)
+            // instead of starting immediately; once the ticket's board_state
+            // carries agentSession, the button becomes "Open agent" and
+            // switches to the chat tab with the session attached. Hidden for
+            // done cards; disabled while another actor (an agent via the
+            // board tool) holds the ticket.
             const startBtn = document.createElement('button');
             startBtn.type = 'button';
             startBtn.className = 'board-card-start';
@@ -5370,12 +5445,7 @@
                     startBtn.title = 'Start an agent for this ticket';
                     startBtn.addEventListener('click', (e) => {
                         e.stopPropagation();
-                        // Optimistic disable: the board_state re-render after
-                        // the claim flips this card to "Open agent" (a failed
-                        // start resyncs the board and re-enables it).
-                        startBtn.disabled = true;
-                        pendingBoardStartId = item.id;
-                        sendBoardOp({ action: 'start', id: item.id });
+                        openBoardStartPopover(item, startBtn);
                     });
                 }
             }
@@ -5431,6 +5501,290 @@
                 form.hidden = true;
             });
         }
+
+        // ── "Start agent" popover (per-ticket model + prompt) ──
+        // Clicking a card's "▶ Start" opens a small floating toolbar-like
+        // popover instead of starting immediately: a model picker (reusing
+        // the shared renderModelList) plus a pen icon that expands the
+        // prompt editor (textarea prefilled with the effective
+        // board_start_prompt template). "Start" sends board_op
+        // {action:'start', id, model, prompt}; the server stores both on
+        // the ticket so the popover pre-fills on the next start.
+
+        function openBoardStartPopover(item, anchor) {
+            const pop = document.getElementById('board-start-popover') || buildBoardStartPopover();
+            if (availableModels.length <= 1) {
+                // Catalog not fetched yet: request it (the reply refreshes
+                // availableModels; the popover re-renders on the next open
+                // or the row click).
+                modelsRequested = false;
+                ensureModelsLoaded();
+            }
+            boardStartState = {
+                item,
+                model: item.model || '',
+                prompt: item.prompt || '',
+                promptOpen: false,
+                filterQuery: '',
+            };
+            boardStartAnchor = anchor;
+            pop.querySelector('.board-start-filter').value = '';
+            pop.querySelector('.board-start-title').textContent = `#${item.id} ${item.title}`;
+            // The popover is a singleton: the previous attempt disabled its
+            // Start button on click (and a failed start resyncs the board
+            // without rebuilding the popover), so re-arm it for this open.
+            const goBtn = pop.querySelector('.board-card-start');
+            if (goBtn) goBtn.disabled = false;
+            // Show first, then position: the width is CSS-driven
+            // (clamp(300px, 36vw, 420px) capped at the viewport), so the
+            // clamping math measures the rendered width instead of a
+            // hardcoded constant that could drift from the stylesheet.
+            pop.classList.add('open');
+            boardStartPopoverOpen = true;
+            positionBoardStartPopover();
+            renderBoardStartModelList();
+            syncBoardStartPromptEditor();
+        }
+
+        function closeBoardStartPopover() {
+            boardStartPopoverOpen = false;
+            boardStartState = null;
+            boardStartAnchor = null;
+            const pop = document.getElementById('board-start-popover');
+            if (pop) pop.classList.remove('open');
+        }
+
+        // Positions the popover below its anchor button, clamped to the
+        // viewport using the popover's actual rendered width. Called on
+        // open and re-called on scroll/resize so the popover stays glued
+        // to its card (it is position:fixed, so it would otherwise float
+        // detached while the board scrolls).
+        function positionBoardStartPopover() {
+            const pop = document.getElementById('board-start-popover');
+            if (!pop || !boardStartPopoverOpen || !boardStartAnchor) return;
+            const rect = boardStartAnchor.getBoundingClientRect();
+            // The anchor scrolled out of view: close instead of leaving an
+            // orphan popover floating in place.
+            if (rect.bottom < 0 || rect.top > window.innerHeight) {
+                closeBoardStartPopover();
+                return;
+            }
+            const pw = pop.offsetWidth;
+            let left = rect.left;
+            if (left + pw > window.innerWidth - 8) left = Math.max(8, window.innerWidth - pw - 8);
+            pop.style.left = left + 'px';
+            pop.style.top = (rect.bottom + 4) + 'px';
+        }
+        // Capture-phase scroll: the board columns scroll inside an inner
+        // container (scroll does not bubble), and window resize changes
+        // the CSS width — both re-anchor the popover.
+        document.addEventListener('scroll', () => {
+            if (boardStartPopoverOpen) positionBoardStartPopover();
+        }, true);
+        window.addEventListener('resize', () => {
+            if (boardStartPopoverOpen) positionBoardStartPopover();
+        });
+
+        function buildBoardStartPopover() {
+            const pop = document.createElement('div');
+            pop.id = 'board-start-popover';
+            pop.className = 'board-start-popover';
+
+            const title = document.createElement('div');
+            title.className = 'board-start-title';
+            const closeBtn = document.createElement('button');
+            closeBtn.type = 'button';
+            closeBtn.className = 'board-start-close';
+            closeBtn.textContent = '✕';
+            closeBtn.title = 'Close';
+            closeBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                closeBoardStartPopover();
+            });
+            const head = document.createElement('div');
+            head.className = 'board-start-head';
+            head.append(title, closeBtn);
+            pop.appendChild(head);
+
+            const filter = document.createElement('input');
+            filter.type = 'text';
+            filter.className = 'board-start-filter';
+            filter.placeholder = 'Filter models…';
+            filter.autocomplete = 'off';
+            filter.addEventListener('input', () => {
+                if (!boardStartState) return;
+                boardStartState.filterQuery = filter.value.trim().toLowerCase();
+                renderBoardStartModelList();
+            });
+            const list = document.createElement('div');
+            list.className = 'board-start-model-list';
+            pop.append(filter, list);
+
+            // Prompt editor: hidden until the pen icon is clicked.
+            const promptSection = document.createElement('div');
+            promptSection.className = 'board-start-prompt-section';
+            promptSection.hidden = true;
+            const promptHead = document.createElement('div');
+            promptHead.className = 'board-start-prompt-head';
+            const promptLabel = document.createElement('span');
+            promptLabel.textContent = 'Prompt for the agent';
+            const resetBtn = document.createElement('button');
+            resetBtn.type = 'button';
+            resetBtn.className = 'board-start-reset';
+            resetBtn.textContent = 'Reset to template';
+            resetBtn.title = 'Use the configured board agent prompt template';
+            resetBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (!boardStartState) return;
+                // Empty = the configured template; the server clears the
+                // ticket's stored override on the next start.
+                boardStartState.prompt = '';
+                syncBoardStartPromptEditor();
+            });
+            promptHead.append(promptLabel, resetBtn);
+            const promptInput = document.createElement('textarea');
+            promptInput.className = 'board-start-prompt-input';
+            promptInput.rows = 8;
+            promptInput.spellcheck = false;
+            promptInput.addEventListener('input', () => {
+                if (!boardStartState) return;
+                boardStartState.prompt = promptInput.value;
+                promptPreview.textContent = renderBoardStartPreview(boardStartState.item, promptInput.value);
+            });
+            const promptPreview = document.createElement('div');
+            promptPreview.className = 'board-start-preview';
+            promptSection.append(promptHead, promptInput, promptPreview);
+            pop.appendChild(promptSection);
+
+            const actions = document.createElement('div');
+            actions.className = 'board-start-actions';
+            const penBtn = document.createElement('button');
+            penBtn.type = 'button';
+            penBtn.className = 'board-start-pen';
+            penBtn.textContent = '✎';
+            penBtn.title = 'Edit the prompt';
+            penBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (!boardStartState) return;
+                boardStartState.promptOpen = !boardStartState.promptOpen;
+                syncBoardStartPromptEditor();
+            });
+            const goBtn = document.createElement('button');
+            goBtn.type = 'button';
+            goBtn.className = 'board-card-start';
+            goBtn.textContent = '▶ Start';
+            goBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (!boardStartState) return;
+                goBtn.disabled = true;
+                pendingBoardStartId = boardStartState.item.id;
+                sendBoardOp({
+                    action: 'start',
+                    id: boardStartState.item.id,
+                    model: boardStartState.model,
+                    prompt: boardStartState.prompt,
+                });
+                closeBoardStartPopover();
+            });
+            actions.append(penBtn, goBtn);
+            pop.appendChild(actions);
+
+            document.body.appendChild(pop);
+            return pop;
+        }
+
+        // Renders the model list from the popover's state: the catalog via
+        // the shared renderModelList, preceded by a "Workspace default"
+        // row (the empty value — the server uses the workspace default
+        // model when the op carries none).
+        function renderBoardStartModelList() {
+            if (!boardStartState) return;
+            const pop = document.getElementById('board-start-popover');
+            const list = pop.querySelector('.board-start-model-list');
+            const filter = pop.querySelector('.board-start-filter');
+            const current = boardStartState.model || (availableModels.find((m) => m.current)?.id || '');
+            const defaultRow = document.createElement('button');
+            defaultRow.type = 'button';
+            defaultRow.className = 'tb-model-row' + (boardStartState.model === '' ? ' active' : '');
+            defaultRow.textContent = 'Workspace default';
+            defaultRow.title = 'Use the workspace default model';
+            defaultRow.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (boardStartState.model === '') return;
+                boardStartState.model = '';
+                renderBoardStartModelList();
+            });
+            renderModelList(
+                list,
+                boardStartState.filterQuery,
+                filter ? filter.value.trim().toLowerCase() : boardStartState.filterQuery,
+                availableModels,
+                current,
+                (id) => {
+                    if (boardStartState.model === id) return;
+                    boardStartState.model = id;
+                    renderBoardStartModelList();
+                },
+                [defaultRow]
+            );
+        }
+
+        // Syncs the popover's prompt editor with the current state: the
+        // textarea shows the edited template, or the effective configured
+        // template when none was chosen, with a live rendered preview.
+        function syncBoardStartPromptEditor() {
+            if (!boardStartState) return;
+            const pop = document.getElementById('board-start-popover');
+            const promptSection = pop.querySelector('.board-start-prompt-section');
+            const promptInput = pop.querySelector('.board-start-prompt-input');
+            const promptPreview = pop.querySelector('.board-start-preview');
+            const penBtn = pop.querySelector('.board-start-pen');
+            promptSection.hidden = !boardStartState.promptOpen;
+            // Pen stays highlighted while a custom prompt is armed (edited
+            // and kept after collapsing the editor).
+            penBtn.classList.toggle('active', boardStartState.promptOpen || boardStartState.prompt !== '');
+            penBtn.title = boardStartState.promptOpen ? 'Hide the prompt editor' : 'Edit the prompt';
+            if (boardStartState.promptOpen) {
+                const text = boardStartState.prompt || boardStartPromptValue;
+                promptInput.value = text;
+                promptPreview.textContent = renderBoardStartPreview(boardStartState.item, text);
+            }
+        }
+
+        // Client-side placeholder substitution for the popover's prompt
+        // PREVIEW only — the authoritative render happens server-side
+        // (TicketPrompt), so the {context} approximation here is cosmetic.
+        function renderBoardStartPreview(item, template) {
+            const priority = item.priority || 'none';
+            return String(template || '')
+                .replaceAll('{id}', item.id)
+                .replaceAll('{title}', item.title || '')
+                .replaceAll('{description}', item.description || '')
+                .replaceAll('{priority}', priority)
+                .replaceAll('{context}', boardStartContext(item.activity || []));
+        }
+
+        // Mirrors the server's activityContext: the content-bearing
+        // activity entries (comments, block reasons), skipping the
+        // generated status-transition noise.
+        function boardStartContext(activity) {
+            const skip = new Set(['created', 'claimed', 'marked done']);
+            const rows = [];
+            for (const act of activity) {
+                const text = String(act.text || '').trim();
+                if (!text || skip.has(text) || text.startsWith('moved to ')) continue;
+                rows.push(text.length > 300 ? text.slice(0, 300) + '…' : text);
+            }
+            const last = rows.slice(-5);
+            if (last.length === 0) return '';
+            return 'Ticket log context:\n' + last.map((e) => '- ' + e).join('\n');
+        }
+
+        // Esc closes the popover (the document click handler covers
+        // outside clicks; the ✕ button covers explicit close).
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && boardStartPopoverOpen) closeBoardStartPopover();
+        });
 
         // ── Image attachments (vision input) ──
         // Mirrors the server's limits (internal/server/server.go
@@ -7198,6 +7552,12 @@
             if (data.subagentModel !== undefined) {
                 subagentModelValue = data.subagentModel || '';
                 if (settingsOverlay.classList.contains('active')) renderSubagentModelPicker();
+            }
+            // Board start prompt template (resolved by the server: empty
+            // config → built-in default): the "Start agent" popover's pen
+            // editor pre-fills from it.
+            if (data.boardStartPrompt !== undefined) {
+                boardStartPromptValue = data.boardStartPrompt || '';
             }
         }
 

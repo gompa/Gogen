@@ -54,6 +54,87 @@ func TestToolCallsParallelEligible(t *testing.T) {
 	}
 }
 
+// TestExecuteToolCallsParallelStreamsToolOutput verifies that the parallel
+// branch attaches the live-output sink to each call's context (exactly like
+// the sequential runToolRound path), so execute_command calls in a parallel
+// batch stream intermediate chunks to the OnToolOutput handler tagged with
+// the right call identity (id/name). The batch is fed directly to
+// executeToolCallsParallel because execute_command is a mutating tool and
+// never passes the parallel-eligibility classifier (covered separately).
+func TestExecuteToolCallsParallelStreamsToolOutput(t *testing.T) {
+	exec := NewExecutor(t.TempDir())
+	a := NewAgent(llm.NewMockProvider(), exec, nil)
+
+	// Each command prints in multiple chunks; every Write from the child
+	// process is forwarded to the sink, so concatenated chunks per call
+	// must equal that command's full output.
+	cmds := []string{
+		"printf 'first\\n'; printf 'second\\n'",
+		"printf 'alpha\\n'; printf 'beta\\n'",
+	}
+	toolCalls := []llm.ToolCall{
+		{ID: "c1", Name: "execute_command", Args: map[string]interface{}{"command": cmds[0]}},
+		{ID: "c2", Name: "execute_command", Args: map[string]interface{}{"command": cmds[1]}},
+	}
+
+	var mu sync.Mutex
+	type streamed struct {
+		id, name, command, chunk string
+	}
+	var got []streamed
+	results := 0
+	h := &llm.StreamHandlers{
+		OnToolOutput: func(id, name, command, chunk string) {
+			mu.Lock()
+			defer mu.Unlock()
+			got = append(got, streamed{id, name, command, chunk})
+		},
+		OnToolResult: func(id, name, result string, success bool) {
+			mu.Lock()
+			defer mu.Unlock()
+			results++
+			if !success {
+				t.Errorf("expected success for %s, got result %q", name, result)
+			}
+		},
+	}
+
+	if cancelled := a.executeToolCallsParallel(context.Background(), h, toolCalls); cancelled {
+		t.Fatal("unexpected cancellation")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if results != 2 {
+		t.Fatalf("expected 2 tool results, got %d", results)
+	}
+	byID := map[string][]string{}
+	commands := map[string]string{}
+	for _, s := range got {
+		if s.name != "execute_command" {
+			t.Fatalf("unexpected tool name %q for call %s", s.name, s.id)
+		}
+		if commands[s.id] != "" && commands[s.id] != s.command {
+			t.Fatalf("call %s streamed chunks for commands %q and %q", s.id, commands[s.id], s.command)
+		}
+		commands[s.id] = s.command
+		byID[s.id] = append(byID[s.id], s.chunk)
+	}
+	want := map[string]string{
+		"c1": "first\nsecond\n",
+		"c2": "alpha\nbeta\n",
+	}
+	wantCmd := map[string]string{"c1": cmds[0], "c2": cmds[1]}
+	for id, out := range want {
+		if commands[id] != wantCmd[id] {
+			t.Fatalf("call %s streamed with command %q, want %q", id, commands[id], wantCmd[id])
+		}
+		if joined := strings.Join(byID[id], ""); joined != out {
+			t.Fatalf("call %s streamed %q, want %q", id, joined, out)
+		}
+	}
+}
+
 // TestExecuteToolCallsParallelRunsReadOnlyToolsConcurrently verifies that a
 // batch of read-only tool calls is executed concurrently (observed overlap),
 // that every tool_call gets a matching tool result, and that results are
@@ -203,5 +284,87 @@ func TestToolCallsParallelCancelStillClosesEveryToolCall(t *testing.T) {
 		if !found[id] {
 			t.Fatalf("tool call %s missing a result after cancel", id)
 		}
+	}
+}
+
+// TestExecuteToolCallsParallelCancelKeepsCompletedResults verifies that when
+// the turn context is cancelled right after a parallel tool has returned,
+// that tool's completed result is preserved (real output, success=true)
+// instead of being overwritten with the cancelled placeholder. Only the
+// still-in-flight call reads as cancelled — mirroring runToolRound, where a
+// tool that already finished keeps its output.
+func TestExecuteToolCallsParallelCancelKeepsCompletedResults(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "fast.txt"), []byte("fast-result"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := NewExecutor(dir)
+	a := NewAgent(llm.NewMockProvider(), exec, nil)
+
+	builtin := BuiltinToolHandlers()
+	orig := builtin["read_file"]
+	fastDone := make(chan struct{})
+	var once sync.Once
+	builtin["read_file"] = func(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+		if path, _ := args["path"].(string); path == "slow.txt" {
+			// Stay in flight until the test cancels the turn context.
+			<-ctx.Done()
+			return "", ctx.Err()
+		}
+		res, err := orig(ctx, a, args)
+		once.Do(func() { close(fastDone) })
+		return res, err
+	}
+	a.SetToolHandlers(builtin)
+
+	toolCalls := []llm.ToolCall{
+		{ID: "c1", Name: "read_file", Args: map[string]interface{}{"path": "fast.txt"}},
+		{ID: "c2", Name: "read_file", Args: map[string]interface{}{"path": "slow.txt"}},
+	}
+
+	var mu sync.Mutex
+	onResult := map[string]bool{}
+	h := &llm.StreamHandlers{
+		OnToolResult: func(id, name, result string, success bool) {
+			mu.Lock()
+			defer mu.Unlock()
+			onResult[id] = success
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan bool, 1)
+	go func() {
+		done <- a.executeToolCallsParallel(ctx, h, toolCalls)
+	}()
+	<-fastDone // c1 has returned its real result...
+	cancel()   // ...cancel right after, while c2 is still in flight.
+	if !<-done {
+		t.Fatal("expected the parallel batch to report cancellation")
+	}
+
+	// The completed call keeps its real output; the interrupted call reads
+	// as cancelled.
+	persisted := map[string]string{}
+	for _, m := range a.Messages {
+		if m.Role == "tool" && m.ToolCallID != "" {
+			persisted[m.ToolCallID] = m.Content
+		}
+	}
+	if got := persisted["c1"]; !strings.Contains(got, "fast-result") {
+		t.Fatalf("completed call c1 result = %q, want its real output preserved", got)
+	}
+	if got := persisted["c2"]; got != "The operation was cancelled by the user." {
+		t.Fatalf("interrupted call c2 result = %q, want the cancelled placeholder", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !onResult["c1"] {
+		t.Fatal("completed call c1 reported success=false, want true")
+	}
+	if onResult["c2"] {
+		t.Fatal("interrupted call c2 reported success=true, want false")
 	}
 }

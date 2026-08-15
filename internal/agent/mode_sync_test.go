@@ -41,6 +41,7 @@ func TestBuiltinToolNamesMatchSchemasAndHandlers(t *testing.T) {
 		"rename_symbol",
 		"call_graph",
 		"background_job",
+		"read_image",
 	}
 
 	schemas := BuiltinTools()

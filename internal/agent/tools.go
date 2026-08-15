@@ -13,9 +13,12 @@ type ToolDef struct {
 	Handler    ToolHandler
 
 	// ReadOnly marks handlers safe to execute concurrently within a single
-	// turn: no workspace mutation, no session-state mutation, and no shell
-	// execution, whose shared state is either internally synchronized or
-	// only read. ReadOnly implies PlanAllowed.
+	// turn: no workspace mutation, no shell execution, and no session-state
+	// mutation performed inline. A ReadOnly handler may still affect the
+	// session indirectly — read_image attaches images to the transcript —
+	// but only through a deferred, model-ordered drain (the image sink)
+	// that runs after the tool batch, never from inside the handler, so
+	// concurrent execution stays safe. ReadOnly implies PlanAllowed.
 	ReadOnly bool
 
 	// PlanAllowed marks the tool as available in plan mode. Read-only tools
@@ -125,8 +128,8 @@ var builtinToolDefs = []ToolDef{
 		Definition: toolDef("read_file", "Read file content; offset/limit for ranges, search for regex jump.",
 			toolSchema(map[string]interface{}{
 				"path":         toolProp("string", "File path"),
-				"offset":       toolProp("integer", "Start line, or context lines with search (default 10)"),
-				"limit":        toolProp("integer", "Max lines (default all, max 10000) or window with search"),
+				"offset":       toolProp("integer", "Start line; with search: context lines before the match (default 10)"),
+				"limit":        toolProp("integer", "Max lines (default all, max 10000); with search: caps total lines in the match window"),
 				"search":       toolProp("string", "Regex to jump to (returns a window of context lines around the match)"),
 				"line_numbers": toolProp("boolean", "Prefix lines with numbers"),
 			}, "path")),
@@ -170,12 +173,12 @@ var builtinToolDefs = []ToolDef{
 		Handler: handleExecuteCommand,
 	},
 	{
-		Definition: toolDef("replace_in_file", "Replace string in file. replace_all=true for all occurrences. Prefer patch_file for multi-line.",
+		Definition: toolDef("replace_in_file", "Edit an existing file by exact search/replace — the default edit tool. Copy the search block verbatim from read_file output; it must match exactly once (replace_all=true replaces all occurrences; add surrounding context to disambiguate).",
 			toolSchema(map[string]interface{}{
 				"path":        toolProp("string", "File path"),
-				"search":      toolProp("string", "Exact string to find"),
+				"search":      toolProp("string", "Exact string to find (must match exactly once unless replace_all=true)"),
 				"replace":     toolProp("string", "Replacement"),
-				"replace_all": toolProp("boolean", "Replace all occurrences (default: first)"),
+				"replace_all": toolProp("boolean", "Replace all occurrences (default false)"),
 			}, "path", "search", "replace")),
 		Handler:   handleReplaceInFile,
 		MutatesFS: true,
@@ -189,9 +192,9 @@ var builtinToolDefs = []ToolDef{
 		MutatesFS: true,
 	},
 	{
-		Definition: toolDef("patch_file", "Apply surgical unified diff(s). dry_run=preview, fuzzy=default.",
+		Definition: toolDef("patch_file", "Apply surgical unified diff(s) — prefer replace_in_file for most edits; use this for positional or multi-hunk edits. Use EXACT context lines from a fresh read_file — include the entire region being edited (never truncate before closing braces); keep hunks small and self-contained; never include '***' markers, diff -c range headers, or copied patch-transcript text in the diff. dry_run=preview, fuzzy=default.",
 			toolSchema(map[string]interface{}{
-				"diff":    toolProp("string", "Unified diff: '--- a/x'/'+++ b/x' headers, '@@' hunks (context=space, removed=-, added=+). Multi-file: stack sections."),
+				"diff":    toolProp("string", "Unified diff: '--- a/x'/'+++ b/x' headers, '@@ -start,count +start,count @@' hunks (context=space, removed=-, added=+). Include all context lines of the edited region; counts must match the hunk body. Multi-file: stack sections."),
 				"dry_run": toolProp("boolean", "Preview without writing"),
 				"fuzzy":   toolProp("boolean", "Tolerate whitespace/shift drift (default true; leave on)"),
 			}, "diff")),
@@ -352,12 +355,24 @@ var builtinToolDefs = []ToolDef{
 		PlanAllowed: true,
 	},
 	{
-		Definition: toolDef("background_job", "Inspect/cancel a background job (execute_command background=true): action=status or cancel.",
+		Definition: toolDef("background_job", "Inspect or feed a background job (execute_command background=true): action=status (full output tail), cancel, or input (write to the job's stdin; returns output produced since the last input).",
 			toolSchema(map[string]interface{}{
-				"action": toolPropEnum("string", []string{"status", "cancel"}, ""),
-				"job_id": toolProp("string", "Job id returned by execute_command background=true"),
+				"action":         toolPropEnum("string", []string{"status", "cancel", "input"}, ""),
+				"job_id":         toolProp("string", "Job id returned by execute_command background=true"),
+				"input":          toolProp("string", "Text to write to the job's stdin (action=input)"),
+				"append_newline": toolProp("boolean", "Append a newline to the input (default true)"),
 			}, "action", "job_id")),
 		Handler: handleBackgroundJob,
+	},
+	{
+		Definition: toolDef("read_image", "Attach an image file to this session's context for vision-capable models: the image enters context as a user message after this tool's result, so the current model must support images. The image stays in THIS session's context — a subagent that calls read_image sees the image, but the parent agent only receives this text report. Supports png/jpeg/gif/webp up to 3.5 MB; SVG is XML text, use read_file instead. detail=low reduces provider vision cost.",
+			toolSchema(map[string]interface{}{
+				"path":   toolProp("string", "Image file path"),
+				"detail": toolPropEnum("string", []string{"auto", "low", "high"}, "Vision detail level (default auto)"),
+			}, "path")),
+		Handler:     handleReadImage,
+		ReadOnly:    true,
+		PlanAllowed: true,
 	},
 }
 

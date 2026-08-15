@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 
 	"gogen/internal/agent"
 )
@@ -21,7 +22,14 @@ import (
 // failure is commented on the ticket via the turnErrorHook so a claimed
 // ticket never fails silently. Failures surface as board error notices;
 // a lost claim race cleans up the fresh session (no orphan empty sessions).
-func (s *Server) wsHandleBoardStart(ws *wsConn, pane **sessionRuntime, op *BoardOpRequest) {
+//
+// The op may carry per-ticket start options: Model ("" = workspace default)
+// and Prompt ("" = the configured board_start_prompt template; the ticket's
+// stored override is cleared). The model is selected BEFORE the claim so a
+// selection failure unwinds with just the fresh-session cleanup; the
+// options are persisted on the ticket after the claim so the start popover
+// pre-fills on the next start.
+func (s *Server) wsHandleBoardStart(ctx context.Context, ws *wsConn, pane **sessionRuntime, op *BoardOpRequest) {
 	if s.ws.Store == nil {
 		writeNoticeError(ws, "board", "Error: session persistence is disabled")
 		return
@@ -48,15 +56,22 @@ func (s *Server) wsHandleBoardStart(ws *wsConn, pane **sessionRuntime, op *Board
 			return
 		}
 	}
-	// Refuse before creating anything when no model is configured: the
-	// fresh session's provider seeds from the workspace default, and a
-	// first turn without a model would fail silently (nobody is attached).
-	if s.ws.DefaultModel() == "" {
-		writeNoticeError(ws, "board", "Error: no model configured — pick a model in Settings first")
+	// Refuse before creating anything when neither the op nor the
+	// workspace provides a model: the fresh session's provider seeds from
+	// the workspace default, and a first turn without a model would fail
+	// silently (nobody is attached). An explicit per-ticket model skips
+	// the default entirely.
+	if op.Model == "" && s.ws.DefaultModel() == "" {
+		writeNoticeError(ws, "board", "Error: no model configured — pick a model in the start dialog or set one in Settings first")
 		return
 	}
 	label := ticketSessionLabel(item)
 	prompt := agent.TicketPrompt(item, s.ws.GetRuntimeConfig().BoardStartPrompt)
+	// Per-ticket prompt template from the start popover wins over the
+	// configured template (TicketPrompt substitutes the placeholders).
+	if strings.TrimSpace(op.Prompt) != "" {
+		prompt = agent.TicketPrompt(item, op.Prompt)
+	}
 	snap := &agent.SessionSnapshot{
 		WorkingDir: s.ws.GetWorkingDir(),
 		// Messages deliberately NOT seeded: startTurn passes the prompt as
@@ -72,6 +87,17 @@ func (s *Server) wsHandleBoardStart(ws *wsConn, pane **sessionRuntime, op *Board
 	rt, _ := s.registerSeededSession(snap, label)
 	sid := rt.agent.SessionID
 
+	// Per-ticket model: select BEFORE the claim so a failure unwinds with
+	// only the fresh-session cleanup (no claim to reset). Catalog lookups
+	// are network I/O — done outside any turn lock, same as set_model.
+	if op.Model != "" {
+		if err := rt.agent.SelectModel(ctx, op.Model); err != nil {
+			s.removeFreshSession(sid)
+			writeNoticeError(ws, "board", "Error: "+err.Error())
+			return
+		}
+	}
+
 	if _, err := bm.Claim(item.ID, label); err != nil {
 		// A concurrent start won the claim: remove the fresh session and
 		// report the claim error — no orphan empty sessions.
@@ -84,6 +110,13 @@ func (s *Server) wsHandleBoardStart(ws *wsConn, pane **sessionRuntime, op *Board
 		// session is still valid — log and continue; the ticket keeps its
 		// assignee and the session is reachable from the sidebar.
 		log.Printf("board start: attach agent link on #%s: %v", item.ID, err)
+	}
+	// Persist the start options (per-ticket model/prompt prefill for the
+	// next start). The start op is authoritative: an empty value clears
+	// the stored override back to the defaults. Non-fatal — the session
+	// already started; the popover just re-falls back to the defaults.
+	if err := bm.SetStartOptions(item.ID, op.Model, op.Prompt); err != nil {
+		log.Printf("board start: persist start options on #%s: %v", item.ID, err)
 	}
 
 	// Unattended approval guard: with zero attached clients a delete

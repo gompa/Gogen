@@ -108,7 +108,27 @@ func TestWriteFileAtomic(t *testing.T) {
 	}
 }
 
-func TestReplaceInFileFirstOccurrenceOnly(t *testing.T) {
+func TestReplaceInFileUniqueMatchReplaces(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.txt")
+	content := "foo bar baz\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exec := NewExecutor(dir)
+	if _, err := exec.ReplaceInFile("a.txt", "foo", "qux", false); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "qux bar baz\n" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestReplaceInFileAmbiguousRejected(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "a.txt")
 	content := "foo bar foo\n"
@@ -116,15 +136,54 @@ func TestReplaceInFileFirstOccurrenceOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := NewExecutor(dir)
-	if _, err := exec.ReplaceInFile("a.txt", "foo", "baz", false); err != nil {
-		t.Fatal(err)
+	// Multiple matches without replace_all must be refused, not silently
+	// replaced at the first occurrence.
+	if _, err := exec.ReplaceInFile("a.txt", "foo", "baz", false); err == nil || !strings.Contains(err.Error(), "appears 2 times") {
+		t.Fatalf("expected ambiguity error, got %v", err)
 	}
 	got, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != "baz bar foo\n" {
+	if string(got) != content {
+		t.Fatalf("file must be unchanged after refused ambiguity, got %q", got)
+	}
+	// replace_all=true replaces all occurrences.
+	if _, err := exec.ReplaceInFile("a.txt", "foo", "baz", true); err != nil {
+		t.Fatal(err)
+	}
+	got, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "baz bar baz\n" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestReplaceInFileNotFoundClosestMatch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.go")
+	content := "package main\n\nfunc main() {\n}\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exec := NewExecutor(dir)
+	// A typo in the search block ("packge"): the error must point at the
+	// closest line so the model can fix the block in one retry.
+	_, err := exec.ReplaceInFile("main.go", "packge main", "package main", false)
+	if err == nil || !strings.Contains(err.Error(), "closest match at line 1") {
+		t.Fatalf("expected closest-match diagnostic, got %v", err)
+	}
+	// Multi-line search miss: the first non-empty line anchors the report.
+	_, err = exec.ReplaceInFile("main.go", "func main( {\n}", "x", false)
+	if err == nil || !strings.Contains(err.Error(), "closest match at line 3") {
+		t.Fatalf("expected closest-match diagnostic for multi-line miss, got %v", err)
+	}
+	// replace_all=true reports the same diagnostic.
+	_, err = exec.ReplaceInFile("main.go", "nope", "x", true)
+	if err == nil || !strings.Contains(err.Error(), "closest match at line 1") {
+		t.Fatalf("expected closest-match diagnostic in replace_all mode, got %v", err)
 	}
 }
 

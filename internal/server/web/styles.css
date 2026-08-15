@@ -1497,6 +1497,84 @@
         }
         .board-card-start:hover:not(:disabled) { background: var(--border); }
         .board-card-start:disabled { opacity: 0.5; cursor: default; }
+        /* "Start agent" popover (per-ticket model + prompt) */
+        .board-start-popover {
+            display: none;
+            position: fixed;
+            z-index: 40;
+            /* Bounded viewport-relative width: scales with the screen
+               (36vw), never below 300px, never above 420px, and never
+               overflowing the window on tiny viewports. */
+            width: min(clamp(300px, 36vw, 420px), calc(100vw - 16px));
+            background: var(--bg-elevated);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+            padding: 8px;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .board-start-popover.open { display: flex; }
+        .board-start-head { display: flex; align-items: center; gap: 6px; }
+        .board-start-title {
+            flex: 1; font-size: 0.85em; font-weight: 600;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .board-start-close {
+            background: none; border: none; cursor: pointer;
+            color: var(--fg-muted); font-size: 0.9em; padding: 0 2px;
+        }
+        .board-start-close:hover { color: var(--fg); }
+        .board-start-filter {
+            width: 100%; box-sizing: border-box;
+            font-size: 0.8em; background: var(--bg); color: var(--fg, inherit);
+            border: 1px solid var(--border); border-radius: 4px; padding: 4px 6px;
+        }
+        .board-start-model-list {
+            max-height: 220px; overflow-y: auto;
+            display: flex; flex-direction: column; gap: 2px;
+        }
+        .board-start-actions {
+            display: flex; align-items: center; justify-content: flex-end; gap: 6px;
+        }
+        .board-start-pen {
+            background: none; border: 1px solid var(--border);
+            color: var(--fg-dim); border-radius: 4px;
+            font-size: 0.85em; line-height: 1.3; padding: 1px 7px;
+            cursor: pointer; user-select: none;
+        }
+        .board-start-pen:hover, .board-start-pen.active {
+            color: var(--accent); border-color: var(--accent); background: var(--accent-soft);
+        }
+        .board-start-prompt-section {
+            border-top: 1px solid var(--border); padding-top: 6px;
+            display: flex; flex-direction: column; gap: 6px;
+        }
+        .board-start-prompt-section[hidden] { display: none; }
+        .board-start-prompt-head {
+            display: flex; justify-content: space-between; align-items: center; gap: 6px;
+        }
+        .board-start-prompt-head span {
+            font-size: 0.72em; text-transform: uppercase; letter-spacing: 0.04em; color: var(--fg-muted);
+        }
+        .board-start-reset {
+            background: none; border: none; cursor: pointer;
+            color: var(--accent); font-size: 0.75em; padding: 0;
+        }
+        .board-start-reset:hover { text-decoration: underline; }
+        .board-start-prompt-input {
+            width: 100%; box-sizing: border-box;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 0.8em; background: var(--bg); color: var(--fg, inherit);
+            border: 1px solid var(--border); border-radius: 4px; padding: 6px;
+            resize: vertical;
+        }
+        .board-start-preview {
+            font-size: 0.75em; color: var(--muted, #888);
+            white-space: pre-wrap; word-break: break-word;
+            max-height: 120px; overflow-y: auto;
+            border: 1px dashed var(--border); border-radius: 4px; padding: 4px 6px;
+        }
         #board-start-prompt-input, #system-prompt-input, #subagent-prompt-input {
             width: 100%; box-sizing: border-box;
             font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
