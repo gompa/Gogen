@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -40,6 +41,22 @@ func hasVCSMarker(dir string) bool {
 	return false
 }
 
+// sameDir reports whether a and b name the same directory. Exact comparison
+// on Unix; on Windows the filesystem is case-insensitive and paths may use
+// 8.3 short-name aliases, so os.SameFile resolves both when the directories
+// exist, with a case-insensitive string fallback.
+func sameDir(a, b string) bool {
+	if runtime.GOOS != "windows" {
+		return a == b
+	}
+	fa, errA := os.Stat(a)
+	fb, errB := os.Stat(b)
+	if errA == nil && errB == nil && os.SameFile(fa, fb) {
+		return true
+	}
+	return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
+}
+
 // DiscoverInstructions walks up from workingDir to the project root and
 // collects AGENTS.md then CLAUDE.md per directory, nearest directory first.
 //
@@ -62,7 +79,7 @@ func DiscoverInstructions(workingDir string) ([]InstructionFile, error) {
 	for {
 		// Never read instruction files from the home directory itself:
 		// the walk covers project directories below it only.
-		if home != "" && home != "." && dir == home {
+		if home != "" && home != "." && sameDir(dir, home) {
 			break
 		}
 		for _, name := range []string{"AGENTS.md", "CLAUDE.md"} {

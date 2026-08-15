@@ -1,41 +1,28 @@
 # GoGen — AI-Powered Coding Agent
 
-GoGen is a self-hosted, terminal or web-based coding assistant that can explore, read, search, and edit source code using an LLM. Think of it as a locally-run coding agent you can query and direct to make real changes to your codebase.
+GoGen is a self-hosted coding agent that works on real codebases. Point it at
+a project and describe the change you want in plain English: it explores the
+layout, searches across files, edits code, runs commands, and checks the
+results — from your terminal, a web browser, or a one-shot CLI prompt.
 
-## Features
+It's built to be handed real work:
 
-- **Repository Exploration** — Top-level layout summary, directory listing, glob patterns, and symbol outlines before diving into files
-- **File Operations** — Read, write, patch, replace, and delete files safely; `download_file` fetches remote source files/binaries into the workspace (SSRF-protected) for local exploration
-- **Code Search** — Regex and literal string search across your codebase (ripgrep with fallback)
-- **Symbol Extraction** — Lists functions, methods, classes, and types via [tree-sitter](https://tree-sitter.github.io/tree-sitter/) for 19 languages
-- **Safe Edits** — Prefers unified diffs (`patch_file`) over full file rewrites; syntax error detection after edits
-- **Command Execution** — Run shell commands with configurable safety modes (blocklist / allowlist / off); `execute_command` can also run commands **in the background** (returns a job id pollable/cancellable via `background_job` with `action=status` / `action=cancel`)
-- **Vision Input** — Paste or attach images in the web UI; they are sent to vision-capable models as image content alongside your prompt
-- **Project Board** — Opt-in kanban board (`.gogen/board/`, one file per ticket) with items available for agents to fix; full drag-and-drop board tab in the web UI and a `board` tool (list/show/add/claim/move/block/comment/done). Live-toggleable from the web settings modal (`board: on`); the board tab is hidden while disabled
-- **Subagents** — Opt-in `subagent` tool that spawns a nested agent session for a job and reports back. Children appear as attachable nested rows in the web sidebar (open one to watch or Cancel a stuck subagent) and in the TUI's `/subagents` modal; transcripts persist under their parent (capped at 10 per parent). `subagent_max_depth` (default 1) controls nesting — by default subagents cannot spawn subagents. With `subagent: on` in web mode, the tool additionally accepts `run_in_background` and the continuable family is registered: `subagent_fork` (a child seeded with a deep copy of this session's history), `list_agents`, `send_message`, `interrupt_agent`, and the child-scoped `report`. Background children that are no longer running (finished or interrupted) stay interactable for a retention window, then their runtime is released (the saved session stays attachable); closing a parent session cancels its running children.
-- **Job Notices** — Opt-in `job_notices: on`: when a background command (`execute_command background=true`) finishes naturally, a one-line summary is injected into the session and a turn runs on it — no polling.
-- **Skills** — Opt-in `skills: on`: a `skill` tool lists and reads structured instructions from `<project>/.gogen/skills` (bundle dirs `SKILL.md` or flat `<name>.md`) and `~/.config/gogen/skills`.
-- **Workspace Instructions** — Opt-in `agent_instructions: on`: loads `AGENTS.md` / `CLAUDE.md` from the working directory up to the project root (`.git`/`.hg` marker), appended below the project guidelines with byte caps.
-- **Human-in-the-Loop** — Requires explicit approval for destructive actions (file deletes)
-- **Context Management** — Auto-compacts conversation history when nearing token limits to stay within model context windows
-- **Project Config** — Separate `.gogen/gogen.conf` (YAML) for settings and `.gogen/gogen.md` (or `GOGEN.md`) for guidelines. Precedence: **env > CLI flags > .conf > defaults**.
-- **Plan Mode** — Read-only exploration via `/plan` (CLI) or web toggle; use `/act` to implement
-- **MCP Client** — Connect stdio MCP servers for extended tools (`mcp_<server>_<tool>`)
-- **Session Persistence** — Auto-save/resume conversations under `.gogen/sessions/` (set `GOGEN_SESSION_PERSIST=off` to disable)
-- **Project Rules** — Guidelines from project file body, or rules-only files (`.gogen/rules.md`, plain `GOGEN.md`)
-- **Two Modes** — Interactive TUI or web-based UI via WebSocket
+- **Runs anywhere** — full-screen TUI, browser UI with multiple chat panes and
+  a built-in terminal, or `-p "..."` for a single prompt
+- **Any OpenAI-compatible API** — OpenAI, local llama.cpp/Ollama servers, or a
+  proxy; register several endpoints and pick a model per session
+- **Safe by default** — read-only plan mode, a command guard (blocklist or
+  allowlist), sandboxed commands, and explicit approval for destructive
+  actions
+- **Remembers** — sessions auto-save and resume, history auto-compacts to fit
+  the model's context window, and todos/pins survive across turns
+- **Knows your project** — project guidelines, `AGENTS.md`/`CLAUDE.md`
+  instructions, skills, and auto-detected test/lint commands shape how it
+  works in your repo
+- **Extensible** — connect MCP servers for extra tools, spawn subagents for
+  parallel work, and track tickets on a project kanban board
 
-## Supported Languages
-
-Tree-sitter is bundled for **26 languages** (syntax checking after edits):
-
-Go, Python, JavaScript, TypeScript, TSX, Rust, Java, Kotlin, C, C++, C#, PHP, Ruby, Scala, SQL, HTML, CSS, JSON, Bash, YAML, TOML, Lua, HCL, Zig, Dockerfile, Make
-
-**Symbol extraction** (`list_definitions`) has dedicated queries for **19** of these: Go, Python, JavaScript, TypeScript, TSX, Rust, Java, Kotlin, C, C++, C#, PHP, Ruby, Scala, SQL, Bash, Lua, HCL, Zig. JSON, HTML, CSS, YAML, TOML, Dockerfile, and Make get syntax checks only.
-
-Tree-sitter requires **CGO** at build time (enabled by default on Linux). Set `CGO_ENABLED=0` to build without it — tree-sitter features are then stubbed out.
-
-## Quick Start
+## Quick start
 
 ### Prerequisites
 
@@ -43,47 +30,48 @@ Tree-sitter requires **CGO** at build time (enabled by default on Linux). Set `C
 - A C compiler (for CGO / tree-sitter), e.g. `gcc` on Linux
 - An OpenAI-compatible API key
 
-### Build
+### Build and run
 
 ```bash
 go build -o gogen .
-```
-
-Build without tree-sitter (smaller binary, no syntax checks or symbol extraction):
-
-```bash
-CGO_ENABLED=0 go build -o gogen-nocgo .
-```
-
-### Run
-
-**TUI mode** (Bubble Tea interactive terminal):
-
-```bash
-OPENAI_API_KEY=sk-... ./gogen
-```
-
-With a workspace directory:
-```bash
 OPENAI_API_KEY=sk-... ./gogen /path/to/project
 ```
 
-**Web mode** (browser UI on `:8081`):
+The TUI starts with your project as the working directory. Try prompts like:
+
+```
+> What test command does this project use?
+> Find the flag parser in main.go and add a --dry-run flag
+> Run the tests for the config package
+```
+
+Prefer a browser? Run with `--web` (http://127.0.0.1:8081). For a single
+prompt without any UI, use `-p`:
 
 ```bash
 OPENAI_API_KEY=sk-... ./gogen --web
+OPENAI_API_KEY=sk-... ./gogen -p "List the top-level packages"
 ```
 
-Non-loopback binds (e.g. `--host 0.0.0.0`) require a token (auto-generated and printed if `GOGEN_WEB_TOKEN` is not set):
+Non-loopback binds (e.g. `--host 0.0.0.0`) require a token (auto-generated
+and printed if `GOGEN_WEB_TOKEN` is not set):
 
 ```bash
 GOGEN_WEB_TOKEN=secret ./gogen --web --host 0.0.0.0
 # then open http://host:8081/?token=secret
 ```
+
 Global mode (use `~/.config/gogen/` instead of project `.gogen/`):
 
 ```bash
 GOGEN_MODE=global ./gogen
+```
+
+Build without tree-sitter (smaller binary, no syntax checks or symbol
+extraction):
+
+```bash
+CGO_ENABLED=0 go build -o gogen-nocgo .
 ```
 
 ### Flags
@@ -91,17 +79,17 @@ GOGEN_MODE=global ./gogen
 | Flag | Description |
 |------|-------------|
 | `--web` | Run in web mode (listens on `:8081`) |
-| `--host <host>` | Listen host for `--web` (e.g. `0.0.0.0`; default `127.0.0.1`; also `GOGEN_WEB_BIND` for host:port) |
+| `--host <host>` | Listen host for `--web` (e.g. `0.0.0.0`; falls back to `GOGEN_WEB_BIND` or `127.0.0.1:8081`) |
 | `--dir <path>` | Set the working directory |
 | `--global` | Ignore project `.gogen/`, use `~/.config/gogen/` instead |
 | `--url <url>` | Override OpenAI API base URL (e.g., for local LLMs or proxies) |
 | `--verbose` | Show full tool output in CLI mode |
 | `-p <prompt>` | Run a single prompt and exit (non-interactive) |
 | `--save-config` | Write effective config to `.gogen/gogen.conf` and guidelines to `.gogen/gogen.md` |
-| `--save-config-secrets` | Include `openai_api_key` when using `--save-config` |
+| `--save-config-secrets` | Include secrets when using `--save-config` (`openai_api_key`, `web_auth_token`, MCP `env`, provider keys) |
 | `--save-config-path <file>` | Output path for `--save-config` config file (default `.gogen/gogen.conf`; project mode only — global mode always writes to `~/.config/gogen/config.yaml`) |
 
-The first positional argument is also treated as the working directory (overridden by `--dir`).
+The first positional argument is also treated as the working directory (overridden by `--dir`); a second positional argument runs as a single prompt, equivalent to `-p`.
 
 ### TUI commands
 
@@ -109,7 +97,8 @@ While in the TUI:
 
 | Command | Description |
 |---------|-------------|
-| `exit` | Quit |
+| `help` or `/help` | Show available commands |
+| `exit`, `quit`, `/exit`, or `/quit` | Quit |
 | `dir <path>` | Change working directory |
 | `compact` or `/compact` | Manually compact conversation history |
 | `/models` | List available models |
@@ -117,14 +106,35 @@ While in the TUI:
 | `/plan` | Enable plan mode (read-only) |
 | `/act` | Enable act mode (full tools) |
 | `/mode` | Show current mode |
+| `/think` | Set thinking/reasoning level (`off`/`low`/`medium`/`high`) or show the current level |
 | `/context` | Show context window usage (tokens used, limit, compact threshold) |
 | `/new` | Start a fresh session; previous session is saved to disk |
 | `/subagents` | Show nested (subagent) sessions that ran in this session, with their final reports (when `subagent: on`) |
 | `/resume` | List saved sessions (with message count and label) |
 | `/resume <id>` | Restore a saved session |
 | `/resume latest` | Restore the most recent session other than the current one |
+| `/resume del <id>` | Delete a saved session |
 | `sessions` | Alias for `/resume` (list sessions) |
+| `/fork` | Fork a new session from the last assistant message (`/fork <N>` from message N) |
+| `/verbose` | Toggle verbose tool output |
 | `/save-config` | Write effective config to `.gogen/gogen.conf` |
+
+Type `/help` for the full list.
+
+## Supported languages
+
+Tree-sitter is bundled for **26 languages** (syntax checking after edits):
+
+Go, Python, JavaScript, TypeScript, TSX, Rust, Java, Kotlin, C, C++, C#, PHP, Ruby, Scala, SQL, HTML, CSS, JSON, Bash, YAML, TOML, Lua, HCL, Zig, Dockerfile, Make
+
+**Symbol extraction** (`list_definitions`) has dedicated queries for **19** of
+these: Go, Python, JavaScript, TypeScript, TSX, Rust, Java, Kotlin, C, C++,
+C#, PHP, Ruby, Scala, SQL, Bash, Lua, HCL, Zig. JSON, HTML, CSS, YAML, TOML,
+Dockerfile, and Make get syntax checks only.
+
+Tree-sitter requires **CGO** at build time (enabled by default on Linux); set
+`CGO_ENABLED=0` to build without it — tree-sitter features are then stubbed
+out.
 
 ## Configuration
 
@@ -148,20 +158,20 @@ subagent_max_depth: 2  # max nesting; 1 (default) = subagents cannot spawn subag
 job_notices: off   # notify the session when a background command finishes
 skills: off        # skill tool (list/read over .gogen/skills + ~/.config/gogen/skills)
 agent_instructions: off  # load AGENTS.md / CLAUDE.md workspace instruction files
-web_bind: 0.0.0.0:8080  # web listen address (restart-staged; also GOGEN_WEB_BIND / --host)
+web_bind: 0.0.0.0:8080  # web listen address (applies on next start; also GOGEN_WEB_BIND / --host)
 # Configurable prompt templates ("" = the built-in default):
 board_start_prompt: "You have been assigned board ticket #{id}: {title}..."  # board "Start agent" prompt
 system_prompt: "You are a coding agent in {working_dir}..."                  # replaces the base system prompt
 subagent_prompt: "You are a subagent...\n\nJob:\n{job}"                      # wraps subagent jobs
 ```
 
-Config values follow a strict schema (typed yaml.v3 decoding): unknown keys are
-ignored, and each key has one canonical spelling — `on`/`off` settings are
-strings, booleans are `true`/`false`, scalar list settings are comma-separated
-strings (e.g. `command_allowlist: "go,git"`, `treesitter_langs: "go,python"`),
-integers are YAML integers, and `mcp_servers` is a YAML list of objects
-(`name`, `command`, `args`, `env`). An empty or zero value means "use the
-default", with these exceptions where `0` is a real setting:
+Config values follow a strict schema: unknown keys are ignored, `on`/`off`
+settings are strings, booleans are `true`/`false`, list settings are
+comma-separated strings (e.g. `command_allowlist: "go,git"`,
+`treesitter_langs: "go,python"`), integers are YAML integers, and `mcp_servers`
+is a YAML list of objects (`name`, `command`, `args`, `env`). An empty or zero
+value means "use the default", with these exceptions where `0` is a real
+setting:
 
 | Key | `0` means |
 |-----|-----------|
@@ -170,9 +180,11 @@ default", with these exceptions where `0` is a real setting:
 | `max_tool_result_bytes` | no truncation cap on tool output |
 | `compact_reserve_tokens` | reserve no tokens for new messages after compaction |
 
-Negative values are invalid and fall back to defaults. `compact_threshold`
-must be in `[0, 1]` when set (including the explicit `0` that disables
-auto-compaction); values outside that range fall back to `0.85`.
+Negative values are invalid for these settings and fall back to defaults
+(`session_max_age_days` is the exception — a negative value keeps sessions
+forever). `compact_threshold` must be in `[0, 1]` when set (including the
+explicit `0` that disables auto-compaction); values outside that range fall
+back to `0.85`.
 Note that disabling auto-compaction means the full conversation is sent to the
 model each turn, so it will eventually exceed the model's context window.
 
@@ -180,10 +192,12 @@ The legacy `keep_recent_messages` key (and `GOGEN_KEEP_RECENT_MESSAGES` env
 var) is still accepted and mapped onto `compact_keep_recent_messages` with a
 deprecation warning, so existing project files keep working after the rename.
 
-`--save-config` writes pure YAML (no `---` front-matter markers). `on`/`off`
-values may be emitted quoted (`"on"`), which parses identically; secrets
-(`openai_api_key`, MCP server `env`) are omitted unless
-`--save-config-secrets` is passed.
+`--save-config` writes pure YAML (no `---` front-matter markers); `on`/`off`
+values may be emitted quoted, which parses identically. Secrets
+(`openai_api_key`, `web_auth_token`, MCP server `env`, provider `api_key`) are
+omitted unless `--save-config-secrets` is passed, and options equal to their
+built-in default are omitted entirely, so a saved config never bakes in a
+default.
 
 Snapshot effective settings:
 
@@ -208,8 +222,6 @@ Discovery order:
 
 Files without config (plain markdown) are treated as guidelines-only. The old combined format (`---` YAML front matter + body) still works as a fallback but `--save-config` now writes separate `.conf` and `.md` files.
 
-### Environment variables
-
 ### API and workspace
 
 | Variable | Default | Description |
@@ -218,6 +230,27 @@ Files without config (plain markdown) are treated as guidelines-only. The old co
 | `OPENAI_MODEL` | *(empty)* | Model to use; leave empty to use the endpoint's default model or pick one with `/models` |
 | `OPENAI_BASE_URL` | *(empty)* | API base URL (e.g. `https://api.openai.com/v1` or a local proxy) |
 | `GOGEN_WORKING_DIR` | `.` | Default working directory |
+
+### Multiple OpenAI-compatible providers
+
+Beyond the default profile (`OPENAI_API_KEY` / `OPENAI_BASE_URL` /
+`OPENAI_MODEL`), extra OpenAI-compatible endpoints can be registered in
+`.gogen/gogen.conf`:
+
+```yaml
+openai_providers:
+  - name: local
+    base_url: http://localhost:11434/v1
+    model: llama3.1
+    api_key: ""   # endpoints that need none
+```
+
+or via the `GOGEN_OPENAI_PROVIDERS` env var (a JSON array of `{name, baseUrl,
+apiKey, model}`, overriding the file). Models from all providers are
+aggregated into the web model picker and routed to their owning endpoint; an
+empty `base_url` means the official OpenAI endpoint. Provider `api_key`
+values are never persisted by `--save-config` unless `--save-config-secrets`
+is passed.
 
 ### Context management
 
@@ -275,6 +308,11 @@ These can be set in `.gogen/gogen.conf` only — there is no CLI flag or environ
 |----------|---------|-------------|
 | `GOGEN_MCP` | off | Set to `on` to enable MCP (also set `mcp: on` in project config) |
 | `GOGEN_MCP_SERVERS` | *(empty)* | JSON array of `{name, command, args, env}` (overrides file) |
+
+### Agent features
+
+| Variable | Default | Description |
+|----------|---------|-------------|
 | `GOGEN_BOARD` | off | Set to `on` to enable the project kanban board (board tool + web board tab; live-toggleable from the web settings modal) |
 | `GOGEN_SUBAGENT` | off | Set to `on` to enable the subagent tool (nested sessions) |
 | `GOGEN_SUBAGENT_MAX_DEPTH` | `1` | Maximum subagent nesting depth (main agent = depth 0); `1` = subagents cannot spawn subagents; values ≤ 0 fall back to the default |
@@ -308,96 +346,88 @@ These can be set in `.gogen/gogen.conf` only — there is no CLI flag or environ
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GOGEN_WEB_BIND` | `127.0.0.1:8081` | Listen address for `--web` (e.g. `0.0.0.0:8080` to accept remote connections); also `web_bind` in `.gogen/gogen.conf` (restart-staged — the settings modal's web-bind field persists it for the next start) |
-| `GOGEN_WEB_TOKEN` | *(empty)* | Required for non-loopback binds; auto-generated and printed when `--web --host` is used without one |
-| `GOGEN_WEB_ALLOWED_ORIGINS` | *(empty)* | Comma-separated host allowlist for WebSocket CORS; empty uses localhost defaults |
-| `GOGEN_WEB_TLS_CERT` | *(empty)* | Path to PEM certificate file for TLS |
-| `GOGEN_WEB_TLS_KEY` | *(empty)* | Path to PEM key file for TLS |
+| `GOGEN_WEB_BIND` | `127.0.0.1:8081` | Listen address for `--web` (e.g. `0.0.0.0:8080` to accept remote connections); also `web_bind` in `.gogen/gogen.conf` (the settings modal's web-bind field persists it for the next start) |
+| `GOGEN_WEB_TOKEN` | *(empty)* | Required for non-loopback binds; auto-generated and printed when `--web --host` is used without one; also `web_auth_token` in `.gogen/gogen.conf` |
+| `GOGEN_WEB_ALLOWED_ORIGINS` | *(empty)* | Comma-separated host allowlist for WebSocket CORS; empty uses localhost defaults; also `web_allowed_origins` in `.gogen/gogen.conf` |
+| `GOGEN_WEB_TLS_CERT` | *(empty)* | Path to PEM certificate file for TLS; also `web_tls_cert_file` in `.gogen/gogen.conf` |
+| `GOGEN_WEB_TLS_KEY` | *(empty)* | Path to PEM key file for TLS; also `web_tls_key_file` in `.gogen/gogen.conf` |
 | `GOGEN_WEB_MAX_ACTIVE_SESSIONS` | `8` | Cap on concurrently active sessions (panes); also `web_max_active_sessions` in `.gogen/gogen.conf` |
 | `GOGEN_WEB_APPROVAL_HOLD_SECS` | `0` | Keep pending delete approvals alive for N seconds after the last client detaches (a reconnecting client is re-notified and can answer); `0` auto-denies immediately on detach. Also `web_approval_hold_secs` in `.gogen/gogen.conf` |
 
-### Web UI: panes and disconnect continuation
+Non-loopback binds without TLS log a warning: the auth token is sent in plain
+text. Set `GOGEN_WEB_TLS_CERT` / `GOGEN_WEB_TLS_KEY` (or the file keys) to
+enable TLS.
+
+### Web UI
 
 The web UI supports **multiple chat panes** on one page. Each pane is an
 independent session with its own history, mode, thinking level, model, and
-in-flight turn — they share one workspace (working directory, filesystem).
-Changing the model in one pane never affects another pane, and a pane's model
-is remembered when you resume the session later.
-Because the panes share one workspace, the working directory is a single
-server-wide setting: it can only be changed in global mode (`gogen --global`).
-In project mode the workspace is fixed to the project directory, and the
-working-directory input is hidden.
+in-flight turn — changing the model in one pane never affects another, and a
+pane's model is remembered when the session is resumed later. Because the
+panes share one workspace, the working directory is a single server-wide
+setting: it can only be changed in global mode (`gogen --global`); in project
+mode it is fixed to the project directory and the input is hidden.
 
-- The sidebar lists **Open panes** on top (the sessions you have open right
-  now) and **saved sessions** below.
-  - **New** (sidebar button) opens a *new* pane with a fresh session. The
-    previous pane stays open in the background and keeps streaming.
-  - Clicking an open pane focuses it; **✕** closes the pane: any in-flight
-    turn is cancelled and the session's live runtime is released, but the
-    session stays saved and can be resumed later from the saved list (it
-    reloads from disk like any other saved session).
-  - Clicking a saved session opens it as a pane (loaded from disk when it is
-    not already open). Deleting a session (✕ on a saved row, with
-    confirmation) removes it permanently.
-  - Typed `/new`, `/resume <id>`, `/fork N` replace the *current* pane's
-    session (muscle memory preserved).
+- The sidebar lists **Open panes** on top and **saved sessions** below.
+  **New** opens a fresh pane alongside the current one (which keeps
+  streaming); clicking an open pane focuses it, and **✕** closes it — any
+  in-flight turn is cancelled and the session's live runtime is released, but
+  it stays saved and can be resumed later. Deleting a saved session (✕, with
+  confirmation) removes it permanently. Typed `/new`, `/resume <id>`, and
+  `/fork N` replace the *current* pane's session.
 - **Background panes keep running**: a turn in a non-focused pane continues
-  server-side, shows the amber responding indicator in the sidebar, and
-  notifies once when it starts. Focus the pane to see it.
+  server-side (amber "responding" indicator in the sidebar) and notifies once
+  when it starts. Focus the pane to see it.
 - **Disconnect ≠ cancel**: closing the tab or losing the connection does not
   stop the current turn — it completes server-side and is saved. When you
-  reconnect, each open pane re-attaches automatically and shows
-  "Resuming…" while a still-running turn finishes; completed turns appear in
-  the history. The **Cancel** button (or `Esc` while streaming) is the only
-  way to stop a turn, and it works even from a fresh connection.
+  reconnect, open panes re-attach automatically and show "Resuming…" while a
+  still-running turn finishes. The **Cancel** button (or `Esc` while
+  streaming) is the only way to stop a turn, and it works even from a fresh
+  connection.
 - **Idle sessions release themselves**: a session whose last tab closes while
-  no turn is running is dropped from memory (it stays saved) and returns to
-  the saved list. The violet "resume to continue" indicator only appears for
-  sessions that are genuinely live — open in another tab, or with a turn
-  still running server-side (it disappears when that turn finishes).
-- The editor runs on its own socket, so saving a file is never blocked by a
-  streaming turn (only by the brief moment a tool actually writes).
+  no turn is running is dropped from memory (it stays saved). The violet
+  "resume to continue" indicator only appears for sessions that are genuinely
+  live — open in another tab, or with a turn still running server-side.
+- A built-in **Terminal** tab provides an interactive user shell (one per
+  connection, respawnable after it exits) plus per-command terminal tabs that
+  stream `execute_command` output live, with running/exit status dots and a
+  restart button. The editor runs on its own socket, so saving a file is never
+  blocked by a streaming turn.
+- The settings modal is organized into sidebar sections (Editor, Chat, Global,
+  Agent, Security, Context, Tools, Sessions, Server, MCP, Providers); opening
+  it auto-selects the section matching the screen you are on, and manual
+  choices are remembered per browser.
 
-### Board and subagents in the web UI
+#### Board and subagents
 
 - The settings modal's **Agent** group toggles the **Project board** and
-  **Subagents** features live (no restart). The toggles are server-backed —
+  **Subagents** features live, no restart. The toggles are server-backed:
   they persist to `.gogen/gogen.conf` and every tab stays in sync via the
-  config push. The settings modal is organized into sidebar sections
-  (Editor, Chat, Global, Agent, Security, Context, Tools, Sessions, Server,
-  MCP, Providers); opening it auto-selects the section matching the screen
-  you are on (Chat, Editor, or Board → Agent), and manual choices are
-  remembered per browser.
+  config push.
 - With `board: on`, a **Board** tab appears next to Chat/Editor: a kanban
   view (backlog, ready, in_progress, in_review, blocked, done) with
   drag-and-drop moves, a "New card" form (title, acceptance criteria,
-  priority), and inline card detail (description + activity log). Agent
-  board-tool mutations re-render the board live. The tab is hidden while the
-  feature is off. Each card has a **▶ Start** button that claims the ticket
-  and starts a dedicated agent session seeded with the ticket (the ticket
-  carries the session id, shown as the card's assignee); the button becomes
-  **Open agent** and switches to the chat tab with the session attached. The
-  started session runs headless until then — it survives closing the tab,
-  and its delete approvals pop the approval modal right on the board (the
-  initiating tab is background-attached; if the tab is closed, approvals are
-  denied until you open the session). The prompt template is editable in the
-  settings modal's Agent group (`board_start_prompt`).
-- With `subagent: on`, spawned subagents appear as **nested rows** under
-  their parent session in the sidebar (⏳ running / ✅ done / ❌ failed).
-  Clicking a nested row opens the child as a normal pane — live transcript,
-  Cancel button, and ✕ close all work per-session, which is the escape hatch
-  for a subagent stuck in a loop. The Agent tab's **Default subagent model**
-  picker (same grouped list as the toolbar) sets which model spawned
-  subagents use — empty means inherit the parent's model, and a subagent
-  tool call's explicit `model` argument always wins. The setting is
-  server-backed: it persists to `.gogen/gogen.conf` and applies to both web
-  and TUI subagents (`subagent_model` / `GOGEN_SUBAGENT_MODEL`).
-  The **System prompt** and **Subagent prompt** textareas in the same group
-  customize the base system prompt and the subagent job wrapper
-  (`system_prompt` / `subagent_prompt`); all three prompt fields are
-  pre-populated with the effective templates and a "Reset to default" button
-  restores the built-in. A value equal to the built-in default is treated as
-  unset, so the default text is never baked into the config file.
+  priority), and inline card detail with an activity log. Agent board-tool
+  mutations re-render the board live; the tab is hidden while the feature is
+  off. Each card has a **▶ Start** button that claims the ticket and starts a
+  dedicated agent session seeded with it; the button becomes **Open agent**
+  and switches to the chat tab with the session attached. The started session
+  runs headless until then — it survives closing the tab, and its delete
+  approvals pop the approval modal right on the board (if the initiating tab
+  is closed, approvals are denied until the session is reopened). The start
+  prompt template is editable in the settings modal (`board_start_prompt`).
+- With `subagent: on`, subagents appear as **nested rows** under their parent
+  session in the sidebar, each with a status dot — amber **responding** while
+  running, green **done** on success, red **failed** on error. Clicking a
+  nested row opens the child as a normal pane (live transcript, Cancel, ✕),
+  which is the escape hatch for a subagent stuck in a loop. The Agent tab's
+  **Default subagent model** picker and the **System prompt** / **Subagent
+  prompt** textareas persist to `.gogen/gogen.conf` and apply to both web and
+  TUI subagents (`subagent_model`, `system_prompt`, `subagent_prompt`). The
+  prompt fields are pre-populated with the effective templates and a "Reset to
+  default" button restores the built-in; a value equal to the built-in default
+  is treated as unset, so the default text is never baked into the config
+  file.
 
 ### Web tools (web_fetch / web_search)
 
@@ -442,6 +472,7 @@ main.go
     ├── projectfile/ — .gogen/gogen.conf and .md file loading/merging/writing
     ├── mcp/         — MCP stdio client and tool registry
     ├── session/     — Conversation persistence (JSON snapshots on disk)
+    ├── skills/      — Skill discovery and loading (project + user dirs)
     ├── tui/         — Interactive terminal interface (Bubble Tea)
     ├── config/      — Environment-based configuration
     ├── contextmgr/  — Token-aware context window management and auto-compaction
@@ -490,8 +521,8 @@ The agent has access to the following tools:
 | `subagent` | Spawn a nested agent session for a job (when `subagent: on`); the final report returns as the tool result. Subagents cannot spawn subagents by default (`subagent_max_depth`) |
 | `session_rename` | Rename the current session |
 | `context_pin_last` | Pin the last user message to survive compaction |
-
-`background_job` (status/cancel for `execute_command background=true`) is available at runtime; `execute_command`'s `background` parameter documents it.
+| `read_image` | Attach an image to the session context for vision-capable models (png/jpeg/gif/webp up to 3.5 MB; optional `detail=auto|low|high`) |
+| `background_job` | Inspect or feed a background job (`execute_command background=true`): `action=status` (output tail), `action=cancel`, or `action=input` (write to the job's stdin) |
 
 Additional tools arrive at runtime from connected MCP servers as `mcp_<server>_<tool>`.
 
@@ -501,3 +532,28 @@ Additional tools arrive at runtime from connected MCP servers as `mcp_<server>_<
 - **Delete Approval** — File deletion requires explicit user confirmation before proceeding (unless `GOGEN_DELETE_APPROVAL=off`).
 - **Patch-First Edits** — The agent prefers `patch_file` (unified diffs) over full file rewrites to minimize accidental data loss.
 - **Syntax Checking** — After edits, syntax errors are detected via tree-sitter for supported languages.
+
+## Development
+
+The Makefile covers the common tasks; `make check` runs the full local suite
+sequentially (it does not auto-update dependencies — use `make update` for
+that):
+
+```bash
+make check        # fmt, tidy, tests (incl. -race), vet, staticcheck, vuln,
+                  # no-CGO build, web UI lint + tests
+make test         # go test -race ./...
+make test-debug   # debug-tagged packages (view-drift, profiling)
+make vet          # go vet ./...
+make staticcheck  # go tool staticcheck ./...
+make build-nocgo  # verify the documented no-tree-sitter build compiles
+make lint-web     # lint the hand-maintained web UI JS (skipped without node)
+make test-web     # jsdom regression tests for the web UI (skipped without node)
+```
+
+`make outdated` fails when any direct dependency or declared tool has a newer
+version; `make update` upgrades them and tidies `go.mod`.
+
+## License
+
+[GNU AGPL-3.0](LICENSE)

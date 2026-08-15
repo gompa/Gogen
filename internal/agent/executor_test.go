@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -122,6 +123,12 @@ func TestExecuteCommandUsesWorkingDir(t *testing.T) {
 }
 
 func TestExecuteCommandBwrapMissingErrors(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// bwrap is Unix-only: Windows rejects the sandbox in
+		// checkCommandConfig before any PATH lookup, with a different
+		// error message.
+		t.Skip("bwrap sandbox is not supported on Windows")
+	}
 	dir := t.TempDir()
 	exec := NewExecutor(dir)
 	exec.SetSandbox("bwrap")

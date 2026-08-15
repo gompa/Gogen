@@ -3,6 +3,7 @@ package projectfile
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -82,7 +83,12 @@ func TestDiscoverInstructionsStopsAtGitRoot(t *testing.T) {
 // directory itself is never read, only project directories below it.
 func TestDiscoverInstructionsStopsAtHome(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	if runtime.GOOS == "windows" {
+		// os.UserHomeDir reads %USERPROFILE% on Windows, not $HOME.
+		t.Setenv("USERPROFILE", home)
+	} else {
+		t.Setenv("HOME", home)
+	}
 	writeFile(t, filepath.Join(home, "AGENTS.md"), "home agents")
 	proj := filepath.Join(home, "proj")
 	writeFile(t, filepath.Join(proj, "AGENTS.md"), "proj agents")
