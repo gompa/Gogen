@@ -491,9 +491,21 @@ func TestBackgroundJobInputStdinClosed(t *testing.T) {
 	a := NewAgent(nil, exec, nil)
 	defer a.Close()
 
-	// exec 0<&- closes the child's stdin immediately; the shell then keeps
-	// running (sleep), so the job is alive while its stdin is gone.
-	id, err := a.StartBackgroundCommand("sh -c 'exec 0<&-; sleep 3'")
+	if exec.SandboxMode() != "off" {
+		// A sandbox wrapper (bwrap) is the direct child and holds its own
+		// copy of the stdin pipe's read end, so the child closing fd 0 can
+		// never surface as EPIPE — the scenario is unobservable here.
+		t.Skip("stdin-close EPIPE is not observable through a sandbox wrapper")
+	}
+
+	// The command runs under BuildCommand's own `sh -c` wrapper, so no
+	// nested shell here: `exec 0<&-` closes the DIRECT child's stdin — the
+	// pipe's read end. (A nested `sh -c '...'` would fork an inner shell
+	// and the outer shell's copy of the read end would stay open, so
+	// writes would never EPIPE and the test would spin until `sleep`
+	// exits.) The shell then keeps running (sleep), so the job is alive
+	// while its stdin is gone.
+	id, err := a.StartBackgroundCommand("exec 0<&-; sleep 3")
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
