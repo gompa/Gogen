@@ -42,6 +42,14 @@ const (
 // modelsCacheTTL governs cache staleness.
 var modelsFetchBackoff = 30 * time.Second
 
+// profileCatalogTimeout bounds ONE provider's catalog query inside the
+// overall fetch budget: profile queries run in parallel, so a hung endpoint
+// (offline host that never refuses the connection) costs only this window
+// instead of the full modelsCatalogTimeout — the merge keeps the catalogs
+// that answered. A var (not const) so tests can shrink it, mirroring
+// modelsFetchBackoff.
+var profileCatalogTimeout = 3 * time.Second
+
 // propsHTTPClient is a plain short-timeout client for capability probes.
 // Intentionally not the SSE client (idle read deadlines are stream-oriented).
 var propsHTTPClient = &http.Client{Timeout: propsProbeTimeout}

@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"errors"
+	"log"
 	"sync"
 	"time"
 
@@ -135,16 +136,16 @@ func (p *OpenAIProvider) fetchModelsWithProfiles(ctx context.Context) ([]openai.
 		routing map[string]*openai.Client
 		err     error
 	}
-	query := func(catalog, stream *openai.Client) result {
+	query := func(qctx context.Context, catalog, stream *openai.Client) result {
 		if catalog == nil {
 			catalog = stream
 		}
 		var models []openai.Model
 		routing := make(map[string]*openai.Client)
-		pager := catalog.Models.ListAutoPaging(ctx)
+		pager := catalog.Models.ListAutoPaging(qctx)
 		for pager.Next() {
-			if ctx.Err() != nil {
-				return result{models: models, routing: routing, err: ctx.Err()}
+			if qctx.Err() != nil {
+				return result{models: models, routing: routing, err: qctx.Err()}
 			}
 			m := pager.Current()
 			models = append(models, m)
@@ -159,20 +160,20 @@ func (p *OpenAIProvider) fetchModelsWithProfiles(ctx context.Context) ([]openai.
 	// queries zen + go in parallel; Go takes precedence over Zen for models
 	// listed on both (a Go-subscription model must never be sent to the Zen
 	// endpoint, which rejects it as unsupported).
-	queryProfile := func(prof *providerProfile) result {
+	queryProfile := func(qctx context.Context, prof *providerProfile) result {
 		if prof.zenStream == nil || prof.goStream == nil {
-			return query(prof.catalog, prof.stream)
+			return query(qctx, prof.catalog, prof.stream)
 		}
 		var zenRes, goRes result
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			zenRes = query(prof.zenCatalog, prof.zenStream)
+			zenRes = query(qctx, prof.zenCatalog, prof.zenStream)
 		}()
 		go func() {
 			defer wg.Done()
-			goRes = query(prof.goCatalog, prof.goStream)
+			goRes = query(qctx, prof.goCatalog, prof.goStream)
 		}()
 		done := make(chan struct{})
 		go func() {
@@ -180,8 +181,8 @@ func (p *OpenAIProvider) fetchModelsWithProfiles(ctx context.Context) ([]openai.
 			close(done)
 		}()
 		select {
-		case <-ctx.Done():
-			return result{err: ctx.Err()}
+		case <-qctx.Done():
+			return result{err: qctx.Err()}
 		case <-done:
 		}
 
@@ -227,7 +228,14 @@ func (p *OpenAIProvider) fetchModelsWithProfiles(ctx context.Context) ([]openai.
 		wg.Add(1)
 		go func(i int, prof *providerProfile) {
 			defer wg.Done()
-			results[i] = queryProfile(prof)
+			// Per-profile deadline: a hung endpoint (offline host that never
+			// refuses the connection) must not hold the picker — or the
+			// first chat request — hostage for the whole fetch budget while
+			// the other providers already answered. The merge below keeps
+			// every catalog that completed within this window.
+			qctx, cancel := context.WithTimeout(ctx, profileCatalogTimeout)
+			defer cancel()
+			results[i] = queryProfile(qctx, prof)
 		}(i, prof)
 	}
 	done := make(chan struct{})
@@ -235,11 +243,15 @@ func (p *OpenAIProvider) fetchModelsWithProfiles(ctx context.Context) ([]openai.
 		wg.Wait()
 		close(done)
 	}()
-	select {
-	case <-ctx.Done():
-		return nil, nil, nil, ctx.Err()
-	case <-done:
-	}
+	// Wait for every profile query to settle — including after the fetch
+	// budget expires: an offline or hanging provider must not discard the
+	// catalogs that already succeeded (the early ctx.Done() exit here used
+	// to empty the whole model picker over a single dead endpoint). The
+	// in-flight queries observe ctx cancellation and each catalog HTTP
+	// client carries its own timeout, so this wait is bounded; the merge
+	// below keeps every profile that completed and only reports an error
+	// when ALL profiles failed.
+	<-done
 
 	models := make([]openai.Model, 0)
 	routing := make(map[string]*openai.Client)
@@ -269,6 +281,13 @@ func (p *OpenAIProvider) fetchModelsWithProfiles(ctx context.Context) ([]openai.
 	}
 	if len(models) == 0 && len(errs) > 0 {
 		return nil, nil, nil, errors.Join(errs...)
+	}
+	if len(errs) > 0 {
+		// Partial failure: serve the catalogs that succeeded and say which
+		// providers dropped out — the picker must not go empty because one
+		// endpoint is offline.
+		log.Printf("model catalog: %d of %d provider(s) failed, serving %d models: %v",
+			len(errs), len(profiles), len(models), errors.Join(errs...))
 	}
 	return models, routing, profileFor, nil
 }

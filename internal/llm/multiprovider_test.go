@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"gogen/internal/config"
 )
@@ -64,6 +65,81 @@ func TestListModelsAggregatesProfiles(t *testing.T) {
 	}
 	if byID["shared-model"].Provider != "default" {
 		t.Fatalf("shared-model provider = %q, want default (first profile wins)", byID["shared-model"].Provider)
+	}
+}
+
+// TestListModelsKeepsLiveProfilesWhenOneHangs verifies that a provider
+// which outlives the fetch budget (offline/hanging endpoint) does not empty
+// the model picker: the catalogs that already succeeded are still returned,
+// and only an all-failed fetch reports an error. Regression for the early
+// ctx.Done() exit in fetchModelsWithProfiles, which discarded every
+// successful catalog when a single profile failed to answer in time.
+func TestListModelsKeepsLiveProfilesWhenOneHangs(t *testing.T) {
+	live := catalogHandler("live-model", "live-model-2")
+	t.Cleanup(live.Close)
+	// The hanging profile never answers: it blocks until the client
+	// cancels the request (fetch budget expiry), like an offline host that
+	// does not refuse the connection.
+	hung := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	t.Cleanup(hung.Close)
+
+	p := NewOpenAIProviderWithProfiles([]ProviderProfile{
+		{Name: "live", BaseURL: live.URL, APIKey: "k1"},
+		{Name: "hung", BaseURL: hung.URL, APIKey: "k2"},
+	}, "", t.TempDir(), nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	models, err := p.ListModels(ctx)
+	if err != nil {
+		t.Fatalf("ListModels with one hanging profile must still return the live catalog, got: %v", err)
+	}
+	if len(models) != 2 {
+		t.Fatalf("aggregated catalog has %d models, want 2 from the live profile", len(models))
+	}
+	for _, m := range models {
+		if m.Provider != "live" {
+			t.Fatalf("model %q provider = %q, want live (the hanging profile must be skipped, not fatal)", m.ID, m.Provider)
+		}
+	}
+}
+
+// TestListModelsHangingProfileCostsOnlyItsOwnBudget verifies that a hung
+// provider delays the fetch by at most its per-profile window
+// (profileCatalogTimeout), even with no outer deadline: the live catalogs
+// are merged and served when the hung profile's own budget expires, instead
+// of waiting out the whole fetch budget. The per-profile wait must never
+// depend on modelsCatalogTimeout.
+func TestListModelsHangingProfileCostsOnlyItsOwnBudget(t *testing.T) {
+	live := catalogHandler("live-model")
+	t.Cleanup(live.Close)
+	hung := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	t.Cleanup(hung.Close)
+
+	p := NewOpenAIProviderWithProfiles([]ProviderProfile{
+		{Name: "live", BaseURL: live.URL, APIKey: "k1"},
+		{Name: "hung", BaseURL: hung.URL, APIKey: "k2"},
+	}, "", t.TempDir(), nil)
+
+	old := profileCatalogTimeout
+	profileCatalogTimeout = 300 * time.Millisecond
+	defer func() { profileCatalogTimeout = old }()
+
+	start := time.Now()
+	models, err := p.ListModels(context.Background())
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("ListModels: %v", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("fetch took %s with a hanging profile; the per-profile budget must bound it", elapsed)
+	}
+	if len(models) != 1 || models[0].ID != "live-model" || models[0].Provider != "live" {
+		t.Fatalf("models = %+v, want the live catalog only", models)
 	}
 }
 
