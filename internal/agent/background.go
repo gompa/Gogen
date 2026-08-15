@@ -82,20 +82,6 @@ func (a *Agent) StartBackgroundCommand(command string) (string, error) {
 		return "", fmt.Errorf("no executor configured")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	cmd, err := a.Executor.BuildCommand(ctx, command)
-	if err != nil {
-		cancel()
-		return "", err
-	}
-	// Create the stdin pipe BEFORE cmd.Start (exec requires it): with the
-	// pipe in place, background_job action=input can feed interactive
-	// programs (REPLs, psql, dev servers). Without it cmd.Stdin is nil and
-	// the child reads from /dev/null.
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		cancel()
-		return "", fmt.Errorf("stdin pipe: %w", err)
-	}
 	job := &BackgroundJob{
 		ID:      newBackgroundJobID(),
 		Command: command,
@@ -104,15 +90,7 @@ func (a *Agent) StartBackgroundCommand(command string) (string, error) {
 		cancel:  cancel,
 		output:  newBoundedOutputWriter(defaultBackgroundOutputCap),
 		unread:  newBoundedOutputWriter(defaultBackgroundUnreadCap),
-		stdin:   stdin,
 	}
-	// Every chunk lands in both the tail and the unread delta buffer. The
-	// MultiWriter preserves per-stream write order; each buffer is
-	// mutex-guarded, and stdout/stderr interleaving follows the child's
-	// write order exactly as the single-writer tail did.
-	cmd.Stdout = io.MultiWriter(job.output, job.unread)
-	cmd.Stderr = io.MultiWriter(job.output, job.unread)
-
 	a.bgMu.Lock()
 	if a.bgJobs == nil {
 		a.bgJobs = make(map[string]*BackgroundJob)
@@ -120,16 +98,24 @@ func (a *Agent) StartBackgroundCommand(command string) (string, error) {
 	a.bgJobs[job.ID] = job
 	a.bgMu.Unlock()
 
-	if err := cmd.Start(); err != nil {
+	// Launch through the platform runner: sh -c with an OS stdin pipe on
+	// Unix (buffered, EPIPE semantics), the embedded POSIX interpreter with
+	// an in-memory stdin pipe on Windows (no external sh required). Every
+	// output chunk lands in both the tail and the unread delta buffer; the
+	// MultiWriter preserves per-stream write order, and stdout/stderr
+	// interleaving follows the child's write order.
+	stdin, wait, err := a.Executor.launchBackground(ctx, command,
+		io.MultiWriter(job.output, job.unread), io.MultiWriter(job.output, job.unread))
+	if err != nil {
 		a.bgMu.Lock()
 		delete(a.bgJobs, job.ID)
 		a.bgMu.Unlock()
 		cancel()
-		_ = stdin.Close()
-		return "", fmt.Errorf("execution error: %w", err)
+		return "", err
 	}
+	job.stdin = stdin
 	go func() {
-		waitErr := cmd.Wait()
+		waitErr := wait()
 		job.mu.Lock()
 		job.exitErr = waitErr
 		job.finishedAt = time.Now()

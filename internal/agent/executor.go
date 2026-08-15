@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -528,22 +527,11 @@ func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd, err := e.BuildCommand(ctx, command)
-	if err != nil {
-		return "", err
-	}
-
 	// Combined-output writer: accumulates the full output (returned to the
 	// caller exactly as before) while streaming each chunk to the optional
 	// ToolOutputSink so frontends can render live terminal output.
 	out := newCommandOutputWriter(command, ToolOutputFromContext(ctx))
-	cmd.Stdout = out
-	cmd.Stderr = out
-
-	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("execution error: %w", err)
-	}
-	err = cmd.Wait()
+	err := e.runCommand(ctx, command, nil, out, out)
 	outStr := out.String()
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
@@ -552,30 +540,9 @@ func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, 
 		if ctx.Err() == context.Canceled {
 			return outStr, fmt.Errorf("command cancelled: %s", command)
 		}
-		return outStr, fmt.Errorf("execution error: %w", err)
+		return outStr, err
 	}
 	return outStr, nil
-}
-
-// BuildCommand validates the command against the command guard and returns a
-// prepared *exec.Cmd for the given context: shell wrapper, sandbox wrapper
-// (bwrap), working directory, and process-group cancellation are configured
-// exactly as ExecuteCommand configures them. Background job execution uses
-// it so the guard and sandbox rules apply identically to foreground and
-// background commands.
-func (e *Executor) BuildCommand(ctx context.Context, command string) (*exec.Cmd, error) {
-	if g := e.commandGuard(); g != nil {
-		if err := g.Check(command); err != nil {
-			return nil, err
-		}
-	}
-	cmd, err := e.buildShellCommand(ctx, command)
-	if err != nil {
-		return nil, err
-	}
-	configureCancelableCmd(cmd)
-	cmd.Dir = e.GetWorkingDir()
-	return cmd, nil
 }
 
 // outputBuffer is a mutex-guarded byte buffer shared by the command output
@@ -658,49 +625,6 @@ func (w *commandOutputWriter) Write(p []byte) (int, error) {
 // (exec waits for the pipe-copy goroutines before Wait completes).
 func (w *commandOutputWriter) String() string {
 	return w.string()
-}
-
-func (e *Executor) buildShellCommand(ctx context.Context, command string) (*exec.Cmd, error) {
-	sandbox := strings.ToLower(strings.TrimSpace(e.sandbox()))
-	switch sandbox {
-	case "", "off":
-		return exec.CommandContext(ctx, "sh", "-c", command), nil
-	case "bwrap":
-		path, err := exec.LookPath("bwrap")
-		if err != nil {
-			return nil, fmt.Errorf("command_sandbox=bwrap but bwrap not found on PATH: %w", err)
-		}
-		wd := e.GetWorkingDir()
-		if wd == "" {
-			wd = "."
-		}
-		// Resolve symlinks so the --bind/--chdir target matches what the
-		// child process will see after its own symlink traversal. Without
-		// this, a working directory that is itself a symlink (common on
-		// macOS /home -> /Users) gets bind-mounted under one path while
-		// the child ends up in the other, so writes/reads don't line up.
-		if resolved, err := filepath.EvalSymlinks(wd); err == nil {
-			wd = resolved
-		}
-		// Restrict filesystem to the working directory; keep network and
-		// basic devices so builds/tests still work. Not a full container.
-		return exec.CommandContext(ctx, path,
-			"--die-with-parent",
-			"--unshare-pid",
-			"--dev", "/dev",
-			"--proc", "/proc",
-			"--ro-bind", "/usr", "/usr",
-			"--ro-bind", "/bin", "/bin",
-			"--ro-bind", "/lib", "/lib",
-			"--ro-bind-try", "/lib64", "/lib64",
-			"--ro-bind-try", "/etc", "/etc",
-			"--bind", wd, wd,
-			"--chdir", wd,
-			"sh", "-c", command,
-		), nil
-	default:
-		return nil, fmt.Errorf("unknown command_sandbox %q (use \"off\" or \"bwrap\")", e.sandbox())
-	}
 }
 
 func (e *Executor) ReplaceInFile(path string, search string, replace string, replaceAll bool) (string, error) {

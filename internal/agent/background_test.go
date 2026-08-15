@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -321,7 +322,9 @@ func TestBackgroundJobInputEcho(t *testing.T) {
 	a := NewAgent(nil, exec, nil)
 	defer a.Close()
 
-	id, err := a.StartBackgroundCommand("sh -c 'while read line; do echo \"got: $line\"; done'")
+	// No nested sh -c: the executor wraps the command in its own shell on
+	// Unix and runs it through the embedded interpreter on Windows.
+	id, err := a.StartBackgroundCommand("while read line; do echo \"got: $line\"; done")
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -358,7 +361,7 @@ func TestBackgroundJobInputAppendNewline(t *testing.T) {
 	a := NewAgent(nil, exec, nil)
 	defer a.Close()
 
-	id, err := a.StartBackgroundCommand("sh -c 'IFS= read -r line; echo \"got:$line\"'")
+	id, err := a.StartBackgroundCommand("read -r line; echo \"got:$line\"")
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -404,7 +407,7 @@ func TestBackgroundJobInputDelta(t *testing.T) {
 	a := NewAgent(nil, exec, nil)
 	defer a.Close()
 
-	id, err := a.StartBackgroundCommand("sh -c 'echo marker; sleep 30'")
+	id, err := a.StartBackgroundCommand("echo marker; sleep 30")
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -491,6 +494,12 @@ func TestBackgroundJobInputStdinClosed(t *testing.T) {
 	a := NewAgent(nil, exec, nil)
 	defer a.Close()
 
+	if runtime.GOOS == "windows" {
+		// The embedded interpreter feeds commands an in-memory pipe, not an
+		// OS pipe: there is no fd the child can close, so the EPIPE
+		// translation cannot be observed (the scenario is Unix-only).
+		t.Skip("stdin-close EPIPE is a Unix OS-pipe scenario")
+	}
 	if exec.SandboxMode() != "off" {
 		// A sandbox wrapper (bwrap) is the direct child and holds its own
 		// copy of the stdin pipe's read end, so the child closing fd 0 can
