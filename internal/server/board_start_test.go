@@ -409,7 +409,7 @@ func TestBoardStartApprovalDeniedAfterTabClose(t *testing.T) {
 func TestBoardStartStaleAgentLink(t *testing.T) {
 	dir := t.TempDir()
 	stub := newBlockingStub()
-	s, _, _ := newContinuationServer(t, stub, dir)
+	s, _, store := newContinuationServer(t, stub, dir)
 	s.ws.ProviderFactory = func() llm.LLMProvider {
 		p := llm.NewMockProvider()
 		p.Model = "default-model"
@@ -462,6 +462,25 @@ func TestBoardStartStaleAgentLink(t *testing.T) {
 	if !sawReset {
 		t.Fatalf("activity missing the reset note: %+v", item.Activity)
 	}
+
+	// Wait for the fresh session's first turn to complete and persist
+	// before the test returns: the temp dir is removed as soon as the test
+	// ends, and a turn still flushing its final state would race that
+	// removal (Windows flakes with TempDir RemoveAll "directory is not
+	// empty"). The start notice is sent while the headless turn is still
+	// running, so the board_state/notice reads above do NOT bound it.
+	waitFor(t, 10*time.Second, func() bool {
+		snap, err := store.LoadInWorkingDir(s.ws.GetWorkingDir(), sid2)
+		if err != nil {
+			return false
+		}
+		for _, m := range snap.Messages {
+			if m.Role == "assistant" && m.Content == "done" {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 // TestBoardStartTurnErrorCommentsTicket verifies the turnErrorHook: a
