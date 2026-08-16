@@ -667,3 +667,73 @@ func TestGenerateResponseStreamUsageAfterManyNoOps(t *testing.T) {
 		t.Fatalf("result.Usage = %#v, want prompt=10 completion=5 total=15", result.Usage)
 	}
 }
+
+// TestGenerateResponseStreamReasoningBareJSONNotExtracted verifies that a
+// bare JSON tool-call shape inside reasoning_content is NOT turned into a
+// tool call: reasoning is scanned for explicit <tool_call>/<invoke> blocks
+// only, and models routinely draft/quote JSON there (previously this
+// produced phantom tool calls executed with prose-derived arguments).
+func TestGenerateResponseStreamReasoningBareJSONNotExtracted(t *testing.T) {
+	t.Parallel()
+	const sse = `data: {"choices":[{"delta":{"reasoning_content":"I'll use {\"name\": \"list_files\", \"arguments\": {\"path\": \"/tmp\"}}"}}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(sse))
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(srv)
+	result, err := p.GenerateResponseStream(
+		t.Context(),
+		[]Message{{Role: "user", Content: "hi"}},
+		nil,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.ToolCalls) != 0 {
+		t.Fatalf("expected 0 tool calls from bare JSON in reasoning, got %+v", result.ToolCalls)
+	}
+}
+
+// TestGenerateResponseStreamContentBareJSONExtracted verifies that the same
+// bare JSON tool-call shape in CONTENT is still recovered as a tool call
+// (the text-format recovery path for providers that never deliver structured
+// tool_calls).
+func TestGenerateResponseStreamContentBareJSONExtracted(t *testing.T) {
+	t.Parallel()
+	const sse = `data: {"choices":[{"delta":{"content":"I'll use {\"name\": \"list_files\", \"arguments\": {\"path\": \"/tmp\"}}"}}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(sse))
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(srv)
+	result, err := p.GenerateResponseStream(
+		t.Context(),
+		[]Message{{Role: "user", Content: "hi"}},
+		nil,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.ToolCalls) != 1 {
+		t.Fatalf("expected 1 tool call from bare JSON in content, got %d: %+v", len(result.ToolCalls), result.ToolCalls)
+	}
+	if result.ToolCalls[0].Name != "list_files" {
+		t.Fatalf("tool name = %q, want list_files", result.ToolCalls[0].Name)
+	}
+}

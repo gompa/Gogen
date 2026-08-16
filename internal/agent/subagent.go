@@ -16,8 +16,10 @@ func SubagentLabel(job string) string {
 		first = first[:i]
 	}
 	first = strings.TrimSpace(first)
-	if len(first) > 60 {
-		first = first[:60] + "…"
+	// Rune-safe cut: slicing on bytes could split a multi-byte character
+	// and inject invalid UTF-8 into the sidebar label.
+	if r := []rune(first); len(r) > 60 {
+		first = string(r[:60]) + "…"
 	}
 	if first == "" {
 		return "subagent"

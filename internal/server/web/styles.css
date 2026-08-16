@@ -2647,8 +2647,29 @@
             }
             #terminal-panel.mobile-full #terminal-body { display: block; }
         }
+        /* Visually hidden, present to assistive tech (sr-live region). */
+        .sr-only {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            padding: 0;
+            margin: -1px;
+            overflow: hidden;
+            clip: rect(0 0 0 0);
+            white-space: nowrap;
+            border: 0;
+        }
+
         @media (prefers-reduced-motion: reduce) {
             .term-tab.flash { animation: none; }
             #terminal-tab-badge.pulse { animation: none; }
+            /* Loops/entrances: connection pulse, input spinner, stream
+               cursor blink, toast slide-in; TOC fades become instant. */
+            #conn-indicator.reconnecting { animation: none; }
+            .progress-spinner { animation: none; }
+            .cursor::after { animation: none; }
+            .toast { animation: none; }
+            #toc-rail { transition: none; }
+            .toc-dot { transition: none; }
         }
 

@@ -1027,19 +1027,38 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 	if a.SessionLabelSnapshot() == "" {
 		a.setSessionLabel(llm.SessionLabel(a.Messages))
 	}
-	// Persist immediately so a failed/cancelled turn does not drop the user message.
-	a.FlushSession()
-
 	if err := a.requireModelSelected(ctx); err != nil {
+		// The turn cannot start: the just-appended user message is dropped
+		// instead of being sent to a provider with no usable model. Roll it
+		// back in memory WITHOUT writing anything: the session must stay
+		// exactly as it was. A fresh session must not get a file at all
+		// (the old pre-check flush created one, and this rollback flush then
+		// overwrote it with an empty snapshot — the "saved as an empty
+		// session" bug, where a 0-message session appeared in the list and
+		// became the restore target on the next startup), and a session
+		// with prior content already has that content on disk.
 		a.truncateMessages(1)
-		// The just-appended user message is being dropped: re-derive the
-		// label from what remains, so a session whose only message failed
-		// does not keep a stale title (its message no longer exists).
-		a.setSessionLabel(llm.SessionLabel(a.Messages))
+		// Re-derive the label from what remains only when it was derived
+		// from the conversation: a session whose only message failed must
+		// not keep a stale title. A deliberate rename (RenameSession /
+		// session_rename) is authoritative — re-deriving it would clear the
+		// rename marker and the next save would silently replace the user's
+		// custom title with the first-message text.
+		a.statsMu.RLock()
+		renamed := a.labelRenamed
+		a.statsMu.RUnlock()
+		if !renamed {
+			a.setSessionLabel(llm.SessionLabel(a.Messages))
+		}
 		a.resetSaveTracking()
-		a.FlushSession()
 		return "", err
 	}
+	// Persist the user message before the turn runs so a failed/cancelled
+	// turn does not drop it. Deliberately AFTER the model check: a turn
+	// that cannot start must not write anything (see the rollback above) —
+	// the message is dropped there, so persisting it first would leave an
+	// empty session file behind once it was rolled back.
+	a.FlushSession()
 
 	if h == nil {
 		h = &llm.StreamHandlers{}

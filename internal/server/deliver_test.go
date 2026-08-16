@@ -168,6 +168,50 @@ func TestDeliverQueueOverflow(t *testing.T) {
 	}
 }
 
+// TestDeliverToSessionOverflowNoDeadlock pins the overflow-notice ordering:
+// the "queue full" broadcast must run OUTSIDE deliverMu — a failing write on
+// the last attached client detaches it and funnels into evictOrphaned →
+// hasPendingDeliveries, which takes deliverMu. Broadcasting under the lock
+// deadlocked that chain on the producer goroutine.
+func TestDeliverToSessionOverflowNoDeadlock(t *testing.T) {
+	reg := newSessionRegistry(8)
+	rt := &sessionRuntime{
+		registry:       reg,
+		clients:        make(map[*wsConn]struct{}),
+		pendingDeliver: make([]string, defaultDeliverQueueCap),
+		deliverNotify:  make(chan struct{}, 1),
+	}
+	// No worker goroutine for this unit test: the queue stays at cap so the
+	// overflow branch fires deterministically.
+	rt.deliverWorker.Store(true)
+	// A nil-conn wsConn fails writeJSON immediately (errWSClosed), so the
+	// overflow notice's broadcast detaches it — the exact chain that used to
+	// deadlock while deliverMu was held.
+	dead := &wsConn{}
+	rt.clients[dead] = struct{}{}
+	reg.agents["test-session"] = rt
+
+	done := make(chan struct{})
+	go func() {
+		rt.deliverToSession("overflow notice")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("deliverToSession deadlocked: overflow notice broadcast ran under deliverMu")
+	}
+
+	// The drop-oldest + append invariant still holds after the fix.
+	rt.deliverMu.Lock()
+	n := len(rt.pendingDeliver)
+	last := rt.pendingDeliver[n-1]
+	rt.deliverMu.Unlock()
+	if n != defaultDeliverQueueCap || last != "overflow notice" {
+		t.Fatalf("queue = %d entries, last %q; want cap=%d with the new notice at the tail", n, last, defaultDeliverQueueCap)
+	}
+}
+
 // TestJobNoticeDeliveredToSession is the end-to-end path: with
 // job_notices on, a background command finishing naturally on the initial
 // agent delivers its summary into the session as a user message.

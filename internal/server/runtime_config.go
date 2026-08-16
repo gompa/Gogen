@@ -236,6 +236,11 @@ func (s *Server) handleWSRuntimeConfig(ws *wsConn, msg WSMessage) {
 	if set("contextLimit") || set("compactThreshold") || set("compactKeepRecentMessages") || set("maxToolResultBytes") || set("compactReserveTokens") {
 		s.applyContextSettingsToAll(r, set)
 	}
+	if set("maxToolResultBytes") {
+		// The executor bounds in-memory command output at the same cap the
+		// context managers apply to tool results (0 = no cap, pass-through).
+		s.ws.Exec.SetMaxToolOutputBytes(r.MaxToolResultBytes)
+	}
 	if set("sessionMaxCount") || set("sessionMaxAgeDays") {
 		if s.ws.Store != nil {
 			s.ws.Store.SetRetention(r.SessionMaxCount, r.SessionMaxAgeDays)

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // TestBackgroundCommandLifecycle covers the happy path: start, poll while
@@ -542,6 +544,33 @@ func TestBackgroundJobInputUnknown(t *testing.T) {
 
 	if _, err := a.BackgroundJobInput("job-nope", "x", false); err == nil || !strings.Contains(err.Error(), "unknown background job") {
 		t.Fatalf("expected unknown-job error, got %v", err)
+	}
+}
+
+// TestFormatJobOutputTailRuneSafe pins the status tail cut to a rune
+// boundary: with output longer than maxShow, the raw byte cut
+// (out[len(out)-maxShow:]) can land inside a multi-byte UTF-8 rune and start
+// the shown tail with an invalid partial character. The cut must back off to
+// the next rune boundary, and the reported byte count must be the
+// actually-shown length (a few bytes smaller than maxShow).
+func TestFormatJobOutputTailRuneSafe(t *testing.T) {
+	// maxShowBytes = 8192; "界" + 8190 ASCII bytes = 8193 bytes, so the raw
+	// cut at byte 1 splits the leading 界 (bytes 0-2). The rune-safe cut
+	// starts at byte 3: the tail is the 8190 ASCII bytes, valid UTF-8.
+	out := "界" + strings.Repeat("a", maxShowBytes-2)
+	job := &BackgroundJob{output: newBoundedOutputWriter(defaultBackgroundOutputCap)}
+	if _, err := job.output.Write([]byte(out)); err != nil {
+		t.Fatal(err)
+	}
+	got := formatJobOutput(job, false)
+	if !utf8.ValidString(got) {
+		t.Fatalf("status output is not valid UTF-8: %q", got)
+	}
+	if !strings.Contains(got, fmt.Sprintf("Output (last %d bytes of %d)", len(out)-3, len(out))) {
+		t.Fatalf("expected rune-safe tail length in status, got: %q", got)
+	}
+	if !strings.HasSuffix(got, strings.Repeat("a", maxShowBytes-2)) {
+		t.Fatalf("tail must start on a rune boundary (leading 界 dropped whole), got: %q", got)
 	}
 }
 

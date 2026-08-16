@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
@@ -39,5 +41,28 @@ func TestPinLastUserNoRealUserMessage(t *testing.T) {
 	p.PinLastUser(msgs)
 	if len(p.PinnedIndices()) != 0 {
 		t.Fatalf("expected no pin, got %v", p.PinnedIndices())
+	}
+}
+
+// TestListPinsTruncatesRuneSafe pins the display truncation: a long pinned
+// message is cut at 80 RUNES (never mid-character), so the tool result stays
+// valid UTF-8.
+func TestListPinsTruncatesRuneSafe(t *testing.T) {
+	p := NewPinManager()
+	// 85 multi-byte runes: a byte-slice cut at 80 would split a rune.
+	content := ""
+	for i := 0; i < 85; i++ {
+		content += "é"
+	}
+	msgs := []llm.Message{{Role: "user", Content: content}}
+	p.PinLastUser(msgs)
+
+	out := p.ListPins(msgs)
+	want := string([]rune(content)[:80]) + "…"
+	if !strings.Contains(out, want) {
+		t.Fatalf("ListPins output = %q, want it to contain the rune-safe 80-rune cut %q", out, want)
+	}
+	if !utf8.ValidString(out) {
+		t.Fatalf("ListPins output is not valid UTF-8: %q", out)
 	}
 }

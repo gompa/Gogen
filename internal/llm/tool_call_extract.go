@@ -48,6 +48,16 @@ type byteRange struct{ start, end int }
 
 // extractToolCallsFromText scans text for embedded tool call patterns and returns them as ToolCall objects.
 func extractToolCallsFromText(text string) []ToolCall {
+	return extractToolCallsFromTextMode(text, true)
+}
+
+// extractToolCallsFromTextMode is extractToolCallsFromText with control over
+// the weak-signal bare-JSON scan. With allowBareJSON=false, explicit
+// <tool_call>/<invoke> blocks are still extracted, but bare {"name": ...}
+// objects in prose are never treated as calls. Reasoning segments are scanned
+// in this mode: models routinely draft or quote JSON examples there, and the
+// old behavior mis-executed them as phantom tool calls.
+func extractToolCallsFromTextMode(text string, allowBareJSON bool) []ToolCall {
 	var toolCalls []ToolCall
 
 	// First, try to find <tool_call> ... </tool_call> blocks.
@@ -81,8 +91,27 @@ func extractToolCallsFromText(text string) []ToolCall {
 		toolCalls = append(toolCalls, calls...)
 	}
 
-	// If no tool calls found yet, try to find JSON tool call objects by looking for {"name": ...
-	if len(toolCalls) == 0 {
+	if allowBareJSON {
+		// Always scan for bare JSON tool-call objects ({"name": ...}) so a reply
+		// that MIXES XML-wrapped calls with plain JSON objects does not silently
+		// drop the JSON ones (the previous len(toolCalls)==0 gate meant a single
+		// <tool_call>/<invoke> block suppressed every bare JSON call after it).
+		// Objects that fall inside an already-parsed <tool_call>/<invoke> block
+		// are skipped — the block path extracted them, and a text-level re-parse
+		// would only duplicate them.
+		//
+		// A bare object is accepted only when it carries an arguments/input
+		// container — i.e. it is shaped like a genuine call. Prose JSON
+		// ({"name": "service", "version": 2}, name-only objects, flattened or
+		// array-element shapes) is structurally indistinguishable from a
+		// call otherwise and used to be mis-executed as a phantom tool call.
+		// Flattened/name-only JSON is still recoverable inside explicit
+		// <tool_call>/<invoke> blocks, where the intent is unambiguous.
+		skipRanges := make([]byteRange, 0, len(toolCallRanges)+len(invokeLocs))
+		skipRanges = append(skipRanges, toolCallRanges...)
+		for _, loc := range invokeLocs {
+			skipRanges = append(skipRanges, byteRange{start: loc[0], end: loc[1]})
+		}
 		matches := toolCallJSONNameRegex.FindAllStringIndex(text, -1)
 		seenEnd := make(map[int]struct{})
 		for _, match := range matches {
@@ -91,20 +120,61 @@ func extractToolCallsFromText(text string) []ToolCall {
 			if objStart >= 0 {
 				jsonStr, endIdx := extractJSONObject(text, objStart)
 				if jsonStr != "" && endIdx > objStart {
+					if isInsideAnyByteRange(objStart, endIdx, skipRanges) {
+						continue
+					}
 					if _, ok := seenEnd[endIdx]; ok {
 						continue
 					}
 					seenEnd[endIdx] = struct{}{}
-					calls := parseToolCallFromJSONString(jsonStr)
-					if len(calls) > 0 {
-						toolCalls = append(toolCalls, calls...)
+					// An object that is an array element is prose (a list of
+					// call-shaped examples), not a standalone call.
+					if objStart > 0 && text[objStart-1] == '[' {
+						continue
 					}
+					var obj map[string]interface{}
+					if err := json.Unmarshal([]byte(jsonStr), &obj); err != nil {
+						continue
+					}
+					if !isToolCallObject(obj) {
+						continue
+					}
+					toolCalls = append(toolCalls, parseToolCallFromObject(obj)...)
 				}
 			}
 		}
 	}
 
+	renumberExtractedToolCalls(toolCalls)
 	return toolCalls
+}
+
+// renumberExtractedToolCalls assigns unique, dense Index and ID values across
+// a combined set of extracted calls. extractToolCallsFromBlock numbers each
+// block's calls from its own local counter, so separate <tool_call>/<invoke>
+// blocks would otherwise collide on "tc_extracted_0" (and Index 0), and a
+// caller combining content and reasoning scans would too. Duplicate tool-call
+// IDs violate the one-to-one tool-call/result protocol the agent relies on
+// when it appends tool results keyed by ID. Every call produced by the
+// extractors carries a synthetic ID (the block extractor always assigns one),
+// so renumbering is safe.
+func renumberExtractedToolCalls(toolCalls []ToolCall) {
+	for i := range toolCalls {
+		toolCalls[i].Index = i
+		toolCalls[i].ID = "tc_extracted_" + strconv.Itoa(i)
+	}
+}
+
+// isToolCallObject reports whether a decoded JSON object is shaped like a
+// genuine tool call: a resolvable name plus an arguments/input container.
+// Name-only objects, flattened shapes, and prose JSON such as
+// {"name": "service", "version": 2} are rejected, so they are never
+// mis-executed as phantom tool calls.
+func isToolCallObject(obj map[string]interface{}) bool {
+	if toolCallNameFromObject(obj) == "" {
+		return false
+	}
+	return obj["arguments"] != nil || obj["input"] != nil
 }
 
 // isInsideAnyByteRange reports whether byte range [start, end) falls entirely
@@ -329,7 +399,14 @@ func parseParamValue(v string) interface{} {
 	// Try integer
 	if iv, err := strconv.ParseInt(v, 10, 64); err == nil {
 		if strconv.FormatInt(iv, 10) == v {
-			return float64(iv)
+			if iv >= -(1<<53) && iv <= 1<<53 {
+				return float64(iv)
+			}
+			// Beyond float64's exact integer range: return int64 so the
+			// value round-trips exactly (float64 would silently round to a
+			// neighboring value, e.g. 9007199254740993 -> 9007199254740992).
+			// Consumers accept both shapes (intArgOptional handles int64).
+			return iv
 		}
 	}
 	// Try float
@@ -384,17 +461,20 @@ func parseToolCallFromJSONString(jsonStr string) []ToolCall {
 	if err := json.Unmarshal([]byte(jsonStr), &obj); err != nil {
 		return nil
 	}
+	return parseToolCallFromObject(obj)
+}
+
+// parseToolCallFromObject builds a ToolCall from an already-decoded JSON
+// object. Note: Index and ID are assigned by the caller
+// (extractToolCallsFromBlock / extractToolCallsFromTextMode) to ensure they
+// are unique within the full result set.
+func parseToolCallFromObject(obj map[string]interface{}) []ToolCall {
 	name := toolCallNameFromObject(obj)
 	if name == "" {
 		return nil
 	}
 	argsMap, argsStr := normalizeToolCallArguments(obj)
-
-	// Create ToolCall
-	// Note: Index and ID are assigned by the caller (extractToolCallsFromBlock)
-	// to ensure they are unique within the full result set.
-	toolCall := ToolCall{Name: name, Args: argsMap, ArgsStr: argsStr}
-	return []ToolCall{toolCall}
+	return []ToolCall{{Name: name, Args: argsMap, ArgsStr: argsStr}}
 }
 
 // toolCallNameFromObject extracts the tool name from a decoded JSON object:

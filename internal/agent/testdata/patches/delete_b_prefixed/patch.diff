@@ -1,0 +1,5 @@
+--- a/b/foo.txt
++++ /dev/null
+@@ -1,2 +0,0 @@
+-one
+-two

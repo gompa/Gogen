@@ -147,7 +147,7 @@ type ddgResultState struct {
 func (st *ddgResultState) handleToken(tt html.TokenType, tok html.Token) *searchResult {
 	switch tt {
 	case html.StartTagToken, html.SelfClosingTagToken:
-		st.handleStartTag(tok)
+		st.handleStartTag(tok, tt == html.SelfClosingTagToken)
 	case html.EndTagToken:
 		return st.handleEndTag(tok)
 	case html.TextToken:
@@ -156,7 +156,7 @@ func (st *ddgResultState) handleToken(tt html.TokenType, tok html.Token) *search
 	return nil
 }
 
-func (st *ddgResultState) handleStartTag(tok html.Token) {
+func (st *ddgResultState) handleStartTag(tok html.Token, selfClosing bool) {
 	// cachedClasses avoids re-parsing the class attribute on every
 	// tokenHasClass call for the same HTML token.
 	var cachedClasses []string
@@ -167,7 +167,10 @@ func (st *ddgResultState) handleStartTag(tok html.Token) {
 		st.href = ""
 		st.titleBuf.Reset()
 		st.snipBuf.Reset()
-	} else if st.inResult && tok.Data == "div" {
+	} else if st.inResult && tok.Data == "div" && !selfClosing {
+		// A self-closing <div/> opens and closes immediately (net depth
+		// change 0): counting it without a matching end tag would stall
+		// result emission (resultDepth never reaches -1).
 		st.resultDepth++
 	}
 	if st.inResult {

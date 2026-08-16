@@ -245,13 +245,26 @@ func formatPatchReport(ok, fail []string, dryRun bool) string {
 }
 
 func (e *Executor) planPatch(pf patchFile, fuzzy bool) (patchPlan, string, error) {
+	// Normalize the header names BEFORE any /dev/null comparison: git
+	// appends tab-timestamps ("+++ /dev/null\t2024-…"), so the raw text
+	// never matches. The empty case is guarded because normalizePatchPath
+	// of "" would Clean to "." and swallow the "could not determine
+	// target" error below.
+	newName := pf.newName
+	if newName != "" {
+		newName = normalizePatchPath(newName)
+	}
+	oldName := pf.oldName
+	if oldName != "" {
+		oldName = normalizePatchPath(oldName)
+	}
+
 	// The +++ header names the target. When it is missing (models sometimes
 	// drop it) or it is /dev/null (delete), fall back to the --- header.
-	target := pf.newName
+	target := newName
 	if target == "" || target == "/dev/null" {
-		target = pf.oldName
+		target = oldName
 	}
-	target = normalizePatchPath(target)
 	if target == "" {
 		return patchPlan{}, "", wrapPatchMismatch(fmt.Errorf("could not determine target file from diff headers"))
 	}
@@ -261,11 +274,11 @@ func (e *Executor) planPatch(pf patchFile, fuzzy bool) (patchPlan, string, error
 		return patchPlan{}, target, err
 	}
 
-	if pf.newName == "/dev/null" {
+	if newName == "/dev/null" {
 		return patchPlan{target: target, secure: secure, delete: true}, target + " (validated delete)", nil
 	}
 
-	isCreate := pf.oldName == "/dev/null"
+	isCreate := oldName == "/dev/null"
 	if !isCreate && len(pf.hunks) == 0 {
 		return patchPlan{}, target, wrapPatchMismatch(fmt.Errorf("no hunks found (check @@ headers use the form '@@ -start,count +start,count @@' with a space after @@)"))
 	}
@@ -329,12 +342,18 @@ func normalizePatchPath(name string) string {
 			name = name[1 : len(name)-1]
 		}
 	}
-	// Strip the conventional unified-diff a/ and b/ prefixes. This matches
-	// git/patch tooling and cannot distinguish a literal path that starts
-	// with "a/" or "b/" (e.g. a repo file named a/foo.go) — a known
-	// limitation of the unified diff format.
-	name = strings.TrimPrefix(name, "a/")
-	name = strings.TrimPrefix(name, "b/")
+	// Strip the conventional unified-diff a/ and b/ prefixes — exactly one,
+	// never both in sequence: a file legitimately named "b/foo.txt" appears
+	// as "--- a/b/foo.txt", and chaining both trims would resolve it to
+	// "foo.txt". This matches git/patch tooling and cannot distinguish a
+	// literal path that starts with "a/" or "b/" (e.g. a repo file named
+	// a/foo.go) — a known limitation of the unified diff format.
+	switch {
+	case strings.HasPrefix(name, "a/"):
+		name = name[len("a/"):]
+	case strings.HasPrefix(name, "b/"):
+		name = name[len("b/"):]
+	}
 	return filepath.Clean(name)
 }
 
@@ -402,7 +421,11 @@ func (p *diffParser) flushFile() {
 		// patch on such a section is spurious. Drop it and keep parsing —
 		// a lone header-only section yields "no patches found" below
 		// (still loud), and real hunks in a later section still apply.
-		if p.current.newName != "/dev/null" && len(p.current.hunks) == 0 {
+		// The /dev/null check tolerates git's tab-timestamp suffix, which
+		// the parser stores verbatim.
+		isDevNull := p.current.newName == "/dev/null" ||
+			strings.HasPrefix(p.current.newName, "/dev/null\t")
+		if !isDevNull && len(p.current.hunks) == 0 {
 			p.current = nil
 			return
 		}
@@ -490,12 +513,19 @@ func (p *diffParser) handleHunkBodyLine(i int) (patchParseState, error) {
 	// imprecise). A hunk whose declared counts EXCEED its emitted lines
 	// never completes; when the next file's header pair follows with no
 	// blank separator, isHeaderPairAhead hands control back to header
-	// mode instead of absorbing "--- a/b.txt" as a removed line.
+	// mode instead of absorbing "--- a/b.txt" as a removed line. The
+	// same lookahead (isSectionMarkerAhead) rescues the "+++ " header in
+	// an incomplete hunk: the next file's "+++ " with its "--- " dropped,
+	// or a repeated "+++ " between hunks, is always followed by the
+	// section marker its hunks start with — while a genuine added line
+	// ("++ X" content, wire "+++ X") is not. Absorbing a "+++ " header as
+	// an added line would inject a bogus "++ X" line into the patched
+	// file with no error.
 	case strings.HasPrefix(p.lines[i], "--- ") && (hunkComplete(p.hunk) || isHeaderPairAhead(p.lines, i)):
 		p.flushFile()
 		p.current = &patchFile{oldName: strings.TrimSpace(strings.TrimPrefix(p.lines[i], "--- "))}
 		return stateFileHeader, nil
-	case strings.HasPrefix(p.lines[i], "+++ ") && hunkComplete(p.hunk):
+	case strings.HasPrefix(p.lines[i], "+++ ") && (hunkComplete(p.hunk) || isSectionMarkerAhead(p.lines, i)):
 		if p.current == nil {
 			return stateHunkBody, fmt.Errorf("malformed diff: +++ before ---")
 		}
@@ -645,7 +675,7 @@ func hunkComplete(h *patchHunk) bool {
 
 // isHeaderPairAhead reports whether the next non-empty line after lines[i]
 // is a "+++ " header whose own next non-empty line starts a new hunk or
-// file section ("@@", "--- ", "diff --git "). It lets an incomplete hunk
+// file section (see isSectionMarkerAhead). It lets an incomplete hunk
 // (declared counts exceeding its emitted lines — LLM under-counting) hand
 // the parser back to file-header mode when a real next-file section follows
 // WITHOUT a blank separator, instead of absorbing "--- a/b.txt" as a removed
@@ -665,16 +695,30 @@ func isHeaderPairAhead(lines []string, i int) bool {
 	if j >= len(lines) || !strings.HasPrefix(lines[j], "+++ ") {
 		return false
 	}
-	k := j + 1
-	for k < len(lines) && lines[k] == "" {
-		k++
+	return isSectionMarkerAhead(lines, j)
+}
+
+// isSectionMarkerAhead reports whether the next non-empty line after
+// lines[i] starts a hunk or file section: "@@", "--- ", or "diff --git ".
+// It is the lookahead that lets an incomplete hunk (declared counts
+// exceeding its emitted lines — LLM under-counting) hand the parser back
+// to file-header mode when a real section boundary follows without a blank
+// separator, instead of absorbing the header as hunk content. EOF and
+// content lines are deliberately NOT accepted as markers: a header at the
+// end of the diff is more likely a content pair in an incomplete hunk, and
+// keeping it as content makes apply fail loudly instead of applying a
+// partial hunk.
+func isSectionMarkerAhead(lines []string, i int) bool {
+	j := i + 1
+	for j < len(lines) && lines[j] == "" {
+		j++
 	}
-	if k >= len(lines) {
+	if j >= len(lines) {
 		return false
 	}
-	return strings.HasPrefix(lines[k], "@@") ||
-		strings.HasPrefix(lines[k], "--- ") ||
-		strings.HasPrefix(lines[k], "diff --git ")
+	return strings.HasPrefix(lines[j], "@@") ||
+		strings.HasPrefix(lines[j], "--- ") ||
+		strings.HasPrefix(lines[j], "diff --git ")
 }
 
 // isPatchDelimiterMarker reports whether line is a model-added patch
@@ -871,7 +915,7 @@ func parseHunkHeader(line string) (patchHunk, error) {
 	}
 	oldPart := strings.TrimPrefix(parts[0], "-")
 	newPart := strings.TrimPrefix(parts[1], "+")
-	if oldPart == parts[0] || newPart == parts[1] {
+	if oldPart == parts[0] || newPart == parts[1] || oldPart == "" || newPart == "" {
 		return patchHunk{}, fmt.Errorf("invalid hunk header: %q", line)
 	}
 	oldStart, oldCount, err := parseDiffLineRange(oldPart)

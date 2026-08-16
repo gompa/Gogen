@@ -12,8 +12,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"gogen/internal/config"
+	"gogen/internal/contextmgr"
 	"gogen/internal/ioutil"
 )
 
@@ -43,6 +45,7 @@ type Executor struct {
 	deleteApproval bool
 	cmdTimeout     time.Duration // 0 = default 2 minutes
 	sandboxMode    string        // off, bwrap
+	maxToolOutput  int           // max bytes retained in-memory per command (0 = unbounded)
 	liveMu         sync.RWMutex
 }
 
@@ -124,6 +127,23 @@ func (e *Executor) sandbox() string {
 	e.liveMu.RLock()
 	defer e.liveMu.RUnlock()
 	return e.sandboxMode
+}
+
+// SetMaxToolOutputBytes caps how much combined stdout+stderr a foreground
+// execute_command retains in memory (web settings modal
+// max_tool_result_bytes; 0 = no cap, per the documented config semantics).
+// The live-output sink is unaffected: it keeps streaming every chunk.
+func (e *Executor) SetMaxToolOutputBytes(max int) {
+	e.liveMu.Lock()
+	e.maxToolOutput = max
+	e.liveMu.Unlock()
+}
+
+// maxToolOutputBytes returns the current per-command output cap (0 = none).
+func (e *Executor) maxToolOutputBytes() int {
+	e.liveMu.RLock()
+	defer e.liveMu.RUnlock()
+	return e.maxToolOutput
 }
 
 // CommandGuardMode returns the current command guard's mode ("blocklist",
@@ -527,12 +547,16 @@ func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// Combined-output writer: accumulates the full output (returned to the
-	// caller exactly as before) while streaming each chunk to the optional
-	// ToolOutputSink so frontends can render live terminal output.
-	out := newCommandOutputWriter(command, ToolOutputFromContext(ctx))
+	// Combined-output writer: accumulates the output returned to the model
+	// (bounded by maxToolOutputBytes when configured) while streaming each
+	// chunk to the optional ToolOutputSink so frontends can render live
+	// terminal output.
+	out := newCommandOutputWriter(command, ToolOutputFromContext(ctx), e.maxToolOutputBytes())
 	err := e.runCommand(ctx, command, nil, out, out)
 	outStr := out.String()
+	if out.overflowed {
+		outStr = e.applyToolOutputCap(outStr)
+	}
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return outStr, fmt.Errorf("command timed out after %s: %s", timeout.Round(time.Second), command)
@@ -545,6 +569,45 @@ func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, 
 	return outStr, nil
 }
 
+// applyToolOutputCap appends the truncation marker when the bounded writer
+// dropped output beyond the configured cap. The writer keeps the FIRST cap
+// bytes — the same prefix the context manager's tool-result cap preserves —
+// so this only reserves room for the marker, mirroring
+// contextmgr.truncateToolResult's budget discipline. The marker shares the
+// manager's standard prefix, so the later truncation pass sees it and leaves
+// the result untouched (no double-marking).
+func (e *Executor) applyToolOutputCap(content string) string {
+	cap := e.maxToolOutputBytes()
+	if cap <= 0 {
+		return content
+	}
+	marker := fmt.Sprintf("\n… truncated (command output exceeds %d bytes)", cap)
+	if len(marker) >= cap {
+		return contextmgr.TruncateRuneSafe(content, cap)
+	}
+	return contextmgr.TruncateRuneSafe(content, cap-len(marker)) + marker
+}
+
+// runeSafeTailStart returns the byte offset at which a tail capped at max
+// bytes of data may start without splitting a UTF-8 rune: the raw cut point
+// (len(data)-max) is advanced forward over continuation bytes until it lands
+// on a rune boundary. A raw byte cut can split a multi-byte character at the
+// start of the shown tail and inject invalid UTF-8 into the tool result —
+// the tail-cut mirror of contextmgr.TruncateRuneSafe (which makes head cuts
+// rune-safe). data is assumed valid UTF-8 (command output usually is; for
+// invalid input the result is never worse than a raw byte cut). Returns 0
+// when the data fits within max, or max <= 0 (no cap).
+func runeSafeTailStart(data []byte, max int) int {
+	if max <= 0 || len(data) <= max {
+		return 0
+	}
+	start := len(data) - max
+	for start < len(data) && !utf8.RuneStart(data[start]) {
+		start++
+	}
+	return start
+}
+
 // outputBuffer is a mutex-guarded byte buffer shared by the command output
 // accumulators. exec copies stdout and stderr to the same writer from
 // separate goroutines, so every mutation is serialized.
@@ -555,17 +618,19 @@ type outputBuffer struct {
 
 // append adds p to the buffer and, when max > 0, trims it to the last max
 // bytes afterwards (so long-running commands cannot grow memory without
-// bound). after, when non-nil, runs while the lock is still held so callers
-// can perform side effects (like forwarding a chunk to a live-output sink)
-// atomically with the buffer update, preserving write ordering.
+// bound). The trim drops from the front on a rune boundary, so the retained
+// tail never starts with a split multi-byte character: bytes.Buffer.Next is
+// a byte cut, and every status/input result built from this buffer would
+// otherwise begin with invalid UTF-8. after, when non-nil, runs while the
+// lock is still held so callers can perform side effects (like forwarding a
+// chunk to a live-output sink) atomically with the buffer update, preserving
+// write ordering.
 func (b *outputBuffer) append(p []byte, max int, after func()) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.buf.Write(p)
 	if max > 0 {
-		if overflow := b.buf.Len() - max; overflow > 0 {
-			b.buf.Next(overflow)
-		}
+		b.buf.Next(runeSafeTailStart(b.buf.Bytes(), max))
 	}
 	if after != nil {
 		after()
@@ -595,36 +660,59 @@ func (b *outputBuffer) string() string {
 // writer for both streams keeps the merged order as close as possible to
 // the child's write order — the same approach CombinedOutput uses.
 //
-// Write may be called concurrently by exec's pipe-copy goroutines, so the
-// sink callback is invoked while holding the internal lock to preserve
-// chunk ordering. Sinks must therefore be fast and must not call back into
-// the executor.
+// When max > 0 the model-facing buffer keeps only the FIRST max bytes (the
+// prefix the context manager's tool-result cap preserves) and stops
+// growing once full, so a noisy command cannot consume unbounded memory for
+// its whole runtime; the sink still receives every chunk, so live terminal
+// output is never capped. Write may be called concurrently by exec's
+// pipe-copy goroutines, so the buffer and the sink callback are serialized
+// by an internal lock to preserve chunk ordering. Sinks must therefore be
+// fast and must not call back into the executor.
 type commandOutputWriter struct {
-	outputBuffer
-	command string
-	sink    ToolOutputSink
+	mu         sync.Mutex
+	buf        bytes.Buffer
+	max        int // 0 = unbounded
+	overflowed bool
+	command    string
+	sink       ToolOutputSink
 }
 
-func newCommandOutputWriter(command string, sink ToolOutputSink) *commandOutputWriter {
-	return &commandOutputWriter{command: command, sink: sink}
+func newCommandOutputWriter(command string, sink ToolOutputSink, max int) *commandOutputWriter {
+	return &commandOutputWriter{command: command, sink: sink, max: max}
 }
 
 func (w *commandOutputWriter) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	w.append(p, 0, func() {
-		if w.sink != nil {
-			w.sink(w.command, string(p))
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.max > 0 {
+		if room := w.max - w.buf.Len(); room > 0 {
+			if len(p) > room {
+				w.buf.Write(p[:room])
+				w.overflowed = true
+			} else {
+				w.buf.Write(p)
+			}
+		} else {
+			w.overflowed = true
 		}
-	})
+	} else {
+		w.buf.Write(p)
+	}
+	if w.sink != nil {
+		w.sink(w.command, string(p))
+	}
 	return len(p), nil
 }
 
 // String returns the accumulated output. Safe to call after Wait returns
 // (exec waits for the pipe-copy goroutines before Wait completes).
 func (w *commandOutputWriter) String() string {
-	return w.string()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
 }
 
 func (e *Executor) ReplaceInFile(path string, search string, replace string, replaceAll bool) (string, error) {

@@ -12,6 +12,30 @@ import (
 	"gogen/internal/llm"
 )
 
+// TestApplyAPIBaselineShrunkConversation pins the truncation guard: when
+// the message list shrank below the recorded baseline (a rollback that did
+// not clear the usage baseline), the stale API count must not be applied
+// verbatim — the locally computed estimate stays.
+func TestApplyAPIBaselineShrunkConversation(t *testing.T) {
+	snap := contextmgr.ContextSnapshot{Used: 1234, Limit: 8000, Percent: 0.154}
+	usage := &llm.Usage{PromptTokens: 5000, CompletionTokens: 100}
+	msgs := []llm.Message{{Role: "user", Content: "hi"}}
+	counts := []int{10}
+	applyAPIBaseline(&snap, msgs, counts, usage, 5000, 4, true)
+	if snap.Used != 1234 || snap.Percent != 0.154 {
+		t.Fatalf("snapshot mutated to Used=%d Percent=%f; want the local estimate unchanged", snap.Used, snap.Percent)
+	}
+
+	// The growth direction is untouched: messages appended since the
+	// baseline add their local estimates on top of the API count.
+	snap2 := contextmgr.ContextSnapshot{Used: 0, Limit: 8000}
+	msgs2 := []llm.Message{{Role: "user", Content: "a"}, {Role: "user", Content: "b"}}
+	applyAPIBaseline(&snap2, msgs2, []int{10, 20}, usage, 5000, 1, true)
+	if snap2.Used != 5020 {
+		t.Fatalf("Used = %d, want 5000 (baseline) + 20 (appended)", snap2.Used)
+	}
+}
+
 type statsStubProvider struct {
 	limit        int
 	models       []llm.ModelInfo

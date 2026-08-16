@@ -307,10 +307,13 @@ func (e *Executor) searchRoot(subpath string) (absRoot, relPrefix string, err er
 }
 
 // runRipgrep runs rg with the standard search arguments and returns the
-// trimmed combined output. A non-zero exit (including rg's exit code 1 for
-// "no matches") is returned as an *exec.ExitError; callers distinguish the
-// no-match case via errors.As.
-func runRipgrep(ctx context.Context, searchRoot, pattern, glob string, contextLines int) (string, error) {
+// trimmed combined output, capped at searchMaxOutputBytes. rg's --max-count
+// is PER FILE, so a repo with many matching files could otherwise produce
+// unbounded output; the writer keeps the first searchMaxOutputBytes and the
+// overflowed flag reports whether anything was dropped. A non-zero exit
+// (including rg's exit code 1 for "no matches") is returned as an
+// *exec.ExitError; callers distinguish the no-match case via errors.As.
+func runRipgrep(ctx context.Context, searchRoot, pattern, glob string, contextLines int) (text string, overflowed bool, err error) {
 	args := []string{
 		"-n",
 		"--no-heading",
@@ -329,12 +332,24 @@ func runRipgrep(ctx context.Context, searchRoot, pattern, glob string, contextLi
 
 	cmd := exec.CommandContext(ctx, "rg", args...)
 	cmd.Dir = searchRoot
-	out, err := cmd.CombinedOutput()
-	return strings.TrimSpace(string(out)), err
+	out := newCommandOutputWriter("rg", nil, searchMaxOutputBytes)
+	cmd.Stdout = out
+	cmd.Stderr = out
+	runErr := cmd.Run()
+	return strings.TrimSpace(out.String()), out.overflowed, runErr
+}
+
+// appendRgTruncationNotice appends the standard truncation footer when rg
+// output was capped at searchMaxOutputBytes (see runRipgrep).
+func appendRgTruncationNotice(out string, overflowed bool) string {
+	if !overflowed {
+		return out
+	}
+	return out + fmt.Sprintf("\n… truncated (output exceeds %d bytes)", searchMaxOutputBytes)
 }
 
 func (e *Executor) searchWithRipgrep(ctx context.Context, searchRoot, relPrefix, pattern, glob string, contextLines int) (string, error) {
-	text, err := runRipgrep(ctx, searchRoot, pattern, glob, contextLines)
+	text, overflowed, err := runRipgrep(ctx, searchRoot, pattern, glob, contextLines)
 	if err != nil {
 		if ctx.Err() != nil {
 			if text != "" {
@@ -347,38 +362,68 @@ func (e *Executor) searchWithRipgrep(ctx context.Context, searchRoot, relPrefix,
 			return "No matches found", nil
 		}
 		if text != "" {
-			return formatSearchOutput("rg", relPrefix, text), nil
+			return appendRgTruncationNotice(formatSearchOutput("rg", relPrefix, text), overflowed), nil
 		}
 		return "", fmt.Errorf("rg failed: %w", err)
 	}
 	if text == "" {
 		return "No matches found", nil
 	}
-	return formatSearchOutput("rg", relPrefix, text), nil
+	return appendRgTruncationNotice(formatSearchOutput("rg", relPrefix, text), overflowed), nil
 }
 
 // searchWithRipgrepMatches runs ripgrep and returns structured matches
-// (context_lines=0 semantics). Nil matches mean "no matches found"; an error
-// means the caller should fall back to the Go walker.
-func (e *Executor) searchWithRipgrepMatches(ctx context.Context, searchRoot, relPrefix, pattern, glob string) ([]SearchMatch, error) {
-	text, err := runRipgrep(ctx, searchRoot, pattern, glob, 0)
+// (context_lines=0 semantics), capped at the same total-match and byte
+// budgets as the Go fallback so both engines report identical limits.
+// Nil matches mean "no matches found"; truncated reports that the result
+// set hit a cap; an error means the caller should fall back to the Go
+// walker.
+func (e *Executor) searchWithRipgrepMatches(ctx context.Context, searchRoot, relPrefix, pattern, glob string) ([]SearchMatch, bool, error) {
+	text, overflowed, err := runRipgrep(ctx, searchRoot, pattern, glob, 0)
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, false, ctx.Err()
 		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && text == "" {
-			return nil, nil // no matches
+			return nil, false, nil // no matches
 		}
 		if text != "" {
-			return parseRgMatches(text, relPrefix), nil
+			ms, truncated := capRgMatches(parseRgMatches(text, relPrefix))
+			return ms, truncated || overflowed, nil
 		}
-		return nil, fmt.Errorf("rg failed: %w", err)
+		return nil, false, fmt.Errorf("rg failed: %w", err)
 	}
 	if text == "" {
-		return nil, nil
+		return nil, false, nil
 	}
-	return parseRgMatches(text, relPrefix), nil
+	ms, truncated := capRgMatches(parseRgMatches(text, relPrefix))
+	return ms, truncated || overflowed, nil
+}
+
+// capRgMatches applies the same total-match and byte budgets the Go
+// fallback uses (searchMaxMatches matches, searchMaxOutputBytes of rendered
+// "path:line:content" lines), so the rg engine reports identical limits and
+// the truncation flag becomes truthful.
+func capRgMatches(matches []SearchMatch) ([]SearchMatch, bool) {
+	truncated := false
+	var size int
+	out := make([]SearchMatch, 0, len(matches))
+	for _, m := range matches {
+		if len(out) >= searchMaxMatches {
+			truncated = true
+			break
+		}
+		// Same byte accounting as the Go fallback's "path:line:content" line.
+		lineLen := len(m.Path) + 1 + len(strconv.Itoa(m.Line)) + 1 + len(m.Text)
+		if size+lineLen+1 > searchMaxOutputBytes {
+			truncated = true
+			break
+		}
+		out = append(out, m)
+		size += lineLen + 1
+	}
+	return out, truncated
 }
 
 // parseRgMatches converts rg's "path:line:content" output into structured
@@ -446,9 +491,9 @@ func splitSearchMatchLine(line string) (path string, lineNum int, content string
 // footer SearchCode shows.
 func (e *Executor) searchStructured(ctx context.Context, searchRoot, relPrefix, pattern, glob string) (matches []SearchMatch, truncated bool, engine string, err error) {
 	if _, err := exec.LookPath("rg"); err == nil {
-		ms, rgErr := e.searchWithRipgrepMatches(ctx, searchRoot, relPrefix, pattern, glob)
+		ms, trunc, rgErr := e.searchWithRipgrepMatches(ctx, searchRoot, relPrefix, pattern, glob)
 		if rgErr == nil {
-			return ms, false, "rg", nil
+			return ms, trunc, "rg", nil
 		}
 		// Real rg failure — fall back to the Go walker (matches SearchCode).
 	}

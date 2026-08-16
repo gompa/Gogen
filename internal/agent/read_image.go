@@ -100,6 +100,19 @@ func handleReadImage(ctx context.Context, a *Agent, args map[string]interface{})
 	return fmt.Sprintf("Image attached to context: %s (%s, %s, detail=%s)", path, mime, formatByteSize(size), displayDetail), nil
 }
 
+// countImages returns the number of read_image attachments across msgs.
+// Used to re-derive the per-session image budget whenever the message list
+// is replaced or truncated wholesale (compaction, restore, fork, reset,
+// rollback): attachments that survive keep counting, dropped ones release
+// their slots. Without this the counter only ever grows.
+func countImages(msgs []llm.Message) int32 {
+	var n int32
+	for i := range msgs {
+		n += int32(len(msgs[i].Images))
+	}
+	return n
+}
+
 // reserveImageSlot claims one slot of the per-session image budget
 // (maxSessionImages). read_image handlers can run concurrently in parallel
 // read-only batches, so the counter is atomic and the claim is a CAS loop.

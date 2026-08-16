@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
@@ -148,5 +149,27 @@ func TestSubagentToolRequiresJob(t *testing.T) {
 	a.SetSubagentSpawner(&fakeSpawner{report: "ok"})
 	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "subagent", Args: map[string]interface{}{}}); err == nil {
 		t.Fatal("missing job should fail")
+	}
+}
+
+// TestSubagentLabelTruncatesRuneSafe pins the sidebar-label truncation: a
+// job whose first line exceeds 60 RUNES is cut at the rune boundary, never
+// mid-character (a byte cut would emit invalid UTF-8 into the label).
+func TestSubagentLabelTruncatesRuneSafe(t *testing.T) {
+	job := ""
+	for i := 0; i < 65; i++ {
+		job += "é"
+	}
+	got := SubagentLabel(job)
+	want := "subagent: " + string([]rune(job)[:60]) + "…"
+	if got != want {
+		t.Fatalf("SubagentLabel = %q, want %q", got, want)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("SubagentLabel is not valid UTF-8: %q", got)
+	}
+	// Short labels are untouched.
+	if short := SubagentLabel("short job"); short != "subagent: short job" {
+		t.Fatalf("SubagentLabel(short) = %q", short)
 	}
 }

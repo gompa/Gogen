@@ -642,6 +642,7 @@ func (a *Agent) replaceMessages(msgs []llm.Message) {
 	a.Messages = msgs
 	a.tokenCounts = nil
 	a.countsEpoch++
+	a.sessionImages.Store(countImages(msgs))
 	a.statsMu.Unlock()
 }
 
@@ -656,6 +657,7 @@ func (a *Agent) replaceMessagesWithCounts(msgs []llm.Message, counts []int) {
 	a.Messages = msgs
 	a.tokenCounts = counts
 	a.countsEpoch++
+	a.sessionImages.Store(countImages(msgs))
 	a.statsMu.Unlock()
 }
 
@@ -683,6 +685,7 @@ func (a *Agent) restoreMessages(msgs []llm.Message, counts []int) {
 			tc.ArgsJSONValid = tc.ArgsStr != "" && tc.ArgsStr == s && json.Valid([]byte(s))
 		}
 	}
+	a.sessionImages.Store(countImages(msgs))
 	a.statsMu.Unlock()
 }
 
@@ -696,6 +699,7 @@ func (a *Agent) truncateMessages(n int) {
 		a.tokenCounts = a.tokenCounts[:len(a.Messages)]
 	}
 	a.countsEpoch++
+	a.sessionImages.Store(countImages(a.Messages))
 	a.statsMu.Unlock()
 }
 

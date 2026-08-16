@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -119,11 +120,70 @@ func TestNormalizePatchPathStripsTimestampsAndQuotes(t *testing.T) {
 		"b/foo.txt 2024-01-01 12:00:00":                  "foo.txt",
 		`"b/foo bar.txt"`:                                "foo bar.txt",
 		"a/foo.txt":                                      "foo.txt",
+		// Exactly one prefix is stripped: a file literally named
+		// "b/foo.txt" appears as "a/b/foo.txt" and must resolve to
+		// "b/foo.txt", not "foo.txt".
+		"a/b/foo.txt": "b/foo.txt",
 	}
 	for in, want := range cases {
 		got := normalizePatchPath(in)
 		if got != want {
 			t.Fatalf("normalizePatchPath(%q)=%q want %q", in, got, want)
+		}
+	}
+}
+
+// TestPlanPatchDevNullTimestampDelete pins the /dev/null detection fix:
+// git appends a tab-timestamp to delete headers ("+++ /dev/null\t2024-…"),
+// which must still classify the section as a delete.
+func TestPlanPatchDevNullTimestampDelete(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "old.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exec := NewExecutor(dir)
+	plan, label, err := exec.planPatch(patchFile{
+		oldName: "a/old.txt",
+		newName: "/dev/null\t2024-01-01 12:00:00.000000000 +0000",
+	}, false)
+	if err != nil {
+		t.Fatalf("planPatch: %v", err)
+	}
+	if !plan.delete || plan.target != "old.txt" {
+		t.Fatalf("plan = %+v, want delete of old.txt", plan)
+	}
+	if label != "old.txt (validated delete)" {
+		t.Fatalf("label = %q", label)
+	}
+}
+
+// TestPlanPatchDevNullTimestampCreate pins the same fix for the create side:
+// "--- /dev/null\t2024-…" must classify the section as a create.
+func TestPlanPatchDevNullTimestampCreate(t *testing.T) {
+	dir := t.TempDir()
+	exec := NewExecutor(dir)
+	plan, label, err := exec.planPatch(patchFile{
+		oldName: "/dev/null\t2024-01-01 12:00:00.000000000 +0000",
+		newName: "b/new.txt",
+	}, false)
+	if err != nil {
+		t.Fatalf("planPatch: %v", err)
+	}
+	if !plan.create || plan.target != "new.txt" {
+		t.Fatalf("plan = %+v, want create of new.txt", plan)
+	}
+	if label != "new.txt (validated create)" {
+		t.Fatalf("label = %q", label)
+	}
+}
+
+// TestParseHunkHeaderRejectsDegenerate pins the hardening: a header whose
+// sides carry no line numbers ("@@ - + @@") must fail loudly instead of
+// silently defaulting to line 1/count 1 and mis-positioning the hunk.
+func TestParseHunkHeaderRejectsDegenerate(t *testing.T) {
+	for _, h := range []string{"@@ - + @@", "@@- +@@", "@@ -1,2 + @@"} {
+		if _, err := parseHunkHeader(h); err == nil {
+			t.Fatalf("parseHunkHeader(%q) succeeded, want error", h)
 		}
 	}
 }
@@ -1650,6 +1710,147 @@ func TestParseUnifiedDiffRepeatedPlusPlusSameFile(t *testing.T) {
 	}
 	if len(files[0].hunks) != 2 {
 		t.Fatalf("expected 2 hunks merged into one file, got %d", len(files[0].hunks))
+	}
+}
+
+func TestParseUnifiedDiffUnderDeclaredHunkThenDroppedPlusPlus(t *testing.T) {
+	// Regression: a hunk whose declared counts exceed its emitted lines (LLM
+	// under-counting) never reaches hunkComplete, so the next file's "+++ "
+	// header with its "--- " dropped used to be absorbed as an ADDED hunk
+	// line ("++ b/b.txt") — silently injecting a bogus line into a.txt on
+	// apply. The isSectionMarkerAhead lookahead must recognize the header
+	// (it is always followed by the section's "@@" marker) and start a new
+	// section for b/b.txt instead.
+	diff := "" +
+		"--- a/a.txt\n" +
+		"+++ b/a.txt\n" +
+		"@@ -1,5 +1,5 @@\n" +
+		" one\n" +
+		" two\n" +
+		" three\n" +
+		"+++ b/b.txt\n" + // --- header for b.txt was dropped
+		"@@ -1,1 +1,1 @@\n" +
+		" x\n"
+	files, err := parseUnifiedDiff(diff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("files=%d want 2: %#v", len(files), files)
+	}
+	if normalizePatchPath(files[0].newName) != "a.txt" || normalizePatchPath(files[1].newName) != "b.txt" {
+		t.Fatalf("newNames=%q %q, want a.txt and b.txt", files[0].newName, files[1].newName)
+	}
+	if len(files[0].hunks) != 1 || len(files[1].hunks) != 1 {
+		t.Fatalf("hunks=%d %d want 1 and 1", len(files[0].hunks), len(files[1].hunks))
+	}
+	h0 := files[0].hunks[0]
+	if !reflect.DeepEqual(h0.oldLines, []string{"one", "two", "three"}) {
+		t.Fatalf("a.txt hunk oldLines corrupted: %#v", h0.oldLines)
+	}
+	if !reflect.DeepEqual(h0.newLines, []string{"one", "two", "three"}) {
+		t.Fatalf("a.txt hunk newLines corrupted (must not absorb the +++ header): %#v", h0.newLines)
+	}
+}
+
+func TestPatchFileUnderDeclaredHunkThenDroppedPlusPlus(t *testing.T) {
+	// End-to-end: the same layout must apply cleanly to BOTH files with no
+	// bogus "++ b/b.txt" line injected into a.txt. This is the silent-
+	// corruption regression: before the fix the parse succeeded and the
+	// patched a.txt gained a foreign line with no error.
+	dir := t.TempDir()
+	pathA := filepath.Join(dir, "a.txt")
+	pathB := filepath.Join(dir, "b.txt")
+	if err := os.WriteFile(pathA, []byte("one\ntwo\nthree\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pathB, []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	diff := "" +
+		"--- a/a.txt\n" +
+		"+++ b/a.txt\n" +
+		"@@ -1,5 +1,5 @@\n" +
+		" one\n" +
+		" two\n" +
+		" three\n" +
+		"+++ b/b.txt\n" + // --- header for b.txt was dropped
+		"@@ -1,1 +1,1 @@\n" +
+		" x\n"
+	exec := NewExecutor(dir)
+	exec.SetDeleteApproval(false)
+	if _, err := exec.PatchFile(context.Background(), diff, false, true); err != nil {
+		t.Fatalf("PatchFile: %v", err)
+	}
+	gotA, err := os.ReadFile(pathA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotA) != "one\ntwo\nthree\n" {
+		t.Fatalf("a.txt=%q want unchanged %q (bogus line injected?)", string(gotA), "one\ntwo\nthree\n")
+	}
+	gotB, err := os.ReadFile(pathB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotB) != "x\n" {
+		t.Fatalf("b.txt=%q want %q", string(gotB), "x\n")
+	}
+}
+
+func TestParseUnifiedDiffUnderDeclaredHunkThenRepeatedPlusPlusSameFile(t *testing.T) {
+	// A repeated "+++ " header for the SAME file between hunks, with the
+	// first hunk under-declared, must keep collecting hunks into one
+	// section — not absorb the header as an added line.
+	diff := "" +
+		"--- a/foo.txt\n" +
+		"+++ b/foo.txt\n" +
+		"@@ -1,5 +1,5 @@\n" +
+		" one\n" +
+		" two\n" +
+		" three\n" +
+		"+++ b/foo.txt\n" + // repeated header, first hunk under-declared
+		"@@ -2,1 +2,2 @@\n" +
+		" two\n" +
+		"+three\n"
+	files, err := parseUnifiedDiff(diff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("files=%d want 1: %#v", len(files), files)
+	}
+	if len(files[0].hunks) != 2 {
+		t.Fatalf("hunks=%d want 2", len(files[0].hunks))
+	}
+	if !reflect.DeepEqual(files[0].hunks[0].newLines, []string{"one", "two", "three"}) {
+		t.Fatalf("hunk 1 newLines corrupted (must not absorb the +++ header): %#v", files[0].hunks[0].newLines)
+	}
+}
+
+func TestParseUnifiedDiffPlusPlusContentLineStaysInHunk(t *testing.T) {
+	// A genuine added line whose content starts with "++" (wire "+++ X",
+	// e.g. C "++i;" at line start) must stay hunk content when it is NOT
+	// followed by a section marker — the isSectionMarkerAhead lookahead must
+	// not over-fire on content.
+	diff := "" +
+		"--- a/x.c\n" +
+		"+++ b/x.c\n" +
+		"@@ -1,1 +1,3 @@\n" +
+		" int a = 0;\n" +
+		"+int b = 1;\n" +
+		"+++i;\n" // added line with content "++i;"
+	files, err := parseUnifiedDiff(diff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("files=%d want 1: %#v", len(files), files)
+	}
+	h := files[0].hunks[0]
+	want := []string{"int a = 0;", "int b = 1;", "++i;"}
+	if !reflect.DeepEqual(h.newLines, want) {
+		t.Fatalf("newLines=%#v want %#v", h.newLines, want)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestExecuteCommandPreservesOutputOnFailure(t *testing.T) {
@@ -201,6 +202,66 @@ func TestExecuteCommandStreamsOutputToSink(t *testing.T) {
 	}
 }
 
+// TestExecuteCommandOutputBounded pins the in-memory output cap: a command
+// producing more than the configured cap returns the first cap bytes plus
+// the standard truncation marker (same prefix the context manager uses, so
+// its later pass does not double-mark), while the live sink still receives
+// every chunk uncapped.
+func TestExecuteCommandOutputBounded(t *testing.T) {
+	dir := t.TempDir()
+	exec := NewExecutor(dir)
+	exec.SetMaxToolOutputBytes(64)
+
+	var mu sync.Mutex
+	var joined strings.Builder
+	sink := func(_ string, chunk string) {
+		mu.Lock()
+		joined.WriteString(chunk)
+		mu.Unlock()
+	}
+
+	// Deterministic 100-byte payload: 10 x 10 chars.
+	cmd := "seq 1 10 | awk '{printf \"0123456789\"}'"
+	out, err := exec.ExecuteCommand(
+		ContextWithToolOutput(context.Background(), sink),
+		cmd,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	sinkOut := joined.String()
+	mu.Unlock()
+	if len(sinkOut) != 100 {
+		t.Fatalf("sink received %d bytes, want the full 100 (sink is never capped)", len(sinkOut))
+	}
+	if len(out) > 64 {
+		t.Fatalf("capped output = %d bytes, want <= 64", len(out))
+	}
+	// The marker length is reserved inside the cap, so the payload prefix
+	// ends before it; the FIRST bytes must still be preserved.
+	if !strings.HasPrefix(out, "0123456789012345") {
+		t.Fatalf("capped output must keep the FIRST bytes, got %q", out)
+	}
+	if !strings.Contains(out, "\n… truncated (") {
+		t.Fatalf("capped output must carry the standard truncation marker, got %q", out)
+	}
+
+	// 0 = explicitly uncapped: byte-identical to the sink.
+	exec.SetMaxToolOutputBytes(0)
+	out2, err := exec.ExecuteCommand(
+		ContextWithToolOutput(context.Background(), sink),
+		cmd,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out2) != 100 {
+		t.Fatalf("uncapped output = %d bytes, want the full 100", len(out2))
+	}
+}
+
 func TestExecuteCommandSinkReceivesPartialOutputOnTimeout(t *testing.T) {
 	dir := t.TempDir()
 	exec := NewExecutor(dir)
@@ -277,5 +338,91 @@ func TestLargeFileSearchSkipsTotalDrain(t *testing.T) {
 	}
 	if !strings.Contains(out, "needle-here") {
 		t.Fatalf("expected match content in output, got: %q", out)
+	}
+}
+
+// TestRuneSafeTailStart verifies the tail-cut counterpart of
+// contextmgr.TruncateRuneSafe: for every byte cap, the tail starting at the
+// returned offset is at most max bytes, valid UTF-8, and begins on a rune
+// boundary (never with a split multi-byte character).
+func TestRuneSafeTailStart(t *testing.T) {
+	const s = "日本語テキスト" // 7 runes × 3 bytes = 21 bytes
+	data := []byte(s)
+	for max := 1; max <= len(data); max++ {
+		start := runeSafeTailStart(data, max)
+		tail := data[start:]
+		if len(tail) > max {
+			t.Fatalf("max %d: tail length %d exceeds max", max, len(tail))
+		}
+		if !utf8.Valid(tail) {
+			t.Fatalf("max %d: tail %q is not valid UTF-8", max, tail)
+		}
+		if len(tail) > 0 && !utf8.RuneStart(tail[0]) {
+			t.Fatalf("max %d: tail %q starts mid-rune", max, tail)
+		}
+	}
+	// Exact cuts: the tail keeps the LAST bytes, backed off to a rune
+	// boundary when the raw cut lands inside a rune.
+	for _, tc := range []struct {
+		max  int
+		want string
+	}{
+		{3, "ト"},  // raw cut at byte 18 lands on a rune start
+		{5, "ト"},  // raw cut at byte 16 lands inside ス (bytes 15-17); backs off to 18
+		{6, "スト"}, // raw cut at byte 15 lands on a rune start
+		{9, "キスト"},
+		{21, s},
+	} {
+		if got := string(data[runeSafeTailStart(data, tc.max):]); got != tc.want {
+			t.Errorf("max %d: got %q, want %q", tc.max, got, tc.want)
+		}
+	}
+	// No-op cases.
+	if got := runeSafeTailStart(data, len(data)); got != 0 {
+		t.Errorf("max == len: got %d, want 0", got)
+	}
+	if got := runeSafeTailStart(data, 100); got != 0 {
+		t.Errorf("max > len: got %d, want 0", got)
+	}
+	if got := runeSafeTailStart(data, 0); got != 0 {
+		t.Errorf("max 0 (no cap): got %d, want 0", got)
+	}
+}
+
+// TestOutputBufferTailRuneSafe pins the bounded-tail trim to a rune
+// boundary: bytes.Buffer.Next is a byte cut, and when the overflow drops
+// bytes up to the middle of a multi-byte rune, the retained tail must start
+// at the next rune boundary instead of leading with an invalid partial
+// character (every status/input result built from the buffer would
+// otherwise start with invalid UTF-8).
+func TestOutputBufferTailRuneSafe(t *testing.T) {
+	var b outputBuffer
+	// 7 ASCII bytes + 界 (bytes 7-9) + 8 ASCII bytes = 18 bytes; the raw
+	// 10-byte cut (drop 8) lands inside the 界, so the rune-safe trim must
+	// drop through byte 9 and keep only the trailing ASCII.
+	b.append([]byte("abcdefg"), 10, nil)
+	b.append([]byte("界"), 10, nil)
+	b.append([]byte("hijklmno"), 10, nil)
+	got := b.string()
+	if got != "hijklmno" {
+		t.Fatalf("retained tail = %q, want %q", got, "hijklmno")
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("retained tail is not valid UTF-8: %q", got)
+	}
+	// drain returns the same rune-safe content to the input-delta path.
+	if drained := b.drain(); drained != "hijklmno" || !utf8.ValidString(drained) {
+		t.Fatalf("drained tail = %q, want rune-safe %q", drained, "hijklmno")
+	}
+}
+
+// TestOutputBufferTailKeepsWithinCapUntouched verifies the trim is a no-op
+// while the buffer fits within max, including a multi-byte rune at the end.
+func TestOutputBufferTailKeepsWithinCapUntouched(t *testing.T) {
+	var b outputBuffer
+	payload := []byte("abcdefg界")
+	b.append(payload, 10, nil)
+	if got := b.string(); got != string(payload) {
+		t.Fatalf("within-cap buffer = %q, want untouched %q", got, payload)
 	}
 }

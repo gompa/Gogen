@@ -530,3 +530,55 @@ func TestSearchCodeGoFallbackConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestCapRgMatches applies the Go fallback's budgets to rg-parsed matches:
+// the total-match cap (searchMaxMatches) and the byte cap
+// (searchMaxOutputBytes), with the truncation flag set when either binds.
+func TestCapRgMatches(t *testing.T) {
+	mk := func(n int) []SearchMatch {
+		out := make([]SearchMatch, n)
+		for i := range out {
+			out[i] = SearchMatch{Path: "pkg/file.go", Line: i + 1, Text: "needle"}
+		}
+		return out
+	}
+	// Under the caps: no truncation, all matches kept.
+	small := mk(10)
+	got, trunc := capRgMatches(small)
+	if trunc || len(got) != 10 {
+		t.Fatalf("small: truncated=%v len=%d want false/10", trunc, len(got))
+	}
+	// Over the match cap: exactly searchMaxMatches, truncated.
+	big := mk(searchMaxMatches + 50)
+	got, trunc = capRgMatches(big)
+	if !trunc || len(got) != searchMaxMatches {
+		t.Fatalf("big: truncated=%v len=%d want true/%d", trunc, len(got), searchMaxMatches)
+	}
+	// Over the byte cap: truncated with a prefix of the matches. The match
+	// cap (200) binds first for short lines, so the byte cap is exercised
+	// with long lines: 180 matches x ~3KB of text ≈ 540KB > 512KB.
+	long := make([]SearchMatch, 180)
+	for i := range long {
+		long[i] = SearchMatch{Path: "pkg/file.go", Line: i + 1, Text: strings.Repeat("x", 3000)}
+	}
+	got, trunc = capRgMatches(long)
+	if !trunc {
+		t.Fatal("byte cap: expected truncated=true")
+	}
+	if len(got) >= len(long) {
+		t.Fatalf("byte cap: expected fewer than %d matches, got %d", len(long), len(got))
+	}
+}
+
+// TestAppendRgTruncationNotice pins the truncation footer for capped rg
+// output (context-lines mode).
+func TestAppendRgTruncationNotice(t *testing.T) {
+	got := appendRgTruncationNotice("some output", false)
+	if got != "some output" {
+		t.Fatalf("no-overflow must be unchanged, got %q", got)
+	}
+	got = appendRgTruncationNotice("some output", true)
+	if !strings.Contains(got, "truncated (output exceeds") {
+		t.Fatalf("expected truncation notice, got %q", got)
+	}
+}

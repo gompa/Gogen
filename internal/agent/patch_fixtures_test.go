@@ -52,8 +52,17 @@ func TestPatchFixtures(t *testing.T) {
 				t.Fatal("parseUnifiedDiff returned no file sections")
 			}
 			for _, pf := range files {
-				oldPath := strings.TrimPrefix(pf.oldName, "a/")
-				newPath := strings.TrimPrefix(pf.newName, "b/")
+				// Normalize exactly like planPatch: strip one a//b/ prefix
+				// and any tab-timestamp, so fixtures can carry real git
+				// header shapes (timestamped /dev/null, b/-prefixed names).
+				oldPath := ""
+				if pf.oldName != "" {
+					oldPath = normalizePatchPath(pf.oldName)
+				}
+				newPath := ""
+				if pf.newName != "" {
+					newPath = normalizePatchPath(pf.newName)
+				}
 				if oldPath == "" {
 					// A section with only a +++ header (the --- was dropped)
 					// modifies the file named by the new header.

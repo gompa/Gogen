@@ -91,6 +91,13 @@ func (a *Agent) runToolRound(ctx context.Context, h *llm.StreamHandlers, toolCal
 		// Mutating tools (patch_file included) are never parallel-eligible,
 		// so the patch-turn stop cannot occur on this path.
 		if a.executeToolCallsParallel(ctx, h, toolCalls) {
+			// The cancelled round's assistant message and tool results were
+			// appended in memory; persist them now. Without this flush the
+			// session is left CLEAN with unsaved state, and the shutdown /
+			// eviction sweep (FlushPending writes only dirty sessions) and
+			// the TUI's /resume (flushes only when dirty) would silently
+			// lose the round. Mirrors the sequential cancel path above.
+			a.FlushSession()
 			return toolRoundCancelled, ""
 		}
 		return toolRoundContinue, ""

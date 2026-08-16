@@ -258,6 +258,13 @@ func matchGlobPattern(pattern, relPath string) bool {
 	if pattern == "" {
 		return false
 	}
+	// A lone "**" is globstar for "everything": the regex translation below
+	// would render it as ^(?:.*/)?$ (the leading-** branch wins over the
+	// trailing-** branch for a single segment), which matches only empty or
+	// directory-trailing paths — never files.
+	if pattern == "**" {
+		return true
+	}
 	// Handle ** (zero or more directories) by converting to a regex.
 	if !strings.Contains(pattern, "/") {
 		base := relPath

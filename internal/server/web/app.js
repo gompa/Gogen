@@ -108,9 +108,11 @@
             el.textContent = message;
             el.addEventListener('click', () => el.remove());
             toastHost.appendChild(el);
+            // Errors need more reading time than info pings.
+            const ttl = kind === 'error' ? 8000 : 3000;
             setTimeout(() => {
                 el.remove();
-            }, 3000);
+            }, ttl);
         }
         setToastHandler(showToast);
 
@@ -1068,6 +1070,12 @@
         let ws;
         let reconnectTimer;
         let wasDisconnected = false;
+        // Reconnect delay doubles per failed attempt and resets on a
+        // successful open, so a down server is probed at 3s, 6s, 12s, …
+        // up to the 30s cap instead of hammered every 3s.
+        const RECONNECT_BASE_MS = 3000;
+        const RECONNECT_MAX_MS = 30000;
+        let reconnectDelay = RECONNECT_BASE_MS;
         // Sticky auto-scroll. Cleared immediately on user scroll-up; re-enabled
         // only when the user returns near the bottom (or clicks the jump button).
         let stickToBottom = true;
@@ -1131,12 +1139,20 @@
         // Monotonic counter for message positions (used for forking)
         let msgIdxCounter = 0;
 
+        // Screen-reader live region: announces turn lifecycle without
+        // reading the streaming transcript token-by-token.
+        const srLive = document.getElementById('sr-live');
+        function announceLive(text) {
+            if (srLive && text) srLive.textContent = text;
+        }
+
         let _prevTurnActive = false;
         function setTurnActive(active, opts) {
             const silent = !!(opts && opts.silent);
             const noMirror = !!(opts && opts.noMirror);
             const wasActive = _prevTurnActive;
             turnActive = !!active;
+            if (turnActive && !wasActive) announceLive('Agent started responding.');
             if (cancelBtn) cancelBtn.disabled = !turnActive;
             if (sendBtn) sendBtn.disabled = false; // send cancels+restarts; keep enabled
             // Toggle class so Send/Cancel swap places
@@ -1171,11 +1187,13 @@
             _prevTurnActive = turnActive;
             if (wasActive && !turnActive && suppressTurnEnds === 0 && !silent) {
                 if (lastTurnError) {
+                    announceLive('Agent stopped with an error.');
                     // The model stopped on an error: say so in the notification
                     // instead of the misleading "Agent finished responding.".
                     sendNotification('GoGen — Error', lastTurnError, 'gogen-turn-error');
                     lastTurnError = null;
                 } else {
+                    announceLive('Agent finished responding.');
                     sendNotification('GoGen', 'Agent finished responding.', 'gogen-turn-end');
                 }
             }
@@ -4114,6 +4132,7 @@
             ws.onopen = () => {
                 clearTimeout(reconnectTimer);
                 reconnectTimer = null;
+                reconnectDelay = RECONNECT_BASE_MS;
                 setConnState('connected');
                 // Replace (don't append) on every connect: the server may omit
                 // history when the session is empty, and reconnect must not
@@ -4251,7 +4270,8 @@
                 clearTimeout(reconnectTimer);
                 setConnState('reconnecting');
                 wasDisconnected = true;
-                reconnectTimer = setTimeout(connect, 3000);
+                reconnectTimer = setTimeout(connect, reconnectDelay);
+                reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
             };
         }
 
@@ -5885,7 +5905,10 @@
             const text = inputArea.value.trim();
             if (!text && pendingAttachments.length === 0) return;
             if (!ws || ws.readyState !== WebSocket.OPEN) {
-                appendMessage('system', 'Not connected — wait for reconnection.');
+                // Toast, not a transcript message: the reconnect already
+                // rebuilds the transcript, so a system bubble here would be
+                // transient junk that survives into exports.
+                showToast('Not connected — wait for reconnection.', 'error');
                 return;
             }
             if (!activePane() || !activePane().id) {
@@ -5947,6 +5970,11 @@
             ws.send(JSON.stringify(payload));
             inputArea.value = '';
             clearAttachments();
+            // Mouse-click sends leave focus on the Send button; hand it
+            // back to the composer. Guarded so Enter-sends (already
+            // focused) and starter-prompt clicks (focus elsewhere) are
+            // untouched — no keyboard yank on mobile.
+            if (document.activeElement === sendBtn) inputArea.focus();
         }
         sendBtn.onclick = sendMessage;
 
@@ -6513,6 +6541,25 @@
             }},
             { id: 'pane-chat', label: 'Switch to Chat', hint: '', run: () => switchMainPane('chat') },
             { id: 'pane-editor', label: 'Switch to Editor', hint: '', run: () => switchMainPane('editor') },
+            { id: 'keybindings', label: 'Keyboard shortcuts', hint: '', run: () => {
+                const overlay = document.getElementById('keybindings-overlay');
+                if (overlay) openModal(overlay);
+            }},
+            { id: 'pane-board', label: 'Switch to Board', hint: '', run: () => {
+                // Board tab is hidden until the feature is enabled; never
+                // switch to a pane that renders nothing.
+                if (!boardTabVisible()) {
+                    showToast('Board is disabled in settings', 'info');
+                    return;
+                }
+                switchMainPane('board');
+            }},
+            { id: 'toggle-terminal', label: 'Toggle terminal', hint: 'Ctrl+`', run: () => {
+                // Same branch as the Ctrl+` handler: mobile gets the
+                // full-screen terminal, desktop toggles the strip.
+                if (terminalIsMobile()) terminalOpenMobile();
+                else terminalSetExpanded(!terminalExpanded);
+            }},
             { id: 'find-files', label: 'Find in files', hint: 'Ctrl+Shift+F', run: () => focusFindInFiles() },
             { id: 'export', label: 'Export chat', hint: 'Ctrl+Shift+E', run: () => exportChat() },
             { id: 'undo', label: 'Undo', hint: 'Ctrl+Z', run: () => editorUndo() },
@@ -6542,6 +6589,25 @@
                 showToast(`Notifications: ${next === 'off' ? 'off' : 'on (' + next + ')'}`, 'info');
             }},
         ];
+        // Slash commands are also reachable from the palette. Picking one
+        // PREFILLS the composer — never auto-sends: /new, /resume and /fork
+        // re-key the pane, and that must stay a deliberate Enter press.
+        // This keeps the palette free of any session-state coupling.
+        for (const c of SLASH_COMMANDS) {
+            PALETTE_COMMANDS.push({
+                id: 'slash-' + c.name.slice(1),
+                label: c.name,
+                hint: c.description,
+                run: () => {
+                    closePalette();
+                    inputArea.value = c.name + ' ';
+                    inputArea.focus();
+                    // Re-run the composer's input handling so command-mode
+                    // styling and slash suggestions react to the fill.
+                    inputArea.dispatchEvent(new Event('input', { bubbles: true }));
+                },
+            });
+        }
         let paletteMatches = [];
         let paletteIndex = 0;
 
@@ -6561,6 +6627,16 @@
         function renderPalette() {
             const q = paletteInput.value.trim().toLowerCase();
             paletteMatches = PALETTE_COMMANDS.filter((c) => !q || c.label.toLowerCase().includes(q) || c.id.includes(q));
+            if (q) {
+                // Prefix matches rank above substring matches (stable sort,
+                // so equal-rank entries keep array order).
+                paletteMatches.sort((a, b) => {
+                    const aPre = a.label.toLowerCase().startsWith(q);
+                    const bPre = b.label.toLowerCase().startsWith(q);
+                    if (aPre !== bPre) return aPre ? -1 : 1;
+                    return 0;
+                });
+            }
             if (paletteIndex >= paletteMatches.length) paletteIndex = 0;
             if (paletteIndex < 0) paletteIndex = Math.max(0, paletteMatches.length - 1);
             paletteList.innerHTML = '';

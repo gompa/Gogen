@@ -197,6 +197,12 @@ func applyAPIBaseline(snap *contextmgr.ContextSnapshot, msgs []llm.Message, coun
 		for _, c := range counts[baselineMsgCount:] {
 			baseline += c
 		}
+	} else if n < baselineMsgCount {
+		// The conversation shrank since the baseline was recorded (a
+		// truncation/rollback that did not clear the usage baseline): the
+		// API count describes a larger request and would over-report.
+		// Keep the locally computed estimate instead.
+		return
 	}
 	snap.Used = baseline
 	if snap.Limit > 0 {

@@ -134,6 +134,12 @@ func (a *Agent) StartBackgroundCommand(command string) (string, error) {
 // outstanding writes.
 const maxBackgroundInputBytes = 16 * 1024
 
+// maxShowBytes caps the output tail a background_job status result embeds,
+// so a chatty job cannot bloat the transcript. The tail cut is rune-safe
+// (runeSafeTailStart), so the shown tail can be a few bytes smaller than
+// this cap.
+const maxShowBytes = 8 * 1024
+
 // defaultBackgroundUnreadCap bounds the per-job output delta retained for
 // action=input, mirroring the output tail cap so a long-running job cannot
 // grow memory without bound.
@@ -217,9 +223,9 @@ func (a *Agent) BackgroundJobStatus(jobID string) (string, error) {
 	}
 	switch {
 	case running:
-		return fmt.Sprintf("Job %s is RUNNING (%s elapsed).\nCommand: %s\n%s", job.ID, elapsed, job.Command, formatJobOutput(job)), nil
+		return fmt.Sprintf("Job %s is RUNNING (%s elapsed).\nCommand: %s\n%s", job.ID, elapsed, job.Command, formatJobOutput(job, true)), nil
 	case job.cancelled.Load():
-		return fmt.Sprintf("Job %s was CANCELLED after %s.\nCommand: %s\n%s", job.ID, elapsed, job.Command, formatJobOutput(job)), nil
+		return fmt.Sprintf("Job %s was CANCELLED after %s.\nCommand: %s\n%s", job.ID, elapsed, job.Command, formatJobOutput(job, false)), nil
 	case exitErr == nil:
 		exitCode = 0
 	default:
@@ -230,19 +236,29 @@ func (a *Agent) BackgroundJobStatus(jobID string) (string, error) {
 			exitCode = 1
 		}
 	}
-	return fmt.Sprintf("Job %s FINISHED in %s with exit code %d.\nCommand: %s\n%s", job.ID, elapsed, exitCode, job.Command, formatJobOutput(job)), nil
+	return fmt.Sprintf("Job %s FINISHED in %s with exit code %d.\nCommand: %s\n%s", job.ID, elapsed, exitCode, job.Command, formatJobOutput(job, false)), nil
 }
 
 // formatJobOutput returns the job's retained output tail, trimmed and
-// labelled, or a note when the job produced none.
-func formatJobOutput(job *BackgroundJob) string {
+// labelled, or a note when the job produced none. running distinguishes the
+// note text: "so far" only makes sense while the job can still produce
+// output.
+func formatJobOutput(job *BackgroundJob, running bool) string {
 	out := job.output.String()
 	if out == "" {
-		return "Output: (none so far)"
+		if running {
+			return "Output: (none so far)"
+		}
+		return "Output: (none)"
 	}
-	const maxShow = 8 * 1024
-	if len(out) > maxShow {
-		return fmt.Sprintf("Output (last %d bytes of %d):\n%s", maxShow, len(out), out[len(out)-maxShow:])
+	if len(out) > maxShowBytes {
+		// Rune-safe tail cut: slicing at len(out)-maxShowBytes could split
+		// a multi-byte UTF-8 rune at the start of the shown tail and inject
+		// invalid UTF-8 into the tool result — the same bug class the head
+		// cuts fix. Back off to a rune boundary; the reported byte count is
+		// the actually-shown length, which can be a few bytes smaller.
+		tail := out[runeSafeTailStart([]byte(out), maxShowBytes):]
+		return fmt.Sprintf("Output (last %d bytes of %d):\n%s", len(tail), len(out), tail)
 	}
 	return "Output:\n" + out
 }

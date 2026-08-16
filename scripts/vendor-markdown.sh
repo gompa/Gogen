@@ -67,7 +67,10 @@ EOF
 # Copy licenses for attribution.
 cp node_modules/marked/LICENSE.md "$OUT/marked.LICENSE.md" 2>/dev/null \
   || cp node_modules/marked/LICENSE "$OUT/marked.LICENSE.md"
+# DOMPurify is dual-licensed (Apache-2.0 OR MPL-2.0); the package ships the
+# two license texts as separate files (LICENSE + LICENSE-MPL).
 cp node_modules/dompurify/LICENSE "$OUT/dompurify.LICENSE" 2>/dev/null || true
+cp node_modules/dompurify/LICENSE-MPL "$OUT/dompurify.LICENSE-MPL" 2>/dev/null || true
 
 echo "Done. Outputs:"
 ls -lah "$OUT"

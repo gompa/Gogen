@@ -244,8 +244,17 @@ func (a *streamAccumulator) buildResult() (*StreamResult, error) {
 	}
 
 	if len(toolCalls) == 0 && (a.fullReasoning.Len() > 0 || a.fullContent.Len() > 0) {
-		extractedCalls := extractToolCallsFromText(a.fullReasoning.String() + a.fullContent.String())
+		// Text-format recovery: when the provider never delivered structured
+		// tool_calls, models write calls inline. Content gets the full scan
+		// (explicit <tool_call>/<invoke> blocks plus bare {"name": ...}
+		// objects); reasoning gets explicit blocks only. Bare JSON in
+		// reasoning is predominantly drafts/examples — scanning it produced
+		// phantom tool calls that executed with prose-derived arguments.
+		contentCalls := extractToolCallsFromText(a.fullContent.String())
+		reasoningCalls := extractToolCallsFromTextMode(a.fullReasoning.String(), false)
+		extractedCalls := append(contentCalls, reasoningCalls...)
 		if len(extractedCalls) > 0 {
+			renumberExtractedToolCalls(extractedCalls)
 			toolCalls = extractedCalls
 		}
 	}

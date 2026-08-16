@@ -89,6 +89,31 @@ func TestGlobFiles(t *testing.T) {
 	}
 }
 
+// TestGlobFilesBareGlobstar pins the lone-"**" semantics: it means
+// "everything", not "nothing" (the regex translation's leading-** branch
+// used to render it as ^(?:.*/)?$, which matches no files).
+func TestGlobFilesBareGlobstar(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sub", "deep.go"), []byte("y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := NewExecutor(dir)
+	out, err := exec.GlobFiles(context.Background(), "**", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "main.go") || !strings.Contains(out, "sub/deep.go") {
+		t.Fatalf("bare ** must match files at any depth, got: %q", out)
+	}
+}
+
 // TestGlobFilesHiddenFiles pins the glob tool's discovery semantics: as the
 // name-based discovery tool it must match dotfiles (e.g. .env via "*.env"),
 // while hidden directories stay pruned (reach them via the path argument).

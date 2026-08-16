@@ -30,17 +30,25 @@ func (rt *sessionRuntime) deliverToSession(text string) bool {
 		return false
 	}
 	rt.deliverMu.Lock()
+	dropped := false
 	if len(rt.pendingDeliver) >= defaultDeliverQueueCap {
 		copy(rt.pendingDeliver, rt.pendingDeliver[1:])
 		rt.pendingDeliver = rt.pendingDeliver[:len(rt.pendingDeliver)-1]
-		rt.broadcast(WSMessage{Type: "notice", Kind: "delivery", Success: false,
-			Content: "A background message was dropped (delivery queue full)."})
+		dropped = true
 	}
 	rt.pendingDeliver = append(rt.pendingDeliver, text)
 	if !rt.deliverWorker.Swap(true) {
 		go rt.deliverLoop()
 	}
 	rt.deliverMu.Unlock()
+	if dropped {
+		// Deliberately OUTSIDE deliverMu: a failing write on the last
+		// attached client funnels into detach → evictOrphaned →
+		// hasPendingDeliveries, which takes deliverMu. Broadcasting under
+		// the lock self-deadlocks that chain on the same goroutine.
+		rt.broadcast(WSMessage{Type: "notice", Kind: "delivery", Success: false,
+			Content: "A background message was dropped (delivery queue full)."})
+	}
 	select {
 	case rt.deliverNotify <- struct{}{}:
 	default:

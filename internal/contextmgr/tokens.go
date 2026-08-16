@@ -186,9 +186,16 @@ func truncateForSummary(text string, maxTokens int) string {
 			}
 		}
 	}
+	return truncateForSummaryHeuristic(text, maxTokens)
+}
+
+// truncateForSummaryHeuristic is the bytes/4 fallback for
+// truncateForSummary, used when the tokenizer is unavailable. The cut is
+// rune-safe so the result is always valid UTF-8.
+func truncateForSummaryHeuristic(text string, maxTokens int) string {
 	maxChars := maxTokens * 4
 	if len(text) <= maxChars {
 		return text
 	}
-	return text[:maxChars] + fmt.Sprintf("\n… truncated for summarization (%d chars total)", len(text))
+	return TruncateRuneSafe(text, maxChars) + fmt.Sprintf("\n… truncated for summarization (%d chars total)", len(text))
 }

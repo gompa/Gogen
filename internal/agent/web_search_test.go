@@ -89,6 +89,30 @@ func TestParseDDGHTMLResults_empty(t *testing.T) {
 	}
 }
 
+// TestParseDDGHTMLResultsSelfClosingDiv pins the state-machine fix: a
+// self-closing <div/> inside a result block must not stall result emission
+// (it opens and closes immediately — net depth change 0).
+func TestParseDDGHTMLResultsSelfClosingDiv(t *testing.T) {
+	const html = `<div class="results">
+  <div class="result results_links">
+    <h2 class="result__title"><a class="result__a" href="https://one.example/">One</a></h2>
+    <a class="result__snippet" href="https://one.example/">Snippet one.</a>
+    <div/>
+  </div>
+  <div class="result results_links">
+    <h2 class="result__title"><a class="result__a" href="https://two.example/">Two</a></h2>
+    <a class="result__snippet" href="https://two.example/">Snippet two.</a>
+  </div>
+</div>`
+	results := parseDDGHTMLResults([]byte(html), 10)
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d (%+v)", len(results), results)
+	}
+	if results[0].link != "https://one.example/" || results[1].link != "https://two.example/" {
+		t.Fatalf("links = %q, %q", results[0].link, results[1].link)
+	}
+}
+
 func TestParseDDGHTMLResults_noTitle(t *testing.T) {
 	// If a result link has empty title, the href should be used as title.
 	const html = `<div class="result results_links">

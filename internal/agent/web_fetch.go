@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -211,33 +212,38 @@ func ConfigureWebSearch(backend, apiKey string) {
 
 // sharedFetchClient is reused across requests for connection pooling.
 // CheckRedirect enforces max redirects, loop detection, and private-host blocking.
-var sharedFetchClient = &http.Client{
-	Transport: func() *http.Transport {
-		tr := &http.Transport{
-			MaxIdleConns:    10,
-			IdleConnTimeout: 90 * time.Second,
-			DialContext:     dialContextPublicOnly,
-		}
-		if err := http2.ConfigureTransport(tr); err != nil {
-			panic(fmt.Sprintf("http2: %v", err))
-		}
-		return tr
-	}(),
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		if len(via) >= webFetchMaxRedirects {
-			return fmt.Errorf("too many redirects")
-		}
-		nextURL := req.URL.String()
-		for _, prev := range via {
-			if prev.URL.String() == nextURL {
-				return fmt.Errorf("redirect loop detected: %s", nextURL)
+var sharedFetchClient = newSharedFetchClient()
+
+// newSharedFetchClient builds the shared transport. ConfigureTransport fails
+// only for a misconfigured transport; HTTP/1.1 remains functional, so an
+// optional protocol upgrade must never crash the process at package init.
+func newSharedFetchClient() *http.Client {
+	tr := &http.Transport{
+		MaxIdleConns:    10,
+		IdleConnTimeout: 90 * time.Second,
+		DialContext:     dialContextPublicOnly,
+	}
+	if err := http2.ConfigureTransport(tr); err != nil {
+		log.Printf("web_fetch: http2 unavailable: %v", err)
+	}
+	return &http.Client{
+		Transport: tr,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= webFetchMaxRedirects {
+				return fmt.Errorf("too many redirects")
 			}
-		}
-		if isPrivateHost(req.URL.Host) {
-			return fmt.Errorf("redirect to private host blocked: %s", req.URL.Host)
-		}
-		return nil
-	},
+			nextURL := req.URL.String()
+			for _, prev := range via {
+				if prev.URL.String() == nextURL {
+					return fmt.Errorf("redirect loop detected: %s", nextURL)
+				}
+			}
+			if isPrivateHost(req.URL.Host) {
+				return fmt.Errorf("redirect to private host blocked: %s", req.URL.Host)
+			}
+			return nil
+		},
+	}
 }
 
 // fetchRequest describes a single HTTP fetch operation.

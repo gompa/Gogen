@@ -48,6 +48,10 @@ func newAgent(cfg *config.Config, isGlobalMode bool) (*agent.Agent, string) {
 	exec := agent.NewExecutorWithGuard(cfg.WorkingDir, agent.NewCommandGuard(cfg.CommandSafetyMode, agent.ParseAllowlist(cfg.CommandAllowlist)))
 	exec.SetDeleteApproval(!strings.EqualFold(cfg.DeleteApproval, "off"))
 	exec.SetSandbox(cfg.CommandSandbox)
+	// The executor bounds in-memory command output at the same cap the
+	// context manager later applies to tool results; 0 (explicit "no cap")
+	// passes through unbounded.
+	exec.SetMaxToolOutputBytes(cfg.MaxToolResultBytes)
 	if cfg.CommandTimeoutSecs > 0 {
 		exec.SetCommandTimeout(time.Duration(cfg.CommandTimeoutSecs) * time.Second)
 	}

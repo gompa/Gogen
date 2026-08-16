@@ -73,8 +73,10 @@ func (p *PinManager) ListPins(messages []llm.Message) string {
 	for idx := range p.pinned {
 		if idx >= 0 && idx < len(messages) {
 			content := messages[idx].Content
-			if len(content) > 80 {
-				content = content[:80] + "…"
+			// Rune-safe cut: slicing on bytes could split a multi-byte
+			// character and inject invalid UTF-8 into the tool result.
+			if r := []rune(content); len(r) > 80 {
+				content = string(r[:80]) + "…"
 			}
 			fmt.Fprintf(&b, "  #%d: %s\n", idx, content)
 		}

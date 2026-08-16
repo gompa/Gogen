@@ -3,6 +3,7 @@ package contextmgr
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"gogen/internal/llm"
 )
@@ -59,3 +60,41 @@ func TestEnsureToolResultsCappedRecountsTokens(t *testing.T) {
 
 // Token cache tests removed — token counts are now computed on demand
 // with no global cache, so cache-size assertions no longer apply.
+
+// TestTruncateForSummaryHeuristicRuneSafe pins that the bytes/4 fallback
+// cuts on a rune boundary: slicing raw bytes at maxChars could split a
+// multi-byte character and inject invalid UTF-8 into the summarization
+// request (regression: text[:maxChars]).
+func TestTruncateForSummaryHeuristicRuneSafe(t *testing.T) {
+	text := strings.Repeat("界", 200) // 3 bytes per rune, 600 bytes total
+	out := truncateForSummaryHeuristic(text, 40)
+	if !utf8.ValidString(out) {
+		t.Fatalf("heuristic truncation produced invalid UTF-8: %q", out)
+	}
+	if !strings.Contains(out, "truncated for summarization") {
+		t.Fatalf("expected truncation marker, got %q", out)
+	}
+	// 40 tokens * 4 = 160 bytes; the cut must back off to a rune boundary
+	// (159 bytes = 53 runes) so the prefix stays <= the byte budget.
+	prefix := strings.TrimSuffix(out, "\n… truncated for summarization (600 chars total)")
+	if len(prefix) > 160 {
+		t.Fatalf("prefix %d bytes exceeds the 160-byte budget", len(prefix))
+	}
+	if len(prefix)%3 != 0 {
+		t.Fatalf("prefix length %d is not a rune boundary for 3-byte runes", len(prefix))
+	}
+}
+
+// TestTruncateForSummaryValidUTF8 guards the same property through the
+// public entry point: whichever path runs (tokenizer or heuristic), the
+// result must be valid UTF-8.
+func TestTruncateForSummaryValidUTF8(t *testing.T) {
+	text := strings.Repeat("界", 500)
+	out := truncateForSummary(text, 40)
+	if !utf8.ValidString(out) {
+		t.Fatalf("truncateForSummary produced invalid UTF-8: %q", out)
+	}
+	if !strings.Contains(out, "truncated for summarization") {
+		t.Fatalf("expected truncation marker, got %q", out)
+	}
+}

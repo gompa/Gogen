@@ -257,3 +257,55 @@ func TestReadImageRequiresImageSink(t *testing.T) {
 		t.Fatalf("expected missing-sink error, got %v", err)
 	}
 }
+
+// TestReadImageSessionCapResetsOnNewSession pins the TUI /new path: the
+// per-session cap must reset when the session state is reset, not persist
+// for the agent's lifetime.
+func TestReadImageSessionCapResetsOnNewSession(t *testing.T) {
+	dir := t.TempDir()
+	exec := NewExecutor(dir)
+	a := NewAgent(nil, exec, nil)
+	writeTestImage(t, filepath.Join(dir, "pic.png"), mustDecodePNG(t))
+
+	for i := 0; i < maxSessionImages; i++ {
+		if _, err := a.executeTool(ContextWithImageSink(context.Background(), &imageSink{}), llm.ToolCall{Name: "read_image", Args: map[string]interface{}{"path": "pic.png"}}); err != nil {
+			t.Fatalf("call %d: %v", i+1, err)
+		}
+	}
+	a.ResetSessionState()
+	if _, err := a.executeTool(ContextWithImageSink(context.Background(), &imageSink{}), llm.ToolCall{Name: "read_image", Args: map[string]interface{}{"path": "pic.png"}}); err != nil {
+		t.Fatalf("cap must reset with the session: %v", err)
+	}
+}
+
+// TestReadImageCapRecountsOnReplace pins the compaction/restore direction:
+// the budget tracks images present in the message list, so replacing the
+// conversation re-derives it — images that survive keep counting, dropped
+// ones release their slots.
+func TestReadImageCapRecountsOnReplace(t *testing.T) {
+	exec := NewExecutor(t.TempDir())
+	a := NewAgent(nil, exec, nil)
+
+	// Exhaust the budget through direct reservations (the same claim the
+	// handler performs) without appending messages.
+	for i := 0; i < maxSessionImages; i++ {
+		if !a.reserveImageSlot() {
+			t.Fatalf("reservation %d failed", i+1)
+		}
+	}
+	if a.sessionImages.Load() != maxSessionImages {
+		t.Fatalf("counter = %d, want %d", a.sessionImages.Load(), maxSessionImages)
+	}
+	// Compaction/restore replace the conversation with a list that holds
+	// exactly one image: the budget must re-derive from the messages.
+	one := llm.Message{Role: "user", Content: "keep", Images: []llm.ImageInput{{DataURL: "data:image/png;base64,"}}}
+	a.replaceMessages([]llm.Message{one})
+	if got := a.sessionImages.Load(); got != 1 {
+		t.Fatalf("counter after replace = %d, want 1", got)
+	}
+	// A fresh session resets the budget to zero (the TUI /new path).
+	a.ResetSessionState()
+	if got := a.sessionImages.Load(); got != 0 {
+		t.Fatalf("counter after reset = %d, want 0", got)
+	}
+}

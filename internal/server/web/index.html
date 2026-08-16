@@ -742,6 +742,10 @@
         <div id="toc-tooltip-body"></div>
     </div>
     <div id="toast-host" aria-live="polite"></div>
+    <!-- Screen-reader announcements: turn lifecycle is announced here
+         instead of from the streaming transcript (which would chatter
+         token-by-token). -->
+    <div id="sr-live" class="sr-only" aria-live="polite"></div>
     <script src="/xterm/xterm.js"></script>
     <script src="/xterm/addon-fit.js"></script>
     <script type="module" src="/app.js"></script>

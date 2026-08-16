@@ -55,6 +55,45 @@ const markerCounts = new Map(); // path -> { errors, warnings }
 // expansion from it so a refresh never collapses folders the user opened.
 const expandedDirs = new Set();
 
+// ── Inline completions (agent ghost-text suggestions) ──
+// Monaco's inline-completion API (stable since 0.53) renders ghost text at
+// the cursor. GoGen exposes a pluggable source: the chat agent can offer
+// pending edits as inline suggestions. The source is null by default, which
+// keeps the provider inert (no ghost text, no behavior change) until
+// something registers one via setInlineCompletionSource.
+let inlineCompletionSource = null;
+
+/**
+ * Set (or clear with null) the inline-completion source. The source is
+ * called with (model, position) and returns either null (no suggestion), a
+ * suggestion { insertText, range? }, or a Promise of one. range defaults to
+ * the line prefix before the cursor, so insertText appends at the cursor.
+ */
+export function setInlineCompletionSource(source) {
+  inlineCompletionSource = source;
+}
+
+// Maps a source suggestion to Monaco's InlineCompletion shape. Exported for
+// the standalone regression test (scripts/test_inlinecompletions.js).
+function suggestionToItems(model, position, suggestion) {
+  if (!suggestion || !suggestion.insertText) return { items: [] };
+  const range = suggestion.range
+    || new monaco.Range(position.lineNumber, 1, position.lineNumber, position.column);
+  return { items: [{ insertText: suggestion.insertText, range }] };
+}
+
+// True when an editable (non-read-only) editor is bound to the model.
+// Inline suggestions must never appear in read-only panes (unstaged diff,
+// chat tool-card viewers); Monaco's own suppression cannot be relied on
+// here, so the provider gates on it explicitly.
+function editableEditorForModel(model) {
+  if (!monaco.editor.getEditors || !monaco.editor.EditorOption) return false;
+  return monaco.editor.getEditors().some((ed) => {
+    return ed.getModel() === model
+      && !ed.getOption(monaco.editor.EditorOption.readOnly);
+  });
+}
+
 function $(id) {
   return document.getElementById(id);
 }
@@ -783,6 +822,27 @@ function ensureEditors() {
         navigator.clipboard.writeText(activePath).catch(() => {});
       },
     });
+
+    // --- Inline (ghost-text) completions: agent edit suggestions. ---
+    // Registered once per editor; inert until a source is set (see
+    // setInlineCompletionSource). Suggestions are offered only on an
+    // editable editor bound to the model, and only for the range the
+    // source specifies (default: the line prefix, so the ghost text
+    // appends at the cursor).
+    if (monaco.languages.registerInlineCompletionsProvider) {
+      monaco.languages.registerInlineCompletionsProvider('*', {
+        provideInlineCompletions(model, position) {
+          if (!inlineCompletionSource) return { items: [] };
+          if (!editableEditorForModel(model)) return { items: [] };
+          const suggestion = inlineCompletionSource(model, position);
+          if (suggestion && typeof suggestion.then === 'function') {
+            return suggestion.then((s) => suggestionToItems(model, position, s));
+          }
+          return suggestionToItems(model, position, suggestion);
+        },
+        freeInlineCompletions() {},
+      });
+    }
   }
 }
 
@@ -811,6 +871,11 @@ function showDiffPane() {
       // Read-only diff pane: no text cursor (avoids a permanent blink
       // animation per editor keeping the refresh driver busy).
       cursorBlinking: 'hidden',
+      // Monaco 0.56's line-based diff algorithm (pure JS, bundled — no wasm
+      // asset; "advanced-external"/"advanced-wasm" need a runtime
+      // import("@vscode/diff") that the vendored build does not ship).
+      // Better hunks/block-move handling than the legacy default ("smart").
+      diffAlgorithm: 'advanced',
       renderSideBySide: GOGEN_UI.diffRenderSideBySide,
       minimap: { enabled: false },
       fontSize: 13,
