@@ -5,11 +5,12 @@
 package skills
 
 import (
+	"cmp"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 
 	"gogen/internal/projectfile"
@@ -187,7 +188,7 @@ func scanRoot(root string) []Skill {
 		}
 		out = append(out, Skill{Name: name, Description: desc, Body: body})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	slices.SortFunc(out, func(a, b Skill) int { return cmp.Compare(a.Name, b.Name) })
 	return out
 }
 

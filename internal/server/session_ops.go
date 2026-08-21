@@ -219,19 +219,41 @@ func (s *Server) createNewSession(ws *wsConn, pane **sessionRuntime) *sessionRun
 	// user changed it — the "thinking level resets" bug. The TUI's /new
 	// already inherits (ResetSessionState leaves ThinkingLevel untouched);
 	// mirror that behavior in the web UI.
+	//
+	// Inherit the pane's current model too. The workspace default (ws.Model)
+	// is the startup-era seed and set_model never advances it (D1 — the
+	// model is per-session), so without inheritance every /new would stay
+	// locked on the first session's model. The TUI's /new inherits
+	// implicitly (one shared provider); the web /new must do it explicitly.
 	var inheritLevel agent.ThinkingLevel
+	var inheritModel string
 	if old := *pane; old != nil && old.agent != nil {
 		// Locked read: another connection can set the pane's thinking level
 		// concurrently (handleWSSetThinkingLevel under the session turnMu),
-		// and /new must not tear the plain field read.
+		// and /new must not tear the plain field read. CurrentModel is
+		// provider-internal-locked.
 		_, inheritLevel = old.agent.ModeAndThinkingLevel()
+		inheritModel = old.agent.CurrentModel()
 	}
 	a := s.ws.NewSessionAgent(nil, newID)
+	// Adopt the pane's model when it differs from the fresh provider's seed
+	// (the workspace default — verified by construction). An equal model
+	// needs no adoption and no validation; a different one is adopted
+	// unverified and confirmed in the background below (same contract as
+	// resume/fork), so the first turn never sends a model that no longer
+	// exists at the endpoint. An empty pane model (e.g. cleared as stale by
+	// its own validation) falls back to the workspace-default seed.
+	modelInherited := inheritModel != "" && inheritModel != a.CurrentModel()
+	if modelInherited {
+		a.AdoptModel(inheritModel)
+	}
 	if inheritLevel != "" {
 		// Seeds the fresh session's agent and provider (SetThinkingLevel
 		// syncs the provider) and persists the level into the new session
 		// file. When the pane never set a level this is a no-op — the agent
-		// already carries the workspace default.
+		// already carries the workspace default. Runs AFTER the model
+		// adoption: the setter flushes, and the flush must persist the
+		// inherited model, not the pre-adoption default seed.
 		a.SetThinkingLevel(inheritLevel)
 	}
 	rt := s.newSessionRuntimeFor(a)
@@ -239,6 +261,17 @@ func (s *Server) createNewSession(ws *wsConn, pane **sessionRuntime) *sessionRun
 	s.registry.setDefault(newID)
 	s.switchPane(ws, pane, rt)
 	s.pruneSessions(evicted...)
+	if modelInherited {
+		// Model validation runs after registration: the async result must
+		// push a config refresh to the new session's clients, which requires
+		// the registered runtime (same wiring as loadOrCreateRuntime and
+		// sessionFork). The adopted model is confirmed against the
+		// provider's own catalog — or cleared and replaced by sole-model
+		// auto-select when it is gone — and the clients are corrected via
+		// OnModelChanged.
+		a.OnModelChanged = func() { s.pushConfigForAgent(a) }
+		go a.ValidateRestoredModel(context.Background(), inheritModel)
+	}
 	return rt
 }
 
@@ -431,23 +464,32 @@ func (s *Server) sessionDelete(ctx context.Context, ws *wsConn, pane **sessionRu
 		}
 		d.agent.FlushSession()
 	}
-	// A nested (subagent) child reports its deletion back to the parent
-	// session: the main agent must learn the child (and its transcript)
-	// is gone. Parent link + label come from the live runtime when the
-	// child is registered, else from the store's metadata index (Info
-	// reads no message payload).
+	// A nested (subagent) child whose outcome has NOT reached the parent
+	// yet reports its deletion back to the parent session: a live child
+	// (running, or interrupted and never delivered) may still be awaited,
+	// so the parent must learn it (and its transcript) is gone. A
+	// FINISHED child already delivered its report (completion notice) and
+	// an UNREGISTERED child's runtime is long gone — both delete silently,
+	// like top-level sessions: the notice is a paid parent turn, and for
+	// a child whose outcome already landed it is pure noise.
 	var notifyParentID, notifyLabel string
+	notifyParent := false
 	if registered {
 		notifyParentID = rt.agent.ParentID()
 		notifyLabel = rt.agent.SessionLabelSnapshot()
-	} else if info := s.ws.Store.Info(s.ws.GetWorkingDir(), id); info != nil {
-		notifyParentID = info.ParentID
-		notifyLabel = info.Label
+		notifyParent = true
+		// A finished continuable child's completion notice already
+		// delivered its outcome: its delete is housekeeping, no notice.
+		if sp, ok := s.ws.SubagentSpawner.(*subagentSpawner); ok {
+			if c := sp.children.get(id); c != nil && c.isFinished() {
+				notifyParent = false
+			}
+		}
 	}
 	if err := s.ws.Store.Delete(s.ws.GetWorkingDir(), id); err != nil {
 		return agent.SessionCommandResult{}, true, err
 	}
-	if notifyParentID != "" {
+	if notifyParent && notifyParentID != "" {
 		if notifyLabel == "" {
 			notifyLabel = id
 		}
@@ -471,7 +513,7 @@ func (s *Server) sessionDelete(ctx context.Context, ws *wsConn, pane **sessionRu
 		// broadcast reaches every attached socket regardless (it writes to
 		// the clients set, not the registry), so client-visible message
 		// ordering is unchanged.
-		s.evictDeletedRuntime(rt)
+		s.teardownDeletedRuntime(rt)
 	} else {
 		// Explicit delete is a teardown even when the runtime is already
 		// gone (orphan/cap eviction): the deleted session's background
@@ -507,7 +549,7 @@ func (s *Server) sessionDelete(ctx context.Context, ws *wsConn, pane **sessionRu
 	return agent.SessionCommandResult{Output: fmt.Sprintf("Deleted session %s.", id)}, true, nil
 }
 
-// evictDeletedRuntime removes a deleted session's runtime from the registry
+// teardownDeletedRuntime removes a deleted session's runtime from the registry
 // and detaches every attached client, AFTER the session's file is gone:
 // once the runtime is unregistered, a concurrent session_attach/resume of
 // the same id loads fresh from the store — the file is already gone, so the
@@ -517,7 +559,7 @@ func (s *Server) sessionDelete(ctx context.Context, ws *wsConn, pane **sessionRu
 // client-visible message ordering is unchanged. The session's background
 // jobs are killed too: with the session gone there is no owner left to
 // poll them. Callers must hold (or have drained) the runtime's turnMu.
-func (s *Server) evictDeletedRuntime(rt *sessionRuntime) {
+func (s *Server) teardownDeletedRuntime(rt *sessionRuntime) {
 	id := rt.agent.SessionID
 	s.registry.remove(id)
 	rt.broadcast(WSMessage{Type: "session_removed", SessionID: id})
@@ -541,17 +583,11 @@ func (s *Server) evictDeletedRuntime(rt *sessionRuntime) {
 // evictNestedDescendants removes the registered runtimes whose files the
 // store's cascade delete just removed: their turns were drained (and
 // flushed) BEFORE the delete, so this eviction writes nothing and cannot
-// resurrect the files. Same removal/notify ordering as evictDeletedRuntime.
+// resurrect the files. Same removal/notify ordering as teardownDeletedRuntime.
 // Callers must hold (or have drained) each runtime's turnMu.
 func (s *Server) evictNestedDescendants(descendants []*sessionRuntime) {
 	for _, d := range descendants {
-		did := d.agent.SessionID
-		s.registry.remove(did)
-		d.broadcast(WSMessage{Type: "session_removed", SessionID: did})
-		s.registry.fireEvictHook(did)
-		d.detachAllClients()
-		// Kill background jobs so no command outlives the deleted session.
-		d.agent.Close()
+		s.teardownDeletedRuntime(d)
 	}
 	// Final sweep: the cascade removed these files, so any file that still
 	// exists was recreated by a write that landed after the delete — the

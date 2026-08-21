@@ -303,14 +303,11 @@ func normalizeURL(u string) string {
 	return strings.TrimRight(strings.TrimSpace(u), "/")
 }
 
-// ResolveContextLimit returns the context window size (in tokens) for the
-// given model, looked up from the already-loaded registry (memory or disk).
-// It never blocks on the network. Returns an error if the registry is not
-// loaded yet or the provider/model is missing — callers fall back to
-// GOGEN_CONTEXT_LIMIT / heuristics.
-func (r *Resolver) ResolveContextLimit(baseURL, modelID string) (Limit, error) {
+// providerFor loads the registry and returns the provider entry matching
+// baseURL. It never blocks on the network.
+func (r *Resolver) providerFor(baseURL string) (providerEntry, error) {
 	if err := r.load(); err != nil {
-		return Limit{}, fmt.Errorf("loading model registry: %w", err)
+		return providerEntry{}, fmt.Errorf("loading model registry: %w", err)
 	}
 
 	r.mu.RLock()
@@ -318,30 +315,29 @@ func (r *Resolver) ResolveContextLimit(baseURL, modelID string) (Limit, error) {
 
 	provider, ok := r.byAPI[normalizeURL(baseURL)]
 	if !ok {
-		return Limit{}, fmt.Errorf("no provider in models.dev registry matches base URL %q", baseURL)
+		return providerEntry{}, fmt.Errorf("no provider in models.dev registry matches base URL %q", baseURL)
 	}
-	if m, ok := provider.Models[modelID]; ok {
-		return m.Limit, nil
-	}
-	return Limit{}, fmt.Errorf("provider %q found for %s, but no entry for model %q", provider.ID, baseURL, modelID)
+	return provider, nil
+}
+
+// ResolveContextLimit returns the context window size (in tokens) for the
+// given model. It never blocks on the network. Returns an error if the
+// registry is not loaded yet or the provider/model is missing — callers fall
+// back to GOGEN_CONTEXT_LIMIT / heuristics.
+func (r *Resolver) ResolveContextLimit(baseURL, modelID string) (Limit, error) {
+	lim, _, _, _, err := r.Resolve(baseURL, modelID)
+	return lim, err
 }
 
 // Resolve returns context limit, pricing, accepted reasoning-effort values,
 // and the model description in a single registry lookup. Use this instead of
-// separate ResolveContextLimit + ResolveCost calls to avoid redundant map
-// lookups. The efforts slice is a fresh copy; like the returned *Cost, it
-// must not be mutated by callers.
+// a separate ResolveContextLimit call to avoid redundant map lookups. The
+// efforts slice is a fresh copy; like the returned *Cost, it must not be
+// mutated by callers.
 func (r *Resolver) Resolve(baseURL, modelID string) (Limit, *Cost, []string, string, error) {
-	if err := r.load(); err != nil {
-		return Limit{}, nil, nil, "", fmt.Errorf("loading model registry: %w", err)
-	}
-
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	provider, ok := r.byAPI[normalizeURL(baseURL)]
-	if !ok {
-		return Limit{}, nil, nil, "", fmt.Errorf("no provider in models.dev registry matches base URL %q", baseURL)
+	provider, err := r.providerFor(baseURL)
+	if err != nil {
+		return Limit{}, nil, nil, "", err
 	}
 	if m, ok := provider.Models[modelID]; ok {
 		return m.Limit, &m.Cost, m.ReasoningEfforts(), m.Description, nil
@@ -352,37 +348,9 @@ func (r *Resolver) Resolve(baseURL, modelID string) (Limit, *Cost, []string, str
 // ProviderID returns the models.dev provider ID matching a base URL, if any.
 // Useful for logging/debugging, not required for ResolveContextLimit.
 func (r *Resolver) ProviderID(baseURL string) (string, bool) {
-	if err := r.load(); err != nil {
-		return "", false
-	}
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	provider, ok := r.byAPI[normalizeURL(baseURL)]
-	if !ok {
+	provider, err := r.providerFor(baseURL)
+	if err != nil {
 		return "", false
 	}
 	return provider.ID, true
-}
-
-// ResolveCost returns per-token pricing for a model from the models.dev
-// registry. Returns a non-nil Cost with zero values when the model is found
-// but has no pricing data (e.g. local/self-hosted models). Returns nil Cost
-// and an error only when the registry isn't loaded or the model isn't found.
-func (r *Resolver) ResolveCost(baseURL, modelID string) (*Cost, error) {
-	if err := r.load(); err != nil {
-		return nil, fmt.Errorf("loading model registry: %w", err)
-	}
-
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	provider, ok := r.byAPI[normalizeURL(baseURL)]
-	if !ok {
-		return nil, fmt.Errorf("no provider in models.dev registry matches base URL %q", baseURL)
-	}
-	if m, ok := provider.Models[modelID]; ok {
-		return &m.Cost, nil
-	}
-	return nil, fmt.Errorf("provider %q found, but no entry for model %q", provider.ID, modelID)
 }

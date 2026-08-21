@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -22,6 +23,18 @@ func (a *Agent) setModelUnverified(v bool) {
 	a.statsMu.Lock()
 	a.modelUnverified = v
 	a.statsMu.Unlock()
+}
+
+// AdoptModel switches the session's provider to model and marks it
+// unverified, mirroring the restore contract (RestoreSessionLocal): the
+// model came from outside this session's provider — e.g. the web /new
+// pane-model inheritance — so it must be confirmed to exist at the endpoint
+// before the first turn sends it. The async confirmation is the caller's
+// job (ValidateRestoredModel); requireModelSelected re-checks a
+// still-unverified model on the first turn as a safety net.
+func (a *Agent) AdoptModel(model string) {
+	_ = a.Provider.SetModel(model)
+	a.setModelUnverified(true)
 }
 
 func (a *Agent) CurrentModel() string {
@@ -74,14 +87,7 @@ func (a *Agent) recheckRestoredModel(ctx context.Context) {
 	if err != nil {
 		return // keep the model, keep it unverified (fail-open)
 	}
-	found := false
-	for _, m := range models {
-		if m.ID == model {
-			found = true
-			break
-		}
-	}
-	if found {
+	if slices.ContainsFunc(models, func(m llm.ModelInfo) bool { return m.ID == model }) {
 		a.setModelUnverified(false)
 		return
 	}

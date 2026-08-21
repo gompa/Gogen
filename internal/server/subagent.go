@@ -2,14 +2,14 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
-	"sync"
 	"time"
 
 	"gogen/internal/agent"
+	"gogen/internal/contextmgr"
 	sesspkg "gogen/internal/session"
-	"gogen/internal/streamutil"
 )
 
 // subagentSpawner implements agent.SubagentSpawner for the web server:
@@ -36,9 +36,13 @@ type subagentSpawner struct {
 	// maxFinished caps finished continuable children per parent
 	// (0 = defaultMaxFinishedSubagents).
 	maxFinished int
-	// maxLive caps NON-finished continuable children per parent
-	// (0 = defaultMaxLiveSubagents).
+	// maxLive overrides the user-facing per-parent cap on ACTIVE subagents
+	// (0 = the configured subagent_max_concurrent limit — see
+	// concurrentLimit).
 	maxLive int
+	// maxLiveGuard overrides the internal per-parent cap on non-finished
+	// children (0 = defaultMaxLiveSubagents — see liveGuardLimit).
+	maxLiveGuard int
 }
 
 // truncateReport bounds the tool result returned to the parent agent.
@@ -69,11 +73,12 @@ func (sp *subagentSpawner) newChildRuntime(ctx context.Context, parent *agent.Ag
 	child := s.ws.NewSessionAgent(nil, childID)
 	child.SetSubagentDepth(depth + 1)
 	child.SetParentID(parent.SessionID)
+	runtimeCfg := s.ws.GetRuntimeConfig()
 	if model != "" {
 		if err := child.SelectModel(ctx, model); err != nil {
 			return nil, "", "", fmt.Errorf("subagent model: %w", err)
 		}
-	} else if m := s.ws.GetRuntimeConfig().SubagentModel; m != "" {
+	} else if m := runtimeCfg.SubagentModel; m != "" {
 		// The configured default subagent model (settings modal) beats
 		// parent-model inheritance: the user explicitly chose a model for
 		// subagents. Selection failures fall back to the workspace default
@@ -91,6 +96,12 @@ func (sp *subagentSpawner) newChildRuntime(ctx context.Context, parent *agent.Ag
 			log.Printf("subagent: parent model %q not selectable on child (%v); using workspace default", m, err)
 		}
 	}
+	// The reasoning effort follows the same cascade as the model: the
+	// configured subagent level (settings) wins; empty = inherit the
+	// parent's live level. Applied AFTER the model cascade so validity is
+	// resolved against the child's final model (a level it does not accept
+	// is omitted — see ApplySubagentThinkingLevel).
+	agent.ApplySubagentThinkingLevel(child, parent, runtimeCfg.SubagentThinkingLevel)
 	label := agent.SubagentLabel(job)
 	child.RenameSession(label)
 	// The job wrapper applies AFTER label derivation: labels and the
@@ -141,6 +152,16 @@ func (sp *subagentSpawner) newChildRuntime(ctx context.Context, parent *agent.Ag
 
 func (sp *subagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, job, model string, depth int) (string, error) {
 	s := sp.s
+	// The foreground child holds a slot of the concurrent limit for the
+	// whole turn, exactly like a background child: acquireForeground
+	// reserves the slot atomically with the cap check (active children
+	// against the user-facing limit, non-finished against the internal
+	// guard), and the deferred release frees it on every exit path.
+	ok, guardHit := sp.children.acquireForeground(parent.SessionID, sp.concurrentLimit(), sp.liveGuardLimit())
+	if !ok {
+		return "", spawnCapError(sp.concurrentLimit(), guardHit)
+	}
+	defer sp.children.releaseForeground(parent.SessionID)
 	childRt, label, rawJob, err := sp.newChildRuntime(ctx, parent, job, model, depth)
 	if err != nil {
 		return "", err
@@ -209,10 +230,11 @@ func (sp *subagentSpawner) approvalHold() time.Duration {
 // runChildTurn runs one full agent turn on the child runtime: the child's
 // stream handles are registered so the Cancel button on an attached child
 // pane works, events broadcast to the child's clients (live transcript when
-// attached), and the parent context propagates cancellation. The child's
-// own turnMu serializes against attach/approval handlers.
+// attached), and the parent context propagates cancellation. The turn
+// skeleton itself (evicted check, turn-active lifecycle, stream handlers,
+// error tail) is shared with startTurn via runTurnBody. The child's own
+// turnMu serializes against attach/approval handlers.
 func (sp *subagentSpawner) runChildTurn(parentCtx context.Context, rt *sessionRuntime, job string) (string, error) {
-	child := rt.agent
 	streamCtx, streamCancel := context.WithCancel(context.Background())
 	// Parent cancellation kills the child: the parent turn owns this tool
 	// call, so if it dies (user Cancel on the parent pane, shutdown) the
@@ -226,27 +248,6 @@ func (sp *subagentSpawner) runChildTurn(parentCtx context.Context, rt *sessionRu
 	}()
 	errCh := rt.stream.begin(streamCancel)
 
-	write := func(v WSMessage) {
-		if streamCtx.Err() != nil {
-			return
-		}
-		if v.SessionID == "" {
-			v.SessionID = child.SessionID
-		}
-		rt.broadcast(v)
-	}
-	tokens := streamutil.NewTokenBatcher(func(think bool, text string) {
-		if think {
-			write(WSMessage{Type: "thinking_token", Content: text})
-		} else {
-			write(WSMessage{Type: "stream", Content: text})
-		}
-	}, wsTokenFlushInterval)
-	var termMu sync.Mutex
-	termBatches := map[string]*streamutil.TokenBatcher{}
-	termOpened := map[string]struct{}{}
-	handlers := rt.buildStreamHandlers(streamCtx, write, tokens, &termMu, termBatches, termOpened)
-
 	type turnResult struct {
 		out string
 		err error
@@ -257,46 +258,20 @@ func (sp *subagentSpawner) runChildTurn(parentCtx context.Context, rt *sessionRu
 		defer rt.stream.end()
 		defer func() { errCh <- nil }()
 		rt.turnMu.Lock()
-		// The runtime may have been released while we waited for the lock
-		// (close/delete/release evict without holding turnMu): nothing to
-		// stream to. The defers above still run, so the stream's cancel
-		// handle is cleared (begin already ran) and cancelInFlight's errCh
-		// wait is released instead of blocking until the drain timeout. The
-		// caller's evicted check handles the rest.
-		if rt.evicted.Load() {
-			resCh <- turnResult{err: fmt.Errorf("child runtime was released while starting")}
-			return
-		}
-		defer rt.setTurnActive(false, time.Time{}, nil)
-		// Terminal frame for the child's OWN attached clients (a pane
-		// opened to watch the subagent): without turn_end the pane stays
-		// stuck in the "responding"/busy state forever — the client only
-		// clears it on cancelled/turn_end/session_state, and the spawner
-		// unregisters the runtime right after this returns. Mirrors the
-		// normal startTurn tail (broadcast while the lock is still held).
-		defer rt.broadcast(WSMessage{Type: "turn_end", SessionID: child.SessionID})
-		// Publish the turn as active ONLY while holding the lock: a window
-		// with turnActive=true but turnMu free would let a delivery/attach
-		// turn start concurrently and clobber the active flag (or run ahead
-		// of the child's own job). Mirrors startTurn, whose caller holds
-		// the lock.
-		rt.setTurnActive(true, time.Now(), nil)
-		appCtx := agent.ContextWithDeleteApprover(streamCtx, rt.approverOverride)
-		out, err := child.StreamProcessInputWithImages(appCtx, job, nil, handlers)
-		if err != nil {
-			if streamCtx.Err() != nil {
-				// The child was cancelled (child-pane Cancel or parent turn
-				// cancel): broadcast directly (write early-returns on a
-				// cancelled ctx), like the normal turn's cancel tail.
-				tokens.Flush()
-				rt.broadcast(WSMessage{Type: "cancelled", Content: "Cancelled.", SessionID: child.SessionID})
-			} else {
-				// Real child error: report it in the child's transcript so
-				// a watching pane sees why the turn ended, like startTurn.
-				tokens.Flush()
-				write(WSMessage{Type: "stream_end"})
-				write(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", err)})
-			}
+		// Child turn options: no owner connection, no positioned token
+		// frames, no error log/hook (the parent sees the error as the tool
+		// result), no persist warning/usage frame (the spawner flushes the
+		// outcome).
+		out, err := rt.runTurnBody(streamCtx, job, nil, turnOpts{})
+		if errors.Is(err, errTurnEvicted) {
+			// The runtime was released while we waited for the lock
+			// (close/delete/release evict without holding turnMu): nothing
+			// to stream to. The defers above still run, so the stream's
+			// cancel handle is cleared (begin already ran) and
+			// cancelInFlight's errCh wait is released instead of blocking
+			// until the drain timeout. The caller's evicted check handles
+			// the rest.
+			err = fmt.Errorf("child runtime was released while starting")
 		}
 		resCh <- turnResult{out: out, err: err}
 	}()
@@ -323,8 +298,5 @@ func (sp *subagentSpawner) runChildTurn(parentCtx context.Context, rt *sessionRu
 }
 
 func truncateJob(job string) string {
-	if len(job) > 200 {
-		return job[:200] + "…"
-	}
-	return job
+	return contextmgr.TruncateMarked(job, 200, "…")
 }

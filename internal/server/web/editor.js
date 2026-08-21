@@ -1,4 +1,5 @@
 // Monaco editor workspace for GoGen web UI.
+import DOMPurify from '/vendor/dompurify.esm.js';
 
 let monaco = null;
 
@@ -54,45 +55,6 @@ const markerCounts = new Map(); // path -> { errors, warnings }
 // refresh button); only this set survives a rebuild — loadTree restores
 // expansion from it so a refresh never collapses folders the user opened.
 const expandedDirs = new Set();
-
-// ── Inline completions (agent ghost-text suggestions) ──
-// Monaco's inline-completion API (stable since 0.53) renders ghost text at
-// the cursor. GoGen exposes a pluggable source: the chat agent can offer
-// pending edits as inline suggestions. The source is null by default, which
-// keeps the provider inert (no ghost text, no behavior change) until
-// something registers one via setInlineCompletionSource.
-let inlineCompletionSource = null;
-
-/**
- * Set (or clear with null) the inline-completion source. The source is
- * called with (model, position) and returns either null (no suggestion), a
- * suggestion { insertText, range? }, or a Promise of one. range defaults to
- * the line prefix before the cursor, so insertText appends at the cursor.
- */
-export function setInlineCompletionSource(source) {
-  inlineCompletionSource = source;
-}
-
-// Maps a source suggestion to Monaco's InlineCompletion shape. Exported for
-// the standalone regression test (scripts/test_inlinecompletions.js).
-function suggestionToItems(model, position, suggestion) {
-  if (!suggestion || !suggestion.insertText) return { items: [] };
-  const range = suggestion.range
-    || new monaco.Range(position.lineNumber, 1, position.lineNumber, position.column);
-  return { items: [{ insertText: suggestion.insertText, range }] };
-}
-
-// True when an editable (non-read-only) editor is bound to the model.
-// Inline suggestions must never appear in read-only panes (unstaged diff,
-// chat tool-card viewers); Monaco's own suppression cannot be relied on
-// here, so the provider gates on it explicitly.
-function editableEditorForModel(model) {
-  if (!monaco.editor.getEditors || !monaco.editor.EditorOption) return false;
-  return monaco.editor.getEditors().some((ed) => {
-    return ed.getModel() === model
-      && !ed.getOption(monaco.editor.EditorOption.readOnly);
-  });
-}
 
 function $(id) {
   return document.getElementById(id);
@@ -516,23 +478,47 @@ function normalizeColorizeHTML(html) {
 // pair, so a cached result is always valid for the same text.
 const COLORIZE_CACHE_MAX = 300;
 const colorizeCache = new Map();
+// Sanitize profile applied once at cache-fill, so every consumer (inline
+// fast path, async applies, tool results) gets purified HTML from this
+// single choke point. Monaco's token spans are class-based, and `class`/
+// `span` survive the html profile, so the painted output is unchanged.
+const COLORIZE_SANITIZE_PROFILE = { USE_PROFILES: { html: true } };
+
+// LRU accessors for colorizeCache. Map iteration order is insertion order,
+// so a cache HIT re-inserts the key (delete + set) to refresh its recency,
+// and eviction removes the first key — the least recently used. Under plain
+// FIFO, entries that are re-used on every flush (the same block rendered
+// repeatedly) could age out behind one-shot entries that are never read
+// again.
+function colorizeCacheGet(key) {
+  const hit = colorizeCache.get(key);
+  if (hit === undefined) return undefined;
+  colorizeCache.delete(key);
+  colorizeCache.set(key, hit);
+  return hit;
+}
+
+function colorizeCachePut(key, html) {
+  if (colorizeCache.size >= COLORIZE_CACHE_MAX) {
+    const oldest = colorizeCache.keys().next().value;
+    if (oldest !== undefined) colorizeCache.delete(oldest);
+  }
+  colorizeCache.set(key, html);
+}
 
 /**
  * Tokenize `source` for `lang` via Monaco, returning normalized HTML.
  * Completed blocks (unchanged text between flushes) hit the cache and skip
- * tokenization entirely; only growing in-flight blocks re-tokenize.
+ * tokenization entirely; only growing in-flight blocks re-tokenize. Results
+ * are DOMPurify-sanitized once before caching.
  */
 function cachedColorize(m, source, lang) {
   const key = lang + '\u0000' + source;
-  const hit = colorizeCache.get(key);
+  const hit = colorizeCacheGet(key);
   if (hit !== undefined) return Promise.resolve(hit);
   return m.editor.colorize(source, lang, {}).then((raw) => {
-    const html = normalizeColorizeHTML(raw);
-    if (colorizeCache.size >= COLORIZE_CACHE_MAX) {
-      const oldest = colorizeCache.keys().next().value;
-      if (oldest !== undefined) colorizeCache.delete(oldest);
-    }
-    colorizeCache.set(key, html);
+    const html = DOMPurify.sanitize(normalizeColorizeHTML(raw), COLORIZE_SANITIZE_PROFILE);
+    colorizeCachePut(key, html);
     return html;
   });
 }
@@ -563,7 +549,9 @@ export async function colorizeElement(el, langHint) {
   if (!source.trim()) return;
 
   try {
-    const html = normalizeColorizeHTML(await m.editor.colorize(source, lang, {}));
+    // Shared token cache: repeated renders of the same source skip
+    // tokenization, and results are purified at cache-fill.
+    const html = await cachedColorize(m, source, lang);
     if (el._gogenHlGen !== gen || !el.isConnected) return;
     el.innerHTML = html;
     el.dataset.monacoColorized = '1';
@@ -576,60 +564,113 @@ export async function colorizeElement(el, langHint) {
 }
 
 /**
- * Syntax-highlight fenced code blocks under root using Monaco's colorize API.
- * Safe to call repeatedly; skips already-highlighted nodes. Stale runs are dropped
- * when root is re-rendered (generation counter).
+ * Language id for a fenced `<code class="language-X">` element, resolved via
+ * the static alias map only (no Monaco needed, so the synchronous cache
+ * fast path works before the bundle loads). The async path re-resolves via
+ * Monaco's full registry (resolveMonacoLanguage), which covers alias-gap
+ * fences (e.g. "xhtml" → html, "c++" → cpp) the static map lacks. For
+ * languages the static map covers, the id here equals the resolved id, so a
+ * sync hit is always valid; for alias-gap languages the sync lookup simply
+ * misses and the async path stores under the canonical id.
  */
-export async function colorizeCodeBlocks(root) {
-  if (!root || !root.querySelectorAll) return;
-  const codes = root.querySelectorAll('pre code');
+function langIdFromClass(code) {
+  const classMatch = /(?:^|\s)language-(\S+)/.exec(code.className || '');
+  if (!classMatch) return null;
+  const id = String(classMatch[1]).trim().toLowerCase();
+  if (!id) return null;
+  return LANG_ALIASES[id] || id;
+}
+
+function applyColorized(code, html) {
+  code.innerHTML = html;
+  code.dataset.monacoColorized = '1';
+  code.classList.add('monaco-colorized');
+  // Notify scroll system that DOM height may have changed.
+  window.dispatchEvent(new CustomEvent('gogen-colorized', { bubbles: false }));
+}
+
+// Background tokenize for one code element. The result is applied only if
+// the element is still in the document — a re-rendered block's code
+// elements are replaced every flush, so element identity is the staleness
+// signal (no generation counter needed).
+//
+// opts.cache (default true) stores the sanitized HTML in the shared LRU.
+// The streaming tail passes false: its source is still growing, so the key
+// can never be hit again and would only evict a useful entry. opts.
+// requireTextMatch (streaming tail) additionally drops the result when the
+// element's current text no longer equals the tokenized source — a flush
+// that re-rendered new content while the tokenize was in flight.
+function enqueueColorize(code, source, lang, opts) {
+  const cache = !opts || opts.cache !== false;
+  const requireTextMatch = !!(opts && opts.requireTextMatch);
+  (async () => {
+    try {
+      const m = await initMonaco();
+      if (!code.isConnected) return;
+      // Resolve through Monaco's full registry (alias scan included) before
+      // tokenizing: the static map in langIdFromClass covers only the common
+      // fences, and colorize with an unregistered id yields no tokens (plain
+      // output, cached as "done" — permanently uncolored). Alias-gap fences
+      // like "xhtml" (→ html), "c++" (→ cpp), "es" (→ javascript) must be
+      // resolved here; unknown ids resolve to null and stay plain, matching
+      // the pre-merge colorizeCodeBlocks behavior.
+      const resolved = resolveMonacoLanguage(lang);
+      if (!resolved || resolved === 'plaintext') return;
+      const raw = await m.editor.colorize(source, resolved, {});
+      if (!code.isConnected) return;
+      // Single-threaded: nothing can mutate the element between this check
+      // and applyColorized below, so one text comparison after the last
+      // await is enough.
+      if (requireTextMatch && code.textContent !== source) return;
+      const html = DOMPurify.sanitize(normalizeColorizeHTML(raw), COLORIZE_SANITIZE_PROFILE);
+      if (cache) colorizeCachePut(resolved + '\u0000' + source, html);
+      applyColorized(code, html);
+    } catch (_) {
+      // Unknown / unloaded language or init failure — leave plain text.
+    }
+  })();
+}
+
+/**
+ * Syntax-highlight fenced code blocks under `node` (a freshly rendered
+ * markdown block: a completed .md-block, the streaming tail, or a full
+ * .msg-text render). Runs synchronously: already-tokenized (lang, source)
+ * pairs are inlined immediately — a single DOM write, no async — and only
+ * uncached blocks tokenize in the background. Callers pass only nodes
+ * whose content is final (completed blocks) or re-rendered every flush
+ * (the streaming tail), so no skip bookkeeping is needed.
+ *
+ * opts.streamingTail (used for streaming-tail renders): uncached code still
+ * tokenizes in the background — the per-flush streaming colorization the
+ * pre-optimization code provided, so a code block keeps its colors as it
+ * grows — but the tokenize skips the shared LRU cache (the tail source is
+ * still growing, so the key can never be hit again and would only evict a
+ * useful entry) and applies only while the element's text still matches the
+ * tokenized source (a flush that re-rendered new content invalidates the
+ * result; the next flush's tokenize covers it). Sync cache hits still apply
+ * instantly.
+ */
+export function colorizeNode(node, opts) {
+  if (!node || !node.querySelectorAll) return;
+  const codes = node.querySelectorAll('pre code');
   if (!codes.length) return;
+  const streamingTail = !!(opts && opts.streamingTail);
 
-  const gen = (root._gogenHlGen = (root._gogenHlGen || 0) + 1);
-  let m;
-  try {
-    m = await initMonaco();
-  } catch (err) {
-    console.warn('monaco colorize init failed', err);
-    return;
-  }
-  if (root._gogenHlGen !== gen || !root.isConnected) return;
-
-  // Collect all colorize tasks and run them concurrently so that large
-  // chat histories with many code blocks finish faster.
-  const tasks = [];
   for (const code of codes) {
-    if (root._gogenHlGen !== gen || !code.isConnected) break;
-    if (code.dataset.monacoColorized === '1') continue;
-
-    const classMatch = /(?:^|\s)language-(\S+)/.exec(code.className || '');
-    const lang = resolveMonacoLanguage(classMatch ? classMatch[1] : '');
+    const lang = langIdFromClass(code);
     if (!lang || lang === 'plaintext') continue;
 
     const source = code.textContent || '';
     if (!source.trim()) continue;
 
-    // Capture snapshot for stale-result detection per block
-    const genSnapshot = root._gogenHlGen;
-    tasks.push(
-      (async () => {
-        try {
-          const html = await cachedColorize(m, source, lang);
-          if (root._gogenHlGen !== genSnapshot || !code.isConnected) return;
-          code.innerHTML = html;
-          code.dataset.monacoColorized = '1';
-          code.classList.add('monaco-colorized');
-        } catch (_) {
-          // Unknown / unloaded language — leave plain text.
-        }
-      })()
-    );
+    const key = lang + '\u0000' + source;
+    const hit = colorizeCacheGet(key);
+    if (hit !== undefined) {
+      applyColorized(code, hit);
+    } else {
+      enqueueColorize(code, source, lang, streamingTail ? { cache: false, requireTextMatch: true } : undefined);
+    }
   }
-  if (tasks.length > 0) {
-    await Promise.all(tasks);
-  }
-  // Notify scroll system that DOM height may have changed.
-  window.dispatchEvent(new CustomEvent('gogen-colorized', { bubbles: false }));
 }
 
 /** Colorize unified-diff lines via decorations (works even if language tokens are missing). */
@@ -823,26 +864,6 @@ function ensureEditors() {
       },
     });
 
-    // --- Inline (ghost-text) completions: agent edit suggestions. ---
-    // Registered once per editor; inert until a source is set (see
-    // setInlineCompletionSource). Suggestions are offered only on an
-    // editable editor bound to the model, and only for the range the
-    // source specifies (default: the line prefix, so the ghost text
-    // appends at the cursor).
-    if (monaco.languages.registerInlineCompletionsProvider) {
-      monaco.languages.registerInlineCompletionsProvider('*', {
-        provideInlineCompletions(model, position) {
-          if (!inlineCompletionSource) return { items: [] };
-          if (!editableEditorForModel(model)) return { items: [] };
-          const suggestion = inlineCompletionSource(model, position);
-          if (suggestion && typeof suggestion.then === 'function') {
-            return suggestion.then((s) => suggestionToItems(model, position, s));
-          }
-          return suggestionToItems(model, position, suggestion);
-        },
-        freeInlineCompletions() {},
-      });
-    }
   }
 }
 
@@ -1338,7 +1359,16 @@ async function openFile(path, line, endLine) {
     editor.focus();
     highlightRefRange(line, endLine);
   }
+  // On mobile the explorer is an overlay drawer: once a file is open it
+  // would cover the editor, so close it (all open paths funnel through
+  // openFile: tree, unstaged list, find-in-files, chat references).
+  closeEditorSidebarOnMobile();
   return true;
+}
+
+function closeEditorSidebarOnMobile() {
+  if (window.innerWidth > 768) return;
+  $('editor-sidebar')?.classList.remove('open');
 }
 
 export async function openFileAtLine(path, line, endLine) {
@@ -1494,26 +1524,198 @@ async function loadTree(path, container) {
 }
 
 async function refreshGitStatus() {
-  const list = $('unstaged-list');
+  const list = $('changes-list');
   if (!list) return;
   list.innerHTML = '';
   try {
     const data = await wsRequest('git_status', {}, WS_REQUEST_SLOW_TIMEOUT_MS);
-    const entries = data.gitEntries || [];
-    if (!entries.length) {
+    // v2 payload: pre-bucketed lists (the client never sees the XY matrix).
+    // Fall back to the legacy flat list (Unstaged+Untracked) if a stale
+    // server predates gitStatus.
+    let sections;
+    if (data.gitStatus) {
+      const gs = data.gitStatus;
+      sections = [
+        { title: 'Conflicts', entries: gs.unmerged || [], cls: 'conflict' },
+        { title: 'Staged', entries: gs.staged || [] },
+        { title: 'Unstaged', entries: gs.unstaged || [] },
+        { title: 'Untracked', entries: gs.untracked || [] },
+      ];
+    } else {
+      sections = [{ title: 'Changes', entries: data.gitEntries || [] }];
+    }
+    if (!sections.some((s) => s.entries.length)) {
       list.textContent = 'Working tree clean';
       return;
     }
-    for (const ent of entries) {
-      const row = document.createElement('div');
-      row.className = 'unstaged-item';
-      row.textContent = `${ent.status}  ${ent.path}`;
-      row.title = ent.path;
-      row.onclick = () => openUnstagedDiff(ent.path);
-      list.appendChild(row);
+    for (const sec of sections) {
+      if (!sec.entries.length) continue; // empty sections are hidden
+      const wrap = document.createElement('div');
+      wrap.className = 'changes-section' + (sec.cls ? ` ${sec.cls}` : '');
+      const head = document.createElement('div');
+      head.className = 'changes-section-head';
+      head.textContent = sec.title;
+      wrap.appendChild(head);
+      for (const ent of sec.entries) {
+        const row = document.createElement('div');
+        row.className = 'changes-item';
+        const label = document.createElement('span');
+        label.className = 'changes-item-label';
+        label.textContent = `${ent.status}  ${ent.path}`;
+        label.title = ent.path;
+        label.onclick = () => openUnstagedDiff(ent.path);
+        row.appendChild(label);
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'changes-item-action';
+        if (sec.title === 'Staged') {
+          btn.textContent = 'Unstage';
+          btn.title = `Unstage ${ent.path}`;
+          btn.onclick = (e) => {
+            e.stopPropagation();
+            unstagePath(ent.path, btn);
+          };
+        } else {
+          // Unstaged / Untracked (and Conflicts, where staging is the
+          // sensible next step) rows stage their path.
+          btn.textContent = 'Stage';
+          btn.title = `Stage ${ent.path}`;
+          btn.onclick = (e) => {
+            e.stopPropagation();
+            stagePath(ent.path, btn);
+          };
+        }
+        row.appendChild(btn);
+        wrap.appendChild(row);
+      }
+      list.appendChild(wrap);
     }
   } catch (err) {
     list.textContent = err.message;
+  }
+}
+
+// ── Git mutations (stage / unstage / push) ──
+// gitErrorToast surfaces git failures. Errors mentioning index.lock are
+// transient — a concurrent git operation (e.g. the agent, whose git tools
+// deliberately do NOT take the editor fsMu) holds the lock — so they get a
+// retryable wording instead of a generic failure.
+function gitErrorToast(err, prefix) {
+  const msg = err && err.message ? err.message : String(err);
+  if (/index\.lock|unable to lock/i.test(msg)) {
+    toast(`${prefix}: git is busy (index.lock) — retry in a moment`, 'error');
+  } else {
+    toast(`${prefix}: ${msg}`, 'error');
+  }
+}
+
+// stagePath stages one Changes-panel row (git_stage with a single path).
+// The row's button is disabled while the request is in flight; the panel
+// re-renders on success so the row moves to the Staged section.
+async function stagePath(path, btn) {
+  if (btn && btn.disabled) return; // request already in flight
+  if (btn) btn.disabled = true;
+  try {
+    await wsRequest('git_stage', { paths: [path] }, WS_REQUEST_SLOW_TIMEOUT_MS);
+    toast(`Staged ${basename(path)}`, 'success');
+    await refreshGitStatus();
+  } catch (err) {
+    gitErrorToast(err, 'Stage failed');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// unstagePath unstages one Staged row (git_unstage with a single path).
+async function unstagePath(path, btn) {
+  if (btn && btn.disabled) return; // request already in flight
+  if (btn) btn.disabled = true;
+  try {
+    await wsRequest('git_unstage', { paths: [path] }, WS_REQUEST_SLOW_TIMEOUT_MS);
+    toast(`Unstaged ${basename(path)}`, 'success');
+    await refreshGitStatus();
+  } catch (err) {
+    gitErrorToast(err, 'Unstage failed');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// pushBranch pushes the current branch to origin (git_push; the server
+// runs a fixed argv, no user-controlled arguments).
+async function pushBranch() {
+  const btn = $('btn-push');
+  if (!btn || btn.disabled) return; // request already in flight
+  btn.disabled = true;
+  const prevLabel = btn.textContent;
+  btn.textContent = 'Pushing…';
+  try {
+    await wsRequest('git_push', {}, WS_REQUEST_SLOW_TIMEOUT_MS);
+    toast('Pushed', 'success');
+  } catch (err) {
+    gitErrorToast(err, 'Push failed');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = prevLabel;
+  }
+}
+
+// ── Commit composer ──
+// Composer in the Changes sidebar. "AI" fills the textarea from the staged
+// diff via a one-shot LLM call (git_commit_message) — it never creates or
+// touches a chat session and never auto-commits. "Stage all before commit"
+// runs git_stage (empty paths = `git add -A`) before committing.
+
+async function generateCommitMessage() {
+  const ta = $('commit-message');
+  const btn = $('btn-commit-ai');
+  if (!ta || !btn) return;
+  if (btn.disabled) return; // request already in flight
+  btn.disabled = true;
+  const prevLabel = btn.textContent;
+  btn.textContent = 'Generating…';
+  try {
+    const data = await wsRequest('git_commit_message', {}, WS_REQUEST_SLOW_TIMEOUT_MS);
+    ta.value = (data.content || '').trim();
+    if (ta.value) {
+      ta.focus();
+      toast('Commit message generated', 'success');
+    }
+  } catch (err) {
+    // Keep the composer usable: the textarea stays as-is, the error toasts.
+    toast(`Generate failed: ${err.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = prevLabel;
+  }
+}
+
+async function commitStaged() {
+  const ta = $('commit-message');
+  const btn = $('btn-commit');
+  if (!ta || !btn) return;
+  if (btn.disabled) return; // request already in flight
+  const message = ta.value.trim();
+  if (!message) {
+    toast('Commit message is required', 'error');
+    return;
+  }
+  btn.disabled = true;
+  const prevLabel = btn.textContent;
+  btn.textContent = 'Committing…';
+  try {
+    if ($('stage-all')?.checked) {
+      await wsRequest('git_stage', {}, WS_REQUEST_SLOW_TIMEOUT_MS);
+    }
+    await wsRequest('git_commit', { content: message }, WS_REQUEST_SLOW_TIMEOUT_MS);
+    ta.value = '';
+    toast('Committed', 'success');
+    await refreshGitStatus();
+  } catch (err) {
+    gitErrorToast(err, 'Commit failed');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = prevLabel;
   }
 }
 
@@ -1525,6 +1727,12 @@ export async function refreshExplorer() {
 
 export function focusFindInFiles() {
   switchToEditorPane();
+  // The find input lives in the explorer sidebar, which is a closed drawer
+  // on mobile — open it so the input is visible and the keyboard focus
+  // lands somewhere the user can see.
+  if (window.innerWidth <= 768) {
+    $('editor-sidebar')?.classList.add('open');
+  }
   const input = $('find-in-files-input');
   if (input) {
     input.focus();
@@ -1602,6 +1810,60 @@ async function runFindInFiles(pattern) {
 // --- Search & Replace ---
 
 /**
+ * Refresh open editor buffers for files that a global replace modified on
+ * disk, so saving an affected tab later cannot revert the replacement:
+ * - clean buffers are reloaded from disk via fs_read;
+ * - dirty buffers keep the user's unsaved edits, but the same
+ *   pattern→replacement is applied in memory (best effort: JS regex
+ *   semantics may differ from the server's for exotic patterns, and a
+ *   pattern that is not a valid regex is treated as a literal).
+ * @param {string[]} affectedPaths - workspace-relative paths from fs_replace_result
+ * @param {string} pattern - the search pattern that was replaced
+ * @param {string} replacement - the replacement string
+ */
+async function syncBuffersAfterReplace(affectedPaths, pattern, replacement) {
+  const affected = new Set(affectedPaths || []);
+  for (const path of [...buffers.keys()]) {
+    if (!affected.has(path)) continue;
+    const b = buffers.get(path);
+    if (!b || !b.model) continue;
+    if (!isDirty(path)) {
+      try {
+        const data = await wsRequest('fs_read', { path });
+        if (data && !data.error) {
+          b.model.setValue(data.content || '');
+          b.savedVersionId = b.model.getAlternativeVersionId();
+        }
+      } catch (err) {
+        toast(`Could not refresh ${basename(path)}: ${err.message || 'read failed'}`, 'error');
+      }
+    } else {
+      applyReplaceInModel(b.model, pattern, replacement);
+    }
+  }
+  updateDirtyIndicators();
+}
+
+/**
+ * Apply a pattern→replacement to a Monaco model in place, preserving the
+ * undo stack (pushEditOperations) and the dirty state.
+ */
+function applyReplaceInModel(model, pattern, replacement) {
+  const value = model.getValue();
+  let next;
+  try {
+    next = value.replace(new RegExp(pattern, 'g'), replacement);
+  } catch {
+    next = value.split(pattern).join(replacement);
+  }
+  if (next === value) return;
+  model.pushEditOperations(
+    [{ range: model.getFullModelRange(), text: next, forceMoveStack: true }],
+    () => model.getFullModelRange()
+  );
+}
+
+/**
  * Replace all occurrences of `search` with `replace` across matching files.
  * Uses the backend `fs_replace` message which performs a safe text replacement.
  * @param {string} [scopePath] - If provided, restrict replacement to this file.
@@ -1624,6 +1886,9 @@ async function runReplaceAll(searchPattern, replacement, scopePath) {
     if (gen !== searchGen) return;
     if (data.replaced && data.replaced > 0) {
       toast(`Replaced ${data.replaced} occurrence(s) in ${data.fileCount || '?'} file(s)`, 'success');
+      // The files changed on disk — refresh any affected open buffers so a
+      // later save cannot overwrite the replacement with a stale model.
+      await syncBuffersAfterReplace(data.files, q, r);
       // Re-run the search to show updated results
       runFindInFiles(searchPattern);
     } else {
@@ -1636,9 +1901,47 @@ async function runReplaceAll(searchPattern, replacement, scopePath) {
   }
 }
 
+/**
+ * Escape HTML special characters for safe insertion into HTML strings.
+ * Covers &, <, >, " and ' while safely handling null/undefined/numbers.
+ */
+export function escapeHtml(str) {
+    if (str == null) return '';
+    const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+    return String(str).replace(/[&<>"']/g, (ch) => map[ch]);
+}
+
 export function setupEditorUI() {
+  // Mobile-only file-explorer drawer: toggle button + close on outside tap
+  // (mirrors the chat sidebar's behavior in app.js).
+  $('editor-sidebar-toggle')?.addEventListener('click', () => {
+    $('editor-sidebar')?.classList.toggle('open');
+  });
+  document.addEventListener('click', (e) => {
+    if (window.innerWidth > 768) return;
+    const sb = $('editor-sidebar');
+    if (!sb || !sb.classList.contains('open')) return;
+    if (sb.contains(e.target) || e.target === $('editor-sidebar-toggle')) return;
+    sb.classList.remove('open');
+  });
   $('btn-refresh-explorer')?.addEventListener('click', () => {
     refreshExplorer().catch((e) => toast(e.message, 'error'));
+  });
+  $('btn-commit-ai')?.addEventListener('click', () => {
+    generateCommitMessage().catch((e) => toast(e.message, 'error'));
+  });
+  $('btn-commit')?.addEventListener('click', () => {
+    commitStaged().catch((e) => toast(e.message, 'error'));
+  });
+  $('btn-push')?.addEventListener('click', () => {
+    pushBranch().catch((e) => toast(e.message, 'error'));
+  });
+  // Ctrl/Cmd+Enter in the message textarea commits (mirrors the chat input).
+  $('commit-message')?.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      e.preventDefault();
+      commitStaged().catch((err) => toast(err.message, 'error'));
+    }
   });
   $('btn-save-file')?.addEventListener('click', () => saveActive());
   $('btn-save-all')?.addEventListener('click', () => saveAll());
@@ -1742,7 +2045,7 @@ export function setupEditorUI() {
 
     let html = '';
     for (const [file, fileMatches] of byFile) {
-      html += `<div class="rp-file-header">${escHTML(file)}</div>`;
+      html += `<div class="rp-file-header">${escapeHtml(file)}</div>`;
       for (const m of fileMatches) {
         const line = m.text || '';
         const highlighted = highlightMatch(line, search);
@@ -1755,11 +2058,6 @@ export function setupEditorUI() {
       }
     }
     return html;
-  }
-
-  /** Escape HTML entities. */
-  function escHTML(s) {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
   /**
@@ -1775,16 +2073,16 @@ export function setupEditorUI() {
       re = new RegExp(lit, 'g');
     }
     if (replacement !== undefined) {
-      return escHTML(text.replace(re, replacement));
+      return escapeHtml(text.replace(re, replacement));
     }
     let out = '';
     let last = 0;
     for (const m of text.matchAll(re)) {
-      out += escHTML(text.slice(last, m.index));
-      out += `<span class="rp-highlight">${escHTML(m[0])}</span>`;
+      out += escapeHtml(text.slice(last, m.index));
+      out += `<span class="rp-highlight">${escapeHtml(m[0])}</span>`;
       last = m.index + m[0].length;
     }
-    out += escHTML(text.slice(last));
+    out += escapeHtml(text.slice(last));
     return out;
   }
 

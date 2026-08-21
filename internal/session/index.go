@@ -5,7 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -182,9 +182,7 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 		if needsRewrite {
 			_ = s.writeIndex(workingDir, idx)
 		}
-		sort.Slice(idx.Entries, func(i, j int) bool {
-			return idx.Entries[i].Updated.After(idx.Entries[j].Updated)
-		})
+		slices.SortFunc(idx.Entries, func(a, b sessionIndexEntry) int { return b.Updated.Compare(a.Updated) })
 		out := make([]agent.SessionInfo, len(idx.Entries))
 		for i, e := range idx.Entries {
 			out[i] = agent.SessionInfo{
@@ -252,10 +250,10 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 	}
 	// Persist the index for next time (best-effort).
 	if len(idx.Entries) > 0 {
-		sort.Slice(idx.Entries, func(i, j int) bool { return idx.Entries[i].Updated.After(idx.Entries[j].Updated) })
+		slices.SortFunc(idx.Entries, func(a, b sessionIndexEntry) int { return b.Updated.Compare(a.Updated) })
 		_ = s.writeIndex(workingDir, idx)
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i].updated.After(items[j].updated) })
+	slices.SortFunc(items, func(a, b item) int { return b.updated.Compare(a.updated) })
 	out := make([]agent.SessionInfo, len(items))
 	for i, it := range items {
 		out[i] = it.info

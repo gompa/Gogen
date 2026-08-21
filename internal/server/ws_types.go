@@ -34,11 +34,12 @@ type SessionEntry struct {
 	MessageCount int    `json:"messageCount,omitempty"`
 	Label        string `json:"label,omitempty"`
 	Oneshot      bool   `json:"oneshot,omitempty"`
-	// Active marks sessions with a live in-memory runtime: the client
-	// can render "resume to continue" for them.
-	// Idle runtimes whose last client detached are orphan-evicted (they
-	// return to the saved list), so active here means genuinely live —
-	// open in another tab, or a headless turn still running.
+	// Active marks sessions that are genuinely live: open as a pane in
+	// some tab (an attached viewer) or with a turn running server-side.
+	// The client renders "resume to continue" for them. A merely
+	// registered runtime does NOT set the flag — the restored default
+	// session after a restart and passive (approval-only) attachments
+	// must not pin the indicator for a session nobody is viewing.
 	Active bool `json:"active,omitempty"`
 	// TurnActive marks active sessions whose runtime currently has a
 	// running turn. The client uses it to distinguish a genuinely running
@@ -87,6 +88,11 @@ type BoardOpRequest struct {
 	// ("" = the configured board_start_prompt template; the stored ticket
 	// override is cleared). start only.
 	Prompt string `json:"prompt,omitempty"`
+	// ThinkingLevel is the per-ticket reasoning-effort level chosen in the
+	// "Start agent" popover ("" = inherit the active pane's live level;
+	// the stored ticket override is cleared). Validated against the
+	// ticket's final model at start time. start only.
+	ThinkingLevel string `json:"thinkingLevel,omitempty"`
 }
 
 // ProviderEntry is one registered OpenAI-compatible provider in the config
@@ -209,7 +215,10 @@ type WSMessage struct {
 	// empty means unknown. Shown as a hover tooltip in the client.
 	ModelDescription string `json:"modelDescription,omitempty"`
 	ContextLimit     int    `json:"contextLimit,omitempty"`
-	UsedTokens       int    `json:"usedTokens,omitempty"`
+	// UsedTokens is always emitted (no omitempty): 0 is meaningful
+	// (fresh session, nothing counted yet) and lets clients distinguish
+	// "0 used" from "no context data at all".
+	UsedTokens       int    `json:"usedTokens"`
 	UsedSource       string `json:"usedSource,omitempty"`
 	PromptTokens     int    `json:"promptTokens,omitempty"`
 	CompletionTokens int    `json:"completionTokens,omitempty"`
@@ -253,6 +262,10 @@ type WSMessage struct {
 	// provided in client→server messages; the server normalizes <= 0 to the
 	// config default when seeding agents).
 	SubagentMaxDepth int `json:"subagentMaxDepth,omitempty"`
+	// SubagentMaxConcurrent is the live per-parent concurrent-subagent
+	// limit (0 = not provided in client→server messages; the server
+	// normalizes <= 0 to the config default when enforcing).
+	SubagentMaxConcurrent int `json:"subagentMaxConcurrent,omitempty"`
 	// SubagentModel is the live default model for spawned subagents
 	// (client→server value inside ConfigFields; server→client current value
 	// in config pushes). A POINTER so config pushes always carry it —
@@ -260,6 +273,13 @@ type WSMessage struct {
 	// broadcast to every other tab — while non-config messages omit it
 	// entirely (no per-token overhead).
 	SubagentModel *string `json:"subagentModel,omitempty"`
+	// SubagentThinkingLevel is the live reasoning-effort level for spawned
+	// subagents (client→server value inside ConfigFields; server→client
+	// current value in config pushes). A POINTER like SubagentModel so
+	// config pushes always carry it — including the empty "inherit the
+	// parent's level" state a clear by one tab must broadcast to every
+	// other tab — while non-config messages omit it entirely.
+	SubagentThinkingLevel *string `json:"subagentThinkingLevel,omitempty"`
 	// BoardStartPrompt / SystemPrompt / SubagentPrompt are the configurable
 	// prompt templates (settings modal "Agent" group). Pushed server→client
 	// as the RESOLVED effective templates (empty config → built-in default),
@@ -313,6 +333,7 @@ type WSMessage struct {
 	CompactKeepRecentMessages int     `json:"compactKeepRecentMessages,omitempty"`
 	MaxToolResultBytes        int     `json:"maxToolResultBytes,omitempty"`
 	CompactReserveTokens      int     `json:"compactReserveTokens,omitempty"`
+	CompactLastResort         string  `json:"compactLastResort,omitempty"` // condense (default) | error
 	WebFetch                  string  `json:"webFetch,omitempty"`
 	WebSearch                 string  `json:"webSearch,omitempty"`
 	WebSearchBackend          string  `json:"webSearchBackend,omitempty"`
@@ -390,13 +411,19 @@ type WSMessage struct {
 	// attach/resume history payload (nil when nothing has streamed yet).
 	Rewind *liveRewindState `json:"rewind,omitempty"`
 	// Filesystem / git editor APIs
-	Path        string              `json:"path,omitempty"`
-	Pattern     string              `json:"pattern,omitempty"`
-	Glob        string              `json:"glob,omitempty"`
-	Language    string              `json:"language,omitempty"`
-	Error       string              `json:"error,omitempty"`
-	Entries     []FSEntry           `json:"entries,omitempty"`
-	GitEntries  []GitStatusEntry    `json:"gitEntries,omitempty"`
+	Path       string           `json:"path,omitempty"`
+	Pattern    string           `json:"pattern,omitempty"`
+	Glob       string           `json:"glob,omitempty"`
+	Language   string           `json:"language,omitempty"`
+	Error      string           `json:"error,omitempty"`
+	Entries    []FSEntry        `json:"entries,omitempty"`
+	GitEntries []GitStatusEntry `json:"gitEntries,omitempty"`
+	// GitStatus is the pre-bucketed v2 payload (git_status_result).
+	// Pointer so omitempty can drop it from non-git messages.
+	GitStatus *GitStatus `json:"gitStatus,omitempty"`
+	// Branch is the target branch for git_push (empty = bare `git push`,
+	// letting git resolve the configured upstream).
+	Branch      string              `json:"branch,omitempty"`
 	Matches     []agent.SearchMatch `json:"matches,omitempty"`
 	Truncated   bool                `json:"truncated,omitempty"`
 	Original    string              `json:"original,omitempty"`
@@ -406,6 +433,9 @@ type WSMessage struct {
 	Replacement string              `json:"replacement,omitempty"`
 	Replaced    int                 `json:"replaced,omitempty"`
 	FileCount   int                 `json:"fileCount,omitempty"`
+	// Files lists the workspace-relative paths modified by fs_replace, so the
+	// editor can refresh the open buffers for exactly those files.
+	Files []string `json:"files,omitempty"`
 }
 
 func applyContextStats(msg *WSMessage, stats agent.TurnContext, accum *agent.UsageAccumulator) {
@@ -413,9 +443,10 @@ func applyContextStats(msg *WSMessage, stats agent.TurnContext, accum *agent.Usa
 	if snap.Limit > 0 {
 		msg.ContextLimit = snap.Limit
 	}
-	if snap.Used > 0 {
-		msg.UsedTokens = snap.Used
-	}
+	// Always report the used count (0 for a fresh session) so clients can
+	// distinguish "0 used" from "no context data at all" — the web badge
+	// renders "—/limit" for the former instead of "unknown".
+	msg.UsedTokens = snap.Used
 	msg.PromptTokens = stats.PromptTokens
 	msg.CompletionTokens = stats.CompletionTokens
 	msg.CachedTokens = stats.CachedTokens

@@ -16,6 +16,7 @@
 const fs = require('fs');
 const path = require('path');
 const { JSDOM } = require('/tmp/gogen-jsdom/node_modules/jsdom');
+const { loadAppJs, installEditorStubs } = require('./web-harness');
 
 const ROOT = path.join(__dirname, '..');
 
@@ -48,17 +49,7 @@ async function main() {
   };
   window.HTMLElement.prototype.scrollIntoView = function () {};
 
-  const editorStubs = [
-    'connectEditorSocket', 'setupEditorUI', 'refreshExplorer', 'disposeChatEditors',
-    'mountDiffEditor', 'updateDiffEditor', 'updateDiffFallback', 'chatDiffWheelEdge',
-    'extractDiffValue', 'initMonaco', 'colorizeCodeBlocks', 'colorizeElement',
-    'languageFromPath', 'setToastHandler', 'focusFindInFiles', 'editorUndo',
-    'editorRedo', 'saveAll', 'saveActive', 'openFileAtLine', 'setMonacoTheme',
-    'applyEditorPrefs', 'applyPatchFromDiff',
-  ];
-  for (const name of editorStubs) {
-    window[name] = window[name] || (() => Promise.resolve());
-  }
+  installEditorStubs(window);
   // Real-ish open/close so the overlay's .active class (which gates the
   // picker's re-render and the fetch-on-open) actually toggles.
   window.openModal = (overlay) => overlay.classList.add('active');
@@ -66,11 +57,7 @@ async function main() {
   window.marked = { use() {}, parse(text) { return String(text == null ? '' : text); } };
   window.DOMPurify = { sanitize: (raw) => raw };
 
-  const appJs = fs.readFileSync(path.join(ROOT, 'internal/server/web/app.js'), 'utf8');
-  const stripped = appJs
-    .replace(/import\s*\{[^}]*\}\s*from\s*['"][^'"]+['"];\s*/gs, '')
-    .replace(/import\s+[A-Za-z_$][\w$]*\s+from\s*['"][^'"]+['"];\s*/g, '');
-  window.eval(stripped);
+  loadAppJs(window);
 
   const settingsBtn = document.getElementById('settings-btn');
   const settingsOverlay = document.getElementById('settings-overlay');
@@ -146,13 +133,14 @@ async function main() {
   // Server push: subagents on, no default model yet.
   window.applyServerConfig({ board: 'off', subagent: 'on', subagentMaxDepth: 1, subagentModel: '' });
   check('picker is visible while subagents are enabled', picker && !picker.hidden);
-  // Catalog reply (the toolbar shares this flow).
+  // Catalog reply (the toolbar shares this flow). The server marks the
+  // pane's model with `current: true` — the picker must ignore that flag.
   window.handleModels({
     models: [
-      { id: 'gpt-4o', provider: 'default', contextLimit: 128000 },
+      { id: 'gpt-4o', provider: 'default', contextLimit: 128000, current: true },
       { id: 'llama3.1', provider: 'local', contextLimit: 8192 },
     ],
-    model: '',
+    model: 'gpt-4o',
   });
   const rows = () => Array.from(pickerList.querySelectorAll('.tb-model-row'));
   const inheritRow = () => rows().find((r) => r.textContent.includes('Inherit'));
@@ -160,6 +148,21 @@ async function main() {
   check('inherit row active when no default is configured', inheritRow().classList.contains('active'));
   check('model rows rendered (toolbar-style)', rows().length === 3); // inherit + 2 models
   check('provider group headers rendered', pickerList.querySelectorAll('.tb-model-group').length === 2);
+  // The pane's model carries `current: true`; while inheriting it must NOT
+  // be highlighted (only the inherit row is active) and clicking it must
+  // select it (regression: the shared row renderer's m.current fallback
+  // pinned the parent's model as active and swallowed the click).
+  const paneModelRow = rows().find((r) => r.textContent.startsWith('gpt-4o'));
+  check('pane model (current flag) not highlighted while inheriting',
+    !paneModelRow.classList.contains('active'));
+  paneModelRow.click();
+  const panePickMsg = sent.find((s) => s.includes('configFields') && s.includes('"subagentModel":"gpt-4o"'));
+  check('clicking the pane model selects it (sends subagentModel)', !!panePickMsg);
+  check('pane model row highlighted after click', rows().find((r) => r.textContent.startsWith('gpt-4o')).classList.contains('active'));
+  // Clear back to inherit so the original flow below starts from a clean slate.
+  window.applyServerConfig({ board: 'off', subagent: 'on', subagentMaxDepth: 1, subagentModel: '' });
+  check('clear back to inherit before the original flow', inheritRow().classList.contains('active'));
+
   const gpt4oRow = rows().find((r) => r.textContent.startsWith('gpt-4o'));
   gpt4oRow.click();
   const pickMsg = sent.find((s) => s.includes('configFields') && s.includes('subagentModel'));
@@ -179,6 +182,25 @@ async function main() {
   // Feature off hides the picker.
   window.applyServerConfig({ board: 'off', subagent: 'off', subagentMaxDepth: 1, subagentModel: '' });
   check('picker hidden while subagents are disabled', picker.hidden);
+
+  // ── Max concurrent subagents input ──
+  // Re-enable subagents (the picker section ended with the feature off).
+  window.applyServerConfig({ board: 'off', subagent: 'on', subagentMaxDepth: 1, subagentModel: '', subagentMaxConcurrent: 4 });
+  const limitInput = document.getElementById('subagent-limit-input');
+  check('concurrent limit input exists', !!limitInput);
+  check('server push populates the concurrent limit input', limitInput && limitInput.value === '4');
+  limitInput.value = '2';
+  limitInput.dispatchEvent(new window.Event('change', { bubbles: true }));
+  const limitMsg = sent.find((s) => s.includes('"subagentMaxConcurrent":2'));
+  check('changing the limit sends subagentMaxConcurrent', !!limitMsg);
+  limitInput.value = '99';
+  limitInput.dispatchEvent(new window.Event('change', { bubbles: true }));
+  check('out-of-range limit clamped to 32', limitInput.value === '32');
+  const clampedMsg = sent.find((s) => s.includes('"subagentMaxConcurrent":32'));
+  check('clamped limit sent', !!clampedMsg);
+  limitInput.value = '0';
+  limitInput.dispatchEvent(new window.Event('change', { bubbles: true }));
+  check('below-range limit reset to 1', limitInput.value === '1');
 
   if (failures > 0) {
     console.error(`test_settings_tabs: ${failures} FAILURE(S)`);

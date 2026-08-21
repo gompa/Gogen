@@ -126,7 +126,9 @@ func newContinuationServer(t *testing.T, stub *blockingStub, dir string) (*Serve
 }
 
 // readUntil reads messages from conn until match returns true; the matched
-// message is returned. Fails the test on timeout.
+// message is returned. Fails the test on timeout. The per-read deadline
+// tracks the overall deadline (not a fresh window per read), so the total
+// wait is bounded by timeout rather than overshooting it.
 func readUntil(t *testing.T, conn *websocket.Conn, timeout time.Duration, match func(WSMessage) bool) WSMessage {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -134,13 +136,46 @@ func readUntil(t *testing.T, conn *websocket.Conn, timeout time.Duration, match 
 		if time.Now().After(deadline) {
 			t.Fatal("timed out waiting for matching WS message")
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(timeout))
+		_ = conn.SetReadDeadline(deadline)
 		var msg WSMessage
 		if err := conn.ReadJSON(&msg); err != nil {
 			t.Fatalf("read: %v", err)
 		}
 		if match(msg) {
 			return msg
+		}
+	}
+}
+
+// readMessagesUntil reads WS messages until pred (over the FULL collected
+// sequence) returns true or the deadline passes, and returns every message
+// read — including the non-matching ones readUntil would discard. Use it when
+// the assertion is about a SET of frames (e.g. "response + clear_chat +
+// history + two configs") rather than one frame: a single-frame readUntil
+// drops the frames it skips over, so an assertion that needs a later frame
+// can starve when an earlier, unrelated frame (like a config) is queued
+// before it. The read deadline tracks the overall deadline (not a fresh
+// window per read), so the total wait is bounded by timeout.
+func readMessagesUntil(t *testing.T, conn *websocket.Conn, timeout time.Duration, pred func([]WSMessage) bool) []WSMessage {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var msgs []WSMessage
+	for {
+		if time.Now().After(deadline) {
+			types := make([]string, 0, len(msgs))
+			for _, m := range msgs {
+				types = append(types, m.Type)
+			}
+			t.Fatalf("timed out waiting for message sequence; got %d frames: %v", len(msgs), types)
+		}
+		_ = conn.SetReadDeadline(deadline)
+		var msg WSMessage
+		if err := conn.ReadJSON(&msg); err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		msgs = append(msgs, msg)
+		if pred(msgs) {
+			return msgs
 		}
 	}
 }

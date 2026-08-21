@@ -54,8 +54,8 @@ func TestCompactPrimaryPathFitsAtDefaultTrigger(t *testing.T) {
 	if req[0].Content != "You are a coding agent." {
 		t.Fatalf("expected view prefix first in summary request, got %q", req[0].Content)
 	}
-	if last := req[len(req)-1]; last.Role != "system" || !strings.Contains(last.Content, "Summarize everything after the first user message") {
-		t.Fatalf("expected summary instruction last, got %q", last.Content)
+	if last := req[len(req)-1]; last.Role != "user" || !strings.Contains(last.Content, "Summarize everything after the first user message") {
+		t.Fatalf("expected user-role summary instruction last, got role=%q content=%q", last.Role, last.Content)
 	}
 	if budget := m.summaryRequestBudgetLocked(); m.EstimateTokens(req) > budget {
 		t.Fatalf("summary request (%d tokens) exceeds continuation budget %d", m.EstimateTokens(req), budget)

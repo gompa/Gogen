@@ -37,7 +37,16 @@ func (a *Agent) runTurn(ctx context.Context, h *llm.StreamHandlers, first bool) 
 		a.FlushSession()
 		return nil, ctx.Err()
 	}
-	view := a.prepareMessages(ctx, h)
+	view, err := a.prepareMessages(ctx, h)
+	if err != nil {
+		// The pre-flight check could not make the request fit and the
+		// last-resort mode is "error" (Phase 0e): the diagnostic is
+		// returned instead of letting the provider refuse the request.
+		finishStreamUI(h)
+		a.RepairOrphanToolCalls()
+		a.FlushSession()
+		return nil, err
+	}
 
 	if first && h.OnStart != nil {
 		h.OnStart()

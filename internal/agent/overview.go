@@ -1,10 +1,12 @@
 package agent
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -47,11 +49,8 @@ func (e *Executor) RepoOverview(ctx context.Context) (string, error) {
 		dirs = append(dirs, dirCount{name: name + "/", files: count})
 	}
 
-	sort.Slice(dirs, func(i, j int) bool {
-		if dirs[i].files == dirs[j].files {
-			return dirs[i].name < dirs[j].name
-		}
-		return dirs[i].files > dirs[j].files
+	slices.SortStableFunc(dirs, func(a, b dirCount) int {
+		return cmp.Or(cmp.Compare(b.files, a.files), cmp.Compare(a.name, b.name))
 	})
 	sort.Strings(rootFiles)
 

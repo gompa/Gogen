@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 'use strict';
 
-// Zero-dependency lint for the hand-maintained web UI JS (app.js, editor.js).
+// Zero-dependency lint for the hand-maintained web UI JS (app.js,
+// editor.js, components/*.js).
 // Runs with plain `node` — no npm, no eslint. Checks:
 //   1. Syntax (`node --check`).
 //   2. No stray debug logging: console.log/debug/info/trace are flagged;
@@ -16,9 +17,16 @@
 const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 
+const WEB = 'internal/server/web';
+const componentFiles = fs.existsSync(`${WEB}/components`)
+  ? fs.readdirSync(`${WEB}/components`)
+      .filter((f) => f.endsWith('.js'))
+      .map((f) => `${WEB}/components/${f}`)
+      .sort()
+  : [];
 const FILES = process.argv.slice(2).length > 0
   ? process.argv.slice(2)
-  : ['internal/server/web/app.js', 'internal/server/web/editor.js'];
+  : [`${WEB}/app.js`, `${WEB}/editor.js`, ...componentFiles];
 
 let problems = 0;
 
@@ -81,4 +89,4 @@ if (problems > 0) {
   console.error(`\n${problems} problem(s) in web UI JS.`);
   process.exit(1);
 }
-console.log('lint-web: OK (app.js, editor.js)');
+console.log(`lint-web: OK (${FILES.join(', ')})`);

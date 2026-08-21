@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -277,18 +278,18 @@ func TestBoardCorruptIndexRebuild(t *testing.T) {
 	}
 }
 
-// TestParseIntIDRejectsEmpty pins the empty-id guard: an empty id must
-// error (it would otherwise parse as 0 with no error), so the index rebuild
-// path skips empty-named files instead of adding a bogus "" entry to the
-// column order.
-func TestParseIntIDRejectsEmpty(t *testing.T) {
-	if _, err := parseIntID(""); err == nil {
+// TestAtoiIDParsing pins the id-parsing behavior the index rebuild path
+// relies on: an empty id must error (it would otherwise parse as 0 with no
+// error), so the rebuild skips empty-named files instead of adding a bogus
+// "" entry to the column order.
+func TestAtoiIDParsing(t *testing.T) {
+	if _, err := strconv.Atoi(""); err == nil {
 		t.Fatal("empty id should error")
 	}
-	if _, err := parseIntID("12"); err != nil {
+	if _, err := strconv.Atoi("12"); err != nil {
 		t.Fatalf("numeric id should parse: %v", err)
 	}
-	if _, err := parseIntID("12a"); err == nil {
+	if _, err := strconv.Atoi("12a"); err == nil {
 		t.Fatal("non-numeric id should error")
 	}
 }
@@ -463,10 +464,10 @@ func TestBoardToolGating(t *testing.T) {
 }
 
 // TestSetStartOptions verifies the per-ticket start-option persistence
-// (model + prompt template chosen in the web "Start agent" popover):
-// stored on the ticket, surviving a reload from disk, and cleared by an
-// explicit empty write. The start op is authoritative — an empty value
-// resets the override.
+// (model + prompt template + reasoning-effort level chosen in the web
+// "Start agent" popover): stored on the ticket, surviving a reload from
+// disk, and cleared by an explicit empty write. The start op is
+// authoritative — an empty value resets the override.
 func TestSetStartOptions(t *testing.T) {
 	m := newTestBoard(t)
 	if _, err := m.Add("Fix parser crash", "make go test pass", "high", "user"); err != nil {
@@ -474,20 +475,34 @@ func TestSetStartOptions(t *testing.T) {
 	}
 
 	// Unknown ticket.
-	if err := m.SetStartOptions("99", "gpt-4o-mini", "custom"); err == nil {
+	if err := m.SetStartOptions("99", "gpt-4o-mini", "custom", "high"); err == nil {
 		t.Fatal("SetStartOptions on an unknown ticket should fail")
 	}
 
-	// Persist both options.
-	if err := m.SetStartOptions("1", "gpt-4o-mini", "custom {title}"); err != nil {
+	// Persist all options.
+	if err := m.SetStartOptions("1", "gpt-4o-mini", "custom {title}", "high"); err != nil {
 		t.Fatal(err)
 	}
 	item, err := m.Item("1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if item.Model != "gpt-4o-mini" || item.Prompt != "custom {title}" {
-		t.Fatalf("stored start options = %q / %q, want gpt-4o-mini / custom {title}", item.Model, item.Prompt)
+	if item.Model != "gpt-4o-mini" || item.Prompt != "custom {title}" || item.ThinkingLevel != "high" {
+		t.Fatalf("stored start options = %q / %q / %q, want gpt-4o-mini / custom {title} / high", item.Model, item.Prompt, item.ThinkingLevel)
+	}
+
+	// The level is canonicalized on persist: a client sending "HIGH" must
+	// store "high" (the value the start handler applies and the popover's
+	// lowercase chips compare against).
+	if err := m.SetStartOptions("1", "gpt-4o-mini", "custom {title}", "  HIGH "); err != nil {
+		t.Fatal(err)
+	}
+	item, err = m.Item("1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.ThinkingLevel != "high" {
+		t.Fatalf("normalized start level = %q, want high", item.ThinkingLevel)
 	}
 
 	// Reload from disk: a fresh manager must see the same options.
@@ -497,19 +512,128 @@ func TestSetStartOptions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if item2.Model != "gpt-4o-mini" || item2.Prompt != "custom {title}" {
-		t.Fatalf("reloaded start options = %q / %q", item2.Model, item2.Prompt)
+	if item2.Model != "gpt-4o-mini" || item2.Prompt != "custom {title}" || item2.ThinkingLevel != "high" {
+		t.Fatalf("reloaded start options = %q / %q / %q", item2.Model, item2.Prompt, item2.ThinkingLevel)
 	}
 
 	// An explicit empty write clears back to the defaults.
-	if err := m.SetStartOptions("1", "", ""); err != nil {
+	if err := m.SetStartOptions("1", "", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	item, err = m.Item("1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if item.Model != "" || item.Prompt != "" {
-		t.Fatalf("cleared start options = %q / %q, want empty", item.Model, item.Prompt)
+	if item.Model != "" || item.Prompt != "" || item.ThinkingLevel != "" {
+		t.Fatalf("cleared start options = %q / %q / %q, want empty", item.Model, item.Prompt, item.ThinkingLevel)
 	}
+}
+
+// TestBoardIDSurvivesToolCall pins the end-to-end board tool behavior for
+// the id-taking actions: board ids are numeric strings, so the handler must
+// accept unquoted JSON numbers (float64 as decoded from model JSON), ints,
+// and quoted numeric strings — all targeting the same card. Failure modes:
+// a non-numeric string surfaces the real type error (not "missing"), zero
+// and absent ids are rejected.
+func TestBoardIDSurvivesToolCall(t *testing.T) {
+	newAgent := func() (*Agent, *BoardManager) {
+		prov := llm.NewMockProvider()
+		exec := NewExecutor(t.TempDir())
+		a := NewAgent(prov, exec, contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 128000}))
+		a.SetBoardEnabled(true)
+		bm := NewBoardManager(t.TempDir(), false)
+		a.SetBoardManager(bm)
+		if _, err := bm.Add("first card", "", "", "user"); err != nil {
+			t.Fatal(err)
+		}
+		return a, bm
+	}
+
+	t.Run("float64 id (JSON number) marks done", func(t *testing.T) {
+		a, _ := newAgent()
+		out, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{
+			"action": "done",
+			"id":     float64(1), // native tool-call JSON decode shape
+		}})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(out, "#1") {
+			t.Fatalf("expected #1 in output, got %q", out)
+		}
+		item, err := a.BoardManager().Item("1")
+		if err != nil || item.Status != "done" {
+			t.Fatalf("item #1 status = %q (err=%v), want done", item.Status, err)
+		}
+	})
+
+	t.Run("int id moves", func(t *testing.T) {
+		a, _ := newAgent()
+		out, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{
+			"action": "move",
+			"id":     1,
+			"column": "in_review",
+		}})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(out, "Moved board item #1 to in_review") {
+			t.Fatalf("move output = %q", out)
+		}
+	})
+
+	t.Run("quoted numeric string id claims", func(t *testing.T) {
+		a, _ := newAgent()
+		out, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{
+			"action": "claim",
+			"id":     "1",
+		}})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(out, "Claimed board item #1") {
+			t.Fatalf("claim output = %q", out)
+		}
+	})
+
+	t.Run("non-numeric string id reports type error not missing", func(t *testing.T) {
+		a, _ := newAgent()
+		_, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{
+			"action": "done",
+			"id":     "abc",
+		}})
+		if err == nil {
+			t.Fatal("expected error for non-numeric string id")
+		}
+		if !strings.Contains(err.Error(), "must be an integer") {
+			t.Fatalf("expected type error, got: %v", err)
+		}
+		if strings.Contains(err.Error(), "missing required argument") {
+			t.Fatalf("non-numeric id must not be masked as missing: %v", err)
+		}
+	})
+
+	t.Run("zero id rejected", func(t *testing.T) {
+		a, _ := newAgent()
+		_, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{
+			"action": "show",
+			"id":     0,
+		}})
+		if err == nil || !strings.Contains(err.Error(), "must be a positive integer") {
+			t.Fatalf("got %v, want positive-integer error", err)
+		}
+	})
+
+	t.Run("absent id reports missing", func(t *testing.T) {
+		a, _ := newAgent()
+		_, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{
+			"action": "done",
+		}})
+		if err == nil {
+			t.Fatal("expected error for absent id")
+		}
+		if !strings.Contains(err.Error(), `missing required argument "id"`) {
+			t.Fatalf("expected missing-argument error, got: %v", err)
+		}
+	})
 }

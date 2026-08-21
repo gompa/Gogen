@@ -316,7 +316,10 @@ func (p *OpenAIProvider) GenerateResponse(ctx context.Context, messages []Messag
 	resp, err := p.clientForModel(ctx).Chat.Completions.New(ctx, params)
 
 	if err != nil {
-		return Response{}, fmt.Errorf("openai api error: %w", err)
+		// wrapContextWindowError classifies a context-window refusal so the
+		// agent run loop can recover in-loop (forced compaction + retry)
+		// instead of aborting the turn.
+		return Response{}, wrapContextWindowError(fmt.Errorf("openai api error: %w", err))
 	}
 
 	if len(resp.Choices) == 0 {
@@ -469,7 +472,11 @@ func (p *OpenAIProvider) handleStreamFallback(ctx context.Context, messages []Me
 	// ran ensureStreamCallbacks, so the callbacks used below are non-nil.
 	resp, fbErr := p.GenerateResponse(ctx, messages, allowedTools, tools)
 	if fbErr != nil {
-		return nil, fmt.Errorf("stream error: %w (non-streaming fallback also failed: %v)", streamErr, fbErr)
+		// Classify the STREAM error (the primary cause): a context-window
+		// refusal that also fails the fallback must reach the agent run
+		// loop still classified, so it recovers in-loop instead of
+		// aborting the turn.
+		return nil, fmt.Errorf("stream error: %w (non-streaming fallback also failed: %v)", wrapContextWindowError(streamErr), fbErr)
 	}
 	// Re-render only the suffix beyond what the failed stream already
 	// emitted, so the live bubble does not show the recovered text twice (a

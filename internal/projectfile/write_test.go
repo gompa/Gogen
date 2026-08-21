@@ -13,7 +13,7 @@ import (
 // file values asserted below; they are unset so the tests are hermetic
 // regardless of the developer's shell environment.
 var configEnvKeys = []string{
-	"GOGEN_BOARD", "GOGEN_SUBAGENT", "GOGEN_SUBAGENT_MAX_DEPTH",
+	"GOGEN_BOARD", "GOGEN_SUBAGENT", "GOGEN_SUBAGENT_MAX_DEPTH", "GOGEN_SUBAGENT_MAX_CONCURRENT",
 	"GOGEN_COMMAND_SANDBOX", "GOGEN_COMMAND_TIMEOUT_SECS",
 	"GOGEN_SESSION_MAX_COUNT", "GOGEN_SESSION_MAX_AGE_DAYS",
 	"GOGEN_WEB_MAX_ACTIVE_SESSIONS", "GOGEN_WEB_APPROVAL_HOLD_SECS",
@@ -74,9 +74,11 @@ func TestSaveConfigOmitsDefaults(t *testing.T) {
 	}
 	body := string(data)
 	for _, key := range []string{
-		"board:", "subagent:", "subagent_max_depth:", "command_sandbox:",
-		"command_timeout_secs:", "session_max_count:", "session_max_age_days:",
-		"web_max_active_sessions:", "web_approval_hold_secs:", "web_bind:",
+		"board:", "subagent:", "subagent_max_depth:", "subagent_max_concurrent:",
+		"subagent_thinking_level:",
+		"command_sandbox:", "command_timeout_secs:", "session_max_count:",
+		"session_max_age_days:", "web_max_active_sessions:",
+		"web_approval_hold_secs:", "web_bind:",
 	} {
 		if strings.Contains(body, key) {
 			t.Fatalf("default config saved key %q:\n%s", key, body)
@@ -92,6 +94,7 @@ func TestSaveConfigOmitsDefaults(t *testing.T) {
 	if merged.CommandSandbox != def.CommandSandbox || merged.CommandTimeoutSecs != def.CommandTimeoutSecs ||
 		merged.Board != def.Board || merged.Subagent != def.Subagent ||
 		merged.SubagentDepth() != config.DefaultSubagentMaxDepth ||
+		merged.SubagentLimit() != config.DefaultSubagentMaxConcurrent ||
 		merged.SessionMaxCount != def.SessionMaxCount || merged.SessionMaxAgeDays != def.SessionMaxAgeDays ||
 		merged.WebMaxActiveSessions != def.WebMaxActiveSessions || merged.WebBind != def.WebBind {
 		t.Fatalf("round-trip lost defaults: %+v", merged)
@@ -111,6 +114,7 @@ func TestSaveConfigOmitsExplicitDefaults(t *testing.T) {
 	cfg.Board = "off"
 	cfg.Subagent = "off"
 	cfg.SubagentMaxDepth = config.DefaultSubagentMaxDepth
+	cfg.SubagentMaxConcurrent = config.DefaultSubagentMaxConcurrent
 	cfg.CommandSandbox = "off"
 	cfg.CommandTimeoutSecs = config.DefaultCommandTimeoutSecs
 	cfg.SessionMaxCount = config.DefaultSessionMaxCount
@@ -125,9 +129,9 @@ func TestSaveConfigOmitsExplicitDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, key := range []string{
-		"board:", "subagent:", "subagent_max_depth:", "command_sandbox:",
-		"command_timeout_secs:", "session_max_count:", "session_max_age_days:",
-		"web_max_active_sessions:", "web_bind:",
+		"board:", "subagent:", "subagent_max_depth:", "subagent_max_concurrent:",
+		"command_sandbox:", "command_timeout_secs:", "session_max_count:",
+		"session_max_age_days:", "web_max_active_sessions:", "web_bind:",
 	} {
 		if strings.Contains(string(data), key) {
 			t.Fatalf("explicit-default value saved key %q:\n%s", key, data)
@@ -147,6 +151,7 @@ func TestSaveConfigWritesNonDefaults(t *testing.T) {
 	cfg.Board = "on"
 	cfg.Subagent = "on"
 	cfg.SubagentMaxDepth = 3
+	cfg.SubagentMaxConcurrent = 5
 	cfg.CommandSandbox = "bwrap"
 	cfg.CommandTimeoutSecs = 180
 	cfg.SessionMaxCount = 60
@@ -163,6 +168,7 @@ func TestSaveConfigWritesNonDefaults(t *testing.T) {
 	}
 	for _, want := range []string{
 		`board: "on"`, `subagent: "on"`, "subagent_max_depth: 3",
+		"subagent_max_concurrent: 5",
 		"command_sandbox: bwrap", "command_timeout_secs: 180",
 		"session_max_count: 60", "session_max_age_days: -1",
 		"web_max_active_sessions: 4", "web_approval_hold_secs: 5",
@@ -178,6 +184,7 @@ func TestSaveConfigWritesNonDefaults(t *testing.T) {
 	}
 	merged := Merge(pf, FlagOverrides{})
 	if merged.Board != "on" || merged.Subagent != "on" || merged.SubagentDepth() != 3 ||
+		merged.SubagentLimit() != 5 ||
 		merged.CommandSandbox != "bwrap" || merged.CommandTimeoutSecs != 180 ||
 		merged.SessionMaxCount != 60 || merged.SessionMaxAgeDays != -1 ||
 		merged.WebMaxActiveSessions != 4 || merged.WebApprovalHoldSecs != 5 ||

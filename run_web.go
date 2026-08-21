@@ -4,7 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
+	"os"
+	"runtime/debug"
 	"strings"
+	"time"
 
 	"gogen/internal/agent"
 	"gogen/internal/config"
@@ -18,9 +22,12 @@ import (
 // agent-level defers (a.Close, a.FlushPending, MCP shutdown) stay in main so
 // the shutdown order is unchanged. MCP init itself is started by startMCP in
 // main before the mode branches.
-func runWeb(ctx context.Context, a *agent.Agent, cfg *config.Config, restoredModel string) error {
+//
+// tokenStatePath is where the auto-generated web auth token is persisted
+// (see web_token.go); it is only touched for non-loopback binds.
+func runWeb(ctx context.Context, a *agent.Agent, cfg *config.Config, restoredModel, tokenStatePath string) error {
 	// Determine the listen address first so we can check for loopback
-	// and auto-generate a token before creating the server.
+	// and resolve the auth token before creating the server.
 	addr := cfg.WebBind
 	var isLoopback bool
 	if addr == "" {
@@ -33,13 +40,29 @@ func runWeb(ctx context.Context, a *agent.Agent, cfg *config.Config, restoredMod
 		isLoopback = server.IsLoopbackBind(addr)
 	}
 
-	// For non-loopback binds, auto-generate a token if none is provided.
+	// Resolve the effective auth token exactly once, before the server is
+	// created, so the pairing setup below and the server's auth checks can
+	// never disagree:
+	//   1. web_auth_token from the config file — used as-is;
+	//   2. GOGEN_WEB_TOKEN env var — used as-is;
+	//   3. otherwise the persisted state file (keeps already-paired devices
+	//      logged in across restarts), or an ephemeral token for this run
+	//      when the state file is unavailable (warned; rotates on restart).
+	// Non-loopback binds without any of these fail in Server.Start. Loopback
+	// binds only get a token when one was explicitly configured.
+	if cfg.WebAuthToken == "" {
+		cfg.WebAuthToken = strings.TrimSpace(os.Getenv("GOGEN_WEB_TOKEN"))
+	}
 	if !isLoopback && cfg.WebAuthToken == "" {
-		token, err := generateToken()
+		tok, err := loadOrCreateWebToken(tokenStatePath)
 		if err != nil {
-			log.Fatalf("failed to generate auth token: %v", err)
+			log.Printf("WARNING: web auth token state unavailable (%v); using an ephemeral token for this run", err)
+			tok, err = generateToken()
+			if err != nil {
+				log.Fatalf("failed to generate auth token: %v", err)
+			}
 		}
-		cfg.WebAuthToken = token
+		cfg.WebAuthToken = tok
 	}
 
 	s := server.NewServer(a, cfg)
@@ -54,16 +77,61 @@ func runWeb(ctx context.Context, a *agent.Agent, cfg *config.Config, restoredMod
 	// forces the TUI write; a dirty session is still written here).
 	defer s.ShutdownSessions()
 
-	// Build a user-friendly URL for the startup message.
-	// Replace 0.0.0.0 with 127.0.0.1 so the link works when clicked.
-	displayAddr := addr
-	if strings.HasPrefix(displayAddr, "0.0.0.0:") {
-		displayAddr = "127.0.0.1:" + displayAddr[len("0.0.0.0:"):]
+	// Print build identity so a stale binary (whose QR/link format may not
+	// match this server's /pair endpoint) is obvious from the startup
+	// output.
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		rev := bi.Main.Version
+		for _, st := range bi.Settings {
+			if st.Key == "vcs.revision" && len(st.Value) >= 7 {
+				rev = st.Value[:7]
+			}
+		}
+		fmt.Printf("build: %s (%s)\n", rev, bi.GoVersion)
 	}
+
+	// Print the onboarding link (and QR for phones) before Start so the UI
+	// is reachable the moment the listener is up. When token auth is active
+	// the link and QR carry a short-lived pairing code — never the long-lived
+	// token — so a photographed link/QR goes dead quickly, and the token is
+	// never printed or logged. The pairing code is per-boot: it dies on the
+	// next restart (rescan the fresh QR); the login itself persists because
+	// the token is stored in the state file.
 	if cfg.WebAuthToken != "" {
-		fmt.Printf("Open http://%s?token=%s\n", displayAddr, cfg.WebAuthToken)
+		code, err := generateToken()
+		if err != nil {
+			log.Fatalf("failed to generate pairing code: %v", err)
+		}
+		expiry := time.Now().Add(server.PairingTTL)
+		s.SetPairingCode(code, expiry)
+
+		fmt.Printf("Open http://%s/pair/%s (this machine)\n", displayAddrFor(addr), code)
+		fmt.Printf("Pairing code: %s\n", code)
+		fmt.Printf("Note: this link and QR expire at %s or at the next restart — whichever comes first. Scan before then; a fresh link and QR are printed at every server start.\n", expiry.Local().Format("15:04:05"))
+		if lan := server.LANHost(addr); lan != "" {
+			_, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return fmt.Errorf("invalid listen address %q: %w", addr, err)
+			}
+			// The code lives in the path (/pair/<code>), not the query:
+			// phone camera apps and in-app browsers strip query strings
+			// when opening a scanned URL, and the path survives.
+			pairURL := fmt.Sprintf("http://%s:%s/pair/%s", lan, port, code)
+			fmt.Println("Phone: scan the QR code below (or type the pairing code above):")
+			if !stdoutIsTerminal() {
+				fmt.Printf("(QR not shown — stdout is not a terminal; open %s on the phone)\n", pairURL)
+			} else if qr, err := server.RenderQR(pairURL); err != nil {
+				fmt.Printf("(QR unavailable: %v)\n", err)
+			} else {
+				fmt.Println(qr)
+			}
+		} else if server.IsLoopbackBind(addr) {
+			fmt.Println("Phone: the web UI is bound to loopback only — use a non-loopback bind (e.g. --host 0.0.0.0) for phone access.")
+		} else {
+			fmt.Println("Phone: no LAN address detected — QR unavailable; use the link above on this machine.")
+		}
 	} else {
-		fmt.Printf("Open http://%s\n", displayAddr)
+		fmt.Printf("Open http://%s\n", displayAddrFor(addr))
 	}
 	// Listen first so the UI can connect immediately. Provider model
 	// validation and context-limit lookup continue in the background.
@@ -83,4 +151,25 @@ func runWeb(ctx context.Context, a *agent.Agent, cfg *config.Config, restoredMod
 	// Start returns nil on graceful context cancellation and a real error
 	// when the listener fails — propagate it to main's error path.
 	return <-errCh
+}
+
+// displayAddrFor rewrites an unspecified bind host (0.0.0.0 / ::) to
+// 127.0.0.1 so the printed link opens in a browser on the server machine.
+func displayAddrFor(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil && ip.IsUnspecified() {
+		return "127.0.0.1:" + port
+	}
+	return addr
+}
+
+// stdoutIsTerminal reports whether stdout is a character device (an
+// interactive terminal rather than a pipe or file), so QR art is skipped
+// when it would just pollute a log.
+func stdoutIsTerminal() bool {
+	fi, err := os.Stdout.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }

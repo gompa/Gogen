@@ -125,12 +125,13 @@ type Model struct {
 	contextStats agent.TurnContext
 	contextLine  string
 	// contextStreamBaseUsed/contextStreamEstAdded support a live, approximate
-	// context-indicator update while a turn is streaming. Reading a.Messages
-	// during streaming (via refreshContextStats) races with the streaming
-	// goroutine mutating it, so instead we snapshot the last authoritative
-	// Used count at stream start and add a cheap local estimate for tokens
-	// arriving via already-safe (Update-thread) stream messages. The exact
-	// count is restored via refreshContextStats() once streaming ends.
+	// context-indicator update while a turn is streaming. We snapshot the
+	// authoritative Used count at stream start and at every round boundary
+	// (ContextStats is safe to call concurrently with a running turn — it
+	// snapshots shared state under statsMu) and add a cheap local estimate
+	// for tokens arriving via already-safe (Update-thread) stream messages.
+	// The exact count is restored via refreshContextStats() once streaming
+	// ends.
 	contextStreamBaseUsed int
 	contextStreamEstAdded int
 

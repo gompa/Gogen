@@ -4,12 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"gogen/internal/agent"
+	"gogen/internal/config"
 	sesspkg "gogen/internal/session"
 )
 
@@ -49,11 +50,12 @@ const (
 	// defaultMaxFinishedSubagents caps finished continuable children per
 	// parent; beyond it the oldest finished children are released.
 	defaultMaxFinishedSubagents = 32
-	// defaultMaxLiveSubagents caps NON-finished continuable children per
-	// parent (running + idle). A child whose turn never ends arms no
-	// retention timer, so without this a stuck parent could accumulate
-	// unbounded runtimes. Spawning beyond it is refused with an error —
-	// never silently released mid-task.
+	// defaultMaxLiveSubagents is the internal per-parent cap on
+	// NON-finished children (running + idle background + in-flight
+	// foreground). The user-facing concurrent limit counts only ACTIVE
+	// children, so without this guard a spawn+interrupt loop could
+	// accumulate unbounded runtimes. Spawning beyond it is refused with
+	// an error — never silently released mid-task.
 	defaultMaxLiveSubagents = 64
 )
 
@@ -83,10 +85,18 @@ type backgroundChild struct {
 type childRegistry struct {
 	mu       sync.Mutex
 	children map[string]*backgroundChild
+	// foreground counts in-flight foreground (Spawn/Fork) children per
+	// parent session id. Foreground children are not backgroundChild
+	// records, but they hold a slot of the concurrent limit for the whole
+	// turn; guarded by mu.
+	foreground map[string]int
 }
 
 func newChildRegistry() *childRegistry {
-	return &childRegistry{children: make(map[string]*backgroundChild)}
+	return &childRegistry{
+		children:   make(map[string]*backgroundChild),
+		foreground: make(map[string]int),
+	}
 }
 
 func (cr *childRegistry) register(c *backgroundChild) {
@@ -112,8 +122,90 @@ func (cr *childRegistry) childrenOf(parentID string) []*backgroundChild {
 			out = append(out, c)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].createdAt.Before(out[j].createdAt) })
+	slices.SortFunc(out, func(a, b *backgroundChild) int { return a.createdAt.Compare(b.createdAt) })
 	return out
+}
+
+// activeCountLocked counts the ACTIVE children of parentID: background
+// children whose statusOf() reports "running" (main job in flight, or
+// mid-turn replying to a send_message) plus in-flight foreground children.
+// An interrupted (idle) child holds no slot — interrupt_agent frees it, as
+// the spawn-refusal error promises. Caller holds mu. Lock order:
+// mu → c.mu → rt.stateMu (statusOf); c.mu and stateMu are leaf locks, never
+// held when acquiring mu.
+func (cr *childRegistry) activeCountLocked(parentID string) int {
+	n := cr.foreground[parentID]
+	for _, c := range cr.children {
+		if c.parentID == parentID && c.statusOf() == "running" {
+			n++
+		}
+	}
+	return n
+}
+
+// liveCountLocked counts the NON-finished children of parentID (running +
+// idle background + in-flight foreground) — the memory guard's metric: an
+// idle child holds no slot of the concurrent limit, but its runtime still
+// lives until the retention window, so it is bounded separately. Caller
+// holds mu.
+func (cr *childRegistry) liveCountLocked(parentID string) int {
+	n := cr.foreground[parentID]
+	for _, c := range cr.children {
+		if c.parentID == parentID && !c.isFinished() {
+			n++
+		}
+	}
+	return n
+}
+
+// acquireForeground atomically checks both spawn caps and, when allowed,
+// reserves a foreground slot for parentID: the user-facing limit against
+// active children (the new child counts itself via the increment, so >=
+// refuses at a full cap) and the internal guard against non-finished
+// children. hitGuard reports a refusal by the guard rather than the
+// user-facing limit. Check and increment are one critical section, so
+// concurrent spawns cannot slip past either cap. A nil registry (test
+// spawners that only exercise the foreground path) is unbounded.
+func (cr *childRegistry) acquireForeground(parentID string, limit, guard int) (ok bool, hitGuard bool) {
+	if cr == nil {
+		return true, false
+	}
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	if cr.activeCountLocked(parentID) >= limit {
+		return false, false
+	}
+	if cr.liveCountLocked(parentID) >= guard {
+		return false, true
+	}
+	cr.foreground[parentID]++
+	return true, false
+}
+
+// releaseForeground returns a slot reserved by acquireForeground. The key
+// is deleted at zero so a long-running server does not accumulate one
+// entry per session.
+func (cr *childRegistry) releaseForeground(parentID string) {
+	if cr == nil {
+		return
+	}
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	if n := cr.foreground[parentID] - 1; n > 0 {
+		cr.foreground[parentID] = n
+	} else {
+		delete(cr.foreground, parentID)
+	}
+}
+
+// spawnCapExceeded reports, in one snapshot, whether the spawn the caller
+// has ALREADY committed (the child is registered) exceeds either cap: the
+// user-facing active limit or the internal non-finished guard. Strictly-
+// greater because the committed child counts itself in both.
+func (cr *childRegistry) spawnCapExceeded(parentID string, limit, guard int) (activeOver, guardOver bool) {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	return cr.activeCountLocked(parentID) > limit, cr.liveCountLocked(parentID) > guard
 }
 
 func (c *backgroundChild) setStatus(s string) {
@@ -141,7 +233,7 @@ func (c *backgroundChild) isFinished() bool {
 // isRunning reports whether the child's main job has not completed or been
 // interrupted yet. Takes c.mu: callers that already hold children.mu must
 // read the status through this helper (lock order children.mu → c.mu, same
-// as liveChildCount's isFinished call).
+// as liveCountLocked's isFinished call).
 func (c *backgroundChild) isRunning() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -197,26 +289,40 @@ func (sp *subagentSpawner) maxFinishedLimit() int {
 	return defaultMaxFinishedSubagents
 }
 
-func (sp *subagentSpawner) maxLiveLimit() int {
+// concurrentLimit returns the user-facing per-parent cap on ACTIVE
+// subagents (running background children + in-flight foreground children;
+// an interrupted idle child holds no slot): the test override (maxLive)
+// when set, otherwise the live workspace value (config default when unset).
+func (sp *subagentSpawner) concurrentLimit() int {
 	if sp.maxLive > 0 {
 		return sp.maxLive
+	}
+	if n := sp.s.ws.GetSubagentMaxConcurrent(); n > 0 {
+		return n
+	}
+	return config.DefaultSubagentMaxConcurrent
+}
+
+// liveGuardLimit returns the internal per-parent cap on NON-finished
+// children (running + idle background + in-flight foreground). The user-
+// facing limit counts only active children, so without this guard a
+// spawn+interrupt loop could accumulate unbounded runtimes. Test override
+// (maxLiveGuard) when set.
+func (sp *subagentSpawner) liveGuardLimit() int {
+	if sp.maxLiveGuard > 0 {
+		return sp.maxLiveGuard
 	}
 	return defaultMaxLiveSubagents
 }
 
-// liveChildCount returns the number of non-finished (running + idle)
-// children of parentID. Lock order: children.mu → c.mu (matches
-// enforceChildCap).
-func (sp *subagentSpawner) liveChildCount(parentID string) int {
-	sp.children.mu.Lock()
-	defer sp.children.mu.Unlock()
-	n := 0
-	for _, c := range sp.children.children {
-		if c.parentID == parentID && !c.isFinished() {
-			n++
-		}
+// spawnCapError builds the refusal error for a spawn rejected by the
+// internal non-finished guard (guardHit) or, by default, by the user-facing
+// concurrent limit.
+func spawnCapError(limit int, guardHit bool) error {
+	if guardHit {
+		return fmt.Errorf("subagent limit reached: too many live subagents (running or interrupted); wait for them to finish or be released")
 	}
-	return n
+	return fmt.Errorf("subagent limit reached (%d concurrent): wait for running subagents to finish or interrupt_agent them", limit)
 }
 
 // SpawnBackground implements agent.ContinuableSubagentSpawner: the child is
@@ -259,12 +365,23 @@ func (sp *subagentSpawner) SpawnBackground(ctx context.Context, parent *agent.Ag
 		child.mu.Unlock()
 	}
 	sp.enforceChildCap(parent.SessionID)
-	// Live-child bound (checked after registration so concurrent spawns
-	// cannot slip past it): the just-registered child counts toward the
-	// cap, so strictly-greater means we are one over.
-	if sp.liveChildCount(parent.SessionID) > sp.maxLiveLimit() {
+	// Spawn caps (checked after registration so concurrent spawns cannot
+	// slip past them): the just-registered child counts itself in both, so
+	// strictly-greater means we are one over.
+	//   - the user-facing limit bounds ACTIVE children (running background
+	//     + in-flight foreground); an interrupted (idle) child holds no
+	//     slot — interrupt_agent frees it, as the refusal error says.
+	//   - the internal guard bounds NON-finished children (running + idle
+	//     + foreground) so interrupted children cannot accumulate
+	//     unbounded runtimes.
+	activeOver, guardOver := sp.children.spawnCapExceeded(parent.SessionID, sp.concurrentLimit(), sp.liveGuardLimit())
+	if activeOver {
 		sp.releaseChild(child)
-		return "", fmt.Errorf("live subagent limit reached (%d): wait for running subagents to finish or interrupt_agent them", sp.maxLiveLimit())
+		return "", spawnCapError(sp.concurrentLimit(), false)
+	}
+	if guardOver {
+		sp.releaseChild(child)
+		return "", spawnCapError(sp.concurrentLimit(), true)
 	}
 
 	go func() {
@@ -347,7 +464,7 @@ func (sp *subagentSpawner) enforceChildCap(parentID string) {
 			finished = append(finished, c)
 		}
 	}
-	sort.Slice(finished, func(i, j int) bool { return finished[i].finishedAt.Before(finished[j].finishedAt) })
+	slices.SortFunc(finished, func(a, b *backgroundChild) int { return a.finishedAt.Compare(b.finishedAt) })
 	overflow := len(finished) - sp.maxFinishedLimit()
 	var victims []*backgroundChild
 	if overflow > 0 {
@@ -439,6 +556,15 @@ func (sp *subagentSpawner) Fork(ctx context.Context, parent *agent.Agent, job st
 	if !ok {
 		return "", fmt.Errorf("subagent_fork: parent session is not live")
 	}
+	// The fork's foreground child holds a slot of the concurrent limit for
+	// the whole turn, exactly like Spawn: acquireForeground reserves the
+	// slot atomically with the cap check, and the deferred release frees
+	// it on every exit path.
+	ok, guardHit := sp.children.acquireForeground(parent.SessionID, sp.concurrentLimit(), sp.liveGuardLimit())
+	if !ok {
+		return "", fmt.Errorf("subagent_fork: %w", spawnCapError(sp.concurrentLimit(), guardHit))
+	}
+	defer sp.children.releaseForeground(parent.SessionID)
 	forkedMsgs, err := agent.ForkMessages(parent.SnapshotMessages(), "last")
 	if err != nil {
 		return "", fmt.Errorf("subagent_fork: %w", err)

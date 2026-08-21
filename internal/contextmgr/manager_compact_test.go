@@ -2,6 +2,8 @@ package contextmgr
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -53,8 +55,11 @@ func TestCompactSummaryRequestUsesConversationPrefix(t *testing.T) {
 		t.Fatalf("expected first user message after prefix, got %q", req[len(viewPrefix)].Content)
 	}
 	last := req[len(req)-1]
-	if last.Role != "system" || !strings.Contains(last.Content, "Summarize everything after the first user message") {
-		t.Fatalf("expected summary instruction last, got %q", last.Content)
+	// The trailing instruction must be a user message: a trailing system
+	// message is rejected by Anthropic and by strict Jinja chat templates
+	// (Qwen3: "System message must be at the beginning").
+	if last.Role != "user" || !strings.Contains(last.Content, "Summarize everything after the first user message") {
+		t.Fatalf("expected user-role summary instruction last, got role=%q content=%q", last.Role, last.Content)
 	}
 	if !strings.Contains(last.Content, "not a conversation turn") || !strings.Contains(last.Content, "Do not continue the conversation") {
 		t.Fatalf("instruction must be framed as a task, not a chat turn: %q", last.Content)
@@ -114,7 +119,7 @@ func TestCompactKeepsToolCallPairInTail(t *testing.T) {
 	m.minMiddleTokens = 0 // tiny messages: skip the minimum-middle guard
 	msgs := []llm.Message{
 		{Role: "user", Content: "fix auth"},
-		{Role: "assistant", Content: "reading"},
+		{Role: "assistant", Content: strings.Repeat("reading the codebase ", 10)}, // middle must outgrow the framed summary (smaller-summary guard)
 		{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "c1", Name: "read_file"}}},
 		{Role: "tool", Content: "file contents", ToolCallID: "c1"},
 		{Role: "assistant", Content: "done"},
@@ -151,7 +156,7 @@ func TestCompactPreservesMetadataFields(t *testing.T) {
 			CreatedAt: created,
 		},
 		{Role: "assistant", Content: "a1"},
-		{Role: "user", Content: "middle"},
+		{Role: "user", Content: strings.Repeat("middle content ", 10)}, // middle must outgrow the framed summary (smaller-summary guard)
 		{Role: "assistant", Content: "a2", Model: "glm-4.6", CreatedAt: created.Add(time.Hour)},
 		{Role: "user", Content: "tail"},
 	}
@@ -269,8 +274,11 @@ func TestCompactRefusesTinyMiddle(t *testing.T) {
 		t.Fatal("expected compaction of a tiny middle to be refused")
 	}
 
-	// Same history with the guard lifted compacts normally.
+	// Same history with the guard lifted compacts normally. The
+	// smaller-summary guard is disabled too: this tiny middle cannot
+	// outgrow its framed summary (covered by TestCompactSmallerSummaryGuard).
 	m.minMiddleTokens = 0
+	m.requireSummaryShrink = false
 	if _, _, err := m.CompactPinned(context.Background(), nil, msgs, nil, nil); err != nil {
 		t.Fatalf("expected compaction to succeed with guard lifted: %v", err)
 	}
@@ -284,5 +292,122 @@ func TestCompactRefusesTinyMiddle(t *testing.T) {
 	}, msgs[3:]...)
 	if _, _, err := big.CompactPinned(context.Background(), nil, bigMsgs, nil, nil); err != nil {
 		t.Fatalf("expected compaction of a substantial middle to succeed: %v", err)
+	}
+}
+
+// fallbackEchoProvider fails the primary continuation-summary request
+// (multiple messages: head + middle + instruction) so the flattened-text
+// fallback runs, and answers the fallback's single-message call with a large
+// "echo" summary — standing in for a depth-capped truncated echo of the
+// middle, which is exactly what the smaller-summary guard must refuse.
+type fallbackEchoProvider struct {
+	stubProvider
+	calls int
+}
+
+func (p *fallbackEchoProvider) GenerateResponse(_ context.Context, msgs []llm.Message, _ map[string]struct{}, _ []llm.Tool) (llm.Response, error) {
+	p.calls++
+	if len(msgs) > 1 {
+		return llm.Response{}, fmt.Errorf("primary summary path forced failure")
+	}
+	return llm.Response{Content: strings.Repeat("echoed middle content ", 30)}, nil
+}
+
+// TestCompactSmallerSummaryGuard verifies the smaller-summary guard:
+// compaction is accepted only when the framed summary (SummaryPrefix +
+// summary) is strictly smaller than the summarized middle. An equal-sized
+// summary is refused (the emergency fit loop needs strict shrinkage to
+// terminate), a larger one is refused, and the test hook disables the guard.
+func TestCompactSmallerSummaryGuard(t *testing.T) {
+	const smallSummary = "ok"
+	var largeSummary = strings.Repeat("long summary content ", 30)
+
+	tests := []struct {
+		name         string
+		middle       string
+		summary      string
+		disableGuard bool
+		wantErr      bool
+	}{
+		{"smaller summary accepted", strings.Repeat("word ", 100), smallSummary, false, false},
+		// Equal: the middle's content is byte-identical to the framed
+		// summary's content, so the framed message has exactly the middle's
+		// token count.
+		{"equal summary refused", SummaryPrefix + smallSummary, smallSummary, false, true},
+		{"larger summary refused", "tiny", largeSummary, false, true},
+		{"guard disabled accepts non-shrinking summary", "tiny", largeSummary, true, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewManager(&stubProvider{summary: tc.summary}, Settings{
+				CompactKeepRecentMessages: 1,
+				ContextLimit:              100000,
+				CompactThreshold:          0.5,
+			})
+			m.minMiddleTokens = 0
+			m.requireSummaryShrink = !tc.disableGuard
+			msgs := []llm.Message{
+				{Role: "user", Content: "first"},
+				{Role: "assistant", Content: tc.middle},
+				{Role: "user", Content: "tail"},
+			}
+			out, _, err := m.CompactPinned(context.Background(), nil, msgs, nil, nil)
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("expected compaction to succeed: %v", err)
+				}
+				found := false
+				for _, msg := range out {
+					if msg.Role == "assistant" && strings.Contains(msg.Content, tc.summary) {
+						found = true
+					}
+				}
+				if !found {
+					t.Fatalf("expected summary message in compacted history: %+v", out)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected refusal, got %d messages", len(out))
+			}
+			if !errors.Is(err, ErrSummaryNotSmaller) {
+				t.Fatalf("err = %v, want ErrSummaryNotSmaller", err)
+			}
+			if out != nil {
+				t.Fatalf("refusal must not return compacted history, got %d messages", len(out))
+			}
+			if msgs[1].Content != tc.middle {
+				t.Fatalf("refusal must not mutate the input history: %q", msgs[1].Content)
+			}
+		})
+	}
+}
+
+// TestCompactSmallerSummaryGuardCoversFallbackPath verifies the guard applies
+// to the flattened-text fallback too: when the primary request fails and the
+// fallback returns a summary as big as the middle (a depth-capped truncated
+// echo), the compaction is refused.
+func TestCompactSmallerSummaryGuardCoversFallbackPath(t *testing.T) {
+	provider := &fallbackEchoProvider{}
+	m := NewManager(provider, Settings{
+		CompactKeepRecentMessages: 1,
+		ContextLimit:              100000,
+		CompactThreshold:          0.5,
+	})
+	m.minMiddleTokens = 0
+	msgs := []llm.Message{
+		{Role: "user", Content: "first"},
+		{Role: "assistant", Content: strings.Repeat("word ", 10)}, // ~20 tokens
+		{Role: "user", Content: "tail"},
+	}
+	_, _, err := m.CompactPinned(context.Background(), nil, msgs, nil, nil)
+	if err == nil {
+		t.Fatal("expected the non-shrinking fallback summary to be refused")
+	}
+	if !errors.Is(err, ErrSummaryNotSmaller) {
+		t.Fatalf("err = %v, want ErrSummaryNotSmaller", err)
+	}
+	if provider.calls < 2 {
+		t.Fatalf("expected the flattened-text fallback to run, provider calls = %d", provider.calls)
 	}
 }

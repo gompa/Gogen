@@ -2,6 +2,7 @@ package contextmgr
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -19,6 +20,22 @@ import (
 const SummaryPrefix = "[Session summary — earlier conversation condensed]\n"
 const maxSummarizeDepth = 8
 
+// CondensedMessagePrefix marks a message that the last-resort condensation
+// (Phase 0e) replaced in place: the original was too large for the context
+// window and was archived to the session's archive sidecar. The marker
+// makes a condensed message ineligible for a second condensation (the
+// idempotency guard that keeps the last-resort path from re-firing on the
+// same message) and identifies it to the UI.
+const CondensedMessagePrefix = "[Message condensed — the original was too large for the context window and was archived]\n"
+
+// ErrSummaryNotSmaller is returned by CompactPinned/CompactPinnedWithKeep when
+// the framed summary (SummaryPrefix + summary) is not strictly smaller than
+// the summarized middle. The compaction is refused without mutating history:
+// a summary as big as what it replaced saves nothing, and in the emergency
+// fit loop a non-shrinking iteration would never converge — refusing it
+// guarantees every accepted iteration strictly shrinks the conversation.
+var ErrSummaryNotSmaller = errors.New("summary not smaller than the summarized region")
+
 // defaultMinMiddleTokens is the smallest middle (estimated tokens) worth
 // summarizing. Compacting a smaller middle makes the model echo the one or
 // two messages it is asked to summarize — a conversation reply, not a recap —
@@ -34,30 +51,42 @@ const defaultMinMiddleTokens = 500
 // constant so the thresholds cannot drift apart.
 const WarnThreshold = 0.75
 
-// summaryInstruction is the user message appended to the summarization
-// request. The request carries the wire prefix (system/enrichment messages)
-// plus everything up to the compaction tail start, so the provider can serve
-// the bulk of it from its prompt cache (the prefix is byte-identical to the
-// last real turn). The instruction itself is a SYSTEM-role message trailing
-// the conversation: a trailing user message reads as the next chat turn and
-// makes the model continue the conversation instead of summarizing (it
-// replied to the head question and echoed the opening messages). A trailing
-// system message is a task directive, and the byte-identical prefix still
-// keeps the conversation cached. The model is asked to summarize only the
-// middle — the first user message (the head) and the tail are preserved
-// verbatim by construction, so they are excluded here and the cut messages
-// are never mentioned.
-const summaryInstruction = `This is a summarization task, not a conversation turn. Do not reply to any question in the transcript above. Do not continue the conversation. Do not quote or repeat any message verbatim.
+// summaryFraming is the shared opening line of both summarization prompts
+// (summaryInstruction and the summarizeText prompt). The framing keeps the
+// model from continuing the conversation — an earlier instruction without it
+// made models reply to the head question instead of summarizing.
+const summaryFraming = "This is a summarization task, not a conversation turn."
 
-Summarize everything after the first user message in the transcript above. The first user message and any leading context before it are preserved verbatim and excluded from this summary.
-
-Preserve:
+// summaryPreserveList is the shared preservation list embedded in both
+// summarization prompts.
+const summaryPreserveList = `Preserve:
 - The user's original goal and any changes to it
 - Files touched and why they matter
 - Key findings from tool results (errors, line numbers, search hits)
 - Technical decisions made
 - Errors encountered and how they were fixed
-- Pending work and the current state
+- Pending work and the current state`
+
+// summaryInstruction is the trailing USER-role message appended to the
+// summarization request. The request carries the wire prefix (system/
+// enrichment messages) plus everything up to the compaction tail start, so
+// the provider can serve the bulk of it from its prompt cache (the prefix
+// is byte-identical to the last real turn). The instruction is a user
+// message because a trailing system message is not portable: OpenAI-style
+// endpoints tolerate it, but Anthropic rejects system-role messages inside
+// the message list and strict Jinja chat templates (Qwen3 and similar)
+// raise "System message must be at the beginning" with a 500. The task
+// framing (summaryFraming) keeps the model from continuing the conversation
+// — an earlier trailing user instruction without that framing made models
+// reply to the head question instead of summarizing. The model is asked to
+// summarize only the middle — the first user message (the head) and the tail
+// are preserved verbatim by construction, so they are excluded here and the
+// cut messages are never mentioned.
+const summaryInstruction = summaryFraming + ` Do not reply to any question in the transcript above. Do not continue the conversation. Do not quote or repeat any message verbatim.
+
+Summarize everything after the first user message in the transcript above. The first user message and any leading context before it are preserved verbatim and excluded from this summary.
+
+` + summaryPreserveList + `
 
 Be concise but keep the facts the agent needs to continue without re-reading the summarized messages. Write a concise factual recap in the third person covering only what is in the transcript. Do not invent information. The recap will be inserted into the conversation in place of the summarized messages.
 
@@ -70,6 +99,12 @@ type Settings struct {
 	CompactKeepRecentMessages int
 	MaxToolResultBytes        int
 	CompactReserveTokens      int
+	// CompactLastResort is the last-resort condensation mode (Phase 0e)
+	// for a message that cannot fit the context window even after all
+	// compaction: "condense" (default) condenses the message in place via
+	// the summarizer; "error" makes the caller return a diagnostic instead.
+	// normalizeSettings clamps any other value to "condense".
+	CompactLastResort string
 }
 
 // DefaultSettings returns defaults; ContextLimit 0 means resolve from the provider at runtime.
@@ -80,17 +115,25 @@ func DefaultSettings() Settings {
 		CompactKeepRecentMessages: config.DefaultCompactKeepRecentMessages,
 		MaxToolResultBytes:        config.DefaultMaxToolResultBytes,
 		CompactReserveTokens:      config.DefaultCompactReserveTokens,
+		CompactLastResort:         config.DefaultCompactLastResort,
 	}
 }
 
 // Manager builds LLM views and compacts canonical conversation history.
 type Manager struct {
-	Settings           Settings
-	Provider           llm.LLMProvider
-	minMiddleTokens    int
-	mu                 sync.RWMutex
-	limitResolved      bool
-	manualContextLimit int
+	Settings Settings
+	Provider llm.LLMProvider
+	// minMiddleTokens is the smallest middle (estimated tokens) worth
+	// summarizing (see defaultMinMiddleTokens); tests may set it to 0.
+	minMiddleTokens int
+	// requireSummaryShrink enables the smaller-summary guard in
+	// CompactPinnedWithKeep (see ErrSummaryNotSmaller). NewManager enables
+	// it; tests may disable it to exercise tiny histories whose framed
+	// summary cannot possibly shrink the middle.
+	requireSummaryShrink bool
+	mu                   sync.RWMutex
+	limitResolved        bool
+	manualContextLimit   int
 }
 
 func NewManager(provider llm.LLMProvider, settings Settings) *Manager {
@@ -100,10 +143,11 @@ func NewManager(provider llm.LLMProvider, settings Settings) *Manager {
 		manual = settings.ContextLimit
 	}
 	return &Manager{
-		Settings:           settings,
-		Provider:           provider,
-		minMiddleTokens:    defaultMinMiddleTokens,
-		manualContextLimit: manual,
+		Settings:             settings,
+		Provider:             provider,
+		minMiddleTokens:      defaultMinMiddleTokens,
+		requireSummaryShrink: true,
+		manualContextLimit:   manual,
 	}
 }
 
@@ -127,7 +171,18 @@ func normalizeSettings(settings Settings) Settings {
 	if settings.CompactReserveTokens < 0 {
 		settings.CompactReserveTokens = def.CompactReserveTokens
 	}
+	settings.CompactLastResort = normalizeCompactLastResort(settings.CompactLastResort)
 	return settings
+}
+
+// normalizeCompactLastResort clamps the last-resort condensation mode to the
+// two known values: "error" passes through (case-insensitive), everything
+// else — including an empty value — is "condense" (the default).
+func normalizeCompactLastResort(v string) string {
+	if strings.EqualFold(strings.TrimSpace(v), "error") {
+		return "error"
+	}
+	return config.DefaultCompactLastResort
 }
 
 // UpdateSettings replaces the context-management settings at runtime (the
@@ -247,6 +302,66 @@ func (m *Manager) CompactBudget() int {
 	return m.compactBudgetLocked()
 }
 
+// HardLimit returns the token count at which the provider will refuse a
+// request: the context window minus the post-compaction reserve. The
+// emergency compaction tier (Agent.emergencyCompactDue) fires when the
+// conversation total reaches this, bypassing the failure backoff.
+func (m *Manager) HardLimit() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.Settings.ContextLimit - m.Settings.CompactReserveTokens
+}
+
+// CompactLastResort returns the last-resort condensation mode (Phase 0e):
+// "condense" or "error" (see Settings.CompactLastResort). Internally
+// synchronized.
+func (m *Manager) CompactLastResort() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.Settings.CompactLastResort
+}
+
+// ChooseCompactKeep returns the number of recent messages to preserve
+// verbatim so that the summarized middle (everything between the first user
+// message and the preserved tail) covers at least needed tokens. It starts
+// at the configured keep and lowers it stepwise — the lowering floor is 1
+// (the current user prompt is preserved verbatim), a worst-case option
+// reached only when the standard split cannot save enough tokens. An
+// explicitly configured keep of 0 is honored as-is (no tail). needed <= 0
+// returns the configured keep unchanged. Returns -1 when no middle exists
+// (too few messages, no user message to anchor the head, or an incomplete
+// count cache) — the caller should then not attempt a compaction at all.
+func (m *Manager) ChooseCompactKeep(messages []llm.Message, counts []int, needed int) int {
+	m.mu.RLock()
+	keep := m.Settings.CompactKeepRecentMessages
+	m.mu.RUnlock()
+	if needed <= 0 {
+		return keep
+	}
+	headIdx, ok := firstUserIndex(messages)
+	if !ok || len(messages) < headIdx+3 {
+		return -1
+	}
+	if counts == nil || len(counts) < len(messages) {
+		return -1
+	}
+	if keep > len(messages)-2 {
+		keep = len(messages) - 2
+	}
+	for keep > 1 {
+		tailStart := len(messages) - keep
+		middle := 0
+		for i := headIdx + 1; i < tailStart; i++ {
+			middle += counts[i] - imageTokenEstimate(messages[i])
+		}
+		if middle >= needed {
+			break
+		}
+		keep--
+	}
+	return keep
+}
+
 // CompactKeepRecentMessages returns how many recent messages are preserved
 // verbatim during compaction.
 func (m *Manager) CompactKeepRecentMessages() int {
@@ -298,6 +413,17 @@ func TruncateRuneSafe(s string, max int) string {
 		max--
 	}
 	return s[:max]
+}
+
+// TruncateMarked caps s to at most max bytes with a rune-safe head cut and
+// appends marker when a cut was made. Unlike truncateToolResult the marker
+// is NOT reserved inside the budget: the capped result may exceed max by
+// len(marker). s is assumed valid UTF-8, like TruncateRuneSafe.
+func TruncateMarked(s string, max int, marker string) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	return TruncateRuneSafe(s, max) + marker
 }
 
 // truncateToolResult caps content to max bytes and appends a truncation
@@ -433,6 +559,15 @@ func (m *Manager) compactBudgetLocked() int {
 // ShouldCompact reports whether messages exceed the compaction threshold.
 // EstimateTokens computes fresh each call — safe to call every turn.
 func (m *Manager) ShouldCompact(messages []llm.Message) bool {
+	return m.ShouldCompactWithOverhead(messages, 0)
+}
+
+// ShouldCompactWithOverhead is like ShouldCompact but adds overhead — the
+// wire cost of the system prompt and tool definitions, which messages does
+// not include — to the estimate before comparing against the budget. Pass
+// zero when the estimate already covers the full request (e.g. a fresh
+// provider prompt_tokens baseline, which includes the overhead).
+func (m *Manager) ShouldCompactWithOverhead(messages []llm.Message, overhead int) bool {
 	m.mu.RLock()
 	keep := m.Settings.CompactKeepRecentMessages
 	budget := m.compactBudgetLocked()
@@ -443,7 +578,7 @@ func (m *Manager) ShouldCompact(messages []llm.Message) bool {
 	if len(messages) <= keep+1 {
 		return false
 	}
-	return m.EstimateTokens(messages) >= budget
+	return m.EstimateTokens(messages)+overhead >= budget
 }
 
 // EnsureToolResultsCapped mutates messages so every tool body fits MaxToolResultBytes.
@@ -495,6 +630,41 @@ func (m *Manager) CompactPinned(ctx context.Context, viewPrefix, messages []llm.
 	m.mu.RLock()
 	keep := m.Settings.CompactKeepRecentMessages
 	m.mu.RUnlock()
+	return m.CompactPinnedWithKeep(ctx, viewPrefix, messages, counts, pinned, keep)
+}
+
+// CompactPinnedWithKeep is like CompactPinned but preserves keep recent
+// messages verbatim instead of the configured CompactKeepRecentMessages.
+// keep=0 is literal (no tail: everything after the head is summarized),
+// matching the configured-keep semantics. The emergency compaction tier
+// passes a lowered keep (see ChooseCompactKeep, whose lowering floor is 1)
+// so the summarized middle can grow large enough to bring the conversation
+// under the hard window.
+func (m *Manager) CompactPinnedWithKeep(ctx context.Context, viewPrefix, messages []llm.Message, counts []int, pinned map[int]struct{}, keep int) ([]llm.Message, map[int]struct{}, error) {
+	return m.compactPinned(ctx, viewPrefix, messages, counts, pinned, keep, false)
+}
+
+// CompactPinnedForced is the emergency forced compaction used by the
+// pre-flight check (Agent.preflightForcedCompact) when the outgoing request
+// would be refused: keep=0 (no preserved tail) and the minMiddleTokens
+// guard is bypassed, because a mid-tool-loop conversation may have only a
+// handful of messages since the last compaction and the alternative is a
+// refused request. The smaller-summary guard (ErrSummaryNotSmaller) still
+// applies. Mid-tool-loop (last message a tool result) the trailing tool
+// group — the last assistant tool-call message and its results — is
+// preserved verbatim as the tail, so the model keeps the fresh results and
+// the tool-call/result protocol stays intact. No-op paths return the input
+// unchanged with a nil error; the caller enforces the strict-shrink
+// requirement (len(result) < len(messages)) and aborts when it is not met —
+// a single-message middle compacts to a conversation of the same length.
+func (m *Manager) CompactPinnedForced(ctx context.Context, viewPrefix, messages []llm.Message, counts []int, pinned map[int]struct{}) ([]llm.Message, map[int]struct{}, error) {
+	return m.compactPinned(ctx, viewPrefix, messages, counts, pinned, 0, true)
+}
+
+// compactPinned is the shared implementation of CompactPinnedWithKeep and
+// CompactPinnedForced; forced bypasses the minMiddleTokens guard (see
+// CompactPinnedForced).
+func (m *Manager) compactPinned(ctx context.Context, viewPrefix, messages []llm.Message, counts []int, pinned map[int]struct{}, keep int, forced bool) ([]llm.Message, map[int]struct{}, error) {
 	if len(messages) <= keep+1 {
 		return messages, copyIntSet(pinned), nil
 	}
@@ -506,6 +676,16 @@ func (m *Manager) CompactPinned(ctx context.Context, viewPrefix, messages []llm.
 		return messages, copyIntSet(pinned), nil
 	}
 	tailStart := adjustCompactTailStart(messages, len(messages)-keep)
+	if forced && keep == 0 && len(messages) > 0 && messages[len(messages)-1].Role == "tool" {
+		// Forced compaction mid-tool-loop: the trailing tool group (the
+		// last assistant tool-call message and its results) is
+		// protocol-required — the model needs the fresh results to
+		// continue the in-flight round, so it survives verbatim. Walking
+		// back over the trailing tool messages makes the tail start at
+		// the calling assistant message; every tool result in the tail
+		// then has its calling assistant message in the tail too.
+		tailStart = adjustCompactTailStart(messages, len(messages)-1)
+	}
 	tailStart = extendTailForPins(messages, headIdx, tailStart, pinned)
 	if tailStart <= headIdx+1 {
 		return messages, copyIntSet(pinned), nil
@@ -548,7 +728,7 @@ func (m *Manager) CompactPinned(ctx context.Context, viewPrefix, messages []llm.
 			middleTokens -= imageTokenEstimate(msg)
 		}
 	}
-	if middleTokens < m.minMiddleTokens {
+	if !forced && middleTokens < m.minMiddleTokens {
 		return nil, nil, fmt.Errorf("not enough history to compact (%d messages in the middle)", len(middle))
 	}
 
@@ -560,6 +740,22 @@ func (m *Manager) CompactPinned(ctx context.Context, viewPrefix, messages []llm.
 	summary, err := m.summarizeMiddle(ctx, viewPrefix, messages[:headIdx+1], middle, knownTokens)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Smaller-summary guard: refuse a compaction whose framed summary is not
+	// strictly smaller than the region it replaces. The comparison is
+	// text-only and fair: middleTokens already excludes per-image estimates
+	// and the framed message carries no images. Refusing (1) stops useless
+	// compactions and (2) guarantees the emergency fit loop terminates —
+	// every accepted iteration strictly shrinks. The guard applies to the
+	// flattened-text fallback as well: a depth-capped truncated echo of the
+	// middle is exactly what it refuses.
+	if m.requireSummaryShrink {
+		framed := llm.Message{Role: "assistant", Content: SummaryPrefix + summary}
+		if framedTokens := m.EstimateTokens([]llm.Message{framed}); framedTokens >= middleTokens {
+			return nil, nil, fmt.Errorf("%w (summary %d tokens, middle %d tokens)",
+				ErrSummaryNotSmaller, framedTokens, middleTokens)
+		}
 	}
 
 	compact := make([]llm.Message, 0, headIdx+1+1+len(tail))
@@ -638,6 +834,14 @@ func IsCompactionSummary(content string) bool {
 	return strings.HasPrefix(content, SummaryPrefix)
 }
 
+// IsCondensedMessage reports whether content is a last-resort-condensed
+// message (Phase 0e, see CondensedMessagePrefix). A condensed message is
+// NOT a compaction summary: it keeps its original role and position, and a
+// condensed user message still anchors the head (firstUserIndex).
+func IsCondensedMessage(content string) bool {
+	return strings.HasPrefix(content, CondensedMessagePrefix)
+}
+
 // firstUserIndex returns the index of the first real user message (skipping
 // compaction summaries — stored as assistant-role messages prefixed with
 // SummaryPrefix today, user-role in legacy sessions) and whether one exists.
@@ -673,17 +877,21 @@ func (m *Manager) summarizeMiddle(ctx context.Context, viewPrefix, prefix, middl
 	budget := m.summaryRequestBudgetLocked()
 	m.mu.RUnlock()
 
-	instruction := llm.Message{Role: "system", Content: summaryInstruction}
+	// Trailing USER-role instruction: a task directive, not a chat turn.
+	// The strong framing in summaryInstruction keeps the model from
+	// continuing the conversation. A trailing system message would be
+	// non-portable (rejected by Anthropic and by strict Jinja chat
+	// templates such as Qwen3's "System message must be at the
+	// beginning"), so the instruction rides on the universally legal user
+	// role. The conversation prefix stays byte-identical, so the provider
+	// prompt cache still covers the bulk of the request.
+	instruction := llm.Message{Role: "user", Content: summaryInstruction}
 	req := make([]llm.Message, 0, len(viewPrefix)+len(prefix)+len(middle)+1)
 	// Summarization requests must not carry user images: the summary model
 	// may not support vision, and image bytes are irrelevant to a recap.
 	req = append(req, stripImages(viewPrefix)...)
 	req = append(req, stripImages(prefix)...)
 	req = append(req, stripImages(middle)...)
-	// Trailing SYSTEM-role instruction: a task directive, not a chat turn
-	// (a trailing user message made models continue the conversation instead
-	// of summarizing). The conversation prefix stays byte-identical, so the
-	// provider prompt cache still covers the bulk of the request.
 	req = append(req, instruction)
 	// Count the request exactly once and reuse the count for the budget
 	// check and both debuglog entries. (The map literal passed to
@@ -820,12 +1028,19 @@ func (m *Manager) summarizeRequest(ctx context.Context, request []llm.Message) (
 	if err != nil {
 		return "", fmt.Errorf("context summarization failed: %w", err)
 	}
+	return extractSummary(resp)
+}
+
+// extractSummary picks the summary text out of a summarization response,
+// falling back from Content to Refusal to Reasoning (some local models only
+// emit reasoning for short completions). It returns an error when all three
+// are empty.
+func extractSummary(resp llm.Response) (string, error) {
 	summary := resp.Content
 	if summary == "" {
 		summary = resp.Refusal
 	}
 	if summary == "" {
-		// Some local models only emit reasoning for short completions.
 		summary = resp.Reasoning
 	}
 	if summary == "" {
@@ -868,45 +1083,56 @@ func adjustCompactTailStart(messages []llm.Message, start int) int {
 	return start
 }
 
-func (m *Manager) summarizeText(ctx context.Context, segment string) (string, error) {
-	if strings.TrimSpace(segment) == "" {
-		return "", nil
-	}
+// summarizeTextPrompt builds the system-role prompt for the flattened
+// segment summarization. It reuses summaryFraming and summaryPreserveList so
+// the shared guidance cannot drift from summaryInstruction.
+func summarizeTextPrompt(segment string) string {
+	return summaryFraming + ` Do not reply to the segment below, do not continue the conversation, and do not quote it verbatim.
 
-	prompt := `This is a summarization task, not a conversation turn. Do not reply to the segment below, do not continue the conversation, and do not quote it verbatim.
-
-Summarize the conversation segment below. Preserve:
-- The user's original goal and any changes to it
-- Files touched and why they matter
-- Key findings from tool results (errors, line numbers, search hits)
-- Technical decisions made
-- Errors encountered and how they were fixed
-- Pending work and the current state
+Summarize the conversation segment below. ` + summaryPreserveList + `
 
 Be concise but keep facts the agent needs to continue without re-reading everything.
 Do not invent information. Output only the summary text.
 
 Conversation segment:
 ` + segment
+}
+
+func (m *Manager) summarizeText(ctx context.Context, segment string) (string, error) {
+	if strings.TrimSpace(segment) == "" {
+		return "", nil
+	}
 
 	resp, err := m.Provider.GenerateResponse(ctx, []llm.Message{
-		{Role: "system", Content: prompt},
+		{Role: "system", Content: summarizeTextPrompt(segment)},
 	}, nil, nil)
 	if err != nil {
 		return "", fmt.Errorf("context summarization failed: %w", err)
 	}
-	summary := resp.Content
-	if summary == "" {
-		summary = resp.Refusal
+	return extractSummary(resp)
+}
+
+// CondenseMessage summarizes the content of a single message — the
+// last-resort condensation (Phase 0e) for a message that cannot fit the
+// context window. The message is rendered with its role label and summarized
+// via the same summarizer path as compaction (summarizeText). When the
+// rendered content does not fit the summary input budget (maxIn), it is
+// truncated deterministically (the depth-cap fallback) instead of calling
+// the provider — a message that big cannot be sent to the provider anyway,
+// so the truncated echo is the best that is possible.
+func (m *Manager) CondenseMessage(ctx context.Context, msg llm.Message) (string, error) {
+	if m.Provider == nil {
+		return "", errors.New("no provider configured for condensation")
 	}
-	if summary == "" {
-		// Some local models only emit reasoning for short completions.
-		summary = resp.Reasoning
+	m.mu.RLock()
+	maxTool := m.Settings.MaxToolResultBytes
+	maxIn := m.maxSummaryInputTokensLocked()
+	m.mu.RUnlock()
+	text := renderMessagesForSummary([]llm.Message{msg}, maxTool)
+	if m.EstimateTokens([]llm.Message{{Content: text}}) <= maxIn {
+		return m.summarizeText(ctx, text)
 	}
-	if summary == "" {
-		return "", fmt.Errorf("context summarization returned empty summary")
-	}
-	return summary, nil
+	return truncateForSummary(text, maxIn), nil
 }
 
 func writeMessageForSummary(b *strings.Builder, msg llm.Message, maxToolBytes int, toolNames map[string]string) {

@@ -399,6 +399,48 @@ func TestSessionRuntimeDetachAllClients(t *testing.T) {
 	}
 }
 
+// TestPassiveAttachNotAViewer pins the board-start attach role: a passive
+// (approval-only) socket counts for broadcast/approval purposes
+// (clientCount) but NOT for the live-session signal (viewerCount) — the
+// orphan eviction and the sessions payload's active flag must treat a
+// passively-attached idle runtime as a plain saved session, not a stale
+// "resume to continue" row. A viewer attach upgrades a passive socket;
+// detach clears the role.
+func TestPassiveAttachNotAViewer(t *testing.T) {
+	r := newSessionRegistry(0)
+	rt := newTestRuntime(t)
+	rt.agent.SessionID = "a"
+	r.register("a", rt)
+
+	ws := newFakeWSConn()
+	rt.attachPassive(ws)
+	if rt.clientCount() != 1 {
+		t.Fatalf("passive attach clientCount = %d, want 1 (approval machinery must see it)", rt.clientCount())
+	}
+	if rt.viewerCount() != 0 {
+		t.Fatalf("passive attach viewerCount = %d, want 0 (not a viewer)", rt.viewerCount())
+	}
+	// Not a viewer → the idle runtime is orphan-evictable.
+	rt.evictOrphanedIfPossible()
+	if _, ok := r.get("a"); ok {
+		t.Fatal("passively-attached idle runtime was not orphan-evicted")
+	}
+
+	// A viewer attach upgrades a passive socket back to a viewer.
+	rt2 := newTestRuntime(t)
+	rt2.agent.SessionID = "a"
+	r.register("a", rt2)
+	rt2.attachPassive(ws)
+	rt2.attach(ws)
+	if rt2.viewerCount() != 1 {
+		t.Fatalf("viewer attach after passive: viewerCount = %d, want 1 (upgraded)", rt2.viewerCount())
+	}
+	rt2.detach(ws)
+	if rt2.clientCount() != 0 || rt2.viewerCount() != 0 {
+		t.Fatalf("after detach: clients=%d viewers=%d, want 0/0", rt2.clientCount(), rt2.viewerCount())
+	}
+}
+
 // TestFSMutatingToolsConsistency guards the server's fsMu wrapper set against
 // drift from the agent tool registry. fsMutatingTools must equal the
 // registry's MutatesFS flag set exactly: a mutating tool that isn't flagged

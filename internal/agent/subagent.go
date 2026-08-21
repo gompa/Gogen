@@ -3,8 +3,11 @@ package agent
 import (
 	"context"
 	"fmt"
+	"log"
+	"slices"
 	"strings"
 
+	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
 )
 
@@ -35,10 +38,31 @@ const MaxSubagentReportBytes = 64 * 1024
 // TruncateSubagentReport bounds a subagent's final report to
 // MaxSubagentReportBytes. Shared by the web and TUI spawners.
 func TruncateSubagentReport(report string) string {
-	if len(report) > MaxSubagentReportBytes {
-		return report[:MaxSubagentReportBytes] + "… (truncated)"
+	return contextmgr.TruncateMarked(report, MaxSubagentReportBytes, "… (truncated)")
+}
+
+// ApplySubagentThinkingLevel resolves and applies the child's reasoning
+// effort: the configured subagent level (the subagent_thinking_level
+// setting) when non-empty, otherwise the parent's live level (empty =
+// inherit). "off" and empty are the child's default and set nothing. A
+// level the child's FINAL model does not accept is omitted (policy B) and
+// logged — the tool's explicit model argument can override the configured
+// subagent model, so validity is resolved against the child's model at
+// spawn time, never at save time. Shared by the web and TUI spawners so
+// the two cannot drift (like SubagentLabel).
+func ApplySubagentThinkingLevel(child, parent *Agent, configured string) {
+	level := NormalizeThinkingLevel(configured)
+	if level == "" {
+		_, level = parent.ModeAndThinkingLevel()
 	}
-	return report
+	if level == "" || level == ThinkingOff {
+		return
+	}
+	if !slices.Contains(child.CurrentModelEfforts(), string(level)) {
+		log.Printf("subagent: thinking level %q not accepted by child model %q; omitted", level, child.CurrentModel())
+		return
+	}
+	child.SetThinkingLevel(level)
 }
 
 // SubagentSpawner runs a nested session with a job prompt and returns its
@@ -87,23 +111,23 @@ type ContinuableSubagentSpawner interface {
 // only when the subagent feature is enabled AND a spawner is installed.
 // bg=true (the installed spawner implements ContinuableSubagentSpawner)
 // adds the run_in_background parameter; TUI v1 keeps the foreground-only
-// schema exactly.
-func subagentToolDef(bg bool) llm.Tool {
-	desc := "Subagent tool: spawn a nested agent session to work on a job and report back. " +
-		"The subagent runs independently with its own context window; its final " +
-		"output is returned as the tool result. Use for isolated subtasks that " +
-		"would otherwise bloat this conversation. Nesting follows subagent_max_depth " +
-		"(default 1 = subagents cannot spawn subagents)."
+// schema exactly. maxConcurrent is the live per-parent concurrent-subagent
+// limit (subagent_max_concurrent) surfaced in the description so the model
+// knows how many background children it can run at once.
+func subagentToolDef(bg bool, maxConcurrent int) llm.Tool {
+	desc := "Spawn a child agent on an isolated task; its final output returns as the tool result. " +
+		"Use for subtasks that would otherwise bloat this context. Subagents cannot " +
+		"spawn subagents by default. " +
+		fmt.Sprintf("At most %d may run concurrently.", maxConcurrent)
 	props := map[string]interface{}{
-		"job":   toolProp("string", "The job prompt for the subagent (a complete, self-contained task)"),
-		"model": toolProp("string", "Optional model override for the subagent"),
+		"job":   toolProp("string", "Complete, self-contained task for the child agent"),
+		"model": toolProp("string", "Optional model override"),
 	}
 	if bg {
-		desc += " Set run_in_background=true for long-running work: the call returns " +
-			"the subagent id immediately, the parent is notified when it finishes, " +
-			"and while it runs it can be steered with send_message, interrupted with " +
-			"interrupt_agent, and resolved with list_agents."
-		props["run_in_background"] = toolProp("boolean", "Run the subagent in the background and return its id immediately (default false)")
+		desc += " run_in_background=true returns the child id immediately; the parent is " +
+			"notified on completion. Steer with send_message, interrupt with " +
+			"interrupt_agent, check with list_agents."
+		props["run_in_background"] = toolProp("boolean", "Run in background; returns the child id immediately")
 	}
 	return toolDef("subagent", desc,
 		toolSchema(props, []string{"job"}...),
@@ -114,14 +138,11 @@ func subagentToolDef(bg bool) llm.Tool {
 // a deep copy of this session's history, then one foreground turn.
 func subagentForkToolDef() llm.Tool {
 	return toolDef("subagent_fork",
-		"Fork tool: create a child session seeded with a deep copy of THIS session's full history, "+
-			"then run a job on it and report back. The fork starts with the same context as this conversation, "+
-			"but its edits and turns happen only in the child — this transcript is untouched. "+
-			"Use to explore an alternative approach without losing the current thread, or to delegate "+
-			"a continuation of this task. Optional job overrides the continuation prompt "+
-			"(default: \"Continue this session from the fork point.\"). Foreground: the call returns the fork's final output.",
+		"Fork this session: the child starts with this transcript and runs a job; its edits and "+
+			"turns stay in the child, this conversation is untouched. Use to explore an alternative "+
+			"approach or continue this task without blocking. Foreground: returns the fork's final output.",
 		toolSchema(map[string]interface{}{
-			"job": toolProp("string", "Optional job for the fork (default: continue this session from the fork point)"),
+			"job": toolProp("string", "Optional job (default: continue this session)"),
 		}),
 	)
 }
@@ -129,10 +150,9 @@ func subagentForkToolDef() llm.Tool {
 // listAgentsToolDef is the schema for the read-only live-child listing.
 func listAgentsToolDef() llm.Tool {
 	return toolDef("list_agents",
-		"List the live nested (subagent) sessions of this session: id, label, status (running / idle / finished), "+
-			"and nesting depth. Read-only. Use to resolve an agent id before send_message / interrupt_agent, "+
-			"or to check whether a background subagent is still working. Only live in-memory children are listed; "+
-			"finished children stay listed until their retention window elapses.",
+		"List this session's child subagents: id, label, status (running/idle/finished), depth. "+
+			"Read-only. Use to resolve agent ids for send_message/interrupt_agent or check background "+
+			"status. Finished children remain listed briefly.",
 		toolSchema(map[string]interface{}{}),
 	)
 }
@@ -140,13 +160,11 @@ func listAgentsToolDef() llm.Tool {
 // sendMessageToolDef is the schema for steering a background subagent.
 func sendMessageToolDef() llm.Tool {
 	return toolDef("send_message",
-		"Send a message to a running background subagent (agent_id). The message is delivered to the subagent's "+
-			"session as a new user message and starts a turn; if the subagent is mid-turn, the message is queued "+
-			"and delivered when it becomes idle. The subagent's response is injected back into this session as a "+
-			"user message when it finishes replying. Use to steer a background subagent mid-task: new instructions, "+
-			"changed requirements, or a stop-and-report request.",
+		"Send a message to a running background subagent (agent_id); queued if it is mid-turn. "+
+			"Its reply is injected into this session when it finishes. Use to steer a background subagent: "+
+			"new instructions, changed requirements, or stop-and-report.",
 		toolSchema(map[string]interface{}{
-			"agent_id": toolProp("string", "The subagent id (see list_agents)"),
+			"agent_id": toolProp("string", "Subagent id (from list_agents)"),
 			"message":  toolProp("string", "The message to deliver to the subagent"),
 		}, "agent_id", "message"),
 	)
@@ -156,11 +174,10 @@ func sendMessageToolDef() llm.Tool {
 // turn without killing the child session.
 func interruptAgentToolDef() llm.Tool {
 	return toolDef("interrupt_agent",
-		"Cancel a running subagent's in-flight turn (agent_id). The subagent session stays alive — only its "+
-			"current turn stops; it can be messaged again or left idle. Use when a background subagent is stuck, "+
-			"looping, or working on the wrong thing. No-op when the subagent is idle.",
+		"Cancel a subagent's in-flight turn (agent_id); the session stays alive and can be messaged again. "+
+			"No-op when idle. Use when a background subagent is stuck or off-track.",
 		toolSchema(map[string]interface{}{
-			"agent_id": toolProp("string", "The subagent id (see list_agents)"),
+			"agent_id": toolProp("string", "Subagent id (from list_agents)"),
 		}, "agent_id"),
 	)
 }
@@ -170,12 +187,10 @@ func interruptAgentToolDef() llm.Tool {
 // installed report hook.
 func reportToolDef() llm.Tool {
 	return toolDef("report",
-		"Report progress to the parent session: injects this subagent's message as a user message into the "+
-			"parent conversation and starts a turn there (queued if the parent is busy). Use to surface "+
-			"intermediate findings, hand back partial results before finishing, or ask the parent for input. "+
-			"Available only inside a continuable subagent.",
+		"Send a progress update to the parent session (starts a turn there; queued if busy). Use to "+
+			"surface findings, hand back partial results, or ask the parent for input. Child-only.",
 		toolSchema(map[string]interface{}{
-			"message": toolProp("string", "The progress message to deliver to the parent session"),
+			"message": toolProp("string", "Progress update for the parent"),
 		}, "message"),
 	)
 }

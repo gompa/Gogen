@@ -302,3 +302,34 @@ func TestExtractResponseText(t *testing.T) {
 		})
 	}
 }
+
+// TestClassifyResponse pins the HTML/plain classification — the single source
+// of truth shared by extractResponseText and extractWebContent. Content-Type
+// wins when it is authoritative; otherwise the URL extension and a body sniff
+// decide.
+func TestClassifyResponse(t *testing.T) {
+	cases := []struct {
+		name        string
+		contentType string
+		finalURL    string
+		body        []byte
+		want        responseKind
+	}{
+		{"html content type", "text/html; charset=utf-8", "https://example.com/", []byte("<html><body><p>Hello</p></body></html>"), kindHTML},
+		{"plain content type", "text/plain; charset=utf-8", "https://example.com/f.c", []byte("#include <stdio.h>\nint a<b;\n"), kindPlain},
+		{"text/plain wins over html-looking body", "text/plain", "https://example.com/gen.go", []byte("// renders a <div> for the user\n"), kindPlain},
+		{"octet-stream with source extension", "application/octet-stream", "https://cdn.example.com/smu.c", []byte("int x = a<b;\n"), kindPlain},
+		{"html content type wins over body sniff", "text/html", "https://example.com/raw.c", []byte("<html><body>t</body></html>"), kindHTML},
+		{"missing type html body sniffed", "", "https://example.com/page", []byte("<html><body>hi</body></html>"), kindHTML},
+		{"missing type plain body", "", "https://example.com/blob", []byte("line1\nline2\n"), kindPlain},
+		{"html url wins over sniff", "application/octet-stream", "https://example.com/page.html", []byte("<html><body>t</body></html>"), kindHTML},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyResponse(tc.contentType, tc.finalURL, tc.body); got != tc.want {
+				t.Fatalf("classifyResponse(%q, %q, %d bytes) = %v, want %v",
+					tc.contentType, tc.finalURL, len(tc.body), got, tc.want)
+			}
+		})
+	}
+}

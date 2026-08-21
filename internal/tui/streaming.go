@@ -63,6 +63,10 @@ type streamEndMsg struct{}
 
 type streamErrorMsg struct{ err error }
 
+// condensedNoteMsg carries the last-resort condensation announcement
+// (Phase 0e) for rendering as a system line.
+type condensedNoteMsg struct{ note string }
+
 type contextStatsMsg struct {
 	stats agent.TurnContext
 }
@@ -93,6 +97,9 @@ func (s *StreamAdapter) Handlers() *llm.StreamHandlers {
 		OnStart: func() {
 			batch.Reset()
 			s.program.Send(streamStartMsg{})
+		},
+		OnCondensed: func(note string) {
+			s.program.Send(condensedNoteMsg{note: note})
 		},
 		OnRoundStart: func() {
 			batch.Reset()
@@ -556,10 +563,17 @@ func (m *Model) handleStreamStart() {
 
 func (m *Model) handleStreamRoundStart() {
 	m.resetStreamState(true)
-	// Recapture the context baseline after each round so the streaming
-	// estimate uses the updated API count from recordTurnUsage rather
-	// than the pre-turn value. Resetting contextStreamEstAdded keeps the
+	// Refresh the authoritative context stats before re-basing the live
+	// estimate. By the time round N+1 starts, recordTurnUsage has stored
+	// round N's exact API prompt_tokens and the tool results are already
+	// appended to a.Messages, so ContextStats now reports the true
+	// pre-round usage (API baseline + local estimates for the appended
+	// messages). Re-basing from the stale end-of-previous-turn mirror
+	// instead made the (est.) indicator visibly drop back to the
+	// pre-reply level at every round boundary of a multi-round
+	// (tool-calling) reply. Resetting contextStreamEstAdded keeps the
 	// (est.) indicator incrementally accurate across multi-round turns.
+	m.refreshContextStatsMidTurn()
 	m.contextStreamBaseUsed = m.contextStats.Snapshot.Used
 	m.contextStreamEstAdded = 0
 }

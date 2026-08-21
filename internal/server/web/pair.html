@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GoGen — Sign in</title>
+<!--
+  Pairing / sign-in page, served unauthenticated by HandleStatic when the
+  ?pair= bootstrap fails or no credentials are present. It must be fully
+  self-contained: every other asset under / is auth-gated, so no external
+  CSS/JS may be referenced here. The message paragraph below is replaced
+  server-side with the failure reason (static text only — the submitted
+  code is never echoed back). NOTE: this comment must never contain the
+  literal message placeholder — servePairingPage substitutes the first
+  occurrence, and a placeholder in the comment would swallow the message.
+-->
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; min-height: 100vh;
+    display: flex; align-items: center; justify-content: center;
+    background: #1e1e1e; color: #d4d4d4;
+    font-family: system-ui, -apple-system, sans-serif;
+  }
+  .card {
+    background: #252526; border: 1px solid #3c3c3c; border-radius: 8px;
+    padding: 24px; width: min(360px, 90vw); box-sizing: border-box;
+  }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  p.msg { margin: 0 0 16px; font-size: 14px; line-height: 1.5; }
+  input[type="text"] {
+    width: 100%; box-sizing: border-box; padding: 10px;
+    border: 1px solid #3c3c3c; border-radius: 4px;
+    background: #1e1e1e; color: #d4d4d4;
+    font-family: ui-monospace, SFMono-Regular, monospace; font-size: 14px;
+  }
+  button {
+    margin-top: 10px; width: 100%; padding: 10px;
+    border: none; border-radius: 4px;
+    background: #0e639c; color: #fff; font-size: 14px; cursor: pointer;
+  }
+  button:hover { background: #1177bb; }
+  p.hint { margin: 14px 0 0; font-size: 12px; color: #8a8a8a; line-height: 1.5; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>GoGen</h1>
+    <p class="msg">{{MESSAGE}}</p>
+    <form method="get" action="/">
+      <input type="text" name="pair" placeholder="Pairing code"
+             autocomplete="off" autocapitalize="off" spellcheck="false"
+             maxlength="64" autofocus>
+      <button type="submit">Sign in</button>
+    </form>
+    <p class="hint">The pairing code is printed in the terminal where gogen
+       was started. It is short-lived and replaced at every server start, so
+       if it no longer works, use the link and QR printed at the current
+       start. Scanning with a phone camera can drop the link's code — typing
+       it here works too.</p>
+  </div>
+</body>
+</html>

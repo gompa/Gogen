@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"embed"
 	"encoding/hex"
+	"fmt"
+	"log"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -89,20 +91,93 @@ func etagMatches(header, etag string) bool {
 
 func (s *Server) HandleStatic(w http.ResponseWriter, r *http.Request) {
 	secure := r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
-	// Bootstrap: accept ?token= once, set HttpOnly cookie, redirect without query.
+	// Bootstrap: accept the onboarding code in the URL path (/pair/<code> —
+	// the QR form: some phone camera apps and in-app browsers strip query
+	// strings, so the QR carries the code in the path, which survives) or in
+	// the query (?pair=, ?token=), set the HttpOnly cookie, redirect without
+	// the secret. All forms are per-IP rate limited: they are the only
+	// unauthenticated endpoints that check a secret.
 	if s.authToken != "" {
-		if q := strings.TrimSpace(r.URL.Query().Get("token")); q != "" {
-			if q == s.authToken {
+		if code := pairingCodeFromPath(r.URL.Path); code != "" {
+			// Only a real navigation may consume the code: camera-app
+			// link previews fetch the URL themselves (no-cors) and would
+			// burn a use and set the cookie into a throwaway context,
+			// leaving the browser that opens the link without a session.
+			if !consumeAllowed(r) {
+				log.Printf("pairing: skipped non-navigation request from %s (path /pair/<code>, %s)", clientIP(r), reqSig(r))
+				pairingPreviewResponse(w)
+				return
+			}
+			s.bootstrapPairing(w, r, code, "path /pair/<code>", "/", secure)
+			return
+		}
+		q := r.URL.Query()
+		if tok := strings.TrimSpace(q.Get("token")); tok != "" {
+			if !s.allowBootstrap(r) {
+				log.Printf("pairing: rate-limited from %s (query ?token=)", clientIP(r))
+				http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+				return
+			}
+			if tokenMatches(tok, s.authToken) {
+				log.Printf("pairing: token bootstrap accepted from %s", clientIP(r))
 				setAuthCookie(w, s.authToken, secure)
 				http.Redirect(w, r, r.URL.Path, http.StatusFound)
 				return
 			}
+			log.Printf("pairing: token bootstrap rejected from %s", clientIP(r))
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if code := strings.TrimSpace(q.Get("pair")); code != "" {
+			if !consumeAllowed(r) {
+				log.Printf("pairing: skipped non-navigation request from %s (query ?pair=, %s)", clientIP(r), reqSig(r))
+				pairingPreviewResponse(w)
+				return
+			}
+			s.bootstrapPairing(w, r, code, "query ?pair=", r.URL.Path, secure)
 			return
 		}
 	}
 	if !s.checkAuth(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		// No (valid) credentials at all — e.g. a phone scanner that
+		// stripped the ?pair= query. Serve the pairing page so the code can
+		// be typed in, instead of a bare 401.
+		//
+		// Log every such request — the only prompt path that is otherwise
+		// silent — so a "pairing: accepted" line followed by a prompt can be
+		// diagnosed from the server side: cookie absent means the browser
+		// never stored or sent it (camera-app WebView jar split, SameSite
+		// withholding, different browser/device); cookie present but
+		// rejected means the server's token rotated (ephemeral token /
+		// different working dir) or the request hit a different server
+		// instance. Never log the credential itself.
+		_, cookieErr := r.Cookie(authCookieName)
+		// cookies sent: the count of cookies in the request — 0 means this
+		// context's cookie jar is blocked or ephemeral for this origin;
+		// >0 with our cookie absent means the jar works but the pairing
+		// cookie was never stored (partitioned storage, attribute reject).
+		// referer + sec-fetch classify the request: a real browser
+		// navigation is navigate/document (same-origin on redirect
+		// follow), a programmatic or preview fetch is cors/no-cors/empty —
+		// the difference between "Brave loaded the page" and "an embedded
+		// fetcher consumed the pairing code".
+		log.Printf("auth: unauthenticated page request from %s (path %q, auth cookie present: %v, cookies sent: %d, secure: %v, referer: %q, %s, user-agent: %q)", clientIP(r), r.URL.Path, cookieErr == nil, len(r.Cookies()), secure, shortReferer(r), reqSig(r), shortUA(r))
+		// The decisive diagnosis: an exchange was accepted from this same
+		// device moments ago (notePairingAccept) and yet no cookie came
+		// back — the server held up its end (the cookie is set to the very
+		// token checkAuth compares against), so the browser either scanned
+		// into a different cookie jar than the one now loading "/" (camera
+		// app / in-app browser vs. the real browser) or is blocking cookies
+		// for this address (Brave Shields, private tab). Say so, both in
+		// the log and on the page — the generic "enter the code" prompt
+		// sends the user down a path (typing the code) that cannot work
+		// while cookies are dropped.
+		if at, ok := s.recentPairingAccept(clientIP(r)); ok && cookieErr != nil {
+			log.Printf("auth: pairing was accepted from %s at %s but this request carries no cookie — the browser dropped or withheld it (different cookie jar or blocked cookies). Typing the code cannot help until cookies are allowed for this address.", clientIP(r), at.Local().Format("15:04:05"))
+			servePairingPage(w, pairingMsgCookieLost)
+			return
+		}
+		servePairingPage(w, pairingMsgEnterCode)
 		return
 	}
 
@@ -127,6 +202,204 @@ func (s *Server) HandleStatic(w http.ResponseWriter, r *http.Request) {
 	// but the fix isn't showing" class of bugs). The ETag below still yields
 	// 304s when the bytes are unchanged, so reloads stay cheap.
 	s.serveEmbedded(w, r, name, ct, "no-cache", false)
+}
+
+// bootstrapPairing validates a pairing-code candidate from an
+// unauthenticated request and completes the exchange: on acceptance it sets
+// the auth cookie and redirects to redirectTo; on rejection it serves the
+// pairing page. Every exchange is logged — the code itself never is, only
+// the outcome — so a failed scan can be diagnosed server-side. It always
+// writes a response.
+func (s *Server) bootstrapPairing(w http.ResponseWriter, r *http.Request, code, form, redirectTo string, secure bool) {
+	if !s.allowBootstrap(r) {
+		log.Printf("pairing: rate-limited from %s (%s)", clientIP(r), form)
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+	switch reason := s.consumePairingCode(code); reason {
+	case pairingAccepted:
+		log.Printf("pairing: accepted from %s (%s, secure: %v, referer: %q, %s, user-agent: %q)", clientIP(r), form, secure, shortReferer(r), reqSig(r), shortUA(r))
+		s.notePairingAccept(clientIP(r))
+		setAuthCookie(w, s.authToken, secure)
+		http.Redirect(w, r, redirectTo, http.StatusFound)
+	default:
+		// reqSig + user-agent on rejections too: a stale link re-opened from
+		// browser history is distinguishable from a fresh mis-scanned QR
+		// only by its request shape, and the code is never logged.
+		log.Printf("pairing: rejected (%s) from %s (%s, %s, user-agent: %q)", reason, clientIP(r), form, reqSig(r), shortUA(r))
+		servePairingPage(w, pairingFailureMessage(reason)+s.pairingDiagnostic(reason))
+	}
+}
+
+// allowBootstrap rate-limits the unauthenticated secret-checking bootstrap
+// endpoints (?token=, ?pair=, /pair/<code>) per source IP. A nil limiter
+// (bare test servers) means no throttling.
+func (s *Server) allowBootstrap(r *http.Request) bool {
+	return s.bootstrapLimiter == nil || s.bootstrapLimiter.allow(clientIP(r))
+}
+
+// consumeAllowed reports whether a request may consume a pairing code:
+// only a GET that is a real top-level browser navigation.
+//
+// Sec-Fetch-Mode is authoritative when present (HTTPS or loopback — the
+// origins browsers consider potentially trustworthy): every mainstream
+// browser sends Sec-Fetch-Mode: navigate on top-level loads there, and
+// camera-app link previews surface as no-cors/cors — require "navigate"
+// outright.
+//
+// But the QR's own URL is plain http://<lan-ip>:<port>/pair/<code>
+// (run_web.go), and browsers send NO Sec-Fetch-* headers at all to origins
+// that are not potentially trustworthy (fetch metadata is withheld from
+// plain-HTTP requests). A real phone scan therefore arrives header-less,
+// and any additional per-browser assumption about what such a request
+// "must" carry (Upgrade-Insecure-Requests, Sec-CH-UA, …) risks locking out
+// that browser — which is how the strict no-fallback rule broke every
+// plain-HTTP scan in the first place. plainHTTPNavigation thus relies only
+// on the two signals that are stable across every observed browser and
+// every mainstream preview client, and errs on the side of allowing: a
+// preview that slips through burns one of the code's maxPairingUses (the
+// real navigation that follows still logs in), whereas a real browser
+// wrongly skipped cannot log in at all.
+func consumeAllowed(r *http.Request) bool {
+	if r.Method != http.MethodGet {
+		return false
+	}
+	if mode := r.Header.Get("Sec-Fetch-Mode"); mode != "" {
+		return mode == "navigate"
+	}
+	return plainHTTPNavigation(r)
+}
+
+// plainHTTPNavigation classifies a request carrying no Sec-Fetch-* headers
+// (a top-level navigation over plain HTTP — the QR form — or a raw HTTP
+// client) as a browser navigation, using only signals that hold across all
+// mainstream browsers:
+//
+//   - no X-Requested-With — set by Android WebView app containers (camera
+//     apps' in-app browsers), never by a standalone browser;
+//   - Accept starting with "text/html" — every browser puts text/html
+//     first when navigating a document; raw preview clients (okhttp,
+//     Dalvik, curl, image fetchers) send */* or nothing.
+//
+// Upgrade-Insecure-Requests is deliberately NOT required: it is a client
+// preference some browser configurations omit, and requiring it locked
+// out real scans. It is still logged (reqSig) for diagnosis.
+func plainHTTPNavigation(r *http.Request) bool {
+	if r.Header.Get("X-Requested-With") != "" {
+		return false
+	}
+	return strings.HasPrefix(r.Header.Get("Accept"), "text/html")
+}
+
+// pairingPreviewResponse answers a skipped non-navigation request: no
+// cookie, no redirect, no pairing use consumed. It serves the full sign-in
+// page rather than bare text so the request can never dead-end: a
+// camera-app preview renders a form it cannot use (harmless), while a real
+// browser that was misclassified — the failure mode that locked phones out
+// of QR login — gets the manual code-entry form and can still sign in.
+// 200 OK: no secret was checked, this is not an auth failure.
+func pairingPreviewResponse(w http.ResponseWriter) {
+	renderPairingPage(w, http.StatusOK, pairingMsgPreview)
+}
+
+// pairingCodeFromPath extracts an onboarding code from a /pair/<code> URL
+// path — the form the QR encodes, because some phone camera apps and
+// in-app browsers strip query strings when opening a scanned URL, and the
+// path is what survives. A trailing slash is tolerated (some browsers
+// normalize scanned URLs to directory form); any other path shape returns
+// "" (the request then falls through to the normal flow).
+func pairingCodeFromPath(path string) string {
+	const prefix = "/pair/"
+	if !strings.HasPrefix(path, prefix) {
+		return ""
+	}
+	code := strings.TrimSpace(strings.TrimPrefix(path, prefix))
+	// Tolerate a single trailing slash. Anything else containing a slash
+	// is still rejected (e.g. /pair/a/b).
+	code = strings.TrimSuffix(code, "/")
+	if code == "" || strings.Contains(code, "/") || code == "." || code == ".." || len(code) > 128 {
+		return ""
+	}
+	return code
+}
+
+// shortHeader returns a request header truncated for log lines. Never
+// contains credentials.
+func shortHeader(r *http.Request, name string) string {
+	v := r.Header.Get(name)
+	if len(v) > 128 {
+		v = v[:128]
+	}
+	return v
+}
+
+// shortUA returns the request's User-Agent truncated for log lines, so the
+// client that scanned the QR can be correlated with the client that later
+// hits "/" without a cookie (camera-app WebView vs. system browser).
+func shortUA(r *http.Request) string {
+	return shortHeader(r, "User-Agent")
+}
+
+// shortReferer returns the request's Referer truncated for log lines, so a
+// redirect follow (same-origin referer) can be told apart from an
+// intent-opened tab (no referer) or a preview fetch (app referer).
+func shortReferer(r *http.Request) string {
+	return shortHeader(r, "Referer")
+}
+
+// reqSig renders the request-classification fields for log lines: the
+// Sec-Fetch-* triple, Sec-CH-UA (client-hints browser brand), Accept,
+// Upgrade-Insecure-Requests and X-Requested-With. A real browser
+// navigation is navigate/document with Accept: text/html; an app's raw
+// HTTP client sends no Sec-Fetch-* at all and often Accept: */* — but so
+// does a real browser over plain HTTP (the QR form), which is why the
+// plain-HTTP fallback keys on Accept and X-Requested-With only. The
+// remaining fields are logged purely for diagnosis (they named the client
+// that scanned vs. the one that hit "/" in past bug hunts): Sec-CH-UA
+// names the browser brand (e.g. Brave); X-Requested-With names the Android
+// app whose WebView made the request; Upgrade-Insecure-Requests is a
+// browser-only preference whose absence in a real scan must NOT be treated
+// as proof of a preview.
+func reqSig(r *http.Request) string {
+	return fmt.Sprintf("sec-fetch: %q/%q/%q, sec-ch-ua: %q, accept: %q, uir: %q, x-requested-with: %q",
+		r.Header.Get("Sec-Fetch-Site"), r.Header.Get("Sec-Fetch-Mode"), r.Header.Get("Sec-Fetch-Dest"),
+		shortHeader(r, "Sec-CH-UA"), shortHeader(r, "Accept"),
+		shortHeader(r, "Upgrade-Insecure-Requests"), shortHeader(r, "X-Requested-With"))
+}
+
+// pairingPage holds the embedded sign-in page (web/pair.html), loaded once.
+// The page is fully self-contained — every other asset under / is
+// auth-gated, so it cannot reference external CSS/JS.
+var pairingPage = sync.OnceValue(func() []byte {
+	b, err := webAssets.ReadFile("web/pair.html")
+	if err != nil {
+		panic("embedded web/pair.html missing: " + err.Error())
+	}
+	return b
+})
+
+// servePairingPage renders the unauthenticated sign-in page with a
+// server-generated message (never user input — the submitted code is not
+// echoed) and a form that re-submits the code through the normal ?pair=
+// bootstrap. Always 401: the exchange is still unauthorized, the body just
+// tells the user how to fix it.
+func servePairingPage(w http.ResponseWriter, msg string) {
+	renderPairingPage(w, http.StatusUnauthorized, msg)
+}
+
+// renderPairingPage writes the sign-in page with the given status and a
+// server-generated message. The form it carries re-submits a typed code
+// through the normal ?pair= bootstrap, so every path that renders this page
+// — auth failure, rejected exchange, skipped "preview" request — leaves the
+// user a way in.
+func renderPairingPage(w http.ResponseWriter, status int, msg string) {
+	// Replace every occurrence: the template must not ship an unreplaced
+	// placeholder to the client, wherever it appears in future edits.
+	page := strings.Replace(string(pairingPage()), "{{MESSAGE}}", msg, -1)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_, _ = w.Write([]byte(page))
 }
 
 // hasPathTraversal reports whether any path element is ".." (a traversal

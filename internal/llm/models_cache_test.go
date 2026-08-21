@@ -112,7 +112,7 @@ func TestFetchModelsQueriesOpenCodeEndpointsInParallel(t *testing.T) {
 	var models []openai.Model
 	go func() {
 		var err error
-		models, _, err = p.fetchModels(context.Background())
+		models, _, _, err = p.fetchModelsWithProfiles(context.Background())
 		errCh <- err
 	}()
 

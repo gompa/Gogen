@@ -57,14 +57,15 @@ gocyclo:
 build-nocgo:
 	CGO_ENABLED=0 go build -o gogen-nocgo .
 
-# Lints the hand-maintained web UI JS (app.js, editor.js) with a zero-
-# dependency Node script (no npm, no eslint). Runs only when `node` is
-# installed; `make check` stays green on machines without node.
+# Lints the hand-maintained web UI JS (app.js, editor.js, components/*.js)
+# with a zero-dependency Node script (no npm, no eslint). Runs only when
+# `node` is installed; `make check` stays green on machines without node.
 lint-web:
 	./scripts/lint-web.sh
 
 # Runs the hand-maintained web UI regression tests (scripts/test_*.js):
-# jsdom harnesses that load the REAL index.html + app.js (imports stubbed)
+# jsdom harnesses that load the REAL index.html + app.js +
+# web/components/*.js (imports stubbed, via scripts/web-harness.js)
 # and drive tab switching, background-compact state, and queued
 # delete-approval Esc handling, plus the standalone state-machine tests.
 # Zero-dependency (plain node + jsdom from /tmp/gogen-jsdom); skipped when

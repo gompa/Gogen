@@ -306,7 +306,9 @@ func TestTokenCountsCacheIncremental(t *testing.T) {
 }
 
 // TestShouldCompactUsingCountsMatchesDirect verifies the cached-count
-// compaction decision agrees with the full EstimateTokens pass.
+// compaction decision agrees with the full EstimateTokens pass. No API
+// baseline is recorded here, so both sides add the wire overhead
+// (system prompt + tool definitions) that the canonical messages omit.
 func TestShouldCompactUsingCountsMatchesDirect(t *testing.T) {
 	provider := &statsStubProvider{limit: 1000}
 	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{
@@ -322,13 +324,13 @@ func TestShouldCompactUsingCountsMatchesDirect(t *testing.T) {
 	}
 
 	// Without a cache the helper must fall back to the direct computation.
-	if got, want := a.shouldCompactUsingCounts(), a.Context.ShouldCompact(a.Messages); got != want {
+	if got, want := a.shouldCompactUsingCounts(), a.Context.ShouldCompactWithOverhead(a.Messages, a.wireOverheadTokens()); got != want {
 		t.Fatalf("fallback decision=%v, want %v", got, want)
 	}
 
 	// Once ContextStats fills the cache, the decisions must still agree.
 	_ = a.ContextStats(context.Background())
-	if got, want := a.shouldCompactUsingCounts(), a.Context.ShouldCompact(a.Messages); got != want {
+	if got, want := a.shouldCompactUsingCounts(), a.Context.ShouldCompactWithOverhead(a.Messages, a.wireOverheadTokens()); got != want {
 		t.Fatalf("cached decision=%v, want %v", got, want)
 	}
 }

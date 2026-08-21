@@ -239,7 +239,7 @@ func TestMergeJobNoticesFlag(t *testing.T) {
 }
 
 func TestMergeBoardSubagentFlags(t *testing.T) {
-	for _, env := range []string{"GOGEN_BOARD", "GOGEN_SUBAGENT", "GOGEN_SUBAGENT_MAX_DEPTH"} {
+	for _, env := range []string{"GOGEN_BOARD", "GOGEN_SUBAGENT", "GOGEN_SUBAGENT_MAX_DEPTH", "GOGEN_SUBAGENT_MAX_CONCURRENT"} {
 		os.Unsetenv(env)
 	}
 
@@ -251,9 +251,12 @@ func TestMergeBoardSubagentFlags(t *testing.T) {
 	if cfg.SubagentDepth() != config.DefaultSubagentMaxDepth {
 		t.Fatalf("default depth = %d, want %d", cfg.SubagentDepth(), config.DefaultSubagentMaxDepth)
 	}
+	if cfg.SubagentLimit() != config.DefaultSubagentMaxConcurrent {
+		t.Fatalf("default concurrent limit = %d, want %d", cfg.SubagentLimit(), config.DefaultSubagentMaxConcurrent)
+	}
 
 	// File values.
-	pf := &ProjectFile{Config: FileConfig{Board: "on", Subagent: "on", SubagentMaxDepth: 3}}
+	pf := &ProjectFile{Config: FileConfig{Board: "on", Subagent: "on", SubagentMaxDepth: 3, SubagentMaxConcurrent: 2}}
 	cfgFile := Merge(pf, FlagOverrides{})
 	if !cfgFile.BoardEnabled() || !cfgFile.SubagentEnabled() {
 		t.Fatalf("file flags not honored: board=%q subagent=%q", cfgFile.Board, cfgFile.Subagent)
@@ -261,11 +264,15 @@ func TestMergeBoardSubagentFlags(t *testing.T) {
 	if cfgFile.SubagentDepth() != 3 {
 		t.Fatalf("file depth = %d, want 3", cfgFile.SubagentDepth())
 	}
+	if cfgFile.SubagentLimit() != 2 {
+		t.Fatalf("file concurrent limit = %d, want 2", cfgFile.SubagentLimit())
+	}
 
 	// Env overrides file.
 	t.Setenv("GOGEN_BOARD", "off")
 	t.Setenv("GOGEN_SUBAGENT", "off")
 	t.Setenv("GOGEN_SUBAGENT_MAX_DEPTH", "5")
+	t.Setenv("GOGEN_SUBAGENT_MAX_CONCURRENT", "7")
 	cfgEnv := Merge(pf, FlagOverrides{})
 	if cfgEnv.BoardEnabled() || cfgEnv.SubagentEnabled() {
 		t.Fatalf("env off should override file on: board=%q subagent=%q", cfgEnv.Board, cfgEnv.Subagent)
@@ -273,12 +280,21 @@ func TestMergeBoardSubagentFlags(t *testing.T) {
 	if cfgEnv.SubagentDepth() != 5 {
 		t.Fatalf("env depth = %d, want 5", cfgEnv.SubagentDepth())
 	}
+	if cfgEnv.SubagentLimit() != 7 {
+		t.Fatalf("env concurrent limit = %d, want 7", cfgEnv.SubagentLimit())
+	}
 
 	// Invalid depth env falls back to default.
 	t.Setenv("GOGEN_SUBAGENT_MAX_DEPTH", "bogus")
 	cfgBad := Merge(nil, FlagOverrides{})
 	if cfgBad.SubagentDepth() != config.DefaultSubagentMaxDepth {
 		t.Fatalf("invalid env depth = %d, want default %d", cfgBad.SubagentDepth(), config.DefaultSubagentMaxDepth)
+	}
+	// Invalid concurrent-limit env falls back to default.
+	t.Setenv("GOGEN_SUBAGENT_MAX_CONCURRENT", "bogus")
+	cfgBadLimit := Merge(nil, FlagOverrides{})
+	if cfgBadLimit.SubagentLimit() != config.DefaultSubagentMaxConcurrent {
+		t.Fatalf("invalid env concurrent limit = %d, want default %d", cfgBadLimit.SubagentLimit(), config.DefaultSubagentMaxConcurrent)
 	}
 }
 
@@ -291,7 +307,9 @@ func TestSaveConfigRoundTripsBoardSubagent(t *testing.T) {
 	cfg.Board = "on"
 	cfg.Subagent = "on"
 	cfg.SubagentMaxDepth = 4
+	cfg.SubagentMaxConcurrent = 6
 	cfg.SubagentModel = "gpt-4o-mini"
+	cfg.SubagentThinkingLevel = "high"
 	if err := SaveConfig(cfgPath, "", &cfg, "", WriteOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -306,8 +324,46 @@ func TestSaveConfigRoundTripsBoardSubagent(t *testing.T) {
 	if merged.SubagentDepth() != 4 {
 		t.Fatalf("round-trip depth = %d, want 4", merged.SubagentDepth())
 	}
+	if merged.SubagentLimit() != 6 {
+		t.Fatalf("round-trip concurrent limit = %d, want 6", merged.SubagentLimit())
+	}
 	if merged.SubagentModel != "gpt-4o-mini" {
 		t.Fatalf("round-trip subagent_model = %q, want gpt-4o-mini", merged.SubagentModel)
+	}
+	if merged.SubagentThinkingLevel != "high" {
+		t.Fatalf("round-trip subagent_thinking_level = %q, want high", merged.SubagentThinkingLevel)
+	}
+}
+
+// TestSaveConfigRoundTripsWebAllowedOrigins is a regression test for the
+// silent data-loss bug where web_allowed_origins was written by --save-config
+// but never parsed back on load (FileConfig had no field and Merge hard-coded
+// the file slot to ""). A CORS allow-list set in the web UI or saved to disk
+// must survive a restart.
+func TestSaveConfigRoundTripsWebAllowedOrigins(t *testing.T) {
+	os.Unsetenv("GOGEN_WEB_ALLOWED_ORIGINS")
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "gogen.conf")
+	cfg := config.Defaults()
+	cfg.WebAllowedOrigins = "https://example.com https://app.dev"
+	if err := SaveConfig(cfgPath, "", &cfg, "", WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	pf, err := Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pf.Config.WebAllowedOrigins; got != cfg.WebAllowedOrigins {
+		t.Fatalf("file WebAllowedOrigins = %q, want %q", got, cfg.WebAllowedOrigins)
+	}
+	merged := Merge(pf, FlagOverrides{})
+	if merged.WebAllowedOrigins != cfg.WebAllowedOrigins {
+		t.Fatalf("round-trip WebAllowedOrigins = %q, want %q", merged.WebAllowedOrigins, cfg.WebAllowedOrigins)
+	}
+	// Env still overrides the persisted file value.
+	t.Setenv("GOGEN_WEB_ALLOWED_ORIGINS", "https://override.test")
+	if got := Merge(pf, FlagOverrides{}).WebAllowedOrigins; got != "https://override.test" {
+		t.Fatalf("env override = %q, want https://override.test", got)
 	}
 }
 
@@ -325,6 +381,24 @@ func TestMergeSubagentModelPrecedence(t *testing.T) {
 	t.Setenv("GOGEN_SUBAGENT_MODEL", "qwen2.5")
 	if got := Merge(pf, FlagOverrides{}).SubagentModel; got != "qwen2.5" {
 		t.Fatalf("env subagent_model = %q, want qwen2.5", got)
+	}
+}
+
+// TestMergeSubagentThinkingLevelPrecedence pins the subagent reasoning-effort
+// merge: empty (default) = inherit the parent's level, file value applies,
+// env overrides file.
+func TestMergeSubagentThinkingLevelPrecedence(t *testing.T) {
+	os.Unsetenv("GOGEN_SUBAGENT_THINKING_LEVEL")
+	if got := Merge(nil, FlagOverrides{}).SubagentThinkingLevel; got != "" {
+		t.Fatalf("default subagent_thinking_level = %q, want empty (inherit)", got)
+	}
+	pf := &ProjectFile{Config: FileConfig{SubagentThinkingLevel: "high"}}
+	if got := Merge(pf, FlagOverrides{}).SubagentThinkingLevel; got != "high" {
+		t.Fatalf("file subagent_thinking_level = %q, want high", got)
+	}
+	t.Setenv("GOGEN_SUBAGENT_THINKING_LEVEL", "low")
+	if got := Merge(pf, FlagOverrides{}).SubagentThinkingLevel; got != "low" {
+		t.Fatalf("env subagent_thinking_level = %q, want low", got)
 	}
 }
 
@@ -414,5 +488,26 @@ func TestConfigFileHasSecretsUnparseableAssumesSecrets(t *testing.T) {
 	}
 	if !ConfigFileHasSecrets(path) {
 		t.Fatal("unparseable existing config should conservatively report secrets")
+	}
+}
+
+// compact_last_resort follows the env > file > defaults merge rule: the
+// last-resort condensation mode (Phase 0e) defaults to "condense", the
+// project file key applies, and the env var overrides the file.
+func TestMergeCompactLastResort(t *testing.T) {
+	os.Unsetenv("GOGEN_COMPACT_LAST_RESORT")
+	if got := Merge(nil, FlagOverrides{}).CompactLastResort; got != config.DefaultCompactLastResort {
+		t.Fatalf("absent key merged to %q, want default %q", got, config.DefaultCompactLastResort)
+	}
+	pf, err := ParseContent("GOGEN.md", "---\ncompact_last_resort: error\n---\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := Merge(pf, FlagOverrides{}).CompactLastResort; got != "error" {
+		t.Fatalf("file value merged to %q, want error", got)
+	}
+	t.Setenv("GOGEN_COMPACT_LAST_RESORT", "condense")
+	if got := Merge(pf, FlagOverrides{}).CompactLastResort; got != "condense" {
+		t.Fatalf("env should override the file: %q, want condense", got)
 	}
 }

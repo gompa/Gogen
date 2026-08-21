@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"strconv"
 	"strings"
@@ -69,13 +70,14 @@ type Agent struct {
 	OnModelChanged func()
 
 	// modelUnverified is true when the selected model came from a session
-	// restore and has not yet been confirmed to exist at the provider.
-	// RestoreSessionLocal sets it; ValidateRestoredModel clears it once the
-	// restored model is resolved (present, absent, or auto-selected);
-	// SelectModel clears it (a selection comes from the provider's own
-	// list). requireModelSelected re-checks a still-unverified model on the
-	// first turn so a stale model from a previous provider is never sent to
-	// the endpoint. Guarded by statsMu.
+	// restore or an external adoption (AdoptModel — the web /new pane-model
+	// inheritance) and has not yet been confirmed to exist at the provider.
+	// RestoreSessionLocal and AdoptModel set it; ValidateRestoredModel
+	// clears it once the model is resolved (present, absent, or
+	// auto-selected); SelectModel clears it (a selection comes from the
+	// provider's own list). requireModelSelected re-checks a
+	// still-unverified model on the first turn so a stale model from a
+	// previous provider is never sent to the endpoint. Guarded by statsMu.
 	modelUnverified bool
 
 	// bgMu guards bgJobs: shell commands started with execute_command
@@ -183,6 +185,32 @@ type Agent struct {
 	compactBackoffUntil time.Time
 	compactBackoffDelay time.Duration
 
+	// lastEmergencyFailCount is the message count at which the last
+	// emergency-tier compaction failed (guarded by statsMu). Emergency
+	// attempts are suppressed while the count has not grown past it (the
+	// progress guard against a hot loop of identical failures); reset on
+	// any successful compaction.
+	lastEmergencyFailCount int
+
+	// lastLastResortFailCount is the message count at which the last
+	// last-resort condensation (Phase 0e) failed (guarded by statsMu).
+	// Same progress-guard semantics as lastEmergencyFailCount: a retry at
+	// the unchanged count would hit the same failure, so attempts are
+	// suppressed until the conversation grows past that count; reset on
+	// success.
+	lastLastResortFailCount int
+
+	// overheadMu guards overheadFingerprint/overheadTokens: the cached wire
+	// overhead (system prompt + tool definitions) in tokens. Recomputed only
+	// when the content fingerprint of (system prompt, tool definitions)
+	// changes, so the per-round prepareMessages call never re-tokenizes the
+	// tool set. Deliberately not statsMu: tokenizing is CPU-heavy and the
+	// cache is consulted only on the turn goroutine (shouldCompactUsingCounts),
+	// not by lock-free readers.
+	overheadMu          sync.Mutex
+	overheadFingerprint string
+	overheadTokens      int
+
 	// ThinkingLevel controls how much reasoning/thinking the model should use.
 	// When "off", no thinking parameter is sent to the API.
 	ThinkingLevel ThinkingLevel
@@ -209,10 +237,13 @@ type Agent struct {
 	// reader: llmTools/AllowedToolNames consult BoardEnabled/SubagentsEnabled
 	// per turn, and the toggle handler rebuilds toolHandlers under toolMu so
 	// executeTool's map lookup is the gate. subagentMaxDepth bounds nesting
-	// (main agent = depth 0; default 1 = subagents cannot spawn subagents).
-	boardEnabled     atomic.Bool
-	subagentsEnabled atomic.Bool
-	subagentMaxDepth atomic.Int32
+	// (main agent = depth 0; default 1 = subagents cannot spawn subagents)
+	// and subagentMaxConcurrent bounds per-parent concurrent subagents
+	// (default config.DefaultSubagentMaxConcurrent).
+	boardEnabled          atomic.Bool
+	subagentsEnabled      atomic.Bool
+	subagentMaxDepth      atomic.Int32
+	subagentMaxConcurrent atomic.Int32
 
 	// boardManager is the shared project board (one instance per workspace
 	// in web mode, per agent in TUI/CLI). Set when the board feature is
@@ -295,6 +326,13 @@ type Agent struct {
 	// failing (same target, same mismatch). A model iterating across
 	// different files or diffs is making progress and must not be stopped.
 	patchStrikeKey atomic.Value // string
+
+	// overflowRetries counts the provider context-window refusals already
+	// recovered in the current turn (Phase 3, handleOverflowError). Reset
+	// at the start of every turn; capped at 1 — a second refusal in the
+	// same turn (or a failed forced compaction) returns the actionable
+	// terminal error instead of retrying again.
+	overflowRetries atomic.Int32
 }
 
 // persistMeta is the set of session fields that only the full snapshot path
@@ -392,6 +430,22 @@ func (a *Agent) SubagentMaxDepth() int {
 		return d
 	}
 	return config.DefaultSubagentMaxDepth
+}
+
+// SetSubagentMaxConcurrent sets the maximum number of subagents that may
+// run concurrently per parent session. Values <= 0 fall back to the config
+// default.
+func (a *Agent) SetSubagentMaxConcurrent(n int) {
+	a.subagentMaxConcurrent.Store(int32(n))
+}
+
+// SubagentMaxConcurrent returns the effective per-parent concurrent-subagent
+// limit.
+func (a *Agent) SubagentMaxConcurrent() int {
+	if n := int(a.subagentMaxConcurrent.Load()); n > 0 {
+		return n
+	}
+	return config.DefaultSubagentMaxConcurrent
 }
 
 // SetBoardManager attaches the shared project board manager. The web server
@@ -731,8 +785,17 @@ func (a *Agent) extendTokenCounts() {
 // shouldCompactUsingCounts reports whether auto-compaction should trigger,
 // summing the cached per-message token counts when they are complete to avoid
 // re-tokenizing the whole conversation on every turn. Falls back to
-// Manager.ShouldCompact (a full EstimateTokens pass) when the cache is empty
-// or incomplete (e.g. right after a compaction or session restore).
+// Manager.ShouldCompactWithOverhead (a full EstimateTokens pass) when the
+// cache is empty or incomplete (e.g. right after a compaction or session
+// restore).
+//
+// Wire overhead accounting: the per-message counts cover the canonical
+// messages only — the system prompt and tool definitions (10-30k tokens)
+// ride on every request but are not in a.Messages. When the provider
+// prompt_tokens baseline is fresh, it already includes that overhead, so it
+// must NOT be added again (double-count trap). When the baseline is absent
+// (post-compaction, post-restore, first turn), the wire overhead is added so
+// the trigger fires on time instead of tens of thousands of tokens late.
 func (a *Agent) shouldCompactUsingCounts() bool {
 	if a.Context == nil {
 		return false
@@ -743,8 +806,17 @@ func (a *Agent) shouldCompactUsingCounts() bool {
 	complete := counts != nil && len(counts) == len(msgs)
 	baselineTokens, baselineMsgCount := a.apiBaselinePromptTokens, a.apiBaselineMsgCount
 	a.statsMu.RUnlock()
+	// Fresh when the provider's prompt_tokens were recorded for a list no
+	// larger than the current one (the list only grew since that request).
+	// A shrunken list (rollback) leaves the baseline stale — the API count
+	// would over-report, so the local estimate is used instead.
+	baselineFresh := baselineTokens > 0 && baselineMsgCount > 0 && baselineMsgCount <= len(msgs)
 	if !complete {
-		return a.Context.ShouldCompact(msgs)
+		overhead := 0
+		if !baselineFresh {
+			overhead = a.wireOverheadTokens()
+		}
+		return a.Context.ShouldCompactWithOverhead(msgs, overhead)
 	}
 	if !a.Context.AutoCompactEnabled() {
 		return false
@@ -752,21 +824,100 @@ func (a *Agent) shouldCompactUsingCounts() bool {
 	if len(msgs) <= a.Context.CompactKeepRecentMessages()+1 {
 		return false
 	}
+	return a.compactionTokenTotal() >= a.Context.CompactBudget()
+}
+
+// compactionTokenTotal returns the estimated total token count of the
+// conversation (system prompt + tool definitions + canonical messages),
+// using the same accounting as shouldCompactUsingCounts: the provider's
+// exact prompt_tokens baseline when fresh, otherwise the cached per-message
+// counts plus the wire overhead. Returns -1 when the per-message count
+// cache is incomplete (e.g. right after a session restore) so callers can
+// fall back to the full-estimate path.
+func (a *Agent) compactionTokenTotal() int {
+	a.statsMu.RLock()
+	counts := a.tokenCounts
+	msgs := a.Messages
+	complete := counts != nil && len(counts) == len(msgs)
+	baselineTokens, baselineMsgCount := a.apiBaselinePromptTokens, a.apiBaselineMsgCount
+	a.statsMu.RUnlock()
+	if !complete {
+		return -1
+	}
+	// Fresh when the provider's prompt_tokens were recorded for a list no
+	// larger than the current one (the list only grew since that request).
+	baselineFresh := baselineTokens > 0 && baselineMsgCount > 0 && baselineMsgCount <= len(msgs)
 	total := 0
 	for _, c := range counts {
 		total += c
 	}
 	// Use the provider's exact prompt_tokens for messages in the last request
 	// (cl100k misjudges other tokenizers); estimate only the suffix appended
-	// since. Cleared by clearTurnUsage after a compaction.
-	if baselineTokens > 0 && baselineMsgCount > 0 && baselineMsgCount <= len(counts) {
+	// since. The provider count already includes the system prompt and tool
+	// definitions, so the wire overhead is NOT added again (double-count
+	// trap). Cleared by clearTurnUsage after a compaction.
+	if baselineFresh {
 		local := 0
 		for _, c := range counts[baselineMsgCount:] {
 			local += c
 		}
 		total = baselineTokens + local
+	} else {
+		// Baseline absent (post-compaction, post-restore, first turn): the
+		// local counts cover the canonical messages only, so add the wire
+		// overhead (system prompt + tool definitions) they omit.
+		total += a.wireOverheadTokens()
 	}
-	return total >= a.Context.CompactBudget()
+	return total
+}
+
+// wireOverheadTokens returns the estimated wire token cost of everything a
+// provider request carries besides the canonical messages: the system prompt
+// (or only its enrichment suffix when the history already carries a system
+// message, whose base content is in the per-message counts) plus all tool
+// definitions. The result is cached and recomputed only when the content
+// fingerprint of (system prompt, tool definitions) changes, so the
+// per-round prepareMessages call does not re-tokenize the tool set.
+func (a *Agent) wireOverheadTokens() int {
+	var sysContent string
+	if prefix := a.systemPromptPrefix(); prefix != nil {
+		sysContent = prefix[0].Content
+	} else {
+		// History carries a system message: only the enrichment suffix is
+		// wire overhead (the base content is counted in the messages).
+		sysContent = buildSystemSuffix(a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode)
+	}
+	tools := a.llmTools()
+	fp := overheadFingerprint(sysContent, tools)
+	a.overheadMu.Lock()
+	if fp != a.overheadFingerprint {
+		tokens := contextmgr.EstimateToolTokens(tools)
+		if sysContent != "" && a.Context != nil {
+			tokens += a.Context.EstimateTokens([]llm.Message{{Role: "system", Content: sysContent}})
+		}
+		a.overheadFingerprint = fp
+		a.overheadTokens = tokens
+	}
+	t := a.overheadTokens
+	a.overheadMu.Unlock()
+	return t
+}
+
+// overheadFingerprint builds a content fingerprint of (system prompt, tool
+// definitions) for the wire-overhead cache: any change to the system prompt
+// text or any tool definition produces a different fingerprint, invalidating
+// the cached token estimate. Length-prefixed segments make the hash
+// collision-resistant against concatenation ambiguity.
+func overheadFingerprint(sysContent string, tools []llm.Tool) string {
+	h := fnv.New64a()
+	fmt.Fprintf(h, "%d\x00", len(sysContent))
+	h.Write([]byte(sysContent))
+	for _, t := range tools {
+		s := contextmgr.ToolDefinitionString(t)
+		fmt.Fprintf(h, "%d\x00", len(s))
+		h.Write([]byte(s))
+	}
+	return strconv.FormatUint(h.Sum64(), 16)
 }
 
 // compactAttemptDue reports whether the auto-compaction failure backoff has expired.
@@ -774,6 +925,53 @@ func (a *Agent) compactAttemptDue() bool {
 	a.statsMu.RLock()
 	defer a.statsMu.RUnlock()
 	return time.Now().After(a.compactBackoffUntil)
+}
+
+// emergencySummaryAllowance is the token budget assumed for the summary
+// output when sizing the emergency compaction middle: the middle must be
+// large enough to save (total - hardLimit) PLUS this much, so the summary
+// itself still lands the conversation under the window.
+const emergencySummaryAllowance = 2000
+
+// emergencyCompactDue reports whether the EMERGENCY compaction tier should
+// fire: the conversation total has reached the hard window
+// (ContextLimit - CompactReserveTokens, where the provider would refuse the
+// request) and the progress guard allows a new attempt. Unlike the normal
+// tier it ignores the failure backoff — a provider refusal is worse than a
+// redundant summarization call — but it refuses to retry a compaction that
+// already failed at a message count >= the current one
+// (lastEmergencyFailCount), so a permanently broken summarization path
+// cannot hot-loop an expensive failure on every turn. It also requires at
+// least 3 messages: with fewer, there is nothing between the starting
+// prompt and the current one to summarize. total < 0 (incomplete count
+// cache) never fires: the normal tier's full-estimate fallback covers that
+// state.
+func (a *Agent) emergencyCompactDue(total int) bool {
+	if a.Context == nil || total < 0 {
+		return false
+	}
+	hardLimit := a.Context.HardLimit()
+	if hardLimit <= 0 || total < hardLimit {
+		return false
+	}
+	a.statsMu.RLock()
+	defer a.statsMu.RUnlock()
+	if len(a.Messages) < 3 {
+		return false
+	}
+	return a.lastEmergencyFailCount < len(a.Messages)
+}
+
+// noteEmergencyCompactFailure records an emergency-tier compaction failure
+// at the current message count: the progress guard suppresses further
+// emergency attempts until the conversation grows past that count (a retry
+// at the same count would hit the same failure).
+func (a *Agent) noteEmergencyCompactFailure() {
+	a.statsMu.Lock()
+	if n := len(a.Messages); n > a.lastEmergencyFailCount {
+		a.lastEmergencyFailCount = n
+	}
+	a.statsMu.Unlock()
 }
 
 // noteCompactFailure records a failed auto-compaction and backs off the next attempt exponentially.
@@ -792,11 +990,13 @@ func (a *Agent) noteCompactFailure(err error) {
 	a.statsMu.Unlock()
 }
 
-// noteCompactSuccess resets the auto-compaction failure backoff.
+// noteCompactSuccess resets the auto-compaction failure backoff and the
+// emergency-tier progress guard.
 func (a *Agent) noteCompactSuccess() {
 	a.statsMu.Lock()
 	a.compactBackoffUntil = time.Time{}
 	a.compactBackoffDelay = 0
+	a.lastEmergencyFailCount = 0
 	a.statsMu.Unlock()
 }
 
@@ -1067,9 +1267,21 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 	// in a row within this turn is looping; the turn is stopped instead of
 	// letting it retry indefinitely.
 	a.patchTurnStrikes.Store(0)
+	// Per-turn context-window refusal recovery budget (Phase 3): at most
+	// one forced-compaction + retry per turn.
+	a.overflowRetries.Store(0)
 	for first := true; ; first = false {
 		result, err := a.runTurn(ctx, h, first)
 		if err != nil {
+			// Phase 3: a provider context-window refusal recovers in-loop
+			// (forced compaction + one retry) instead of aborting the turn.
+			// Non-overflow errors, a cancelled context, and an exhausted
+			// recovery budget all fall through to the original error path.
+			if retry, terminal := a.handleOverflowError(ctx, h, err); retry {
+				continue
+			} else if terminal != nil {
+				return "", terminal
+			}
 			return "", err
 		}
 
@@ -1316,15 +1528,10 @@ func (a *Agent) RepairOrphanToolCalls() bool {
 }
 
 func stringArg(args map[string]interface{}, key string) (string, error) {
-	val, ok := args[key]
-	if !ok {
+	if _, ok := args[key]; !ok {
 		return "", fmt.Errorf("missing required argument %q", key)
 	}
-	s, ok := val.(string)
-	if !ok {
-		return "", fmt.Errorf("argument %q must be a string", key)
-	}
-	return s, nil
+	return stringArgOptional(args, key)
 }
 
 func stringArgOptional(args map[string]interface{}, key string) (string, error) {
@@ -1394,12 +1601,30 @@ func intArgOptional(args map[string]interface{}, key string) (int, error) {
 	}
 }
 
+// intRequiredArg reads a required positive-integer tool argument, e.g. an
+// item id. Unlike intArgOptional it errors when the key is absent or the
+// value is not a positive integer (ids start at 1, so 0 is invalid). It
+// accepts the same value shapes intArgOptional does: JSON numbers
+// (float64), int/int64, and quoted numeric strings.
+func intRequiredArg(args map[string]interface{}, key string) (int, error) {
+	if _, ok := args[key]; !ok {
+		return 0, fmt.Errorf("missing required argument %q", key)
+	}
+	n, err := intArgOptional(args, key)
+	if err != nil {
+		return 0, err
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("argument %q must be a positive integer", key)
+	}
+	return n, nil
+}
+
 func stringSliceArg(args map[string]interface{}, key string) ([]string, error) {
-	val, ok := args[key]
-	if !ok {
+	if _, ok := args[key]; !ok {
 		return nil, fmt.Errorf("missing required argument %q", key)
 	}
-	return coerceStringSlice(key, val)
+	return stringSliceArgOptional(args, key)
 }
 
 func stringSliceArgOptional(args map[string]interface{}, key string) ([]string, error) {

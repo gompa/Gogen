@@ -32,6 +32,11 @@
             display: flex;
             flex-direction: column;
             height: 100vh;
+            /* Mobile browsers: 100vh includes the area behind the collapsible
+               URL bar; 100dvh tracks the actual visible viewport so fixed
+               bottom UI never sits under browser chrome. Older engines ignore
+               the second declaration and keep 100vh. */
+            height: 100dvh;
             background: var(--bg);
             color: var(--fg);
         }
@@ -163,11 +168,14 @@
         /* ===== Conversation TOC rail =====
            One dot per user prompt, overlaid on the right edge of the chat
            and revealed on hover (app.js toggles .has-dots for presence and
-           .toc-hover for visibility; pointer-events stay off until shown so
-           the chat underneath is fully interactive). top/height are synced
-           to the #messages box by app.js syncTocRailBox so the strip never
-           covers the composer toolbar, input row, or scroll-bottom button.
-           The dot column scrolls internally past the 50lvh / 246px cap. */
+           .toc-hover for visibility). The rail itself is always
+           pointer-events:none; only the dot column captures events while
+           shown, so the rest of the strip never blocks the chat underneath
+           (e.g. the resend/edit buttons on user messages). top/height are
+           synced to the #messages box by app.js syncTocRailBox so the strip
+           never covers the composer toolbar, input row, or scroll-bottom
+           button. The dot column scrolls internally past the 50lvh / 246px
+           cap. */
         #toc-rail {
             display: none;
             position: absolute;
@@ -193,15 +201,19 @@
         #toc-rail.toc-hover {
             opacity: 1;
             visibility: visible;
-            pointer-events: auto;
             transition: opacity 0.15s ease; /* visibility flips instantly on show */
         }
+        /* Only the dot column is interactive (the rail above stays
+           pointer-events:none), so a visible rail cannot swallow clicks on
+           the chat content it overlays. */
+        #toc-rail.toc-hover #toc-dots { pointer-events: auto; }
         #toc-dots {
             display: flex;
             flex-direction: column;
             align-items: center;
             gap: 12px;
             padding: 4px 0;
+            pointer-events: none; /* inherited anyway; explicit for clarity */
             /* Allow the column to shrink below its content and scroll when
                the prompt count exceeds the rail's max-height. */
             min-height: 0;
@@ -591,6 +603,34 @@
             opacity: 0.7;
         }
         #near-compact-banner #ncb-dismiss-btn:hover { opacity: 1; }
+
+        /* ===== Condensed banner (Phase 0e: a message was condensed to fit the window) ===== */
+        #condensed-banner {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 6px 16px;
+            font-size: 0.82em;
+            color: var(--warn);
+            background: var(--warn-bg);
+            border-top: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+        #condensed-banner[hidden] { display: none; }
+        #condensed-banner #condensed-banner-text {
+            flex: 1;
+            min-width: 0;
+        }
+        #condensed-banner #condensed-banner-dismiss {
+            padding: 3px 10px;
+            font-size: 0.8em;
+            background: transparent;
+            border: 1px solid var(--warn);
+            color: var(--warn);
+            border-radius: 3px;
+            flex-shrink: 0;
+        }
+        #condensed-banner #condensed-banner-dismiss:hover { background: var(--warn-bg); }
 
         .message {
             padding: 10px 12px;
@@ -1182,8 +1222,10 @@
 
         #toast-host {
             position: fixed;
-            bottom: 16px;
-            right: 16px;
+            /* env() is 0 outside iOS standalone/notched contexts, so this is
+               a no-op on desktop and in the normal mobile browser. */
+            bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+            right: calc(16px + env(safe-area-inset-right, 0px));
             z-index: 2000;
             display: flex;
             flex-direction: column;
@@ -1432,7 +1474,8 @@
         .session-row.nested .session-row-title { opacity: 0.9; }
 
         /* Editor workspace */
-        #editor-pane { flex-direction: row; background: var(--bg); }
+        /* position: relative anchors the mobile editor-sidebar drawer. */
+        #editor-pane { flex-direction: row; background: var(--bg); position: relative; }
         /* Board pane: kanban column/card styles land with the board UI
            (Phase 3b); the pane container just needs the flex layout. */
         #board-pane { flex-direction: column; background: var(--bg); overflow: hidden; }
@@ -1479,6 +1522,35 @@
             opacity: 1; background: #d16969; color: #fff;
             font-size: 0.75em; text-transform: uppercase;
         }
+        /* Touch-only "move card" button (HTML5 drag-and-drop does not work
+           on touch, so cards get a tap-to-move fallback; app.js
+           boardMoveId/boardMoveCancel drive the move-mode highlight). */
+        .board-card-move {
+            display: none;
+            margin-left: auto;
+            align-items: center;
+            gap: 4px;
+            background: none;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            color: var(--fg-muted);
+            font-size: 0.8em;
+            padding: 2px 8px;
+            cursor: pointer;
+            user-select: none;
+        }
+        .board-card-move:hover { background: var(--border); color: var(--fg); }
+        .board-card-move.active {
+            color: var(--accent);
+            border-color: var(--accent);
+            background: var(--accent-soft);
+        }
+        .board-card.move-source { outline: 2px dashed var(--accent); outline-offset: -2px; }
+        /* Move mode: column headers become the tap targets. */
+        .board-columns.move-mode .board-column-header {
+            cursor: pointer;
+            background: var(--accent-soft);
+        }
         .board-card-meta { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
         .board-prio { font-size: 0.75em; padding: 1px 6px; border-radius: 8px; text-transform: uppercase; }
         .board-prio.prio-low { background: var(--border); }
@@ -1506,6 +1578,11 @@
                (36vw), never below 300px, never above 420px, and never
                overflowing the window on tiny viewports. */
             width: min(clamp(300px, 36vw, 420px), calc(100vw - 16px));
+            /* Never taller than the viewport (minus the shell's 8px
+               margins): on very small screens the popover scrolls its
+               own content instead of overflowing the clamped position. */
+            max-height: calc(100vh - 16px);
+            overflow-y: auto;
             background: var(--bg-elevated);
             border: 1px solid var(--border);
             border-radius: 6px;
@@ -1533,6 +1610,13 @@
         .board-start-model-list {
             max-height: 220px; overflow-y: auto;
             display: flex; flex-direction: column; gap: 2px;
+        }
+        .board-start-thinking {
+            display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+        }
+        .board-start-thinking-label {
+            font-size: 0.72em; text-transform: uppercase; letter-spacing: 0.04em; color: var(--fg-muted);
+            white-space: nowrap;
         }
         .board-start-actions {
             display: flex; align-items: center; justify-content: flex-end; gap: 6px;
@@ -1602,7 +1686,7 @@
             border-bottom: 1px solid var(--border);
             background: var(--bg-elevated);
         }
-        #file-tree, #unstaged-list {
+        #file-tree, #changes-list {
             overflow-y: auto;
             padding: 6px 8px;
             font-size: 0.85em;
@@ -1610,15 +1694,67 @@
             color: var(--fg);
         }
         #file-tree { flex: 1; min-height: 0; }
-        #unstaged-wrap {
+        #changes-wrap {
             border-top: 1px solid var(--border);
-            max-height: 40%;
+            max-height: 30%;
             display: flex;
             flex-direction: column;
             min-height: 0;
         }
-        #unstaged-list { flex: 1; min-height: 0; }
-        .tree-item, .unstaged-item {
+        #changes-list { flex: 1; min-height: 0; }
+        /* Changes panel sections (Conflicts / Staged / Unstaged /
+           Untracked); empty sections are not rendered at all. */
+        #changes-list .changes-section { margin-bottom: 4px; }
+        #changes-list .changes-section-head {
+            padding: 3px 6px;
+            font-size: 0.8em;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            color: var(--fg-muted);
+        }
+        #changes-list .changes-section.conflict .changes-section-head,
+        #changes-list .changes-section.conflict .changes-item { color: var(--error); }
+        #commit-composer {
+            border-top: 1px solid var(--border);
+            padding: 6px 8px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            flex-shrink: 0;
+        }
+        #commit-message {
+            width: 100%;
+            box-sizing: border-box;
+            font-family: var(--mono);
+            font-size: 0.85em;
+            background: var(--bg);
+            color: var(--fg);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 6px;
+            resize: vertical;
+        }
+        #stage-all-row {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 0.8em;
+            color: var(--fg-muted);
+            cursor: pointer;
+            user-select: none;
+        }
+        #commit-buttons-row {
+            display: flex;
+            gap: 6px;
+        }
+        #commit-buttons-row button {
+            flex: 1;
+            font-size: 0.8em;
+            padding: 4px 6px;
+            white-space: nowrap;
+        }
+        .tree-item {
             padding: 3px 6px;
             cursor: pointer;
             border-radius: 2px;
@@ -1626,7 +1762,37 @@
             overflow: hidden;
             text-overflow: ellipsis;
         }
-        .tree-item:hover, .unstaged-item:hover { background: var(--bg-hover); }
+        .tree-item:hover { background: var(--bg-hover); }
+        /* Changes rows: label (opens the diff) + a Stage/Unstage action
+           button; the button stops propagation so it never opens the diff. */
+        .changes-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 6px;
+            border-radius: 2px;
+            white-space: nowrap;
+        }
+        .changes-item:hover { background: var(--bg-hover); }
+        .changes-item-label {
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            cursor: pointer;
+        }
+        .changes-item-action {
+            flex-shrink: 0;
+            font-size: 0.75em;
+            padding: 1px 6px;
+            background: var(--bg-elevated);
+            color: var(--fg);
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            cursor: pointer;
+        }
+        .changes-item-action:hover { background: var(--bg-hover); }
+        .changes-item-action:disabled { opacity: 0.5; cursor: default; }
         .tree-item.dir { color: var(--accent); }
         .tree-item.file { color: var(--fg); }
         .tree-children { padding-left: 14px; }
@@ -1797,10 +1963,10 @@
         /* ===== Scroll-to-bottom button ===== */
         #scroll-bottom-btn {
             position: absolute;
-            /* 80px clears the composer toolbar + input row; the terminal
-               strip docks below the input row now, so add its live height
-               (kept in sync by app.js as --terminal-strip-h). */
-            bottom: calc(80px + var(--terminal-strip-h, 0px));
+            /* Clears the composer block (toolbar + compact banner + input
+               row, live height kept in sync by app.js as --composer-h) plus
+               the terminal strip below it (--terminal-strip-h). */
+            bottom: calc(var(--composer-h, 80px) + var(--terminal-strip-h, 0px));
             left: 0;
             right: 0;
             width: fit-content;
@@ -1836,6 +2002,10 @@
             border-radius: 3px;
         }
         #sidebar-toggle:hover { color: var(--fg); }
+        /* Mobile-only: opens the editor file-explorer sidebar as a drawer. */
+        #editor-sidebar-toggle {
+            display: none;
+        }
         @media (max-width: 768px) {
             #sidebar {
                 position: absolute;
@@ -2314,7 +2484,7 @@
             border-radius: 3px;
             line-height: 1.3;
             user-select: none;
-            z-index: 5;
+            z-index: 6; /* above the TOC rail (5) so the rail never blocks it */
         }
         .fork-btn:hover {
             color: var(--accent);
@@ -2342,7 +2512,7 @@
             border-radius: 3px;
             line-height: 1.3;
             user-select: none;
-            z-index: 5;
+            z-index: 6; /* above the TOC rail (5) so the rail never blocks them */
         }
         .resend-btn:hover, .edit-btn:hover {
             color: var(--accent);
@@ -2641,7 +2811,12 @@
                 top: 41px;
                 left: 0;
                 right: 0;
-                bottom: 0;
+                /* Track the visual viewport (--vvh, kept fresh by app.js)
+                   so the OS keyboard never covers the terminal's bottom
+                   rows; falls back to the layout viewport when
+                   visualViewport is unsupported. */
+                height: calc(var(--vvh, 100vh) - 41px);
+                bottom: auto;
                 z-index: 60;
                 background: var(--bg-elevated);
             }
@@ -2671,5 +2846,107 @@
             .toast { animation: none; }
             #toc-rail { transition: none; }
             .toc-dot { transition: none; }
+        }
+
+        /* ============================================================
+           Mobile & touch refinements
+           ============================================================ */
+
+        /* Disable double-tap-zoom delays on interactive elements (they still
+           pan and pinch-zoom; only the 300ms tap delay and double-tap zoom
+           go away) and kill the Android tap flash. */
+        button, input, select, textarea, a,
+        .tree-item, .changes-item, .session-row, .board-card,
+        .slash-item, .palette-item, .term-more-row {
+            touch-action: manipulation;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        /* Touch devices have no hover: keep the hover-revealed message and
+           session actions visible so fork/resend/edit/delete stay reachable.
+           (On hybrid devices that report hover, the higher-specificity
+           :hover rules below still win while hovering.) */
+        @media (hover: none) {
+            .fork-btn, .resend-btn, .edit-btn { display: inline-block; }
+            .session-row-del { opacity: 1; }
+            .board-card-remove { opacity: 0.6; }
+            .board-card-move { display: inline-flex; }
+        }
+
+        @media (max-width: 768px) {
+            /* Both sidebars become full-height drawers; cap the drawer width
+               to the viewport even when the user saved a wider
+               drag-resized width (inline style would otherwise win). */
+            #sidebar { width: min(300px, 85vw) !important; }
+            #editor-sidebar { width: min(280px, 85vw) !important; }
+
+            #editor-pane { position: relative; }
+            #editor-sidebar {
+                position: absolute;
+                top: 0;
+                bottom: 0;
+                left: 0;
+                z-index: 15;
+                transform: translateX(-100%);
+                transition: transform 0.2s ease;
+                box-shadow: none;
+            }
+            #editor-sidebar.open {
+                transform: translateX(0);
+                box-shadow: 4px 0 16px rgba(0,0,0,0.4);
+            }
+            #editor-sidebar-toggle { display: inline-flex; align-items: center; }
+
+            /* The editor toolbar has more buttons than fit a phone; let it
+               scroll instead of crushing the buttons. */
+            #editor-toolbar { overflow-x: auto; scrollbar-width: none; }
+            #editor-toolbar::-webkit-scrollbar { display: none; }
+            #editor-toolbar button { flex-shrink: 0; white-space: nowrap; }
+        }
+
+        @media (max-width: 767px) {
+            /* Pin the tab bar to one row so the terminal overlay's
+               top: 41px stays exact; wide tab sets scroll horizontally. */
+            #top-tabs {
+                height: 41px;
+                overflow-x: auto;
+                scrollbar-width: none;
+            }
+            #top-tabs::-webkit-scrollbar { display: none; }
+            .main-tab { padding: 10px 12px; flex-shrink: 0; white-space: nowrap; }
+        }
+
+        @media (max-width: 720px) {
+            .provider-form { grid-template-columns: 1fr; }
+            #near-compact-banner { flex-wrap: wrap; }
+            #near-compact-banner #ncb-text {
+                white-space: normal;
+                overflow: visible;
+                text-overflow: clip;
+            }
+        }
+
+        @media (max-width: 480px) {
+            #messages { padding: 12px 10px; }
+            #settings-dialog { padding: 12px; }
+            #input-area { padding: 8px 10px; }
+            #composer-toolbar { padding: 4px 10px 0; }
+            #editor-toolbar { padding: 6px 6px; }
+        }
+
+        /* Bigger tap targets on coarse pointers (phones/tablets). */
+        @media (pointer: coarse) {
+            .tb-btn { padding: 8px 10px; }
+            #settings-btn { padding: 8px 10px; }
+            #sidebar-toggle { padding: 10px 12px; }
+            #attach-btn, #send-btn, #cancel-btn { padding: 10px 14px; }
+            #editor-toolbar button { min-height: 32px; }
+            #session-actions button { padding: 8px 10px; }
+            .slash-item { padding: 12px; }
+            .palette-item { padding: 12px 16px; }
+            .term-tab { padding: 7px 10px; }
+            .session-row { padding: 10px; }
+            .board-card { padding: 12px 10px; }
+            .board-card-start { padding: 8px 12px; }
         }
 

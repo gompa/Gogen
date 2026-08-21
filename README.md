@@ -53,8 +53,16 @@ OPENAI_API_KEY=sk-... ./gogen --web
 OPENAI_API_KEY=sk-... ./gogen -p "List the top-level packages"
 ```
 
-Non-loopback binds (e.g. `--host 0.0.0.0`) require a token (auto-generated
-and printed if `GOGEN_WEB_TOKEN` is not set):
+Non-loopback binds (e.g. `--host 0.0.0.0`) require a token. Without
+`GOGEN_WEB_TOKEN`, one is auto-generated and persisted (`.gogen/web_token`,
+0600) so **logins persist across restarts** — an already-paired device keeps
+its session. Startup prints a short-lived pairing link, the pairing code in
+plain text, and a QR code: the link opens the UI on this machine, the QR
+(encoding the LAN address) logs a phone in on scan. The pairing code is
+ephemeral by design — it expires after 15 minutes and is replaced at every
+server start, so after any restart scan the freshly printed QR; the
+long-lived token itself is never printed or logged. Set `GOGEN_WEB_TOKEN`
+to use your own token:
 
 ```bash
 GOGEN_WEB_TOKEN=secret ./gogen --web --host 0.0.0.0
@@ -155,6 +163,9 @@ mcp_servers:
 board: on          # project kanban board (board tool + web board tab)
 subagent: on       # subagent tool (nested sessions)
 subagent_max_depth: 2  # max nesting; 1 (default) = subagents cannot spawn subagents
+subagent_max_concurrent: 4  # max subagents running at once per session (web); 4 (default)
+subagent_model: gpt-4o-mini    # default subagent model (empty = inherit the parent's model)
+subagent_thinking_level: high  # subagent reasoning effort (empty = inherit the parent's level)
 job_notices: off   # notify the session when a background command finishes
 skills: off        # skill tool (list/read over .gogen/skills + ~/.config/gogen/skills)
 agent_instructions: off  # load AGENTS.md / CLAUDE.md workspace instruction files
@@ -261,6 +272,21 @@ is passed.
 | `GOGEN_COMPACT_KEEP_RECENT_MESSAGES` | `12` | Most recent messages kept verbatim when a compaction runs (older middle history is summarized; `0` keeps only the first user message) |
 | `GOGEN_MAX_TOOL_RESULT_BYTES` | `262144` | Max bytes for tool output before truncation (matches web_fetch's 256 KB limit) |
 | `GOGEN_COMPACT_RESERVE_TOKENS` | `4000` | Tokens reserved for new messages after compaction |
+| `GOGEN_COMPACT_LAST_RESORT` | `condense` | `condense` or `error`: what happens when a single message cannot fit the context window even after all compaction (e.g. a fresh session whose first message is bigger than the window) |
+
+When a single message is too large for the window, there is no middle history
+to summarize — the message is the head and every request would be refused.
+The last-resort condensation handles this: with `compact_last_resort: condense`
+(the default) the message is condensed in place via the summarizer, the
+original is archived to the session's archive sidecar
+(`<session>.archive.jsonl` next to the session file), and the condensation is
+announced in-band (TUI system line / web banner: message size vs window,
+original archived). With `compact_last_resort: error` the request is not sent
+at all: a clear diagnostic ("message is ~N tokens vs M window; shorten it or
+start a fresh session (/new)") is returned instead of the raw provider
+refusal. The path is strictly last-resort — it only fires when the request is
+provably over the window after the forced compaction, and only when condensing
+the single largest message would bring it under.
 
 After each agent turn, GoGen shows context usage in the CLI (dim line) and web UI (sidebar meter). Use `/context` for a detailed breakdown. When the provider returns usage stats (`prompt_tokens` from the API, including streaming with `include_usage`), the display labels this as **last request**; otherwise it falls back to a local token estimate.
 
@@ -316,7 +342,9 @@ These can be set in `.gogen/gogen.conf` only — there is no CLI flag or environ
 | `GOGEN_BOARD` | off | Set to `on` to enable the project kanban board (board tool + web board tab; live-toggleable from the web settings modal) |
 | `GOGEN_SUBAGENT` | off | Set to `on` to enable the subagent tool (nested sessions) |
 | `GOGEN_SUBAGENT_MAX_DEPTH` | `1` | Maximum subagent nesting depth (main agent = depth 0); `1` = subagents cannot spawn subagents; values ≤ 0 fall back to the default |
+| `GOGEN_SUBAGENT_MAX_CONCURRENT` | `4` | Maximum subagents running concurrently per session (web mode); spawning beyond it is refused. Interrupted (idle) subagents do not hold a slot. The TUI runs subagents one at a time, so it is unaffected; values ≤ 0 fall back to the default |
 | `GOGEN_SUBAGENT_MODEL` | *(empty)* | Default model for spawned subagents (empty = inherit the parent's model; the tool's explicit `model` argument always wins) |
+| `GOGEN_SUBAGENT_THINKING_LEVEL` | *(empty)* | Reasoning-effort level for spawned subagents (empty = inherit the parent session's live level; `off` = never send `reasoning_effort`). A level the subagent's final model does not accept is omitted at spawn time |
 | `GOGEN_BOARD_START_PROMPT` | *(empty)* | Template for the agent started from a board ticket (`{id}` `{title}` `{description}` `{priority}` `{context}`; empty = built-in default) |
 | `GOGEN_SYSTEM_PROMPT` | *(empty)* | Custom system prompt template (`{working_dir}`; replaces the built-in base prompt; project rules and plan mode still apply; empty = built-in default) |
 | `GOGEN_SUBAGENT_PROMPT` | *(empty)* | Template wrapping subagent jobs (`{job}`; empty = built-in default) |
@@ -347,7 +375,7 @@ These can be set in `.gogen/gogen.conf` only — there is no CLI flag or environ
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GOGEN_WEB_BIND` | `127.0.0.1:8081` | Listen address for `--web` (e.g. `0.0.0.0:8080` to accept remote connections); also `web_bind` in `.gogen/gogen.conf` (the settings modal's web-bind field persists it for the next start) |
-| `GOGEN_WEB_TOKEN` | *(empty)* | Required for non-loopback binds; auto-generated and printed when `--web --host` is used without one; also `web_auth_token` in `.gogen/gogen.conf` |
+| `GOGEN_WEB_TOKEN` | *(empty)* | Required for non-loopback binds; auto-generated and persisted (`.gogen/web_token`) when `--web --host` is used without one — startup prints a short-lived pairing link + QR; also `web_auth_token` in `.gogen/gogen.conf` |
 | `GOGEN_WEB_ALLOWED_ORIGINS` | *(empty)* | Comma-separated host allowlist for WebSocket CORS; empty uses localhost defaults; also `web_allowed_origins` in `.gogen/gogen.conf` |
 | `GOGEN_WEB_TLS_CERT` | *(empty)* | Path to PEM certificate file for TLS; also `web_tls_cert_file` in `.gogen/gogen.conf` |
 | `GOGEN_WEB_TLS_KEY` | *(empty)* | Path to PEM key file for TLS; also `web_tls_key_file` in `.gogen/gogen.conf` |
@@ -409,13 +437,18 @@ mode it is fixed to the project directory and the input is hidden.
   drag-and-drop moves, a "New card" form (title, acceptance criteria,
   priority), and inline card detail with an activity log. Agent board-tool
   mutations re-render the board live; the tab is hidden while the feature is
-  off. Each card has a **▶ Start** button that claims the ticket and starts a
-  dedicated agent session seeded with it; the button becomes **Open agent**
-  and switches to the chat tab with the session attached. The started session
-  runs headless until then — it survives closing the tab, and its delete
-  approvals pop the approval modal right on the board (if the initiating tab
-  is closed, approvals are denied until the session is reopened). The start
-  prompt template is editable in the settings modal (`board_start_prompt`).
+  off. Each card has a **▶ Start** button that opens a small popover with a
+  per-ticket model picker, a model-aware **reasoning effort** picker
+  (**Inherit** = the active pane's live level, **Off**, or the model's
+  accepted values), and an editable prompt — then claims the ticket and
+  starts a dedicated agent session seeded with it; the button becomes
+  **Open agent** and switches to the chat tab with the session attached.
+  The started session runs headless until then — it survives closing the
+  tab, and its delete approvals pop the approval modal right on the board
+  (if the initiating tab is closed, approvals are denied until the session
+  is reopened). The choices are stored on the ticket so the popover
+  pre-fills on the next start; the start prompt template is editable in
+  the settings modal (`board_start_prompt`).
 - With `subagent: on`, subagents appear as **nested rows** under their parent
   session in the sidebar, each with a status dot — amber **responding** while
   running, green **done** on success, red **failed** on error. Clicking a
@@ -428,6 +461,29 @@ mode it is fixed to the project directory and the input is hidden.
   default" button restores the built-in; a value equal to the built-in default
   is treated as unset, so the default text is never baked into the config
   file.
+- **TUI subagents are foreground-only in v1**: the TUI's `subagent` tool runs
+  the child to completion inline and returns the final report, but
+  `run_in_background` and the control tools (`subagent_fork`, `list_agents`,
+  `send_message`, `interrupt_agent`, `report`) are web-only — they depend on
+  the web server's session registry and delivery worker, which the TUI does
+  not host.
+- **Max concurrent subagents** (`subagent_max_concurrent`, default `4`): caps
+  how many subagents may run at the same time for one session (web mode). The
+  Agent tab's numeric input live-toggles it like the depth field; spawning
+  beyond the cap is refused with an error the agent can act on
+  (`interrupt_agent` a running child or wait for one to finish). The TUI runs
+  subagents one at a time, so the setting has no effect there.
+- **Subagent reasoning effort** (`subagent_thinking_level`): the Agent tab's
+  **Subagent reasoning effort** picker sits next to the model picker and is
+  model-aware — its options are the selected subagent model's accepted
+  values (the active session's model values while the model is "Inherit").
+  The leading **Inherit** option (the default, empty value) makes spawned
+  subagents run with the parent session's live thinking level; **Off** never
+  sends `reasoning_effort`. A level the subagent's final model does not
+  accept is omitted at spawn time (the tool's explicit `model` argument can
+  override the configured model, so validity is resolved against the child's
+  model, never at save time). `subagent_fork` always inherits the parent's
+  level.
 
 ### Web tools (web_fetch / web_search)
 
@@ -519,6 +575,11 @@ The agent has access to the following tools:
 | `todo` | Manage todo items: add/list/done/remove/clear |
 | `board` | Project kanban board (when `board: on`): list/show/add/claim/move/block/comment/done/remove (remove deletes a card entirely). Available in plan mode too — the board is the coordination exception |
 | `subagent` | Spawn a nested agent session for a job (when `subagent: on`); the final report returns as the tool result. Subagents cannot spawn subagents by default (`subagent_max_depth`) |
+| `subagent_fork` | Fork a child session seeded with a deep copy of this session's history and run one turn on it (web only, when `subagent: on`) |
+| `list_agents` | List live nested (subagent) sessions of this session: id, label, status, depth (web only, when `subagent: on`) |
+| `send_message` | Send a message to a running background subagent of this session (web only, when `subagent: on`) |
+| `interrupt_agent` | Cancel a running background subagent's in-flight turn (web only, when `subagent: on`) |
+| `report` | Child-scoped: return a subagent's final report to its parent (web only, when `subagent: on`) |
 | `session_rename` | Rename the current session |
 | `context_pin_last` | Pin the last user message to survive compaction |
 | `read_image` | Attach an image to the session context for vision-capable models (png/jpeg/gif/webp up to 3.5 MB; optional `detail=auto|low|high`) |

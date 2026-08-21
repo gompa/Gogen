@@ -271,6 +271,12 @@ func matchGlobPattern(pattern, relPath string) bool {
 		if idx := strings.LastIndex(relPath, "/"); idx >= 0 {
 			base = relPath[idx+1:]
 		}
+		// Simple globs (no character classes) are equivalent to the regex
+		// translation and get a cached compiled regex instead of
+		// re-translating via filepath.Match on every call.
+		if !strings.ContainsRune(pattern, '[') {
+			return matchGlobCached(pattern, base)
+		}
 		ok, err := filepath.Match(pattern, base)
 		if err != nil {
 			// Malformed pattern (filepath.ErrBadPattern). The path-based
@@ -284,7 +290,11 @@ func matchGlobPattern(pattern, relPath string) bool {
 	if strings.Contains(pattern, "**") {
 		return matchGlobRegex(pattern, relPath)
 	}
-	// Path-based patterns without ** use filepath.Match.
+	// Path-based patterns without ** use filepath.Match, unless they are
+	// simple globs (no character classes), which use the cached regex.
+	if !strings.ContainsRune(pattern, '[') {
+		return matchGlobCached(pattern, relPath)
+	}
 	ok, err := filepath.Match(pattern, relPath)
 	if err != nil {
 		return false
@@ -292,17 +302,24 @@ func matchGlobPattern(pattern, relPath string) bool {
 	return ok
 }
 
-// matchGlobRegex handles glob patterns that contain ** by converting
-// them to a regular expression. ** matches zero or more path segments.
-func matchGlobRegex(pattern, path string) bool {
-	// Fast path: read a compiled regex under the shared lock. The lookup is
-	// cheap and the regex (once compiled) is safe for concurrent use.
-	globRegexMu.Lock()
-	re, ok := globRegexCache[pattern]
-	globRegexMu.Unlock()
-	if ok {
-		return re.MatchString(path)
+// matchGlobCached matches a simple glob pattern (no ** and no character
+// classes) against path using a compiled regex that is memoized by pattern
+// string, so repeated matches with the same pattern skip re-translation.
+// The regex translation is equivalent to filepath.Match for such patterns.
+func matchGlobCached(pattern, path string) bool {
+	re, err := compiledRegex(globToRegexString(pattern))
+	if err != nil {
+		// Unreachable: globToRegexString always produces a valid regex.
+		return false
 	}
+	return re.MatchString(path)
+}
+
+// globToRegexString converts a glob pattern into an anchored regex string.
+// ** matches zero or more path segments (or everything when trailing); *
+// and ? match within a single path segment. Character classes ([...]) are
+// not supported; callers should fall back to filepath.Match for those.
+func globToRegexString(pattern string) string {
 	// Split pattern into segments, then convert each segment.
 	segments := strings.Split(pattern, "/")
 	var reParts []string
@@ -312,13 +329,12 @@ func matchGlobRegex(pattern, path string) bool {
 			reParts = append(reParts, "/")
 		}
 		if seg == "**" {
-			// Leading or middle "**" matches zero or more path segments
-			// (`(?:.*/)?`); a trailing "**" matches zero or more of any
-			// character including "/" (`.*`) so "**/*.go" and "src/**"
-			// both behave intuitively.
-			if i == 0 {
-				reParts = append(reParts, `(?:.*/)?`)
-			} else if i == len(segments)-1 {
+			// A trailing "**" (the last segment of a multi-segment pattern,
+			// e.g. "src/**") matches zero or more of any character including
+			// "/" (`.*`). Any other position — leading, middle, or the lone
+			// "**" pattern (hence the i != 0 guard) — matches zero or more
+			// path segments (`(?:.*/)?`).
+			if i == len(segments)-1 && i != 0 {
 				reParts = append(reParts, `.*`)
 			} else {
 				reParts = append(reParts, `(?:.*/)?`)
@@ -332,7 +348,21 @@ func matchGlobRegex(pattern, path string) bool {
 		}
 	}
 	reParts = append(reParts, "$")
-	reStr := strings.Join(reParts, "")
+	return strings.Join(reParts, "")
+}
+
+// matchGlobRegex handles glob patterns that contain ** by converting
+// them to a regular expression. ** matches zero or more path segments.
+func matchGlobRegex(pattern, path string) bool {
+	// Fast path: read a compiled regex under the shared lock. The lookup is
+	// cheap and the regex (once compiled) is safe for concurrent use.
+	globRegexMu.Lock()
+	re, ok := globRegexCache[pattern]
+	globRegexMu.Unlock()
+	if ok {
+		return re.MatchString(path)
+	}
+	reStr := globToRegexString(pattern)
 	re = regexp.MustCompile(reStr)
 	// Insert under the lock. If this insert pushes us over the cap, evict
 	// the oldest entry (by insertion order) rather than clearing the entire

@@ -200,7 +200,7 @@ func run() error {
 	}
 
 	if opts.web {
-		return runWeb(ctx, a, cfg, restoredModel)
+		return runWeb(ctx, a, cfg, restoredModel, webTokenStatePath(isGlobalMode, workingDir))
 	}
 
 	// Default: TUI mode.

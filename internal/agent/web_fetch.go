@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
+
+	"gogen/internal/onoff"
 )
 
 const (
@@ -76,13 +78,11 @@ var (
 )
 
 func envFetchOn() bool {
-	raw := strings.TrimSpace(fetchOnEnv.get("GOGEN_WEB_FETCH"))
-	return strings.EqualFold(raw, "on") || strings.EqualFold(raw, "1") || strings.EqualFold(raw, "true")
+	return onoff.Enabled(fetchOnEnv.get("GOGEN_WEB_FETCH"))
 }
 
 func envSearchOn() bool {
-	raw := strings.TrimSpace(searchOnEnv.get("GOGEN_WEB_SEARCH"))
-	return strings.EqualFold(raw, "on") || strings.EqualFold(raw, "1") || strings.EqualFold(raw, "true")
+	return onoff.Enabled(searchOnEnv.get("GOGEN_WEB_SEARCH"))
 }
 
 // normalizeFetchMode validates a web fetch mode ("https" or "all"). Unknown
@@ -483,12 +483,13 @@ func extractWebContent(body []byte, contentType, finalURL string, opts WebFetchO
 		}
 		return text, false, false, nil
 	}
-	if isHTMLLike(contentType, finalURL, body) {
+	if classifyResponse(contentType, finalURL, body) == kindHTML {
+		// HTML: prefer readability main-content extraction. When no single
+		// article is found (list pages, docs indexes, tables, ...) fall back
+		// to full-page conversion.
 		if md, ok := extractReadable(body, finalURL); ok {
 			return md, true, false, nil
 		}
-		// Readability found no single main article (list pages, docs
-		// indexes, tables, ...): fall back to full-page conversion.
 		return extractResponseText(contentType, finalURL, body), false, true, nil
 	}
 	return extractResponseText(contentType, finalURL, body), false, false, nil

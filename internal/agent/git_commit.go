@@ -59,6 +59,54 @@ func (e *Executor) GitStage(ctx context.Context, paths []string) (string, error)
 	return "Staged successfully", nil
 }
 
+// GitUnstage removes paths from the index (reverts them to unstaged).
+// When paths is empty, it unstages everything with `git restore --staged -- .`
+// (git restore rejects a bare invocation with no paths).
+func (e *Executor) GitUnstage(ctx context.Context, paths []string) (string, error) {
+	args := []string{"restore", "--staged"}
+	if len(paths) > 0 {
+		for _, p := range paths {
+			if _, err := e.SecurePath(p); err != nil {
+				return "", err
+			}
+		}
+		args = append(args, "--")
+		args = append(args, paths...)
+	} else {
+		args = append(args, "--", ".")
+	}
+
+	text, err := e.runGitCommand(ctx, args)
+	if err != nil {
+		return "", gitError("restore", text, err)
+	}
+	invalidateTrackedCache(e.GetWorkingDir())
+	return "Unstaged successfully", nil
+}
+
+// GitPush pushes the current branch to origin. When branch is empty it runs
+// the fixed argv `git push` (git resolves the upstream itself); otherwise
+// branch is validated as a git ref and `git push -u origin <branch>` runs.
+// No user input besides the validated branch ref ever reaches argv.
+func (e *Executor) GitPush(ctx context.Context, branch string) (string, error) {
+	branch = strings.TrimSpace(branch)
+	var args []string
+	if branch == "" {
+		args = []string{"push"}
+	} else {
+		if err := validateGitRef(branch); err != nil {
+			return "", err
+		}
+		args = []string{"push", "-u", "origin", branch}
+	}
+
+	text, err := e.runGitCommand(ctx, args)
+	if err != nil {
+		return text, gitError("push", text, err)
+	}
+	return text, nil
+}
+
 // GitCommit creates a commit with the given message.
 func (e *Executor) GitCommit(ctx context.Context, message string) (string, error) {
 	message = strings.TrimSpace(message)

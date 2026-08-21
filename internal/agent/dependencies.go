@@ -124,7 +124,7 @@ func (e *Executor) findIndirectDependents(ctx context.Context, directDependents 
 		// Search for references to the relative path (e.g. "internal/agent/utils").
 		// This is more precise than searching for just the filename stem.
 		pattern := regexp.QuoteMeta(dep)
-		results, err := e.SearchCode(ctx, pattern, subpath, "", 0)
+		results, err := e.SearchCode(ctx, pattern, subpath, "", 0, false)
 		if err != nil {
 			continue
 		}

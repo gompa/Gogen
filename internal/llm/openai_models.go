@@ -113,14 +113,6 @@ func waitModelsFetch(ctx context.Context, f *modelsFetch) ([]openai.Model, error
 	}
 }
 
-// fetchModels loads the merged model catalog from every registered provider
-// endpoint. It is the 3-value wrapper kept for direct callers/tests;
-// fetchModelsWithProfiles is the full implementation.
-func (p *OpenAIProvider) fetchModels(ctx context.Context) ([]openai.Model, map[string]*openai.Client, error) {
-	models, routing, _, err := p.fetchModelsWithProfiles(ctx)
-	return models, routing, err
-}
-
 // fetchModelsWithProfiles loads the merged catalog from every registered
 // provider endpoint: each profile's catalog is queried in parallel (an
 // OpenCode profile queries its zen and go endpoints in parallel with

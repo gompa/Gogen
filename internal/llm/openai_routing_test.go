@@ -63,9 +63,9 @@ func TestFetchModelsGoTakesPrecedenceOverZen(t *testing.T) {
 		modelClient: make(map[string]*openai.Client),
 	}
 
-	models, routing, err := p.fetchModels(context.Background())
+	models, routing, _, err := p.fetchModelsWithProfiles(context.Background())
 	if err != nil {
-		t.Fatalf("fetchModels: %v", err)
+		t.Fatalf("fetchModelsWithProfiles: %v", err)
 	}
 	if len(models) != 3 {
 		t.Fatalf("merged list has %d entries, want 3 (overlap deduped)", len(models))

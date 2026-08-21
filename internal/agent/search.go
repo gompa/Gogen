@@ -80,7 +80,7 @@ func (e *Executor) SearchCodeMatches(ctx context.Context, pattern, subpath, glob
 	if err != nil {
 		return nil, false, err
 	}
-	matches, truncated, _, err = e.searchStructured(ctx, searchRoot, relPrefix, pattern, glob)
+	matches, truncated, _, err = e.searchStructured(ctx, searchRoot, relPrefix, pattern, glob, false)
 	return matches, truncated, err
 }
 
@@ -124,8 +124,11 @@ func (e *Executor) resolveSearchScope(subpath, glob string) (searchRoot, relPref
 	return searchRoot, relPrefix, effectiveGlob, err
 }
 
-// SearchCode finds pattern matches using system rg when available, otherwise a Go fallback.
-func (e *Executor) SearchCode(ctx context.Context, pattern, subpath, glob string, contextLines int) (string, error) {
+// SearchCode finds pattern matches using system rg when available, otherwise
+// a Go fallback. When ignoreCase is true, matching ignores letter case (rg -i,
+// or a (?i)-prefixed regex in the Go fallback); literal patterns keep their
+// literal meaning — they simply match any casing.
+func (e *Executor) SearchCode(ctx context.Context, pattern, subpath, glob string, contextLines int, ignoreCase bool) (string, error) {
 	if err := validateSearchArgs(pattern, glob); err != nil {
 		return "", err
 	}
@@ -149,7 +152,7 @@ func (e *Executor) SearchCode(ctx context.Context, pattern, subpath, glob string
 	// Context-free searches go through the structured path shared with
 	// SearchCodeMatches; context-lines mode keeps the raw-output formatter.
 	if contextLines == 0 {
-		matches, truncated, engine, sErr := e.searchStructured(ctx, searchRoot, relPrefix, pattern, glob)
+		matches, truncated, engine, sErr := e.searchStructured(ctx, searchRoot, relPrefix, pattern, glob, ignoreCase)
 		if sErr != nil {
 			return "", sErr
 		}
@@ -170,13 +173,13 @@ func (e *Executor) SearchCode(ctx context.Context, pattern, subpath, glob string
 	}
 
 	if _, err := exec.LookPath("rg"); err == nil {
-		out, rgErr := e.searchWithRipgrep(ctx, searchRoot, relPrefix, pattern, glob, contextLines)
+		out, rgErr := e.searchWithRipgrep(ctx, searchRoot, relPrefix, pattern, glob, contextLines, ignoreCase)
 		if rgErr == nil {
 			return out, nil
 		}
 	}
 
-	out, goErr := e.searchWithGo(ctx, searchRoot, relPrefix, pattern, glob, contextLines)
+	out, goErr := e.searchWithGo(ctx, searchRoot, relPrefix, pattern, glob, contextLines, ignoreCase)
 	if goErr != nil {
 		return "", goErr
 	}
@@ -186,16 +189,19 @@ func (e *Executor) SearchCode(ctx context.Context, pattern, subpath, glob string
 // ReplaceInTree replaces every regex match of pattern with replacement under
 // subpath (same pattern semantics as SearchCode). Unlike search, it is not
 // capped by searchMaxMatches — every matching text file is updated.
-func (e *Executor) ReplaceInTree(ctx context.Context, pattern, replacement, subpath, glob string) (replaced, fileCount int, err error) {
+// It also returns the workspace-relative slash paths of the files that were
+// modified, so callers (e.g. the editor's open-buffer sync) can tell exactly
+// which files changed on disk.
+func (e *Executor) ReplaceInTree(ctx context.Context, pattern, replacement, subpath, glob string) (replaced, fileCount int, files []string, err error) {
 	if pattern == "" {
-		return 0, 0, fmt.Errorf("search pattern is required")
+		return 0, 0, nil, fmt.Errorf("search pattern is required")
 	}
 	if err := rejectLeadingDashArg("pattern", pattern); err != nil {
-		return 0, 0, err
+		return 0, 0, nil, err
 	}
 	if glob != "" {
 		if err := rejectLeadingDashArg("glob", glob); err != nil {
-			return 0, 0, err
+			return 0, 0, nil, err
 		}
 	}
 	if ctx == nil {
@@ -204,9 +210,9 @@ func (e *Executor) ReplaceInTree(ctx context.Context, pattern, replacement, subp
 	ctx, cancel := context.WithTimeout(ctx, replaceTreeTimeout)
 	defer cancel()
 
-	re, err := compileSearchPattern(pattern)
+	re, err := compileSearchPattern(pattern, false)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, nil, err
 	}
 
 	// Single-file scope: replace only in that file.
@@ -217,7 +223,7 @@ func (e *Executor) ReplaceInTree(ctx context.Context, pattern, replacement, subp
 			if statErr == nil && !info.IsDir() {
 				absWD, absErr := filepath.Abs(e.GetWorkingDir())
 				if absErr != nil {
-					return 0, 0, absErr
+					return 0, 0, nil, absErr
 				}
 				rel, relErr := filepath.Rel(absWD, secure)
 				if relErr != nil {
@@ -226,19 +232,19 @@ func (e *Executor) ReplaceInTree(ctx context.Context, pattern, replacement, subp
 				rel = filepath.ToSlash(rel)
 				n, writeErr := e.replaceInFilePath(secure, rel, re, replacement)
 				if writeErr != nil {
-					return 0, 0, writeErr
+					return 0, 0, nil, writeErr
 				}
 				if n > 0 {
-					return n, 1, nil
+					return n, 1, []string{rel}, nil
 				}
-				return 0, 0, nil
+				return 0, 0, nil, nil
 			}
 		}
 	}
 
 	searchRoot, relPrefix, err := e.searchRoot(subpath)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, nil, err
 	}
 	glob = strings.TrimSpace(glob)
 
@@ -250,10 +256,11 @@ func (e *Executor) ReplaceInTree(ctx context.Context, pattern, replacement, subp
 		if n > 0 {
 			replaced += n
 			fileCount++
+			files = append(files, rel)
 		}
 		return nil
 	})
-	return replaced, fileCount, err
+	return replaced, fileCount, files, err
 }
 
 func (e *Executor) replaceInFilePath(absPath, relPath string, re *regexp.Regexp, replacement string) (int, error) {
@@ -313,13 +320,16 @@ func (e *Executor) searchRoot(subpath string) (absRoot, relPrefix string, err er
 // overflowed flag reports whether anything was dropped. A non-zero exit
 // (including rg's exit code 1 for "no matches") is returned as an
 // *exec.ExitError; callers distinguish the no-match case via errors.As.
-func runRipgrep(ctx context.Context, searchRoot, pattern, glob string, contextLines int) (text string, overflowed bool, err error) {
+func runRipgrep(ctx context.Context, searchRoot, pattern, glob string, contextLines int, ignoreCase bool) (text string, overflowed bool, err error) {
 	args := []string{
 		"-n",
 		"--no-heading",
 		"--color=never",
 		"--max-count", fmt.Sprintf("%d", searchMaxMatches),
 		"--max-columns", "500",
+	}
+	if ignoreCase {
+		args = append(args, "-i")
 	}
 	if contextLines > 0 {
 		args = append(args, "-C", fmt.Sprintf("%d", contextLines))
@@ -348,25 +358,41 @@ func appendRgTruncationNotice(out string, overflowed bool) string {
 	return out + fmt.Sprintf("\n… truncated (output exceeds %d bytes)", searchMaxOutputBytes)
 }
 
-func (e *Executor) searchWithRipgrep(ctx context.Context, searchRoot, relPrefix, pattern, glob string, contextLines int) (string, error) {
-	text, overflowed, err := runRipgrep(ctx, searchRoot, pattern, glob, contextLines)
-	if err != nil {
+// runRipgrepChecked runs rg and interprets its exit status in one place:
+// no matches (exit code 1 with empty output) is reported via noMatches,
+// a context cancellation is returned as ctx.Err() (with any partial output
+// preserved in text), and a failed run that still produced output is
+// treated as success with what was captured. Any other error is wrapped
+// as "rg failed".
+func runRipgrepChecked(ctx context.Context, searchRoot, pattern, glob string, contextLines int, ignoreCase bool) (text string, overflowed, noMatches bool, err error) {
+	text, overflowed, runErr := runRipgrep(ctx, searchRoot, pattern, glob, contextLines, ignoreCase)
+	if runErr != nil {
 		if ctx.Err() != nil {
-			if text != "" {
-				return formatSearchOutput("rg", relPrefix, text), ctx.Err()
-			}
-			return "", ctx.Err()
+			return text, overflowed, false, ctx.Err()
 		}
 		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && text == "" {
-			return "No matches found", nil
+		if errors.As(runErr, &exitErr) && exitErr.ExitCode() == 1 && text == "" {
+			return "", false, true, nil
 		}
-		if text != "" {
-			return appendRgTruncationNotice(formatSearchOutput("rg", relPrefix, text), overflowed), nil
+		if text == "" {
+			return "", false, false, fmt.Errorf("rg failed: %w", runErr)
 		}
-		return "", fmt.Errorf("rg failed: %w", err)
 	}
 	if text == "" {
+		return "", false, true, nil
+	}
+	return text, overflowed, false, nil
+}
+
+func (e *Executor) searchWithRipgrep(ctx context.Context, searchRoot, relPrefix, pattern, glob string, contextLines int, ignoreCase bool) (string, error) {
+	text, overflowed, noMatches, err := runRipgrepChecked(ctx, searchRoot, pattern, glob, contextLines, ignoreCase)
+	if err != nil {
+		if ctx.Err() != nil && text != "" {
+			return formatSearchOutput("rg", relPrefix, text), ctx.Err()
+		}
+		return "", err
+	}
+	if noMatches {
 		return "No matches found", nil
 	}
 	return appendRgTruncationNotice(formatSearchOutput("rg", relPrefix, text), overflowed), nil
@@ -378,27 +404,24 @@ func (e *Executor) searchWithRipgrep(ctx context.Context, searchRoot, relPrefix,
 // Nil matches mean "no matches found"; truncated reports that the result
 // set hit a cap; an error means the caller should fall back to the Go
 // walker.
-func (e *Executor) searchWithRipgrepMatches(ctx context.Context, searchRoot, relPrefix, pattern, glob string) ([]SearchMatch, bool, error) {
-	text, overflowed, err := runRipgrep(ctx, searchRoot, pattern, glob, 0)
+func (e *Executor) searchWithRipgrepMatches(ctx context.Context, searchRoot, relPrefix, pattern, glob string, ignoreCase bool) ([]SearchMatch, bool, error) {
+	text, overflowed, noMatches, err := runRipgrepChecked(ctx, searchRoot, pattern, glob, 0, ignoreCase)
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, false, ctx.Err()
-		}
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && text == "" {
-			return nil, false, nil // no matches
-		}
-		if text != "" {
-			ms, truncated := capRgMatches(parseRgMatches(text, relPrefix))
-			return ms, truncated || overflowed, nil
-		}
-		return nil, false, fmt.Errorf("rg failed: %w", err)
+		return nil, false, err
 	}
-	if text == "" {
+	if noMatches {
 		return nil, false, nil
 	}
 	ms, truncated := capRgMatches(parseRgMatches(text, relPrefix))
 	return ms, truncated || overflowed, nil
+}
+
+// searchMatchLineLen reports the rendered byte length of a structured
+// match's "path:line:content" line, excluding the trailing newline. Both
+// search engines (rg and Go fallback) account match sizes against
+// searchMaxOutputBytes with this single expression.
+func searchMatchLineLen(m SearchMatch) int {
+	return len(m.Path) + 1 + len(strconv.Itoa(m.Line)) + 1 + len(m.Text)
 }
 
 // capRgMatches applies the same total-match and byte budgets the Go
@@ -414,8 +437,7 @@ func capRgMatches(matches []SearchMatch) ([]SearchMatch, bool) {
 			truncated = true
 			break
 		}
-		// Same byte accounting as the Go fallback's "path:line:content" line.
-		lineLen := len(m.Path) + 1 + len(strconv.Itoa(m.Line)) + 1 + len(m.Text)
+		lineLen := searchMatchLineLen(m)
 		if size+lineLen+1 > searchMaxOutputBytes {
 			truncated = true
 			break
@@ -489,15 +511,15 @@ func splitSearchMatchLine(line string) (path string, lineNum int, content string
 // Go fallback, and returns structured matches (context_lines=0 semantics).
 // engine is "rg" or "go" so callers can reproduce the per-engine output
 // footer SearchCode shows.
-func (e *Executor) searchStructured(ctx context.Context, searchRoot, relPrefix, pattern, glob string) (matches []SearchMatch, truncated bool, engine string, err error) {
+func (e *Executor) searchStructured(ctx context.Context, searchRoot, relPrefix, pattern, glob string, ignoreCase bool) (matches []SearchMatch, truncated bool, engine string, err error) {
 	if _, err := exec.LookPath("rg"); err == nil {
-		ms, trunc, rgErr := e.searchWithRipgrepMatches(ctx, searchRoot, relPrefix, pattern, glob)
+		ms, trunc, rgErr := e.searchWithRipgrepMatches(ctx, searchRoot, relPrefix, pattern, glob, ignoreCase)
 		if rgErr == nil {
 			return ms, trunc, "rg", nil
 		}
 		// Real rg failure — fall back to the Go walker (matches SearchCode).
 	}
-	ms, truncated, err := e.searchWithGoMatches(ctx, searchRoot, relPrefix, pattern, glob)
+	ms, truncated, err := e.searchWithGoMatches(ctx, searchRoot, relPrefix, pattern, glob, ignoreCase)
 	return ms, truncated, "go", err
 }
 
@@ -527,85 +549,87 @@ func prefixRelPaths(body, relPrefix string) string {
 	return strings.TrimSuffix(b.String(), "\n")
 }
 
-// errSearchWalkStop stops walkSearchableFiles early once the match/output
+// errSearchWalkStop stops walkSearchFiles early once the match/output
 // caps are reached. It is swallowed by the walker, so callers only see it as
 // a nil error.
 var errSearchWalkStop = errors.New("search walk stopped")
 
-// walkSearchableFiles walks searchRoot with the Go fallback semantics (glob
-// filter, readable-file probe) and calls visit for each searchable file. The
-// pattern is compiled once and the glob trimmed once by the walker, so the
-// formatted and structured search paths cannot drift on setup. visit returns
-// true to stop the walk (used once the match/output caps are reached); the
-// returned error is nil in that case.
-func walkSearchableFiles(ctx context.Context, searchRoot, relPrefix, pattern, glob string, visit func(path, rel string, re *regexp.Regexp) (stop bool)) error {
-	re, err := compileSearchPattern(pattern)
+// walkSearchFiles walks searchRoot with the Go fallback semantics (glob
+// filter, readable-file probe) and scans each searchable file with scan,
+// collecting up to searchMaxMatches items and searchMaxOutputBytes of
+// rendered output (size reports each item's byte cost including its
+// trailing newline). truncated is true when either cap was hit. The pattern
+// is compiled once and the glob trimmed once by the walker, so the formatted
+// and structured search paths cannot drift on setup. scan errors are
+// swallowed (the file is skipped), matching the historical behavior.
+func walkSearchFiles[T any](ctx context.Context, searchRoot, relPrefix, pattern, glob string, ignoreCase bool,
+	scan func(reader io.Reader, rel string, re *regexp.Regexp, matchLimit int) ([]T, error),
+	size func(item T) int) (items []T, truncated bool, err error) {
+	re, err := compileSearchPattern(pattern, ignoreCase)
 	if err != nil {
-		return err
+		return nil, false, err
 	}
 	glob = strings.TrimSpace(glob)
 
+	var bytesUsed int
 	err = walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true}, func(path, rel string, d os.DirEntry) error {
-		if visit(path, rel, re) {
+		limit := searchMaxMatches - len(items)
+		if limit <= 0 {
+			// Match cap reached: stop the walk and report truncation.
+			truncated = true
 			return errSearchWalkStop
+		}
+		reader, closer, binary, openErr := openSearchableFile(path)
+		if openErr != nil {
+			return nil
+		}
+		defer closer.Close()
+		if binary {
+			return nil
+		}
+		fileItems, scanErr := scan(reader, rel, re, limit)
+		if scanErr != nil {
+			return nil
+		}
+		for _, item := range fileItems {
+			if len(items) >= searchMaxMatches {
+				truncated = true
+				return errSearchWalkStop
+			}
+			if bytesUsed+size(item) > searchMaxOutputBytes {
+				truncated = true
+				return errSearchWalkStop
+			}
+			items = append(items, item)
+			bytesUsed += size(item)
 		}
 		return nil
 	})
 	if errors.Is(err, errSearchWalkStop) {
-		return nil
+		return items, truncated, nil
 	}
-	return err
+	return items, truncated, err
 }
 
-func (e *Executor) searchWithGo(ctx context.Context, searchRoot, relPrefix, pattern, glob string, contextLines int) (string, error) {
-	var matches []string
-	var size int
-	truncated := false
-
-	err := walkSearchableFiles(ctx, searchRoot, relPrefix, pattern, glob, func(path, rel string, re *regexp.Regexp) bool {
-		limit := searchMaxMatches - len(matches)
-		if limit <= 0 {
-			// Match cap reached: stop the walk (visit returning true is
-			// converted to errSearchWalkStop and swallowed by the walker)
-			// and report the truncation so the footer is emitted.
-			truncated = true
-			return true
-		}
-		reader, closer, binary, err := openSearchableFile(path)
-		if err != nil {
-			return false
-		}
-		defer closer.Close()
-		if binary {
-			return false
-		}
-		fileMatches, err := scanFileSinglePass(reader, rel, re, contextLines, limit)
-		if err != nil {
-			return false
-		}
-		for _, line := range fileMatches {
-			if len(matches) >= searchMaxMatches {
-				truncated = true
-				return true
-			}
-			if size+len(line)+1 > searchMaxOutputBytes {
-				truncated = true
-				return true
-			}
-			matches = append(matches, line)
-			size += len(line) + 1
-		}
-		return false
-	})
+// searchWithGo runs the Go fallback walker with context lines and returns
+// the rendered output. The match cap, byte budget, and file probing are
+// shared with searchWithGoMatches via walkSearchFiles; only the per-file
+// scanner (scanFileSinglePass) and the rendering differ.
+func (e *Executor) searchWithGo(ctx context.Context, searchRoot, relPrefix, pattern, glob string, contextLines int, ignoreCase bool) (string, error) {
+	lines, truncated, err := walkSearchFiles(ctx, searchRoot, relPrefix, pattern, glob, ignoreCase,
+		func(reader io.Reader, rel string, re *regexp.Regexp, matchLimit int) ([]string, error) {
+			return scanFileSinglePass(reader, rel, re, contextLines, matchLimit)
+		},
+		func(line string) int { return len(line) + 1 })
 	if err != nil {
 		return "", err
 	}
-	if len(matches) == 0 {
+	if len(lines) == 0 {
 		return "No matches found (go fallback; install ripgrep for faster search)", nil
 	}
-	out := formatSearchOutput("go", relPrefix, strings.Join(matches, "\n"))
+	out := formatSearchOutput("go", relPrefix, strings.Join(lines, "\n"))
 	if truncated {
-		out += fmt.Sprintf("\n… truncated (showing first %d matches)", len(matches))
+		out += fmt.Sprintf("\n… truncated (showing first %d matches)", len(lines))
 	}
 	return out, nil
 }
@@ -613,48 +637,10 @@ func (e *Executor) searchWithGo(ctx context.Context, searchRoot, relPrefix, patt
 // searchWithGoMatches runs the Go fallback walker and returns structured
 // matches (context_lines=0 semantics) plus the truncation flag. Paths are
 // already workspace-relative with relPrefix applied by walkTree.
-func (e *Executor) searchWithGoMatches(ctx context.Context, searchRoot, relPrefix, pattern, glob string) ([]SearchMatch, bool, error) {
-	var matches []SearchMatch
-	var size int
-	truncated := false
-
-	err := walkSearchableFiles(ctx, searchRoot, relPrefix, pattern, glob, func(path, rel string, re *regexp.Regexp) bool {
-		limit := searchMaxMatches - len(matches)
-		if limit <= 0 {
-			// Match cap reached: stop the walk (visit returning true is
-			// converted to errSearchWalkStop and swallowed by the walker)
-			// and report the truncation to callers.
-			truncated = true
-			return true
-		}
-		reader, closer, binary, err := openSearchableFile(path)
-		if err != nil {
-			return false
-		}
-		defer closer.Close()
-		if binary {
-			return false
-		}
-		fileMatches, err := scanFileMatches(reader, rel, re, limit)
-		if err != nil {
-			return false
-		}
-		for _, m := range fileMatches {
-			if len(matches) >= searchMaxMatches {
-				truncated = true
-				return true
-			}
-			// Same byte accounting as the formatted "path:line:content" line.
-			lineLen := len(m.Path) + 1 + len(strconv.Itoa(m.Line)) + 1 + len(m.Text)
-			if size+lineLen+1 > searchMaxOutputBytes {
-				truncated = true
-				return true
-			}
-			matches = append(matches, m)
-			size += lineLen + 1
-		}
-		return false
-	})
+func (e *Executor) searchWithGoMatches(ctx context.Context, searchRoot, relPrefix, pattern, glob string, ignoreCase bool) ([]SearchMatch, bool, error) {
+	matches, truncated, err := walkSearchFiles(ctx, searchRoot, relPrefix, pattern, glob, ignoreCase,
+		scanFileMatches,
+		func(m SearchMatch) int { return searchMatchLineLen(m) + 1 })
 	if err != nil {
 		return nil, false, err
 	}
@@ -702,10 +688,21 @@ func formatSearchMatches(matches []SearchMatch) string {
 	return strings.TrimSuffix(b.String(), "\n")
 }
 
-func compileSearchPattern(pattern string) (*regexp.Regexp, error) {
-	re, err := regexp.Compile(pattern)
+// compileSearchPattern compiles pattern as a regex, falling back to a quoted
+// literal when it is not valid regex syntax. With ignoreCase, the (?i) inline
+// flag is prepended to the validated source so it applies to regex and
+// literal patterns alike; the flag is part of the regex memo key, so
+// case-sensitive and case-insensitive compiles of one pattern stay separate.
+func compileSearchPattern(pattern string, ignoreCase bool) (*regexp.Regexp, error) {
+	re, err := compiledRegex(pattern)
 	if err != nil {
-		re, err = regexp.Compile(regexp.QuoteMeta(pattern))
+		re, err = compiledRegex(regexp.QuoteMeta(pattern))
+		if err != nil {
+			return nil, fmt.Errorf("invalid search pattern: %w", err)
+		}
+	}
+	if ignoreCase {
+		re, err = compiledRegex("(?i)" + re.String())
 		if err != nil {
 			return nil, fmt.Errorf("invalid search pattern: %w", err)
 		}

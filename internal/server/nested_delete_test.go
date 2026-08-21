@@ -1,10 +1,12 @@
 package server
 
 // Tests for the sidebar close/delete mechanics on nested (subagent)
-// sessions: closing a child pane (session_close) or deleting a child
-// session (session_delete) reports back to the parent agent via the
-// delivery channel, so the main agent learns the child was stopped or
-// removed by the user.
+// sessions: closing a child pane (session_close), or deleting a child
+// whose outcome has not reached the parent yet (still running /
+// interrupted), reports back to the parent agent via the delivery
+// channel. Deleting a FINISHED child is silent: its completion notice
+// already delivered the outcome, so no paid parent turn is spent on a
+// housekeeping event.
 
 import (
 	"context"
@@ -101,10 +103,13 @@ func TestSubagentCloseChildNotifiesParent(t *testing.T) {
 	})
 }
 
-// TestSubagentDeleteChildNotifiesParent drives the ✕ delete on a CLOSED
+// TestSubagentDeleteFinishedChildSilent drives the ✕ delete on a CLOSED
 // nested row: the child's saved session is deleted by id and the parent
-// session receives a "[subagent ...] deleted by the user" notice.
-func TestSubagentDeleteChildNotifiesParent(t *testing.T) {
+// receives NO notice — the finished child's completion notice already
+// delivered its outcome, so the delete is housekeeping and must not spend
+// a paid parent turn (a "[subagent ...] deleted by the user" message in
+// the parent transcript is the regression this test guards against).
+func TestSubagentDeleteFinishedChildSilent(t *testing.T) {
 	dir := t.TempDir()
 	stub := newBlockingStub()
 	s, a, store := newContinuationServer(t, stub, dir)
@@ -151,18 +156,62 @@ func TestSubagentDeleteChildNotifiesParent(t *testing.T) {
 		t.Fatalf("delete child: %v", err)
 	}
 
-	// The parent receives the delete notice and the child's file is gone.
-	waitFor(t, 5*time.Second, func() bool { return deliveredMessages(a, "deleted by the user") })
-	if _, err := store.LoadInWorkingDir(dir, childID); err == nil {
-		t.Fatal("child session must be deleted from the store")
-	}
-	// The notice is delivered as a turn on the parent; it blocks on the
-	// stub provider. Release it and wait for the turn to end so its final
-	// flush completes before the test's temp dir is removed.
-	stub.releaseN(1)
-	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool {
-		return m.Type == "turn_end" && m.SessionID == a.SessionID
+	// The child's file is gone (the delete is processed asynchronously on
+	// the connection read loop) and the parent receives NO notice: a
+	// (buggy) notice would deliver within the settle window below.
+	waitFor(t, 5*time.Second, func() bool {
+		_, err := store.LoadInWorkingDir(dir, childID)
+		return err != nil
 	})
+	requireNever(t, 500*time.Millisecond,
+		"deleting a finished child must not notify the parent (its outcome already landed)",
+		func() bool { return deliveredMessages(a, "deleted by the user") })
+}
+
+// TestSubagentDeleteFinishedRegisteredChildSilent covers the
+// registered-runtime + finished-child case: a background child inside its
+// retention window is still REGISTERED when deleted, but its completion
+// notice already delivered the outcome — the delete must be silent (no
+// paid parent turn), same as the unregistered case.
+func TestSubagentDeleteFinishedRegisteredChildSilent(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, a, store := newContinuationServer(t, stub, dir)
+	s.ws.ProviderFactory = func() llm.LLMProvider {
+		p := llm.NewMockProvider()
+		p.StreamResults = []*llm.StreamResult{{Content: "bg report"}}
+		return p
+	}
+	a.SetSubagentsEnabled(true)
+	srv := startWSServer(t, s)
+	defer srv.Close()
+
+	conn := dialWS(t, srv, "/ws")
+	defer conn.Close()
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+
+	sp := continuableSpawner(t, s)
+	sp.retain = time.Hour // keep the finished child registered
+	id, err := sp.SpawnBackground(context.Background(), a, "bg job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := sp.children.get(id)
+	waitFor(t, 5*time.Second, func() bool { return child != nil && child.isFinished() })
+	if _, ok := s.registry.get(id); !ok {
+		t.Fatal("finished child must still be registered within the retention window")
+	}
+
+	if err := conn.WriteJSON(WSMessage{Type: "session_delete", SessionID: id}); err != nil {
+		t.Fatalf("delete child: %v", err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		_, err := store.LoadInWorkingDir(dir, id)
+		return err != nil
+	})
+	requireNever(t, 500*time.Millisecond,
+		"deleting a finished (still-registered) child must not notify the parent",
+		func() bool { return deliveredMessages(a, "deleted by the user") })
 }
 
 // TestSubagentDeleteChildNotifiesParentRunning covers the registered-runtime

@@ -10,6 +10,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"gogen/internal/agent"
 	"gogen/internal/llm"
 )
 
@@ -201,6 +202,29 @@ func TestBoardStartModelAndPrompt(t *testing.T) {
 	if card.Model != "" || card.Prompt != "" {
 		t.Fatalf("start without options left overrides: model %q prompt %q, want empty", card.Model, card.Prompt)
 	}
+
+	// Both starts run headless turns whose start notice is sent while the
+	// turn is still running, so the board_state/notice reads above do NOT
+	// bound either turn. Wait for BOTH sessions' turns to persist before
+	// the test returns: the TempDir is removed as soon as the test ends,
+	// and a turn still flushing its final state would race that removal
+	// (TempDir RemoveAll "directory not empty"). Same guard as
+	// TestBoardStartStaleAgentLink.
+	sid2 := state.BoardState.Items[0].AgentSessionID
+	for _, sid := range []string{agentSid, sid2} {
+		waitFor(t, 10*time.Second, func() bool {
+			snap, err := store.LoadInWorkingDir(s.ws.GetWorkingDir(), sid)
+			if err != nil {
+				return false
+			}
+			for _, m := range snap.Messages {
+				if m.Role == "assistant" && m.Content == "ticket done reply" {
+					return true
+				}
+			}
+			return false
+		})
+	}
 }
 
 // TestBoardStartErrors pins the fast-fail guards: unknown ticket, no model
@@ -268,6 +292,176 @@ func TestBoardStartErrors(t *testing.T) {
 	_ = readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "board_state" })
 	_ = readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "notice" })
 	startAndExpectError("1", "is done")
+}
+
+// TestBoardStartThinkingLevel pins the per-ticket reasoning-effort cascade:
+// an explicit level wins over the pane's live level (including "off"), an
+// empty level keeps the pane inheritance (the pre-existing behavior — old
+// clients never send the field), and the choice is persisted on the ticket
+// so the popover pre-fills on the next start (a start without the field
+// clears it back to inherit).
+func TestBoardStartThinkingLevel(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, _, store := newContinuationServer(t, stub, dir)
+	s.ws.ProviderFactory = func() llm.LLMProvider {
+		p := llm.NewMockProvider()
+		p.Model = "default-model"
+		p.StreamResults = []*llm.StreamResult{{Content: "ticket done reply"}}
+		return p
+	}
+	srv := startWSServer(t, s)
+	defer srv.Close()
+
+	conn := dialWS(t, srv, "/ws")
+	defer conn.Close()
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+	cfg := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" })
+	enableBoardAndAddCard(t, conn, cfg.SessionID)
+
+	// Raise the pane's live level: the inheritance cases reference it.
+	if err := conn.WriteJSON(WSMessage{Type: "set_thinking_level", ThinkingLevel: "high", SessionID: cfg.SessionID}); err != nil {
+		t.Fatalf("send set_thinking_level: %v", err)
+	}
+	_ = readUntil(t, conn, 5*time.Second, func(m WSMessage) bool {
+		return m.Type == "config" && m.SessionID == cfg.SessionID && m.ThinkingLevel == "high"
+	})
+
+	// start sends the op and returns the ack + the updated ticket. The
+	// start notice is sent while the headless turn is still running, so
+	// these reads do NOT bound the turn (the wait below does).
+	var sids []string
+	start := func(thinkingLevel string) *agent.BoardItem {
+		t.Helper()
+		if err := conn.WriteJSON(WSMessage{Type: "board_op", BoardOp: &BoardOpRequest{Action: "start", ID: "1", ThinkingLevel: thinkingLevel}}); err != nil {
+			t.Fatalf("send board_op start: %v", err)
+		}
+		state := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "board_state" })
+		ack := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "notice" && m.Kind == "board" })
+		if !ack.Success {
+			t.Fatalf("start(%q) ack = %+v", thinkingLevel, ack)
+		}
+		if state.BoardState == nil || len(state.BoardState.Items) != 1 {
+			t.Fatalf("board_state = %+v", state)
+		}
+		card := &state.BoardState.Items[0]
+		if card.AgentSessionID == "" {
+			t.Fatalf("start(%q) produced no agent session", thinkingLevel)
+		}
+		sids = append(sids, card.AgentSessionID)
+		return card
+	}
+
+	// Wait for the headless turn to persist, then read the session file's
+	// thinking level.
+	levelOf := func(agentSid string) string {
+		t.Helper()
+		waitFor(t, 10*time.Second, func() bool {
+			snap, err := store.LoadInWorkingDir(s.ws.GetWorkingDir(), agentSid)
+			if err != nil {
+				return false
+			}
+			for _, m := range snap.Messages {
+				if m.Role == "assistant" && m.Content == "ticket done reply" {
+					return true
+				}
+			}
+			return false
+		})
+		snap, err := store.LoadInWorkingDir(s.ws.GetWorkingDir(), agentSid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return snap.ThinkingLevel
+	}
+
+	// Empty = inherit: the pane's live level (high) is carried into the
+	// fresh session (the pre-existing behavior).
+	card := start("")
+	if card.ThinkingLevel != "" {
+		t.Fatalf("inherited start stored ticket level %q, want empty", card.ThinkingLevel)
+	}
+	if got := levelOf(card.AgentSessionID); got != "high" {
+		t.Fatalf("inherited session level = %q, want high (pane's live level)", got)
+	}
+
+	// Explicit "off" overrides the pane's high: a real state (no
+	// reasoning_effort sent), not "unselected".
+	card = start("off")
+	if card.ThinkingLevel != "off" {
+		t.Fatalf("ticket level = %q, want off", card.ThinkingLevel)
+	}
+	if got := levelOf(card.AgentSessionID); got != "off" {
+		t.Fatalf("explicit-off session level = %q, want off", got)
+	}
+
+	// Explicit level is applied and persisted on the ticket (the popover
+	// pre-fills from it on the next start).
+	card = start("high")
+	if card.ThinkingLevel != "high" {
+		t.Fatalf("ticket level = %q, want high", card.ThinkingLevel)
+	}
+	if got := levelOf(card.AgentSessionID); got != "high" {
+		t.Fatalf("explicit session level = %q, want high", got)
+	}
+
+	// A start WITHOUT the field clears the stored override back to
+	// inherit (the start op is authoritative) — and inheritance applies
+	// again.
+	card = start("")
+	if card.ThinkingLevel != "" {
+		t.Fatalf("start without the field left ticket level %q, want empty", card.ThinkingLevel)
+	}
+	if got := levelOf(card.AgentSessionID); got != "high" {
+		t.Fatalf("re-inherited session level = %q, want high (pane's live level)", got)
+	}
+}
+
+// TestBoardStartThinkingLevelRejected pins the validation: a level the
+// ticket's FINAL model does not accept is rejected BEFORE the claim (the
+// fresh session is unwound — no orphan session, ticket back in the
+// backlog, unclaimed), mirroring the per-ticket model's failure path.
+func TestBoardStartThinkingLevelRejected(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, _, _ := newContinuationServer(t, stub, dir)
+	// Reports efforts {high, max} for glm-5.2 — "low" is a vocabulary
+	// word but not in the set.
+	s.ws.ProviderFactory = func() llm.LLMProvider { return &wsEffortStub{model: "glm-5.2"} }
+	srv := startWSServer(t, s)
+	defer srv.Close()
+
+	conn := dialWS(t, srv, "/ws")
+	defer conn.Close()
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+	cfg := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" })
+	enableBoardAndAddCard(t, conn, cfg.SessionID)
+
+	if err := conn.WriteJSON(WSMessage{Type: "board_op", BoardOp: &BoardOpRequest{Action: "start", ID: "1", ThinkingLevel: "low"}}); err != nil {
+		t.Fatalf("send board_op start: %v", err)
+	}
+	resp := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "notice" })
+	if resp.Success || resp.Kind != "board" || !strings.Contains(resp.Content, "is not accepted by the selected model") {
+		t.Fatalf("start notice = %+v, want the rejection", resp)
+	}
+
+	// The ticket is untouched: still backlog, unclaimed, no session link.
+	bm := s.ws.GetBoardManager()
+	item, err := bm.Item("1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.Status != "backlog" || item.Assignee != "" || item.AgentSessionID != "" {
+		t.Fatalf("ticket after rejected start = status %q assignee %q session %q, want unclaimed backlog",
+			item.Status, item.Assignee, item.AgentSessionID)
+	}
+
+	// No orphan session: only the pane's session is registered.
+	for _, id := range s.registry.activeIDs() {
+		if id != cfg.SessionID {
+			t.Fatalf("rejected start left orphan session %q registered", id)
+		}
+	}
 }
 
 // TestBoardStartApprovalViaBackgroundAttach verifies the background-attach
@@ -521,4 +715,67 @@ func TestBoardStartTurnErrorCommentsTicket(t *testing.T) {
 		}
 		return false
 	})
+}
+
+// TestBoardStartCompletedSessionNotActive pins the sidebar fix: after the
+// headless first turn completes, the ticket session must NOT report
+// active=true in the sessions payload while the initiating tab is still
+// open — the background attach is approval-only (passive), not a viewer —
+// and the idle runtime must be orphan-evicted. The sidebar would otherwise
+// pin a stale "resume to continue" row for a completed ticket nobody is
+// viewing (README: the indicator only appears for sessions open in another
+// tab or with a turn still running).
+func TestBoardStartCompletedSessionNotActive(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, _, store := newContinuationServer(t, stub, dir)
+	s.ws.ProviderFactory = func() llm.LLMProvider {
+		p := llm.NewMockProvider()
+		p.Model = "default-model"
+		p.StreamResults = []*llm.StreamResult{{Content: "ticket done reply"}}
+		return p
+	}
+	srv := startWSServer(t, s)
+	conn := dialWS(t, srv, "/ws")
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+	cfg := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" })
+	enableBoardAndAddCard(t, conn, cfg.SessionID)
+
+	sendBoardStart(t, conn, "1")
+	state := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "board_state" })
+	_ = readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "notice" && m.Kind == "board" })
+	agentSid := state.BoardState.Items[0].AgentSessionID
+	if agentSid == "" {
+		t.Fatal("no agent session id")
+	}
+
+	// The headless turn completes.
+	_ = readUntil(t, conn, 10*time.Second, func(m WSMessage) bool { return m.Type == "turn_end" && m.SessionID == agentSid })
+
+	// The idle runtime is orphan-evicted even though the initiating tab is
+	// still open (the passive attach is not a viewer).
+	waitFor(t, 5*time.Second, func() bool {
+		_, ok := s.registry.get(agentSid)
+		return !ok
+	})
+
+	// The sessions payload must not report the completed ticket active.
+	if err := conn.WriteJSON(WSMessage{Type: "list_sessions"}); err != nil {
+		t.Fatalf("list_sessions: %v", err)
+	}
+	msg := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "sessions" && len(m.Sessions) > 0 })
+	for _, e := range msg.Sessions {
+		if e.ID == agentSid && e.Active {
+			t.Fatalf("completed board session %s reports active=true (stale 'resume to continue' row)", agentSid)
+		}
+	}
+
+	// The session is still saved: "Open agent" reloads it from the store.
+	snap, err := store.LoadInWorkingDir(s.ws.GetWorkingDir(), agentSid)
+	if err != nil {
+		t.Fatalf("load completed board session from store: %v", err)
+	}
+	if len(snap.Messages) < 2 {
+		t.Fatalf("completed board session lost its transcript: %d messages", len(snap.Messages))
+	}
 }

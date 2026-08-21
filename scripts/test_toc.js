@@ -16,6 +16,7 @@
 const fs = require('fs');
 const path = require('path');
 const { JSDOM } = require('/tmp/gogen-jsdom/node_modules/jsdom');
+const { loadAppJs, installEditorStubs } = require('./web-harness');
 
 const ROOT = path.join(__dirname, '..');
 
@@ -55,25 +56,14 @@ async function main() {
   // jsdom does not implement scrollIntoView; app.js's dot click calls it.
   window.HTMLElement.prototype.scrollIntoView = function () {};
 
-  const editorStubs = [
-    'connectEditorSocket', 'setupEditorUI', 'refreshExplorer', 'disposeChatEditors',
-    'mountDiffEditor', 'updateDiffEditor', 'updateDiffFallback', 'chatDiffWheelEdge',
-    'extractDiffValue', 'initMonaco', 'colorizeCodeBlocks', 'colorizeElement',
-    'languageFromPath', 'setToastHandler', 'focusFindInFiles', 'editorUndo',
-    'editorRedo', 'saveAll', 'saveActive', 'openFileAtLine', 'setMonacoTheme',
-    'applyEditorPrefs', 'applyPatchFromDiff', 'openModal', 'closeModal',
-  ];
-  for (const name of editorStubs) {
-    window[name] = window[name] || (() => Promise.resolve());
-  }
+  installEditorStubs(window);
+  // Synchronous string mapper (app.js imports it from /editor.js); the
+  // generic stub above would hand back a Promise.
+  window.escapeHtml = (s) => String(s == null ? '' : s);
   window.marked = { use() {}, parse(text) { return String(text == null ? '' : text); } };
   window.DOMPurify = { sanitize: (raw) => raw };
 
-  const appJs = fs.readFileSync(path.join(ROOT, 'internal/server/web/app.js'), 'utf8');
-  const stripped = appJs
-    .replace(/import\s*\{[^}]*\}\s*from\s*['"][^'"]+['"];\s*/gs, '')
-    .replace(/import\s+[A-Za-z_$][\w$]*\s+from\s*['"][^'"]+['"];\s*/g, '');
-  window.eval(stripped);
+  loadAppJs(window);
 
   const messagesDiv = document.getElementById('messages');
   const tocRail = document.getElementById('toc-rail');
@@ -122,38 +112,50 @@ async function main() {
 
   // ── Phase A2: hover reveal (overlay above the chat) ──
   console.log('— Phase A2: hover reveal —');
-  // Fake the messages box so syncTocRailBox can build the hover zone. The
-  // reveal is coordinate-driven: the hidden rail has pointer-events:none
-  // (so the chat below stays interactive), which means a mouseenter on the
-  // rail itself can never fire — the app watches mousemove over the chat
-  // container instead.
+  // Fake the messages box and the dot column so syncTocRailBox can build
+  // the hover zone (jsdom has no layout). The reveal is coordinate-driven:
+  // the rail is pointer-events:none (so the chat below stays interactive),
+  // which means a mouseenter on the rail itself can never fire — the app
+  // watches mousemove over the chat container instead. The trigger is a
+  // small box around the dots, not the full-height right strip.
   messagesDiv.getBoundingClientRect = () => ({ top: 0, right: 800, bottom: 500, left: 0, height: 500, width: 800 });
+  // Dots at x 756..780, y 150..250 → zone (margin 8) x 748..788, y 142..258.
+  tocDots.getBoundingClientRect = () => ({ top: 150, left: 756, right: 780, bottom: 250, height: 100, width: 24 });
   window.syncTocRailBox();
   const chatContainer = document.getElementById('chat-container');
-  chatContainer.dispatchEvent(new window.MouseEvent('mousemove', { clientX: 780, clientY: 100, bubbles: true }));
-  check('hovering the right edge reveals the rail', tocRail.classList.contains('toc-hover'));
-  chatContainer.dispatchEvent(new window.MouseEvent('mousemove', { clientX: 700, clientY: 100, bubbles: true }));
+  chatContainer.dispatchEvent(new window.MouseEvent('mousemove', { clientX: 770, clientY: 200, bubbles: true }));
+  check('hovering near the dots reveals the rail', tocRail.classList.contains('toc-hover'));
+  // Regression: the trigger must NOT be the full-height right strip — the
+  // resend/edit buttons live at the bottom-right of user messages and the
+  // old strip-based zone revealed the rail over them (blocking clicks).
+  chatContainer.dispatchEvent(new window.MouseEvent('mousemove', { clientX: 770, clientY: 450, bubbles: true }));
   await sleep(200); // > TOC_RAIL_HIDE_MS debounce
+  check('hovering the right edge away from the dots does not reveal the rail',
+    !tocRail.classList.contains('toc-hover'));
+  chatContainer.dispatchEvent(new window.MouseEvent('mousemove', { clientX: 700, clientY: 200, bubbles: true }));
+  await sleep(200);
   check('moving away hides the rail again', !tocRail.classList.contains('toc-hover'));
   // Keyboard: focusing a dot reveals the rail and keeps it visible.
-  tocRail.dispatchEvent(new window.FocusEvent('focusin'));
-  check('keyboard focus on the rail reveals it', tocRail.classList.contains('toc-hover'));
-  tocRail.dispatchEvent(new window.FocusEvent('focusout'));
+  tocDots.dispatchEvent(new window.FocusEvent('focusin'));
+  check('keyboard focus on the dots reveals the rail', tocRail.classList.contains('toc-hover'));
+  tocDots.dispatchEvent(new window.FocusEvent('focusout'));
   await sleep(200);
-  check('focus leaving the rail hides it', !tocRail.classList.contains('toc-hover'));
-  // The strip must clear the #messages scrollbar: with a classic scrollbar
+  check('focus leaving the dots hides the rail', !tocRail.classList.contains('toc-hover'));
+  // The rail must clear the #messages scrollbar: with a classic scrollbar
   // (offsetWidth > clientWidth) the rail shifts left by the scrollbar width
-  // and the scrollbar area is excluded from the hover zone, so dragging the
-  // scrollbar stays possible while the rail is up.
+  // and the dots (inside the rail) sit left of the scrollbar, so the hover
+  // zone excludes the scrollbar strip and dragging it stays possible.
   fake(messagesDiv, { offsetWidth: 820, clientWidth: 800 });
+  // Dots now at x 740..764 (rail shifted 20px) → zone x 732..772.
+  tocDots.getBoundingClientRect = () => ({ top: 150, left: 740, right: 764, bottom: 250, height: 100, width: 24 });
   window.syncTocRailBox();
   check('strip shifts left of the messages scrollbar', tocRail.style.right === '20px');
-  chatContainer.dispatchEvent(new window.MouseEvent('mousemove', { clientX: 790, clientY: 100, bubbles: true }));
+  chatContainer.dispatchEvent(new window.MouseEvent('mousemove', { clientX: 790, clientY: 200, bubbles: true }));
   await sleep(200);
   check('hovering the scrollbar does not reveal the rail', !tocRail.classList.contains('toc-hover'));
-  chatContainer.dispatchEvent(new window.MouseEvent('mousemove', { clientX: 770, clientY: 100, bubbles: true }));
+  chatContainer.dispatchEvent(new window.MouseEvent('mousemove', { clientX: 750, clientY: 200, bubbles: true }));
   check('hovering just left of the scrollbar reveals the rail', tocRail.classList.contains('toc-hover'));
-  chatContainer.dispatchEvent(new window.MouseEvent('mousemove', { clientX: 700, clientY: 100, bubbles: true }));
+  chatContainer.dispatchEvent(new window.MouseEvent('mousemove', { clientX: 700, clientY: 200, bubbles: true }));
   await sleep(200);
   check('moving away hides the rail again', !tocRail.classList.contains('toc-hover'));
   // Overlay-scrollbar platforms measure 0 (the scrollbar takes no layout

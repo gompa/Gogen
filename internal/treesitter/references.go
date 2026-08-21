@@ -1,8 +1,9 @@
 package treesitter
 
 import (
+	"cmp"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -40,11 +41,8 @@ func FormatReferenceMatches(relPath string, refs []Reference) []string {
 }
 
 func sortReferences(refs []Reference) {
-	sort.Slice(refs, func(i, j int) bool {
-		if refs[i].Start != refs[j].Start {
-			return refs[i].Start < refs[j].Start
-		}
-		return refs[i].End < refs[j].End
+	slices.SortFunc(refs, func(a, b Reference) int {
+		return cmp.Or(cmp.Compare(a.Start, b.Start), cmp.Compare(a.End, b.End))
 	})
 }
 

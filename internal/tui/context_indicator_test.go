@@ -1,11 +1,13 @@
 package tui
 
 import (
+	"context"
 	"strings"
 	"testing"
 
 	"gogen/internal/agent"
 	"gogen/internal/contextmgr"
+	"gogen/internal/llm"
 )
 
 // TestContextIndicatorUpdatesDuringStreaming is a regression test: the
@@ -58,5 +60,68 @@ func TestContextIndicatorUpdatesDuringStreaming(t *testing.T) {
 	m.contextLine = agent.FormatContextBrief(m.contextStats)
 	if strings.Contains(m.contextLine, "(est.)") {
 		t.Fatalf("final refreshed indicator should not be marked as an estimate: %q", m.contextLine)
+	}
+}
+
+// TestContextIndicatorNoResetAtRoundStart is a regression test for the
+// (est.) context indicator dropping back to the pre-reply value at each
+// round boundary of a multi-round (tool-calling) reply. handleStreamRoundStart
+// must re-base the live estimate from a refreshed authoritative value —
+// which includes the previous round's growth — rather than from the stale
+// end-of-previous-turn mirror.
+func TestContextIndicatorNoResetAtRoundStart(t *testing.T) {
+	mgr := contextmgr.NewManager(nil, contextmgr.Settings{ContextLimit: 100000})
+	a := &agent.Agent{
+		Context:  mgr,
+		Messages: []llm.Message{{Role: "user", Content: "hello"}},
+	}
+	m := Model{
+		agent:               a,
+		chatLines:           nil,
+		streamAssistantLine: -1,
+		streamThinkingLine:  -1,
+	}
+	m.contextStats = a.ContextStats(context.Background())
+	if m.contextStats.Snapshot.Used <= 0 {
+		t.Fatalf("expected non-zero baseline usage, got %+v", m.contextStats.Snapshot)
+	}
+	m.contextLine = agent.FormatContextBrief(m.contextStats)
+	usedBeforeTurn := m.contextStats.Snapshot.Used
+
+	// Round 1 streams in: the estimate climbs above the pre-turn value.
+	m.handleStreamStart()
+	m.handleStreamToken(strings.Repeat("a", 400)) // ~100 estimated tokens
+	if !strings.Contains(m.contextLine, "(est.)") {
+		t.Fatalf("expected live estimate during round 1, got %q", m.contextLine)
+	}
+	estAfterRound1 := m.contextStreamBaseUsed + m.contextStreamEstAdded
+
+	// Between rounds the agent appends the assistant message and the tool
+	// result to a.Messages (and records the round's API usage).
+	a.Messages = append(a.Messages,
+		llm.Message{Role: "assistant", Content: "reading file"},
+		llm.Message{Role: "tool", ToolCallID: "c1", Content: strings.Repeat("x", 4000)},
+	)
+
+	m.handleStreamRoundStart()
+
+	// The re-base must reflect the refreshed authoritative value, which
+	// includes round 1's growth — not the stale pre-turn mirror.
+	if m.contextStreamBaseUsed <= usedBeforeTurn {
+		t.Fatalf("round-start baseline did not include round 1 growth: baseline=%d before-turn=%d",
+			m.contextStreamBaseUsed, usedBeforeTurn)
+	}
+	if m.contextStreamBaseUsed < estAfterRound1 {
+		t.Fatalf("indicator reset at round start: baseline=%d is below the pre-round estimate %d",
+			m.contextStreamBaseUsed, estAfterRound1)
+	}
+	if strings.Contains(m.contextLine, "(est.)") {
+		t.Fatalf("refreshed round-start value should be exact, got %q", m.contextLine)
+	}
+
+	// The live estimate resumes from the new baseline.
+	m.handleStreamToken(strings.Repeat("b", 400))
+	if !strings.Contains(m.contextLine, "(est.)") {
+		t.Fatalf("expected live estimate to resume after round start, got %q", m.contextLine)
 	}
 }

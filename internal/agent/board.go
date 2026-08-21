@@ -5,7 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -61,11 +62,17 @@ type BoardItem struct {
 	// Prompt is the per-ticket prompt template for the agent started from
 	// this ticket ("" = the configured board_start_prompt template). The
 	// popover pre-fills from it; the start op is authoritative.
-	Prompt    string          `json:"prompt,omitempty"`
-	CreatedAt time.Time       `json:"created_at"`
-	UpdatedAt time.Time       `json:"updated_at"`
-	DoneAt    time.Time       `json:"done_at,omitempty"`
-	Activity  []BoardActivity `json:"activity,omitempty"`
+	Prompt string `json:"prompt,omitempty"`
+	// ThinkingLevel is the per-ticket reasoning-effort level chosen in the
+	// web board's "Start agent" popover ("" = inherit the active pane's
+	// live level, the pre-existing behavior; "off" = never send
+	// reasoning_effort). The popover pre-fills from it; the start op is
+	// authoritative.
+	ThinkingLevel string          `json:"thinkingLevel,omitempty"`
+	CreatedAt     time.Time       `json:"created_at"`
+	UpdatedAt     time.Time       `json:"updated_at"`
+	DoneAt        time.Time       `json:"done_at,omitempty"`
+	Activity      []BoardActivity `json:"activity,omitempty"`
 }
 
 // BoardSnapshot is the full board state for rendering (web UI / list).
@@ -189,15 +196,15 @@ func (m *BoardManager) rebuildIndexLocked() error {
 		if err := json.Unmarshal(data, &item); err != nil {
 			continue
 		}
-		if n, err := parseIntID(id); err == nil && n > maxID {
+		if n, err := strconv.Atoi(id); err == nil && n > maxID {
 			maxID = n
 		}
 		metas = append(metas, itemMeta{id: id, status: item.Status, createdAt: item.CreatedAt})
 	}
-	sort.Slice(metas, func(i, j int) bool { return metas[i].createdAt.Before(metas[j].createdAt) })
+	slices.SortFunc(metas, func(a, b itemMeta) int { return a.createdAt.Compare(b.createdAt) })
 	for _, meta := range metas {
 		col := meta.status
-		if !containsString(idx.Columns, col) {
+		if !slices.Contains(idx.Columns, col) {
 			col = idx.Columns[0]
 		}
 		idx.Order[col] = append(idx.Order[col], meta.id)
@@ -205,29 +212,6 @@ func (m *BoardManager) rebuildIndexLocked() error {
 	idx.NextID = maxID + 1
 	m.idx = idx
 	return nil
-}
-
-func parseIntID(id string) (int, error) {
-	if id == "" {
-		return 0, fmt.Errorf("empty id")
-	}
-	n := 0
-	for _, r := range id {
-		if r < '0' || r > '9' {
-			return 0, fmt.Errorf("not numeric")
-		}
-		n = n*10 + int(r-'0')
-	}
-	return n, nil
-}
-
-func containsString(list []string, s string) bool {
-	for _, v := range list {
-		if v == s {
-			return true
-		}
-	}
-	return false
 }
 
 func (m *BoardManager) saveIndexLocked() error {
@@ -446,12 +430,15 @@ func (m *BoardManager) ResetAgent(id, by string) (string, error) {
 	return fmt.Sprintf("Reset board item #%s for a fresh start", item.ID), nil
 }
 
-// SetStartOptions persists the model and prompt template chosen in the web
-// board's "Start agent" popover ("" clears back to the defaults: workspace
-// model / configured board_start_prompt). Silent by design — the claim
-// already logs the start, and the stored options only pre-fill the popover
-// on the next start.
-func (m *BoardManager) SetStartOptions(id, model, prompt string) error {
+// SetStartOptions persists the model, prompt template, and reasoning-effort
+// level chosen in the web board's "Start agent" popover ("" clears back to
+// the defaults: workspace model / configured board_start_prompt / inherit
+// the active pane's level). The level is canonicalized via
+// NormalizeThinkingLevel so the stored value matches what the start handler
+// applies and what the popover compares against (lowercase chips). Silent by
+// design — the claim already logs the start, and the stored options only
+// pre-fill the popover on the next start.
+func (m *BoardManager) SetStartOptions(id, model, prompt, thinkingLevel string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err := m.loadIndexLocked(); err != nil {
@@ -463,6 +450,7 @@ func (m *BoardManager) SetStartOptions(id, model, prompt string) error {
 	}
 	item.Model = strings.TrimSpace(model)
 	item.Prompt = strings.TrimSpace(prompt)
+	item.ThinkingLevel = string(NormalizeThinkingLevel(thinkingLevel))
 	item.UpdatedAt = time.Now().UTC()
 	return m.saveItemLocked(item)
 }
@@ -547,7 +535,7 @@ func (m *BoardManager) Claim(id, by string) (string, error) {
 // Move changes a ticket's column.
 func (m *BoardManager) Move(id, column, by string) (string, error) {
 	column = strings.TrimSpace(strings.ToLower(column))
-	if !containsString(BoardColumns, column) {
+	if !slices.Contains(BoardColumns, column) {
 		return "", fmt.Errorf("unknown board column %q (want one of: %s)", column, strings.Join(BoardColumns, ", "))
 	}
 	m.mu.Lock()
@@ -670,14 +658,7 @@ func (m *BoardManager) Delete(id string) (string, error) {
 	}
 	title := item.Title
 	// Drop the id from its column's order.
-	if order := m.idx.Order[item.Status]; order != nil {
-		for i, oid := range order {
-			if oid == id {
-				m.idx.Order[item.Status] = append(order[:i], order[i+1:]...)
-				break
-			}
-		}
-	}
+	m.idx.Order[item.Status] = removeFromOrder(m.idx.Order[item.Status], id)
 	if err := os.Remove(m.itemPath(id)); err != nil && !os.IsNotExist(err) {
 		return "", err
 	}
@@ -691,13 +672,7 @@ func (m *BoardManager) Delete(id string) (string, error) {
 // Callers must hold m.mu and save both files afterwards.
 func (m *BoardManager) moveLocked(item *BoardItem, column string) error {
 	if item.Status != "" {
-		order := m.idx.Order[item.Status]
-		for i, id := range order {
-			if id == item.ID {
-				m.idx.Order[item.Status] = append(order[:i], order[i+1:]...)
-				break
-			}
-		}
+		m.idx.Order[item.Status] = removeFromOrder(m.idx.Order[item.Status], item.ID)
 	}
 	item.Status = column
 	if column == "done" {
@@ -715,6 +690,15 @@ func (m *BoardManager) itemCountLocked() int {
 		n += len(ids)
 	}
 	return n
+}
+
+// removeFromOrder returns order with id removed, or order unchanged if id is
+// not present.
+func removeFromOrder(order []string, id string) []string {
+	if i := slices.Index(order, id); i >= 0 {
+		return append(order[:i], order[i+1:]...)
+	}
+	return order
 }
 
 func normalizePriority(p string) string {

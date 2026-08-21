@@ -14,7 +14,7 @@ func TestCompactPinnedPreservesPinnedMessage(t *testing.T) {
 	m.minMiddleTokens = 0 // tiny messages: skip the minimum-middle guard
 	msgs := []llm.Message{
 		{Role: "user", Content: "first"},
-		{Role: "assistant", Content: "a1"},
+		{Role: "assistant", Content: strings.Repeat("a1 ", 10)}, // middle must outgrow the framed summary (smaller-summary guard)
 		{Role: "user", Content: "PIN ME important constraint"},
 		{Role: "assistant", Content: "a2"},
 		{Role: "user", Content: "later1"},

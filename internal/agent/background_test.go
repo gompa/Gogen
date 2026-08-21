@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -279,7 +279,7 @@ func TestFinishedJobCapReapsOldest(t *testing.T) {
 		job.mu.Unlock()
 		finished = append(finished, finisher{id: job.ID, at: at})
 	}
-	sort.Slice(finished, func(i, j int) bool { return finished[i].at.Before(finished[j].at) })
+	slices.SortFunc(finished, func(a, b finisher) int { return a.at.Compare(b.at) })
 
 	// The cap reaps as jobs finish: the first finisher is reaped when the
 	// fourth finisher's enforcement runs, and the second finisher when the

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"gogen/internal/agent"
 	"gogen/internal/config"
@@ -298,6 +299,65 @@ func TestSubagentConfiguredModelFallbackToDefault(t *testing.T) {
 	}
 }
 
+// TestSubagentChildThinkingLevelCascade pins the spawn-time reasoning-effort
+// cascade end to end (web host): the configured subagent level (settings)
+// wins; empty inherits the parent's live level; "off" and empty set
+// nothing; a level the child's model does not accept is omitted (policy B).
+// The mock provider records the level the child provider was set to.
+func TestSubagentChildThinkingLevelCascade(t *testing.T) {
+	cases := []struct {
+		name       string
+		configured string
+		parent     agent.ThinkingLevel
+		want       string
+	}{
+		// "off" is the child's default agent level (NewAgent seeds
+		// ThinkingOff) and what the turn's provider re-sync sends when no
+		// effort is applied — semantically "no reasoning_effort sent".
+		{name: "configured-wins-over-parent", configured: "high", parent: agent.ThinkingMedium, want: "high"},
+		{name: "empty-inherits-parent", configured: "", parent: agent.ThinkingMedium, want: "medium"},
+		{name: "empty-parent-off", configured: "", parent: agent.ThinkingOff, want: "off"},
+		{name: "configured-off", configured: "off", parent: agent.ThinkingHigh, want: "off"},
+		// The mock provider reports no per-model efforts, so the child's
+		// accepted set is the default low/medium/high triple: "max" is
+		// omitted (policy B) and the child stays at its off default.
+		{name: "not-accepted-omitted", configured: "max", parent: agent.ThinkingOff, want: "off"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			parentProv := llm.NewMockProvider()
+			exec := agent.NewExecutor(dir)
+			ctxMgr := contextmgr.NewManager(parentProv, contextmgr.Settings{ContextLimit: 128000})
+			a := agent.NewAgent(parentProv, exec, ctxMgr)
+			a.SessionStore = session.NewStore(true)
+			s := NewServer(a, &config.Config{})
+			a.SetThinkingLevel(tc.parent)
+			r := s.ws.GetRuntimeConfig()
+			r.SubagentThinkingLevel = tc.configured
+			s.ws.SetRuntimeConfig(r)
+			var created []*llm.MockProvider
+			s.ws.ProviderFactory = func() llm.LLMProvider {
+				p := llm.NewMockProvider()
+				p.StreamResults = []*llm.StreamResult{{Content: "report"}}
+				created = append(created, p)
+				return p
+			}
+			a.SetSubagentsEnabled(true)
+
+			if _, err := (&subagentSpawner{s: s}).Spawn(context.Background(), a, "job", "", 0); err != nil {
+				t.Fatal(err)
+			}
+			if len(created) != 1 {
+				t.Fatalf("child providers created = %d, want 1", len(created))
+			}
+			if got := created[0].ThinkingLevel; got != tc.want {
+				t.Fatalf("child provider thinking level = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestSubagentChildModelFallbackToDefault verifies that when the parent's
 // model cannot be selected on the child (no longer listed), the spawn falls
 // back to the workspace default instead of failing.
@@ -579,3 +639,40 @@ func (p *blockingProvider) GenerateResponseStream(ctx context.Context, _ []llm.M
 	return nil, ctx.Err()
 }
 func (p *blockingProvider) ModelContextLimit(context.Context) (int, error) { return 1000, nil }
+
+// TestTruncateJobRuneSafe verifies the 200-byte job cap never splits a
+// multi-byte rune at the cut point (a byte cut could store invalid UTF-8
+// on the child).
+func TestTruncateJobRuneSafe(t *testing.T) {
+	cases := []struct {
+		name    string
+		job     string
+		wantCap bool // result is truncated (ellipsis appended)
+	}{
+		{"empty", "", false},
+		{"short ascii", "fix the parser", false},
+		{"exactly 200 bytes", strings.Repeat("a", 200), false},
+		{"ascii over cap", strings.Repeat("a", 201), true},
+		{"emoji straddles cut", strings.Repeat("a", 198) + "🦄", true},
+		{"cjk straddles cut", strings.Repeat("a", 199) + "中", true},
+		{"all emoji, cut on rune boundary", strings.Repeat("🦄", 51), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := truncateJob(tc.job)
+			if !utf8.ValidString(got) {
+				t.Fatalf("result is not valid UTF-8 (len=%d)", len(got))
+			}
+			if tc.wantCap {
+				if !strings.HasSuffix(got, "…") {
+					t.Fatalf("expected ellipsis suffix, got tail %q", got[len(got)-16:])
+				}
+				if len(got) > 200+len("…") {
+					t.Fatalf("truncated result exceeds byte cap: %d > %d", len(got), 200+len("…"))
+				}
+			} else if got != tc.job {
+				t.Fatalf("short job was modified: %q", got)
+			}
+		})
+	}
+}

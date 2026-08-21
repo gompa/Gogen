@@ -1,8 +1,10 @@
 package contextmgr
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 
 	"gogen/internal/llm"
@@ -75,6 +77,62 @@ func (m *Manager) EstimateTokens(messages []llm.Message) int {
 	total := 0
 	for i := range messages {
 		total += computeMessageTokens(messages[i], count, memo) + imageTokenEstimate(messages[i])
+	}
+	return total
+}
+
+// ToolDefinitionString serializes a single tool definition in a stable,
+// wire-like form: type, name, description, and JSON parameters
+// (encoding/json sorts map keys, so the output is deterministic regardless
+// of map construction order). Shared by EstimateToolTokens (token counting)
+// and the agent's wire-overhead cache fingerprint, so the two can never
+// disagree about what a tool definition "is".
+func ToolDefinitionString(t llm.Tool) string {
+	var b strings.Builder
+	b.WriteString(t.Type)
+	b.WriteString(t.Name)
+	b.WriteString(t.Description)
+	if len(t.Parameters) > 0 {
+		if raw, err := json.Marshal(t.Parameters); err == nil {
+			b.Write(raw)
+		} else {
+			// Unmarshalable values (channels, funcs): fall back to a
+			// deterministic key/value dump so the string is still stable.
+			for _, k := range sortedToolArgKeys(t.Parameters) {
+				b.WriteString(k)
+				b.WriteString(fmt.Sprint(t.Parameters[k]))
+			}
+		}
+	}
+	return b.String()
+}
+
+// EstimateToolTokens estimates the wire token cost of a set of tool
+// definitions: every definition serialized through ToolDefinitionString and
+// counted through the same messageCounterFor path as messages, plus a small
+// per-tool framing allowance. The per-pass memo is keyed by the full
+// definition string, so it only deduplicates identical definitions.
+// Overestimating is safe: it only makes compaction run slightly earlier.
+func EstimateToolTokens(tools []llm.Tool) int {
+	if len(tools) == 0 {
+		return 0
+	}
+	count := messageCounterFor()
+	memo := make(map[string]int)
+	// Per-pass memo: identical definitions encode once instead of once
+	// per tool.
+	c := func(s string) int {
+		if v, ok := memo[s]; ok {
+			return v
+		}
+		v := count(s)
+		memo[s] = v
+		return v
+	}
+	total := 0
+	for _, t := range tools {
+		total += 4 // per-tool framing overhead
+		total += c(ToolDefinitionString(t))
 	}
 	return total
 }
@@ -193,9 +251,5 @@ func truncateForSummary(text string, maxTokens int) string {
 // truncateForSummary, used when the tokenizer is unavailable. The cut is
 // rune-safe so the result is always valid UTF-8.
 func truncateForSummaryHeuristic(text string, maxTokens int) string {
-	maxChars := maxTokens * 4
-	if len(text) <= maxChars {
-		return text
-	}
-	return TruncateRuneSafe(text, maxChars) + fmt.Sprintf("\n… truncated for summarization (%d chars total)", len(text))
+	return TruncateMarked(text, maxTokens*4, fmt.Sprintf("\n… truncated for summarization (%d chars total)", len(text)))
 }

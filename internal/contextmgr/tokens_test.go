@@ -98,3 +98,98 @@ func TestTruncateForSummaryValidUTF8(t *testing.T) {
 		t.Fatalf("expected truncation marker, got %q", out)
 	}
 }
+
+func TestEstimateToolTokens(t *testing.T) {
+	small := llm.Tool{
+		Type:        "function",
+		Name:        "ping",
+		Description: "ping the service",
+		Parameters:  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+	}
+	big := llm.Tool{
+		Type:        "function",
+		Name:        "do_work",
+		Description: strings.Repeat("a very long description of what the tool does ", 50),
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"query":   map[string]interface{}{"type": "string", "description": "the query"},
+				"limit":   map[string]interface{}{"type": "integer"},
+				"verbose": map[string]interface{}{"type": "boolean"},
+				"filters": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+			},
+		},
+	}
+
+	tests := []struct {
+		name  string
+		tools []llm.Tool
+		check func(t *testing.T, got int)
+	}{
+		{
+			name:  "empty set costs nothing",
+			tools: nil,
+			check: func(t *testing.T, got int) {
+				if got != 0 {
+					t.Fatalf("EstimateToolTokens(nil) = %d, want 0", got)
+				}
+			},
+		},
+		{
+			name:  "single tool is positive",
+			tools: []llm.Tool{small},
+			check: func(t *testing.T, got int) {
+				if got <= 0 {
+					t.Fatalf("EstimateToolTokens = %d, want > 0", got)
+				}
+			},
+		},
+		{
+			name:  "larger definition costs more",
+			tools: []llm.Tool{big},
+			check: func(t *testing.T, got int) {
+				if got <= EstimateToolTokens([]llm.Tool{small}) {
+					t.Fatalf("big tool (%d) should cost more than small tool (%d)", got, EstimateToolTokens([]llm.Tool{small}))
+				}
+			},
+		},
+		{
+			name:  "multiple tools cost more than one",
+			tools: []llm.Tool{small, big},
+			check: func(t *testing.T, got int) {
+				if got <= EstimateToolTokens([]llm.Tool{big}) {
+					t.Fatalf("two tools (%d) should cost more than one (%d)", got, EstimateToolTokens([]llm.Tool{big}))
+				}
+			},
+		},
+		{
+			name:  "deterministic across calls",
+			tools: []llm.Tool{small, big},
+			check: func(t *testing.T, got int) {
+				if again := EstimateToolTokens([]llm.Tool{small, big}); again != got {
+					t.Fatalf("non-deterministic: %d then %d", got, again)
+				}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.check(t, EstimateToolTokens(tc.tools))
+		})
+	}
+}
+
+// TestToolDefinitionStringStableAcrossMapOrder pins that the serialization
+// does not depend on map construction/iteration order: the agent's
+// wire-overhead cache fingerprint relies on it for cache stability.
+func TestToolDefinitionStringStableAcrossMapOrder(t *testing.T) {
+	a := llm.Tool{Type: "function", Name: "t", Description: "d", Parameters: map[string]interface{}{
+		"type": "object", "x": 1, "y": "two", "z": []interface{}{"a", "b"},
+	}}
+	b := llm.Tool{Type: "function", Name: "t", Description: "d", Parameters: map[string]interface{}{
+		"z": []interface{}{"a", "b"}, "type": "object", "y": "two", "x": 1,
+	}}
+	if got, want := ToolDefinitionString(a), ToolDefinitionString(b); got != want {
+		t.Fatalf("serialization not stable across map order:\n%q\n%q", got, want)
+	}
+}

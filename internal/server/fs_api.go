@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -41,6 +42,22 @@ type FSEntry struct {
 type GitStatusEntry struct {
 	Path   string `json:"path"`
 	Status string `json:"status"`
+}
+
+// GitStatus is the pre-bucketed result of `git status --porcelain=v2 -b`.
+// Clients consume ready-to-render lists and never see the XY matrix; a
+// partially staged file appears in BOTH Staged and Unstaged (matching VS
+// Code). Branch/Upstream/Ahead/Behind come from the "# branch.*" headers
+// (empty/zero when the repo has no branch info).
+type GitStatus struct {
+	Branch    string           `json:"branch,omitempty"`
+	Upstream  string           `json:"upstream,omitempty"`
+	Ahead     int              `json:"ahead,omitempty"`
+	Behind    int              `json:"behind,omitempty"`
+	Staged    []GitStatusEntry `json:"staged,omitempty"`
+	Unstaged  []GitStatusEntry `json:"unstaged,omitempty"`
+	Untracked []GitStatusEntry `json:"untracked,omitempty"`
+	Unmerged  []GitStatusEntry `json:"unmerged,omitempty"`
 }
 
 // extLanguage maps a lowercase file extension to the language name sent to
@@ -165,18 +182,22 @@ func (s *Server) fsWrite(path, content string) error {
 // fsReplace performs a regex search-and-replace across files matching the given
 // pattern (same semantics as fs_search / SearchCode). It walks the tree rather
 // than relying on the capped search result set, so replace-all is complete.
-func (s *Server) fsReplace(ctx context.Context, search, replacement, subpath, glob string) (replaced int, fileCount int, err error) {
+// fsReplace also returns the workspace-relative paths of the files that were
+// modified, so the editor can refresh open buffers for exactly those files.
+func (s *Server) fsReplace(ctx context.Context, search, replacement, subpath, glob string) (replaced int, fileCount int, files []string, err error) {
 	if s.ws == nil || s.ws.Exec == nil {
-		return 0, 0, fmt.Errorf("executor unavailable")
+		return 0, 0, nil, fmt.Errorf("executor unavailable")
 	}
 	return s.ws.Exec.ReplaceInTree(ctx, search, replacement, subpath, glob)
 }
 
-func (s *Server) gitStatusEntries(ctx context.Context) ([]GitStatusEntry, error) {
+// gitStatusEntries runs `git status --porcelain=v2 -b` (single command) and
+// returns the pre-bucketed status.
+func (s *Server) gitStatusEntries(ctx context.Context) (GitStatus, error) {
 	exec := s.ws.Exec
-	cmd, err := exec.NewGitCmd(ctx, "status", "--porcelain", "-uall")
+	cmd, err := exec.NewGitCmd(ctx, "status", "--porcelain=v2", "-b")
 	if err != nil {
-		return nil, err
+		return GitStatus{}, err
 	}
 	out, err := cmd.CombinedOutput()
 	text := string(out)
@@ -185,59 +206,184 @@ func (s *Server) gitStatusEntries(ctx context.Context) ([]GitStatusEntry, error)
 		if msg == "" {
 			msg = err.Error()
 		}
-		return nil, fmt.Errorf("git status failed: %s", msg)
+		return GitStatus{}, fmt.Errorf("git status failed: %s", msg)
 	}
-	return parsePorcelainUnstaged(text), nil
+	return parsePorcelainV2(text), nil
 }
 
-// parsePorcelainUnstaged returns working-tree (unstaged / untracked) changes.
-func parsePorcelainUnstaged(text string) []GitStatusEntry {
-	var entries []GitStatusEntry
+// parsePorcelainV2 parses `git status --porcelain=v2 -b` output into
+// pre-bucketed lists. Pure function; no git invocation.
+//
+// Record rules:
+//   - "1 XY ... path": X not ' '/'.' → Staged (status X); Y not ' '/'.'
+//     → Unstaged (status Y). A file may appear in BOTH lists (partially
+//     staged). '.' means "no change" (worktree column for new index entries).
+//   - "2 XY ... path": Unmerged (status U), also into Staged/Unstaged per
+//     column so conflicts stay actionable there.
+//   - "? path": Untracked (status U).
+//   - "N ... old -> new": rename/copy companion of the previous record —
+//     the entry's path is replaced with the new path.
+//   - "# branch.head/upstream/ab" headers fill the branch fields; other
+//     "#" lines (and T/u records) are ignored.
+func parsePorcelainV2(text string) GitStatus {
+	var st GitStatus
+	// Rename/copy companion lines ("N") arrive AFTER their "1"/"2" record;
+	// remember the last record's path and the slice positions of the entries
+	// appended for it so the N line can swap in the new path.
+	lastFrom := ""
+	lastStaged, lastUnstaged := -1, -1
 	for _, line := range strings.Split(text, "\n") {
-		if len(line) < 4 {
+		if line == "" {
 			continue
 		}
-		xy := line[:2]
-		rest := strings.TrimSpace(line[2:])
-		if rest == "" {
-			continue
-		}
-		path := rest
-		if i := strings.Index(rest, " -> "); i >= 0 {
-			path = rest[i+4:]
-		}
-		path = filepath.ToSlash(path)
-
-		if xy == "??" {
-			entries = append(entries, GitStatusEntry{Path: path, Status: "untracked"})
-			continue
-		}
-		wt := xy[1]
-		if wt == ' ' {
-			continue
-		}
-		status := "modified"
-		switch wt {
-		case 'M':
-			status = "modified"
-		case 'D':
-			status = "deleted"
-		case 'A':
-			status = "added"
-		case 'R':
-			status = "renamed"
-		case 'C':
-			status = "copied"
-		case 'U':
-			status = "unmerged"
+		switch line[0] {
+		case '#':
+			parseBranchHeader(line, &st)
+		case '1', '2':
+			if len(line) < 5 {
+				continue
+			}
+			// "1 <XY> <sub> <hM> <m1> <m2> <m3> <o> <X> <Y> <path>": the
+			// path is the LAST field (quoted paths contain no raw spaces,
+			// so Fields is safe).
+			xy := line[2:4]
+			fields := strings.Fields(line[5:])
+			if len(fields) == 0 {
+				continue
+			}
+			path := unquoteGitPath(fields[len(fields)-1])
+			lastFrom, lastStaged, lastUnstaged = path, -1, -1
+			if line[0] == '2' {
+				st.Unmerged = append(st.Unmerged, GitStatusEntry{Path: path, Status: "U"})
+			}
+			// ' ' or '.' means no change in that column ('.' is used for
+			// the worktree column when the index entry is new and matches).
+			if x := xy[0]; x != ' ' && x != '.' {
+				lastStaged = len(st.Staged)
+				st.Staged = append(st.Staged, GitStatusEntry{Path: path, Status: string(x)})
+			}
+			if y := xy[1]; y != ' ' && y != '.' {
+				lastUnstaged = len(st.Unstaged)
+				st.Unstaged = append(st.Unstaged, GitStatusEntry{Path: path, Status: string(y)})
+			}
+		case 'N':
+			if len(line) < 3 || lastFrom == "" {
+				continue
+			}
+			arrow := strings.Index(line, " -> ")
+			if arrow < 0 {
+				continue
+			}
+			fromFields := strings.Fields(line[:arrow])
+			if len(fromFields) == 0 || unquoteGitPath(fromFields[len(fromFields)-1]) != lastFrom {
+				continue
+			}
+			to := unquoteGitPath(strings.TrimSpace(line[arrow+4:]))
+			if lastStaged >= 0 {
+				st.Staged[lastStaged].Path = to
+			}
+			if lastUnstaged >= 0 {
+				st.Unstaged[lastUnstaged].Path = to
+			}
 		case '?':
-			status = "untracked"
-		default:
-			status = string(wt)
+			if len(line) < 3 {
+				continue
+			}
+			path := unquoteGitPath(strings.TrimSpace(line[2:]))
+			if path == "" {
+				continue
+			}
+			st.Untracked = append(st.Untracked, GitStatusEntry{Path: path, Status: "U"})
 		}
-		entries = append(entries, GitStatusEntry{Path: path, Status: status})
 	}
-	return entries
+	return st
+}
+
+// parseBranchHeader fills the branch fields from "# branch.head <name>",
+// "# branch.upstream <name>" and "# branch.ab +N -M" lines; other "#"
+// headers are ignored.
+func parseBranchHeader(line string, st *GitStatus) {
+	rest := strings.TrimSpace(line[1:])
+	i := strings.IndexByte(rest, ' ')
+	if i < 0 {
+		return
+	}
+	key, val := rest[:i], strings.TrimSpace(rest[i+1:])
+	switch key {
+	case "branch.head":
+		st.Branch = val
+	case "branch.upstream":
+		st.Upstream = val
+	case "branch.ab":
+		// Format is "+N -M": the behind count arrives negative.
+		fields := strings.Fields(val)
+		if len(fields) != 2 {
+			return
+		}
+		if a, err := strconv.Atoi(fields[0]); err == nil {
+			st.Ahead = a
+		}
+		if b, err := strconv.Atoi(fields[1]); err == nil && b < 0 {
+			st.Behind = -b
+		}
+	}
+}
+
+// unquoteGitPath decodes a C-style-quoted path from porcelain output (git
+// quotes paths containing special bytes; escapes are C-style, with octal
+// sequences carrying raw byte values). Non-quoted paths pass through.
+func unquoteGitPath(p string) string {
+	if len(p) < 2 || p[0] != '"' {
+		return p
+	}
+	var b strings.Builder
+	b.Grow(len(p))
+	for i := 1; i < len(p); i++ {
+		c := p[i]
+		if c == '"' {
+			break
+		}
+		if c != '\\' {
+			b.WriteByte(c)
+			continue
+		}
+		if i+1 >= len(p) {
+			b.WriteByte('\\')
+			continue
+		}
+		i++
+		switch e := p[i]; e {
+		case 'n':
+			b.WriteByte('\n')
+		case 't':
+			b.WriteByte('\t')
+		case 'r':
+			b.WriteByte('\r')
+		case 'a':
+			b.WriteByte('\a')
+		case 'b':
+			b.WriteByte('\b')
+		case 'f':
+			b.WriteByte('\f')
+		case 'v':
+			b.WriteByte('\v')
+		case '\\':
+			b.WriteByte('\\')
+		case '"':
+			b.WriteByte('"')
+		case '0', '1', '2', '3', '4', '5', '6', '7':
+			v := int(e - '0')
+			for n := 1; n < 3 && i+1 < len(p) && p[i+1] >= '0' && p[i+1] <= '7'; n++ {
+				i++
+				v = v*8 + int(p[i]-'0')
+			}
+			b.WriteByte(byte(v))
+		default:
+			b.WriteByte('\\')
+			b.WriteByte(e)
+		}
+	}
+	return b.String()
 }
 
 func (s *Server) gitFileDiff(ctx context.Context, path string) (original, modified, language string, err error) {

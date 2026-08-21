@@ -216,45 +216,48 @@ func extractReadable(body []byte, baseURL string) (string, bool) {
 	return b.String(), true
 }
 
-// isHTMLLike reports whether extractResponseText would treat the response as
-// HTML (in which case readability extraction is attempted before falling back
-// to full-page conversion). It mirrors the HTML branches of extractResponseText.
-func isHTMLLike(contentType, finalURL string, body []byte) bool {
-	if isHTMLContentType(contentType) {
-		return true
+// responseKind is the classification of a fetched response body.
+type responseKind int
+
+const (
+	kindPlain responseKind = iota // plain text / source / data: return as-is
+	kindHTML                      // HTML: convert to Markdown
+)
+
+// classifyResponse reports whether the response is HTML, deciding via
+// Content-Type first, then URL extension, then a body sniff. It is the single
+// source of truth for the HTML/plain split: extractResponseText uses it to
+// pick a converter, and extractWebContent uses it to decide whether to attempt
+// readability extraction. It performs no conversion, so it is cheap to call on
+// its own (a caller deciding the readability path never pays for a full-page
+// Markdown conversion it may discard).
+//
+// Content-Type wins when it is authoritative; for ambiguous or missing types
+// the URL extension and a body sniff decide.
+func classifyResponse(contentType, finalURL string, body []byte) responseKind {
+	switch {
+	case isHTMLContentType(contentType):
+		return kindHTML
+	case isPlainContentType(contentType):
+		return kindPlain
+	case isHTMLURL(finalURL):
+		return kindHTML
+	case isPlainURL(finalURL):
+		return kindPlain
+	case looksLikeHTML(body):
+		return kindHTML
+	default:
+		return kindPlain
 	}
-	if isPlainContentType(contentType) {
-		return false
-	}
-	if isHTMLURL(finalURL) {
-		return true
-	}
-	if isPlainURL(finalURL) {
-		return false
-	}
-	return looksLikeHTML(body)
 }
 
 // extractResponseText converts a fetched response body into text. HTML
 // responses are converted to Markdown via htmlToMarkdown; everything else
 // (source files, JSON, plain text, ...) is returned as-is so `<` characters
 // and code formatting survive.
-//
-// Content-Type wins when it is authoritative; for ambiguous or missing types
-// the URL extension and a body sniff decide.
 func extractResponseText(contentType, finalURL string, body []byte) string {
-	switch {
-	case isHTMLContentType(contentType):
+	if classifyResponse(contentType, finalURL, body) == kindHTML {
 		return htmlToMarkdown(body, finalURL)
-	case isPlainContentType(contentType):
-		return plainText(body)
-	case isHTMLURL(finalURL):
-		return htmlToMarkdown(body, finalURL)
-	case isPlainURL(finalURL):
-		return plainText(body)
-	case looksLikeHTML(body):
-		return htmlToMarkdown(body, finalURL)
-	default:
-		return plainText(body)
 	}
+	return plainText(body)
 }

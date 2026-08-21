@@ -54,28 +54,35 @@ func (sp *tuiSubagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, jo
 		_ = prov.SetModel(m)
 	}
 	child := agent.NewSessionAgent(agent.SessionAgentOptions{
-		Provider:             prov,
-		Executor:             parent.Executor,
-		Store:                parent.SessionStore,
-		Config:               cfg,
-		GlobalMode:           parent.GlobalMode,
-		ProjectFilePath:      parent.ProjectFilePath,
-		ProjectGuidelines:    parent.ProjectGuidelines,
-		TestCommand:          parent.TestCommand,
-		LintCommand:          parent.LintCommand,
-		WorkingDir:           parent.WorkingDir,
-		MCPRegistry:          parent.MCPRegistry,
-		DebugCompareMessages: parent.DebugCompareMessages,
-		BoardEnabled:         parent.BoardEnabled(),
-		SubagentsEnabled:     parent.SubagentsEnabled(),
-		SubagentMaxDepth:     parent.SubagentMaxDepth(),
-		BoardManager:         parent.BoardManager(),
-		SkillsManager:        parent.SkillsManager(),
-		InstructionsEnabled:  parent.InstructionsEnabled(),
-		SubagentSpawner:      sp, // nesting allowed up to the configured depth
+		Provider:              prov,
+		Executor:              parent.Executor,
+		Store:                 parent.SessionStore,
+		Config:                cfg,
+		GlobalMode:            parent.GlobalMode,
+		ProjectFilePath:       parent.ProjectFilePath,
+		ProjectGuidelines:     parent.ProjectGuidelines,
+		TestCommand:           parent.TestCommand,
+		LintCommand:           parent.LintCommand,
+		WorkingDir:            parent.WorkingDir,
+		MCPRegistry:           parent.MCPRegistry,
+		DebugCompareMessages:  parent.DebugCompareMessages,
+		BoardEnabled:          parent.BoardEnabled(),
+		SubagentsEnabled:      parent.SubagentsEnabled(),
+		SubagentMaxDepth:      parent.SubagentMaxDepth(),
+		SubagentMaxConcurrent: parent.SubagentMaxConcurrent(),
+		BoardManager:          parent.BoardManager(),
+		SkillsManager:         parent.SkillsManager(),
+		InstructionsEnabled:   parent.InstructionsEnabled(),
+		SubagentSpawner:       sp, // nesting allowed up to the configured depth
 	}, nil, session.NewID())
 	child.SetSubagentDepth(depth + 1)
 	child.SetParentID(parent.SessionID)
+	// Reasoning effort: the same cascade as the web spawner — the
+	// configured subagent level (subagent_thinking_level) wins; empty =
+	// inherit the parent's live level. A level the child's final model
+	// does not accept is omitted (shared helper, so the hosts cannot
+	// drift).
+	agent.ApplySubagentThinkingLevel(child, parent, cfg.SubagentThinkingLevel)
 	label := agent.SubagentLabel(job)
 	_, _ = child.RenameSession(label)
 	// The job wrapper applies AFTER label derivation, so the /subagents

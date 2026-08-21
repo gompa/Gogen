@@ -19,15 +19,15 @@ var runtimeConfigFields = map[string]bool{
 	"commandSafety": true, "commandAllowlist": true, "deleteApproval": true,
 	"commandSandbox": true, "commandTimeoutSecs": true,
 	"contextLimit": true, "compactThreshold": true, "compactKeepRecentMessages": true,
-	"maxToolResultBytes": true, "compactReserveTokens": true,
+	"maxToolResultBytes": true, "compactReserveTokens": true, "compactLastResort": true,
 	"webFetch": true, "webSearch": true, "webSearchBackend": true, "webSearchApiKey": true,
 	"webAllowedDomains": true, "webFetchMode": true,
 	"treesitter": true, "treesitterLangs": true, "preserveReasoning": true,
 	"sessionMaxCount": true, "sessionMaxAgeDays": true, "webApprovalHoldSecs": true,
 	"webBind": true, "webAllowedOrigins": true, "webAuthToken": true,
 	"webTLSCertFile": true, "webTLSKeyFile": true, "webMaxActiveSessions": true,
-	"mcp":              true,
-	"subagentModel":    true,
+	"mcp":           true,
+	"subagentModel": true, "subagentThinkingLevel": true,
 	"boardStartPrompt": true, "systemPrompt": true, "subagentPrompt": true,
 }
 
@@ -120,6 +120,15 @@ func (s *Server) handleWSRuntimeConfig(ws *wsConn, msg WSMessage) {
 				return
 			}
 			r.CompactThreshold = msg.CompactThreshold
+		case "compactLastResort":
+			// The last-resort condensation mode (Phase 0e): condense
+			// (default) or error (diagnostic instead of condensing).
+			v := strings.ToLower(strings.TrimSpace(msg.CompactLastResort))
+			if v != "condense" && v != "error" {
+				writeNoticeError(ws, "settings", fmt.Sprintf("Error: invalid compactLastResort %q (want condense or error)", msg.CompactLastResort))
+				return
+			}
+			r.CompactLastResort = v
 		case "sessionMaxAgeDays":
 			// -1 = "keep sessions forever" (the store's retention sentinel);
 			// the merge path preserves it so it survives a restart.
@@ -174,6 +183,24 @@ func (s *Server) handleWSRuntimeConfig(ws *wsConn, msg WSMessage) {
 				return
 			}
 			r.SubagentModel = v
+		case "subagentThinkingLevel":
+			// The reasoning-effort level for spawned subagents; empty
+			// clears back to "inherit the parent's level". Normalized to a
+			// literal reasoning_effort value; validity against the
+			// subagent's final model is fail-open at spawn time (a value
+			// the model does not accept is omitted — the tool's model
+			// argument can override the configured model, so the server
+			// cannot validate it here).
+			raw := ""
+			if msg.SubagentThinkingLevel != nil {
+				raw = *msg.SubagentThinkingLevel
+			}
+			v := string(agent.NormalizeThinkingLevel(raw))
+			if raw != "" && v == "" {
+				writeNoticeError(ws, "settings", "Error: subagentThinkingLevel must be a reasoning-effort value or empty (inherit)")
+				return
+			}
+			r.SubagentThinkingLevel = v
 		case "mcp":
 			v := strings.ToLower(strings.TrimSpace(msg.MCP))
 			if _, ok := parseOnOff(v); !ok {
@@ -233,7 +260,7 @@ func (s *Server) handleWSRuntimeConfig(ws *wsConn, msg WSMessage) {
 	if set("preserveReasoning") {
 		s.applyPreserveReasoningToAll(r.PreserveReasoning)
 	}
-	if set("contextLimit") || set("compactThreshold") || set("compactKeepRecentMessages") || set("maxToolResultBytes") || set("compactReserveTokens") {
+	if set("contextLimit") || set("compactThreshold") || set("compactKeepRecentMessages") || set("maxToolResultBytes") || set("compactReserveTokens") || set("compactLastResort") {
 		s.applyContextSettingsToAll(r, set)
 	}
 	if set("maxToolResultBytes") {
@@ -446,6 +473,9 @@ func (s *Server) applyContextSettingsToAll(r config.Config, apply func(name stri
 		}
 		if apply("compactReserveTokens") {
 			next.CompactReserveTokens = r.CompactReserveTokens
+		}
+		if apply("compactLastResort") {
+			next.CompactLastResort = r.CompactLastResort
 		}
 		rt.agent.Context.UpdateSettings(next)
 	}

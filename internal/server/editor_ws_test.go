@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -105,5 +106,70 @@ func TestWSEditorEndpointFSRoundTrip(t *testing.T) {
 	}
 	if resp3.Type != "fs_list_result" || resp3.RequestID != "ed-3" {
 		t.Fatalf("fs_list #2 response = %+v, want fs_list_result/ed-3", resp3)
+	}
+}
+
+// TestWSEditorGitStatusRoundTrip exercises the v2 git_status payload over the
+// real editor socket: the reply carries pre-bucketed gitStatus lists
+// (including the staged-only file the v1 parser dropped) plus the legacy flat
+// gitEntries (Unstaged+Untracked) for stale tabs.
+func TestWSEditorGitStatusRoundTrip(t *testing.T) {
+	dir := newGitTestRepo(t)
+	// Initial commit so the repo has a branch header.
+	if err := os.WriteFile(filepath.Join(dir, "work.go"), []byte("b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", "work.go")
+	gitIn(t, dir, "commit", "-m", "init")
+	// Staged-only file: the v1 vanishing-bug case (worktree column ' ').
+	if err := os.WriteFile(filepath.Join(dir, "staged.go"), []byte("a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", "staged.go")
+	// Unstaged file (committed, then modified in the worktree).
+	if err := os.WriteFile(filepath.Join(dir, "work.go"), []byte("b2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Untracked file.
+	if err := os.WriteFile(filepath.Join(dir, "new.txt"), []byte("c\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	prov := llm.NewMockProvider()
+	exec := agent.NewExecutor(dir)
+	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
+	a := agent.NewAgent(prov, exec, ctxMgr)
+	s := NewServer(a, &config.Config{})
+	editor := dialEditor(t, startEditorTestServer(t, s))
+
+	resp := sendEditorMsg(t, editor, WSMessage{Type: "git_status", RequestID: "gs-1"})
+	if resp.Type != "git_status_result" || resp.RequestID != "gs-1" || !resp.Success {
+		t.Fatalf("reply = %+v, want successful git_status_result/gs-1", resp)
+	}
+	gs := resp.GitStatus
+	if gs == nil {
+		t.Fatalf("gitStatus payload missing: %+v", resp)
+	}
+	if gs.Branch == "" {
+		t.Fatalf("branch header missing: %+v", gs)
+	}
+	if !reflect.DeepEqual(gs.Staged, []GitStatusEntry{{Path: "staged.go", Status: "A"}}) {
+		t.Fatalf("staged = %#v, want staged.go/A", gs.Staged)
+	}
+	if !reflect.DeepEqual(gs.Unstaged, []GitStatusEntry{{Path: "work.go", Status: "M"}}) {
+		t.Fatalf("unstaged = %#v, want work.go/M", gs.Unstaged)
+	}
+	if !reflect.DeepEqual(gs.Untracked, []GitStatusEntry{{Path: "new.txt", Status: "U"}}) {
+		t.Fatalf("untracked = %#v, want new.txt/U", gs.Untracked)
+	}
+	if len(gs.Unmerged) != 0 {
+		t.Fatalf("unmerged = %#v, want empty", gs.Unmerged)
+	}
+	// Legacy flat list = Unstaged + Untracked.
+	if !reflect.DeepEqual(resp.GitEntries, []GitStatusEntry{
+		{Path: "work.go", Status: "M"},
+		{Path: "new.txt", Status: "U"},
+	}) {
+		t.Fatalf("legacy gitEntries = %#v, want unstaged+untracked", resp.GitEntries)
 	}
 }

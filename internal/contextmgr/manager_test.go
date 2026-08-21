@@ -252,7 +252,7 @@ func TestCompactPreservesHeadAndTail(t *testing.T) {
 	m.minMiddleTokens = 0 // tiny messages: skip the minimum-middle guard
 	msgs := []llm.Message{
 		{Role: "user", Content: "fix auth"},
-		{Role: "assistant", Content: "reading"},
+		{Role: "assistant", Content: strings.Repeat("reading the codebase ", 10)}, // middle must outgrow the framed summary (smaller-summary guard)
 		{Role: "tool", Content: "file contents", ToolCallID: "c1"},
 		{Role: "assistant", Content: "done"},
 		{Role: "user", Content: "add tests"},

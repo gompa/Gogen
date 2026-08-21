@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
-	"sort"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -394,7 +394,7 @@ func (a *Agent) enforceFinishedJobCap(keep *BackgroundJob) {
 	if overflow <= 0 {
 		return
 	}
-	sort.Slice(finished, func(i, j int) bool { return finished[i].at.Before(finished[j].at) })
+	slices.SortFunc(finished, func(a, b finishedJob) int { return a.at.Compare(b.at) })
 	for i := 0; i < overflow && i < len(finished); i++ {
 		j := finished[i]
 		delete(a.bgJobs, j.job.ID)

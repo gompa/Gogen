@@ -98,6 +98,23 @@ func (s *Server) wsHandleBoardStart(ctx context.Context, ws *wsConn, pane **sess
 		}
 	}
 
+	// Per-ticket reasoning effort: validated against the FINAL model (after
+	// SelectModel above, mirroring the subagent effort cascade) and applied
+	// before the claim so a failure unwinds with only the fresh-session
+	// cleanup (no claim to reset). Empty keeps the pane-inherited level
+	// seeded into the snapshot; "off" is a real state (never send
+	// reasoning_effort) that overrides the inheritance.
+	if strings.TrimSpace(op.ThinkingLevel) != "" {
+		level := string(agent.NormalizeThinkingLevel(op.ThinkingLevel))
+		if level == "" || !s.isValidThinkingLevel(rt.agent, op.ThinkingLevel) {
+			s.removeFreshSession(sid)
+			writeNoticeError(ws, "board",
+				fmt.Sprintf("Error: reasoning-effort level %q is not accepted by the selected model", strings.TrimSpace(op.ThinkingLevel)))
+			return
+		}
+		rt.agent.SetThinkingLevel(agent.ThinkingLevel(level))
+	}
+
 	if _, err := bm.Claim(item.ID, label); err != nil {
 		// A concurrent start won the claim: remove the fresh session and
 		// report the claim error — no orphan empty sessions.
@@ -115,7 +132,7 @@ func (s *Server) wsHandleBoardStart(ctx context.Context, ws *wsConn, pane **sess
 	// next start). The start op is authoritative: an empty value clears
 	// the stored override back to the defaults. Non-fatal — the session
 	// already started; the popover just re-falls back to the defaults.
-	if err := bm.SetStartOptions(item.ID, op.Model, op.Prompt); err != nil {
+	if err := bm.SetStartOptions(item.ID, op.Model, op.Prompt, op.ThinkingLevel); err != nil {
 		log.Printf("board start: persist start options on #%s: %v", item.ID, err)
 	}
 
@@ -140,7 +157,7 @@ func (s *Server) wsHandleBoardStart(ctx context.Context, ws *wsConn, pane **sess
 	// Acquire the turn BEFORE attaching the tab: a failed acquire (runtime
 	// evicted / busy) must not leave the tab attached to a session it was
 	// never told about, and the cleanup below has nothing to unwind.
-	if !s.acquireTurnForHandler(ws, rt) {
+	if !rt.acquireTurnForHandler(ws) {
 		// The turn could not start (runtime evicted / busy): undo the start
 		// so no claimed-but-idle ticket and no orphan empty session survive.
 		// No turn has run, so removing the fresh session is safe (same as
@@ -156,15 +173,20 @@ func (s *Server) wsHandleBoardStart(ctx context.Context, ws *wsConn, pane **sess
 		return
 	}
 
-	// Background attach: the initiating tab becomes a viewer of the ticket
-	// session WITHOUT switching the pane or main tab (the user stays on the
-	// board). Delete approvals then reach the tab — the client renders the
-	// approval modal globally, even though no pane owns the session — and
-	// closing the tab detaches normally, so the standard approval-hold /
-	// auto-deny-on-detach machinery applies. The deny-when-unattended
-	// override above still covers approvals that arrive after the tab is
-	// gone (between detach and turn end).
-	rt.attach(ws)
+	// Background attach: the initiating tab becomes an APPROVAL RECEIVER of
+	// the ticket session WITHOUT viewing it (attachPassive, not attach) and
+	// without switching the pane or main tab (the user stays on the board).
+	// Delete approvals reach the tab — the client renders the approval
+	// modal globally, even though no pane owns the session — and closing
+	// the tab detaches normally, so the standard approval-hold /
+	// auto-deny-on-detach machinery applies (clientCount includes passive
+	// attachments). The passive role keeps the session OUT of the
+	// live-session signal (viewerCount): once the turn ends, the orphan
+	// eviction releases the runtime, so the sidebar never pins a stale
+	// "resume to continue" row for a completed ticket nobody is viewing.
+	// The deny-when-unattended override above still covers approvals that
+	// arrive after the tab is gone (between detach and turn end).
+	rt.attachPassive(ws)
 	rt.startTurn(ws, prompt, nil)
 	s.broadcastBoardState()
 	writeNotice(ws, "board", true, fmt.Sprintf("Started agent session %s for board item #%s: %s", sid, item.ID, item.Title))

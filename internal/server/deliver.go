@@ -182,7 +182,19 @@ func (rt *sessionRuntime) deliverLoop() {
 		// delivery-start hook (if any) fires immediately before, so
 		// consumers can arm per-delivery state exactly when the delivered
 		// turn begins.
+		//
+		// Re-verify the head under the lock before popping: the queue can
+		// shift between the peek above and this pop (an overflow drop or an
+		// eviction prunes the head while we waited for the turn lock). If
+		// the head is no longer the item we peeked, that item was dropped —
+		// do NOT pop the (different) item now at the head and deliver the
+		// stale one; release the turn lock and re-peek instead.
 		rt.deliverMu.Lock()
+		if len(rt.pendingDeliver) == 0 || rt.pendingDeliver[0] != text {
+			rt.deliverMu.Unlock()
+			rt.turnMu.Unlock()
+			continue
+		}
 		rt.pendingDeliver = rt.pendingDeliver[1:]
 		rt.deliverMu.Unlock()
 		if rt.deliverStartHook != nil {

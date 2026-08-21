@@ -111,6 +111,7 @@ type configYAML struct {
 	CompactKeepRecentMessages int                           `yaml:"compact_keep_recent_messages"`
 	MaxToolResultBytes        int                           `yaml:"max_tool_result_bytes"`
 	CompactReserveTokens      int                           `yaml:"compact_reserve_tokens"`
+	CompactLastResort         string                        `yaml:"compact_last_resort,omitempty"`
 	CommandSafety             string                        `yaml:"command_safety"`
 	CommandAllowlist          string                        `yaml:"command_allowlist,omitempty"`
 	DeleteApproval            string                        `yaml:"delete_approval"`
@@ -128,7 +129,9 @@ type configYAML struct {
 	Board                     string                        `yaml:"board,omitempty"`
 	Subagent                  string                        `yaml:"subagent,omitempty"`
 	SubagentMaxDepth          int                           `yaml:"subagent_max_depth,omitempty"`
+	SubagentMaxConcurrent     int                           `yaml:"subagent_max_concurrent,omitempty"`
 	SubagentModel             string                        `yaml:"subagent_model,omitempty"`
+	SubagentThinkingLevel     string                        `yaml:"subagent_thinking_level,omitempty"`
 	BoardStartPrompt          string                        `yaml:"board_start_prompt,omitempty"`
 	SystemPrompt              string                        `yaml:"system_prompt,omitempty"`
 	SubagentPrompt            string                        `yaml:"subagent_prompt,omitempty"`
@@ -190,6 +193,7 @@ func buildConfigYAML(cfg *config.Config, opts WriteOptions) (string, error) {
 		CompactKeepRecentMessages: cfg.CompactKeepRecentMessages,
 		MaxToolResultBytes:        cfg.MaxToolResultBytes,
 		CompactReserveTokens:      cfg.CompactReserveTokens,
+		CompactLastResort:         omitDefaultString(cfg.CompactLastResort, def.CompactLastResort),
 		CommandSafety:             cfg.CommandSafetyMode,
 		CommandAllowlist:          cfg.CommandAllowlist,
 		DeleteApproval:            cfg.DeleteApproval,
@@ -206,7 +210,9 @@ func buildConfigYAML(cfg *config.Config, opts WriteOptions) (string, error) {
 		Board:                     omitDefaultString(cfg.Board, def.Board),
 		Subagent:                  omitDefaultString(cfg.Subagent, def.Subagent),
 		SubagentMaxDepth:          omitDefaultInt(cfg.SubagentMaxDepth, def.SubagentMaxDepth),
+		SubagentMaxConcurrent:     omitDefaultInt(cfg.SubagentMaxConcurrent, def.SubagentMaxConcurrent),
 		SubagentModel:             cfg.SubagentModel,
+		SubagentThinkingLevel:     cfg.SubagentThinkingLevel,
 		BoardStartPrompt:          cfg.BoardStartPrompt,
 		SystemPrompt:              cfg.SystemPrompt,
 		SubagentPrompt:            cfg.SubagentPrompt,

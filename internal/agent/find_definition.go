@@ -70,7 +70,7 @@ func (e *Executor) findDefinitionText(ctx context.Context, subpath, glob, symbol
 		`\bdef\s+` + q + `\s*\(` +
 		`)`
 
-	out, err := e.SearchCode(ctx, pattern, subpath, glob, 0)
+	out, err := e.SearchCode(ctx, pattern, subpath, glob, 0, false)
 	if err != nil {
 		return nil, err
 	}

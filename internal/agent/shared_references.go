@@ -87,7 +87,7 @@ func (e *Executor) walkSymbolReferences(ctx context.Context, searchRoot, relPref
 func (e *Executor) walkSymbolReferencesText(ctx context.Context, searchRoot, relPrefix, glob, pattern string,
 	visitor func(filePath string, lineNum int, line string) error) error {
 
-	re, err := compileSearchPattern(pattern)
+	re, err := compileSearchPattern(pattern, false)
 	if err != nil {
 		return err
 	}

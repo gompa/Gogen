@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -469,6 +469,7 @@ func (s *Store) Delete(workingDir, id string) error {
 			if err := s.clearDeltaFile(workingDir, id); err != nil && !os.IsNotExist(err) {
 				log.Printf("warning: failed to remove delta for session %s: %v", id, err)
 			}
+			s.removeArchiveFile(workingDir, id)
 			// Mirror the found-path cleanup: a stale Created cache entry would
 			// otherwise be re-used by a later Save of a new session with the
 			// same id (in-memory-only sessions are created and deleted without
@@ -485,6 +486,7 @@ func (s *Store) Delete(workingDir, id string) error {
 	if err := s.clearDeltaFile(workingDir, id); err != nil && !os.IsNotExist(err) {
 		log.Printf("warning: failed to remove delta for session %s: %v", id, err)
 	}
+	s.removeArchiveFile(workingDir, id)
 	delete(s.createdCache, id)
 	// Remove from index and invalidate in-memory cache.
 	s.removeFromIndex(workingDir, id)
@@ -513,7 +515,7 @@ func (s *Store) nestedChildrenLocked(workingDir, parentID string) []string {
 				entries = append(entries, e)
 			}
 		}
-		sort.Slice(entries, func(i, j int) bool { return entries[i].Updated.After(entries[j].Updated) })
+		slices.SortFunc(entries, func(a, b sessionIndexEntry) int { return b.Updated.Compare(a.Updated) })
 		ids := make([]string, len(entries))
 		for i, e := range entries {
 			ids[i] = e.ID
@@ -548,7 +550,7 @@ func (s *Store) nestedChildrenLocked(workingDir, parentID string) []string {
 	// Mirror the index path's ordering: most-recently-updated first, so the
 	// per-parent cap prunes the OLDEST children (name order from ReadDir is
 	// id-sorted, which would prune the wrong siblings).
-	sort.Slice(metas, func(i, j int) bool { return metas[i].updated.After(metas[j].updated) })
+	slices.SortFunc(metas, func(a, b childMeta) int { return b.updated.Compare(a.updated) })
 	for _, meta := range metas {
 		ids = append(ids, meta.id)
 	}
@@ -614,6 +616,7 @@ func (s *Store) deleteSessionFile(workingDir, id string) error {
 	if cerr := s.clearDeltaFile(workingDir, id); cerr != nil && !os.IsNotExist(cerr) {
 		log.Printf("warning: failed to remove delta for session %s: %v", id, cerr)
 	}
+	s.removeArchiveFile(workingDir, id)
 	delete(s.createdCache, id)
 	s.removeFromIndex(workingDir, id)
 	s.invalidateListCache(workingDir)

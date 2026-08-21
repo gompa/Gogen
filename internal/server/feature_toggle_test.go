@@ -86,14 +86,20 @@ func TestFeatureToggleSubagentAndDepth(t *testing.T) {
 	sid := cfg.SessionID
 	_ = readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" && m.SessionID == sid })
 
-	if err := conn.WriteJSON(WSMessage{Type: "config", Subagent: "on", SubagentMaxDepth: 3, SessionID: sid}); err != nil {
+	if err := conn.WriteJSON(WSMessage{Type: "config", Subagent: "on", SubagentMaxDepth: 3, SubagentMaxConcurrent: 2, SessionID: sid}); err != nil {
 		t.Fatalf("send subagent on: %v", err)
 	}
 	subCfg := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" && m.Subagent == "on" })
 	if subCfg.SubagentMaxDepth != 3 {
 		t.Fatalf("config push depth = %d, want 3", subCfg.SubagentMaxDepth)
 	}
-	waitForCond(t, 5*time.Second, func() bool { return s.ws.GetSubagentEnabled() && a.SubagentsEnabled() && a.SubagentMaxDepth() == 3 })
+	if subCfg.SubagentMaxConcurrent != 2 {
+		t.Fatalf("config push concurrent limit = %d, want 2", subCfg.SubagentMaxConcurrent)
+	}
+	waitForCond(t, 5*time.Second, func() bool {
+		return s.ws.GetSubagentEnabled() && a.SubagentsEnabled() && a.SubagentMaxDepth() == 3 &&
+			a.SubagentMaxConcurrent() == 2 && s.ws.GetSubagentMaxConcurrent() == 2
+	})
 }
 
 // TestFeatureToggleInvalidValueRejected verifies invalid on/off spellings
@@ -128,6 +134,14 @@ func TestFeatureToggleInvalidValueRejected(t *testing.T) {
 	resp = readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "notice" })
 	if resp.Kind != "settings" || resp.Success || !strings.Contains(resp.Content, "subagentMaxDepth") {
 		t.Fatalf("negative depth notice = %+v", resp)
+	}
+
+	if err := conn.WriteJSON(WSMessage{Type: "config", SubagentMaxConcurrent: -1, SessionID: sid}); err != nil {
+		t.Fatalf("send negative concurrent limit: %v", err)
+	}
+	resp = readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "notice" })
+	if resp.Kind != "settings" || resp.Success || !strings.Contains(resp.Content, "subagentMaxConcurrent") {
+		t.Fatalf("negative concurrent limit notice = %+v", resp)
 	}
 }
 

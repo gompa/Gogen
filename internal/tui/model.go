@@ -341,7 +341,11 @@ func (m *Model) bumpContextEstimate(delta string) {
 }
 
 // refreshContextStats updates the status-bar context indicator immediately.
-// Only call when StreamProcessInput is not running (no Messages race).
+// ContextStats is safe to call concurrently with a running turn (it
+// snapshots shared state under statsMu), but this unguarded variant is
+// reserved for paths where a minimal snapshot is acceptable (stream end,
+// error, session changes); mid-turn callers should use
+// refreshContextStatsMidTurn, which never blanks the indicator.
 func (m *Model) refreshContextStats() {
 	if m.agent == nil {
 		m.contextStats = agent.TurnContext{}
@@ -353,6 +357,29 @@ func (m *Model) refreshContextStats() {
 		ctx = context.Background()
 	}
 	stats := m.agent.ContextStats(ctx)
+	m.contextStats = stats
+	m.contextLine = agent.FormatContextBrief(stats)
+}
+
+// refreshContextStatsMidTurn refreshes the context indicator from the agent
+// at a round boundary while a turn is streaming. ContextStats is safe to
+// call concurrently with a running turn (it snapshots shared state under
+// statsMu and tokenizes a clone), so this does not race the streaming
+// goroutine. A minimal snapshot (e.g. the caller context was cancelled and
+// ContextStats short-circuited) is not adopted, so the indicator never
+// blanks out mid-turn.
+func (m *Model) refreshContextStatsMidTurn() {
+	if m.agent == nil {
+		return
+	}
+	ctx := m.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stats := m.agent.ContextStats(ctx)
+	if stats.Snapshot.Used <= 0 && stats.Snapshot.Limit <= 0 {
+		return
+	}
 	m.contextStats = stats
 	m.contextLine = agent.FormatContextBrief(stats)
 }

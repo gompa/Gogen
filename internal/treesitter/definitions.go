@@ -1,9 +1,10 @@
 package treesitter
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -40,11 +41,8 @@ func FormatDefinitions(path string, defs []Definition) string {
 	if len(defs) == 0 {
 		return fmt.Sprintf("No definitions found in %s", path)
 	}
-	sort.Slice(defs, func(i, j int) bool {
-		if defs[i].Line == defs[j].Line {
-			return defs[i].Name < defs[j].Name
-		}
-		return defs[i].Line < defs[j].Line
+	slices.SortFunc(defs, func(a, b Definition) int {
+		return cmp.Or(cmp.Compare(a.Line, b.Line), cmp.Compare(a.Name, b.Name))
 	})
 	var b strings.Builder
 	fmt.Fprintf(&b, "Definitions in %s (%d):\n", path, len(defs))

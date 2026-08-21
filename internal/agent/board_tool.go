@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strconv"
 
 	"gogen/internal/llm"
 )
@@ -27,7 +28,7 @@ func boardToolDef() llm.Tool {
 		toolSchema(
 			map[string]interface{}{
 				"action":      toolPropEnum("string", []string{"list", "show", "add", "claim", "move", "block", "comment", "done", "remove"}, "Board action"),
-				"id":          toolProp("string", "Board item id (show, claim, move, block, comment, done, remove)"),
+				"id":          toolProp("integer", "Board item id (show, claim, move, block, comment, done, remove)"),
 				"title":       toolProp("string", "Item title (add)"),
 				"description": toolProp("string", "Acceptance criteria / details (add)"),
 				"priority":    toolProp("string", "Priority: low, medium, high, urgent (add)"),
@@ -60,11 +61,11 @@ func handleBoard(_ context.Context, a *Agent, args map[string]interface{}) (stri
 	case "list":
 		return m.List()
 	case "show":
-		id, err := stringArg(args, "id")
+		id, err := intRequiredArg(args, "id")
 		if err != nil {
 			return "", err
 		}
-		return m.Show(id)
+		return m.Show(strconv.Itoa(id))
 	case "add":
 		title, err := stringArg(args, "title")
 		if err != nil {
@@ -74,13 +75,13 @@ func handleBoard(_ context.Context, a *Agent, args map[string]interface{}) (stri
 		prio, _ := stringArgOptional(args, "priority")
 		out, opErr = m.Add(title, desc, prio, by)
 	case "claim":
-		id, err := stringArg(args, "id")
+		id, err := intRequiredArg(args, "id")
 		if err != nil {
 			return "", err
 		}
-		out, opErr = m.Claim(id, by)
+		out, opErr = m.Claim(strconv.Itoa(id), by)
 	case "move":
-		id, err := stringArg(args, "id")
+		id, err := intRequiredArg(args, "id")
 		if err != nil {
 			return "", err
 		}
@@ -88,9 +89,9 @@ func handleBoard(_ context.Context, a *Agent, args map[string]interface{}) (stri
 		if err != nil {
 			return "", err
 		}
-		out, opErr = m.Move(id, column, by)
+		out, opErr = m.Move(strconv.Itoa(id), column, by)
 	case "block":
-		id, err := stringArg(args, "id")
+		id, err := intRequiredArg(args, "id")
 		if err != nil {
 			return "", err
 		}
@@ -98,9 +99,9 @@ func handleBoard(_ context.Context, a *Agent, args map[string]interface{}) (stri
 		if err != nil {
 			return "", err
 		}
-		out, opErr = m.Block(id, reason, by)
+		out, opErr = m.Block(strconv.Itoa(id), reason, by)
 	case "comment":
-		id, err := stringArg(args, "id")
+		id, err := intRequiredArg(args, "id")
 		if err != nil {
 			return "", err
 		}
@@ -108,19 +109,19 @@ func handleBoard(_ context.Context, a *Agent, args map[string]interface{}) (stri
 		if err != nil {
 			return "", err
 		}
-		out, opErr = m.Comment(id, text, by)
+		out, opErr = m.Comment(strconv.Itoa(id), text, by)
 	case "done":
-		id, err := stringArg(args, "id")
+		id, err := intRequiredArg(args, "id")
 		if err != nil {
 			return "", err
 		}
-		out, opErr = m.Done(id, by)
+		out, opErr = m.Done(strconv.Itoa(id), by)
 	case "remove":
-		id, err := stringArg(args, "id")
+		id, err := intRequiredArg(args, "id")
 		if err != nil {
 			return "", err
 		}
-		out, opErr = m.Delete(id)
+		out, opErr = m.Delete(strconv.Itoa(id))
 	default:
 		return "", fmt.Errorf("unknown board action %q (want list, show, add, claim, move, block, comment, done, or remove)", action)
 	}

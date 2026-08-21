@@ -9,7 +9,7 @@
             chatDiffWheelEdge,
             extractDiffValue,
             initMonaco,
-            colorizeCodeBlocks,
+            colorizeNode,
             colorizeElement,
             languageFromPath,
             setToastHandler,
@@ -19,15 +19,109 @@
             saveAll,
             saveActive,
             openFileAtLine,
-            setMonacoTheme,
-            applyEditorPrefs,
             openModal,
             closeModal,
+            escapeHtml,
         } from '/editor.js';
+        // Shared UI components (see web/components/): the generic anchored
+        // popover shell and the model + reasoning-effort picker rendering
+        // used by the toolbar, the settings subagent picker and the board
+        // "Start agent" popover.
+        import { createPopover } from '/components/popover.js';
+        import {
+            createModelThinkingPicker,
+            createThinkingChips,
+            formatTokenCount,
+            renderModelList,
+        } from '/components/model-picker.js';
+        import {
+            boardTabVisible,
+            handleBoardState,
+            initBoard,
+            refreshBoardStartPicker,
+            requestBoardState,
+        } from '/components/board.js';
+        import {
+            appendTocDot,
+            hideTocTooltip,
+            initToc,
+            rebuildToc,
+            syncTocRailBox,
+            updateTocActive,
+        } from '/components/toc.js';
+        import {
+            USER_TERM_ID,
+            initTerminal,
+            terminalDismissMobile,
+            terminalEnsureUserTab,
+            terminalExit,
+            terminalFitSoon,
+            terminalHideMoreMenu,
+            terminalInterruptAll,
+            terminalOpen,
+            terminalToggleMobile,
+            terminalTogglePanel,
+            terminalUserExited,
+            terminalUserOpened,
+            terminalWrite,
+        } from '/components/terminal.js';
+        // Sidebar session list (components/sessions.js): unified open-pane +
+        // saved-session rows, the delete confirm modal, resume/export.
+        import {
+            deleteSession,
+            exportChat,
+            getLastSessions,
+            initSessions,
+            refreshSidebarSessions,
+            renderSessionList,
+            requestSessionList,
+            resumeSession,
+            setLastSessions,
+            updateCurrentSessionLabel,
+        } from '/components/sessions.js';
+        // Settings modal + all persisted preferences (components/settings.js):
+        // tabbed overlay, server-backed feature/runtime config, MCP test
+        // flow, providers list, theme, editor preferences, notifications,
+        // accent color. The ws dispatch stays here and forwards to the
+        // module's apply*Settings functions.
+        import {
+            applyFeatureSettings,
+            applyMCPSettings,
+            applyProviderSettings,
+            applyRuntimeSettings,
+            closeSettings,
+            diffViewerMode,
+            getNotificationPref,
+            getShowReplyModelPref,
+            initSettings,
+            isSettingsOpen,
+            openSettings,
+            sendNotification,
+            sendRuntimeConfig,
+            setNotificationPref,
+            showMCPTest,
+            showProviderTest,
+        } from '/components/settings.js';
         import { marked } from '/vendor/marked.esm.js';
         import DOMPurify from '/vendor/dompurify.esm.js';
 
-        marked.use({ gfm: true, breaks: true });
+        marked.use({
+            gfm: true,
+            breaks: true,
+            renderer: {
+                // Model/user text is not trusted HTML: a quoted <div id="…">
+                // must display as the literal text <div id="…"> (escaped in
+                // the DOM, decoded on screen and in copy), never become an
+                // element — the same policy user messages already get
+                // (escapeHtml in appendMessage). Raw HTML that passes
+                // through would otherwise render as real elements (and, when
+                // unclosed, nest and compound the 0.9em code font-size in
+                // reasoning cards). Marked-generated tags (fences, emphasis,
+                // links) don't pass through this renderer, so markdown is
+                // unaffected. escapeHtml is imported from /editor.js.
+                html(token) { return escapeHtml(token.text); },
+            },
+        });
 
         const messagesDiv = document.getElementById('messages');
         const inputArea = document.getElementById('message-input');
@@ -58,14 +152,10 @@
         const paletteInput = document.getElementById('command-palette-input');
         const paletteList = document.getElementById('command-palette-list');
         const toastHost = document.getElementById('toast-host');
-        // Conversation TOC rail (one dot per user prompt) and its hover
-        // preview tooltip. Elements always exist in index.html; the rail is
-        // hidden until the first user message renders (.has-dots).
-        const tocRail = document.getElementById('toc-rail');
-        const tocDots = document.getElementById('toc-dots');
-        const tocTooltip = document.getElementById('toc-tooltip');
-        const tocTooltipLabel = document.getElementById('toc-tooltip-label');
-        const tocTooltipBody = document.getElementById('toc-tooltip-body');
+        // The conversation TOC rail (one dot per user prompt) and its
+        // hover preview tooltip live in components/toc.js (initToc
+        // below); the rail is hidden until the first user message
+        // renders (.has-dots).
         // Toolbar elements
         const tbModelBtn = document.getElementById('tb-model-btn');
         const tbModelPopover = document.getElementById('tb-model-popover');
@@ -76,6 +166,9 @@
         const nearCompactBanner = document.getElementById('near-compact-banner');
         const ncbCompactBtn = document.getElementById('ncb-compact-btn');
         const ncbDismissBtn = document.getElementById('ncb-dismiss-btn');
+        const condensedBanner = document.getElementById('condensed-banner');
+        const condensedBannerText = document.getElementById('condensed-banner-text');
+        const condensedBannerDismiss = document.getElementById('condensed-banner-dismiss');
         const tbModeBtn = document.getElementById('tb-mode-btn');
         const tbContextBadge = document.getElementById('tb-context-badge');
 
@@ -87,11 +180,6 @@
         // to the right session's runtime.
         let pendingDeleteApprovals = []; // {approvalId, sessionId, reason, paths}
         let messageRawStore = new WeakMap();
-        // Last sessions payload from the server. The sidebar's single
-        // session list is re-rendered from this cache whenever pane state
-        // (active focus, busy/responding, label) changes, avoiding a
-        // round-trip per state flip.
-        let lastSessions = null;
 
         // Bounded toast stack: a burst of events (copy feedback, connection
         // flips) must not pile an unbounded column over the composer. When
@@ -219,9 +307,7 @@
                 }
                 // Switching to a regular pane on mobile dismisses the
                 // full-screen terminal overlay so it can't cover the chat.
-                if (terminalIsMobile() && terminalPanel.classList.contains('mobile-full')) {
-                    terminalCloseMobile();
-                }
+                terminalDismissMobile();
                 document.querySelectorAll('.main-tab').forEach((b) => b.classList.remove('active'));
                 document.querySelectorAll('.pane').forEach((p) => p.classList.remove('active'));
                 btn.classList.add('active');
@@ -308,44 +394,28 @@
         }
 
         // ── Toolbar: model picker popover ──
-        let tbModelPopoverOpen = false;
         let modelFilterQuery = '';
+        // Shared popover shell (components/popover.js): outside-click +
+        // Escape dismissal; the stylesheet keeps the absolute placement
+        // above the button (fixed: false).
+        const tbModelPopoverCtl = createPopover({
+            el: tbModelPopover,
+            getAnchor: () => tbModelBtn,
+        });
 
         function toggleModelPopover() {
-            tbModelPopoverOpen = !tbModelPopoverOpen;
-            if (tbModelPopoverOpen) {
+            tbModelPopoverCtl.toggle();
+            if (tbModelPopoverCtl.isOpen()) {
                 // Start from a clean slate each time the popover opens.
                 if (tbModelFilter) tbModelFilter.value = '';
                 modelFilterQuery = '';
                 renderToolbarModelList(availableModels, availableModels.find((m) => m.current)?.id || '');
             }
-            tbModelPopover.classList.toggle('open', tbModelPopoverOpen);
         }
 
         function closeModelPopover() {
-            tbModelPopoverOpen = false;
-            tbModelPopover.classList.remove('open');
+            tbModelPopoverCtl.close();
         }
-
-        // Click outside a popover to close it (model + mode pickers). The
-        // toggle buttons stopPropagation, so a click on them never reaches
-        // this document-level handler.
-        document.addEventListener('click', (e) => {
-            if (tbModelPopoverOpen && !tbModelBtn.contains(e.target) && !tbModelPopover.contains(e.target)) {
-                closeModelPopover();
-            }
-            if (tbModePopoverOpen && !tbModePicker.contains(e.target)) {
-                closeModePopover();
-            }
-            // Board "Start agent" popover: close on any outside click (the
-            // card's Start button stops propagation, so clicking it while
-            // the popover is open never reaches here — mirroring the
-            // toolbar popovers).
-            if (boardStartPopoverOpen) {
-                const pop = document.getElementById('board-start-popover');
-                if (pop && !pop.contains(e.target)) closeBoardStartPopover();
-            }
-        });
 
         tbModelFilter?.addEventListener('input', () => {
             modelFilterQuery = tbModelFilter.value.trim().toLowerCase();
@@ -362,92 +432,9 @@
             toggleModelPopover();
         });
 
-        // Non-interactive placeholder row for the model list when there is
-        // nothing to show (catalog not loaded yet, or the filter matched
-        // nothing).
-        function appendEmptyModelRow(listEl, text) {
-            const empty = document.createElement('div');
-            empty.className = 'tb-model-row';
-            empty.textContent = text;
-            empty.style.color = 'var(--fg-muted)';
-            empty.style.fontSize = '0.82em';
-            empty.style.cursor = 'default';
-            listEl.appendChild(empty);
-        }
-
-        // Group header row: the registered provider profile that serves the
-        // models below it (models without a provider tag belong to the
-        // implicit default profile).
-        function appendModelGroupHeader(listEl, name) {
-            const header = document.createElement('div');
-            header.className = 'tb-model-group';
-            header.textContent = name || 'default';
-            listEl.appendChild(header);
-        }
-
-        // buildModelRow renders one model row: description tooltip,
-        // context-limit chip, and the current-model check. onSelect receives
-        // (id, active, event); the caller decides what selecting means.
-        function buildModelRow(m, current, onSelect) {
-            const active = m.id === current || m.current;
-            const row = document.createElement('button');
-            row.className = 'tb-model-row' + (active ? ' active' : '');
-            row.type = 'button';
-            // Hover tooltip: models.dev description of this model.
-            if (m.description) row.title = m.description;
-            const label = document.createElement('span');
-            label.textContent = m.id;
-            row.appendChild(label);
-            if (m.contextLimit) {
-                const limit = document.createElement('span');
-                limit.className = 'tb-model-limit';
-                limit.textContent = formatTokenCount(m.contextLimit);
-                row.appendChild(limit);
-            }
-            if (active) {
-                const check = document.createElement('span');
-                check.className = 'tb-check';
-                check.textContent = '✓';
-                row.appendChild(check);
-            }
-            row.addEventListener('click', (e) => {
-                e.stopPropagation();
-                onSelect(m.id, active, e);
-            });
-            return row;
-        }
-
-        // Shared model-list renderer: grouped by provider, search-filtered,
-        // with the current-model check. Used by the toolbar model popover
-        // (renderToolbarModelList) AND the settings modal's subagent model
-        // picker so both stay identical. extraRows (if any) are appended
-        // before the catalog rows (the picker's "Inherit" row).
-        function renderModelList(listEl, query, filterLabel, models, current, onSelect, extraRows) {
-            if (!listEl) return;
-            listEl.innerHTML = '';
-            for (const el of extraRows || []) listEl.appendChild(el);
-            if (!models || models.length === 0) {
-                appendEmptyModelRow(listEl, 'No models loaded');
-                return;
-            }
-            const q = query;
-            const filtered = q ? models.filter((m) => m.id.toLowerCase().includes(q)) : models;
-            if (filtered.length === 0) {
-                appendEmptyModelRow(listEl, `No models match "${filterLabel}"`);
-                return;
-            }
-            // Group by provider: the server pushes models in profile order
-            // (default first), so consecutive grouping matches the catalog.
-            let lastProvider = null;
-            for (const m of filtered) {
-                const provider = m.provider || 'default';
-                if (provider !== lastProvider) {
-                    appendModelGroupHeader(listEl, provider);
-                    lastProvider = provider;
-                }
-                listEl.appendChild(buildModelRow(m, current, onSelect));
-            }
-        }
+        // The model-list rendering (grouped rows, filter, empty state)
+        // lives in components/model-picker.js — shared with the settings
+        // subagent picker and the board "Start agent" popover.
 
         // Toolbar wrapper: behavior unchanged (per-session set_model +
         // popover close), just routed through the shared renderer.
@@ -463,134 +450,65 @@
             });
         }
 
-        // ── Subagent model picker (Agent settings tab) ──
-        // Reuses the toolbar's model-list rendering (same grouping, filter,
-        // rows). The first row is the "inherit" option: empty value =
-        // subagents use the parent's model. Selections round-trip through
-        // the runtime-config channel (configFields: ["subagentModel"]) so
-        // the server persists and re-broadcasts the value to every tab.
-        let subagentModelValue = ''; // server-pushed current value ('' = inherit)
-        let subagentModelQuery = ''; // modal filter input state
+        // ── Subagent model + reasoning-effort picker (Agent settings tab) ──
+        // The shared ModelThinkingPicker (components/model-picker.js),
+        // configured for the settings tab:
+        // the model list reuses the toolbar's model-list rendering (same
+        // grouping, filter, rows) with a leading "Inherit" row (empty
+        // value = subagents use the parent's model); the effort chips are
+        // model-aware (the selected subagent model's accepted values from
+        // the catalog, the active pane's model values while it is
+        // "Inherit" (the child then runs the parent's model), the default
+        // set as a last resort). Selections round-trip through the
+        // runtime-config channel (configFields: ["subagentModel",
+        // "subagentThinkingLevel"]) so the server persists and
+        // re-broadcasts the values to every tab.
+        const subagentPickerState = { model: '', thinkingLevel: '' }; // server-pushed current values ('' = inherit)
         const subagentModelFilter = document.getElementById('subagent-model-filter');
-        const subagentModelList = document.getElementById('subagent-model-list');
-
-        subagentModelFilter?.addEventListener('input', () => {
-            subagentModelQuery = subagentModelFilter.value.trim().toLowerCase();
-            renderSubagentModelPicker();
+        const subagentPicker = createModelThinkingPicker({
+            listEl: document.getElementById('subagent-model-list'),
+            filterEl: subagentModelFilter,
+            chipsEl: document.getElementById('subagent-thinking-options'),
+            getState: () => subagentPickerState,
+            getModels: () => availableModels,
+            getPane: () => activePane(),
+            defaultRow: { label: 'Inherit (parent\u2019s model)' },
+            inheritChipTitle: "Inherit the parent session's level",
+            stripPaneCurrent: true,
+            onModelChange: (id) => sendRuntimeConfig({ subagentModel: { prop: 'subagentModel', value: id } }),
+            onThinkingChange: (value) => sendRuntimeConfig({ subagentThinkingLevel: { prop: 'subagentThinkingLevel', value } }),
         });
-
-        function renderSubagentModelPicker() {
-            if (!subagentModelList) return;
-            const current = subagentModelValue || '';
-            // The "Inherit (parent's model)" row: the empty value,
-            // highlighted when no default is configured.
-            const inherit = document.createElement('button');
-            inherit.type = 'button';
-            inherit.className = 'tb-model-row' + (current === '' ? ' active' : '');
-            inherit.textContent = 'Inherit (parent\u2019s model)';
-            if (current === '') {
-                const check = document.createElement('span');
-                check.className = 'tb-check';
-                check.textContent = '✓';
-                inherit.appendChild(check);
-            }
-            inherit.addEventListener('click', (e) => {
-                e.stopPropagation();
-                if (current !== '') selectSubagentModel('');
-            });
-            renderModelList(subagentModelList, subagentModelQuery,
-                subagentModelFilter ? subagentModelFilter.value : subagentModelQuery,
-                availableModels, current, (id, active) => {
-                    if (!active) selectSubagentModel(id);
-                }, [inherit]);
-        }
-
-        function selectSubagentModel(id) {
-            subagentModelValue = id || '';
-            renderSubagentModelPicker();
-            sendRuntimeConfig({ subagentModel: { prop: 'subagentModel', value: subagentModelValue } });
-        }
+        subagentModelFilter?.addEventListener('input', () => subagentPicker.render());
 
         // ── Toolbar: thinking level chips ──
-        // Labels for the default reasoning_effort levels (off/low/medium/high).
-        // Values outside the defaults (e.g. a model's "max" from models.dev)
-        // derive their label by title-casing. Chips are rendered from the
-        // ACTIVE model's accepted values (config reasoningEfforts); unknown
-        // models fall back to the default set. The Off chip is always
-        // rendered: the level is off (or empty) whenever no other chip is
-        // selected, and the server then omits reasoning_effort entirely.
-        const THINKING_LABELS = { off: 'Off', low: 'L', medium: 'M', high: 'H' };
-        const DEFAULT_THINKING_EFFORTS = ['low', 'medium', 'high'];
-
-        function thinkingLabel(value) {
-            return THINKING_LABELS[value] || (value ? value[0].toUpperCase() + value.slice(1) : value);
-        }
-
-        function renderThinkingChips(level, efforts, unsupported) {
-            if (!tbThinkingGrid) return;
-            tbThinkingGrid.innerHTML = '';
-            if (unsupported) {
-                // The model definitively has no reasoning-effort control (a
-                // known toggle-only models.dev entry, or a llama.cpp /props
-                // probe that reported no support): hide the chips entirely —
-                // there is nothing to select and nothing would be sent.
-                if (tbThinkingSection) tbThinkingSection.hidden = true;
-                return;
-            }
-            if (tbThinkingSection) tbThinkingSection.hidden = false;
-            const off = !level || level === 'off';
-            // Explicit Off chip: the "no reasoning_effort sent" state.
-            // Active when the level is off/empty. A stored level the model
-            // does not accept (policy B) renders as NO active chip — the
-            // parameter is omitted, so the chips read the truth: nothing
-            // selected = nothing sent.
-            const offChip = document.createElement('button');
-            offChip.className = 'tb-thinking-chip' + (off ? ' active' : '');
-            offChip.type = 'button';
-            offChip.textContent = thinkingLabel('off');
-            offChip.title = off ? 'No reasoning_effort sent' : 'Click to disable reasoning (no reasoning_effort sent)';
-            offChip.addEventListener('click', (e) => {
-                e.stopPropagation();
+        // The chip rendering (Off chip + the model's accepted values,
+        // L/M/H short labels) lives in components/model-picker.js; this
+        // instance sends set_thinking_level on the chat socket.
+        const renderThinkingChips = createThinkingChips({
+            gridEl: tbThinkingGrid,
+            sectionEl: tbThinkingSection,
+            onSelect: (value) => {
                 if (!ws || ws.readyState !== WebSocket.OPEN) return;
-                if (off) return; // already off
-                ws.send(JSON.stringify({ type: 'set_thinking_level', thinkingLevel: 'off', sessionId: activePane().id }));
-            });
-            tbThinkingGrid.appendChild(offChip);
-            const values = (Array.isArray(efforts) && efforts.length > 0) ? efforts : DEFAULT_THINKING_EFFORTS;
-            for (const value of values) {
-                if (value === 'off') continue; // the Off chip above owns that state
-                const chip = document.createElement('button');
-                const label = thinkingLabel(value);
-                chip.className = 'tb-thinking-chip' + (value === level ? ' active' : '');
-                chip.type = 'button';
-                chip.textContent = label;
-                chip.title = value;
-                chip.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-                    // Toggle: clicking the active chip deselects (sends
-                    // 'off' → parameter omitted); clicking another chip
-                    // switches to that value.
-                    const next = value === level ? 'off' : value;
-                    ws.send(JSON.stringify({ type: 'set_thinking_level', thinkingLevel: next, sessionId: activePane().id }));
-                });
-                tbThinkingGrid.appendChild(chip);
-            }
-        }
+                ws.send(JSON.stringify({ type: 'set_thinking_level', thinkingLevel: value, sessionId: activePane().id }));
+            },
+        });
 
         // ── Toolbar: mode selector popover ──
         const tbModePopover = document.getElementById('tb-mode-popover');
         const tbModePicker = document.getElementById('tb-mode-picker');
-        let tbModePopoverOpen = false;
+        // Shared popover shell (components/popover.js); the anchor is the
+        // whole .tb-group so clicks on the button or the list don't close.
+        const tbModePopoverCtl = createPopover({
+            el: tbModePopover,
+            getAnchor: () => tbModePicker,
+        });
 
         function toggleModePopover() {
-            tbModePopoverOpen = !tbModePopoverOpen;
-            tbModePopover.classList.toggle('open', tbModePopoverOpen);
+            tbModePopoverCtl.toggle();
         }
 
         function closeModePopover() {
-            tbModePopoverOpen = false;
-            tbModePopover.classList.remove('open');
+            tbModePopoverCtl.close();
         }
 
         tbModeBtn.addEventListener('click', (e) => {
@@ -632,10 +550,27 @@
             if (!ensureToolbarBadgeNodes()) return;
             const used = (data && data.usedTokens) || 0;
             const limit = (data && data.contextLimit) || 0;
-            if (used <= 0 || limit <= 0) {
+            if (limit <= 0) {
+                // No window size known at all — nothing to render.
                 tbBadgeRing.style.setProperty('--ctx-pct', '0%');
                 if (tbBadgeLabel.nodeValue !== ' —') tbBadgeLabel.nodeValue = ' —';
                 const title = 'Context usage unknown';
+                if (tbBadgeTitle !== title) { tbContextBadge.title = title; tbBadgeTitle = title; }
+                const tone = '';
+                if (tbBadgeTone !== tone) {
+                    tbContextBadge.removeAttribute('data-tone');
+                    tbBadgeTone = tone;
+                }
+                return;
+            }
+            if (used <= 0) {
+                // Window size known but nothing counted yet (fresh session):
+                // show "—/limit" instead of claiming 0% of a window the
+                // system prompt alone already occupies.
+                tbBadgeRing.style.setProperty('--ctx-pct', '0%');
+                const label = ` —/${formatTokenCount(limit)}`;
+                if (tbBadgeLabel.nodeValue !== label) tbBadgeLabel.nodeValue = label;
+                const title = `Context: not yet used / ${limit.toLocaleString()} tokens`;
                 if (tbBadgeTitle !== title) { tbContextBadge.title = title; tbBadgeTitle = title; }
                 const tone = '';
                 if (tbBadgeTone !== tone) {
@@ -665,6 +600,7 @@
             const lines = [];
             lines.push('── Context ──');
             if (d.usedTokens) lines.push(`Used: ${formatTokenCount(d.usedTokens)}`);
+            else if (d.contextLimit) lines.push('Used: — (nothing counted yet)');
             if (d.contextLimit) lines.push(`Limit: ${formatTokenCount(d.contextLimit)}`);
             if (d.promptTokens) lines.push(`Prompt: ${formatTokenCount(d.promptTokens)}`);
             if (d.completionTokens) lines.push(`Completion: ${formatTokenCount(d.completionTokens)}`);
@@ -705,11 +641,11 @@
         });
 
         // ── Command mode indicator ──
+        // inputAreaWrap is declared here; the command-mode class toggle runs
+        // in the single shared input listener registered next to
+        // updateSlashSuggest (one listener for all per-keystroke composer
+        // updates instead of two).
         const inputAreaWrap = document.getElementById('input-area');
-        inputArea.addEventListener('input', () => {
-            const val = inputArea.value;
-            inputAreaWrap.classList.toggle('command-mode', val.startsWith('/') && val.length > 0);
-        });
 
         function updateModeInfo(mode) {
             currentMode = (mode || 'act').toLowerCase();
@@ -720,14 +656,6 @@
             document.querySelectorAll('#tb-mode-list .tb-model-row').forEach((r) => {
                 r.classList.toggle('active', r.dataset.mode === currentMode);
             });
-        }
-
-        function formatTokenCount(n, zeroText = '—') {
-            if (!n || n <= 0) return zeroText;
-            if (n < 1000) return String(n);
-            const whole = Math.floor(n / 1000);
-            const frac = Math.floor((n % 1000) / 100);
-            return frac === 0 ? `${whole}k` : `${whole}.${frac}k`;
         }
 
         let availableModels = [];
@@ -773,8 +701,11 @@
             // The board "Start agent" popover renders from the same
             // catalog — refresh it while open so a late list_models reply
             // is not stuck on "No models loaded" (same pattern as the
-            // settings subagent picker).
-            if (boardStartPopoverOpen) renderBoardStartModelList();
+            // settings subagent picker). The picker's refresh re-runs the
+            // shared model-aware effort guard: a stored effort the model
+            // does not accept is now knowable, so it resets to "Inherit"
+            // before re-rendering (the server re-validates at start).
+            refreshBoardStartPicker();
             // Extract pricing for the active model
             currentModelPricing = modelPricing(
                 active && active.inputPricePer1M,
@@ -834,6 +765,13 @@
         ncbDismissBtn?.addEventListener('click', () => {
             nearCompactDismissed = true;
             nearCompactBanner.hidden = true;
+        });
+
+        // Phase 0e condensation banner: dismissible; a new condensation
+        // re-shows it (the server sends a fresh "condensed" message each
+        // time a message is condensed).
+        condensedBannerDismiss?.addEventListener('click', () => {
+            condensedBanner.hidden = true;
         });
 
         function updateContextInfo(data) {
@@ -916,56 +854,6 @@
             if (document.getElementById('editor-pane').classList.contains('active')) {
                 refreshExplorer().catch(() => {});
             }
-        }
-
-        // ── Feature settings (board / subagents) ──
-        // Server-backed: the settings-modal controls and the board tab
-        // visibility follow the config push (data.board / data.subagent /
-        // data.subagentMaxDepth), so every tab stays in sync without
-        // localStorage. Toggling board off while the board pane is the
-        // active view falls back to chat; the board data is untouched.
-        function applyFeatureSettings(data) {
-            const boardOn = data.board === 'on';
-            const subagentOn = data.subagent === 'on';
-            const boardTab = document.getElementById('board-tab');
-            const wasVisible = boardTab && !boardTab.hidden;
-            if (boardTab && boardTab.hidden === boardOn) boardTab.hidden = !boardOn;
-            const boardSel = document.getElementById('board-enabled-select');
-            if (boardSel && boardSel.value !== (boardOn ? 'on' : 'off')) boardSel.value = boardOn ? 'on' : 'off';
-            // The board agent prompt is meaningful only while the board
-            // feature is on (like the subagent model picker).
-            const boardPromptRow = document.getElementById('board-prompt-row');
-            if (boardPromptRow) boardPromptRow.hidden = !boardOn;
-            const subSel = document.getElementById('subagent-enabled-select');
-            if (subSel && subSel.value !== (subagentOn ? 'on' : 'off')) subSel.value = subagentOn ? 'on' : 'off';
-            const depthInput = document.getElementById('subagent-depth-input');
-            if (depthInput && data.subagentMaxDepth > 0 && String(depthInput.value) !== String(data.subagentMaxDepth)) {
-                depthInput.value = String(data.subagentMaxDepth);
-            }
-            if (boardOn && !wasVisible) requestBoardState();
-            if (!boardOn) {
-                const boardPane = document.getElementById('board-pane');
-                if (boardPane && boardPane.classList.contains('active')) switchMainPane('chat');
-            }
-            // The subagent model picker is meaningful only while subagents
-            // are enabled.
-            const subModelPicker = document.getElementById('subagent-model-picker');
-            if (subModelPicker) subModelPicker.hidden = !subagentOn;
-            if (subagentOn && !subModelPicker.hidden && settingsOverlay.classList.contains('active')
-                && (!availableModels || availableModels.length === 0)
-                && ws && ws.readyState === WebSocket.OPEN) {
-                // Just enabled while the modal is open: fetch the catalog so
-                // the picker is not stuck on "No models loaded".
-                ws.send(JSON.stringify({ type: 'list_models' }));
-            }
-        }
-
-        // Sends a feature-setting change over the existing config WS message
-        // (the same channel the server uses to push config to us).
-        function sendFeatureConfig(fields) {
-            if (!ws || ws.readyState !== WebSocket.OPEN) return;
-            const pane = activePane();
-            ws.send(JSON.stringify(Object.assign({ type: 'config', sessionId: pane ? pane.id || '' : '' }, fields)));
         }
 
         function clearChat() {
@@ -1065,7 +953,9 @@
         // Error text of the most recent turn's failed model reply (a `response`
         // message whose content starts with "Error:"). Consumed by setTurnActive
         // to fire an error-specific turn-end notification instead of the generic
-        // "Agent finished responding." one; cleared when a new turn starts.
+        // "Agent finished responding." one, and by handleResponse to notify
+        // directly for failures that never became an active turn; cleared when
+        // a new turn starts.
         let lastTurnError = null;
         let ws;
         let reconnectTimer;
@@ -1854,12 +1744,6 @@
             return DOMPurify.sanitize(raw, { USE_PROFILES: { html: true } });
         }
 
-        /** Escape HTML entities so tags are displayed as plain text. */
-        function escapeHtml(str) {
-            const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-            return (str || '').replace(/[&<>"']/g, (ch) => map[ch]);
-        }
-
         function enhanceCodeBlocksWithCopy(root) {
             if (!root || !root.querySelectorAll) return;
             root.querySelectorAll('pre').forEach((pre) => {
@@ -1890,10 +1774,34 @@
             });
         }
 
-        // Colorize runs on the same cadence as markdown; stale async runs are dropped via _gogenHlGen.
+        // Shared post-render pipeline for a markdown node: the (sanitized)
+        // HTML, copy buttons, and Monaco colorize. Cached tokenized blocks
+        // inline synchronously (one DOM write, no async); uncached ones
+        // colorize in the background (colorizeNode). `linkify` is enabled
+        // only for full single-shot renders — the streaming path linkifies
+        // once at stream end via setMessageMarkdown. `streamingTail` marks
+        // the in-flight tail render (content still growing, node re-rendered
+        // every flush): uncached code still tokenizes in the background so
+        // the block stays colorized as it streams (the pre-optimization
+        // behavior), but in the no-cache mode — no LRU writes for a source
+        // that is still growing, stale results dropped by element identity
+        // and text match.
+        function renderBlockNode(node, blockText, opts) {
+            node.innerHTML = renderMarkdownHTML(blockText);
+            enhanceCodeBlocksWithCopy(node);
+            colorizeNode(node, { streamingTail: !!(opts && opts.streamingTail) });
+            if (opts && opts.linkify) linkifyMessageRefs(node);
+        }
+
+        // Full single-shot render (stream end, history replay, edit/resend,
+        // thinking finalize). The WHOLE text goes through marked at once:
+        // per-block renders (renderStreamMarkdown) can split lists at blank
+        // lines, and this pass is the artifact corrector. The block cache
+        // from a prior streaming phase must be dropped — its nodes are
+        // detached by the innerHTML wipe below, and renderStreamMarkdown's
+        // index-based reconciliation would otherwise trust stale entries.
         function setMessageMarkdown(el, text) {
             el.classList.add('md');
-            el._gogenHlGen = (el._gogenHlGen || 0) + 1;
             // Wrap rendered content in a child element so edit-resend can
             // hide/show it without touching appended buttons.
             let textWrap = el.querySelector('.msg-text');
@@ -1902,11 +1810,9 @@
                 textWrap.className = 'msg-text';
                 el.appendChild(textWrap);
             }
-            textWrap.innerHTML = renderMarkdownHTML(text);
+            delete el._gogenBlocks;
             messageRawStore.set(el, text);
-            enhanceCodeBlocksWithCopy(textWrap);
-            linkifyMessageRefs(textWrap);
-            colorizeCodeBlocks(textWrap);
+            renderBlockNode(textWrap, text, { linkify: true });
         }
 
         /**
@@ -2009,7 +1915,6 @@
         // and history replay behave identically.
         function renderStreamMarkdown(el, text) {
             el.classList.add('md');
-            el._gogenHlGen = (el._gogenHlGen || 0) + 1;
             let textWrap = el.querySelector('.msg-text');
             if (!textWrap) {
                 textWrap = document.createElement('div');
@@ -2021,44 +1926,57 @@
             // The last block is the in-flight tail; everything before it is complete.
             const doneCount = blocks.length > 0 ? blocks.length - 1 : 0;
 
-            // Completed blocks: keep stable nodes for unchanged text, render
-            // new ones. New nodes are inserted before the tail node so DOM
-            // order always matches document order.
-            for (let i = 0; i < doneCount; i++) {
-                const prev = st.done[i];
-                if (prev && prev.text === blocks[i]) continue;
-                const node = document.createElement('div');
-                node.className = 'md-block';
-                node.innerHTML = renderMarkdownHTML(blocks[i]);
-                if (prev) {
-                    prev.node.replaceWith(node);
-                    st.done[i] = { text: blocks[i], node };
-                } else if (st.tailNode) {
-                    textWrap.insertBefore(node, st.tailNode);
-                    st.done.push({ text: blocks[i], node });
-                } else {
-                    textWrap.appendChild(node);
-                    st.done.push({ text: blocks[i], node });
-                }
-            }
-            // Drop completed blocks that no longer exist (text rewound — this is
-            // defensive; streaming only ever grows).
-            while (st.done.length > doneCount) {
-                st.done.pop().node.remove();
+            // Reconciliation is index-based, not text-based: the streaming
+            // text for a given element is append-only (appendStreamToken
+            // appends; rewinds start a fresh element), so splitStreamBlocks
+            // is prefix-stable and completed blocks before the cached count
+            // can never change — only indices >= st.done.length are new
+            // (promoted tails). The guards cover the ways the cache can go
+            // stale: a rewind (doneCount shrank — old nodes are removed and
+            // everything re-renders), a full re-render that detached the
+            // nodes while the cache survived (setMessageMarkdown deletes it,
+            // but an isConnected check keeps this safe for any future
+            // caller), or a same-length content rewrite — impossible under
+            // the append-only invariant, but the stored-text comparison
+            // makes the reconciliation safe even if a future caller breaks
+            // it (the per-entry text kept in st.done is the record of what
+            // each stable node rendered).
+            const textStale = doneCount >= st.done.length
+                && st.done.some((entry, i) => entry.text !== blocks[i]);
+            if (doneCount < st.done.length || textStale
+                || (st.done.length && !st.done[0].node.isConnected)) {
+                for (const entry of st.done) entry.node.remove();
+                st.done = [];
             }
 
-            // Tail: one stable node, re-rendered every flush.
+            // Completed blocks: render only the new ones, inserted before the
+            // tail node so DOM order always matches document order.
+            for (let i = st.done.length; i < doneCount; i++) {
+                const node = document.createElement('div');
+                node.className = 'md-block';
+                renderBlockNode(node, blocks[i], { linkify: false });
+                if (st.tailNode) {
+                    textWrap.insertBefore(node, st.tailNode);
+                } else {
+                    textWrap.appendChild(node);
+                }
+                st.done.push({ text: blocks[i], node });
+            }
+
+            // Tail: one stable node, re-rendered every flush. Markdown and
+            // copy buttons re-run here; colorize re-tokenizes the tail's
+            // uncached code every flush (streamingTail mode: no LRU writes,
+            // stale results dropped) so streaming code stays colorized as it
+            // grows — the UX the pre-optimization code provided.
             const tailText = doneCount < blocks.length ? blocks[doneCount] : '';
             if (!st.tailNode) {
                 st.tailNode = document.createElement('div');
                 st.tailNode.className = 'md-block md-tail';
                 textWrap.appendChild(st.tailNode);
             }
-            st.tailNode.innerHTML = tailText ? renderMarkdownHTML(tailText) : '';
+            renderBlockNode(st.tailNode, tailText, { linkify: false, streamingTail: true });
 
             messageRawStore.set(el, text);
-            enhanceCodeBlocksWithCopy(textWrap);
-            colorizeCodeBlocks(textWrap);
         }
 
         // ===== Message timestamps =====
@@ -2131,17 +2049,15 @@
         // === Reply-model attribution (Settings → Chat → "Show reply model") ===
         // The provider-reported model is kept in dataset.model regardless of
         // the preference so toggling the setting later can show chips on
-        // already-rendered bubbles without refetching history.
-        function replyModelPref() {
-            return (localStorage.getItem('gogen_show_reply_model') || 'off') === 'on';
-        }
-
+        // already-rendered bubbles without refetching history. The
+        // preference itself lives in components/settings.js
+        // (getShowReplyModelPref).
         // Adds or removes the model chip on one assistant message element.
         function applyReplyModelChip(msgDiv) {
             if (!msgDiv || !msgDiv.dataset) return;
             const model = msgDiv.dataset.model || '';
             const chip = msgDiv.querySelector('.msg-model');
-            if (!model || !replyModelPref()) {
+            if (!model || !getShowReplyModelPref()) {
                 if (chip) chip.remove();
                 return;
             }
@@ -2958,23 +2874,25 @@
             const live = ensureToolCardLiveOutput(cardInfo);
             if (cardInfo.liveOutputTruncated) return;
             if (cardInfo.liveOutputText.length + chunk.length > TOOL_CARD_LIVE_OUTPUT_LIMIT) {
-                cardInfo.liveOutputText += '\n… output truncated in card (see terminal tab for the full log)';
+                chunk = '\n… output truncated in card (see terminal tab for the full log)';
                 cardInfo.liveOutputTruncated = true;
-            } else {
-                cardInfo.liveOutputText += chunk;
             }
-            live.textContent = cardInfo.liveOutputText;
+            cardInfo.liveOutputText += chunk;
+            // Incremental append instead of a full-buffer rewrite: chatty
+            // commands stream ~30 frames/sec and the buffer can hold the
+            // full 128 KB cap, so `live.textContent = liveOutputText`
+            // re-serialized the entire buffer (and forced a layout) on
+            // every frame. The DOM mirrors exactly what was appended, so
+            // textContent stays byte-identical to liveOutputText.
+            const last = live.lastChild;
+            if (last && last.nodeType === Node.TEXT_NODE) {
+                last.data += chunk;
+            } else {
+                live.appendChild(document.createTextNode(chunk));
+            }
             // Keep the newest output in view, like a terminal.
             live.scrollTop = live.scrollHeight;
             scheduleRepinIfPinned();
-        }
-
-        // The chat diff viewer is either a static line-numbered <pre>
-        // (default) or a full Monaco editor — a user setting
-        // (gogen_chat_diff_viewer). Reads localStorage directly so it works
-        // regardless of when the settings UI initializes.
-        function diffViewerMode() {
-            return localStorage.getItem('gogen_chat_diff_viewer') === 'monaco' ? 'monaco' : 'tokenizer';
         }
 
         // The chat diff host is a fixed-height box in Monaco mode (the editor
@@ -3445,685 +3363,9 @@
         }
 
         // ===== Terminal panel =====
-        // A docked strip at the bottom of the page (collapsed by default) with
-        // terminal tabs: a pinned interactive "User" shell (the default
-        // terminal) plus one read-only tab per agent command (execute_command,
-        // run_tests, run_lint) streaming live output. On mobile the dock is
-        // replaced by the "Terminal" header tab (full-screen).
-        const terminalPanel = document.getElementById('terminal-panel');
-        const terminalBody = document.getElementById('terminal-body');
-        const terminalTabsEl = document.getElementById('terminal-tabs');
-        const terminalChevron = document.getElementById('terminal-chevron');
-        const terminalResizeHandle = document.getElementById('terminal-resize-handle');
-        const terminalTabBtn = document.getElementById('terminal-tab');
-        const terminalTabBadge = document.getElementById('terminal-tab-badge');
-        const terminalHint = document.getElementById('terminal-hint');
-        const terminalMoreBtn = document.getElementById('terminal-more');
-        const terminalMoreMenu = document.getElementById('terminal-more-menu');
-
-        const TERM_STORE_KEY = 'gogen.terminalPanel.v1';
-        const TERM_MAX_TABS = 8;
-        const TERM_MIN_HEIGHT = 120;
-        const TERM_MAX_HEIGHT_RATIO = 0.7;
-        const TERM_DEFAULT_HEIGHT = 280;
-        const USER_TERM_ID = 'user';
-
-        const terminals = new Map(); // termId -> {id, tab, host, term, fit, statusEl, titleEl, restartEl, closable, user, done, success}
-        let terminalActiveId = null;
-        let userTermState = 'spawning'; // spawning | ready | dead
-        let userTermFocused = false;
-        let terminalExpanded = false;
-        let terminalHeight = TERM_DEFAULT_HEIGHT;
-        // True when xterm.js failed to load/init; the strip then shows the
-        // fallback hint instead of looking silently broken.
-        let terminalLoadFailed = false;
-        try {
-            const stored = JSON.parse(localStorage.getItem(TERM_STORE_KEY) || '{}');
-            terminalExpanded = !!stored.expanded;
-            if (Number.isFinite(stored.height) && stored.height >= TERM_MIN_HEIGHT) {
-                // The height is only capped at drag time; a stored height from a
-                // taller window must not be reapplied unclamped on load, or the
-                // panel overflows the body (which is fixed at 100vh).
-                terminalHeight = Math.min(stored.height, terminalMaxHeight());
-            }
-        } catch (_) { /* corrupt storage — keep defaults */ }
-
-        function terminalMaxHeight() {
-            return Math.round(window.innerHeight * TERM_MAX_HEIGHT_RATIO);
-        }
-
-        function terminalSaveState() {
-            try {
-                localStorage.setItem(TERM_STORE_KEY, JSON.stringify({
-                    expanded: terminalExpanded,
-                    height: terminalHeight,
-                }));
-            } catch (_) {}
-        }
-
-        // The strip docks below the chat input bar, so the scroll-to-bottom
-        // button must clear it to hover over the messages area. Publish the
-        // strip's live height as --terminal-strip-h (read by #scroll-bottom-btn
-        // in styles.css). While the chat pane is hidden (editor pane active,
-        // or mobile) the height is 0 and the button returns to its base
-        // offset; a ResizeObserver keeps the variable fresh on pane switches.
-        function terminalRefreshStripVar() {
-            document.documentElement.style.setProperty(
-                '--terminal-strip-h', terminalPanel.offsetHeight + 'px'
-            );
-        }
-
-        function terminalIsMobile() {
-            return window.matchMedia('(max-width: 767px)').matches;
-        }
-
-        function terminalTheme() {
-            const cs = getComputedStyle(document.documentElement);
-            return {
-                background: cs.getPropertyValue('--bg').trim() || '#1e1e1e',
-                foreground: cs.getPropertyValue('--fg').trim() || '#d4d4d4',
-                cursor: cs.getPropertyValue('--accent').trim() || '#569cd6',
-            };
-        }
-
-        function terminalFit() {
-            // Only fit when the terminal body is actually laid out; hidden or
-            // zero-sized containers make xterm report bogus dimensions.
-            if (!terminalPanel.classList.contains('expanded')) return;
-            // The strip now lives inside the chat pane; when another pane is
-            // active the panel is display:none and xterm would measure 0.
-            if (!terminalPanel.getClientRects().length) return;
-            const t = terminals.get(terminalActiveId);
-            if (!t || !t.fit) return;
-            try {
-                let dims = t.fit.proposeDimensions();
-                if (!dims && t.term) {
-                    // The terminal may have been opened while its container was
-                    // hidden (collapsed panel), leaving xterm's char-size
-                    // measurement at 0. Fit then refuses to do anything and the
-                    // screen keeps its default 80x24 size, spilling past the
-                    // panel. Resize with the current size to force a re-measure
-                    // now that the panel is laid out, then fit for real.
-                    t.term.resize(t.term.cols, t.term.rows);
-                    dims = t.fit.proposeDimensions();
-                }
-                if (dims) t.fit.fit();
-                if (t.user) terminalSendResize(t);
-            } catch (_) {}
-        }
-
-        let terminalFitRaf = 0;
-        function terminalFitSoon() {
-            if (terminalFitRaf) return;
-            terminalFitRaf = requestAnimationFrame(() => {
-                terminalFitRaf = 0;
-                terminalFit();
-            });
-        }
-
-        function terminalSetExpanded(expanded) {
-            terminalExpanded = expanded;
-            terminalPanel.classList.toggle('expanded', expanded);
-            if (expanded) {
-                terminalHeight = Math.min(terminalHeight, terminalMaxHeight());
-                // The mobile overlay is positioned with top/bottom, so a pixel
-                // height would override bottom and shrink it to a small strip.
-                if (!terminalPanel.classList.contains('mobile-full')) {
-                    terminalPanel.style.height = terminalHeight + 'px';
-                }
-            } else {
-                terminalPanel.style.height = '';
-            }
-            terminalChevron.textContent = expanded ? '▾' : '▴';
-            terminalSaveState();
-            terminalRefreshStripVar();
-            if (expanded) {
-                terminalFitSoon();
-            } else if (terminalIsMobile()) {
-                terminalCloseMobile();
-            }
-        }
-
-        function terminalUpdateHint() {
-            // Only the genuine failure case gets the fallback message: an
-            // empty strip (no tabs yet, or all agent tabs closed) is normal
-            // and shows nothing.
-            terminalHint.style.display = (terminalLoadFailed && terminals.size === 0) ? '' : 'none';
-        }
-
-        // Creates a terminal tab and its xterm instance. opts:
-        //   title/tooltip — tab label + hover text
-        //   closable      — show a close button (agent tabs yes, user tab no)
-        //   user          — interactive terminal (stdin enabled) vs read-only
-        function terminalCreateTab(id, opts = {}) {
-            const tab = document.createElement('div');
-            tab.className = 'term-tab active' + (opts.user ? ' user-tab' : '');
-            tab.title = opts.tooltip || opts.title || '';
-            const titleEl = document.createElement('span');
-            titleEl.className = 'term-tab-title';
-            titleEl.textContent = opts.title || id;
-            const statusEl = document.createElement('span');
-            statusEl.className = 'term-tab-status';
-            const restartEl = document.createElement('span');
-            restartEl.className = 'term-tab-restart';
-            restartEl.textContent = '↻';
-            restartEl.title = 'Restart shell';
-            restartEl.hidden = true;
-            restartEl.addEventListener('click', (e) => {
-                e.stopPropagation();
-                terminalRestartUser();
-            });
-            const closeEl = document.createElement('span');
-            closeEl.className = 'term-tab-close';
-            closeEl.textContent = '✕';
-            if (opts.closable === false) {
-                closeEl.style.display = 'none';
-            } else {
-                closeEl.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    terminalClose(id);
-                });
-            }
-            tab.appendChild(titleEl);
-            tab.appendChild(statusEl);
-            tab.appendChild(restartEl);
-            tab.appendChild(closeEl);
-            tab.addEventListener('click', () => terminalSelectAndFocus(id));
-            terminalTabsEl.appendChild(tab);
-
-            const host = document.createElement('div');
-            host.className = 'term-host';
-            const inst = document.createElement('div');
-            inst.className = 'term-instance';
-            host.appendChild(inst);
-            terminalBody.appendChild(host);
-
-            const term = new Terminal({
-                disableStdin: !opts.user, // agent tabs are read-only mirrors
-                cursorBlink: !!opts.user,
-                convertEol: true,
-                scrollback: 2000,
-                fontSize: 12,
-                fontFamily: getComputedStyle(document.documentElement)
-                    .getPropertyValue('--mono').trim() || 'monospace',
-                theme: terminalTheme(),
-            });
-            let fit = null;
-            try {
-                const FA = (window.FitAddon && window.FitAddon.FitAddon) || window.FitAddon;
-                if (FA) {
-                    fit = new FA();
-                    term.loadAddon(fit);
-                }
-            } catch (_) {}
-            if (opts.user) {
-                term.onData((d) => {
-                    if (userTermState === 'ready' && ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({ type: 'user_term_input', content: d }));
-                    }
-                });
-            }
-            term.open(inst);
-            if (opts.user) {
-                // xterm >= 6.0.0 removed onFocus/onBlur from the public
-                // Terminal API; the textarea (created by open()) is public
-                // and stable across versions, so track focus via its DOM
-                // events (falling back to the typed events on older xterm).
-                const markFocused = () => { userTermFocused = true; };
-                const markBlurred = () => { userTermFocused = false; };
-                if (typeof term.onFocus === 'function' && typeof term.onBlur === 'function') {
-                    term.onFocus(markFocused);
-                    term.onBlur(markBlurred);
-                } else if (term.textarea) {
-                    term.textarea.addEventListener('focus', markFocused);
-                    term.textarea.addEventListener('blur', markBlurred);
-                }
-            }
-
-            const entry = {
-                id,
-                tab,
-                host,
-                term,
-                fit,
-                statusEl,
-                titleEl,
-                restartEl,
-                closable: opts.closable !== false,
-                user: !!opts.user,
-                done: false,
-                success: false,
-            };
-            terminals.set(id, entry);
-            return entry;
-        }
-
-        // Opens a read-only tab for one agent tool command.
-        function terminalOpen(id, name, title) {
-            if (terminals.has(id)) return;
-            if (typeof window.Terminal !== 'function') {
-                // xterm failed to load — degrade gracefully, the chat tool
-                // cards still show the full result.
-                console.error('xterm.js not loaded; terminal tabs disabled');
-                return;
-            }
-            terminalPrune();
-            const t = terminalCreateTab(id, { title: title || id, closable: true, user: false });
-            // Echo the command like a shell prompt (title already includes "$ ").
-            try { t.term.write('\x1b[90m' + (title || '') + '\x1b[0m\r\n'); } catch (_) {}
-            // Select the new tab unless the user is actively typing in their
-            // own terminal — don't yank focus away mid-command.
-            if (!userTermFocused) terminalSelect(id);
-            terminalUpdateHint();
-            terminalFlashTab(id);
-            terminalUpdateBadge();
-            terminalMoreRender();
-        }
-
-        // The pinned default terminal: created on load, interactive, never
-        // pruned. It exists client-side regardless of the server shell state;
-        // user_term_opened/exit drive its ready/dead states.
-        function terminalEnsureUserTab() {
-            if (terminals.has(USER_TERM_ID)) return;
-            if (typeof window.Terminal !== 'function') return;
-            terminalCreateTab(USER_TERM_ID, {
-                title: 'starting…',
-                tooltip: 'User shell (interactive)',
-                closable: false,
-                user: true,
-            });
-            terminalSelect(USER_TERM_ID);
-            terminalUpdateHint();
-            terminalUpdateBadge();
-            terminalMoreRender();
-        }
-
-        function terminalUserOpened(title, wd) {
-            terminalEnsureUserTab();
-            const t = terminals.get(USER_TERM_ID);
-            if (!t) return;
-            userTermState = 'ready';
-            t.titleEl.textContent = title || 'shell';
-            t.tab.title = wd ? (title || 'shell') + ' — ' + wd : (title || 'shell');
-            t.restartEl.hidden = true;
-            t.done = false;
-            t.statusEl.textContent = '';
-            t.statusEl.className = 'term-tab-status';
-            terminalSendResize(t);
-            terminalUpdateBadge();
-            terminalMoreRender();
-        }
-
-        function terminalUserExited(code) {
-            const t = terminals.get(USER_TERM_ID);
-            userTermState = 'dead';
-            if (!t) return;
-            t.done = true;
-            t.success = code === 0;
-            t.tab.classList.add('done');
-            t.statusEl.textContent = t.success ? '✓' : '✗';
-            t.statusEl.classList.add(t.success ? 'ok' : 'err');
-            t.restartEl.hidden = false;
-            try {
-                t.term.write('\r\n\x1b[90m[' + (t.success ? 'exited' : 'exited (' + code + ')') + ' — click ↻ to restart]\x1b[0m');
-            } catch (_) {}
-            terminalUpdateBadge();
-            terminalMoreRender();
-        }
-
-        function terminalRestartUser() {
-            if (userTermState !== 'dead') return;
-            userTermState = 'spawning';
-            const t = terminals.get(USER_TERM_ID);
-            if (t) {
-                t.done = false;
-                t.tab.classList.remove('done');
-                t.statusEl.textContent = '…';
-                t.statusEl.className = 'term-tab-status';
-                t.restartEl.hidden = true;
-            }
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'user_term_request' }));
-            }
-        }
-
-        // Sends the fitted terminal size to the server for the user shell.
-        function terminalSendResize(t) {
-            if (!t || !t.fit || !t.term || userTermState !== 'ready') return;
-            // While the panel is collapsed the terminal has no layout; a resize
-            // here would report a bogus 1-row x 2-col size to the shell.
-            if (!terminalPanel.classList.contains('expanded')) return;
-            // Same for a panel hidden behind an inactive pane (editor view).
-            if (!terminalPanel.getClientRects().length) return;
-            try {
-                const dims = t.fit.proposeDimensions();
-                if (dims && dims.cols > 0 && dims.rows > 0 && ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify({
-                        type: 'user_term_resize',
-                        cols: Math.max(2, Math.round(dims.cols)),
-                        rows: Math.max(2, Math.round(dims.rows)),
-                    }));
-                }
-            } catch (_) {}
-        }
-
-        function terminalWrite(id, chunk) {
-            const t = terminals.get(id);
-            if (!t || !chunk || t.done) return;
-            try { t.term.write(chunk); } catch (_) {}
-        }
-
-        function terminalExit(id, success) {
-            const t = terminals.get(id);
-            if (!t || t.done) return;
-            t.done = true;
-            t.success = success;
-            t.tab.classList.add('done');
-            t.statusEl.textContent = success ? '✓' : '✗';
-            t.statusEl.classList.add(success ? 'ok' : 'err');
-            try {
-                t.term.write('\r\n\x1b[90m[' + (success ? 'exit 0' : 'failed') + ']\x1b[0m');
-            } catch (_) {}
-            terminalUpdateBadge();
-            terminalMoreRender();
-        }
-
-        function terminalSelect(id) {
-            terminalActiveId = id;
-            for (const [tid, t] of terminals) {
-                t.tab.classList.toggle('active', tid === id);
-                t.host.style.display = tid === id ? '' : 'none';
-                if (tid !== id && t.user && t.term) {
-                    // Blur the interactive terminal so keystrokes don't keep
-                    // flowing into a hidden tab.
-                    try { t.term.blur(); } catch (_) {}
-                }
-            }
-            const t = terminals.get(id);
-            if (t && t.user && userTermState === 'ready') terminalSendResize(t);
-            terminalMoreRender();
-            terminalFitSoon();
-        }
-
-        function terminalSelectAndFocus(id) {
-            terminalSelect(id);
-            const t = terminals.get(id);
-            if (t && t.user && userTermState === 'ready' && t.term) {
-                try { t.term.focus(); } catch (_) {}
-            }
-        }
-
-        function terminalClose(id) {
-            const t = terminals.get(id);
-            if (!t) return;
-            try { t.term.dispose(); } catch (_) {}
-            t.tab.remove();
-            t.host.remove();
-            terminals.delete(id);
-            if (terminalActiveId === id) {
-                terminalActiveId = null;
-                const remaining = [...terminals.keys()];
-                if (remaining.length > 0) terminalSelect(remaining[remaining.length - 1]);
-            }
-            terminalUpdateHint();
-            terminalUpdateBadge();
-            terminalMoreRender();
-        }
-
-        // Keep the tab strip tidy: when over the cap, auto-close the oldest
-        // finished tabs (their full output stays in the chat tool card). The
-        // pinned user tab is never pruned.
-        function terminalPrune() {
-            if (terminals.size < TERM_MAX_TABS) return;
-            for (const [id, t] of terminals) {
-                if (terminals.size < TERM_MAX_TABS) break;
-                if (t.done && id !== USER_TERM_ID) terminalClose(id);
-            }
-        }
-
-        function terminalFlashTab(id) {
-            const t = terminals.get(id);
-            if (!t) return;
-            t.tab.classList.remove('flash');
-            void t.tab.offsetWidth; // restart the animation
-            t.tab.classList.add('flash');
-            setTimeout(() => t.tab.classList.remove('flash'), 900);
-        }
-
-        // Badge on the mobile "Terminal" header tab: number of running agent
-        // commands, shown only while the terminal panel itself is hidden.
-        function terminalUpdateBadge() {
-            if (!terminalTabBadge) return;
-            // Count running AGENT commands only — the user shell is always
-            // "not done" but shouldn't keep the badge lit.
-            const running = [...terminals.values()].filter((t) => !t.done && t.id !== USER_TERM_ID).length;
-            const visible = terminalIsMobile()
-                ? terminalPanel.classList.contains('mobile-full')
-                : true;
-            terminalTabBadge.hidden = !(running > 0 && !visible);
-            terminalTabBadge.textContent = running > 0 ? String(running) : '';
-            terminalTabBadge.classList.toggle('pulse', running > 0 && !visible);
-        }
-
-        // WS closed mid-command: the server will never finish these tabs, so
-        // mark every still-running one as interrupted so the UI isn't stuck.
-        // The user shell is also killed server-side on disconnect — show it
-        // as dead with a restart affordance (revived on reconnect's opened).
-        function terminalInterruptAll() {
-            for (const id of [...terminals.keys()]) {
-                if (id === USER_TERM_ID) terminalUserExited(-1);
-                else terminalExit(id, false);
-            }
-        }
-
-        // ===== Overflow: '»' dropdown + wheel scrolling =====
-        // The tab strip clips when many agent terminals accumulate; the '»'
-        // menu keeps every terminal selectable (and closable) regardless of
-        // how many there are. Shown once more than the user tab exists.
-        function terminalMoreRender() {
-            if (!terminalMoreBtn || !terminalMoreMenu) return;
-            terminalMoreBtn.hidden = terminals.size < 2;
-            if (terminals.size < 2) {
-                terminalMoreMenu.hidden = true;
-                return;
-            }
-            terminalMoreMenu.innerHTML = '';
-            for (const [id, t] of terminals) {
-                const row = document.createElement('div');
-                row.className = 'term-more-row' + (id === terminalActiveId ? ' active' : '');
-                const status = document.createElement('span');
-                status.className = 'term-more-status'
-                    + (t.done ? (t.success ? ' ok' : ' err') : ' running');
-                status.textContent = t.done ? (t.success ? '✓' : '✗') : '●';
-                const title = document.createElement('span');
-                title.className = 'term-more-title';
-                title.textContent = t.titleEl.textContent;
-                title.title = t.tab.title || t.titleEl.textContent;
-                row.appendChild(status);
-                row.appendChild(title);
-                if (t.closable) {
-                    const close = document.createElement('span');
-                    close.className = 'term-more-close';
-                    close.textContent = '✕';
-                    close.title = 'Close terminal';
-                    close.addEventListener('click', (e) => {
-                        e.stopPropagation();
-                        terminalClose(id);
-                    });
-                    row.appendChild(close);
-                }
-                row.addEventListener('click', () => {
-                    terminalSelectAndFocus(id);
-                    terminalMoreMenu.hidden = true;
-                });
-                terminalMoreMenu.appendChild(row);
-            }
-        }
-
-        function terminalMoreToggle() {
-            if (!terminalMoreMenu) return;
-            if (terminalMoreMenu.hidden) {
-                terminalMoreRender();
-                terminalMoreMenu.hidden = false;
-            } else {
-                terminalMoreMenu.hidden = true;
-            }
-        }
-
-        if (terminalMoreBtn) {
-            terminalMoreBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                terminalMoreToggle();
-            });
-        }
-        document.addEventListener('click', (e) => {
-            if (terminalMoreMenu && !terminalMoreMenu.hidden
-                && !terminalMoreMenu.contains(e.target)
-                && e.target !== terminalMoreBtn) {
-                terminalMoreMenu.hidden = true;
-            }
-        });
-
-        // Scroll the tab strip horizontally with the wheel (the scrollbar is
-        // hidden to avoid a stray track under the tabs).
-        terminalTabsEl.addEventListener('wheel', (e) => {
-            if (terminalTabsEl.scrollWidth <= terminalTabsEl.clientWidth) return;
-            e.preventDefault();
-            terminalTabsEl.scrollLeft += e.deltaY || e.deltaX;
-        }, { passive: false });
-
-        // ===== Terminal panel: expand/collapse + resize =====
-        terminalChevron.addEventListener('click', () => {
-            terminalSetExpanded(!terminalExpanded);
-        });
-
-        let termDrag = null;
-        terminalResizeHandle.addEventListener('mousedown', (e) => {
-            // The mobile overlay is positioned with top/bottom; dragging its
-            // handle must not set a pixel height (it would override bottom).
-            if (!terminalExpanded || terminalPanel.classList.contains('mobile-full')) return;
-            termDrag = { startY: e.clientY, startH: terminalPanel.offsetHeight };
-            terminalResizeHandle.classList.add('active');
-            e.preventDefault();
-        });
-        document.addEventListener('mousemove', (e) => {
-            if (!termDrag) return;
-            const h = Math.min(
-                Math.max(termDrag.startH + (termDrag.startY - e.clientY), TERM_MIN_HEIGHT),
-                terminalMaxHeight()
-            );
-            terminalHeight = h;
-            terminalPanel.style.height = h + 'px';
-            terminalRefreshStripVar();
-        });
-        document.addEventListener('mouseup', () => {
-            if (!termDrag) return;
-            termDrag = null;
-            terminalResizeHandle.classList.remove('active');
-            terminalSaveState();
-            terminalFitSoon();
-        });
-
-        // ===== Mobile: "Terminal" header tab toggles a full-screen overlay =====
-        function terminalOpenMobile() {
-            terminalPanel.classList.add('mobile-full');
-            // The overlay is positioned with top/bottom; clear any docked
-            // height (e.g. restored at init) so it fills the viewport instead
-            // of shrinking to a strip.
-            terminalPanel.style.height = '';
-            // Align the overlay's top edge with the bottom of the header
-            // (its height varies with wrapping on narrow screens).
-            const tabs = document.getElementById('top-tabs');
-            terminalPanel.style.top = (tabs ? tabs.getBoundingClientRect().height : 41) + 'px';
-            terminalTabBtn.classList.add('active');
-            terminalSetExpanded(true);
-            terminalUpdateBadge();
-            terminalFitSoon();
-        }
-
-        function terminalCloseMobile() {
-            terminalPanel.classList.remove('mobile-full');
-            terminalPanel.style.top = '';
-            terminalTabBtn.classList.remove('active');
-            terminalUpdateBadge();
-        }
-
-        function terminalToggleMobile() {
-            if (terminalPanel.classList.contains('mobile-full')) {
-                terminalCloseMobile();
-                if (terminalExpanded) terminalSetExpanded(false);
-            } else {
-                terminalOpenMobile();
-            }
-        }
-
-        function initTerminal() {
-            terminalPanel.classList.toggle('expanded', terminalExpanded);
-            if (terminalExpanded) {
-                terminalHeight = Math.min(terminalHeight, terminalMaxHeight());
-                terminalPanel.style.height = terminalHeight + 'px';
-            }
-            terminalChevron.textContent = terminalExpanded ? '▾' : '▴';
-            if (terminalIsMobile()) terminalCloseMobile();
-            // The user shell is the default terminal: pinned tab, selected now.
-            terminalEnsureUserTab();
-            terminalUpdateHint();
-            terminalUpdateBadge();
-            terminalRefreshStripVar();
-            if (typeof ResizeObserver !== 'undefined') {
-                // Keep --terminal-strip-h in sync on any strip resize
-                // (expand/collapse, drag, pane switches hiding/showing it).
-                new ResizeObserver(() => terminalRefreshStripVar()).observe(terminalPanel);
-            }
-            const mq = window.matchMedia('(max-width: 767px)');
-            const onMQChange = () => {
-                if (mq.matches) {
-                    terminalCloseMobile();
-                    if (terminalExpanded) terminalSetExpanded(false);
-                } else {
-                    // Clears mobile-full, the inline top offset and the tab
-                    // highlight.
-                    terminalCloseMobile();
-                    // Coming back to a desktop viewport: restore the docked
-                    // pixel height that mobile-full had cleared.
-                    if (terminalExpanded) {
-                        terminalHeight = Math.min(terminalHeight, terminalMaxHeight());
-                        terminalPanel.style.height = terminalHeight + 'px';
-                    }
-                }
-                terminalRefreshStripVar();
-                terminalFitSoon();
-            };
-            if (typeof mq.addEventListener === 'function') mq.addEventListener('change', onMQChange);
-            else if (typeof mq.addListener === 'function') mq.addListener(onMQChange);
-            window.addEventListener('resize', () => {
-                // The panel height is only capped while dragging; re-clamp it on
-                // viewport changes too (e.g. opening devtools docked at the
-                // bottom) so the panel can never exceed the body.
-                if (terminalExpanded && !terminalPanel.classList.contains('mobile-full')) {
-                    terminalHeight = Math.min(terminalHeight, terminalMaxHeight());
-                    terminalPanel.style.height = terminalHeight + 'px';
-                }
-                terminalRefreshStripVar();
-                terminalFitSoon();
-            });
-        }
-        try {
-            initTerminal();
-        } catch (err) {
-            // A terminal-init failure must never block the chat connection:
-            // tear down any half-created terminal UI and keep going so
-            // connect() below still runs.
-            console.error('terminal init failed:', err);
-            terminalLoadFailed = true;
-            document.querySelectorAll('#terminal-tabs .term-tab, #terminal-body .term-host')
-                .forEach((el) => el.remove());
-            terminals.clear();
-            userTermState = 'dead';
-            terminalUpdateHint();
-            terminalUpdateBadge();
-            terminalMoreRender();
-        }
+        // The docked terminal strip (pinned user shell + read-only agent
+        // command tabs) lives in components/terminal.js.
+        initTerminal({ getWs: () => ws });
 
         function connect() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -4230,7 +3472,20 @@
                     return;
                 }
                 const msgPane = paneForMessage(data);
-                if (!msgPane) return; // stale message for a closed session
+                if (!msgPane) {
+                    // The connect handshake attaches this connection to the
+                    // restored default session even when none of this tab's
+                    // panes is it (a reconnect whose panes are other
+                    // sessions). Release that attachment: an idle default
+                    // must be free to orphan-evict, or it would pin the
+                    // "resume to continue" indicator for the tab's life.
+                    // Only the handshake sends session_state for a session
+                    // this tab has no pane for — attach replies always name
+                    // a pane the tab opened, and in-flight session changes
+                    // route to their initiator pane (paneForMessage).
+                    if (data.type === 'session_state') sendSessionDetach(data.sessionId);
+                    return; // stale message for a closed session
+                }
                 if (msgPane !== activePane()) {
                     handleBackgroundMessage(msgPane, data);
                     return;
@@ -4317,6 +3572,7 @@
             notice: handleNotice,
             provider_test: handleProviderTest,
             mcp_test: handleMCPTest,
+            condensed: handleCondensed,
         };
 
         function handleProviderTest(data) {
@@ -4357,6 +3613,18 @@
             // progress event (thinking/stream/tool) or the compact
             // response replaces it.
             setInputProgress('compacting', 'Compacting context\u2026');
+
+        }
+
+        function handleCondensed(data) {
+
+            // Phase 0e last-resort condensation: a message was condensed
+            // in place because it could not fit the context window. Show
+            // the announcement as a dismissible banner above the composer
+            // (in-band — the condensed message itself is in the history).
+            if (!condensedBanner || !data.content) return;
+            condensedBannerText.textContent = data.content;
+            condensedBanner.hidden = false;
 
         }
 
@@ -4737,10 +4005,14 @@
                     nestedChanged = true;
                 }
             }
-            if (lastSessions) {
-                const before = lastSessions.length;
-                lastSessions = lastSessions.filter((s) => s.id !== data.sessionId && s.parentId !== data.sessionId);
-                if (lastSessions.length !== before) nestedChanged = true;
+            const cachedSessions = getLastSessions();
+            if (cachedSessions) {
+                const before = cachedSessions.length;
+                const remaining = cachedSessions.filter((s) => s.id !== data.sessionId && s.parentId !== data.sessionId);
+                if (remaining.length !== before) {
+                    setLastSessions(remaining);
+                    nestedChanged = true;
+                }
             }
             if (nestedChanged) refreshSidebarSessions();
             requestSessionList();
@@ -4870,6 +4142,21 @@
                 // when turn_end arrives right after this response) reports the
                 // error instead of "Agent finished responding.".
                 lastTurnError = data.content;
+                // A turn that never became active (no thinking/stream/tool
+                // event arrived — the model's stream failed before the first
+                // chunk, or the message was rejected before the turn started)
+                // is invisible to the turn-end notification: setTurnActive
+                // only announces on an active→idle transition, and some
+                // failures (busy rejection, validation) never send a turn_end
+                // at all. Fire the error notification here so an unsuccessful
+                // stop is announced even then. Mid-stream errors are
+                // untouched: turnActive is true, so this is skipped and the
+                // turn_end transition still notifies exactly once as before.
+                if (!turnActive) {
+                    announceLive('Agent stopped with an error.');
+                    sendNotification('GoGen — Error', lastTurnError, 'gogen-turn-error');
+                    lastTurnError = null;
+                }
             } else {
                 appendMessage('assistant', data.content);
             }
@@ -4885,9 +4172,11 @@
             }
             if (data.models) {
                 updateModelSelect(data.models, data.model);
-                // The settings modal's subagent model picker renders from
-                // the same catalog — refresh it when the modal is open.
-                if (settingsOverlay.classList.contains('active')) renderSubagentModelPicker();
+                // The settings modal's subagent picker renders from the
+                // same catalog — refresh it when the modal is open (the
+                // effort options come from the catalog's per-model
+                // reasoningEfforts too).
+                if (isSettingsOpen()) subagentPicker.render();
             } else if (data.model) {
                 updateModelInfo(data.model, availableModels.find((m) => m.id === data.model)?.description);
             }
@@ -5072,8 +4361,24 @@
                     rec.success = !!data.subagentSuccess;
                     rec.summary = data.subagentSummary || '';
                 }
+                // Live-only failure display: the completion notice reaches the
+                // parent MODEL as a persisted user message (the delivery
+                // service), but the error itself is shown here as an
+                // ephemeral system line — no hist-idx, so it is not part of
+                // the transcript and any history replay (reload, pane
+                // switch, turn convergence) removes it. The event is
+                // sidebar-global, so render into the chat only when the
+                // parent session is the focused pane.
+                if (!data.subagentSuccess) {
+                    const parentPane = findPaneBySession(data.subagentParent);
+                    if (parentPane && parentPane.key === activePaneKey) {
+                        const label = (rec && rec.label) || data.subagentLabel || 'subagent';
+                        appendMessage('system',
+                            `\u26a0 subagent ${label} failed${data.subagentSummary ? ': ' + data.subagentSummary : ''}`);
+                    }
+                }
             }
-            renderSessionList(lastSessions || []);
+            renderSessionList(getLastSessions() || []);
         }
 
         // Append nested rows for parentId after its row. Sources: the live
@@ -5095,7 +4400,7 @@
                 sessionListDiv.appendChild(buildNestedSessionRow(rec));
                 rendered.add(rec.id);
             }
-            for (const s of lastSessions || []) {
+            for (const s of getLastSessions() || []) {
                 if (!s.parentId || s.parentId !== parentId) continue;
                 if (rendered.has(s.id)) continue;
                 // The payload carries the runtime's LIVE turn state
@@ -5234,46 +4539,8 @@
         }
 
         // ── Kanban board tab ──
-        // Server-backed like the feature toggles: the tab renders from
-        // board_state broadcasts (server→client) and sends board_op
-        // messages (client→server) for list/add/move/comment/done. The
-        // server re-broadcasts after every mutation — including agent
-        // board-tool calls — so the board stays live while agents work.
-        let lastBoardState = null;
-        let boardDragId = null;
-        // Set while a board "Start agent" op is in flight; cleared when the
-        // ticket's board_state shows the agentSession link (the sidebar then
-        // refreshes so the new session row appears).
-        let pendingBoardStartId = null;
-        // Per-ticket "Start agent" popover state: the open popover's
-        // selections (model, edited prompt template, whether the prompt
-        // editor is expanded). The popover element is a singleton appended
-        // to <body>, so a board re-render while the user is mid-choice
-        // closes it without losing anything — nothing is sent until Start.
-        let boardStartPopoverOpen = false;
-        let boardStartState = null; // { item, model, prompt, promptOpen, filterQuery }
-        // The anchor element (the card's Start button) the open popover is
-        // positioned under; re-read on scroll/resize to keep the popover
-        // glued to its card. Null while closed.
-        let boardStartAnchor = null;
-        // Effective board_start_prompt template from the last config push
-        // ("" = built-in default); the popover's prompt editor pre-fills
-        // from it.
-        let boardStartPromptValue = '';
-
-        function handleBoardState(data) {
-            if (data.boardState) {
-                lastBoardState = data.boardState;
-                renderBoard();
-                if (pendingBoardStartId) {
-                    const item = (data.boardState.items || []).find((i) => i.id === pendingBoardStartId);
-                    if (item && item.agentSession) {
-                        pendingBoardStartId = null;
-                        requestSessionList();
-                    }
-                }
-            }
-        }
+        // Rendering, board_op messaging and the per-ticket "Start agent"
+        // popover live in components/board.js (initBoard below).
 
         // ── Notice channel (non-chat UI feedback) ──
         // "notice" messages toast and NEVER touch the chat transcript or
@@ -5291,520 +4558,6 @@
             // not re-trigger another op (toast/resync loop).
             if (data.kind === 'board' && boardTabVisible()) requestBoardState();
         }
-
-        function boardTabVisible() {
-            const t = document.getElementById('board-tab');
-            return !!t && !t.hidden;
-        }
-
-        function requestBoardState() {
-            if (!ws || ws.readyState !== WebSocket.OPEN) return;
-            ws.send(JSON.stringify({ type: 'board_op', boardOp: { action: 'list' } }));
-        }
-
-        function sendBoardOp(op) {
-            if (!ws || ws.readyState !== WebSocket.OPEN) return;
-            ws.send(JSON.stringify({ type: 'board_op', boardOp: op }));
-        }
-
-        function renderBoard() {
-            // A board_state re-render rebuilds every card; the floating
-            // popover's anchor would be gone. Close it — nothing is sent
-            // until Start, so no input is lost.
-            closeBoardStartPopover();
-            const colsDiv = document.getElementById('board-columns');
-            if (!colsDiv) return;
-            colsDiv.innerHTML = '';
-            const snap = lastBoardState;
-            if (!snap) return;
-            const byColumn = new Map();
-            for (const col of snap.columns) byColumn.set(col, []);
-            for (const item of snap.items || []) {
-                const list = byColumn.get(item.status) || byColumn.get('backlog');
-                if (list) list.push(item);
-            }
-            for (const col of snap.columns) {
-                colsDiv.appendChild(buildBoardColumn(col, byColumn.get(col) || []));
-            }
-        }
-
-        function buildBoardColumn(name, items) {
-            const col = document.createElement('div');
-            col.className = 'board-column';
-            col.dataset.column = name;
-            const header = document.createElement('div');
-            header.className = 'board-column-header';
-            const title = document.createElement('span');
-            title.className = 'board-column-title';
-            title.textContent = name.replace('_', ' ');
-            const count = document.createElement('span');
-            count.className = 'board-column-count';
-            count.textContent = String(items.length);
-            header.append(title, count);
-            col.appendChild(header);
-            const body = document.createElement('div');
-            body.className = 'board-column-body';
-            for (const item of items) body.appendChild(buildBoardCard(item));
-            // Drop target for the whole column (cards are dragged onto it).
-            col.addEventListener('dragover', (e) => {
-                e.preventDefault();
-                col.classList.add('drag-over');
-            });
-            col.addEventListener('dragleave', () => col.classList.remove('drag-over'));
-            col.addEventListener('drop', (e) => {
-                e.preventDefault();
-                col.classList.remove('drag-over');
-                if (boardDragId && name !== currentCardColumn(boardDragId)) {
-                    sendBoardOp({ action: 'move', id: boardDragId, column: name });
-                }
-                boardDragId = null;
-            });
-            col.appendChild(body);
-            return col;
-        }
-
-        function currentCardColumn(id) {
-            const snap = lastBoardState;
-            if (!snap) return null;
-            const item = (snap.items || []).find((i) => i.id === id);
-            return item ? item.status : null;
-        }
-
-        function buildBoardCard(item) {
-            const card = document.createElement('div');
-            card.className = 'board-card';
-            card.draggable = true;
-            card.dataset.itemId = item.id;
-            card.addEventListener('dragstart', (e) => {
-                boardDragId = item.id;
-                if (e.dataTransfer) e.dataTransfer.setData('text/plain', item.id);
-            });
-            card.addEventListener('dragend', () => { boardDragId = null; });
-            // Remove button: hover-revealed trashcan with a two-step inline
-            // confirm (click once → "Remove?" highlighted; click again →
-            // delete; Esc/click elsewhere cancels). No modal needed for a
-            // card, mirroring the session rows' hover-reveal ✕.
-            const removeBtn = document.createElement('button');
-            removeBtn.type = 'button';
-            removeBtn.className = 'board-card-remove';
-            removeBtn.title = 'Remove card';
-            removeBtn.textContent = '🗑';
-            let removeArmed = false;
-            removeBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                if (!removeArmed) {
-                    removeArmed = true;
-                    removeBtn.classList.add('armed');
-                    removeBtn.textContent = 'Remove?';
-                    return;
-                }
-                sendBoardOp({ action: 'remove', id: item.id });
-                removeArmed = false;
-                removeBtn.classList.remove('armed');
-                removeBtn.textContent = '🗑';
-            });
-            card.addEventListener('click', (e) => {
-                if (e.target.closest('.board-card-detail') || e.target === removeBtn) return;
-                // Clicking anywhere else cancels a pending remove confirm.
-                if (removeArmed) {
-                    removeArmed = false;
-                    removeBtn.classList.remove('armed');
-                    removeBtn.textContent = '🗑';
-                    return;
-                }
-                detail.hidden = !detail.hidden;
-            });
-            card.appendChild(removeBtn);
-            const title = document.createElement('div');
-            title.className = 'board-card-title';
-            title.textContent = `#${item.id} ${item.title}`;
-            card.appendChild(title);
-            const meta = document.createElement('div');
-            meta.className = 'board-card-meta';
-            const frags = [];
-            if (item.priority) {
-                const prio = document.createElement('span');
-                prio.className = 'board-prio prio-' + item.priority;
-                prio.textContent = item.priority;
-                frags.push(prio);
-            }
-            if (item.assignee) {
-                const who = document.createElement('span');
-                who.className = 'board-assignee';
-                who.textContent = item.assignee;
-                frags.push(who);
-            }
-            for (const f of frags) meta.appendChild(f);
-            card.appendChild(meta);
-            // Start / open agent button: the first click opens the per-ticket
-            // "Start agent" popover (model picker + pen-icon prompt editor)
-            // instead of starting immediately; once the ticket's board_state
-            // carries agentSession, the button becomes "Open agent" and
-            // switches to the chat tab with the session attached. Hidden for
-            // done cards; disabled while another actor (an agent via the
-            // board tool) holds the ticket.
-            const startBtn = document.createElement('button');
-            startBtn.type = 'button';
-            startBtn.className = 'board-card-start';
-            if (item.status === 'done') {
-                startBtn.hidden = true;
-            } else if (item.agentSession) {
-                startBtn.textContent = 'Open agent';
-                startBtn.title = 'Open the agent session working on this ticket';
-                startBtn.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    switchMainPane('chat');
-                    openSessionPane(item.agentSession);
-                });
-            } else {
-                startBtn.textContent = '▶ Start';
-                if (item.assignee) {
-                    startBtn.disabled = true;
-                    startBtn.title = 'Claimed by ' + item.assignee;
-                } else {
-                    startBtn.title = 'Start an agent for this ticket';
-                    startBtn.addEventListener('click', (e) => {
-                        e.stopPropagation();
-                        openBoardStartPopover(item, startBtn);
-                    });
-                }
-            }
-            card.appendChild(startBtn);
-            // Click expands the detail (description + activity) inline.
-            const detail = document.createElement('div');
-            detail.className = 'board-card-detail';
-            detail.hidden = true;
-            if (item.description) {
-                const d = document.createElement('div');
-                d.className = 'board-card-desc';
-                d.textContent = item.description;
-                detail.appendChild(d);
-            }
-            if (item.activity && item.activity.length) {
-                const acts = document.createElement('div');
-                acts.className = 'board-card-activity';
-                for (const act of item.activity.slice(-10)) {
-                    const row = document.createElement('div');
-                    row.className = 'board-activity-row';
-                    row.textContent = `${act.at ? new Date(act.at).toLocaleString() : ''} ${act.by}: ${act.text}`;
-                    acts.appendChild(row);
-                }
-                detail.appendChild(acts);
-            }
-            card.appendChild(detail);
-            return card;
-        }
-
-        function initBoardTab() {
-            const addBtn = document.getElementById('board-add-btn');
-            if (!addBtn) return;
-            addBtn.addEventListener('click', () => {
-                const form = document.getElementById('board-add-form');
-                if (form) form.hidden = !form.hidden;
-            });
-            const form = document.getElementById('board-add-form');
-            if (!form) return;
-            form.addEventListener('submit', (e) => {
-                e.preventDefault();
-                const title = document.getElementById('board-add-title');
-                const desc = document.getElementById('board-add-desc');
-                const prio = document.getElementById('board-add-prio');
-                if (!title || !title.value.trim()) return;
-                sendBoardOp({
-                    action: 'add',
-                    title: title.value.trim(),
-                    description: desc ? desc.value.trim() : '',
-                    priority: prio ? prio.value : '',
-                });
-                title.value = '';
-                if (desc) desc.value = '';
-                form.hidden = true;
-            });
-        }
-
-        // ── "Start agent" popover (per-ticket model + prompt) ──
-        // Clicking a card's "▶ Start" opens a small floating toolbar-like
-        // popover instead of starting immediately: a model picker (reusing
-        // the shared renderModelList) plus a pen icon that expands the
-        // prompt editor (textarea prefilled with the effective
-        // board_start_prompt template). "Start" sends board_op
-        // {action:'start', id, model, prompt}; the server stores both on
-        // the ticket so the popover pre-fills on the next start.
-
-        function openBoardStartPopover(item, anchor) {
-            const pop = document.getElementById('board-start-popover') || buildBoardStartPopover();
-            if (availableModels.length <= 1) {
-                // Catalog not fetched yet: request it (the reply refreshes
-                // availableModels; the popover re-renders on the next open
-                // or the row click).
-                modelsRequested = false;
-                ensureModelsLoaded();
-            }
-            boardStartState = {
-                item,
-                model: item.model || '',
-                prompt: item.prompt || '',
-                promptOpen: false,
-                filterQuery: '',
-            };
-            boardStartAnchor = anchor;
-            pop.querySelector('.board-start-filter').value = '';
-            pop.querySelector('.board-start-title').textContent = `#${item.id} ${item.title}`;
-            // The popover is a singleton: the previous attempt disabled its
-            // Start button on click (and a failed start resyncs the board
-            // without rebuilding the popover), so re-arm it for this open.
-            const goBtn = pop.querySelector('.board-card-start');
-            if (goBtn) goBtn.disabled = false;
-            // Show first, then position: the width is CSS-driven
-            // (clamp(300px, 36vw, 420px) capped at the viewport), so the
-            // clamping math measures the rendered width instead of a
-            // hardcoded constant that could drift from the stylesheet.
-            pop.classList.add('open');
-            boardStartPopoverOpen = true;
-            positionBoardStartPopover();
-            renderBoardStartModelList();
-            syncBoardStartPromptEditor();
-        }
-
-        function closeBoardStartPopover() {
-            boardStartPopoverOpen = false;
-            boardStartState = null;
-            boardStartAnchor = null;
-            const pop = document.getElementById('board-start-popover');
-            if (pop) pop.classList.remove('open');
-        }
-
-        // Positions the popover below its anchor button, clamped to the
-        // viewport using the popover's actual rendered width. Called on
-        // open and re-called on scroll/resize so the popover stays glued
-        // to its card (it is position:fixed, so it would otherwise float
-        // detached while the board scrolls).
-        function positionBoardStartPopover() {
-            const pop = document.getElementById('board-start-popover');
-            if (!pop || !boardStartPopoverOpen || !boardStartAnchor) return;
-            const rect = boardStartAnchor.getBoundingClientRect();
-            // The anchor scrolled out of view: close instead of leaving an
-            // orphan popover floating in place.
-            if (rect.bottom < 0 || rect.top > window.innerHeight) {
-                closeBoardStartPopover();
-                return;
-            }
-            const pw = pop.offsetWidth;
-            let left = rect.left;
-            if (left + pw > window.innerWidth - 8) left = Math.max(8, window.innerWidth - pw - 8);
-            pop.style.left = left + 'px';
-            pop.style.top = (rect.bottom + 4) + 'px';
-        }
-        // Capture-phase scroll: the board columns scroll inside an inner
-        // container (scroll does not bubble), and window resize changes
-        // the CSS width — both re-anchor the popover.
-        document.addEventListener('scroll', () => {
-            if (boardStartPopoverOpen) positionBoardStartPopover();
-        }, true);
-        window.addEventListener('resize', () => {
-            if (boardStartPopoverOpen) positionBoardStartPopover();
-        });
-
-        function buildBoardStartPopover() {
-            const pop = document.createElement('div');
-            pop.id = 'board-start-popover';
-            pop.className = 'board-start-popover';
-
-            const title = document.createElement('div');
-            title.className = 'board-start-title';
-            const closeBtn = document.createElement('button');
-            closeBtn.type = 'button';
-            closeBtn.className = 'board-start-close';
-            closeBtn.textContent = '✕';
-            closeBtn.title = 'Close';
-            closeBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                closeBoardStartPopover();
-            });
-            const head = document.createElement('div');
-            head.className = 'board-start-head';
-            head.append(title, closeBtn);
-            pop.appendChild(head);
-
-            const filter = document.createElement('input');
-            filter.type = 'text';
-            filter.className = 'board-start-filter';
-            filter.placeholder = 'Filter models…';
-            filter.autocomplete = 'off';
-            filter.addEventListener('input', () => {
-                if (!boardStartState) return;
-                boardStartState.filterQuery = filter.value.trim().toLowerCase();
-                renderBoardStartModelList();
-            });
-            const list = document.createElement('div');
-            list.className = 'board-start-model-list';
-            pop.append(filter, list);
-
-            // Prompt editor: hidden until the pen icon is clicked.
-            const promptSection = document.createElement('div');
-            promptSection.className = 'board-start-prompt-section';
-            promptSection.hidden = true;
-            const promptHead = document.createElement('div');
-            promptHead.className = 'board-start-prompt-head';
-            const promptLabel = document.createElement('span');
-            promptLabel.textContent = 'Prompt for the agent';
-            const resetBtn = document.createElement('button');
-            resetBtn.type = 'button';
-            resetBtn.className = 'board-start-reset';
-            resetBtn.textContent = 'Reset to template';
-            resetBtn.title = 'Use the configured board agent prompt template';
-            resetBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                if (!boardStartState) return;
-                // Empty = the configured template; the server clears the
-                // ticket's stored override on the next start.
-                boardStartState.prompt = '';
-                syncBoardStartPromptEditor();
-            });
-            promptHead.append(promptLabel, resetBtn);
-            const promptInput = document.createElement('textarea');
-            promptInput.className = 'board-start-prompt-input';
-            promptInput.rows = 8;
-            promptInput.spellcheck = false;
-            promptInput.addEventListener('input', () => {
-                if (!boardStartState) return;
-                boardStartState.prompt = promptInput.value;
-                promptPreview.textContent = renderBoardStartPreview(boardStartState.item, promptInput.value);
-            });
-            const promptPreview = document.createElement('div');
-            promptPreview.className = 'board-start-preview';
-            promptSection.append(promptHead, promptInput, promptPreview);
-            pop.appendChild(promptSection);
-
-            const actions = document.createElement('div');
-            actions.className = 'board-start-actions';
-            const penBtn = document.createElement('button');
-            penBtn.type = 'button';
-            penBtn.className = 'board-start-pen';
-            penBtn.textContent = '✎';
-            penBtn.title = 'Edit the prompt';
-            penBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                if (!boardStartState) return;
-                boardStartState.promptOpen = !boardStartState.promptOpen;
-                syncBoardStartPromptEditor();
-            });
-            const goBtn = document.createElement('button');
-            goBtn.type = 'button';
-            goBtn.className = 'board-card-start';
-            goBtn.textContent = '▶ Start';
-            goBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                if (!boardStartState) return;
-                goBtn.disabled = true;
-                pendingBoardStartId = boardStartState.item.id;
-                sendBoardOp({
-                    action: 'start',
-                    id: boardStartState.item.id,
-                    model: boardStartState.model,
-                    prompt: boardStartState.prompt,
-                });
-                closeBoardStartPopover();
-            });
-            actions.append(penBtn, goBtn);
-            pop.appendChild(actions);
-
-            document.body.appendChild(pop);
-            return pop;
-        }
-
-        // Renders the model list from the popover's state: the catalog via
-        // the shared renderModelList, preceded by a "Workspace default"
-        // row (the empty value — the server uses the workspace default
-        // model when the op carries none).
-        function renderBoardStartModelList() {
-            if (!boardStartState) return;
-            const pop = document.getElementById('board-start-popover');
-            const list = pop.querySelector('.board-start-model-list');
-            const filter = pop.querySelector('.board-start-filter');
-            const current = boardStartState.model || (availableModels.find((m) => m.current)?.id || '');
-            const defaultRow = document.createElement('button');
-            defaultRow.type = 'button';
-            defaultRow.className = 'tb-model-row' + (boardStartState.model === '' ? ' active' : '');
-            defaultRow.textContent = 'Workspace default';
-            defaultRow.title = 'Use the workspace default model';
-            defaultRow.addEventListener('click', (e) => {
-                e.stopPropagation();
-                if (boardStartState.model === '') return;
-                boardStartState.model = '';
-                renderBoardStartModelList();
-            });
-            renderModelList(
-                list,
-                boardStartState.filterQuery,
-                filter ? filter.value.trim().toLowerCase() : boardStartState.filterQuery,
-                availableModels,
-                current,
-                (id) => {
-                    if (boardStartState.model === id) return;
-                    boardStartState.model = id;
-                    renderBoardStartModelList();
-                },
-                [defaultRow]
-            );
-        }
-
-        // Syncs the popover's prompt editor with the current state: the
-        // textarea shows the edited template, or the effective configured
-        // template when none was chosen, with a live rendered preview.
-        function syncBoardStartPromptEditor() {
-            if (!boardStartState) return;
-            const pop = document.getElementById('board-start-popover');
-            const promptSection = pop.querySelector('.board-start-prompt-section');
-            const promptInput = pop.querySelector('.board-start-prompt-input');
-            const promptPreview = pop.querySelector('.board-start-preview');
-            const penBtn = pop.querySelector('.board-start-pen');
-            promptSection.hidden = !boardStartState.promptOpen;
-            // Pen stays highlighted while a custom prompt is armed (edited
-            // and kept after collapsing the editor).
-            penBtn.classList.toggle('active', boardStartState.promptOpen || boardStartState.prompt !== '');
-            penBtn.title = boardStartState.promptOpen ? 'Hide the prompt editor' : 'Edit the prompt';
-            if (boardStartState.promptOpen) {
-                const text = boardStartState.prompt || boardStartPromptValue;
-                promptInput.value = text;
-                promptPreview.textContent = renderBoardStartPreview(boardStartState.item, text);
-            }
-        }
-
-        // Client-side placeholder substitution for the popover's prompt
-        // PREVIEW only — the authoritative render happens server-side
-        // (TicketPrompt), so the {context} approximation here is cosmetic.
-        function renderBoardStartPreview(item, template) {
-            const priority = item.priority || 'none';
-            return String(template || '')
-                .replaceAll('{id}', item.id)
-                .replaceAll('{title}', item.title || '')
-                .replaceAll('{description}', item.description || '')
-                .replaceAll('{priority}', priority)
-                .replaceAll('{context}', boardStartContext(item.activity || []));
-        }
-
-        // Mirrors the server's activityContext: the content-bearing
-        // activity entries (comments, block reasons), skipping the
-        // generated status-transition noise.
-        function boardStartContext(activity) {
-            const skip = new Set(['created', 'claimed', 'marked done']);
-            const rows = [];
-            for (const act of activity) {
-                const text = String(act.text || '').trim();
-                if (!text || skip.has(text) || text.startsWith('moved to ')) continue;
-                rows.push(text.length > 300 ? text.slice(0, 300) + '…' : text);
-            }
-            const last = rows.slice(-5);
-            if (last.length === 0) return '';
-            return 'Ticket log context:\n' + last.map((e) => '- ' + e).join('\n');
-        }
-
-        // Esc closes the popover (the document click handler covers
-        // outside clicks; the ✕ button covers explicit close).
-        document.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape' && boardStartPopoverOpen) closeBoardStartPopover();
-        });
 
         // ── Image attachments (vision input) ──
         // Mirrors the server's limits (internal/server/server.go
@@ -5984,7 +4737,17 @@
         // processed against whatever UI state follows (the cancel race).
         cancelBtn.onclick = cancelActiveTurn;
 
-        inputArea.addEventListener('input', updateSlashSuggest);
+        // Single per-keystroke composer listener: slash suggestions plus the
+        // command-mode indicator (the input-area wrapper is styled while the
+        // first token starts with '/'). The palette's command fill dispatches
+        // a synthetic 'input' event and runs through here too; other
+        // programmatic value writes (applySlashCompletion, the clear after
+        // send) skip the event, so the indicator catches up on the next real
+        // keystroke.
+        inputArea.addEventListener('input', () => {
+            updateSlashSuggest();
+            inputAreaWrap.classList.toggle('command-mode', inputArea.value.startsWith('/') && inputArea.value.length > 0);
+        });
 
         /* Textarea auto-resize is handled natively by CSS
            `field-sizing: content` (see styles.css) — no JS size tracking.
@@ -6058,260 +4821,6 @@
             setTimeout(() => requestSessionList(), 100);
         };
 
-        function requestSessionList() {
-            if (!ws || ws.readyState !== WebSocket.OPEN) return;
-            ws.send(JSON.stringify({ type: 'list_sessions' }));
-        }
-
-        function renderSessionList(sessions) {
-            if (!sessionListDiv) return;
-            // Cache the payload so pane-state changes (focus, busy, label)
-            // can re-render the list without a server round-trip.
-            lastSessions = sessions || [];
-            sessionListDiv.innerHTML = '';
-            const list = lastSessions;
-            // One unified list: open panes (client state) plus the server's
-            // saved-session payload. Open panes are merged in FIRST so an
-            // open session's row ALWAYS exists — even before the server's
-            // store lists it (fresh session, list lag) — and shows the LIVE
-            // pane label (kept current by config/context echoes). Open
-            // panes render most-recently-used first (movePaneToFront keeps
-            // the map in that order), then saved sessions in server order.
-            const act = activePane();
-            const rows = [];
-            const openIds = new Set();
-            for (const pane of panes.values()) {
-                const entry = pane.id ? (list.find((s) => s.id === pane.id) || null) : null;
-                if (pane.id) openIds.add(pane.id);
-                rows.push({ pane, entry });
-            }
-            for (const s of list) {
-                // Nested (subagent) rows render under their parent below,
-                // never as flat rows.
-                if (s.parentId) continue;
-                if (!openIds.has(s.id)) rows.push({ pane: null, entry: s });
-            }
-            // A nested (subagent) child open as a pane renders under its
-            // parent via appendNestedRows below, NOT as a flat open-pane
-            // row — opening a subagent must not make its row jump out of
-            // the parent. The child falls back to its flat open-pane row
-            // only when the parent's row is missing from this render (a
-            // parent session still unknown to this tab / the store).
-            const rowIds = new Set();
-            for (const r of rows) rowIds.add(r.pane ? r.pane.id : (r.entry ? r.entry.id : ''));
-            const flatRows = rows.filter((r) => {
-                const id = r.pane ? r.pane.id : (r.entry ? r.entry.id : '');
-                if (!r.pane || !id) return true;
-                const parentId = nestedParentIdOf(id, list);
-                // Skip the flat row when the child's row renders nested
-                // under a parent — including via a recursively nested
-                // ancestor (depth >= 2). Only a missing ancestor chain
-                // falls back to the flat open-pane row.
-                return !parentId || !nestedRowWillRender(parentId, list, rowIds, new Set());
-            });
-            if (!flatRows.length) {
-                const empty = document.createElement('div');
-                empty.className = 'session-list-empty';
-                empty.textContent = 'No sessions';
-                sessionListDiv.appendChild(empty);
-                return;
-            }
-            for (const r of flatRows) {
-                sessionListDiv.appendChild(buildSessionRow(r.pane, r.entry, act));
-                // Nested (subagent) rows render directly under their parent
-                // (live events + persisted children from the payload).
-                const parentId = r.pane ? r.pane.id : (r.entry ? r.entry.id : '');
-                if (parentId) appendNestedRows(parentId);
-            }
-        }
-
-        // Build one sidebar row for an open pane (pane != null) or a saved
-        // session (pane == null). act is the active pane used to mark the
-        // current row; it is passed in so re-renders never re-derive it
-        // inconsistently with the caller's snapshot.
-        function buildSessionRow(pane, entry, act) {
-            const s = entry || {
-                id: pane ? pane.id : '',
-                label: pane ? pane.label : '',
-                messageCount: null,
-                active: true,
-                updatedAt: '',
-            };
-            const isActivePane = !!pane && pane === act;
-            // A fresh session has an id but no label yet — show the
-            // "New session" placeholder as its title until the first
-            // turn derives a real label. The raw id stays available in
-            // the row tooltip and in dataset.sessionId (delete/attach).
-            const paneTitle = pane ? (pane.label || (entry && entry.label) || '') : '';
-            const label = pane
-                ? (paneTitle || 'New session…')
-                : (s.label || s.id || '(unknown)');
-            const row = document.createElement('div');
-            row.className = 'session-row' + (isActivePane ? ' current' : '') + (pane && pane.turnActive ? ' busy' : '');
-            row.dataset.sessionId = pane ? pane.id : (entry ? entry.id : '');
-            row.title = !paneTitle && pane && pane.id ? `${label} (${pane.id})` : label;
-            const content = document.createElement('div');
-            content.className = 'session-row-content';
-            const title = document.createElement('div');
-            title.className = 'session-row-title';
-            title.textContent = label;
-            const meta = document.createElement('div');
-            meta.className = 'session-row-meta';
-            const frags = [];
-            // Every pane state gets a uniform colored-dot indicator: the
-            // dot carries the state color and the label stays muted. The
-            // status indicator is pushed first so it always renders ahead
-            // of the message count and relative time in the meta row.
-            //   active              → green   (this pane is focused)
-            //   responding          → amber   (a turn is running)
-            //   creating…           → gray    (session id not assigned yet)
-            //   open                → blue    (background pane in this tab)
-            //   resume to continue  → violet  (live elsewhere / headless)
-            let stateLabel = '';
-            let stateClass = '';
-            if (pane && pane.turnActive) {
-                stateLabel = 'responding';
-                stateClass = 'amber';
-            } else if (pane && !pane.id) {
-                stateLabel = 'creating…';
-                stateClass = 'gray';
-            } else if (isActivePane) {
-                stateLabel = 'active';
-                stateClass = 'green';
-            } else if (pane && pane.id) {
-                // Open as a background pane in this tab — clicking the
-                // row focuses it.
-                stateLabel = 'open';
-                stateClass = 'blue';
-            } else if (s.active) {
-                // Live in-memory runtime elsewhere (another tab, or a
-                // headless turn running): reopening attaches to it.
-                stateLabel = 'resume to continue';
-                stateClass = 'violet';
-            }
-            if (stateLabel) {
-                const group = document.createElement('span');
-                group.className = 'session-state';
-                const dot = document.createElement('span');
-                dot.className = 'session-state-dot ' + stateClass;
-                dot.title = stateLabel;
-                dot.setAttribute('aria-label', stateLabel);
-                const label = document.createElement('span');
-                label.className = 'session-state-label';
-                label.textContent = stateLabel;
-                group.appendChild(dot);
-                group.appendChild(label);
-                frags.push(group);
-            }
-            if (entry && entry.messageCount != null) frags.push(`${entry.messageCount} msgs`);
-            const rel = relativeTime(s.updatedAt);
-            if (rel) {
-                // Tag the relative time so the 30s tick can refresh it in
-                // place (session rows are otherwise re-rendered only on
-                // pane-state changes or new sessions payloads, leaving the
-                // "3m ago" labels to go stale).
-                const t = document.createElement('span');
-                t.className = 'session-row-time';
-                t.dataset.updated = s.updatedAt || '';
-                t.textContent = rel;
-                frags.push(t);
-            }
-            for (let i = 0; i < frags.length; i++) {
-                if (i > 0) meta.appendChild(document.createTextNode(' · '));
-                if (typeof frags[i] === 'string') {
-                    meta.appendChild(document.createTextNode(frags[i]));
-                } else {
-                    meta.appendChild(frags[i]);
-                }
-            }
-            content.appendChild(title);
-            content.appendChild(meta);
-            content.onclick = () => {
-                if (pane) {
-                    // Open pane rows focus the pane (no-op when already
-                    // active).
-                    focusPane(pane.key);
-                } else {
-                    // Saved rows attach the session as a new pane.
-                    openSessionPane(s.id);
-                }
-            };
-            row.appendChild(content);
-            // Close/delete button (hidden by default, shown on row
-            // hover): an OPEN session's ✕ closes the pane — the session
-            // is detached (it stays saved and its row reappears as a
-            // saved session); a saved session's ✕ deletes it.
-            const closeBtn = document.createElement('button');
-            closeBtn.className = 'session-row-del';
-            closeBtn.textContent = '✕';
-            if (pane) {
-                closeBtn.title = 'Close session (stays saved)';
-                closeBtn.onclick = (e) => {
-                    e.stopPropagation();
-                    closePane(pane.key);
-                };
-            } else {
-                closeBtn.title = 'Delete this session';
-                closeBtn.onclick = (e) => {
-                    e.stopPropagation();
-                    deleteSession(s.id, s.label);
-                };
-            }
-            row.appendChild(closeBtn);
-            return row;
-        }
-
-        /**
-         * Update the current session's row title in the sidebar without
-         * re-rendering the entire list. The current session lives in the
-         * unified session list (the active pane's row).
-         */
-        function updateCurrentSessionLabel(label) {
-            if (!label || !sessionListDiv) return;
-            const pane = activePane();
-            if (pane) pane.label = label;
-            if (!pane || !pane.id) return;
-            // Keep the cached server entry in sync so a later re-render
-            // keeps the new label even before the server echoes it.
-            if (lastSessions) {
-                const entry = lastSessions.find((s) => s.id === pane.id);
-                if (entry) entry.label = label;
-            }
-            const row = findSessionRow(pane.id);
-            if (!row) return;
-            if (row.classList.contains('nested')) {
-                // Nested rows carry a job tooltip and a colored-dot state;
-                // rebuild the row instead of overwriting the title with the
-                // bare label.
-                refreshSidebarSessions();
-                return;
-            }
-            const titleEl = row.querySelector('.session-row-title');
-            if (titleEl.textContent === label) return; // already up-to-date
-            titleEl.textContent = label;
-            row.title = label;
-        }
-
-        function findSessionRow(id) {
-            if (!sessionListDiv || !id) return null;
-            for (const row of sessionListDiv.querySelectorAll('.session-row')) {
-                if (row.dataset.sessionId === id) return row;
-            }
-            return null;
-        }
-
-        // Re-render the sidebar session list from the cached payload. Used
-        // when pane state the list shows (focus, busy/responding, label)
-        // changes without a server round-trip; falls back to asking the
-        // server when no payload has arrived yet.
-        function refreshSidebarSessions() {
-            if (lastSessions) {
-                renderSessionList(lastSessions);
-            } else {
-                requestSessionList();
-            }
-        }
-
         function newSession() {
             if (!ensureConnected()) return;
             if (resendAwaitingHistory) {
@@ -6338,102 +4847,8 @@
             ws.send(JSON.stringify({ type: 'session_new' }));
         }
 
-        async function deleteSession(id, label) {
-            if (!ensureConnected()) return;
-            if (!id) return;
-            if (resendAwaitingHistory) {
-                showToast('Resend already in progress', 'info');
-                return;
-            }
-            if (pendingSessionResponse) {
-                showToast('Session change already in progress', 'info');
-                return;
-            }
-            const displayName = label || id;
-            const confirmed = await showSessionDeleteModal(displayName);
-            if (!confirmed) return;
-            // Deleting the active pane's session interrupts its turn; a
-            // background session's delete leaves the active turn running.
-            if (activePane() && activePane().id === id) {
-                cancelActiveTurn();
-            }
-            pendingSessionResponse = true;
-            ws.send(JSON.stringify({ type: 'session_delete', sessionId: id }));
-            // A deleted nested (subagent) child must stop rendering under
-            // its parent: drop its live-event record AND the cached payload
-            // entry now (a closed child has no attached pane, so no
-            // session_removed broadcast comes back to this tab; the server
-            // still reports the deletion to the parent agent, and the
-            // fresh list round-trip after the reply confirms the purge).
-            if (nestedSessions.delete(id)) {
-                if (lastSessions) {
-                    const idx = lastSessions.findIndex((s) => s.id === id);
-                    if (idx >= 0) lastSessions.splice(idx, 1);
-                }
-                refreshSidebarSessions();
-            }
-        }
-
-        // Custom confirm modal for session deletion (matches the other dialogs).
-        // Esc cancels; the safe default (Cancel) is focused on open.
-        function showSessionDeleteModal(displayName) {
-            return new Promise((resolve) => {
-                const overlay = document.getElementById('session-delete-overlay');
-                const filenameEl = document.getElementById('session-delete-filename');
-                const cancelBtn = document.getElementById('session-delete-cancel-btn');
-                const confirmBtn = document.getElementById('session-delete-confirm-btn');
-                if (!overlay) { resolve(window.confirm(`Delete session "${displayName}"? This cannot be undone.`)); return; }
-                filenameEl.textContent = `Session "${displayName}" and its message history will be permanently deleted.`;
-                openModal(overlay);
-                const cleanup = (result) => {
-                    closeModal(overlay);
-                    cancelBtn.removeEventListener('click', onCancel);
-                    confirmBtn.removeEventListener('click', onConfirm);
-                    overlay.removeEventListener('keydown', onKey);
-                    resolve(result);
-                };
-                const onCancel = () => cleanup(false);
-                const onConfirm = () => cleanup(true);
-                const onKey = (e) => {
-                    if (e.key === 'Escape') {
-                        e.stopPropagation(); // keep the document handler from cancelling the agent turn
-                        onCancel();
-                    }
-                };
-                cancelBtn.addEventListener('click', onCancel);
-                confirmBtn.addEventListener('click', onConfirm);
-                overlay.addEventListener('keydown', onKey);
-            });
-        }
-
-        function resumeSession(id) {
-            if (!ensureConnected()) return;
-            if (!id) return;
-            if (resendAwaitingHistory) {
-                showToast('Resend already in progress', 'info');
-                return;
-            }
-            if (pendingSessionResponse) {
-                showToast('Session change already in progress', 'info');
-                return;
-            }
-            // The old session's turn keeps running headless (continuation
-            // design — /new behaves the same): resume only re-keys this
-            // pane, it does NOT cancel the turn. Record the old session id
-            // so its turn_end (which may arrive before the reply re-keys the
-            // pane) cannot clear our pending flag mid-resume or block the
-            // resumed session's convergence; once the reply re-keys the
-            // pane, the old session's events are dropped by paneForMessage.
-            const p = activePane();
-            if (p && p.id) p.ignoreTurnEndsFor = p.id;
-            pendingSessionResponse = true;
-            ws.send(JSON.stringify({ type: 'session_resume', sessionId: id }));
-        }
-
         function switchMainPane(pane) {
-            if (pane !== 'terminal' && terminalIsMobile() && terminalPanel.classList.contains('mobile-full')) {
-                terminalCloseMobile();
-            }
+            if (pane !== 'terminal') terminalDismissMobile();
             document.querySelectorAll('.main-tab').forEach((t) => {
                 t.classList.toggle('active', t.dataset.pane === pane);
             });
@@ -6443,93 +4858,6 @@
             if (pane === 'editor') {
                 initMonaco().then(() => refreshExplorer()).catch(() => {});
             }
-        }
-
-        function exportChat() {
-            const lines = [];
-            const pane = activePane();
-            const sessionId = (sessionInfoDiv.textContent || 'session').replace(/[^\w.-]+/g, '_');
-            const label = (pane && pane.label) || '';
-            const date = new Date().toISOString().slice(0, 10);
-            lines.push(`# GoGen chat${label ? ` — ${label}` : ''} (${sessionId})`);
-            lines.push(`_Exported ${new Date().toLocaleString()}_`);
-            lines.push('');
-            for (const el of messagesDiv.querySelectorAll('.message, .tool-card')) {
-                appendExportEntry(lines, el);
-            }
-            const labelSlug = label.toLowerCase().replace(/[^\w.-]+/g, '_').replace(/^_+|_+$/g, '');
-            const base = labelSlug ? `${labelSlug}-${sessionId}` : sessionId;
-            const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' });
-            const a = document.createElement('a');
-            a.href = URL.createObjectURL(blob);
-            a.download = `gogen-chat-${base}-${date}.md`;
-            a.click();
-            URL.revokeObjectURL(a.href);
-            showToast('Chat exported', 'success');
-        }
-
-        // Append the markdown lines for one chat element (a tool call card or
-        // a user/assistant message) to the export buffer. Returns false when
-        // the element is skipped (system/thinking/thought cards, or an
-        // element with no exportable body).
-        function appendExportEntry(lines, el) {
-            if (el.classList.contains('system') || el.classList.contains('thinking') || el.classList.contains('thinking-block')) {
-                return false;
-            }
-            if (el.classList.contains('thought-card')) return false;
-            if (el.classList.contains('tool-card')) {
-                // Tool call card: name, args, result, and (for patch_file /
-                // show_diff) the raw diff text from the fallback <pre>.
-                const nameEl = el.querySelector('.tool-name');
-                const name = nameEl ? nameEl.textContent.trim() : 'tool';
-                const statusEl = el.querySelector('.tool-status-bar');
-                const status = statusEl ? statusEl.textContent.trim() : '';
-                const argsText = (el.querySelector('.tool-args')?.textContent || '').trim();
-                let resultText = (el.querySelector('.tool-result-body')?.textContent || '').trim();
-                // The status bar is a child of the result body; drop its
-                // label from the text so it is not duplicated.
-                if (status && resultText.startsWith(status)) {
-                    resultText = resultText.slice(status.length).trim();
-                }
-                const copyLabel = el.querySelector('.tool-result-copy')?.textContent || '';
-                if (copyLabel && resultText.startsWith(copyLabel)) {
-                    resultText = resultText.slice(copyLabel.length).trim();
-                }
-                const diffText = (el.querySelector('.monaco-tool-host .diff-fallback')?.textContent || '').trim();
-                if (!argsText && !resultText && !diffText) return false;
-                lines.push(`### tool: ${name}${status ? ` — ${status}` : ''}`);
-                if (argsText) {
-                    lines.push('');
-                    lines.push('```');
-                    lines.push(argsText);
-                    lines.push('```');
-                }
-                if (diffText) {
-                    lines.push('');
-                    lines.push('```diff');
-                    lines.push(diffText);
-                    lines.push('```');
-                }
-                if (resultText) {
-                    lines.push('');
-                    lines.push(resultText);
-                }
-                lines.push('');
-                return true;
-            }
-            const role = el.classList.contains('user') ? 'user'
-                : el.classList.contains('assistant') ? 'assistant' : null;
-            if (!role) return false;
-            const raw = messageRawStore.get(el);
-            const body = (raw != null ? raw : el.textContent || '').trim();
-            if (!body) return false;
-            const ts = el.dataset.createdAt ? new Date(el.dataset.createdAt) : null;
-            const stamp = (ts && !Number.isNaN(ts.getTime())) ? ` — ${ts.toLocaleString()}` : '';
-            lines.push(`## ${role}${stamp}`);
-            lines.push('');
-            lines.push(body);
-            lines.push('');
-            return true;
         }
 
         const PALETTE_COMMANDS = [
@@ -6557,8 +4885,7 @@
             { id: 'toggle-terminal', label: 'Toggle terminal', hint: 'Ctrl+`', run: () => {
                 // Same branch as the Ctrl+` handler: mobile gets the
                 // full-screen terminal, desktop toggles the strip.
-                if (terminalIsMobile()) terminalOpenMobile();
-                else terminalSetExpanded(!terminalExpanded);
+                terminalTogglePanel();
             }},
             { id: 'find-files', label: 'Find in files', hint: 'Ctrl+Shift+F', run: () => focusFindInFiles() },
             { id: 'export', label: 'Export chat', hint: 'Ctrl+Shift+E', run: () => exportChat() },
@@ -6579,13 +4906,11 @@
                     ensureModelsLoaded();
                 }
             }},
-            { id: 'open-settings', label: 'Open settings', hint: '', run: () => settingsBtn.click() },
+            { id: 'open-settings', label: 'Open settings', hint: '', run: () => openSettings() },
             { id: 'toggle-notifications', label: 'Toggle notifications', hint: '', run: () => {
-                const cur = localStorage.getItem('gogen_notifications') || 'off';
+                const cur = getNotificationPref();
                 const next = cur === 'off' ? 'background' : 'off';
-                localStorage.setItem('gogen_notifications', next);
-                notificationsSelect.value = next;
-                if (next !== 'off') requestNotificationPermission();
+                setNotificationPref(next);
                 showToast(`Notifications: ${next === 'off' ? 'off' : 'on (' + next + ')'}`, 'info');
             }},
         ];
@@ -6715,20 +5040,18 @@
                 // this opens the full-screen terminal; on desktop it switches
                 // between the strip and the expanded panel.
                 e.preventDefault();
-                if (terminalIsMobile()) terminalOpenMobile();
-                else terminalSetExpanded(!terminalExpanded);
+                terminalTogglePanel();
                 return;
             }
             if (e.key === 'Escape') {
                 hideTocTooltip();
-                if (terminalMoreMenu && !terminalMoreMenu.hidden) {
+                if (terminalHideMoreMenu()) {
                     e.preventDefault();
-                    terminalMoreMenu.hidden = true;
                     return;
                 }
-                if (settingsOverlay.classList.contains('active')) {
+                if (isSettingsOpen()) {
                     e.preventDefault();
-                    closeModal(settingsOverlay);
+                    closeSettings();
                     return;
                 }
                 const kbOverlay = document.getElementById('keybindings-overlay');
@@ -6759,6 +5082,44 @@
                 }
             }
         });
+
+        // === Composer block height (--composer-h) ===
+        // The scroll-to-bottom button floats above the composer block
+        // (toolbar + near-compact banner + input row). Measure the block's
+        // live height so the button never overlaps it — the toolbar wraps on
+        // narrow screens and the banner appears/disappears, so a constant
+        // drifts. Pane switches hide the block entirely (offsetHeight 0).
+        function composerRefreshVar() {
+            let h = 0;
+            for (const id of ['composer-toolbar', 'near-compact-banner', 'input-area']) {
+                const el = document.getElementById(id);
+                if (el) h += el.offsetHeight;
+            }
+            document.documentElement.style.setProperty('--composer-h', h + 'px');
+        }
+        if (typeof ResizeObserver !== 'undefined') {
+            const composerObs = new ResizeObserver(() => composerRefreshVar());
+            for (const id of ['composer-toolbar', 'near-compact-banner', 'input-area']) {
+                const el = document.getElementById(id);
+                if (el) composerObs.observe(el);
+            }
+        }
+        composerRefreshVar();
+
+        // === Visual viewport height (--vvh) ===
+        // The mobile full-screen terminal overlay is sized to the visual
+        // viewport so the OS keyboard never covers its bottom rows. Without
+        // visualViewport support the CSS falls back to the layout viewport.
+        function visualViewportRefresh() {
+            const vv = window.visualViewport;
+            if (!vv) return;
+            document.documentElement.style.setProperty('--vvh', vv.height + 'px');
+        }
+        if (window.visualViewport) {
+            visualViewportRefresh();
+            window.visualViewport.addEventListener('resize', visualViewportRefresh);
+            window.visualViewport.addEventListener('scroll', visualViewportRefresh);
+        }
 
         // === Scroll-to-bottom button ===
         const scrollBottomBtn = document.getElementById('scroll-bottom-btn');
@@ -7057,249 +5418,16 @@
             });
         }
 
+
         // === Conversation TOC rail ===
-        // One dot per user prompt (ChatGPT-style) between the sidebar and
-        // the chat. Dots mirror the transcript: every user bubble is created
-        // by appendMessageAtTime, so a dot is appended there (O(1) per
-        // prompt) and the rail is rebuilt from scratch on clearChat (pane
-        // switch, /new, compaction re-fetch, rewind). The active dot follows
-        // the prompt currently in view; clicking a dot jumps to its prompt;
-        // hovering shows a preview tooltip (fixed-position so the rail's
-        // overflow never clips it). On mobile the rail is hidden by CSS.
-        let lastTocActive = -1;
-        let tocHideTimer = null;
-        const TOC_TOOLTIP_HIDE_MS = 120; // debounce: sliding across dots must not flicker
-        const TOC_PREVIEW_MAX_CHARS = 300;
-
-        function appendTocDot(msgDiv) {
-            if (!tocRail || !tocDots || !msgDiv) return;
-            const i = tocDots.children.length;
-            const dot = document.createElement('button');
-            dot.type = 'button';
-            dot.className = 'toc-dot';
-            dot.dataset.tocItemIndex = String(i);
-            dot.setAttribute('aria-label', `Prompt ${i + 1}`);
-            dot.addEventListener('mouseenter', () => showTocTooltip(dot, msgDiv, i));
-            dot.addEventListener('mouseleave', scheduleHideTocTooltip);
-            dot.addEventListener('focus', () => showTocTooltip(dot, msgDiv, i));
-            dot.addEventListener('blur', scheduleHideTocTooltip);
-            dot.addEventListener('click', () => {
-                unpinFromBottom();
-                hideTocTooltip();
-                msgDiv.scrollIntoView({ behavior: 'smooth', block: 'start' });
-            });
-            tocDots.appendChild(dot);
-            tocRail.classList.add('has-dots');
-            if (!replayInProgress) updateTocActive();
-        }
-
-        function rebuildToc() {
-            if (!tocRail || !tocDots) return;
-            tocDots.innerHTML = '';
-            lastTocActive = -1;
-            for (const m of messagesDiv.querySelectorAll('.message.user')) appendTocDot(m);
-            const hasDots = tocDots.children.length > 0;
-            tocRail.classList.toggle('has-dots', hasDots);
-            if (!hasDots) hideTocRail();
-            updateTocActive();
-        }
-
-        // Highlight the dot of the prompt currently in view: the last user
-        // message whose top is above the upper-third line of the chat
-        // viewport; while pinned at the bottom (or within the re-pin
-        // threshold) the last prompt wins. Also keeps the active dot visible
-        // inside the scrollable rail (minimal scroll, only when the active
-        // dot changes, so streaming never churns the rail).
-        function updateTocActive(d) {
-            const users = messagesDiv.querySelectorAll('.message.user');
-            const dots = tocDots ? tocDots.children : null;
-            if (!users.length || !dots || !dots.length) return;
-            if (d === undefined) d = distanceFromBottom();
-            let active = users.length - 1;
-            if (!stickToBottom && d > NEAR_BOTTOM_PX) {
-                const viewTop = messagesDiv.getBoundingClientRect().top;
-                const probe = viewTop + messagesDiv.clientHeight * 0.35;
-                active = 0;
-                // Messages are in document order: the first one below the
-                // probe line means everything after it is too — stop early.
-                for (let i = 0; i < users.length; i++) {
-                    if (users[i].getBoundingClientRect().top <= probe) active = i;
-                    else break;
-                }
-            }
-            // Nothing changed — skip the class pass and rail auto-scroll so
-            // streaming never churns the DOM (active stays put while pinned).
-            if (active === lastTocActive) return;
-            const n = Math.min(dots.length, users.length);
-            for (let i = 0; i < n; i++) {
-                const on = i === active;
-                dots[i].classList.toggle('active', on);
-                if (on) dots[i].setAttribute('data-toc-active', '');
-                else dots[i].removeAttribute('data-toc-active');
-            }
-            if (active !== lastTocActive && active < dots.length) {
-                lastTocActive = active;
-                const dot = dots[active];
-                // offsetTop is relative to the nearest positioned ancestor;
-                // dot and column share it, so the difference is the dot's
-                // offset within the column.
-                const relTop = dot.offsetTop - tocDots.offsetTop;
-                if (relTop < tocDots.scrollTop) {
-                    tocDots.scrollTop = relTop;
-                } else if (relTop + dot.offsetHeight > tocDots.scrollTop + tocDots.clientHeight) {
-                    tocDots.scrollTop = relTop + dot.offsetHeight - tocDots.clientHeight;
-                }
-            }
-        }
-
-        function showTocTooltip(dot, msgDiv, i) {
-            if (!tocTooltip) return;
-            clearTimeout(tocHideTimer);
-            tocHideTimer = null;
-            const raw = (msgDiv && msgDiv.dataset.rawContent) || '';
-            tocTooltipLabel.textContent = `Prompt ${i + 1}`;
-            tocTooltipBody.textContent = raw.length > TOC_PREVIEW_MAX_CHARS
-                ? raw.slice(0, TOC_PREVIEW_MAX_CHARS) + '…'
-                : (raw || '(image attachment)');
-            tocTooltip.style.display = 'block';
-            // Position after un-hiding so offsetWidth/offsetHeight measure
-            // the real size. Fixed coordinates from the dot's viewport rect
-            // — immune to the rail's overflow clipping. The rail sits on
-            // the right edge of the chat pane, so the preview opens to the
-            // LEFT of the dot and flips to the right when the left side has
-            // no room (clamped to the viewport in both directions).
-            const r = dot.getBoundingClientRect();
-            const w = tocTooltip.offsetWidth;
-            const h = tocTooltip.offsetHeight;
-            let left = r.left - w - 8;
-            if (left < 8) left = r.right + 8;
-            left = Math.max(8, Math.min(left, window.innerWidth - w - 8));
-            const top = Math.max(8, Math.min(r.top + r.height / 2 - h / 2, window.innerHeight - h - 8));
-            tocTooltip.style.left = left + 'px';
-            tocTooltip.style.top = top + 'px';
-        }
-
-        function hideTocTooltip() {
-            clearTimeout(tocHideTimer);
-            tocHideTimer = null;
-            if (tocTooltip) tocTooltip.style.display = 'none';
-        }
-
-        function scheduleHideTocTooltip() {
-            if (!tocTooltip) return;
-            clearTimeout(tocHideTimer);
-            tocHideTimer = setTimeout(hideTocTooltip, TOC_TOOLTIP_HIDE_MS);
-        }
-
-        // The rail overlays the chat, so it must stay aligned with the
-        // #messages box: it must never cover the composer toolbar, the
-        // input row, or the scroll-to-bottom button (whose positions flex
-        // with the terminal strip and window size). Re-synced on every
-        // #messages box change (ResizeObserver) and at init.
-        function syncTocRailBox() {
-            const container = tocRail ? tocRail.parentElement : null;
-            if (!container || !tocDots) return;
-            const cRect = container.getBoundingClientRect();
-            const mRect = messagesDiv.getBoundingClientRect();
-            // Keep the strip clear of the #messages scrollbar. Classic
-            // scrollbars take layout space (offsetWidth - clientWidth is the
-            // scrollbar width); overlay-scrollbar platforms (macOS default,
-            // etc.) report 0 but still float a scrollbar over the right
-            // edge. Reserve a minimum 16px gutter either way so the rail
-            // (and its hover zone) can never cover the scrollbar strip and
-            // swallow its clicks.
-            const gutter = Math.max(16, messagesDiv.offsetWidth - messagesDiv.clientWidth);
-            tocRail.style.top = (mRect.top - cRect.top) + 'px';
-            tocRail.style.height = mRect.height + 'px';
-            tocRail.style.right = gutter + 'px';
-            // Viewport-space hover zone (clientX/clientY are viewport
-            // absolute, so no container math needed here).
-            tocZone = { right: mRect.right - gutter, top: mRect.top, bottom: mRect.top + mRect.height };
-        }
-
-        let tocRailHideTimer = null;
-        let tocZone = null;
-        const TOC_RAIL_HIDE_MS = 150; // debounce: leaving the strip hides the rail
-        const TOC_ZONE_WIDTH = 40; // matches the rail width
-
-        function showTocRail() {
-            if (!tocRail.classList.contains('has-dots')) return;
-            clearTimeout(tocRailHideTimer);
-            tocRailHideTimer = null;
-            tocRail.classList.add('toc-hover');
-        }
-
-        function hideTocRail() {
-            clearTimeout(tocRailHideTimer);
-            tocRailHideTimer = null;
-            tocRail.classList.remove('toc-hover');
-            // The pointer left the strip — its fixed-position preview would
-            // point at nothing.
-            hideTocTooltip();
-        }
-
-        function scheduleHideTocRail() {
-            if (!tocRail) return;
-            clearTimeout(tocRailHideTimer);
-            tocRailHideTimer = setTimeout(hideTocRail, TOC_RAIL_HIDE_MS);
-        }
-
-        function initToc() {
-            if (!tocRail || !tocDots || !tocTooltip) return;
-            const container = tocRail.parentElement;
-            // Wheel over the rail scrolls the dot list; at the boundaries
-            // the wheel is chained to the chat below (manual: the rail is
-            // an overlay, not a sibling, so native chaining would not reach
-            // #messages).
-            tocRail.addEventListener('wheel', (e) => {
-                const overflows = tocDots.scrollHeight > tocDots.clientHeight;
-                if (!overflows) return;
-                const delta = e.deltaMode === 1 ? e.deltaY * 16
-                    : e.deltaMode === 2 ? e.deltaY * tocDots.clientHeight
-                    : e.deltaY;
-                if ((delta < 0 && tocDots.scrollTop <= 0) ||
-                    (delta > 0 && tocDots.scrollTop + tocDots.clientHeight >= tocDots.scrollHeight - 1)) {
-                    // At a boundary: chain the wheel to the chat below (the
-                    // rail overlays #messages now) instead of swallowing it.
-                    // Wheel-up also leaves the bottom, matching the chat's
-                    // own unpin behavior.
-                    if (delta < 0) unpinFromBottom();
-                    messagesDiv.scrollTop += delta;
-                    return;
-                }
-                e.preventDefault();
-                tocDots.scrollTop += delta;
-            }, { passive: false });
-            // Hover reveal via coordinates, NOT pointer events: the rail has
-            // pointer-events:none while hidden (otherwise the chat below it
-            // would be unclickable), so a mouseenter on the rail itself can
-            // never fire. Watch mousemove over the chat container instead:
-            // the pointer is in the right-edge strip → show; elsewhere →
-            // schedule hide. The rail's own mouseleave covers the pointer
-            // leaving the window.
-            if (container) {
-                container.addEventListener('mousemove', (e) => {
-                    if (!tocRail.classList.contains('has-dots') || !tocZone) return;
-                    const inZone = e.clientX >= tocZone.right - TOC_ZONE_WIDTH
-                        && e.clientX < tocZone.right
-                        && e.clientY >= tocZone.top && e.clientY < tocZone.bottom;
-                    if (inZone) showTocRail();
-                    else scheduleHideTocRail();
-                }, { passive: true });
-            }
-            tocRail.addEventListener('mouseleave', scheduleHideTocRail);
-            // Keyboard: Tab-focusing a dot (visibility:hidden removes dots
-            // from the tab order, so this only fires while visible) keeps
-            // the rail shown while focus is inside it.
-            tocRail.addEventListener('focusin', showTocRail);
-            tocRail.addEventListener('focusout', scheduleHideTocRail);
-            // The hovered dot moves when the list scrolls; a fixed tooltip
-            // anchored to the old spot would mislead.
-            tocDots.addEventListener('scroll', () => hideTocTooltip());
-            window.addEventListener('resize', () => hideTocTooltip());
-            syncTocRailBox();
-        }
-        initToc();
+        initToc({
+            getMessages: () => messagesDiv,
+            getDistanceFromBottom: () => distanceFromBottom(),
+            isPinned: () => stickToBottom,
+            getNearBottomPx: () => NEAR_BOTTOM_PX,
+            isReplaying: () => replayInProgress,
+            unpin: () => unpinFromBottom(),
+        });
 
         // === Collapsible sidebar toggle ===
         const sidebarToggle = document.getElementById('sidebar-toggle');
@@ -7420,680 +5548,68 @@
             return `$${usd.toFixed(2)}`;
         };
 
-        // === Settings modal ===
-        const settingsBtn = document.getElementById('settings-btn');
-        const settingsOverlay = document.getElementById('settings-overlay');
-        const themeSelect = document.getElementById('theme-select');
-
-        // Settings sections are tabbed (sidebar): showSettingsTab reveals
-        // one .settings-group panel at a time. The last-used tab persists
-        // per browser (localStorage); opening the modal from a screen with
-        // a natural settings home (chat/editor/board) auto-selects that tab
-        // instead — the screen the user is on wins on open.
-        const SETTINGS_TAB_STORAGE = 'gogen-settings-tab';
-        const SCREEN_TO_SETTINGS_TAB = { chat: 'chat', editor: 'editor', board: 'agent' };
-        let settingsTab = localStorage.getItem(SETTINGS_TAB_STORAGE) || 'chat';
-
-        function showSettingsTab(tab) {
-            const panel = document.getElementById('settings-tab-' + tab);
-            if (!panel) tab = 'chat'; // stale localStorage value — fall back
-            settingsTab = tab;
-            try { localStorage.setItem(SETTINGS_TAB_STORAGE, tab); } catch (e) { /* private mode */ }
-            document.querySelectorAll('.settings-tab-btn').forEach((btn) => {
-                const on = btn.dataset.tab === tab;
-                btn.classList.toggle('active', on);
-                btn.setAttribute('aria-selected', on ? 'true' : 'false');
-            });
-            document.querySelectorAll('.settings-group[role="tabpanel"]').forEach((p) => {
-                p.hidden = p.id !== 'settings-tab-' + tab;
-            });
-        }
-
-        function openSettings() {
-            const pane = document.querySelector('.main-tab.active')?.dataset.pane;
-            showSettingsTab(SCREEN_TO_SETTINGS_TAB[pane] || settingsTab);
-            openModal(settingsOverlay);
-            // The subagent model picker (Agent tab) needs the model catalog;
-            // fetch it on open — the reply refreshes the toolbar picker too
-            // (shared list_models flow, server-cached).
-            if (document.getElementById('subagent-enabled-select')?.value === 'on'
-                && ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'list_models' }));
-            }
-        }
-
-        settingsBtn.addEventListener('click', openSettings);
-        document.querySelector('.settings-sidebar')?.addEventListener('click', (e) => {
-            const btn = e.target.closest('.settings-tab-btn');
-            if (btn && btn.dataset.tab) showSettingsTab(btn.dataset.tab);
-        });
-        document.getElementById('settings-close-btn')?.addEventListener('click', () => {
-            closeModal(settingsOverlay);
-        });
-        settingsOverlay.addEventListener('click', (e) => {
-            if (e.target === settingsOverlay) closeModal(settingsOverlay);
+        // === Settings modal + persisted preferences (components/settings.js) ===
+        // The tabbed settings overlay, the server-backed feature/runtime
+        // config, the MCP test flow, the providers list, the theme, the
+        // editor preferences, desktop notifications, the "show reply model"
+        // toggle and the accent color all live in the module; app.js keeps
+        // the ws dispatch (config / test_mcp / provider_test) and forwards
+        // payloads to its apply*Settings functions.
+        initSettings({
+            getWs: () => ws,
+            getPane: () => activePane(),
+            getModels: () => availableModels,
+            requestModels: () => {
+                modelsRequested = false;
+                ensureModelsLoaded();
+            },
+            switchMainPane: (pane) => switchMainPane(pane),
+            showToast: (message, kind) => showToast(message, kind),
+            applyReplyModelChips: () => applyReplyModelChips(),
+            setSubagentModel: (v) => { subagentPickerState.model = v; },
+            setSubagentThinkingLevel: (v) => { subagentPickerState.thinkingLevel = v; },
+            renderSubagentPicker: () => subagentPicker.render(),
         });
 
-        // === Feature settings: server-backed toggles (config WS message) ===
-        // Unlike the localStorage preferences above, these round-trip to the
-        // server: the toggle applies live to every session and is persisted
-        // to .gogen/gogen.conf. The select state follows the config push
-        // (applyFeatureSettings), so multiple tabs stay in sync.
-        const boardEnabledSelect = document.getElementById('board-enabled-select');
-        const subagentEnabledSelect = document.getElementById('subagent-enabled-select');
-        const subagentDepthInput = document.getElementById('subagent-depth-input');
-        if (boardEnabledSelect) {
-            boardEnabledSelect.addEventListener('change', () => {
-                sendFeatureConfig({ board: boardEnabledSelect.value });
-            });
-        }
-        if (subagentEnabledSelect) {
-            subagentEnabledSelect.addEventListener('change', () => {
-                sendFeatureConfig({ subagent: subagentEnabledSelect.value });
-            });
-        }
-        if (subagentDepthInput) {
-            subagentDepthInput.addEventListener('change', () => {
-                const n = parseInt(subagentDepthInput.value, 10);
-                if (!Number.isFinite(n) || n < 1) {
-                    subagentDepthInput.value = '1';
-                    return;
-                }
-                const clamped = Math.min(n, 10);
-                subagentDepthInput.value = String(clamped);
-                sendFeatureConfig({ subagentMaxDepth: clamped });
-            });
-        }
-
-        // === Runtime config options: server-backed (config WS message) ===
-        // The settings-modal options below round-trip through the config
-        // message's ConfigFields mechanism: a change sends { type: 'config',
-        // configFields: [name], <prop>: value }, the server applies it (live
-        // or restart-staged) and pushes the current values back, which keeps
-        // every tab in sync. prop overrides the WSMessage property when it
-        // differs from the ConfigFields name (contextLimitConfig).
-        const RUNTIME_CONTROLS = [
-            // Security
-            { id: 'command-safety-select', field: 'commandSafety' },
-            { id: 'command-allowlist-input', field: 'commandAllowlist' },
-            { id: 'delete-approval-select', field: 'deleteApproval' },
-            { id: 'command-sandbox-select', field: 'commandSandbox' },
-            { id: 'command-timeout-input', field: 'commandTimeoutSecs' },
-            // Context
-            { id: 'context-limit-input', field: 'contextLimit', prop: 'contextLimitConfig' },
-            { id: 'compact-threshold-input', field: 'compactThreshold' },
-            { id: 'compact-keep-input', field: 'compactKeepRecentMessages' },
-            { id: 'max-tool-bytes-input', field: 'maxToolResultBytes' },
-            { id: 'compact-reserve-input', field: 'compactReserveTokens' },
-            { id: 'preserve-reasoning-select', field: 'preserveReasoning' },
-            // Tools
-            { id: 'web-fetch-select', field: 'webFetch' },
-            { id: 'web-search-select', field: 'webSearch' },
-            { id: 'web-search-backend-select', field: 'webSearchBackend' },
-            { id: 'web-search-api-key-input', field: 'webSearchApiKey' },
-            { id: 'web-allowed-domains-input', field: 'webAllowedDomains' },
-            { id: 'web-fetch-mode-select', field: 'webFetchMode' },
-            { id: 'treesitter-select', field: 'treesitter' },
-            { id: 'treesitter-langs-input', field: 'treesitterLangs' },
-            // Sessions
-            { id: 'session-max-count-input', field: 'sessionMaxCount' },
-            { id: 'session-max-age-input', field: 'sessionMaxAgeDays' },
-            { id: 'approval-hold-input', field: 'webApprovalHoldSecs' },
-            // Server (restart-staged)
-            { id: 'web-bind-input', field: 'webBind' },
-            { id: 'web-allowed-origins-input', field: 'webAllowedOrigins' },
-            { id: 'web-auth-token-input', field: 'webAuthToken' },
-            { id: 'web-tls-cert-input', field: 'webTLSCertFile' },
-            { id: 'web-tls-key-input', field: 'webTLSKeyFile' },
-            { id: 'web-max-active-input', field: 'webMaxActiveSessions' },
-            { id: 'mcp-select', field: 'mcp' },
-            // Prompts (configurable templates; settings Agent group)
-            { id: 'board-start-prompt-input', field: 'boardStartPrompt' },
-            { id: 'system-prompt-input', field: 'systemPrompt' },
-            { id: 'subagent-prompt-input', field: 'subagentPrompt' },
-        ];
-
-        // Sends one or more runtime-config changes: { field: {prop, value} }.
-        function sendRuntimeConfig(changes) {
-            if (!ws || ws.readyState !== WebSocket.OPEN) return;
-            const payload = { type: 'config', configFields: [] };
-            for (const field of Object.keys(changes)) {
-                payload.configFields.push(field);
-                const { prop, value } = changes[field];
-                payload[prop] = value;
-            }
-            ws.send(JSON.stringify(payload));
-        }
-
-        function wireRuntimeControl(ctrl) {
-            const el = document.getElementById(ctrl.id);
-            if (!el) return;
-            el.addEventListener('change', () => {
-                let value = el.value;
-                if (el.type === 'number') {
-                    const n = parseInt(el.value, 10);
-                    if (!Number.isFinite(n)) return;
-                    value = n;
-                }
-                sendRuntimeConfig({ [ctrl.field]: { prop: ctrl.prop || ctrl.field, value } });
-            });
-        }
-        RUNTIME_CONTROLS.forEach(wireRuntimeControl);
-
-        // "Reset to default" for the prompt templates: send the explicit
-        // empty value; the server resolves it back to the built-in default
-        // and the next push re-populates the textarea with it.
-        const PROMPT_RESET_BUTTONS = [
-            { id: 'board-prompt-reset-btn', field: 'boardStartPrompt' },
-            { id: 'system-prompt-reset-btn', field: 'systemPrompt' },
-            { id: 'subagent-prompt-reset-btn', field: 'subagentPrompt' },
-        ];
-        for (const b of PROMPT_RESET_BUTTONS) {
-            const el = document.getElementById(b.id);
-            if (!el) continue;
-            el.addEventListener('click', () => sendRuntimeConfig({ [b.field]: { prop: b.field, value: '' } }));
-        }
-
-        // Applies the runtime-config values from the server push to the
-        // controls, updates the secret placeholders, and renders the
-        // restart banner. Values not present in the push are left as-is.
-        function applyRuntimeSettings(data) {
-            for (const ctrl of RUNTIME_CONTROLS) {
-                const el = document.getElementById(ctrl.id);
-                if (!el) continue;
-                const v = data[ctrl.prop || ctrl.field];
-                if (v === undefined) continue;
-                if (el.type === 'number') {
-                    if (String(el.value) !== String(v)) el.value = String(v);
-                } else if (el.value !== String(v)) {
-                    el.value = String(v);
-                }
-            }
-            const searchKeyEl = document.getElementById('web-search-api-key-input');
-            if (searchKeyEl) searchKeyEl.placeholder = data.webSearchApiKeySet ? 'API key (blank keeps stored)' : 'API key';
-            const authTokenEl = document.getElementById('web-auth-token-input');
-            if (authTokenEl) authTokenEl.placeholder = data.webAuthTokenSet ? 'Token set (blank keeps stored)' : 'Auth token';
-            const banner = document.getElementById('restart-banner');
-            if (banner) {
-                if (Array.isArray(data.restartRequired) && data.restartRequired.length > 0) {
-                    banner.textContent = '⚠ Restart gogen for these to take effect: ' + data.restartRequired.join(', ');
-                    banner.hidden = false;
-                } else {
-                    banner.hidden = true;
-                }
-            }
-            // Subagent default model: the server pushes the current value
-            // ("" = inherit, included even when empty so a clear by another
-            // tab syncs here too).
-            if (data.subagentModel !== undefined) {
-                subagentModelValue = data.subagentModel || '';
-                if (settingsOverlay.classList.contains('active')) renderSubagentModelPicker();
-            }
-            // Board start prompt template (resolved by the server: empty
-            // config → built-in default): the "Start agent" popover's pen
-            // editor pre-fills from it.
-            if (data.boardStartPrompt !== undefined) {
-                boardStartPromptValue = data.boardStartPrompt || '';
-            }
-        }
-
-        // === MCP test: server-backed (test_mcp WS message) ===
-        // The configured server list follows the config push (applyMCPSettings);
-        // row Test buttons probe a saved server by name (stored command/args/
-        // env resolved server-side), the form probes a typed command/args/env
-        // before adding it to the config file by hand. Never registers anything.
-        const mcpServerListEl = document.getElementById('mcp-server-list');
-        const mcpTestNameInput = document.getElementById('mcp-test-name');
-        const mcpTestCommandInput = document.getElementById('mcp-test-command');
-        const mcpTestArgsInput = document.getElementById('mcp-test-args');
-        const mcpTestEnvInput = document.getElementById('mcp-test-env');
-        const mcpTestBtn = document.getElementById('mcp-test-btn');
-        const mcpTestResult = document.getElementById('mcp-test-result');
-
-        function renderMCPServerList(servers) {
-            if (!mcpServerListEl || !Array.isArray(servers)) return;
-            mcpServerListEl.innerHTML = '';
-            if (servers.length === 0) {
-                mcpServerListEl.textContent = 'No MCP servers configured (mcp_servers in the config file).';
-                mcpServerListEl.className = 'settings-note';
-                return;
-            }
-            mcpServerListEl.className = 'mcp-server-list';
-            for (const s of servers) {
-                const row = document.createElement('div');
-                row.className = 'provider-row';
-                const info = document.createElement('span');
-                info.className = 'provider-row-info';
-                info.textContent = s.name + '  ·  ' + s.command + (s.args && s.args.length ? '  ' + s.args.join(' ') : '') + (s.envSet ? '  ·  env •••' : '');
-                row.appendChild(info);
-                const actions = document.createElement('span');
-                actions.className = 'provider-row-actions';
-                const testBtn = document.createElement('button');
-                testBtn.type = 'button';
-                testBtn.textContent = 'Test';
-                testBtn.title = 'Test connectivity and list tools';
-                testBtn.addEventListener('click', () => {
-                    showMCPTest('Testing ' + s.name + '…', '');
-                    sendMCPTest({ name: s.name });
-                });
-                actions.appendChild(testBtn);
-                row.appendChild(actions);
-                mcpServerListEl.appendChild(row);
-            }
-        }
-
-        function showMCPTest(text, kind) {
-            if (!mcpTestResult) return;
-            mcpTestResult.textContent = text;
-            mcpTestResult.className = 'settings-note' + (kind ? ' ' + kind : '');
-        }
-
-        function sendMCPTest(req) {
-            if (!ws || ws.readyState !== WebSocket.OPEN) return;
-            ws.send(JSON.stringify({ type: 'test_mcp', mcpTest: req }));
-        }
-
-        // "KEY=VALUE KEY2=VALUE2" → { KEY: VALUE, KEY2: VALUE2 } (invalid
-        // parts silently dropped).
-        function parseEnvInput(raw) {
-            const env = {};
-            for (const part of String(raw || '').trim().split(/\s+/)) {
-                if (!part) continue;
-                const eq = part.indexOf('=');
-                if (eq <= 0) continue;
-                env[part.slice(0, eq)] = part.slice(eq + 1);
-            }
-            return env;
-        }
-
-        function applyMCPSettings(data) {
-            if (Array.isArray(data.mcpServers)) {
-                renderMCPServerList(data.mcpServers);
-            }
-        }
-
-        if (mcpTestBtn) {
-            mcpTestBtn.addEventListener('click', () => {
-                showMCPTest('Testing…', '');
-                const rawArgs = mcpTestArgsInput.value.trim();
-                sendMCPTest({
-                    name: mcpTestNameInput.value.trim(),
-                    command: mcpTestCommandInput.value.trim(),
-                    args: rawArgs ? rawArgs.split(/\s+/) : [],
-                    env: parseEnvInput(mcpTestEnvInput.value),
-                });
-            });
-        }
-
-        // === Providers: server-backed list (config WS message) ===
-        // The list follows the config push (applyProviderSettings); the
-        // add/edit/delete/test actions round-trip through provider_save /
-        // provider_delete / test_provider. Keys are never pushed — only the
-        // apiKeySet flag — and the storage warning renders the actual config
-        // file path from the server.
-        const providerListEl = document.getElementById('provider-list');
-        const providerWarningPath = document.getElementById('provider-config-path');
-        const providerNameInput = document.getElementById('provider-name');
-        const providerBaseURLInput = document.getElementById('provider-base-url');
-        const providerKeyInput = document.getElementById('provider-api-key');
-        const providerModelInput = document.getElementById('provider-model');
-        const providerAddBtn = document.getElementById('provider-add-btn');
-        const providerTestBtn = document.getElementById('provider-test-btn');
-        const providerTestResult = document.getElementById('provider-test-result');
-
-        function sendProviderOp(type, fields) {
-            if (!ws || ws.readyState !== WebSocket.OPEN) return;
-            ws.send(JSON.stringify({ type, providerOp: fields }));
-        }
-
-        function showProviderTest(text, kind) {
-            if (!providerTestResult) return;
-            providerTestResult.textContent = text;
-            providerTestResult.className = 'settings-note' + (kind ? ' ' + kind : '');
-        }
-
-        function renderProviderList(providers) {
-            if (!providerListEl || !Array.isArray(providers)) return;
-            providerListEl.innerHTML = '';
-            for (const p of providers) {
-                const row = document.createElement('div');
-                row.className = 'provider-row';
-                const info = document.createElement('span');
-                info.className = 'provider-row-info';
-                info.textContent = p.name + (p.baseUrl ? '  ·  ' + p.baseUrl : '') + (p.apiKeySet ? '  ·  key •••' : '');
-                row.appendChild(info);
-                const actions = document.createElement('span');
-                actions.className = 'provider-row-actions';
-                const testBtn = document.createElement('button');
-                testBtn.type = 'button';
-                testBtn.textContent = 'Test';
-                testBtn.title = 'Test connectivity and list models';
-                testBtn.addEventListener('click', () => {
-                    showProviderTest('Testing ' + p.name + '…', '');
-                    sendProviderOp('test_provider', { name: p.name, baseUrl: p.baseUrl, model: p.model });
-                });
-                actions.appendChild(testBtn);
-                const editBtn = document.createElement('button');
-                editBtn.type = 'button';
-                editBtn.textContent = 'Edit';
-                editBtn.addEventListener('click', () => {
-                    providerNameInput.value = p.name;
-                    providerBaseURLInput.value = p.baseUrl || '';
-                    providerKeyInput.value = '';
-                    providerModelInput.value = p.model || '';
-                    providerKeyInput.placeholder = p.apiKeySet ? 'API key (blank keeps stored)' : 'API key';
-                    providerNameInput.focus();
-                });
-                actions.appendChild(editBtn);
-                const delBtn = document.createElement('button');
-                delBtn.type = 'button';
-                delBtn.textContent = 'Delete';
-                delBtn.disabled = !p.deletable;
-                if (p.deletable) {
-                    delBtn.title = 'Remove this provider';
-                    delBtn.addEventListener('click', () => {
-                        if (!confirm('Delete provider "' + p.name + '"? Its models will disappear from the picker.')) return;
-                        showProviderTest('', '');
-                        sendProviderOp('provider_delete', { name: p.name });
-                    });
-                } else {
-                    delBtn.title = 'The default profile is built from the legacy config fields';
-                }
-                actions.appendChild(delBtn);
-                row.appendChild(actions);
-                providerListEl.appendChild(row);
-            }
-        }
-
-        // Last-seen provider list (JSON): a change means a provider was
-        // added/edited/deleted, so the model catalog must be re-fetched —
-        // the picker's availableModels is otherwise a stale snapshot.
-        let lastProvidersJson = null;
-
-        function applyProviderSettings(data) {
-            if (Array.isArray(data.providers)) {
-                const json = JSON.stringify(data.providers);
-                if (json !== lastProvidersJson) {
-                    lastProvidersJson = json;
-                    // Re-request the aggregated catalog so the new provider's
-                    // models appear in the picker (and deleted ones drop).
-                    modelsRequested = false;
-                    ensureModelsLoaded();
-                }
-                renderProviderList(data.providers);
-            }
-            if (data.configFilePath && providerWarningPath) {
-                providerWarningPath.textContent = data.configFilePath;
-            }
-        }
-
-        function testProviderForm() {
-            const name = providerNameInput.value.trim();
-            const baseUrl = providerBaseURLInput.value.trim();
-            const model = providerModelInput.value.trim();
-            showProviderTest('Testing…', '');
-            // Testing a saved provider by name uses its stored key; the
-            // add-form test carries the typed endpoint (key included).
-            sendProviderOp('test_provider', { name, baseUrl, apiKey: providerKeyInput.value, model });
-        }
-
-        if (providerAddBtn) {
-            providerAddBtn.addEventListener('click', () => {
-                const name = providerNameInput.value.trim();
-                if (!name) {
-                    showToast('Provider name is required', 'error');
-                    return;
-                }
-                const baseUrl = providerBaseURLInput.value.trim();
-                const apiKey = providerKeyInput.value;
-                const model = providerModelInput.value.trim();
-                sendProviderOp('provider_save', { name, baseUrl, apiKey, model });
-                providerKeyInput.value = '';
-                providerKeyInput.placeholder = 'API key (blank keeps stored)';
-                showProviderTest('', '');
-            });
-        }
-        if (providerTestBtn) {
-            providerTestBtn.addEventListener('click', testProviderForm);
-        }
+        // === Sidebar session list (components/sessions.js) ===
+        initSessions({
+            getWs: () => ws,
+            getPane: () => activePane(),
+            getPanes: () => panes,
+            getNestedSessions: () => nestedSessions,
+            nestedParentIdOf: (id, list) => nestedParentIdOf(id, list),
+            nestedRowWillRender: (id, list, rowIds, seen) => nestedRowWillRender(id, list, rowIds, seen),
+            appendNestedRows: (parentId, depth) => appendNestedRows(parentId, depth),
+            relativeTime: (value, now) => relativeTime(value, now),
+            focusPane: (key) => focusPane(key),
+            openSessionPane: (id) => openSessionPane(id),
+            closePane: (key) => closePane(key),
+            ensureConnected: () => ensureConnected(),
+            cancelActiveTurn: () => cancelActiveTurn(),
+            showToast: (message, kind) => showToast(message, kind),
+            isResendAwaitingHistory: () => resendAwaitingHistory,
+            isPendingSessionResponse: () => pendingSessionResponse,
+            setPendingSessionResponse: (v) => { pendingSessionResponse = v; },
+            getSessionInfoDiv: () => sessionInfoDiv,
+            getMessagesDiv: () => messagesDiv,
+            getMessageRawStore: () => messageRawStore,
+        });
 
         // === Kanban board tab (drag-and-drop) ===
-        initBoardTab();
-
-        // === Theme: detect system preference, allow override ===
-        const prefersDark = window.matchMedia('(prefers-color-scheme: dark)');
-        const savedTheme = localStorage.getItem('gogen-theme') || 'auto';
-
-        function resolveTheme(preference) {
-            if (preference === 'auto' || !preference) return prefersDark.matches ? 'dark' : 'light';
-            return preference;
-        }
-
-        function applyTheme(preference) {
-            const resolved = resolveTheme(preference);
-            document.documentElement.classList.toggle('light', resolved === 'light');
-            localStorage.setItem('gogen-theme', preference);
-            // Keep select in sync
-            if (themeSelect.value !== preference) themeSelect.value = preference;
-            // Switch Monaco theme to match
-            setMonacoTheme(resolved === 'light');
-        }
-
-        // Initialize
-        themeSelect.value = savedTheme;
-        applyTheme(savedTheme);
-
-        // Listen for OS theme changes (only affects "auto" mode)
-        prefersDark.addEventListener('change', () => {
-            const pref = localStorage.getItem('gogen-theme') || 'auto';
-            if (pref === 'auto') applyTheme('auto');
+        initBoard({
+            getWs: () => ws,
+            requestModels: () => {
+                modelsRequested = false;
+                ensureModelsLoaded();
+            },
+            onSessionListRequested: () => requestSessionList(),
+            onOpenAgent: (sessionId) => {
+                switchMainPane('chat');
+                openSessionPane(sessionId);
+            },
+            getModels: () => availableModels,
+            getPane: () => activePane(),
         });
-
-        themeSelect.addEventListener('change', () => {
-            applyTheme(themeSelect.value);
-        });
-
-        // === File-click behavior: persist and apply ===
-        const fileClickSelect = document.getElementById('file-click-behavior');
-        const savedFileClick = localStorage.getItem('gogen_file_click_behavior') || 'open';
-        fileClickSelect.value = savedFileClick;
-        fileClickSelect.addEventListener('change', () => {
-            localStorage.setItem('gogen_file_click_behavior', fileClickSelect.value);
-        });
-        // Listen for storage changes from other tabs
-        window.addEventListener('storage', (e) => {
-            if (e.key === 'gogen_file_click_behavior') {
-                const val = e.newValue || 'open';
-                if (fileClickSelect.value !== val) fileClickSelect.value = val;
-            }
-        });
-
-        // === Chat diff viewer: static tokenizer pre (default) or full Monaco editor ===
-        const diffViewerSelect = document.getElementById('chat-diff-viewer');
-        const savedDiffViewer = localStorage.getItem('gogen_chat_diff_viewer') || 'tokenizer';
-        diffViewerSelect.value = savedDiffViewer;
-        diffViewerSelect.addEventListener('change', () => {
-            localStorage.setItem('gogen_chat_diff_viewer', diffViewerSelect.value);
-        });
-        window.addEventListener('storage', (e) => {
-            if (e.key === 'gogen_chat_diff_viewer') {
-                const val = e.newValue || 'tokenizer';
-                if (diffViewerSelect.value !== val) diffViewerSelect.value = val;
-            }
-        });
-
-        // === Editor preferences: persist and apply to the live Monaco editor ===
-        const editorMinimapSelect = document.getElementById('editor-minimap');
-        const editorWordwrapSelect = document.getElementById('editor-wordwrap');
-        const editorStickySelect = document.getElementById('editor-sticky');
-        const editorFontsizeInput = document.getElementById('editor-fontsize');
-
-        function clampFontSize(v) {
-            // Mirror getEditorPrefs() clamping so the control can never show a
-            // value the editor won't actually apply.
-            const min = parseInt(editorFontsizeInput?.min || '8', 10);
-            const max = parseInt(editorFontsizeInput?.max || '32', 10);
-            let n = parseInt(v, 10);
-            if (!Number.isFinite(n)) n = 13;
-            return Math.max(min, Math.min(max, n));
-        }
-
-        function initEditorPrefControl(control, key, dflt) {
-            if (!control) return;
-            const saved = localStorage.getItem(key) || dflt;
-            control.value = saved;
-            control.addEventListener('change', () => {
-                if (control.type === 'number') {
-                    // Keep the visible value in sync with what the editor will
-                    // actually apply (getEditorPrefs clamps to [min, max]).
-                    control.value = String(clampFontSize(control.value));
-                }
-                localStorage.setItem(key, control.value);
-                applyEditorPrefs();
-            });
-        }
-        initEditorPrefControl(editorMinimapSelect, 'gogen_editor_minimap', 'off');
-        initEditorPrefControl(editorWordwrapSelect, 'gogen_editor_wordwrap', 'on');
-        initEditorPrefControl(editorStickySelect, 'gogen_editor_sticky', 'on');
-        initEditorPrefControl(editorFontsizeInput, 'gogen_editor_fontsize', '13');
-        // Keep editor prefs in sync across tabs (mirrors the other settings).
-        window.addEventListener('storage', (e) => {
-            let changed = false;
-            if (e.key === 'gogen_editor_minimap' && editorMinimapSelect) {
-                editorMinimapSelect.value = e.newValue || 'off';
-                changed = true;
-            } else if (e.key === 'gogen_editor_wordwrap' && editorWordwrapSelect) {
-                editorWordwrapSelect.value = e.newValue || 'on';
-                changed = true;
-            } else if (e.key === 'gogen_editor_sticky' && editorStickySelect) {
-                editorStickySelect.value = e.newValue || 'on';
-                changed = true;
-            } else if (e.key === 'gogen_editor_fontsize' && editorFontsizeInput) {
-                editorFontsizeInput.value = String(clampFontSize(e.newValue || '13'));
-                changed = true;
-            }
-            if (changed) applyEditorPrefs();
-        });
-
-        // === Desktop notifications ===
-        const notificationsSelect = document.getElementById('notifications-select');
-        const savedNotifications = localStorage.getItem('gogen_notifications') || 'off';
-        notificationsSelect.value = savedNotifications;
-        notificationsSelect.addEventListener('change', () => {
-            localStorage.setItem('gogen_notifications', notificationsSelect.value);
-            if (notificationsSelect.value !== 'off') {
-                requestNotificationPermission();
-            }
-        });
-        window.addEventListener('storage', (e) => {
-            if (e.key === 'gogen_notifications') {
-                const val = e.newValue || 'off';
-                if (notificationsSelect.value !== val) notificationsSelect.value = val;
-            }
-        });
-
-        // === Show reply model (Settings → Chat): per-bubble model chip ===
-        const showReplyModelSelect = document.getElementById('show-reply-model');
-        const savedShowReplyModel = localStorage.getItem('gogen_show_reply_model') || 'off';
-        if (showReplyModelSelect) {
-            showReplyModelSelect.value = savedShowReplyModel;
-            showReplyModelSelect.addEventListener('change', () => {
-                localStorage.setItem('gogen_show_reply_model', showReplyModelSelect.value);
-                applyReplyModelChips();
-            });
-        }
-        window.addEventListener('storage', (e) => {
-            if (e.key === 'gogen_show_reply_model') {
-                const val = e.newValue || 'off';
-                if (showReplyModelSelect && showReplyModelSelect.value !== val) {
-                    showReplyModelSelect.value = val;
-                }
-                applyReplyModelChips();
-            }
-        });
-
-        // === Accent color: persist and apply ===
-        const accentInput = document.getElementById('accent-color-input');
-
-        // The soft accent variant is derived in CSS via color-mix, so JS only
-        // needs to set the base --user-accent (see styles.css).
-        function applyAccentColor(hex) {
-            if (!hex) {
-                document.documentElement.style.removeProperty('--user-accent');
-                return;
-            }
-            document.documentElement.style.setProperty('--user-accent', hex);
-        }
-
-        const savedAccent = localStorage.getItem('gogen-accent-color') || '';
-        if (savedAccent) {
-            accentInput.value = savedAccent;
-            applyAccentColor(savedAccent);
-        }
-
-        accentInput.addEventListener('input', function () {
-            const hex = accentInput.value;
-            applyAccentColor(hex);
-            localStorage.setItem('gogen-accent-color', hex);
-        });
-
-        window.addEventListener('storage', function (e) {
-            if (e.key === 'gogen-accent-color') {
-                const val = e.newValue || '';
-                if (accentInput.value !== val) accentInput.value = val;
-                applyAccentColor(val);
-            }
-        });
-
-        // === Accent color: reset to theme default ===
-        document.getElementById('accent-reset-btn').addEventListener('click', function () {
-            localStorage.removeItem('gogen-accent-color');
-            document.documentElement.style.removeProperty('--user-accent');
-            // Reset picker to the current theme's default accent
-            const isLight = document.documentElement.classList.contains('light');
-            accentInput.value = isLight ? '#0066cc' : '#569cd6';
-            accentInput.blur();
-        });
-
-        function getNotificationPref() {
-            return localStorage.getItem('gogen_notifications') || 'off';
-        }
-
-        function requestNotificationPermission() {
-            if (!('Notification' in window)) return;
-            if (Notification.permission === 'granted') return;
-            if (Notification.permission === 'denied') return;
-            Notification.requestPermission();
-        }
-
-        /**
-         * Send a desktop notification if the user has enabled them.
-         * @param {string} title
-         * @param {string} [body]
-         * @param {string} [tag] - dedup tag (prevents stacking)
-         */
-        function sendNotification(title, body, tag) {
-            const pref = getNotificationPref();
-            if (pref === 'off') return;
-            if (!('Notification' in window)) return;
-            if (Notification.permission !== 'granted') return;
-
-            // "background" mode: only notify when the tab is not focused
-            if (pref === 'background' && document.hasFocus()) return;
-
-            try {
-                const opts = { tag: tag || 'gogen-notification' };
-                if (body) opts.body = body;
-                new Notification(title, opts);
-            } catch (_) {
-                // Service worker or permission issue — silently ignore.
-            }
-        }
-
-        // Restore notification permission on load if preference is non-off
-        if (getNotificationPref() !== 'off') {
-            requestNotificationPermission();
-        }
 
         // Create the initial pane (the server's default session). Its session
         // id arrives in the connect handshake's config and is adopted by the

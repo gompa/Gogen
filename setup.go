@@ -43,6 +43,7 @@ func newAgent(cfg *config.Config, isGlobalMode bool) (*agent.Agent, string) {
 		CompactKeepRecentMessages: cfg.CompactKeepRecentMessages,
 		MaxToolResultBytes:        cfg.MaxToolResultBytes,
 		CompactReserveTokens:      cfg.CompactReserveTokens,
+		CompactLastResort:         cfg.CompactLastResort,
 	})
 
 	exec := agent.NewExecutorWithGuard(cfg.WorkingDir, agent.NewCommandGuard(cfg.CommandSafetyMode, agent.ParseAllowlist(cfg.CommandAllowlist)))
@@ -71,6 +72,7 @@ func newAgent(cfg *config.Config, isGlobalMode bool) (*agent.Agent, string) {
 	a.SetBoardEnabled(cfg.BoardEnabled())
 	a.SetSubagentsEnabled(cfg.SubagentEnabled())
 	a.SetSubagentMaxDepth(cfg.SubagentDepth())
+	a.SetSubagentMaxConcurrent(cfg.SubagentLimit())
 	if cfg.BoardEnabled() {
 		// Project board: per-process manager rooted at the working dir
 		// (global mode → the global board dir). Re-pointed on /dir changes

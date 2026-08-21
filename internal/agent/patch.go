@@ -611,7 +611,7 @@ func parseUnifiedDiff(diff string) ([]patchFile, error) {
 		boundaryAhead: computeBoundaryAhead(lines),
 		state:         stateFileHeader,
 	}
-	for i := 0; i < len(p.lines); i++ {
+	for i := range p.lines {
 		var err error
 		switch p.state {
 		case stateFileHeader:
@@ -1089,7 +1089,7 @@ func findHunkMatch(lines, oldLines []string, hint int, fuzzy bool) (matched int,
 	}
 	// Try exact relocation (nearest candidate; the hunk header line number is
 	// authoritative and the text matches exactly).
-	if alt, ok := findHunkLocation(lines, oldLines, hint); ok {
+	if alt, _, ok := findHunkLocationWith(lines, oldLines, hint, linesEqual); ok {
 		return alt, false
 	}
 	// Try relocation with whitespace-tolerant matching. Only apply it when the
@@ -1161,11 +1161,6 @@ func findHunkLocationWith(lines, oldLines []string, hint int, cmp func([]string,
 		return 0, 0, false
 	}
 	return best, count, true
-}
-
-func findHunkLocation(lines, oldLines []string, hint int) (int, bool) {
-	best, _, ok := findHunkLocationWith(lines, oldLines, hint, linesEqual)
-	return best, ok
 }
 
 func absInt(n int) int {

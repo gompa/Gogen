@@ -9,6 +9,8 @@ import (
 
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/shared"
+
+	"gogen/internal/onoff"
 )
 
 // SetPreserveReasoningMode controls whether chat_template_kwargs.preserve_reasoning
@@ -21,14 +23,13 @@ func (p *OpenAIProvider) SetPreserveReasoningMode(mode string) {
 }
 
 func normalizePreserveReasoningMode(mode string) string {
-	switch strings.ToLower(strings.TrimSpace(mode)) {
-	case "on", "1", "true", "yes":
-		return "on"
-	case "off", "0", "false", "no":
+	if on, ok := onoff.Parse(mode); ok {
+		if on {
+			return "on"
+		}
 		return "off"
-	default:
-		return "auto"
 	}
+	return "auto"
 }
 
 // applyChatCompletionExtras sets llama.cpp-style kwargs that keep prompt-cache

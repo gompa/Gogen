@@ -23,6 +23,9 @@ func TestFeatureFlagsDefaultOff(t *testing.T) {
 	if d := a.SubagentMaxDepth(); d != config.DefaultSubagentMaxDepth {
 		t.Fatalf("default depth = %d, want %d", d, config.DefaultSubagentMaxDepth)
 	}
+	if n := a.SubagentMaxConcurrent(); n != config.DefaultSubagentMaxConcurrent {
+		t.Fatalf("default concurrent limit = %d, want %d", n, config.DefaultSubagentMaxConcurrent)
+	}
 }
 
 // TestFeatureFlagSetters verifies the setters publish atomically (run under
@@ -44,6 +47,14 @@ func TestFeatureFlagSetters(t *testing.T) {
 	if d := a.SubagentMaxDepth(); d != config.DefaultSubagentMaxDepth {
 		t.Fatalf("zero depth should fall back to default, got %d", d)
 	}
+	a.SetSubagentMaxConcurrent(2)
+	if n := a.SubagentMaxConcurrent(); n != 2 {
+		t.Fatalf("concurrent limit = %d, want 2", n)
+	}
+	a.SetSubagentMaxConcurrent(0)
+	if n := a.SubagentMaxConcurrent(); n != config.DefaultSubagentMaxConcurrent {
+		t.Fatalf("zero concurrent limit should fall back to default, got %d", n)
+	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -51,6 +62,7 @@ func TestFeatureFlagSetters(t *testing.T) {
 			_ = a.BoardEnabled()
 			_ = a.SubagentsEnabled()
 			_ = a.SubagentMaxDepth()
+			_ = a.SubagentMaxConcurrent()
 		}
 	}()
 	for i := 0; i < 100; i++ {
@@ -65,13 +77,14 @@ func TestSessionAgentFactorySeedsFlags(t *testing.T) {
 	prov := llm.NewMockProvider()
 	exec := NewExecutor(t.TempDir())
 	opts := SessionAgentOptions{
-		Provider:         prov,
-		Executor:         exec,
-		Config:           &config.Config{ContextLimit: 128000},
-		WorkingDir:       exec.GetWorkingDir(),
-		BoardEnabled:     true,
-		SubagentsEnabled: true,
-		SubagentMaxDepth: 4,
+		Provider:              prov,
+		Executor:              exec,
+		Config:                &config.Config{ContextLimit: 128000},
+		WorkingDir:            exec.GetWorkingDir(),
+		BoardEnabled:          true,
+		SubagentsEnabled:      true,
+		SubagentMaxDepth:      4,
+		SubagentMaxConcurrent: 7,
 	}
 	a := NewSessionAgent(opts, nil, "test-id")
 	if !a.BoardEnabled() || !a.SubagentsEnabled() {
@@ -79,6 +92,9 @@ func TestSessionAgentFactorySeedsFlags(t *testing.T) {
 	}
 	if d := a.SubagentMaxDepth(); d != 4 {
 		t.Fatalf("factory depth = %d, want 4", d)
+	}
+	if n := a.SubagentMaxConcurrent(); n != 7 {
+		t.Fatalf("factory concurrent limit = %d, want 7", n)
 	}
 	if a.SessionID != "test-id" {
 		t.Fatalf("session id = %q, want test-id", a.SessionID)

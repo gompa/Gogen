@@ -3,6 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- Address-bar color; kept in sync with the theme by app.js (applyTheme). -->
+    <meta name="theme-color" content="#1e1e1e">
     <title>GoGen AI Agent</title>
     <link rel="stylesheet" href="/styles.css">
     <link rel="stylesheet" href="/xterm/xterm.css">
@@ -93,6 +95,10 @@
                     <button type="button" id="ncb-compact-btn">Compact now</button>
                     <button type="button" id="ncb-dismiss-btn" title="Dismiss" aria-label="Dismiss">✕</button>
                 </div>
+                <div id="condensed-banner" hidden>
+                    <span id="condensed-banner-text"></span>
+                    <button type="button" id="condensed-banner-dismiss" title="Dismiss" aria-label="Dismiss">✕</button>
+                </div>
                 <div id="input-area">
                     <div id="attachment-preview" hidden></div>
                     <div id="input-wrap">
@@ -143,14 +149,29 @@
                 </div>
                 <h4>Files <button type="button" id="btn-refresh-explorer">Refresh</button></h4>
                 <div id="file-tree"></div>
-                <div id="unstaged-wrap">
-                    <h4>Unstaged changes</h4>
-                    <div id="unstaged-list"></div>
+                <div id="changes-wrap">
+                    <h4>Changes</h4>
+                    <div id="changes-list"></div>
+                </div>
+                <div id="commit-composer">
+                    <h4>Commit</h4>
+                    <textarea id="commit-message" rows="3" placeholder="Commit message…"></textarea>
+                    <label id="stage-all-row" title="Stage all changes (including untracked files) before committing">
+                        <input type="checkbox" id="stage-all"> Stage all before commit
+                    </label>
+                    <div id="commit-buttons-row">
+                        <button type="button" id="btn-commit-ai" title="Generate a commit message from the staged diff with AI">✨ AI</button>
+                        <button type="button" id="btn-commit" class="primary" title="Commit the staged changes">Commit</button>
+                        <button type="button" id="btn-push" title="Push the current branch to origin">Push</button>
+                    </div>
                 </div>
             </div>
             <div class="sidebar-resize-handle" data-target="editor-sidebar" title="Drag to resize sidebar"></div>
             <div id="editor-main">
                 <div id="editor-toolbar">
+                    <!-- Mobile-only: opens the file explorer sidebar as an
+                         overlay drawer (styles.css / editor.js). -->
+                    <button type="button" id="editor-sidebar-toggle" title="Toggle file explorer">☰</button>
                     <span id="editor-path-label">No file open</span>
                     <button type="button" id="btn-undo" title="Undo (Ctrl+Z)" disabled>Undo</button>
                     <button type="button" id="btn-redo" title="Redo (Ctrl+Shift+Z)" disabled>Redo</button>
@@ -419,6 +440,13 @@
                 </div>
                 <div class="setting-row">
                     <div>
+                        <label>Max concurrent subagents</label>
+                        <input type="number" id="subagent-limit-input" min="1" max="32" step="1" aria-label="Max concurrent subagents">
+                        <p class="settings-note">Per session: how many subagents may run at the same time. Spawning beyond the limit is refused (the agent can interrupt or wait). Web mode only — the TUI runs subagents one at a time.</p>
+                    </div>
+                </div>
+                <div class="setting-row">
+                    <div>
                         <label>Default subagent model</label>
                         <!-- Server-backed (runtime-config WS message): the
                              list reuses the toolbar model picker's rendering
@@ -431,6 +459,24 @@
                             <input type="text" id="subagent-model-filter" class="tb-model-filter" placeholder="Filter models…" autocomplete="off" aria-label="Filter subagent models">
                             <div id="subagent-model-list" class="tb-model-list"></div>
                             <p class="settings-note">Empty = inherit the parent's model. The subagent tool's explicit model argument always wins.</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting-row">
+                    <div>
+                        <label>Subagent reasoning effort</label>
+                        <!-- Server-backed (runtime-config WS message), paired
+                             with the subagent model picker above: the chips
+                             are MODEL-AWARE — the selected subagent model's
+                             accepted values (catalog reasoningEfforts), or
+                             the active pane's model values while the model
+                             is "Inherit" (the child then runs the parent's
+                             model). The selection round-trips through
+                             configFields ["subagentThinkingLevel"]; empty =
+                             inherit the parent session's live level. -->
+                        <div id="subagent-thinking-picker">
+                            <div id="subagent-thinking-options" class="tb-thinking-grid"></div>
+                            <p class="settings-note">Empty = inherit the parent session's level. Options follow the subagent model's accepted values; a level the model does not accept is never sent.</p>
                         </div>
                     </div>
                 </div>
@@ -508,6 +554,15 @@
                     <div>
                         <label>Compact reserve tokens</label>
                         <input type="number" id="compact-reserve-input" min="0" step="100" aria-label="Compact reserve tokens">
+                    </div>
+                </div>
+                <div class="setting-row">
+                    <div>
+                        <label>Last-resort condensation (message too large for the window)</label>
+                        <select id="compact-last-resort-select" aria-label="Last-resort condensation">
+                            <option value="condense">Condense (archive the original)</option>
+                            <option value="error">Error (diagnostic, no condensation)</option>
+                        </select>
                     </div>
                 </div>
                 <div class="setting-row">

@@ -36,6 +36,7 @@ type FileConfig struct {
 	CompactKeepRecentMessages *int                  `yaml:"compact_keep_recent_messages"` // 0 = keep no recent messages on compaction
 	MaxToolResultBytes        *int                  `yaml:"max_tool_result_bytes"`        // 0 = no truncation cap
 	CompactReserveTokens      *int                  `yaml:"compact_reserve_tokens"`       // 0 = reserve no tokens
+	CompactLastResort         string                `yaml:"compact_last_resort"`          // condense (default) | error
 	CommandSafety             string                `yaml:"command_safety"`
 	CommandAllowlist          string                `yaml:"command_allowlist"`
 	DeleteApproval            string                `yaml:"delete_approval"`
@@ -55,6 +56,7 @@ type FileConfig struct {
 	WebSearchBackend          string                `yaml:"web_search_backend"`
 	WebSearchAPIKey           string                `yaml:"web_search_api_key"`
 	WebAllowedDomains         string                `yaml:"web_allowed_domains"`
+	WebAllowedOrigins         string                `yaml:"web_allowed_origins"`
 	WebFetchMode              string                `yaml:"web_fetch_mode"`
 	WebAuthToken              string                `yaml:"web_auth_token"`
 	WebTLSCertFile            string                `yaml:"web_tls_cert_file"`
@@ -70,7 +72,9 @@ type FileConfig struct {
 	Board                     string                `yaml:"board"`
 	Subagent                  string                `yaml:"subagent"`
 	SubagentMaxDepth          int                   `yaml:"subagent_max_depth"`
+	SubagentMaxConcurrent     int                   `yaml:"subagent_max_concurrent"`
 	SubagentModel             string                `yaml:"subagent_model"`
+	SubagentThinkingLevel     string                `yaml:"subagent_thinking_level"`
 	BoardStartPrompt          string                `yaml:"board_start_prompt"`
 	SystemPrompt              string                `yaml:"system_prompt"`
 	SubagentPrompt            string                `yaml:"subagent_prompt"`

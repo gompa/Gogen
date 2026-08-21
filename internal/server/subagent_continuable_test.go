@@ -467,6 +467,325 @@ func TestLiveChildCapRefuses(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool { return sp.children.get(id1) == nil })
 }
 
+// TestConcurrentLimitFromConfig pins the user-facing concurrent-subagent
+// limit (subagent_max_concurrent): with the workspace value set, background
+// spawning beyond it is refused (the refused child's runtime is released),
+// and foreground Spawn / Fork are refused while the cap is full.
+func TestConcurrentLimitFromConfig(t *testing.T) {
+	gate := make(chan struct{})
+	defer close(gate)
+	s, a := newContinuableServer(t, func() llm.LLMProvider {
+		return &gateProvider{release: gate}
+	})
+	sp := continuableSpawner(t, s)
+	sp.retain = time.Hour
+	s.ws.SetSubagentMaxConcurrent(2)
+
+	id1, err := sp.SpawnBackground(context.Background(), a, "job one", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id2, err := sp.SpawnBackground(context.Background(), a, "job two", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		return sp.children.get(id1) != nil && sp.children.get(id2) != nil
+	})
+
+	// A third background child exceeds the limit: refused and released.
+	if _, err := sp.SpawnBackground(context.Background(), a, "job three", "", 0); err == nil ||
+		!strings.Contains(err.Error(), "limit reached") {
+		t.Fatalf("background spawn beyond the concurrent limit must be refused with a limit error, got %v", err)
+	}
+	// Foreground spawn and fork are refused while the cap is full.
+	if _, err := sp.Spawn(context.Background(), a, "foreground job", "", 0); err == nil ||
+		!strings.Contains(err.Error(), "limit reached") {
+		t.Fatalf("foreground spawn at a full cap must be refused with a limit error, got %v", err)
+	}
+	if _, err := sp.Fork(context.Background(), a, "", 0); err == nil ||
+		!strings.Contains(err.Error(), "limit reached") {
+		t.Fatalf("fork at a full cap must be refused with a limit error, got %v", err)
+	}
+	// The two accepted children stay registered.
+	if sp.children.get(id1) == nil || sp.children.get(id2) == nil {
+		t.Fatal("accepted children must stay registered")
+	}
+	// Cleanup: cancel the running children so their turn goroutines exit.
+	sp.cancelAll(a.SessionID)
+}
+
+// TestConcurrentLimitCountsOnlyLiveChildren pins that FINISHED children do
+// not count toward the concurrent limit: with a limit of 1, a second spawn
+// is allowed once the first child has finished.
+func TestConcurrentLimitCountsOnlyLiveChildren(t *testing.T) {
+	s, a := newContinuableServer(t, func() llm.LLMProvider {
+		p := llm.NewMockProvider()
+		p.StreamResults = []*llm.StreamResult{{Content: "done"}}
+		return p
+	})
+	sp := continuableSpawner(t, s)
+	sp.retain = time.Hour
+	s.ws.SetSubagentMaxConcurrent(1)
+	// Held: the parent has no attached clients, so the orphan re-check after
+	// the completion-notice turn would evict it while we wait for the first
+	// child to finish.
+	if parentRt, ok := s.registry.get(a.SessionID); ok {
+		parentRt.held.Store(true)
+	}
+
+	id1, err := sp.SpawnBackground(context.Background(), a, "first job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		c := sp.children.get(id1)
+		return c != nil && c.isFinished()
+	})
+	// The finished child no longer counts: the second spawn is allowed.
+	id2, err := sp.SpawnBackground(context.Background(), a, "second job", "", 0)
+	if err != nil {
+		t.Fatalf("spawn after the first child finished must be allowed: %v", err)
+	}
+	if id2 == id1 {
+		t.Fatal("expected a fresh child id")
+	}
+}
+
+// TestInterruptFreesConcurrentSlot pins that the concurrent limit counts
+// ACTIVE children: interrupting a child frees its slot immediately (the
+// refusal error promises interrupt_agent makes room) while the interrupted
+// child stays registered and continuable until its retention window.
+func TestInterruptFreesConcurrentSlot(t *testing.T) {
+	n := 0
+	s, a := newContinuableServer(t, func() llm.LLMProvider {
+		n++
+		if n == 2 {
+			p := llm.NewMockProvider()
+			p.StreamResults = []*llm.StreamResult{{Content: "done"}}
+			return p
+		}
+		return &blockingProvider{}
+	})
+	sp := continuableSpawner(t, s)
+	sp.retain = time.Hour
+	s.ws.SetSubagentMaxConcurrent(1)
+	// Held: the parent has no attached clients, so the orphan re-check
+	// after id2's completion-notice turn would evict it before the
+	// foreground spawn below.
+	if parentRt, ok := s.registry.get(a.SessionID); ok {
+		parentRt.held.Store(true)
+	}
+
+	id1, err := sp.SpawnBackground(context.Background(), a, "long job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := sp.children.get(id1)
+	waitFor(t, 5*time.Second, func() bool { return child.statusOf() == "running" })
+	// Wait until the turn is actually in flight: cancelInFlight is a
+	// no-op before the turn registers its cancel handle, so an interrupt
+	// fired at mere "running" status (set at registration) could be lost.
+	waitFor(t, 5*time.Second, func() bool {
+		active, _ := child.rt.turnState()
+		return active
+	})
+
+	if err := sp.InterruptAgent(a, id1); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return child.statusOf() == "idle" })
+
+	// The slot is free: a new background spawn is allowed while the
+	// interrupted child is still registered.
+	id2, err := sp.SpawnBackground(context.Background(), a, "second job", "", 0)
+	if err != nil {
+		t.Fatalf("spawn after interrupt must be allowed (an idle child holds no slot): %v", err)
+	}
+	if sp.children.get(id2) == nil {
+		t.Fatal("the second child must stay registered")
+	}
+	// Let it finish so the foreground admission below is deterministic
+	// (with the cap at 1 a still-running id2 would refuse it).
+	waitFor(t, 5*time.Second, func() bool {
+		c := sp.children.get(id2)
+		return c != nil && c.statusOf() == "finished"
+	})
+
+	// A foreground spawn is admitted at the free slot (its slot is
+	// released when the turn is cancelled).
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := sp.Spawn(ctx, a, "foreground job", "", 0)
+		done <- err
+	}()
+	var fgID string
+	waitFor(t, 5*time.Second, func() bool {
+		for _, id := range s.registry.activeIDs() {
+			if id != a.SessionID && id != id1 && id != id2 {
+				fgID = id
+				return true
+			}
+		}
+		return false
+	})
+	if fgID == "" {
+		t.Fatal("foreground spawn at a free slot must be admitted")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("foreground spawn did not return after cancel")
+	}
+	sp.cancelAll(a.SessionID)
+	waitFor(t, 5*time.Second, func() bool {
+		return sp.children.get(id1) == nil && sp.children.get(id2) == nil
+	})
+}
+
+// TestForegroundCountsTowardConcurrentLimit pins that an in-flight
+// foreground child holds a slot of the concurrent limit: with the limit at
+// 2 and one background + one foreground child running, a second background
+// spawn is refused — and allowed again once the foreground child is gone.
+func TestForegroundCountsTowardConcurrentLimit(t *testing.T) {
+	s, a := newContinuableServer(t, func() llm.LLMProvider {
+		return &blockingProvider{}
+	})
+	sp := continuableSpawner(t, s)
+	sp.retain = time.Hour
+	s.ws.SetSubagentMaxConcurrent(2)
+
+	id1, err := sp.SpawnBackground(context.Background(), a, "background job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		c := sp.children.get(id1)
+		return c != nil && c.statusOf() == "running"
+	})
+
+	// A foreground child in flight (blocking provider, cancelled below).
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := sp.Spawn(ctx, a, "foreground job", "", 0)
+		done <- err
+	}()
+	var fgID string
+	waitFor(t, 5*time.Second, func() bool {
+		for _, id := range s.registry.activeIDs() {
+			if id != a.SessionID && id != id1 {
+				fgID = id
+				return true
+			}
+		}
+		return false
+	})
+	if fgID == "" {
+		t.Fatal("foreground child not registered")
+	}
+
+	// Active = 2 (background + foreground): the cap is full.
+	if _, err := sp.SpawnBackground(context.Background(), a, "second background", "", 0); err == nil ||
+		!strings.Contains(err.Error(), "limit reached") {
+		t.Fatalf("background spawn with an in-flight foreground child at the cap must be refused, got %v", err)
+	}
+
+	// Cancel the foreground child: its slot is released when Spawn returns.
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("foreground spawn did not return after cancel")
+	}
+	// Active = 1 again: the background spawn is allowed.
+	id3, err := sp.SpawnBackground(context.Background(), a, "second background", "", 0)
+	if err != nil {
+		t.Fatalf("background spawn after the foreground child finished must be allowed: %v", err)
+	}
+	if sp.children.get(id3) == nil {
+		t.Fatal("the second background child must stay registered")
+	}
+	sp.cancelAll(a.SessionID)
+}
+
+// TestForegroundSlotReleasedOnFailure pins the deferred foreground release:
+// a foreground spawn that fails BEFORE its turn starts (model selection)
+// must free its slot, or the parent would lose a slot of the concurrent
+// limit for nothing.
+func TestForegroundSlotReleasedOnFailure(t *testing.T) {
+	s, a := newContinuableServer(t, func() llm.LLMProvider {
+		p := llm.NewMockProvider()
+		p.StreamResults = []*llm.StreamResult{{Content: "done"}}
+		return p
+	})
+	sp := continuableSpawner(t, s)
+	sp.retain = time.Hour
+	s.ws.SetSubagentMaxConcurrent(1)
+
+	// Fails in newChildRuntime (unknown model), after the slot was taken.
+	if _, err := sp.Spawn(context.Background(), a, "job", "no/such-model", 0); err == nil ||
+		!strings.Contains(err.Error(), "subagent model") {
+		t.Fatalf("foreground spawn with an unknown model must fail with a model error, got %v", err)
+	}
+	// The slot is free: a background spawn at the cap is allowed.
+	id, err := sp.SpawnBackground(context.Background(), a, "job", "", 0)
+	if err != nil {
+		t.Fatalf("background spawn after a failed foreground spawn must be allowed: %v", err)
+	}
+	if sp.children.get(id) == nil {
+		t.Fatal("the background child must stay registered")
+	}
+	sp.cancelAll(a.SessionID)
+}
+
+// TestLiveGuardBoundsIdleChildren pins the internal non-finished guard:
+// interrupted (idle) children hold no slot of the user-facing concurrent
+// limit, but they still count against the memory guard, so a
+// spawn+interrupt loop cannot accumulate unbounded runtimes.
+func TestLiveGuardBoundsIdleChildren(t *testing.T) {
+	s, a := newContinuableServer(t, func() llm.LLMProvider {
+		return &blockingProvider{}
+	})
+	sp := continuableSpawner(t, s)
+	sp.retain = time.Hour
+	s.ws.SetSubagentMaxConcurrent(4)
+	sp.maxLiveGuard = 2
+
+	var ids []string
+	for _, job := range []string{"job one", "job two"} {
+		id, err := sp.SpawnBackground(context.Background(), a, job, "", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	for _, id := range ids {
+		c := sp.children.get(id)
+		waitFor(t, 5*time.Second, func() bool { return c.statusOf() == "running" })
+		// The turn must be in flight before the interrupt: cancelInFlight
+		// is a no-op before the turn registers its cancel handle.
+		waitFor(t, 5*time.Second, func() bool {
+			active, _ := c.rt.turnState()
+			return active
+		})
+		if err := sp.InterruptAgent(a, id); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, 5*time.Second, func() bool { return c.statusOf() == "idle" })
+	}
+	// Active = 0 (well under the limit of 4), but non-finished = 2 = the
+	// guard: the next spawn is refused by the guard, not the user limit.
+	if _, err := sp.SpawnBackground(context.Background(), a, "third job", "", 0); err == nil ||
+		!strings.Contains(err.Error(), "too many live subagents") {
+		t.Fatalf("spawn at the live guard must be refused by the guard, got %v", err)
+	}
+	sp.cancelAll(a.SessionID)
+}
+
 // TestOnTurnEndReplyBaseline pins the reply-capture baseline: only
 // messages the delivered turn actually produced count as the reply — an
 // older assistant message (e.g. the main job report) must never be

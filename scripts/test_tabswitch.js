@@ -8,6 +8,7 @@
 const fs = require('fs');
 const path = require('path');
 const { JSDOM } = require('/tmp/gogen-jsdom/node_modules/jsdom');
+const { loadAppJs, installEditorStubs } = require('./web-harness');
 
 const ROOT = path.join(__dirname, '..');
 
@@ -36,25 +37,11 @@ async function main() {
     send() {} close() {}
   };
 
-  const editorStubs = [
-    'connectEditorSocket', 'setupEditorUI', 'refreshExplorer', 'disposeChatEditors',
-    'mountDiffEditor', 'updateDiffEditor', 'updateDiffFallback', 'chatDiffWheelEdge',
-    'extractDiffValue', 'initMonaco', 'colorizeCodeBlocks', 'colorizeElement',
-    'languageFromPath', 'setToastHandler', 'focusFindInFiles', 'editorUndo',
-    'editorRedo', 'saveAll', 'saveActive', 'openFileAtLine', 'setMonacoTheme',
-    'applyEditorPrefs', 'applyPatchFromDiff', 'openModal', 'closeModal',
-  ];
-  for (const name of editorStubs) {
-    window[name] = window[name] || (() => Promise.resolve());
-  }
+  installEditorStubs(window);
   window.marked = { use() {}, parse(text) { return String(text == null ? '' : text); } };
   window.DOMPurify = { sanitize: (raw) => raw };
 
-  const appJs = fs.readFileSync(path.join(ROOT, 'internal/server/web/app.js'), 'utf8');
-  const stripped = appJs
-    .replace(/import\s*\{[^}]*\}\s*from\s*['"][^'"]+['"];\s*/gs, '')
-    .replace(/import\s+[A-Za-z_$][\w$]*\s+from\s*['"][^'"]+['"];\s*/g, '');
-  window.eval(stripped);
+  loadAppJs(window);
 
   const doc = window.document;
   const chatPane = doc.querySelector('.pane:not(#editor-pane)');

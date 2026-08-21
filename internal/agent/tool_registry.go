@@ -366,7 +366,11 @@ func handleSearchCode(ctx context.Context, a *Agent, args map[string]interface{}
 	if err != nil {
 		return "", err
 	}
-	return a.Executor.SearchCode(ctx, pattern, subpath, glob, contextLines)
+	ignoreCase, err := boolArg(args, "ignore_case", false)
+	if err != nil {
+		return "", err
+	}
+	return a.Executor.SearchCode(ctx, pattern, subpath, glob, contextLines, ignoreCase)
 }
 
 func handleFindSymbol(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
@@ -429,6 +433,23 @@ func handleGit(ctx context.Context, a *Agent, args map[string]interface{}) (stri
 	}
 }
 
+func handleGitBlame(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+	file, err := stringArg(args, "file")
+	if err != nil {
+		return "", err
+	}
+	ref, _ := stringArgOptional(args, "ref")
+	lineStart, err := intArgOptional(args, "line_start")
+	if err != nil {
+		return "", err
+	}
+	lineEnd, err := intArgOptional(args, "line_end")
+	if err != nil {
+		return "", err
+	}
+	return a.Executor.GitBlame(ctx, file, ref, lineStart, lineEnd)
+}
+
 func handleTodo(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
 	action, err := stringArg(args, "action")
 	if err != nil {
@@ -453,12 +474,9 @@ func handleTodo(_ context.Context, a *Agent, args map[string]interface{}) (strin
 	case "list":
 		return tm.ListTodos(), nil
 	case "done":
-		id, err := intArgOptional(args, "id")
+		id, err := intRequiredArg(args, "id")
 		if err != nil {
 			return "", err
-		}
-		if id == 0 {
-			return "", fmt.Errorf("missing required argument %q", "id")
 		}
 		out, err := tm.DoneTodo(id)
 		if err != nil {
@@ -467,12 +485,9 @@ func handleTodo(_ context.Context, a *Agent, args map[string]interface{}) (strin
 		a.persistTodos()
 		return out, nil
 	case "remove":
-		id, err := intArgOptional(args, "id")
+		id, err := intRequiredArg(args, "id")
 		if err != nil {
 			return "", err
-		}
-		if id == 0 {
-			return "", fmt.Errorf("missing required argument %q", "id")
 		}
 		out, err := tm.RemoveTodo(id)
 		if err != nil {

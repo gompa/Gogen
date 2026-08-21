@@ -20,6 +20,10 @@ type MockProvider struct {
 	CallCount     int
 	LastMessages  []Message
 	LastAllowed   map[string]struct{}
+	// ThinkingLevel records the last SetThinkingLevel call ("" = never
+	// set) so spawn-time wiring tests can assert the level reached the
+	// child provider.
+	ThinkingLevel string
 	OnGenerate    func(ctx context.Context, messages []Message) (Response, error)
 	OnStream      func(ctx context.Context, messages []Message, h *StreamHandlers) (*StreamResult, error)
 }
@@ -161,8 +165,7 @@ func (m *MockProvider) ModelName() string {
 func (m *MockProvider) SetThinkingLevel(level string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// Mock: no-op, just record it if needed.
-	_ = level
+	m.ThinkingLevel = level
 }
 
 // Ensure MockProvider implements LLMProvider.

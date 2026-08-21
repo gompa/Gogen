@@ -184,6 +184,31 @@ func TestSubagentDepth(t *testing.T) {
 	}
 }
 
+func TestSubagentLimit(t *testing.T) {
+	if got := ((*Config)(nil)).SubagentLimit(); got != DefaultSubagentMaxConcurrent {
+		t.Fatalf("nil config limit = %d, want default %d", got, DefaultSubagentMaxConcurrent)
+	}
+	zero := Config{}
+	if got := zero.SubagentLimit(); got != DefaultSubagentMaxConcurrent {
+		t.Fatalf("zero limit = %d, want default %d", got, DefaultSubagentMaxConcurrent)
+	}
+	neg := Config{SubagentMaxConcurrent: -2}
+	if got := neg.SubagentLimit(); got != DefaultSubagentMaxConcurrent {
+		t.Fatalf("negative limit = %d, want default %d", got, DefaultSubagentMaxConcurrent)
+	}
+	two := Config{SubagentMaxConcurrent: 2}
+	if got := two.SubagentLimit(); got != 2 {
+		t.Fatalf("limit 2 = %d, want 2", got)
+	}
+	def := Defaults()
+	if got := def.SubagentLimit(); got != DefaultSubagentMaxConcurrent {
+		t.Fatalf("defaults limit = %d, want %d", got, DefaultSubagentMaxConcurrent)
+	}
+	if def.SubagentMaxConcurrent != 4 {
+		t.Fatalf("default SubagentMaxConcurrent = %d, want 4", def.SubagentMaxConcurrent)
+	}
+}
+
 func TestConfigDefaults(t *testing.T) {
 	d := Defaults()
 	if d.CompactThreshold != 0.85 {

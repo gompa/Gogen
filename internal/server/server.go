@@ -19,6 +19,7 @@ import (
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
 	"gogen/internal/mcp"
+	"gogen/internal/onoff"
 	"gogen/internal/projectfile"
 	sesspkg "gogen/internal/session"
 	"gogen/internal/streamutil"
@@ -78,7 +79,24 @@ type Server struct {
 	wsConns        []*websocket.Conn
 	connLimiter    *rateLimitState
 	upgradeLimiter *ipLimiter
-	staticAssets   staticAssetCache // lazily gzip-compressed embedded assets
+	// bootstrapLimiter throttles the unauthenticated ?token= / ?pair=
+	// bootstrap endpoints per source IP.
+	bootstrapLimiter *ipLimiter
+	// pairMu guards the onboarding pairing code (see pairing.go): the code,
+	// its expiry, and the number of uses so far.
+	pairMu     sync.Mutex
+	pairCode   string
+	pairExpiry time.Time
+	pairMinted time.Time // when the current code was installed (SetPairingCode)
+	pairUses   int
+	// lastPairIP / lastPairAt remember the most recent accepted pairing
+	// exchange (IP + time) so the unauthenticated-page path can recognize
+	// "an exchange just succeeded from this device, yet no cookie arrived"
+	// — the browser-side cookie failure (different cookie jar or blocked
+	// cookies) — and diagnose it in the log and on the sign-in page.
+	lastPairIP   string
+	lastPairAt   time.Time
+	staticAssets staticAssetCache // lazily gzip-compressed embedded assets
 
 	// providerTestBuilder builds a throwaway provider for test_provider
 	// (never registered, never wired to a session). Defaults to a real
@@ -132,15 +150,16 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 	// mutation window of a tool.
 	a.SetToolHandlers(ws.buildToolHandlers())
 	s := &Server{
-		ws:             ws,
-		registry:       reg,
-		config:         cfg,
-		allowedOrigins: allowed,
-		authToken:      token,
-		tlsCertFile:    tlsCert,
-		tlsKeyFile:     tlsKey,
-		connLimiter:    newRateLimitState(defaultMaxWSConns),
-		upgradeLimiter: newIPLimiter(5, 10), // 5 upgrades/sec/IP, burst 10
+		ws:               ws,
+		registry:         reg,
+		config:           cfg,
+		allowedOrigins:   allowed,
+		authToken:        token,
+		tlsCertFile:      tlsCert,
+		tlsKeyFile:       tlsKey,
+		connLimiter:      newRateLimitState(defaultMaxWSConns),
+		upgradeLimiter:   newIPLimiter(5, 10), // 5 upgrades/sec/IP, burst 10
+		bootstrapLimiter: newIPLimiter(1, 5),  // 1 bootstrap/sec/IP, burst 5
 	}
 	s.providerTestBuilder = func(op ProviderOpRequest, workingDir string) (llm.LLMProvider, error) {
 		return llm.NewOpenAIProvider(op.APIKey, op.Model, op.BaseURL, workingDir), nil
@@ -174,6 +193,7 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 	a.SetBoardEnabled(ws.GetBoardEnabled())
 	a.SetSubagentsEnabled(ws.GetSubagentEnabled())
 	a.SetSubagentMaxDepth(ws.GetSubagentMaxDepth())
+	a.SetSubagentMaxConcurrent(ws.GetSubagentMaxConcurrent())
 	a.SetBoardManager(ws.GetBoardManager())
 	a.SetSkillsManager(ws.skillsManager)
 	// The subagent spawner needs the registry, so it is installed after the
@@ -346,6 +366,18 @@ func agentConfigMsg(ctx context.Context, rt *sessionRuntime) WSMessage {
 	return msg
 }
 
+// echoConfigOffLoop applies context stats to cfg and writes the config echo
+// off the read loop: ContextStats tokenization can take seconds on a large
+// uncached session, and the read loop serializes every message on the
+// connection (including cancel).
+func echoConfigOffLoop(ws *wsConn, ctx context.Context, a *agent.Agent, cfg *WSMessage) {
+	go func() {
+		accum := a.SnapshotUsageAccum()
+		applyContextStats(cfg, a.ContextStats(ctx), &accum)
+		_ = ws.writeJSON(*cfg)
+	}()
+}
+
 // fillModelPricing looks up pricing for the current model from the models.dev
 // registry cache (never blocks — pure map lookup).
 func fillModelPricing(a *agent.Agent, msg *WSMessage) {
@@ -377,12 +409,31 @@ func sessionEntries(list []agent.SessionInfo, active, turnActive map[string]bool
 	return out
 }
 
-// activeSet returns the set of registered session ids.
+// activeSet returns the session ids that are genuinely live for the
+// sessions payload's "resume to continue" indicator: a runtime with at
+// least one attached VIEWER (open as a pane in some tab) or a running
+// turn. Merely being registered is not enough — the restored default
+// session and passive (approval-only) attachments must not pin the
+// indicator for a session nobody is viewing (README: the indicator only
+// appears for sessions open in another tab or with a turn running
+// server-side). Ids are snapshotted under the registry lock and each
+// runtime's state read without it (no lock ordering with clientsMu /
+// stateMu), mirroring turnActiveSet.
 func (r *sessionRegistry) activeSet() map[string]bool {
 	ids := r.activeIDs()
 	out := make(map[string]bool, len(ids))
 	for _, id := range ids {
-		out[id] = true
+		rt, ok := r.get(id)
+		if !ok {
+			continue
+		}
+		if rt.viewerCount() > 0 {
+			out[id] = true
+			continue
+		}
+		if active, _ := rt.turnState(); active {
+			out[id] = true
+		}
 	}
 	return out
 }
@@ -714,8 +765,8 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	var target *sessionRuntime
 	for msg := range incoming {
 		target, pane = s.resolveMessageTarget(msg, pane)
-		if h, ok := wsHandlers[msg.Type]; ok {
-			h(s, ws, r, &pane, target, msg, userTermHolder)
+		if e, ok := wsHandlers[msg.Type]; ok {
+			e.handle(s, ws, r, &pane, target, msg, userTermHolder)
 		}
 	}
 }
@@ -772,41 +823,64 @@ func (s *Server) resolveMessageTarget(msg WSMessage, pane *sessionRuntime) (*ses
 // equivalent to the old switch's `continue`: the message is consumed.
 type wsMessageHandler func(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder)
 
+// wsHandlerKind tags which handler family serves a message type. Go only
+// allows comparing function values to nil, so tests assert socket routing
+// through this tag instead of the handler itself.
+type wsHandlerKind string
+
+const (
+	wsKindChat    wsHandlerKind = "chat"
+	wsKindFSRead  wsHandlerKind = "fs-read"
+	wsKindFSWrite wsHandlerKind = "fs-write"
+)
+
+type wsHandlerEntry struct {
+	handle wsMessageHandler
+	kind   wsHandlerKind
+}
+
 // wsHandlers maps inbound message types to their handlers. Unknown types are
-// dropped silently, exactly like the switch's implicit default.
-var wsHandlers = map[string]wsMessageHandler{
-	"session_fork":       wsHandleFork,
-	"fs_list":            wsHandleFSRead,
-	"fs_read":            wsHandleFSRead,
-	"fs_search":          wsHandleFSRead,
-	"git_status":         wsHandleFSRead,
-	"git_file_diff":      wsHandleFSRead,
-	"fs_write":           wsHandleFSWrite,
-	"fs_replace":         wsHandleFSWrite,
-	"fs_apply_patch":     wsHandleFSWrite,
-	"list_sessions":      wsHandleListSessions,
-	"session_new":        wsHandleSessionAction,
-	"session_resume":     wsHandleSessionAction,
-	"session_delete":     wsHandleSessionAction,
-	"list_models":        wsHandleListModels,
-	"set_model":          wsHandleSetModel,
-	"set_mode":           wsHandleSetMode,
-	"set_thinking_level": wsHandleSetThinkingLevel,
-	"config":             wsHandleConfig,
-	"cancel":             wsHandleCancel,
-	"board_op":           wsHandleBoardOp,
-	"provider_save":      wsHandleProviderSave,
-	"provider_delete":    wsHandleProviderDelete,
-	"test_provider":      wsHandleTestProvider,
-	"test_mcp":           wsHandleTestMCP,
-	"session_attach":     wsHandleAttach,
-	"session_detach":     wsHandleDetach,
-	"session_close":      wsHandleClose,
-	"user_term_input":    wsHandleUserTermInput,
-	"user_term_resize":   wsHandleUserTermResize,
-	"user_term_request":  wsHandleUserTermRequest,
-	"compact":            wsHandleCompact,
-	"message":            wsHandleMessage,
+// dropped silently, exactly like the switch's implicit default. FS entries
+// carry a kind tag so TestWSEditorHandlerParity can assert they stay in
+// lockstep with the /ws/editor socket's editorReadTypes/editorWriteTypes.
+var wsHandlers = map[string]wsHandlerEntry{
+	"session_fork":       {handle: wsHandleFork},
+	"fs_list":            {handle: wsHandleFSRead, kind: wsKindFSRead},
+	"fs_read":            {handle: wsHandleFSRead, kind: wsKindFSRead},
+	"fs_search":          {handle: wsHandleFSRead, kind: wsKindFSRead},
+	"git_status":         {handle: wsHandleFSRead, kind: wsKindFSRead},
+	"git_file_diff":      {handle: wsHandleFSRead, kind: wsKindFSRead},
+	"git_commit_message": {handle: wsHandleFSRead, kind: wsKindFSRead},
+	"fs_write":           {handle: wsHandleFSWrite, kind: wsKindFSWrite},
+	"fs_replace":         {handle: wsHandleFSWrite, kind: wsKindFSWrite},
+	"fs_apply_patch":     {handle: wsHandleFSWrite, kind: wsKindFSWrite},
+	"git_commit":         {handle: wsHandleFSWrite, kind: wsKindFSWrite},
+	"git_stage":          {handle: wsHandleFSWrite, kind: wsKindFSWrite},
+	"git_unstage":        {handle: wsHandleFSWrite, kind: wsKindFSWrite},
+	"git_push":           {handle: wsHandleFSWrite, kind: wsKindFSWrite},
+	"list_sessions":      {handle: wsHandleListSessions},
+	"session_new":        {handle: wsHandleSessionAction},
+	"session_resume":     {handle: wsHandleSessionAction},
+	"session_delete":     {handle: wsHandleSessionAction},
+	"list_models":        {handle: wsHandleListModels},
+	"set_model":          {handle: wsHandleSetModel},
+	"set_mode":           {handle: wsHandleSetMode},
+	"set_thinking_level": {handle: wsHandleSetThinkingLevel},
+	"config":             {handle: wsHandleConfig},
+	"cancel":             {handle: wsHandleCancel},
+	"board_op":           {handle: wsHandleBoardOp},
+	"provider_save":      {handle: wsHandleProviderSave},
+	"provider_delete":    {handle: wsHandleProviderDelete},
+	"test_provider":      {handle: wsHandleTestProvider},
+	"test_mcp":           {handle: wsHandleTestMCP},
+	"session_attach":     {handle: wsHandleAttach},
+	"session_detach":     {handle: wsHandleDetach},
+	"session_close":      {handle: wsHandleClose},
+	"user_term_input":    {handle: wsHandleUserTermInput},
+	"user_term_resize":   {handle: wsHandleUserTermResize},
+	"user_term_request":  {handle: wsHandleUserTermRequest},
+	"compact":            {handle: wsHandleCompact},
+	"message":            {handle: wsHandleMessage},
 }
 
 // wsHandleFork handles session_fork: the fork source is the pane named by
@@ -1067,49 +1141,37 @@ func (s *Server) attachSession(ws *wsConn, r *http.Request, rt *sessionRuntime, 
 	rt.attach(ws)
 	s.sendSessionState(ws, rt)
 	go func() {
-		if !sendHistory {
-			// Lightweight re-register: no history snapshot, no rewind. The
-			// session_state sent above already told the client whether the
-			// session is mid-turn; the config frames below refresh the
-			// pane's toolbar/context mirrors.
-			basic := agentConfigMsgBasic(rt.agent)
-			full := agentConfigMsg(r.Context(), rt)
-			s.decorateConfig(&basic)
-			s.decorateConfig(&full)
-			_ = ws.writeJSON(basic)
-			_ = ws.writeJSON(full)
-			// Derive llama.cpp reasoning-effort options for the (possibly
-			// restored) model and push a correction when they differ from
-			// the fallback set the configs above carried.
-			s.maybeProbeReasoningEfforts(r.Context(), rt.agent)
-			return
-		}
-		// Snapshot and send history FIRST, without the turn lock. A running
-		// turn holds turnMu for its ENTIRE duration (startTurn defers the
-		// unlock), so taking turnMu.RLock here would leave a mid-turn page
-		// open / reconnect with an empty transcript until the turn finishes
-		// — minutes for a long agent run, or indefinitely for a stuck turn.
-		// SnapshotMessages deep-clones under its own statsMu (its documented
-		// contract: web history snapshots never hold turnMu), so the
-		// transcript is consistent with the live stream and paints at once.
-		msgs := rt.agent.SnapshotMessages()
-		if len(msgs) > 0 {
-			_ = ws.writeJSON(WSMessage{
-				Type:         "history",
-				History:      historyEntries(msgs),
-				HistoryEpoch: rt.agent.HistoryEpoch(),
-				// The in-flight turn's partial output, so a mid-turn attach
-				// shows the current reply instead of "Resuming…" with no
-				// context until the turn ends.
-				Rewind:    rt.liveRewind(),
-				SessionID: rt.agent.SessionID,
-			})
+		if sendHistory {
+			// Snapshot and send history FIRST, without the turn lock. A running
+			// turn holds turnMu for its ENTIRE duration (startTurn defers the
+			// unlock), so taking turnMu.RLock here would leave a mid-turn page
+			// open / reconnect with an empty transcript until the turn finishes
+			// — minutes for a long agent run, or indefinitely for a stuck turn.
+			// SnapshotMessages deep-clones under its own statsMu (its documented
+			// contract: web history snapshots never hold turnMu), so the
+			// transcript is consistent with the live stream and paints at once.
+			msgs := rt.agent.SnapshotMessages()
+			if len(msgs) > 0 {
+				_ = ws.writeJSON(WSMessage{
+					Type:         "history",
+					History:      historyEntries(msgs),
+					HistoryEpoch: rt.agent.HistoryEpoch(),
+					// The in-flight turn's partial output, so a mid-turn attach
+					// shows the current reply instead of "Resuming…" with no
+					// context until the turn ends.
+					Rewind:    rt.liveRewind(),
+					SessionID: rt.agent.SessionID,
+				})
+			}
 		}
 		// Config echo: no turnMu — every field is internally synchronized
 		// (agentConfigMsgBasic), so a mid-turn attach gets the session's
 		// identity/toolbar state immediately instead of when the turn ends.
 		// Only the context-stats badge may lag (tokenization of a freshly
-		// restored session runs in agentConfigMsg below).
+		// restored session runs in agentConfigMsg below). For a lightweight
+		// re-register (sendHistory=false) the session_state sent above already
+		// told the client whether the session is mid-turn; these frames just
+		// refresh the pane's toolbar/context mirrors.
 		basic := agentConfigMsgBasic(rt.agent)
 		full := agentConfigMsg(r.Context(), rt)
 		s.decorateConfig(&basic)
@@ -1134,10 +1196,35 @@ func (s *Server) sendSessionState(ws *wsConn, rt *sessionRuntime) {
 	})
 }
 
+// editorReadTypes and editorWriteTypes are the message types served by the
+// /ws/editor socket (HandleWSEditor). They must stay in lockstep with the
+// wsHandlers map (the main chat socket routes the same types): missing
+// either registration silently drops the message. TestWSEditorHandlerParity
+// asserts the two agree.
+var editorReadTypes = []string{
+	"fs_list", "fs_read", "fs_search",
+	"git_status", "git_file_diff", "git_commit_message",
+}
+var editorWriteTypes = []string{
+	"fs_write", "fs_replace", "fs_apply_patch",
+	"git_commit", "git_stage", "git_unstage", "git_push",
+}
+
+// typeInList reports whether t is present in list (small linear scan — the
+// lists are a handful of constants).
+func typeInList(list []string, t string) bool {
+	for _, x := range list {
+		if x == t {
+			return true
+		}
+	}
+	return false
+}
+
 // HandleWSEditor serves the editor WebSocket endpoint (/ws/editor). It is the
-// workspace-scoped counterpart of HandleWS: it handles only filesystem and git
-// messages (fs_list/fs_read/fs_search/fs_write/fs_replace/fs_apply_patch,
-// git_status/git_file_diff) and ignores chat/session messages. The editor
+// workspace-scoped counterpart of HandleWS: it handles only the filesystem
+// and git message types in editorReadTypes/editorWriteTypes and ignores
+// chat/session messages. The editor
 // socket is independent of any chat session, so a busy or streaming session
 // never blocks editor saves behind the chat read loop. Write messages
 // serialize on the workspace filesystem lock (fsMu) — they wait only
@@ -1165,10 +1252,10 @@ func (s *Server) HandleWSEditor(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	for msg := range incoming {
-		switch msg.Type {
-		case "fs_list", "fs_read", "fs_search", "git_status", "git_file_diff":
+		switch {
+		case typeInList(editorReadTypes, msg.Type):
 			s.handleFSReadMessage(ws, r.Context(), msg)
-		case "fs_write", "fs_replace", "fs_apply_patch":
+		case typeInList(editorWriteTypes, msg.Type):
 			s.handleFSWriteMessage(ws, r.Context(), msg)
 		default:
 			// Non-editor messages (chat, sessions, terminal) are not
@@ -1290,11 +1377,7 @@ func (s *Server) handleWSSetModel(ws *wsConn, ctx context.Context, rt *sessionRu
 	// Tokenization + echo off the read loop: ContextStats on a large
 	// uncached session takes seconds, and the read loop serializes every
 	// message (including pane switches).
-	go func() {
-		accum := a.SnapshotUsageAccum()
-		applyContextStats(&cfg, a.ContextStats(ctx), &accum)
-		_ = ws.writeJSON(cfg)
-	}()
+	echoConfigOffLoop(ws, ctx, a, &cfg)
 	// llama.cpp endpoints: derive the new model's true reasoning-effort
 	// options from /props (+ /apply-template) and push a config update when
 	// they differ from the fallback the echo above carried (the provider
@@ -1321,11 +1404,7 @@ func (s *Server) handleWSSetMode(ws *wsConn, ctx context.Context, rt *sessionRun
 	if modeSet {
 		// Echo off the read loop (tokenization can take seconds on a large
 		// uncached session; the read loop serializes every message).
-		go func() {
-			accum := a.SnapshotUsageAccum()
-			applyContextStats(&cfg, a.ContextStats(ctx), &accum)
-			_ = ws.writeJSON(cfg)
-		}()
+		echoConfigOffLoop(ws, ctx, a, &cfg)
 	}
 }
 
@@ -1346,11 +1425,7 @@ func (s *Server) handleWSSetThinkingLevel(ws *wsConn, ctx context.Context, rt *s
 	s.decorateConfig(&cfg)
 	// Echo off the read loop (tokenization can take seconds on a large
 	// uncached session; the read loop serializes every message).
-	go func() {
-		accum := a.SnapshotUsageAccum()
-		applyContextStats(&cfg, a.ContextStats(ctx), &accum)
-		_ = ws.writeJSON(cfg)
-	}()
+	echoConfigOffLoop(ws, ctx, a, &cfg)
 }
 
 // isValidThinkingLevel reports whether v is a valid reasoning-effort selection
@@ -1380,7 +1455,7 @@ func (s *Server) handleWSConfig(ws *wsConn, ctx context.Context, pane **sessionR
 	if msg.WorkingDir != "" {
 		s.handleWSWorkingDir(ws, ctx, pane, msg)
 	}
-	if msg.Board != "" || msg.Subagent != "" || msg.SubagentMaxDepth != 0 {
+	if msg.Board != "" || msg.Subagent != "" || msg.SubagentMaxDepth != 0 || msg.SubagentMaxConcurrent != 0 {
 		s.handleWSFeatureFlags(ws, msg)
 	}
 	if len(msg.ConfigFields) > 0 {
@@ -1459,15 +1534,9 @@ func (s *Server) handleWSWorkingDir(ws *wsConn, ctx context.Context, pane **sess
 }
 
 // parseOnOff parses a config-WS on/off value. ok is false for anything that
-// is not a recognized on/off/1/0/true/false spelling.
+// is not a recognized on/off spelling (see onoff.Parse).
 func parseOnOff(v string) (on, ok bool) {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "on", "1", "true":
-		return true, true
-	case "off", "0", "false":
-		return false, true
-	}
-	return false, false
+	return onoff.Parse(v)
 }
 
 // handleWSFeatureFlags handles the Board / Subagent / SubagentMaxDepth
@@ -1502,6 +1571,10 @@ func (s *Server) handleWSFeatureFlags(ws *wsConn, msg WSMessage) {
 		writeNoticeError(ws, "settings", "Error: subagentMaxDepth must be >= 0")
 		return
 	}
+	if msg.SubagentMaxConcurrent < 0 {
+		writeNoticeError(ws, "settings", "Error: subagentMaxConcurrent must be >= 0")
+		return
+	}
 	if boardSet {
 		s.ws.SetBoardEnabled(board)
 	}
@@ -1510,6 +1583,9 @@ func (s *Server) handleWSFeatureFlags(ws *wsConn, msg WSMessage) {
 	}
 	if msg.SubagentMaxDepth > 0 {
 		s.ws.SetSubagentMaxDepth(msg.SubagentMaxDepth)
+	}
+	if msg.SubagentMaxConcurrent > 0 {
+		s.ws.SetSubagentMaxConcurrent(msg.SubagentMaxConcurrent)
 	}
 	// Sweep + persist + broadcast OFF the read loop: the persistence is a
 	// file write and the broadcast fans out to every attached socket.
@@ -1544,6 +1620,7 @@ func (s *Server) effectiveConfig() *config.Config {
 	out.CompactKeepRecentMessages = r.CompactKeepRecentMessages
 	out.MaxToolResultBytes = r.MaxToolResultBytes
 	out.CompactReserveTokens = r.CompactReserveTokens
+	out.CompactLastResort = r.CompactLastResort
 	out.CommandSafetyMode = r.CommandSafetyMode
 	out.CommandAllowlist = r.CommandAllowlist
 	out.DeleteApproval = r.DeleteApproval
@@ -1574,7 +1651,9 @@ func (s *Server) effectiveConfig() *config.Config {
 	out.Board = onOff(s.ws.GetBoardEnabled())
 	out.Subagent = onOff(s.ws.GetSubagentEnabled())
 	out.SubagentMaxDepth = s.ws.GetSubagentMaxDepth()
+	out.SubagentMaxConcurrent = s.ws.GetSubagentMaxConcurrent()
 	out.SubagentModel = r.SubagentModel
+	out.SubagentThinkingLevel = r.SubagentThinkingLevel
 	out.BoardStartPrompt = r.BoardStartPrompt
 	out.SystemPrompt = r.SystemPrompt
 	out.SubagentPrompt = r.SubagentPrompt
@@ -1591,6 +1670,7 @@ func (s *Server) applyFeatureFlagsToAll() {
 	board := s.ws.GetBoardEnabled()
 	subagent := s.ws.GetSubagentEnabled()
 	depth := s.ws.GetSubagentMaxDepth()
+	concurrent := s.ws.GetSubagentMaxConcurrent()
 	// Enabling the board creates the shared manager (data from a previous
 	// enable persists; disabling keeps it so re-enabling restores the
 	// board).
@@ -1607,6 +1687,7 @@ func (s *Server) applyFeatureFlagsToAll() {
 		a.SetBoardEnabled(board)
 		a.SetSubagentsEnabled(subagent)
 		a.SetSubagentMaxDepth(depth)
+		a.SetSubagentMaxConcurrent(concurrent)
 		a.SetBoardManager(bm)
 	}
 }
@@ -1645,6 +1726,7 @@ func (s *Server) decorateConfig(msg *WSMessage) {
 	msg.CompactKeepRecentMessages = r.CompactKeepRecentMessages
 	msg.MaxToolResultBytes = r.MaxToolResultBytes
 	msg.CompactReserveTokens = r.CompactReserveTokens
+	msg.CompactLastResort = r.CompactLastResort
 	msg.WebFetch = r.WebFetch
 	msg.WebSearch = r.WebSearch
 	msg.WebSearchBackend = r.WebSearchBackend
@@ -1654,7 +1736,9 @@ func (s *Server) decorateConfig(msg *WSMessage) {
 	msg.TreeSitter = r.TreeSitter
 	msg.TreeSitterLangs = r.TreeSitterLangs
 	msg.PreserveReasoning = r.PreserveReasoning
+	msg.SubagentMaxConcurrent = s.ws.GetSubagentMaxConcurrent()
 	msg.SubagentModel = &r.SubagentModel
+	msg.SubagentThinkingLevel = &r.SubagentThinkingLevel
 	msg.BoardStartPrompt = agent.ResolvePromptTemplate(r.BoardStartPrompt, agent.DefaultBoardStartPrompt)
 	msg.SystemPrompt = agent.ResolvePromptTemplate(r.SystemPrompt, agent.DefaultSystemPromptTemplate())
 	msg.SubagentPrompt = agent.ResolvePromptTemplate(r.SubagentPrompt, agent.DefaultSubagentPrompt)
@@ -1834,29 +1918,10 @@ func workingDirSkipMessage(absDir string, skipped []string) string {
 // the provider), then reports the result and refreshed context stats. Runs in
 // a goroutine so the slow summarization does not block the WS read loop.
 func (s *Server) handleWSCompact(ws *wsConn, r *http.Request, rt *sessionRuntime) {
-	// Interrupt semantics are scoped to the connection that owns the current
-	// turn: a second connection attached as a viewer must not kill a
-	// turn it does not own — it waits and gets the busy rejection instead.
-	if rt.ownsTurn(ws) {
-		rt.stream.cancelInFlight()
-	}
-	if !rt.tryAcquireTurn(wsTurnAcquireWait) {
-		// Cancel may have timed out while a tool was still exiting; wait once more.
-		if rt.ownsTurn(ws) {
-			rt.stream.cancelInFlight()
-		}
-		if !rt.tryAcquireTurn(wsStreamDrainWait) {
-			// /compact is a typed chat command: the busy rejection is its
-			// reply on the conversation channel.
-			_ = ws.writeJSON(WSMessage{Type: "response", Content: errAgentBusy})
-			return
-		}
-	}
-	// Same eviction guard as handleWSUserMessage/acquireTurnForHandler: the
-	// session may have left the registry while we waited for the lock; a
-	// compact on an evicted runtime would be invisible to shutdown.
-	if rt.evicted.Load() {
-		rt.turnMu.Unlock()
+	if !rt.acquireTurnForHandler(ws) {
+		// /compact is a typed chat command: the busy rejection is its
+		// reply on the conversation channel.
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: errAgentBusy})
 		return
 	}
 	// Mark the session as "busy" for the compaction duration so a
@@ -1903,7 +1968,7 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 	if sel, isModels := agent.ParseModelsCommand(msg.Content); isModels && sel != "" {
 		_, _ = rt.agent.ListModels(r.Context())
 	}
-	if !s.acquireTurnForHandler(ws, rt) {
+	if !rt.acquireTurnForHandler(ws) {
 		// Busy rejection on the CONVERSATION channel: the user typed a chat
 		// message (or a chat command) and the error is its reply.
 		_ = ws.writeJSON(WSMessage{Type: "response", Content: errAgentBusy})
@@ -2064,37 +2129,6 @@ func (s *Server) preprocessWSUserMessage(ws *wsConn, r *http.Request, rt *sessio
 // the chat transcript.
 const errAgentBusy = "Error: agent is busy with another client"
 
-// acquireTurnForHandler takes the session turn lock for a message handler,
-// waiting briefly and re-cancelling once when the previous turn is still
-// draining. Returns false when the runtime is busy or was evicted; the
-// caller drops the message and notifies the client on its own channel (see
-// errAgentBusy). On success the caller owns rt.turnMu.
-func (s *Server) acquireTurnForHandler(ws *wsConn, rt *sessionRuntime) bool {
-	if !rt.tryAcquireTurn(wsTurnAcquireWait) {
-		// Cancel may have timed out while a tool was still exiting; wait once
-		// more. Only re-cancel when this connection owns the turn — a second
-		// connection must not kill a turn it does not own.
-		if rt.ownsTurn(ws) {
-			rt.stream.cancelInFlight()
-		}
-		if !rt.tryAcquireTurn(wsStreamDrainWait) {
-			return false
-		}
-	}
-
-	// The session may have been evicted (registry cap / delete) after this
-	// connection resolved it (e.g. a stale id-less pane). Starting a turn on
-	// an evicted runtime would be invisible to cancel/prune/shutdown. The
-	// flag is set while the eviction holds turnMu, so the check under the
-	// lock is race-free (see acquireTurnForHandler). Drop silently — the
-	// client already got session_detached and closed the pane.
-	if rt.evicted.Load() {
-		rt.turnMu.Unlock()
-		return false
-	}
-	return true
-}
-
 // startTurn begins a streaming turn owned by the session runtime. The caller
 // (the connection read loop) must already hold rt.turnMu; the goroutine
 // defers the unlock. The turn context derives from context.Background() plus
@@ -2105,11 +2139,10 @@ func (s *Server) acquireTurnForHandler(ws *wsConn, rt *sessionRuntime) bool {
 func (rt *sessionRuntime) startTurn(owner *wsConn, content string, images []llm.ImageInput) {
 	streamCtx, streamCancel := context.WithCancel(context.Background())
 	errCh := rt.stream.begin(streamCancel)
-	rt.setTurnActive(true, time.Now(), owner)
 	go func(content string, images []llm.ImageInput, turnCtx context.Context, done chan error) {
 		// Defers run LIFO, so the cleanup executes in this order: turn_end
-		// broadcast → setTurnActive(false) → done → stream.end() →
-		// turnMu.Unlock().
+		// broadcast → setTurnActive(false) (both inside runTurnBody, while
+		// the lock is still held) → done → stream.end() → turnMu.Unlock().
 		// The turn state must be cleared BEFORE the lock is released: a new
 		// turn can only start once the lock is free, and it must never see
 		// (or clobber) a stale turnActive/turnOwner from the turn it
@@ -2128,101 +2161,168 @@ func (rt *sessionRuntime) startTurn(owner *wsConn, content string, images []llm.
 		defer rt.turnMu.Unlock()
 		defer rt.stream.end()
 		defer func() { done <- nil }()
-		defer rt.setTurnActive(false, time.Time{}, nil)
-		defer rt.broadcast(WSMessage{Type: "turn_end", SessionID: rt.agent.SessionID})
-		// The runtime may have been evicted while the caller waited for the
-		// turn lock: close/delete/cap eviction proceed WITHOUT turnMu when
-		// the lock is held (the stuck-turn path), so an eviction can land
-		// after the caller's own evicted check. Starting the turn would
-		// stream into the void and persist a message into a torn-down
-		// session (the delivery worker's pop-then-start handoff is exactly
-		// this window). The defers above still run, so the early return is
-		// a clean no-op turn: turn state is reset, errCh is signaled, the
-		// stream handles are cleared, and the lock is released.
-		if rt.evicted.Load() {
+		// runTurnBody owns the evicted check (an evicted runtime is a clean
+		// no-op turn: the defers above still signal errCh, clear the stream
+		// handles, and release the lock) and the turn-active lifecycle.
+		rt.runTurnBody(turnCtx, content, images, turnOpts{
+			owner:        owner,
+			tagPositions: true,
+			reportErr:    true,
+			persist:      true,
+		})
+	}(content, images, streamCtx, errCh)
+}
+
+// errTurnEvicted is returned by runTurnBody when the runtime was evicted
+// before the turn could start. Callers map it to their own failure mode:
+// web turns are a silent no-op, child turns report it to the parent.
+var errTurnEvicted = errors.New("turn evicted before start")
+
+// turnOpts captures the per-caller differences between the two entry
+// points that share runTurnBody: the web turn (startTurn) and the
+// subagent child turn (runChildTurn).
+type turnOpts struct {
+	// owner is the connection that started the turn (web turns); nil for
+	// child turns.
+	owner *wsConn
+	// tagPositions stamps the live thinking/content segment positions on
+	// token frames (web panes render positioned segments; child panes do
+	// not).
+	tagPositions bool
+	// reportErr logs the turn error and fires rt.turnErrorHook (web turns;
+	// child turns surface the error to the parent as the tool result
+	// instead).
+	reportErr bool
+	// persist consumes the agent's persist error and appends the
+	// context-usage frame (web turns; child turns persist through
+	// doPersist and the spawner's outcome flush).
+	persist bool
+}
+
+// runTurnBody executes one streaming turn synchronously. It is the shared
+// core of startTurn (web turns) and runChildTurn (subagent child turns);
+// the callers keep the goroutine, the turn lock, and the stream handles.
+//
+//	Precondition: the caller holds rt.turnMu and has called
+//	rt.stream.begin with ctx's cancel.
+//	Postcondition: the turn is no longer active and turn_end has been
+//	broadcast (both while the lock is still held).
+//
+// It returns errTurnEvicted when the runtime was evicted before the turn
+// could start; the caller decides how to surface that.
+func (rt *sessionRuntime) runTurnBody(ctx context.Context, content string, images []llm.ImageInput, o turnOpts) (string, error) {
+	// The runtime may have been evicted while the caller waited for the
+	// turn lock: close/delete/cap eviction proceed WITHOUT turnMu when
+	// the lock is held (the stuck-turn path), so an eviction can land
+	// after the caller's own evicted check. Starting the turn would
+	// stream into the void and persist a message into a torn-down
+	// session (the delivery worker's pop-then-start handoff is exactly
+	// this window). The caller's defers still run, so the early return is
+	// a clean no-op turn: turn state is reset, errCh is signaled, the
+	// stream handles are cleared, and the lock is released.
+	if rt.evicted.Load() {
+		return "", errTurnEvicted
+	}
+	// The turn is published as active ONLY while holding the lock: a
+	// window with turnActive=true but turnMu free would let a
+	// delivery/attach turn start concurrently and clobber the active flag
+	// (or run ahead of the turn's own work). Both defers run while the
+	// lock is still held: turn_end first, so a new turn's first events can
+	// never interleave ahead of it, then the state reset, so the next turn
+	// never sees a stale turnActive/turnOwner.
+	defer rt.setTurnActive(false, time.Time{}, nil)
+	defer rt.broadcast(WSMessage{Type: "turn_end", SessionID: rt.agent.SessionID})
+	rt.setTurnActive(true, time.Now(), o.owner)
+	// An installed approverOverride (subagent D6 forwarding, board start
+	// deny-when-unattended) replaces the default per-session approver.
+	approver := rt.deleteApprover()
+	if rt.approverOverride != nil {
+		approver = rt.approverOverride
+	}
+	appCtx := agent.ContextWithDeleteApprover(ctx, approver)
+	// write fans out to every attached socket and tags the source
+	// sessionId. A write failure detaches that socket (broadcast does it);
+	// it NEVER cancels the LLM call — the turn belongs to the session and
+	// keeps running headless (§4).
+	write := func(v WSMessage) {
+		if appCtx.Err() != nil {
 			return
 		}
-		// An installed approverOverride (subagent D6 forwarding, board start
-		// deny-when-unattended) replaces the default per-session approver.
-		approver := rt.deleteApprover()
-		if rt.approverOverride != nil {
-			approver = rt.approverOverride
+		if v.SessionID == "" {
+			v.SessionID = rt.agent.SessionID
 		}
-		ctx := agent.ContextWithDeleteApprover(turnCtx, approver)
-		// write fans out to every attached socket and tags the source
-		// sessionId. A write failure detaches that socket (broadcast does it);
-		// it NEVER cancels the LLM call — the turn belongs to the session and
-		// keeps running headless (§4).
-		write := func(v WSMessage) {
-			if ctx.Err() != nil {
-				return
+		rt.broadcast(v)
+	}
+	tokens := streamutil.NewTokenBatcher(func(think bool, text string) {
+		if think {
+			msg := WSMessage{Type: "thinking_token", Content: text}
+			if o.tagPositions {
+				msg.ThinkingPos = rt.liveThinkingSegmentEnd(text)
 			}
-			if v.SessionID == "" {
-				v.SessionID = rt.agent.SessionID
+			write(msg)
+		} else {
+			msg := WSMessage{Type: "stream", Content: text}
+			if o.tagPositions {
+				msg.ContentPos = rt.liveContentSegmentEnd(text)
 			}
-			rt.broadcast(v)
+			write(msg)
 		}
-		tokens := streamutil.NewTokenBatcher(func(think bool, text string) {
-			if think {
-				write(WSMessage{Type: "thinking_token", Content: text, ThinkingPos: rt.liveThinkingSegmentEnd(text)})
-			} else {
-				write(WSMessage{Type: "stream", Content: text, ContentPos: rt.liveContentSegmentEnd(text)})
-			}
-		}, wsTokenFlushInterval)
+	}, wsTokenFlushInterval)
 
-		// Live terminal tabs for shell tools: a tab is opened lazily on the
-		// first output chunk (which carries the exact command string), fed by
-		// a per-tool batcher, and closed on tool end. Both maps are keyed by
-		// the tool call ID, which doubles as the terminal tab ID. They are
-		// accessed from the exec pipe goroutine (OnToolOutput) and the stream
-		// goroutine (OnToolResult), so access is mutex-guarded.
-		var termMu sync.Mutex
-		termBatches := map[string]*streamutil.TokenBatcher{}
-		termOpened := map[string]struct{}{}
+	// Live terminal tabs for shell tools: a tab is opened lazily on the
+	// first output chunk (which carries the exact command string), fed by
+	// a per-tool batcher, and closed on tool end. Both maps are keyed by
+	// the tool call ID, which doubles as the terminal tab ID. They are
+	// accessed from the exec pipe goroutine (OnToolOutput) and the stream
+	// goroutine (OnToolResult), so access is mutex-guarded.
+	var termMu sync.Mutex
+	termBatches := map[string]*streamutil.TokenBatcher{}
+	termOpened := map[string]struct{}{}
 
-		handlers := rt.buildStreamHandlers(ctx, write, tokens, &termMu, termBatches, termOpened)
+	handlers := rt.buildStreamHandlers(appCtx, write, tokens, &termMu, termBatches, termOpened)
 
-		_, err := rt.agent.StreamProcessInputWithImages(ctx, content, images, handlers)
-		var persistErr error
-		var ctxMsg WSMessage
-		if err == nil {
-			// No turnMu re-acquire here: this goroutine already holds the
-			// session turn lock (handed off by handleWSUserMessage) for the
-			// whole turn. ConsumePersistError is internally synchronized
-			// (persistMu), so it is safe even when a shutdown/delete/eviction
-			// flush runs concurrently without turnMu.
-			persistErr = rt.agent.ConsumePersistError()
-			// context.Background() rather than the (dead) request context:
-			// the turn outlives the connection (§4).
-			ctxMsg = contextMsg(context.Background(), rt.agent)
-		}
-		if err != nil {
-			if ctx.Err() != nil {
-				tokens.Flush()
-				// Broadcast directly (not via write, which early-returns on a
-				// cancelled ctx) so the cancellation reaches attached clients.
-				rt.broadcast(WSMessage{Type: "cancelled", Content: "Cancelled.", SessionID: rt.agent.SessionID})
-				return
-			}
+	out, err := rt.agent.StreamProcessInputWithImages(appCtx, content, images, handlers)
+	if err != nil {
+		if appCtx.Err() != nil {
 			tokens.Flush()
-			write(WSMessage{Type: "stream_end"})
-			write(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", err)})
+			// Broadcast directly (not via write, which early-returns on a
+			// cancelled ctx) so the cancellation reaches attached clients.
+			rt.broadcast(WSMessage{Type: "cancelled", Content: "Cancelled.", SessionID: rt.agent.SessionID})
+			return out, err
+		}
+		tokens.Flush()
+		write(WSMessage{Type: "stream_end"})
+		write(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", err)})
+		if o.reportErr {
 			log.Printf("stream error: %v", err)
 			if rt.turnErrorHook != nil {
 				rt.turnErrorHook(err)
 			}
-			return
 		}
-		if persistErr != nil {
-			write(WSMessage{Type: "response", Content: fmt.Sprintf("Warning: failed to save session: %v", persistErr)})
-		}
-		tokens.Flush()
-		// No trailing stream_end here: every round already wrote one via the
-		// OnStreamEnd handler above, and turn_end marks the turn boundary.
-		if ctxMsg.Type != "" {
-			write(ctxMsg)
-		}
-	}(content, images, streamCtx, errCh)
+		return out, err
+	}
+	var persistErr error
+	var ctxMsg WSMessage
+	if o.persist {
+		// No turnMu re-acquire here: the caller holds the session turn
+		// lock for the whole turn. ConsumePersistError is internally
+		// synchronized (persistMu), so it is safe even when a
+		// shutdown/delete/eviction flush runs concurrently without turnMu.
+		persistErr = rt.agent.ConsumePersistError()
+		// context.Background() rather than the (dead) request context:
+		// the turn outlives the connection (§4).
+		ctxMsg = contextMsg(context.Background(), rt.agent)
+	}
+	if persistErr != nil {
+		write(WSMessage{Type: "response", Content: fmt.Sprintf("Warning: failed to save session: %v", persistErr)})
+	}
+	tokens.Flush()
+	// No trailing stream_end here: every round already wrote one via the
+	// OnStreamEnd handler above, and turn_end marks the turn boundary.
+	if ctxMsg.Type != "" {
+		write(ctxMsg)
+	}
+	return out, nil
 }
 
 // buildStreamHandlers wires the runtime's live-turn state and the token
@@ -2233,6 +2333,11 @@ func (rt *sessionRuntime) buildStreamHandlers(ctx context.Context, write func(WS
 	return &llm.StreamHandlers{
 		OnCompacting: func() {
 			write(WSMessage{Type: "compacting"})
+		},
+		OnCondensed: func(note string) {
+			// Last-resort condensation announcement (Phase 0e): the
+			// client renders it as a banner above the composer.
+			write(WSMessage{Type: "condensed", Content: note, SessionID: rt.agent.SessionID})
 		},
 		OnStart: func() {
 			// Reset the live-turn buffer for the new turn.
@@ -2401,10 +2506,6 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 			log.Printf("WARNING: non-loopback bind %q without TLS — auth token is sent in plain text. Set GOGEN_WEB_TLS_CERT and GOGEN_WEB_TLS_KEY (or web_tls_cert_file / web_tls_key_file) for encryption.", addr)
 		}
 		log.Printf("listening on non-loopback %s with token auth", addr)
-	}
-	if s.authToken != "" {
-		// Log the token on startup so users can construct the login URL.
-		log.Printf("auth token: %s", s.authToken)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", s.HandleWS)

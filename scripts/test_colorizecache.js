@@ -3,22 +3,40 @@
 
 const COLORIZE_CACHE_MAX = 300;
 const colorizeCache = new Map();
+const COLORIZE_SANITIZE_PROFILE = { USE_PROFILES: { html: true } };
+// Test stub mirroring the vendored DOMPurify used by editor.js: an identity
+// sanitize keeps the fake monaco output unchanged for the checks below.
+const DOMPurify = { sanitize: (html) => html };
 
 function normalizeColorizeHTML(html) {
   return html.replace(/<\s*br\s*\/?>\s*$/i, '');
 }
 
+// LRU accessors (verbatim from editor.js): a hit re-inserts the key so
+// re-used entries never age out behind one-shot ones.
+function colorizeCacheGet(key) {
+  const hit = colorizeCache.get(key);
+  if (hit === undefined) return undefined;
+  colorizeCache.delete(key);
+  colorizeCache.set(key, hit);
+  return hit;
+}
+
+function colorizeCachePut(key, html) {
+  if (colorizeCache.size >= COLORIZE_CACHE_MAX) {
+    const oldest = colorizeCache.keys().next().value;
+    if (oldest !== undefined) colorizeCache.delete(oldest);
+  }
+  colorizeCache.set(key, html);
+}
+
 function cachedColorize(m, source, lang) {
   const key = lang + '\u0000' + source;
-  const hit = colorizeCache.get(key);
+  const hit = colorizeCacheGet(key);
   if (hit !== undefined) return Promise.resolve(hit);
   return m.editor.colorize(source, lang, {}).then((raw) => {
-    const html = normalizeColorizeHTML(raw);
-    if (colorizeCache.size >= COLORIZE_CACHE_MAX) {
-      const oldest = colorizeCache.keys().next().value;
-      if (oldest !== undefined) colorizeCache.delete(oldest);
-    }
-    colorizeCache.set(key, html);
+    const html = DOMPurify.sanitize(normalizeColorizeHTML(raw), COLORIZE_SANITIZE_PROFILE);
+    colorizeCachePut(key, html);
     return html;
   });
 }
@@ -65,6 +83,18 @@ function check(name, cond, detail) {
   const before = tokenizeCalls;
   await cachedColorize(monaco, 'src0', 'lang');
   check('evicted key re-tokenizes', tokenizeCalls === before + 1);
+
+  // LRU: a re-used entry survives overflow while newer-but-unused entries
+  // are evicted first. Pin 'src1' (oldest remaining) by reading it, push
+  // one new entry past the cap, and assert the pinned entry is still a hit
+  // while the next-oldest untouched entry ('src2') was evicted instead.
+  await cachedColorize(monaco, 'src1', 'lang'); // LRU refresh
+  await cachedColorize(monaco, 'overflow-entry', 'lang'); // evicts LRU (src2)
+  check('recently used entry survives (LRU)', colorizeCache.has('lang\u0000' + 'src1'));
+  check('least recently used entry evicted', !colorizeCache.has('lang\u0000' + 'src2'));
+  const beforeLru = tokenizeCalls;
+  await cachedColorize(monaco, 'src1', 'lang');
+  check('surviving entry is still a hit', tokenizeCalls === beforeLru);
 
   console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);

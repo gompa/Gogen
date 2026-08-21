@@ -30,10 +30,10 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 		Type: "config",
 		ConfigFields: []string{
 			"commandSafety", "commandAllowlist", "deleteApproval", "commandSandbox", "commandTimeoutSecs",
-			"contextLimit", "compactThreshold", "compactKeepRecentMessages", "maxToolResultBytes", "compactReserveTokens",
+			"contextLimit", "compactThreshold", "compactKeepRecentMessages", "maxToolResultBytes", "compactReserveTokens", "compactLastResort",
 			"webFetch", "webSearch", "treesitter", "preserveReasoning",
 			"sessionMaxCount", "sessionMaxAgeDays", "webApprovalHoldSecs",
-			"subagentModel", "boardStartPrompt", "systemPrompt", "subagentPrompt",
+			"subagentModel", "subagentThinkingLevel", "boardStartPrompt", "systemPrompt", "subagentPrompt",
 		},
 		CommandSafetyMode:         "allowlist",
 		CommandAllowlist:          "ls, cat",
@@ -45,6 +45,7 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 		CompactKeepRecentMessages: 3,
 		MaxToolResultBytes:        65536,
 		CompactReserveTokens:      1000,
+		CompactLastResort:         "error",
 		WebFetch:                  "off",
 		WebSearch:                 "off",
 		TreeSitter:                "off",
@@ -53,6 +54,7 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 		SessionMaxAgeDays:         9,
 		WebApprovalHoldSecs:       7,
 		SubagentModel:             strPtr("gpt-4o-mini"),
+		SubagentThinkingLevel:     strPtr("high"),
 		BoardStartPrompt:          "board tmpl {title}",
 		SystemPrompt:              "sys tmpl {working_dir}",
 		SubagentPrompt:            "sub tmpl {job}",
@@ -74,9 +76,11 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 	if cfg.CommandAllowlist != "ls, cat" || cfg.DeleteApproval != "off" || cfg.CommandSandbox != "bwrap" ||
 		cfg.CommandTimeoutSecs != 45 || cfg.ContextLimitConfig != 20000 || cfg.CompactThreshold != 0.5 ||
 		cfg.CompactKeepRecentMessages != 3 || cfg.MaxToolResultBytes != 65536 || cfg.CompactReserveTokens != 1000 ||
+		cfg.CompactLastResort != "error" ||
 		cfg.WebFetch != "off" || cfg.WebSearch != "off" || cfg.TreeSitter != "off" ||
 		cfg.PreserveReasoning != "on" || cfg.SessionMaxCount != 4 || cfg.SessionMaxAgeDays != 9 ||
 		cfg.WebApprovalHoldSecs != 7 || cfg.SubagentModel == nil || *cfg.SubagentModel != "gpt-4o-mini" ||
+		cfg.SubagentThinkingLevel == nil || *cfg.SubagentThinkingLevel != "high" ||
 		cfg.BoardStartPrompt != "board tmpl {title}" || cfg.SystemPrompt != "sys tmpl {working_dir}" ||
 		cfg.SubagentPrompt != "sub tmpl {job}" {
 		t.Fatalf("config echo missing live values: %+v", cfg)
@@ -97,7 +101,7 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 	}
 	snap := a.Context.SettingsSnapshot()
 	if snap.ContextLimit != 20000 || snap.CompactThreshold != 0.5 || snap.CompactKeepRecentMessages != 3 ||
-		snap.MaxToolResultBytes != 65536 || snap.CompactReserveTokens != 1000 {
+		snap.MaxToolResultBytes != 65536 || snap.CompactReserveTokens != 1000 || snap.CompactLastResort != "error" {
 		t.Fatalf("context settings = %+v, want applied values", snap)
 	}
 	if s.ws.Store.MaxCount() != 4 || s.ws.Store.MaxAgeDays() != 9 {
@@ -108,6 +112,9 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 	}
 	if got := s.ws.GetRuntimeConfig().SubagentModel; got != "gpt-4o-mini" {
 		t.Fatalf("runtime subagentModel = %q, want gpt-4o-mini", got)
+	}
+	if got := s.ws.GetRuntimeConfig().SubagentThinkingLevel; got != "high" {
+		t.Fatalf("runtime subagentThinkingLevel = %q, want high", got)
 	}
 	// Live prompt setters: the next turn's system prompt and subagent jobs
 	// resolve the configured templates.
@@ -124,7 +131,7 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"command_safety: allowlist", "command_allowlist: ls, cat", `delete_approval: "off"`, "context_limit: 20000", "session_max_count: 4", "web_approval_hold_secs: 7", "subagent_model: gpt-4o-mini", "board_start_prompt: board tmpl {title}", "system_prompt: sys tmpl {working_dir}", "subagent_prompt: sub tmpl {job}"} {
+	for _, want := range []string{"command_safety: allowlist", "command_allowlist: ls, cat", `delete_approval: "off"`, "context_limit: 20000", "session_max_count: 4", "web_approval_hold_secs: 7", "subagent_model: gpt-4o-mini", "subagent_thinking_level: high", "board_start_prompt: board tmpl {title}", "system_prompt: sys tmpl {working_dir}", "subagent_prompt: sub tmpl {job}"} {
 		if !strings.Contains(string(data), want) {
 			t.Fatalf("expected %q in persisted config:\n%s", want, data)
 		}
@@ -134,15 +141,19 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 	// and pushed — the explicit-empty mechanism distinguishes it from "not
 	// provided".
 	empty := ""
-	clear := WSMessage{Type: "config", ConfigFields: []string{"subagentModel"}, SubagentModel: &empty}
+	clear := WSMessage{Type: "config", ConfigFields: []string{"subagentModel", "subagentThinkingLevel"}, SubagentModel: &empty, SubagentThinkingLevel: &empty}
 	if err := conn.WriteJSON(clear); err != nil {
 		t.Fatalf("send config clear subagentModel: %v", err)
 	}
 	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool {
-		return len(m.ConfigFields) == 0 && m.SubagentModel != nil && *m.SubagentModel == ""
+		return len(m.ConfigFields) == 0 && m.SubagentModel != nil && *m.SubagentModel == "" &&
+			m.SubagentThinkingLevel != nil && *m.SubagentThinkingLevel == ""
 	})
 	if got := s.ws.GetRuntimeConfig().SubagentModel; got != "" {
 		t.Fatalf("cleared subagentModel = %q, want empty (inherit)", got)
+	}
+	if got := s.ws.GetRuntimeConfig().SubagentThinkingLevel; got != "" {
+		t.Fatalf("cleared subagentThinkingLevel = %q, want empty (inherit)", got)
 	}
 
 	// Clearing the prompts: the push resolves the empty values back to the
@@ -201,6 +212,7 @@ func TestRuntimeConfigRejectsInvalid(t *testing.T) {
 		{Type: "config", ConfigFields: []string{"webFetch"}, WebFetch: "sometimes"},
 		{Type: "config", ConfigFields: []string{"deleteApproval"}, DeleteApproval: "maybe"},
 		{Type: "config", ConfigFields: []string{"subagentModel"}, SubagentModel: strPtr("   ")},
+		{Type: "config", ConfigFields: []string{"subagentThinkingLevel"}, SubagentThinkingLevel: strPtr("   ")},
 		{Type: "config", ConfigFields: []string{"systemPrompt"}, SystemPrompt: strings.Repeat("x", maxPromptTemplateLen+1)},
 		{Type: "config", ConfigFields: []string{"nope"}},
 	}

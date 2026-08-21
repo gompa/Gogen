@@ -39,12 +39,14 @@ type SessionAgentOptions struct {
 	// predate the persisted thinking-level field.
 	ThinkingLevel ThinkingLevel
 
-	// Live feature flags (board / subagent / nesting depth). The web server
-	// passes its workspace values so sessions created after a live toggle
-	// agree with the rest; the TUI passes its startup config values.
-	BoardEnabled     bool
-	SubagentsEnabled bool
-	SubagentMaxDepth int
+	// Live feature flags (board / subagent / nesting depth / concurrent
+	// limit). The web server passes its workspace values so sessions created
+	// after a live toggle agree with the rest; the TUI passes its startup
+	// config values.
+	BoardEnabled          bool
+	SubagentsEnabled      bool
+	SubagentMaxDepth      int
+	SubagentMaxConcurrent int
 	// BoardManager is the shared project board (nil when disabled). The web
 	// server passes its single workspace manager so all sessions share one;
 	// the TUI creates one per process.
@@ -75,6 +77,7 @@ func NewSessionAgent(opts SessionAgentOptions, snap *SessionSnapshot, id string)
 			CompactKeepRecentMessages: opts.Config.CompactKeepRecentMessages,
 			MaxToolResultBytes:        opts.Config.MaxToolResultBytes,
 			CompactReserveTokens:      opts.Config.CompactReserveTokens,
+			CompactLastResort:         opts.Config.CompactLastResort,
 		}
 	}
 	ctxMgr := contextmgr.NewManager(opts.Provider, settings)
@@ -105,6 +108,7 @@ func NewSessionAgent(opts SessionAgentOptions, snap *SessionSnapshot, id string)
 	a.SetBoardEnabled(opts.BoardEnabled)
 	a.SetSubagentsEnabled(opts.SubagentsEnabled)
 	a.SetSubagentMaxDepth(opts.SubagentMaxDepth)
+	a.SetSubagentMaxConcurrent(opts.SubagentMaxConcurrent)
 	a.SetBoardManager(opts.BoardManager)
 	a.SetSkillsManager(opts.SkillsManager)
 	if opts.SkillsManager != nil {

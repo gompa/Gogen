@@ -173,7 +173,7 @@ var builtinToolDefs = []ToolDef{
 		Handler: handleExecuteCommand,
 	},
 	{
-		Definition: toolDef("replace_in_file", "Edit an existing file by exact search/replace — the default edit tool. Copy the search block verbatim from read_file output; it must match exactly once (replace_all=true replaces all occurrences; add surrounding context to disambiguate).",
+		Definition: toolDef("replace_in_file", "Default edit tool: exact search/replace in an existing file. Copy the search block verbatim from read_file output; add surrounding context to disambiguate.",
 			toolSchema(map[string]interface{}{
 				"path":        toolProp("string", "File path"),
 				"search":      toolProp("string", "Exact string to find (must match exactly once unless replace_all=true)"),
@@ -184,7 +184,7 @@ var builtinToolDefs = []ToolDef{
 		MutatesFS: true,
 	},
 	{
-		Definition: toolDef("delete", "Delete a file or EMPTY directory (requires approval); not for replacing content — edit in place. Non-empty directories are refused.",
+		Definition: toolDef("delete", "Delete a file or empty directory (requires approval); non-empty directories are refused.",
 			toolSchema(map[string]interface{}{
 				"path": toolProp("string", "File path"),
 			}, "path")),
@@ -192,9 +192,9 @@ var builtinToolDefs = []ToolDef{
 		MutatesFS: true,
 	},
 	{
-		Definition: toolDef("patch_file", "Apply surgical unified diff(s) — prefer replace_in_file for most edits; use this for positional or multi-hunk edits. Use EXACT context lines from a fresh read_file — include the entire region being edited (never truncate before closing braces); keep hunks small and self-contained; never include '***' markers, diff -c range headers, or copied patch-transcript text in the diff. dry_run=preview, fuzzy=default.",
+		Definition: toolDef("patch_file", "Apply unified diff(s); prefer replace_in_file for most edits. Use exact context lines from a fresh read_file, covering the entire edited region (never truncate before closing braces); keep hunks small and self-contained. Never include '***' markers, diff -c range headers, or copied patch-transcript text.",
 			toolSchema(map[string]interface{}{
-				"diff":    toolProp("string", "Unified diff: '--- a/x'/'+++ b/x' headers, '@@ -start,count +start,count @@' hunks (context=space, removed=-, added=+). Include all context lines of the edited region; counts must match the hunk body. Multi-file: stack sections."),
+				"diff":    toolProp("string", "Unified diff: '--- a/x'/'+++ b/x' headers, '@@ -start,count +start,count @@' hunks (context=space, removed=-, added=+). Counts must match the hunk body. Multi-file: stack sections."),
 				"dry_run": toolProp("boolean", "Preview without writing"),
 				"fuzzy":   toolProp("boolean", "Tolerate whitespace/shift drift (default true; leave on)"),
 			}, "diff")),
@@ -212,19 +212,20 @@ var builtinToolDefs = []ToolDef{
 		PlanAllowed: true,
 	},
 	{
-		Definition: toolDef("search_code", "Search codebase (case-sensitive regex or literal); returns file:line:content.",
+		Definition: toolDef("search_code", "Search codebase (regex or literal, case-sensitive by default; set ignore_case to match any casing); returns file:line:content.",
 			toolSchema(map[string]interface{}{
 				"pattern":       toolProp("string", "Regex or literal"),
 				"path":          toolProp("string", "Subdirectory (required for hidden dirs)"),
 				"glob":          toolProp("string", "Glob filter (e.g. *.go)"),
 				"context_lines": toolProp("integer", "Context lines (max 20)"),
+				"ignore_case":   toolProp("boolean", "Case-insensitive matching (default false)"),
 			}, "pattern")),
 		Handler:     handleSearchCode,
 		ReadOnly:    true,
 		PlanAllowed: true,
 	},
 	{
-		Definition: toolDef("find_symbol", "Locate symbols: kind=def (definition) or refs (references). Cross-file (AST or text fallback).",
+		Definition: toolDef("find_symbol", "Locate symbols: kind=def (definition) or refs (references).",
 			toolSchema(map[string]interface{}{
 				"kind":   toolPropEnum("string", []string{"def", "refs"}, ""),
 				"symbol": toolProp("string", "Symbol name"),
@@ -248,7 +249,7 @@ var builtinToolDefs = []ToolDef{
 		PlanAllowed: true,
 	},
 	{
-		Definition: toolDef("web_search", "Web search (DuckDuckGo Lite).",
+		Definition: toolDef("web_search", "Web search.",
 			toolSchema(map[string]interface{}{
 				"query":       toolProp("string", "Query"),
 				"max_results": toolProp("integer", "Max results (default 10, max 20)"),
@@ -296,7 +297,7 @@ var builtinToolDefs = []ToolDef{
 		Handler: handleGitStage,
 	},
 	{
-		Definition: toolDef("todo", "Todo tool: add (text), list, done (id), remove (id), clear.",
+		Definition: toolDef("todo", "Manage the todo list: add (text), list, done (id), remove (id), clear.",
 			toolSchema(map[string]interface{}{
 				"action": toolPropEnum("string", []string{"add", "list", "done", "remove", "clear"}, ""),
 				"text":   toolProp("string", "Text for action=add"),
@@ -331,7 +332,7 @@ var builtinToolDefs = []ToolDef{
 		PlanAllowed: true,
 	},
 	{
-		Definition: toolDef("rename_symbol", "Rename symbol across files (AST or text fallback).",
+		Definition: toolDef("rename_symbol", "Rename symbol across files.",
 			toolSchema(map[string]interface{}{
 				"old_name": toolProp("string", "Current name"),
 				"new_name": toolProp("string", "New name"),
@@ -365,12 +366,24 @@ var builtinToolDefs = []ToolDef{
 		Handler: handleBackgroundJob,
 	},
 	{
-		Definition: toolDef("read_image", "Attach an image file to this session's context for vision-capable models: the image enters context as a user message after this tool's result, so the current model must support images. The image stays in THIS session's context — a subagent that calls read_image sees the image, but the parent agent only receives this text report. Supports png/jpeg/gif/webp up to 3.5 MB; SVG is XML text, use read_file instead. detail=low reduces provider vision cost.",
+		Definition: toolDef("read_image", "Attach an image to this session's context (the model must support vision). The image stays in THIS session — a subagent calling read_image sees it, but the parent only receives this text report. png/jpeg/gif/webp up to 3.5 MB; SVG is XML text, use read_file. detail=low reduces vision cost.",
 			toolSchema(map[string]interface{}{
 				"path":   toolProp("string", "Image file path"),
 				"detail": toolPropEnum("string", []string{"auto", "low", "high"}, "Vision detail level (default auto)"),
 			}, "path")),
 		Handler:     handleReadImage,
+		ReadOnly:    true,
+		PlanAllowed: true,
+	},
+	{
+		Definition: toolDef("git_blame", "Git blame for a file (read-only): shows which commit last modified each line (hash, author, date, content). Optional ref blames the file as of that commit instead of the working tree; pass line_start and line_end together to blame a range of a large file.",
+			toolSchema(map[string]interface{}{
+				"file":       toolProp("string", "File path (workspace-relative)"),
+				"ref":        toolProp("string", "Blame as of this commit/ref instead of the working tree"),
+				"line_start": toolProp("integer", "First line of the blame range (requires line_end)"),
+				"line_end":   toolProp("integer", "Last line of the blame range (requires line_start)"),
+			}, "file")),
+		Handler:     handleGitBlame,
 		ReadOnly:    true,
 		PlanAllowed: true,
 	},

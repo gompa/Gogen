@@ -84,6 +84,9 @@ func (m *Model) handleMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case streamErrorMsg:
 		return m.handleStreamErrorMsg(msg)
 
+	case condensedNoteMsg:
+		return m.handleCondensedNoteMsg(msg)
+
 	case contextStatsMsg:
 		return m.handleContextStatsMsg(msg)
 
@@ -260,6 +263,13 @@ func (m *Model) handleStreamEndMsg() (tea.Model, tea.Cmd) {
 func (m *Model) handleStreamErrorMsg(msg streamErrorMsg) (tea.Model, tea.Cmd) {
 	m.handleStreamError(msg.err)
 	return m, tea.Batch(m.refocusInput(), m.drainDeliveries())
+}
+
+func (m *Model) handleCondensedNoteMsg(msg condensedNoteMsg) (tea.Model, tea.Cmd) {
+	// Last-resort condensation announcement (Phase 0e): a system line in
+	// the chat, not part of the LLM history.
+	m.appendChatLine(DimStyle.Render("System: " + msg.note))
+	return m, nil
 }
 
 func (m *Model) handleContextStatsMsg(msg contextStatsMsg) (tea.Model, tea.Cmd) {

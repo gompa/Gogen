@@ -1,8 +1,9 @@
 package config
 
 import (
-	"strings"
 	"time"
+
+	"gogen/internal/onoff"
 )
 
 // Exported defaults for configurable settings. Other packages reference these
@@ -24,6 +25,11 @@ const (
 	// DefaultCompactReserveTokens is the token budget reserved for new
 	// messages after compaction.
 	DefaultCompactReserveTokens = 4000
+	// DefaultCompactLastResort is the default compact_last_resort mode:
+	// "condense" runs the last-resort condensation (Phase 0e) on a message
+	// that cannot fit the context window; "error" returns a diagnostic
+	// instead.
+	DefaultCompactLastResort = "condense"
 	// DefaultCommandTimeoutSecs is the maximum duration for execute_command.
 	DefaultCommandTimeoutSecs = 120
 	// DefaultSessionMaxCount is the maximum saved sessions per working dir.
@@ -39,6 +45,10 @@ const (
 	// DefaultSubagentMaxDepth is the default maximum subagent nesting depth
 	// (main agent = depth 0). 1 means subagents cannot spawn subagents.
 	DefaultSubagentMaxDepth = 1
+	// DefaultSubagentMaxConcurrent is the default cap on concurrently
+	// running subagents per parent session (web host). Spawning beyond it
+	// is refused; values <= 0 fall back to this default.
+	DefaultSubagentMaxConcurrent = 4
 )
 
 // Effective returns v when v > 0, else def. It is the single "0 = unset, use
@@ -97,6 +107,13 @@ type Config struct {
 	CompactKeepRecentMessages int
 	MaxToolResultBytes        int
 	CompactReserveTokens      int
+	// CompactLastResort controls the last-resort condensation (Phase 0e)
+	// for a message that cannot fit the context window even after all
+	// compaction: "condense" (default) condenses the message in place via
+	// the summarizer (the original is archived to the session's archive
+	// sidecar and the condensation is announced in-band); "error" returns
+	// a clear diagnostic instead of condensing.
+	CompactLastResort string
 
 	CommandSafetyMode string // blocklist, allowlist, off
 	CommandAllowlist  string // comma-separated when allowlist mode
@@ -167,10 +184,26 @@ type Config struct {
 	// higher value re-enables nesting up to the configured depth. Values
 	// <= 0 fall back to the default.
 	SubagentMaxDepth int
+	// SubagentMaxConcurrent is the maximum number of subagents that may run
+	// concurrently for one parent session (web host; the TUI runs
+	// foreground-only, so it is never bounded by this). The default 4
+	// limits parallel fan-out; spawning beyond it is refused with an error
+	// the model can act on (interrupt_agent / wait). Values <= 0 fall back
+	// to the default.
+	SubagentMaxConcurrent int
 	// SubagentModel is the default model for spawned subagents. Empty
 	// (the default) means subagents inherit the parent session's model;
 	// an explicit tool-call model argument always wins over this value.
 	SubagentModel string
+	// SubagentThinkingLevel is the reasoning-effort level for spawned
+	// subagents. Empty (the default) means subagents inherit the parent
+	// session's live thinking level; "off" never sends reasoning_effort;
+	// any other value is a literal reasoning_effort value, sent only when
+	// the subagent's final model accepts it (omitted at spawn time
+	// otherwise — the tool's model argument can override the configured
+	// model, so validity is resolved against the child's model, never at
+	// save time).
+	SubagentThinkingLevel string
 
 	// BoardStartPrompt is the template for prompts given to agents started
 	// from a board ticket ("" = the built-in default). Placeholders:
@@ -213,6 +246,7 @@ func Defaults() Config {
 		CompactKeepRecentMessages: DefaultCompactKeepRecentMessages,
 		MaxToolResultBytes:        DefaultMaxToolResultBytes,
 		CompactReserveTokens:      DefaultCompactReserveTokens,
+		CompactLastResort:         DefaultCompactLastResort,
 		CommandSafetyMode:         "blocklist",
 		CommandAllowlist:          "",
 		DeleteApproval:            "required",
@@ -243,6 +277,7 @@ func Defaults() Config {
 		Board:                     "off",
 		Subagent:                  "off",
 		SubagentMaxDepth:          DefaultSubagentMaxDepth,
+		SubagentMaxConcurrent:     DefaultSubagentMaxConcurrent,
 		AgentInstructions:         "off",
 		Skills:                    "off",
 		JobNotices:                "off",
@@ -260,16 +295,15 @@ func (c *Config) ApprovalHold() time.Duration {
 
 // configOn reports whether a config field is explicitly enabled.
 func configOn(v string) bool {
-	v = strings.ToLower(strings.TrimSpace(v))
-	return v == "on" || v == "1" || v == "true"
+	return onoff.Enabled(v)
 }
 
 // configOff reports whether a config field is explicitly disabled
-// (set to "off", "0", or "false"). An empty string is not "off" —
+// (set to "off", "0", "false", or "no"). An empty string is not "off" —
 // absence of a value does not imply explicit disablement.
 func configOff(v string) bool {
-	v = strings.ToLower(strings.TrimSpace(v))
-	return v == "off" || v == "0" || v == "false"
+	on, ok := onoff.Parse(v)
+	return ok && !on
 }
 
 // MCPEnabled reports whether MCP integration is active.
@@ -318,6 +352,16 @@ func (c *Config) SubagentDepth() int {
 		return DefaultSubagentMaxDepth
 	}
 	return c.SubagentMaxDepth
+}
+
+// SubagentLimit returns the effective maximum number of concurrently
+// running subagents per parent session. Values <= 0 fall back to
+// DefaultSubagentMaxConcurrent.
+func (c *Config) SubagentLimit() int {
+	if c == nil || c.SubagentMaxConcurrent <= 0 {
+		return DefaultSubagentMaxConcurrent
+	}
+	return c.SubagentMaxConcurrent
 }
 
 // TreeSitterEnabled reports whether tree-sitter checks are active.

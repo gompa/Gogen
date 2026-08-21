@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"gogen/internal/config"
+	"gogen/internal/onoff"
 )
 
 // Merge builds the effective runtime config: env > flags > file > defaults.
@@ -30,6 +31,7 @@ func Merge(pf *ProjectFile, flags FlagOverrides) *config.Config {
 		CompactKeepRecentMessages: mergeCompactKeepRecentMessages(file, def.CompactKeepRecentMessages),
 		MaxToolResultBytes:        mergeIntOpt("GOGEN_MAX_TOOL_RESULT_BYTES", file.MaxToolResultBytes, def.MaxToolResultBytes),
 		CompactReserveTokens:      mergeIntOpt("GOGEN_COMPACT_RESERVE_TOKENS", file.CompactReserveTokens, def.CompactReserveTokens),
+		CompactLastResort:         mergeString("GOGEN_COMPACT_LAST_RESORT", file.CompactLastResort, def.CompactLastResort),
 		CommandSafetyMode:         mergeString("GOGEN_COMMAND_SAFETY", file.CommandSafety, def.CommandSafetyMode),
 		CommandAllowlist:          mergeString("GOGEN_COMMAND_ALLOWLIST", file.CommandAllowlist, def.CommandAllowlist),
 		DeleteApproval:            mergeString("GOGEN_DELETE_APPROVAL", file.DeleteApproval, def.DeleteApproval),
@@ -45,7 +47,7 @@ func Merge(pf *ProjectFile, flags FlagOverrides) *config.Config {
 		TestCommand:               mergeString("", file.TestCommand, ""),
 		LintCommand:               mergeString("", file.LintCommand, ""),
 		WebBind:                   mergeString("GOGEN_WEB_BIND", file.WebBind, def.WebBind),
-		WebAllowedOrigins:         mergeString("GOGEN_WEB_ALLOWED_ORIGINS", "", def.WebAllowedOrigins),
+		WebAllowedOrigins:         mergeString("GOGEN_WEB_ALLOWED_ORIGINS", file.WebAllowedOrigins, def.WebAllowedOrigins),
 		WebAuthToken:              mergeString("GOGEN_WEB_TOKEN", file.WebAuthToken, def.WebAuthToken),
 		WebTLSCertFile:            mergeString("GOGEN_WEB_TLS_CERT", file.WebTLSCertFile, def.WebTLSCertFile),
 		WebTLSKeyFile:             mergeString("GOGEN_WEB_TLS_KEY", file.WebTLSKeyFile, def.WebTLSKeyFile),
@@ -65,7 +67,9 @@ func Merge(pf *ProjectFile, flags FlagOverrides) *config.Config {
 		Board:                     mergeString("GOGEN_BOARD", file.Board, def.Board),
 		Subagent:                  mergeString("GOGEN_SUBAGENT", file.Subagent, def.Subagent),
 		SubagentMaxDepth:          mergeInt("GOGEN_SUBAGENT_MAX_DEPTH", file.SubagentMaxDepth, def.SubagentMaxDepth),
+		SubagentMaxConcurrent:     mergeInt("GOGEN_SUBAGENT_MAX_CONCURRENT", file.SubagentMaxConcurrent, def.SubagentMaxConcurrent),
 		SubagentModel:             mergeString("GOGEN_SUBAGENT_MODEL", file.SubagentModel, def.SubagentModel),
+		SubagentThinkingLevel:     mergeString("GOGEN_SUBAGENT_THINKING_LEVEL", file.SubagentThinkingLevel, def.SubagentThinkingLevel),
 		BoardStartPrompt:          mergeString("GOGEN_BOARD_START_PROMPT", file.BoardStartPrompt, def.BoardStartPrompt),
 		SystemPrompt:              mergeString("GOGEN_SYSTEM_PROMPT", file.SystemPrompt, def.SystemPrompt),
 		SubagentPrompt:            mergeString("GOGEN_SUBAGENT_PROMPT", file.SubagentPrompt, def.SubagentPrompt),
@@ -223,15 +227,12 @@ func envBool(envKey string, def bool) (bool, bool) {
 	if !ok {
 		return false, false
 	}
-	switch strings.TrimSpace(strings.ToLower(v)) {
-	case "1", "true", "on", "yes":
-		return true, true
-	case "0", "false", "off", "no":
-		return false, true
-	default:
+	on, ok := onoff.Parse(v)
+	if !ok {
 		log.Printf("warning: %s=%q is not a valid boolean; using default %t", envKey, v, def)
 		return def, true
 	}
+	return on, true
 }
 
 // mergeString returns the env value when set, the file value when non-empty,

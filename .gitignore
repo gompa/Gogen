@@ -27,14 +27,9 @@
 /tmp/
 
 # --- Project configuration ---
-# .gogen/ holds local runtime state (config, models cache, sessions, board);
-# not tracked.
-/.gogen/gogen.conf
-/.gogen/models.json
-/.gogen/sessions/
-/.gogen/board/
-/.gogen/gogen.md
-/.gogen/todos.json.migrated
+# .gogen/ holds local runtime state (config, models cache, sessions, board,
+# web_token, …); not tracked.
+/.gogen/
 
 # --- Editor / IDE ---
 *.swp

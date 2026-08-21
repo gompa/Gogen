@@ -2,7 +2,7 @@ package session
 
 import (
 	"os"
-	"sort"
+	"slices"
 	"time"
 )
 
@@ -68,7 +68,7 @@ func (s *Store) prune(workingDir string, keepIDs ...string) {
 	if len(items) == 0 {
 		return
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i].updated.After(items[j].updated) })
+	slices.SortFunc(items, func(a, b item) int { return b.updated.Compare(a.updated) })
 
 	// A negative maxAgeDays disables age-based retention ("keep forever");
 	// the count-based budget still applies.
@@ -101,6 +101,7 @@ func (s *Store) prune(workingDir string, keepIDs ...string) {
 		_ = os.Remove(path)
 		delete(s.createdCache, id)
 		_ = s.clearDeltaFile(workingDir, id)
+		s.removeArchiveFile(workingDir, id)
 		// Cascade: a pruned parent's nested children would otherwise be
 		// orphaned — invisible in the flat list (ParentID non-empty) and
 		// never touched again (the per-parent cap only runs on child

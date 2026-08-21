@@ -80,7 +80,7 @@ func TestParseRgMatchesNormalizesWindowsPaths(t *testing.T) {
 func TestSearchCodeRejectsDashPattern(t *testing.T) {
 	dir := t.TempDir()
 	executor := NewExecutor(dir)
-	_, err := executor.SearchCode(context.Background(), "--pre=/tmp/evil.sh", "", "", 0)
+	_, err := executor.SearchCode(context.Background(), "--pre=/tmp/evil.sh", "", "", 0, false)
 	if err == nil {
 		t.Fatal("expected dash pattern to be rejected")
 	}
@@ -99,7 +99,7 @@ func TestSearchCodeGoFallback(t *testing.T) {
 	}
 
 	executor := NewExecutor(dir)
-	out, err := executor.SearchCode(context.Background(), "func hello", "", "*.go", 0)
+	out, err := executor.SearchCode(context.Background(), "func hello", "", "*.go", 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestSearchCodeGoFallback(t *testing.T) {
 func TestSearchCodeNoMatches(t *testing.T) {
 	dir := t.TempDir()
 	executor := NewExecutor(dir)
-	out, err := executor.SearchCode(context.Background(), "missing-pattern-xyz", "", "", 0)
+	out, err := executor.SearchCode(context.Background(), "missing-pattern-xyz", "", "", 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +136,7 @@ func TestSearchCodeSubpath(t *testing.T) {
 	}
 
 	executor := NewExecutor(dir)
-	out, err := executor.SearchCode(context.Background(), "Target", "pkg", "", 0)
+	out, err := executor.SearchCode(context.Background(), "Target", "pkg", "", 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func TestSearchCodeUsesRipgrepWhenAvailable(t *testing.T) {
 	}
 
 	executor := NewExecutor(dir)
-	out, err := executor.SearchCode(context.Background(), "unique-needle-42", "", "", 0)
+	out, err := executor.SearchCode(context.Background(), "unique-needle-42", "", "", 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +199,7 @@ func TestSearchCodeDotDirRequiresSubpath(t *testing.T) {
 
 	executor := NewExecutor(dir)
 
-	out, err := executor.SearchCode(context.Background(), "unique-workflow-marker-99", "", "", 0)
+	out, err := executor.SearchCode(context.Background(), "unique-workflow-marker-99", "", "", 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func TestSearchCodeDotDirRequiresSubpath(t *testing.T) {
 		t.Fatalf("root search should skip hidden paths, got %q", out)
 	}
 
-	out, err = executor.SearchCode(context.Background(), "unique-workflow-marker-99", ".github", "", 0)
+	out, err = executor.SearchCode(context.Background(), "unique-workflow-marker-99", ".github", "", 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +230,7 @@ func TestSearchCodeGlobPathPatternGoFallback(t *testing.T) {
 	}
 
 	executor := NewExecutor(dir)
-	out, err := executor.SearchCode(context.Background(), "TargetNeedle", "", "internal/*.go", 0)
+	out, err := executor.SearchCode(context.Background(), "TargetNeedle", "", "internal/*.go", 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +250,7 @@ func TestSearchCodeContextLinesGoFallback(t *testing.T) {
 	}
 
 	executor := NewExecutor(dir)
-	out, err := executor.SearchCode(context.Background(), "needle", "", "", 1)
+	out, err := executor.SearchCode(context.Background(), "needle", "", "", 1, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +271,7 @@ func TestSearchCodeContextLinesRipgrep(t *testing.T) {
 	}
 
 	executor := NewExecutor(dir)
-	out, err := executor.SearchCode(context.Background(), "needle", "", "", 1)
+	out, err := executor.SearchCode(context.Background(), "needle", "", "", 1, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,12 +286,15 @@ func TestReplaceInTreeRegexSemantics(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := NewExecutor(dir)
-	replaced, files, err := exec.ReplaceInTree(context.Background(), `foo\w+`, "XX", "", "")
+	replaced, fileCount, files, err := exec.ReplaceInTree(context.Background(), `foo\w+`, "XX", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if replaced != 2 || files != 1 {
-		t.Fatalf("replaced=%d files=%d, want 2/1", replaced, files)
+	if replaced != 2 || fileCount != 1 {
+		t.Fatalf("replaced=%d fileCount=%d, want 2/1", replaced, fileCount)
+	}
+	if len(files) != 1 || files[0] != "a.txt" {
+		t.Fatalf("files=%v, want [a.txt]", files)
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "a.txt"))
 	if err != nil {
@@ -311,12 +314,15 @@ func TestReplaceInTreeSingleFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := NewExecutor(dir)
-	replaced, files, err := exec.ReplaceInTree(context.Background(), "old", "new", "edit.txt", "")
+	replaced, fileCount, files, err := exec.ReplaceInTree(context.Background(), "old", "new", "edit.txt", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if replaced != 1 || files != 1 {
-		t.Fatalf("replaced=%d files=%d, want 1/1", replaced, files)
+	if replaced != 1 || fileCount != 1 {
+		t.Fatalf("replaced=%d fileCount=%d, want 1/1", replaced, fileCount)
+	}
+	if len(files) != 1 || files[0] != "edit.txt" {
+		t.Fatalf("files=%v, want [edit.txt]", files)
 	}
 	keep, _ := os.ReadFile(filepath.Join(dir, "keep.txt"))
 	edit, _ := os.ReadFile(filepath.Join(dir, "edit.txt"))
@@ -338,7 +344,7 @@ func TestReplaceInTreeEmptyPatternRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := NewExecutor(dir)
-	if _, _, err := exec.ReplaceInTree(context.Background(), "", "X", "", ""); err == nil {
+	if _, _, _, err := exec.ReplaceInTree(context.Background(), "", "X", "", ""); err == nil {
 		t.Fatal("expected error for empty search pattern")
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "a.txt"))
@@ -460,7 +466,7 @@ func TestSearchCodeGoFallbackSkipsBinaryFiles(t *testing.T) {
 	}
 	t.Setenv("PATH", "/nonexistent") // hide rg so the Go fallback runs
 	executor := NewExecutor(dir)
-	out, err := executor.SearchCode(context.Background(), "needle", "", "", 0)
+	out, err := executor.SearchCode(context.Background(), "needle", "", "", 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -489,7 +495,7 @@ func TestSearchCodeGoFallbackTruncatesAtMatchCap(t *testing.T) {
 	}
 	t.Setenv("PATH", "/nonexistent") // hide rg so the Go fallback runs
 	executor := NewExecutor(dir)
-	out, err := executor.SearchCode(context.Background(), "needle", "", "", 0)
+	out, err := executor.SearchCode(context.Background(), "needle", "", "", 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -521,7 +527,7 @@ func TestSearchCodeGoFallbackConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 5; i++ {
-				if _, err := executor.SearchCode(context.Background(), "alpha", "", "*.txt", 0); err != nil {
+				if _, err := executor.SearchCode(context.Background(), "alpha", "", "*.txt", 0, false); err != nil {
 					t.Error(err)
 					return
 				}
@@ -580,5 +586,129 @@ func TestAppendRgTruncationNotice(t *testing.T) {
 	got = appendRgTruncationNotice("some output", true)
 	if !strings.Contains(got, "truncated (output exceeds") {
 		t.Fatalf("expected truncation notice, got %q", got)
+	}
+}
+
+// TestSearchCodeIgnoreCase verifies the ignore_case option end to end:
+// with ignoreCase=true a literal pattern matches lines whose casing differs,
+// and with the default (false) it does not. The search runs on whichever
+// engine is installed (rg or the Go fallback), so both engines honor the
+// flag; the Go fallback is additionally exercised directly below so its
+// behavior is pinned even where rg is present.
+func TestSearchCodeIgnoreCase(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "mixed.go"), []byte("package main\n\nvar ErrorCode = 1\nvar errorCode = 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	executor := NewExecutor(dir)
+	out, err := executor.SearchCode(context.Background(), "errorcode", "", "", 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "ErrorCode") || !strings.Contains(out, "errorCode") {
+		t.Fatalf("ignore_case should match both casings, got: %q", out)
+	}
+
+	out, err = executor.SearchCode(context.Background(), "errorcode", "", "", 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "ErrorCode") || strings.Contains(out, "errorCode") {
+		t.Fatalf("case-sensitive search must not match either casing, got: %q", out)
+	}
+}
+
+// TestSearchWithGoIgnoreCase pins case-insensitive matching on the Go
+// fallback engine specifically (independent of rg availability), for both
+// regex and literal patterns.
+func TestSearchWithGoIgnoreCase(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("Hello World\nhello world\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	executor := NewExecutor(dir)
+
+	cases := []struct {
+		name       string
+		pattern    string // regex-interpreted first, quoted-literal fallback otherwise
+		ignoreCase bool
+		wantLines  []int // 1-based file lines expected to match
+	}{
+		{"regex sensitive", `hello \w+`, false, []int{2}},
+		{"regex insensitive", `hello \w+`, true, []int{1, 2}},
+		{"literal sensitive", "Hello World", false, []int{1}},
+		{"literal insensitive", "Hello World", true, []int{1, 2}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			matches, truncated, err := executor.searchWithGoMatches(context.Background(), dir, "", tc.pattern, "", tc.ignoreCase)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if truncated {
+				t.Fatal("unexpected truncation")
+			}
+			if len(matches) != len(tc.wantLines) {
+				t.Fatalf("got %d matches (%+v), want %d", len(matches), matches, len(tc.wantLines))
+			}
+			for i, want := range tc.wantLines {
+				if matches[i].Line != want {
+					t.Fatalf("match %d: got line %d, want %d", i, matches[i].Line, want)
+				}
+			}
+
+			// The rendered form agrees: compacted layout shows the file
+			// header once, then "line:content" per match.
+			out, err := executor.searchWithGo(context.Background(), dir, "", tc.pattern, "", 0, tc.ignoreCase)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range tc.wantLines {
+				if !strings.Contains(out, fmt.Sprintf("\n%d:", want)) {
+					t.Fatalf("output missing line %d: %q", want, out)
+				}
+			}
+		})
+	}
+}
+
+// TestCompileSearchPatternIgnoreCase pins the (?i) plumbing in
+// compileSearchPattern: valid regexes get the flag prepended, invalid regexes
+// fall back to a quoted literal that still matches case-insensitively (the
+// flag must not end up escaped inside the literal), and the memo keeps
+// sensitive/insensitive compiles of one pattern distinct.
+func TestCompileSearchPatternIgnoreCase(t *testing.T) {
+	re, err := compileSearchPattern(`[Ee]rror`, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if re.String() != `(?i)[Ee]rror` {
+		t.Fatalf("re.String() = %q, want %q", re.String(), `(?i)[Ee]rror`)
+	}
+
+	// Invalid regex falls back to QuoteMeta; (?i) stays a live flag rather
+	// than being escaped into the literal.
+	re, err = compileSearchPattern("[invalid", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if re.String() != `(?i)\[invalid` {
+		t.Fatalf("re.String() = %q, want %q", re.String(), `(?i)\[invalid`)
+	}
+	if !re.MatchString("[INVALID]") || re.MatchString("[valid") {
+		t.Fatalf("quoted-literal fallback broken: %q", re.String())
+	}
+
+	sens, err := compileSearchPattern("abc", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insens, err := compileSearchPattern("abc", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sens.String() == insens.String() {
+		t.Fatal("sensitive and insensitive compiles must be distinct cache entries")
 	}
 }

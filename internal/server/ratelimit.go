@@ -10,9 +10,13 @@ import (
 )
 
 const (
-	defaultMaxWSConns    = 32
-	authCookieName       = "gogen_web_token"
-	authCookieMaxAgeSecs = 7 * 24 * 60 * 60
+	defaultMaxWSConns = 32
+	authCookieName    = "gogen_web_token"
+	// authCookieMaxAgeSecs is the session cookie lifetime. The auth token is
+	// persisted across restarts for non-loopback binds, so the cookie can
+	// outlive a single server run (30 days); a re-login via the printed
+	// link/QR mints a fresh cookie.
+	authCookieMaxAgeSecs = 30 * 24 * 60 * 60
 )
 
 type rateLimitState struct {

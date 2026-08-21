@@ -63,10 +63,15 @@ type StreamCallback func(token string)
 
 // StreamHandlers provides optional callbacks for streaming and progress events.
 type StreamHandlers struct {
-	OnStart          func()         // called once when processing begins
-	OnRoundStart     func()         // called at the start of each LLM round after the first
-	OnStreamOpened   func()         // called when the SSE connection is established
-	OnCompacting     func()         // called when context compaction starts (before the summarization call)
+	OnStart        func() // called once when processing begins
+	OnRoundStart   func() // called at the start of each LLM round after the first
+	OnStreamOpened func() // called when the SSE connection is established
+	OnCompacting   func() // called when context compaction starts (before the summarization call)
+	// OnCondensed is called when the last-resort condensation (Phase 0e)
+	// replaced a message that could not fit the context window: note is
+	// the human-readable announcement (message size vs window, original
+	// archived) for an in-band system line / banner.
+	OnCondensed      func(note string)
 	OnStreamStall    func()         // called when no SSE chunk arrives for several seconds
 	OnStreamActivity func()         // called on the first visible content/refusal token
 	OnThinkingToken  StreamCallback // called for each reasoning/thinking token (display separately)

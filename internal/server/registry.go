@@ -1,8 +1,9 @@
 package server
 
 import (
+	"cmp"
 	"context"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -51,6 +52,18 @@ type sessionRuntime struct {
 	// the turn.
 	clientsMu sync.Mutex
 	clients   map[*wsConn]struct{}
+
+	// passive is the subset of clients attached for approval delivery only,
+	// not as viewers (the board start's background attach: the initiating
+	// tab receives the headless turn's delete approvals via the global
+	// modal without "viewing" the session). Passive sockets count for
+	// broadcast and approval auto-deny (clientCount) but NOT for the
+	// live-session signal: viewerCount backs the sessions payload's active
+	// flag and the orphan eviction, so a completed board session reads as a
+	// plain saved session — not a stale "resume to continue" row — while
+	// the initiating tab is still open. Invariant: passive ⊆ clients; a
+	// viewer attach upgrades a passive socket (delete from passive).
+	passive map[*wsConn]struct{}
 
 	// turnActive backs the session_state reply on attach so a reconnecting
 	// client can distinguish "turn running headless" from "idle"; startedAt
@@ -142,6 +155,7 @@ func newSessionRuntime(a *agent.Agent) *sessionRuntime {
 		stream:        &wsConnStream{},
 		approvals:     make(map[string]*pendingApproval),
 		clients:       make(map[*wsConn]struct{}),
+		passive:       make(map[*wsConn]struct{}),
 		deliverNotify: make(chan struct{}, 1),
 	}
 }
@@ -366,18 +380,42 @@ func (rt *sessionRuntime) liveRewind() *liveRewindState {
 			Index: idx, ID: rt.live.toolIDs[idx], Name: name, Args: argsStr, ArgsPos: argsPos,
 		})
 	}
-	sort.Slice(rw.ToolCalls, func(i, j int) bool { return rw.ToolCalls[i].Index < rw.ToolCalls[j].Index })
+	slices.SortFunc(rw.ToolCalls, func(a, b liveToolCallState) int { return cmp.Compare(a.Index, b.Index) })
 	return rw
 }
 
 // attach registers a socket as a viewer of this session. Broadcasts reach all
-// attached sockets; the first client to send a message starts the turn.
+// attached sockets; the first client to send a message starts the turn. A
+// socket previously attached passively (approval delivery only) is upgraded
+// to a viewer: the session is now genuinely open in this tab, so it counts
+// for the live-session signal again.
 func (rt *sessionRuntime) attach(ws *wsConn) {
+	rt.attachWithRole(ws, false)
+}
+
+// attachPassive registers a socket for approval delivery WITHOUT making it a
+// viewer: broadcasts (delete approvals) reach it, and its presence keeps the
+// approval auto-deny machinery armed (clientCount), but it does not count as
+// a live viewer — viewerCount backs the sessions payload's active flag and
+// the orphan eviction, so the session can read as a plain saved session (no
+// stale "resume to continue" row) while only passively attached sockets
+// remain. The board start uses it: the initiating tab must receive the
+// headless turn's delete approvals without "viewing" the session.
+func (rt *sessionRuntime) attachPassive(ws *wsConn) {
+	rt.attachWithRole(ws, true)
+}
+
+func (rt *sessionRuntime) attachWithRole(ws *wsConn, passive bool) {
 	if ws == nil {
 		return
 	}
 	rt.clientsMu.Lock()
 	rt.clients[ws] = struct{}{}
+	if passive {
+		rt.passive[ws] = struct{}{}
+	} else {
+		delete(rt.passive, ws) // viewer attach upgrades a passive socket
+	}
 	rt.clientsMu.Unlock()
 	// A reconnecting client missed the original delete_approval broadcast.
 	// Re-notify it of every pending approval (F2: the hold window is only
@@ -421,6 +459,7 @@ func (rt *sessionRuntime) detach(ws *wsConn) {
 	if ok {
 		delete(rt.clients, ws)
 	}
+	delete(rt.passive, ws)
 	empty := len(rt.clients) == 0
 	rt.clientsMu.Unlock()
 	if ok && empty {
@@ -458,10 +497,25 @@ func (rt *sessionRuntime) scheduleAutoDenyAfter(after time.Duration) {
 }
 
 // clientCount returns the number of attached sockets (for tests/shutdown).
+// Includes passive (approval-only) attachments: they can still answer
+// delete approvals, so the auto-deny and deny-when-unattended machinery
+// must see them.
 func (rt *sessionRuntime) clientCount() int {
 	rt.clientsMu.Lock()
 	defer rt.clientsMu.Unlock()
 	return len(rt.clients)
+}
+
+// viewerCount returns the number of attached sockets that are genuine
+// viewers (not passive approval-only attachments). It backs the sessions
+// payload's active flag and the orphan eviction: a runtime whose only
+// attachments are passive, with no running turn, is a warm session nobody
+// is viewing and must read as a plain saved session — not a stale
+// "resume to continue" row.
+func (rt *sessionRuntime) viewerCount() int {
+	rt.clientsMu.Lock()
+	defer rt.clientsMu.Unlock()
+	return len(rt.clients) - len(rt.passive)
 }
 
 // broadcast writes a message to every attached socket. A socket whose write
@@ -865,7 +919,10 @@ func (r *sessionRegistry) evictOrphaned(rt *sessionRuntime) {
 	if rt == nil || rt.evicted.Load() {
 		return
 	}
-	if rt.clientCount() > 0 {
+	// A passive (approval-only) attachment is not a viewer: a completed
+	// board session whose initiating tab is still open must be evictable,
+	// or it would pin a stale "resume to continue" row for the tab's life.
+	if rt.viewerCount() > 0 {
 		return
 	}
 	if active, _ := rt.turnState(); active {
@@ -1068,14 +1125,26 @@ func (s *Server) ShutdownSessions() {
 	}
 }
 
-// acquireTurnForHandler implements the cancel-then-lock pattern scoped to one
-// session: it cancels the in-flight turn only when THIS connection owns
-// it (interrupt semantics — typing a new message replaces your own turn). A
-// second connection attached to the same session never cancels a turn
-// it does not own; it waits and gets the standard busy rejection. Returns
-// false when the runtime is busy or was evicted; the caller drops the
-// message and notifies the client on its own channel (see errAgentBusy —
-// UI-channel handlers must not emit the busy rejection as a "response").
+// acquireTurnForHandler is the single cancel-then-lock acquisition used by
+// every WS handler that takes the session turn lock (chat messages, /compact,
+// board start, and the UI-channel config handlers). It cancels the in-flight
+// turn only when THIS connection owns it (interrupt semantics — typing a new
+// message replaces your own turn). A second connection attached to the same
+// session never cancels a turn it does not own; it waits and gets the
+// standard busy rejection. Returns false when the runtime is busy or was
+// evicted; the caller drops the message and notifies the client on its own
+// channel (see errAgentBusy — UI-channel handlers must not emit the busy
+// rejection as a "response"). On success the caller owns rt.turnMu.
+//
+// The cancel happens TWICE on purpose, and the up-front one is not
+// redundant: when the caller owns the turn, its own turn's goroutine holds
+// turnMu, so the first tryAcquireTurn would be guaranteed to time out —
+// cancelling up front makes that 150 ms window cover the drain instead of
+// delaying the interrupt. The retry-cancel after the first timeout covers
+// the case where the drain outlived the window (a tool still exiting).
+// Both are scoped to the owner via ownsTurn, and cancelInFlight is
+// idempotent, so a caller that already cancelled (e.g.
+// preprocessWSUserMessage before routing /compact) pays nothing.
 func (rt *sessionRuntime) acquireTurnForHandler(ws *wsConn) bool {
 	if rt.ownsTurn(ws) {
 		rt.stream.cancelInFlight()

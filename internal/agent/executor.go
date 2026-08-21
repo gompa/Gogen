@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -255,7 +254,7 @@ func (e *Executor) validateAndCheckFile(path string) (string, string, error) {
 }
 
 func (e *Executor) readWithRegexSearch(secure string, offset, limit int, search string, lineNumbers bool, header string) (string, error) {
-	re, err := regexp.Compile(search)
+	re, err := compiledRegex(search)
 	if err != nil {
 		return "", fmt.Errorf("invalid search pattern: %w", err)
 	}

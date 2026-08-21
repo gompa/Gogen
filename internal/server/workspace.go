@@ -60,10 +60,11 @@ type Workspace struct {
 	// field access raced those readers (data race under -race). Production
 	// access must go through the Get*/Set* accessors; the fields stay
 	// exported only so existing tests can read them directly.
-	featureMu        sync.RWMutex
-	BoardEnabled     bool
-	SubagentEnabled  bool
-	SubagentMaxDepth int
+	featureMu             sync.RWMutex
+	BoardEnabled          bool
+	SubagentEnabled       bool
+	SubagentMaxDepth      int
+	SubagentMaxConcurrent int
 
 	// boardManager is the single shared project board for this workspace
 	// (all session agents share one instance, so claims and moves serialize
@@ -284,6 +285,23 @@ func (ws *Workspace) SetSubagentMaxDepth(depth int) {
 	ws.featureMu.Unlock()
 }
 
+// GetSubagentMaxConcurrent returns the live per-parent concurrent-subagent
+// limit (0 = unset; readers resolve the effective value via
+// config.DefaultSubagentMaxConcurrent).
+func (ws *Workspace) GetSubagentMaxConcurrent() int {
+	ws.featureMu.RLock()
+	defer ws.featureMu.RUnlock()
+	return ws.SubagentMaxConcurrent
+}
+
+// SetSubagentMaxConcurrent updates the live per-parent concurrent-subagent
+// limit.
+func (ws *Workspace) SetSubagentMaxConcurrent(n int) {
+	ws.featureMu.Lock()
+	ws.SubagentMaxConcurrent = n
+	ws.featureMu.Unlock()
+}
+
 // GetBoardManager returns the shared project board manager (nil when the
 // board feature has never been enabled).
 func (ws *Workspace) GetBoardManager() *agent.BoardManager {
@@ -407,6 +425,15 @@ func subagentDepthFrom(cfg *config.Config) int {
 	return cfg.SubagentDepth()
 }
 
+// subagentLimitFrom resolves the effective concurrent-subagent limit for a
+// possibly-nil config (NewServer tolerates nil configs in tests).
+func subagentLimitFrom(cfg *config.Config) int {
+	if cfg == nil {
+		return config.DefaultSubagentMaxConcurrent
+	}
+	return cfg.SubagentLimit()
+}
+
 // buildToolHandlers returns the agent tool handler map for the workspace:
 // the builtin handlers wrapped with the workspace fsMu (so concurrent
 // sessions serialize file mutations). The feature-gated tools (board,
@@ -432,27 +459,28 @@ func (ws *Workspace) NewSessionAgent(snap *agent.SessionSnapshot, id string) *ag
 	// context change applies to sessions created afterwards too.
 	runtimeCfg := ws.GetRuntimeConfig()
 	opts := agent.SessionAgentOptions{
-		Provider:             ws.ProviderFactory(),
-		Executor:             ws.Exec,
-		Store:                ws.Store,
-		Config:               &runtimeCfg,
-		GlobalMode:           ws.GlobalMode,
-		ProjectFilePath:      ws.ProjectFilePath,
-		ProjectGuidelines:    ws.ProjectGuidelines,
-		TestCommand:          ws.TestCommand,
-		LintCommand:          ws.LintCommand,
-		WorkingDir:           ws.GetWorkingDir(),
-		MCPRegistry:          ws.MCPRegistry,
-		ToolHandlers:         ws.buildToolHandlers(),
-		DebugCompareMessages: ws.DebugCompareMessages,
-		ThinkingLevel:        agent.ThinkingLevel(ws.ThinkingLevel),
-		BoardEnabled:         ws.GetBoardEnabled(),
-		SubagentsEnabled:     ws.GetSubagentEnabled(),
-		SubagentMaxDepth:     ws.GetSubagentMaxDepth(),
-		BoardManager:         ws.GetBoardManager(),
-		SkillsManager:        ws.skillsManager,
-		InstructionsEnabled:  runtimeCfg.AgentInstructionsEnabled(),
-		SubagentSpawner:      ws.SubagentSpawner,
+		Provider:              ws.ProviderFactory(),
+		Executor:              ws.Exec,
+		Store:                 ws.Store,
+		Config:                &runtimeCfg,
+		GlobalMode:            ws.GlobalMode,
+		ProjectFilePath:       ws.ProjectFilePath,
+		ProjectGuidelines:     ws.ProjectGuidelines,
+		TestCommand:           ws.TestCommand,
+		LintCommand:           ws.LintCommand,
+		WorkingDir:            ws.GetWorkingDir(),
+		MCPRegistry:           ws.MCPRegistry,
+		ToolHandlers:          ws.buildToolHandlers(),
+		DebugCompareMessages:  ws.DebugCompareMessages,
+		ThinkingLevel:         agent.ThinkingLevel(ws.ThinkingLevel),
+		BoardEnabled:          ws.GetBoardEnabled(),
+		SubagentsEnabled:      ws.GetSubagentEnabled(),
+		SubagentMaxDepth:      ws.GetSubagentMaxDepth(),
+		SubagentMaxConcurrent: ws.GetSubagentMaxConcurrent(),
+		BoardManager:          ws.GetBoardManager(),
+		SkillsManager:         ws.skillsManager,
+		InstructionsEnabled:   runtimeCfg.AgentInstructionsEnabled(),
+		SubagentSpawner:       ws.SubagentSpawner,
 	}
 	a := agent.NewSessionAgent(opts, snap, id)
 	a.SetOnBoardChanged(ws.BoardChangedHook)
@@ -475,24 +503,25 @@ func (ws *Workspace) NewSessionAgent(snap *agent.SessionSnapshot, id string) *ag
 // factory seeds each new provider from the agent's current model/thinking.
 func newWorkspaceFromAgent(a *agent.Agent, cfg *config.Config) *Workspace {
 	ws := &Workspace{
-		Exec:                 a.Executor,
-		Config:               cfg,
-		GlobalMode:           a.GlobalMode,
-		ProjectFilePath:      a.ProjectFilePath,
-		ProjectGuidelines:    a.ProjectGuidelines,
-		TestCommand:          a.TestCommand,
-		LintCommand:          a.LintCommand,
-		DebugCompareMessages: a.DebugCompareMessages,
-		MCPRegistry:          a.MCPRegistry,
-		Model:                a.CurrentModel(),
-		ThinkingLevel:        string(a.ThinkingLevel),
-		WorkingDir:           a.Executor.GetWorkingDir(),
-		BoardEnabled:         cfg != nil && cfg.BoardEnabled(),
-		SubagentEnabled:      cfg != nil && cfg.SubagentEnabled(),
-		SubagentMaxDepth:     subagentDepthFrom(cfg),
-		jobNotices:           cfg != nil && cfg.JobNoticesEnabled(),
-		OpenAIProviders:      providerListFromConfig(cfg),
-		runtime:              runtimeSeed(cfg),
+		Exec:                  a.Executor,
+		Config:                cfg,
+		GlobalMode:            a.GlobalMode,
+		ProjectFilePath:       a.ProjectFilePath,
+		ProjectGuidelines:     a.ProjectGuidelines,
+		TestCommand:           a.TestCommand,
+		LintCommand:           a.LintCommand,
+		DebugCompareMessages:  a.DebugCompareMessages,
+		MCPRegistry:           a.MCPRegistry,
+		Model:                 a.CurrentModel(),
+		ThinkingLevel:         string(a.ThinkingLevel),
+		WorkingDir:            a.Executor.GetWorkingDir(),
+		BoardEnabled:          cfg != nil && cfg.BoardEnabled(),
+		SubagentEnabled:       cfg != nil && cfg.SubagentEnabled(),
+		SubagentMaxDepth:      subagentDepthFrom(cfg),
+		SubagentMaxConcurrent: subagentLimitFrom(cfg),
+		jobNotices:            cfg != nil && cfg.JobNoticesEnabled(),
+		OpenAIProviders:       providerListFromConfig(cfg),
+		runtime:               runtimeSeed(cfg),
 	}
 	if cfg != nil && cfg.BoardEnabled() {
 		// The workspace owns the single board manager; session agents are

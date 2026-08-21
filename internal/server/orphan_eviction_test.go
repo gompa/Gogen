@@ -148,6 +148,82 @@ func TestReKeyedSessionOrphanEvicted(t *testing.T) {
 	}
 }
 
+// TestReconnectForeignDefaultReleasable pins the restart fix: the connect
+// handshake attaches the connection to the restored default session even
+// when the client's panes are other sessions (a reconnect after a server
+// restart whose latest saved session is not the tab's active pane). The
+// client releases that attachment (session_detach for the foreign default —
+// app.js's onmessage drop branch), and the idle default must then be free
+// to orphan-evict: the sessions payload stops reporting it active, so a
+// restart does not pin "resume to continue" on the restored (often
+// board-started) session.
+func TestReconnectForeignDefaultReleasable(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, a, _ := newContinuationServer(t, stub, dir)
+	srv := startWSServer(t, s)
+	defer srv.Close()
+
+	conn := dialWS(t, srv, "/ws")
+	defer conn.Close()
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+	sidDefault := a.SessionID
+
+	// Use the default so it is saved (a real restorable session), then
+	// re-key to a fresh session — the reconnecting tab's actual pane.
+	if err := conn.WriteJSON(WSMessage{Type: "message", Content: "hello", SessionID: sidDefault}); err != nil {
+		t.Fatalf("send turn: %v", err)
+	}
+	stub.releaseN(1)
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "turn_end" && m.SessionID == sidDefault })
+
+	if err := conn.WriteJSON(WSMessage{Type: "session_new"}); err != nil {
+		t.Fatalf("send session_new: %v", err)
+	}
+	var sidNew string
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool {
+		if m.Type == "response" && m.SessionID != "" && m.SessionID != sidDefault {
+			sidNew = m.SessionID
+			return true
+		}
+		return false
+	})
+
+	// The client releases the foreign handshake default (its panes are the
+	// fresh session, not the restored one).
+	if err := conn.WriteJSON(WSMessage{Type: "session_detach", SessionID: sidDefault}); err != nil {
+		t.Fatalf("send session_detach: %v", err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		_, ok := s.registry.get(sidDefault)
+		return !ok
+	})
+
+	// The sessions payload: the released default is listed (saved) but
+	// inactive — no "resume to continue" row.
+	if err := conn.WriteJSON(WSMessage{Type: "list_sessions"}); err != nil {
+		t.Fatalf("list_sessions: %v", err)
+	}
+	msg := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "sessions" && len(m.Sessions) > 0 })
+	listed := false
+	for _, e := range msg.Sessions {
+		if e.ID != sidDefault {
+			continue
+		}
+		listed = true
+		if e.Active {
+			t.Fatalf("released default session reports active=true (stale 'resume to continue' row)")
+		}
+	}
+	if !listed {
+		t.Fatalf("released default session missing from the saved-session list")
+	}
+	// The pane's session (still viewed by this connection) survives.
+	if _, ok := s.registry.get(sidNew); !ok {
+		t.Fatal("the pane's session was evicted by the foreign default's release")
+	}
+}
+
 // TestSessionOpenInAnotherTabNotOrphanEvicted pins the multi-tab guard: the
 // last client of a session is only "the last" per session — closing one tab
 // must not evict a session another tab still has open.

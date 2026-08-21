@@ -2,10 +2,12 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"unicode/utf8"
 
+	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
 )
@@ -94,6 +96,27 @@ func TestSubagentToolGating(t *testing.T) {
 	}
 }
 
+// TestSubagentToolDescriptionConcurrentLimit verifies the subagent tool
+// description surfaces the live per-parent concurrent-subagent limit,
+// defaulting to the config default.
+func TestSubagentToolDescriptionConcurrentLimit(t *testing.T) {
+	a := newSubagentTestAgent(t)
+	a.SetSubagentsEnabled(true)
+	a.SetSubagentSpawner(&fakeSpawner{})
+
+	def := subagentToolDef(false, a.SubagentMaxConcurrent())
+	want := fmt.Sprintf("At most %d may run concurrently.", config.DefaultSubagentMaxConcurrent)
+	if !strings.Contains(def.Description, want) {
+		t.Fatalf("description missing default concurrent limit:\n%s", def.Description)
+	}
+
+	a.SetSubagentMaxConcurrent(2)
+	def = subagentToolDef(true, a.SubagentMaxConcurrent())
+	if !strings.Contains(def.Description, "At most 2 may run concurrently.") {
+		t.Fatalf("description missing live concurrent limit:\n%s", def.Description)
+	}
+}
+
 // TestSubagentSpawnerNil verifies the nil-guard: enabled but no spawner
 // installed → a clear error, not a panic.
 func TestSubagentSpawnerNil(t *testing.T) {
@@ -171,5 +194,44 @@ func TestSubagentLabelTruncatesRuneSafe(t *testing.T) {
 	// Short labels are untouched.
 	if short := SubagentLabel("short job"); short != "subagent: short job" {
 		t.Fatalf("SubagentLabel(short) = %q", short)
+	}
+}
+
+// TestTruncateSubagentReportRuneSafe verifies the report cap never splits a
+// multi-byte rune at the cut point (a byte cut would emit invalid UTF-8
+// into the parent's context).
+func TestTruncateSubagentReportRuneSafe(t *testing.T) {
+	const suffix = "… (truncated)"
+	cap := MaxSubagentReportBytes
+	cases := []struct {
+		name    string
+		report  string
+		wantCap bool // result is truncated (suffix appended)
+	}{
+		{"empty", "", false},
+		{"short ascii", "hello", false},
+		{"exactly at cap", strings.Repeat("a", cap), false},
+		{"ascii over cap", strings.Repeat("a", cap+1), true},
+		{"emoji straddles cut", strings.Repeat("a", cap-2) + "🦄", true},
+		{"cjk straddles cut", strings.Repeat("a", cap-1) + "中", true},
+		{"two-byte rune straddles cut", strings.Repeat("a", cap-1) + "é", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := TruncateSubagentReport(tc.report)
+			if !utf8.ValidString(got) {
+				t.Fatalf("result is not valid UTF-8 (len=%d)", len(got))
+			}
+			if tc.wantCap {
+				if !strings.HasSuffix(got, suffix) {
+					t.Fatalf("expected %q suffix, got tail %q", suffix, got[len(got)-32:])
+				}
+				if len(got) > cap+len(suffix) {
+					t.Fatalf("truncated result exceeds byte cap: %d > %d", len(got), cap+len(suffix))
+				}
+			} else if got != tc.report {
+				t.Fatalf("short report was modified: %q", got)
+			}
+		})
 	}
 }

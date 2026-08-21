@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"strings"
 )
 
 func (s *Server) handleFSReadMessage(ws *wsConn, ctx context.Context, msg WSMessage) {
@@ -40,13 +41,19 @@ func (s *Server) handleFSReadMessage(ws *wsConn, ctx context.Context, msg WSMess
 		}
 		_ = ws.writeJSON(resp)
 	case "git_status":
-		entries, err := s.gitStatusEntries(ctx)
+		status, err := s.gitStatusEntries(ctx)
 		resp := WSMessage{Type: "git_status_result", RequestID: reqID}
 		if err != nil {
 			resp.Error = err.Error()
 		} else {
 			resp.Success = true
-			resp.GitEntries = entries
+			resp.GitStatus = &status
+			// Legacy flat list (Unstaged+Untracked) kept for one release
+			// cycle so a stale browser tab (pre-v2 panel) keeps working.
+			legacy := make([]GitStatusEntry, 0, len(status.Unstaged)+len(status.Untracked))
+			legacy = append(legacy, status.Unstaged...)
+			legacy = append(legacy, status.Untracked...)
+			resp.GitEntries = legacy
 		}
 		_ = ws.writeJSON(resp)
 	case "git_file_diff":
@@ -65,6 +72,25 @@ func (s *Server) handleFSReadMessage(ws *wsConn, ctx context.Context, msg WSMess
 			resp.Modified = modified
 		}
 		_ = ws.writeJSON(resp)
+	case "git_commit_message":
+		// One-shot LLM call over the staged diff — no chat session is
+		// created or touched (see generateCommitMessage). Run it OFF the
+		// read loop: the call can take up to gitCommitMessageTimeout (60s),
+		// and the read loop serializes every message on the connection
+		// (cancel, FS reads/writes, editor saves). The reply is safe to
+		// write from a goroutine (writeJSON only enqueues onto the conn's
+		// send queue, drained by a single writer) and the client correlates
+		// by RequestID, so out-of-order delivery is fine.
+		go func() {
+			resp := WSMessage{Type: "git_commit_message_result", RequestID: reqID}
+			if out, err := s.generateCommitMessage(ctx); err != nil {
+				resp.Error = err.Error()
+			} else {
+				resp.Success = true
+				resp.Content = out
+			}
+			_ = ws.writeJSON(resp)
+		}()
 	}
 }
 
@@ -87,7 +113,7 @@ func (s *Server) handleFSWriteMessage(ws *wsConn, ctx context.Context, msg WSMes
 		}
 		_ = ws.writeJSON(resp)
 	case "fs_replace":
-		replaced, fileCount, err := s.fsReplace(ctx, msg.Pattern, msg.Replacement, msg.Path, msg.Glob)
+		replaced, fileCount, files, err := s.fsReplace(ctx, msg.Pattern, msg.Replacement, msg.Path, msg.Glob)
 		resp := WSMessage{Type: "fs_replace_result", Path: path, RequestID: reqID, Pattern: msg.Pattern}
 		if err != nil {
 			resp.Error = err.Error()
@@ -95,6 +121,7 @@ func (s *Server) handleFSWriteMessage(ws *wsConn, ctx context.Context, msg WSMes
 			resp.Success = true
 			resp.Replaced = replaced
 			resp.FileCount = fileCount
+			resp.Files = files
 		}
 		_ = ws.writeJSON(resp)
 	case "fs_apply_patch":
@@ -112,6 +139,53 @@ func (s *Server) handleFSWriteMessage(ws *wsConn, ctx context.Context, msg WSMes
 		} else {
 			resp.Success = true
 			resp.Result = report
+		}
+		_ = ws.writeJSON(resp)
+	case "git_commit":
+		// Commit composer (ticket #53). The message is passed as a single
+		// argv element via GitCommit — never through a shell.
+		resp := WSMessage{Type: "git_commit_result", RequestID: reqID}
+		if strings.TrimSpace(msg.Content) == "" {
+			resp.Error = "commit message is required"
+		} else if out, err := s.ws.Exec.GitCommit(ctx, msg.Content); err != nil {
+			resp.Error = err.Error()
+		} else {
+			resp.Success = true
+			resp.Result = out
+		}
+		_ = ws.writeJSON(resp)
+	case "git_stage":
+		// Stage the given paths (empty = all changes, i.e. `git add -A`).
+		// GitStage SecurePath-validates every path and builds argv-only.
+		resp := WSMessage{Type: "git_stage_result", RequestID: reqID}
+		if out, err := s.ws.Exec.GitStage(ctx, msg.Paths); err != nil {
+			resp.Error = err.Error()
+		} else {
+			resp.Success = true
+			resp.Result = out
+		}
+		_ = ws.writeJSON(resp)
+	case "git_unstage":
+		// Unstage the given paths (empty = all staged changes) via
+		// `git restore --staged -- <paths>` — SecurePath-validated,
+		// argv-only.
+		resp := WSMessage{Type: "git_unstage_result", RequestID: reqID}
+		if out, err := s.ws.Exec.GitUnstage(ctx, msg.Paths); err != nil {
+			resp.Error = err.Error()
+		} else {
+			resp.Success = true
+			resp.Result = out
+		}
+		_ = ws.writeJSON(resp)
+	case "git_push":
+		// Push to origin with a fixed argv; the only user-controlled input
+		// is the branch ref, validated inside GitPush (validateGitRef).
+		resp := WSMessage{Type: "git_push_result", RequestID: reqID}
+		if out, err := s.ws.Exec.GitPush(ctx, msg.Branch); err != nil {
+			resp.Error = err.Error()
+		} else {
+			resp.Success = true
+			resp.Result = out
 		}
 		_ = ws.writeJSON(resp)
 	}

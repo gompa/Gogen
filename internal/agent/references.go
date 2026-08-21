@@ -58,7 +58,7 @@ func (e *Executor) FindReferences(ctx context.Context, symbol, subpath, glob str
 
 	// Text search fallback
 	pattern := `\b` + regexp.QuoteMeta(symbol) + `\b`
-	textOut, err := e.SearchCode(ctx, pattern, subpath, glob, 0)
+	textOut, err := e.SearchCode(ctx, pattern, subpath, glob, 0, false)
 	if err != nil {
 		return "", err
 	}
