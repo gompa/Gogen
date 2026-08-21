@@ -52,7 +52,21 @@ var profileCatalogTimeout = 3 * time.Second
 
 // propsHTTPClient is a plain short-timeout client for capability probes.
 // Intentionally not the SSE client (idle read deadlines are stream-oriented).
-var propsHTTPClient = &http.Client{Timeout: propsProbeTimeout}
+//
+// Keep-alives are disabled. Probes target many short-lived llama.cpp
+// endpoints (and, under t.Parallel(), repeatedly-started httptest servers that
+// recycle ephemeral ports). A pooled idle connection to a since-closed
+// endpoint can be reused against a different server; the transport retries such
+// stale-connection failures for idempotent requests (GET /props) but not for
+// POST /apply-template, so a lingering connection intermittently breaks the
+// probe. Disabling keep-alives forces a fresh dial per probe, always reaching
+// the live endpoint. The transport is cloned from DefaultTransport so proxy
+// and TLS behavior are unchanged.
+var propsHTTPClient = func() *http.Client {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DisableKeepAlives = true
+	return &http.Client{Timeout: propsProbeTimeout, Transport: t}
+}()
 
 // isOpencodeURL reports whether baseURL points to an OpenCode endpoint that
 // should also expose the Go model family at openCodeGoBaseURL.
