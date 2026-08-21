@@ -26,7 +26,7 @@ It's built to be handed real work:
 
 ### Prerequisites
 
-- Go 1.26+
+- Go 1.27+
 - A C compiler (for CGO / tree-sitter), e.g. `gcc` on Linux
 - An OpenAI-compatible API key
 

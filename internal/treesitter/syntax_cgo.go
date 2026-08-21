@@ -181,7 +181,7 @@ func compileQuery(langName, kind, src string) (*tree_sitter.Query, error) {
 	}
 	q, err := tree_sitter.NewQuery(lang, src)
 	if err != nil {
-		return nil, fmt.Errorf("compile %s query for %s: %w", kind, langName, err)
+		return nil, fmt.Errorf("compile %s query for %s: %w", kind, langName, *err)
 	}
 	queryCache.Store(key, q)
 	return q, nil
