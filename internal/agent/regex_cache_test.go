@@ -1,7 +1,7 @@
 package agent
 
 import (
-	"path/filepath"
+	"path"
 	"sync"
 	"testing"
 )
@@ -89,10 +89,15 @@ func TestCompiledRegexCompileErrorNotCached(t *testing.T) {
 	}
 }
 
-// TestMatchGlobCachedMatchesFilepathMatch verifies the cached regex path is
-// equivalent to filepath.Match for simple globs (no ** and no character
+// TestMatchGlobCachedMatchesPathMatch verifies the cached regex path is
+// equivalent to path.Match for simple globs (no ** and no character
 // classes), which is the precondition for routing them through the cache.
-func TestMatchGlobCachedMatchesFilepathMatch(t *testing.T) {
+// path.Match (not filepath.Match) is the oracle: the cached matcher is
+// slash-based by design (callers ToSlash the input), while on Windows
+// filepath.Match additionally treats "/" as a separator, so
+// filepath.Match("*", "bar/baz.go") is true there and would make the
+// test platform-dependent.
+func TestMatchGlobCachedMatchesPathMatch(t *testing.T) {
 	patterns := []string{"*", "?", "a", "*.go", "a?c", "a*b*c", "src/*.go", "src/x_?.txt"}
 	paths := []string{
 		"a", "ab", "abc", "axxxbxxx c", "foo.go", "bar/baz.go",
@@ -100,13 +105,13 @@ func TestMatchGlobCachedMatchesFilepathMatch(t *testing.T) {
 		"a1", "a2b", "aX",
 	}
 	for _, p := range patterns {
-		for _, path := range paths {
-			want, err := filepath.Match(p, path)
+		for _, candidate := range paths {
+			want, err := path.Match(p, candidate)
 			if err != nil {
-				t.Fatalf("filepath.Match(%q, %q): %v", p, path, err)
+				t.Fatalf("path.Match(%q, %q): %v", p, candidate, err)
 			}
-			if got := matchGlobCached(p, path); got != want {
-				t.Errorf("matchGlobCached(%q, %q) = %v, filepath.Match = %v", p, path, got, want)
+			if got := matchGlobCached(p, candidate); got != want {
+				t.Errorf("matchGlobCached(%q, %q) = %v, path.Match = %v", p, candidate, got, want)
 			}
 		}
 	}

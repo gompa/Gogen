@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -36,11 +37,14 @@ func TestLoadOrCreateWebTokenCreatesAndPersists(t *testing.T) {
 	}
 
 	// Persisted with 0600 so other users cannot read the credential.
+	// Windows does not track POSIX mode bits (only the read-only
+	// attribute), so a regular file always reports 0666 — the assertion
+	// is only meaningful on Unix.
 	fi, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("stat state file: %v", err)
 	}
-	if fi.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
 		t.Fatalf("state file mode = %o, want 600", fi.Mode().Perm())
 	}
 	data, err := os.ReadFile(path)

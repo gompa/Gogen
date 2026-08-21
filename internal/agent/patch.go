@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
+	"path"
 	"strconv"
 	"strings"
 	"unicode"
@@ -354,7 +354,12 @@ func normalizePatchPath(name string) string {
 	case strings.HasPrefix(name, "b/"):
 		name = name[len("b/"):]
 	}
-	return filepath.Clean(name)
+	// path.Clean (not filepath.Clean): diff headers are slash-separated by
+	// convention on every platform, and filepath.Clean would rewrite the
+	// separators to backslashes on Windows — turning "/dev/null" into
+	// "dev\null" (breaking delete/create detection) and "b/foo.txt" into
+	// "b\foo.txt".
+	return path.Clean(name)
 }
 
 func looksLikePatchTimestamp(s string) bool {

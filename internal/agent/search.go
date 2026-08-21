@@ -221,12 +221,18 @@ func (e *Executor) ReplaceInTree(ctx context.Context, pattern, replacement, subp
 		if secErr == nil {
 			info, statErr := os.Stat(secure)
 			if statErr == nil && !info.IsDir() {
-				absWD, absErr := filepath.Abs(e.GetWorkingDir())
+				// Resolve the working dir the same way SecurePath does
+				// (evalPath follows symlinks — e.g. macOS /var →
+				// /private/var, Windows 8.3 short names). Comparing a
+				// resolved path against an unresolved base makes
+				// filepath.Rel emit a "../../…" climb instead of the
+				// clean relative name.
+				absWD, absErr := evalPath(e.GetWorkingDir())
 				if absErr != nil {
 					return 0, 0, nil, absErr
 				}
 				rel, relErr := filepath.Rel(absWD, secure)
-				if relErr != nil {
+				if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 					rel = subpath
 				}
 				rel = filepath.ToSlash(rel)
@@ -302,7 +308,10 @@ func (e *Executor) searchRoot(subpath string) (absRoot, relPrefix string, err er
 	if !info.IsDir() {
 		return "", "", fmt.Errorf("search path must be a directory: %s", subpath)
 	}
-	absWD, err := filepath.Abs(e.GetWorkingDir())
+	// evalPath (not filepath.Abs): secure is symlink-resolved, so the base
+	// must be resolved the same way or filepath.Rel emits a "../../…"
+	// climb (macOS /var → /private/var, Windows 8.3 short names).
+	absWD, err := evalPath(e.GetWorkingDir())
 	if err != nil {
 		return "", "", err
 	}
