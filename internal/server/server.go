@@ -649,12 +649,14 @@ func (s *Server) upgradeWS(w http.ResponseWriter, r *http.Request) (*upgradedWS,
 		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 		return nil, errWSUpgrade
 	}
-	release := func() {}
-	if s.connLimiter != nil && !s.connLimiter.acquireConn() {
-		http.Error(w, "too many connections", http.StatusServiceUnavailable)
-		return nil, errWSUpgrade
+	var release func()
+	if s.connLimiter != nil {
+		if !s.connLimiter.acquireConn() {
+			http.Error(w, "too many connections", http.StatusServiceUnavailable)
+			return nil, errWSUpgrade
+		}
+		release = s.connLimiter.releaseConn
 	}
-	release = s.connLimiter.releaseConn
 	upg := s.wsUpgrader()
 	conn, err := upg.Upgrade(w, r, nil)
 	if err != nil {
@@ -683,7 +685,9 @@ func (s *Server) upgradeWS(w http.ResponseWriter, r *http.Request) (*upgradedWS,
 		ws.closeSend()
 		s.unregisterWSConn(conn)
 		_ = conn.Close()
-		release()
+		if release != nil {
+			release()
+		}
 	}
 	return &upgradedWS{conn: conn, ws: ws, cleanup: cleanup}, nil
 }
