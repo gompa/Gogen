@@ -10,7 +10,6 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/muesli/reflow/wrap"
 )
 
 // wrapWidth returns the available width for word-wrapping inside the viewport.
@@ -26,57 +25,21 @@ func (m *Model) wrapWidth() int {
 	return w
 }
 
-// wrapLine wraps a single chat line ready for display.  It handles SGR
-// propagation so that ANSI styles are re‑emitted on every continuation line.
-//
-// wrap.String handles both word-wrapping and hard-wrapping of overlong tokens
-// (URLs, paths, etc.) in a single pass, avoiding the cost of double-wrapping
-// on every streaming update (~32ms batches).
+// wrapLine wraps a single chat line ready for display. lipgloss.Wrap does
+// word-wrapping plus hard-wrapping of overlong tokens (URLs, paths, etc.) in
+// one pass, and re-applies any SGR style that is still open onto every
+// continuation line while closing it before end-of-line — so styles survive
+// wrapping without manual SGR bookkeeping here (the hand-rolled tracker this
+// replaced was the source of the v2 label-bleed bug fixed in a3b358b).
 func (m *Model) wrapLine(line string) []string {
 	w := m.wrapWidth()
-	wrapped := wrap.String(line, w)
+	wrapped := lipgloss.Wrap(line, w, "")
 	parts := strings.Split(wrapped, "\n")
 	// Strip trailing empty elements caused by a trailing newline.
 	// Without this, a trailing \n creates a blank visual line that
 	// flickers during streaming or persists in the final output.
 	for len(parts) > 1 && parts[len(parts)-1] == "" {
 		parts = parts[:len(parts)-1]
-	}
-	if len(parts) > 1 {
-		// Propagate the attributes that are still active at each wrap point,
-		// threaded as running SGR state across every part. A styled segment
-		// can begin partway through any line (e.g. a plain tool-call prefix
-		// followed by dimmed args spanning several wrapped lines), so state
-		// must be carried forward — not derived once from parts[0].
-		//
-		// The tracker is attribute-aware (applySGRs/sgrState): it handles
-		// lipgloss v2's bare "\x1b[m" close and per-property resets as well
-		// as v1's literal "\x1b[0m". Matching on the literal reset string
-		// broke under v2, making label styles "bleed" onto every
-		// continuation line.
-		var st sgrState
-		for i := range parts {
-			if parts[i] == "" {
-				continue // skip styling on empty continuation lines
-			}
-			var prefix string
-			if i > 0 && st.hasAttrs() {
-				prefix = st.sequence()
-			}
-			// Advance the state over this part's own content first: the
-			// attributes open at its end are what the next part inherits.
-			applySGRs(&st, parts[i])
-			if i > 0 {
-				if prefix != "" {
-					parts[i] = prefix + parts[i]
-				}
-				if st.hasAttrs() {
-					// Close the line so trailing viewport padding does not
-					// inherit the style; the next part re-opens via prefix.
-					parts[i] += "\x1b[0m"
-				}
-			}
-		}
 	}
 	return parts
 }

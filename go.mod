@@ -15,7 +15,6 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/gortexhq/tree-sitter-dockerfile v0.1.0
 	github.com/makiuchi-d/gozxing v0.1.1
-	github.com/muesli/reflow v0.3.0
 	github.com/openai/openai-go v1.12.0
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	github.com/tiktoken-go/tokenizer v0.8.1

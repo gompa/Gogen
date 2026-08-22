@@ -9,78 +9,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 )
 
-func TestSGRState(t *testing.T) {
-	dim := "\x1b[38;2;136;136;136m"
-
-	t.Run("lipgloss v2 bare close resets everything", func(t *testing.T) {
-		// lipgloss v2 renders AssistantStyle.Render("GoGen:") exactly like
-		// this: merged params, closed with a bare CSI-m (not "\x1b[0m").
-		var st sgrState
-		applySGRs(&st, "\x1b[1;38;2;0;170;170mGoGen:\x1b[m hello")
-		if st.hasAttrs() {
-			t.Fatalf("bare \\x1b[m must reset, still active: %q", st.sequence())
-		}
-	})
-
-	t.Run("open style survives end of string", func(t *testing.T) {
-		var st sgrState
-		applySGRs(&st, dim+"<thinking>very long reasoning")
-		if got := st.sequence(); got != dim {
-			t.Fatalf("sequence = %q, want %q", got, dim)
-		}
-	})
-
-	t.Run("v1 full reset clears", func(t *testing.T) {
-		var st sgrState
-		applySGRs(&st, "\x1b[1m\x1b[38;2;0;170;170mGoGen:\x1b[0m long message")
-		if st.hasAttrs() {
-			t.Fatalf("\\x1b[0m must reset, still active: %q", st.sequence())
-		}
-	})
-
-	t.Run("property-specific reset keeps other attributes", func(t *testing.T) {
-		// Foreground default (\x1b[39m) closes only the color; bold stays.
-		var st sgrState
-		applySGRs(&st, "\x1b[1m\x1b[31mX\x1b[39m tail")
-		if got := st.sequence(); got != "\x1b[1m" {
-			t.Fatalf("sequence = %q, want bold only", got)
-		}
-	})
-
-	t.Run("bold-off leaves foreground", func(t *testing.T) {
-		var st sgrState
-		applySGRs(&st, "\x1b[1;38;2;0;170;170mGoGen:\x1b[22m rest")
-		if got := st.sequence(); got != "\x1b[38;2;0;170;170m" {
-			t.Fatalf("sequence = %q, want fg only", got)
-		}
-	})
-
-	t.Run("new foreground replaces old", func(t *testing.T) {
-		var st sgrState
-		applySGRs(&st, "\x1b[38;2;204;170;0m  →\x1b[0m name \x1b[38;2;136;136;136margs")
-		if got := st.sequence(); got != dim {
-			t.Fatalf("sequence = %q, want latest fg %q", got, dim)
-		}
-	})
-
-	t.Run("256-color form captured as one op", func(t *testing.T) {
-		var st sgrState
-		applySGRs(&st, "\x1b[38;5;99mX")
-		if got := st.sequence(); got != "\x1b[38;5;99m" {
-			t.Fatalf("sequence = %q, want \\x1b[38;5;99m", got)
-		}
-	})
-
-	t.Run("non-SGR CSI ignored", func(t *testing.T) {
-		var st sgrState
-		applySGRs(&st, "\x1b[2J\x1b[1mbold")
-		if got := st.sequence(); got != "\x1b[1m" {
-			t.Fatalf("sequence = %q, want bold only", got)
-		}
-	})
-}
-
-func TestSGRPropagation(t *testing.T) {
+func TestWrapLinePropagatesOpenStyles(t *testing.T) {
 	const cyanBold = "\x1b[1;38;2;0;170;170m"
 	const dim = "\x1b[38;2;136;136;136m"
 
@@ -97,7 +26,12 @@ func TestSGRPropagation(t *testing.T) {
 			if !strings.HasPrefix(parts[i], dim) {
 				t.Fatalf("part %d missing dim prefix: %q", i, parts[i])
 			}
-			if !strings.HasSuffix(parts[i], "\x1b[0m") {
+			// Intermediate continuations are closed so padding cannot
+			// inherit the style — accept either reset dialect. The LAST
+			// part stays open when the source line does (same state as the
+			// unwrapped input).
+			if i < len(parts)-1 &&
+				!strings.HasSuffix(parts[i], "\x1b[m") && !strings.HasSuffix(parts[i], "\x1b[0m") {
 				t.Fatalf("part %d missing reset suffix: %q", i, parts[i])
 			}
 		}
