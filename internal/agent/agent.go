@@ -333,6 +333,18 @@ type Agent struct {
 	// same turn (or a failed forced compaction) returns the actionable
 	// terminal error instead of retrying again.
 	overflowRetries atomic.Int32
+
+	// ghostRetries counts CONSECUTIVE truncated-turn (ghost) rounds — a
+	// stream that ends with reasoning but no content, refusal, or tool
+	// calls — since the last successful round. Providers emit this
+	// transiently (e.g. a finish_reason="stop" right after
+	// reasoning-only chunks), so the round is retried once in-loop instead
+	// of failing the turn. Any successful round (content, refusal, or tool
+	// calls) resets the counter, so a long multi-round turn gets a fresh
+	// retry after each recovery; the cap only stops a model that ghosts
+	// back-to-back — a second consecutive ghost round surfaces the
+	// "model returned no output" error to the user.
+	ghostRetries atomic.Int32
 }
 
 // persistMeta is the set of session fields that only the full snapshot path
@@ -1270,6 +1282,11 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 	// Per-turn context-window refusal recovery budget (Phase 3): at most
 	// one forced-compaction + retry per turn.
 	a.overflowRetries.Store(0)
+	// Ghost-round recovery budget: at most one automatic retry of a round
+	// the model ended without usable output. The counter tracks
+	// CONSECUTIVE ghosts and resets after any successful round (see the
+	// tool-call branch); the turn-start reset covers the first round.
+	a.ghostRetries.Store(0)
 	for first := true; ; first = false {
 		result, err := a.runTurn(ctx, h, first)
 		if err != nil {
@@ -1295,14 +1312,25 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 			// too would double-deliver on every recovered content turn.
 			// A result with no content, no refusal, and no tool calls is a
 			// truncated turn (e.g. finish_reason="length" after consuming the
-			// output budget on reasoning). Persisting it would leave a ghost
+			// output budget on reasoning, or a "stop" right after
+			// reasoning-only chunks). Persisting it would leave a ghost
 			// assistant message that renders as an empty reply, pollutes later
-			// turns, and becomes a fork point. Surface it as an error instead
-			// and let the user retry. The provider-reported finish reason is
-			// included when known so these turns are diagnosable without
+			// turns, and becomes a fork point. Providers emit this
+			// transiently, so the round is retried once in-loop before the
+			// error surfaces to the user. The budget counts CONSECUTIVE
+			// ghost rounds: any successful round (notably a tool-call
+			// round, which continues the loop) resets it, so a long turn
+			// gets a fresh retry after each recovery — only back-to-back
+			// ghosts exhaust the cap. Nothing was appended for the ghost
+			// round, so the retried request re-sends the identical view.
+			// The provider-reported finish reason is included when
+			// known so exhausted retries are diagnosable without
 			// provider-side logs ("length" = output budget exhausted,
 			// "stop" = stream ended after reasoning-only chunks).
 			if result.Content == "" && result.Refusal == "" {
+				if a.ghostRetries.Add(1) <= 1 {
+					continue
+				}
 				if result.FinishReason == "" {
 					return "", fmt.Errorf("model returned no output (response was truncated mid-reasoning); please try again")
 				}
@@ -1323,6 +1351,12 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 			// Refusal is user-visible when the model declined without content.
 			return result.Refusal, nil
 		}
+
+		// A tool-call round is a successful round: the model produced
+		// usable output, so the consecutive-ghost counter restarts. Without
+		// this, a long multi-round turn would spend its single retry on an
+		// early transient ghost and hard-fail on a later one.
+		a.ghostRetries.Store(0)
 
 		if h.OnStreamEnd != nil {
 			h.OnStreamEnd()
@@ -1533,14 +1567,14 @@ func (a *Agent) RepairOrphanToolCalls() bool {
 	return modified
 }
 
-func stringArg(args map[string]interface{}, key string) (string, error) {
+func stringArg(args map[string]any, key string) (string, error) {
 	if _, ok := args[key]; !ok {
 		return "", fmt.Errorf("missing required argument %q", key)
 	}
 	return stringArgOptional(args, key)
 }
 
-func stringArgOptional(args map[string]interface{}, key string) (string, error) {
+func stringArgOptional(args map[string]any, key string) (string, error) {
 	val, ok := args[key]
 	if !ok {
 		return "", nil
@@ -1561,7 +1595,7 @@ func (a *Agent) toolContext(ctx context.Context) context.Context {
 
 // boolArg reads an optional boolean tool argument, returning def when the
 // key is absent.
-func boolArg(args map[string]interface{}, key string, def bool) (bool, error) {
+func boolArg(args map[string]any, key string, def bool) (bool, error) {
 	val, ok := args[key]
 	if !ok {
 		return def, nil
@@ -1573,7 +1607,7 @@ func boolArg(args map[string]interface{}, key string, def bool) (bool, error) {
 	return b, nil
 }
 
-func intArgOptional(args map[string]interface{}, key string) (int, error) {
+func intArgOptional(args map[string]any, key string) (int, error) {
 	val, ok := args[key]
 	if !ok {
 		return 0, nil
@@ -1612,7 +1646,7 @@ func intArgOptional(args map[string]interface{}, key string) (int, error) {
 // value is not a positive integer (ids start at 1, so 0 is invalid). It
 // accepts the same value shapes intArgOptional does: JSON numbers
 // (float64), int/int64, and quoted numeric strings.
-func intRequiredArg(args map[string]interface{}, key string) (int, error) {
+func intRequiredArg(args map[string]any, key string) (int, error) {
 	if _, ok := args[key]; !ok {
 		return 0, fmt.Errorf("missing required argument %q", key)
 	}
@@ -1626,14 +1660,14 @@ func intRequiredArg(args map[string]interface{}, key string) (int, error) {
 	return n, nil
 }
 
-func stringSliceArg(args map[string]interface{}, key string) ([]string, error) {
+func stringSliceArg(args map[string]any, key string) ([]string, error) {
 	if _, ok := args[key]; !ok {
 		return nil, fmt.Errorf("missing required argument %q", key)
 	}
 	return stringSliceArgOptional(args, key)
 }
 
-func stringSliceArgOptional(args map[string]interface{}, key string) ([]string, error) {
+func stringSliceArgOptional(args map[string]any, key string) ([]string, error) {
 	val, ok := args[key]
 	if !ok {
 		return nil, nil
@@ -1641,11 +1675,11 @@ func stringSliceArgOptional(args map[string]interface{}, key string) ([]string, 
 	return coerceStringSlice(key, val)
 }
 
-func coerceStringSlice(key string, val interface{}) ([]string, error) {
+func coerceStringSlice(key string, val any) ([]string, error) {
 	switch v := val.(type) {
 	case []string:
 		return v, nil
-	case []interface{}:
+	case []any:
 		out := make([]string, 0, len(v))
 		for i, item := range v {
 			s, ok := item.(string)
