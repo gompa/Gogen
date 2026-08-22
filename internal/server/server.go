@@ -2494,14 +2494,13 @@ func (rt *sessionRuntime) buildStreamHandlers(ctx context.Context, write func(WS
 
 // truncateToolResult cuts oversized tool results at a rune boundary so the
 // client never renders a broken UTF-8 character, marking the cut explicitly.
+// Delegates to contextmgr.TruncateMarked rather than hand-rolling the cut —
+// the previous local copy had drifted from the context manager's truncation
+// discipline (no idempotency guard, marker outside the byte budget).
 func truncateToolResult(result string) string {
 	const maxResult = 128 * 1024
-	if len(result) <= maxResult {
-		return result
-	}
-	// Rune-safe cut: slicing at maxResult could split a UTF-8
-	// rune mid-sequence and render a broken character.
-	return contextmgr.TruncateRuneSafe(result, maxResult) + fmt.Sprintf("\n… truncated (%d bytes total)", len(result))
+	return contextmgr.TruncateMarked(result, maxResult,
+		fmt.Sprintf("\n… truncated (%d bytes total)", len(result)))
 }
 
 // Start serves the web UI until ctx is cancelled or the listener fails.

@@ -439,7 +439,7 @@ func truncateToolResult(content string, max int) string {
 	if strings.Contains(content, toolResultTruncationMarker) {
 		return content
 	}
-	marker := fmt.Sprintf("\n… truncated (%d chars total)", len(content))
+	marker := fmt.Sprintf("\n… truncated (%d bytes total)", len(content))
 	if len(marker) >= max {
 		return TruncateRuneSafe(content, max)
 	}
