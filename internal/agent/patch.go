@@ -962,13 +962,6 @@ func parseDiffLineRange(part string) (start, count int, err error) {
 	return n, count, nil
 }
 
-// parseDiffLineCount returns only the start line of a hunk header range.
-// Kept for tests and callers that only need the start position.
-func parseDiffLineCount(part string) (int, error) {
-	start, _, err := parseDiffLineRange(part)
-	return start, err
-}
-
 // applyPatchHunks applies hunks to original. originalTrailing reports
 // whether the original file's final line ends with a newline; the returned
 // outNoNewline reports the same property for the patched output, which

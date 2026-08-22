@@ -1949,3 +1949,12 @@ func TestApplyPatchHunksTrailingNewline(t *testing.T) {
 		})
 	}
 }
+
+// parseDiffLineCount returns only the start line of a hunk header range.
+//
+// Lives in this _test.go file: production callers use parseDiffLineRange
+// (which also yields the count); only tests need the start-only convenience.
+func parseDiffLineCount(part string) (int, error) {
+	start, _, err := parseDiffLineRange(part)
+	return start, err
+}

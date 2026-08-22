@@ -53,10 +53,3 @@ func compiledRegex(pattern string) (*regexp.Regexp, error) {
 	regexMemoMu.Unlock()
 	return re, nil
 }
-
-// resetRegexMemoLocked clears the compiled regex memo. Callers must hold
-// regexMemoMu.
-func resetRegexMemoLocked() {
-	regexMemo = make(map[string]*regexp.Regexp)
-	regexMemoOrder = regexMemoOrder[:0]
-}

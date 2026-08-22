@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -414,4 +415,14 @@ func TestMatchGlobPatternRejectsMalformedGlob(t *testing.T) {
 	if matchGlobPattern("pkg/[bad", "pkg/foo.txt") {
 		t.Fatalf(`malformed path glob "pkg/[bad" matched; expected no match`)
 	}
+}
+
+// resetGlobRegexCacheLocked clears the glob regex cache and insertion-order
+// slice. Caller must hold globRegexMu.
+//
+// Lives in this _test.go file: production code mutates the cache through its
+// own paths; only tests need wholesale resets.
+func resetGlobRegexCacheLocked() {
+	globRegexCache = make(map[string]*regexp.Regexp)
+	globRegexOrder = globRegexOrder[:0]
 }

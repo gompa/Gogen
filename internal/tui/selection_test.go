@@ -324,3 +324,13 @@ func TestMousePressRestartsSelection(t *testing.T) {
 		t.Fatalf("start = (%d,%d), want (3,0)", m.selection.StartX, m.selection.StartY)
 	}
 }
+
+// hasSelection reports whether there is a non-empty finalized or in-progress
+// selection.
+//
+// Lives in this _test.go file: production code checks selection state via
+// getSelectedText/clearSelection directly; only tests want the boolean
+// summary.
+func (m *Model) hasSelection() bool {
+	return m.selection != nil && m.selection.Active && m.getSelectedText() != ""
+}

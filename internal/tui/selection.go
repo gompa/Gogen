@@ -69,11 +69,6 @@ type SelectionState struct {
 	EndY     int
 }
 
-// hasSelection reports whether there is a non-empty finalized or in-progress selection.
-func (m *Model) hasSelection() bool {
-	return m.selection != nil && m.selection.Active && m.getSelectedText() != ""
-}
-
 // mouseEventKind identifies which bubbletea v2 mouse message a mouseEvent
 // was normalized from. (v1 carried everything in one MouseMsg with an
 // Action field; v2 splits events into distinct message types.)

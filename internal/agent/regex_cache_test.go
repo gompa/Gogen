@@ -2,6 +2,7 @@ package agent
 
 import (
 	"path"
+	"regexp"
 	"sync"
 	"testing"
 )
@@ -130,4 +131,14 @@ func TestMatchGlobPatternCharacterClassFallback(t *testing.T) {
 	if matchGlobPattern("f[ao]o.txt", "fxx.txt") {
 		t.Fatalf(`character-class glob "f[ao]o.txt" should not match "fxx.txt"`)
 	}
+}
+
+// resetRegexMemoLocked clears the compiled regex memo. Callers must hold
+// regexMemoMu.
+//
+// Lives in this _test.go file: only tests need wholesale memo resets;
+// production code mutates the memo through compiledRegex's own eviction.
+func resetRegexMemoLocked() {
+	regexMemo = make(map[string]*regexp.Regexp)
+	regexMemoOrder = regexMemoOrder[:0]
 }

@@ -78,13 +78,6 @@ var (
 	globRegexOrder []string
 )
 
-// resetGlobRegexCacheLocked clears the glob regex cache and insertion-order
-// slice. Caller must hold globRegexMu. Exposed for tests only.
-func resetGlobRegexCacheLocked() {
-	globRegexCache = make(map[string]*regexp.Regexp)
-	globRegexOrder = globRegexOrder[:0]
-}
-
 // ListFiles lists directory entries as workspace-relative paths (same convention as
 // GlobFiles / search_code), so results can be passed straight to read_file.
 // When recursive is true, walks the tree (max 500 paths).
