@@ -59,7 +59,7 @@ func writeFileSync(path string, content []byte, perm os.FileMode, skipFSync bool
 			_ = tmp.Close()
 			return err
 		}
-		debuglog.Write("ioutil/write", "Chmod unsupported; file written with default mode", "fs-chmod-unsupported", map[string]interface{}{
+		debuglog.Write("ioutil/write", "Chmod unsupported; file written with default mode", "fs-chmod-unsupported", map[string]any{
 			"path": path,
 			"err":  err.Error(),
 		})

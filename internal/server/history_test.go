@@ -13,7 +13,7 @@ func TestHistoryEntriesIncludesTools(t *testing.T) {
 			Role:    "assistant",
 			Content: "I'll patch",
 			ToolCalls: []llm.ToolCall{
-				{ID: "c1", Name: "patch_file", Args: map[string]interface{}{"diff": "@@ -1 +1 @@\n-a\n+b\n"}},
+				{ID: "c1", Name: "patch_file", Args: map[string]any{"diff": "@@ -1 +1 @@\n-a\n+b\n"}},
 			},
 		},
 		{Role: "tool", ToolCallID: "c1", Content: "Applied patch to 1 file"},

@@ -373,13 +373,13 @@ func TestMergedToolHandlersRejectUnknownActions(t *testing.T) {
 		want string
 	}{
 		{"git", func() (string, error) {
-			return handleGit(context.Background(), a, map[string]interface{}{"action": "bogus"})
+			return handleGit(context.Background(), a, map[string]any{"action": "bogus"})
 		}, "unknown git action"},
 		{"find_symbol", func() (string, error) {
-			return handleFindSymbol(context.Background(), a, map[string]interface{}{"kind": "bogus", "symbol": "x"})
+			return handleFindSymbol(context.Background(), a, map[string]any{"kind": "bogus", "symbol": "x"})
 		}, "unknown find_symbol kind"},
 		{"background_job", func() (string, error) {
-			return handleBackgroundJob(context.Background(), a, map[string]interface{}{"action": "bogus", "job_id": "j1"})
+			return handleBackgroundJob(context.Background(), a, map[string]any{"action": "bogus", "job_id": "j1"})
 		}, "unknown background_job action"},
 	}
 	for _, tc := range cases {

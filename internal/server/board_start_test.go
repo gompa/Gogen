@@ -478,7 +478,7 @@ func TestBoardStartApprovalViaBackgroundAttach(t *testing.T) {
 	stub.firstTools = []llm.ToolCall{{
 		ID:   "call_del",
 		Name: "delete",
-		Args: map[string]interface{}{"path": "victim.txt"},
+		Args: map[string]any{"path": "victim.txt"},
 	}}
 	s, _, store := newContinuationServer(t, stub, dir)
 	s.ws.ProviderFactory = func() llm.LLMProvider { return stub }
@@ -545,7 +545,7 @@ func TestBoardStartApprovalDeniedAfterTabClose(t *testing.T) {
 	stub.firstTools = []llm.ToolCall{{
 		ID:   "call_del",
 		Name: "delete",
-		Args: map[string]interface{}{"path": "victim.txt"},
+		Args: map[string]any{"path": "victim.txt"},
 	}}
 	s, _, store := newContinuationServer(t, stub, dir)
 	s.ws.ProviderFactory = func() llm.LLMProvider { return stub }

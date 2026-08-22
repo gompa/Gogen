@@ -10,7 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -62,10 +62,10 @@ type Client struct {
 }
 
 type jsonRPCRequest struct {
-	JSONRPC string      `json:"jsonrpc"`
-	ID      *int64      `json:"id,omitempty"`
-	Method  string      `json:"method"`
-	Params  interface{} `json:"params,omitempty"`
+	JSONRPC string `json:"jsonrpc"`
+	ID      *int64 `json:"id,omitempty"`
+	Method  string `json:"method"`
+	Params  any    `json:"params,omitempty"`
 }
 
 type jsonRPCResponse struct {
@@ -234,10 +234,10 @@ func (c *Client) failPending(err error) {
 }
 
 func (c *Client) initialize(ctx context.Context) error {
-	_, err := c.call(ctx, "initialize", map[string]interface{}{
+	_, err := c.call(ctx, "initialize", map[string]any{
 		"protocolVersion": "2024-11-05",
-		"capabilities":    map[string]interface{}{},
-		"clientInfo": map[string]interface{}{
+		"capabilities":    map[string]any{},
+		"clientInfo": map[string]any{
 			"name":    "gogen",
 			"version": "1.0.0",
 		},
@@ -245,19 +245,19 @@ func (c *Client) initialize(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return c.notify("notifications/initialized", map[string]interface{}{})
+	return c.notify("notifications/initialized", map[string]any{})
 }
 
 func (c *Client) listTools(ctx context.Context) ([]llm.Tool, error) {
-	raw, err := c.call(ctx, "tools/list", map[string]interface{}{})
+	raw, err := c.call(ctx, "tools/list", map[string]any{})
 	if err != nil {
 		return nil, err
 	}
 	var result struct {
 		Tools []struct {
-			Name        string                 `json:"name"`
-			Description string                 `json:"description"`
-			InputSchema map[string]interface{} `json:"inputSchema"`
+			Name        string         `json:"name"`
+			Description string         `json:"description"`
+			InputSchema map[string]any `json:"inputSchema"`
 		} `json:"tools"`
 	}
 	if err := json.Unmarshal(raw, &result); err != nil {
@@ -267,7 +267,7 @@ func (c *Client) listTools(ctx context.Context) ([]llm.Tool, error) {
 	for _, t := range result.Tools {
 		params := t.InputSchema
 		if params == nil {
-			params = map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}
+			params = map[string]any{"type": "object", "properties": map[string]any{}}
 		}
 		out = append(out, llm.Tool{
 			Name:        t.Name,
@@ -278,8 +278,8 @@ func (c *Client) listTools(ctx context.Context) ([]llm.Tool, error) {
 	return out, nil
 }
 
-func (c *Client) CallTool(ctx context.Context, name string, args map[string]interface{}) (string, error) {
-	raw, err := c.call(ctx, "tools/call", map[string]interface{}{
+func (c *Client) CallTool(ctx context.Context, name string, args map[string]any) (string, error) {
+	raw, err := c.call(ctx, "tools/call", map[string]any{
 		"name":      name,
 		"arguments": args,
 	})
@@ -310,7 +310,7 @@ func (c *Client) CallTool(ctx context.Context, name string, args map[string]inte
 	return out, nil
 }
 
-func (c *Client) notify(method string, params interface{}) error {
+func (c *Client) notify(method string, params any) error {
 	select {
 	case <-c.closed:
 		return fmt.Errorf("mcp client closed")
@@ -327,7 +327,7 @@ func (c *Client) notify(method string, params interface{}) error {
 	return err
 }
 
-func (c *Client) call(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
+func (c *Client) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	ctx, cancel := context.WithTimeout(ctx, mcpCallTimeout)
 	defer cancel()
 
@@ -434,7 +434,7 @@ func (r *Registry) Definitions() []llm.Tool {
 	for name := range r.tools {
 		names = append(names, name)
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 	out := make([]llm.Tool, 0, len(r.tools))
 	for _, name := range names {
 		t := r.tools[name].schema
@@ -457,7 +457,7 @@ func (r *Registry) ToolNames() map[string]struct{} {
 }
 
 // CallTool implements agent.MCPToolRegistry.
-func (r *Registry) CallTool(ctx context.Context, name string, args map[string]interface{}) (string, error) {
+func (r *Registry) CallTool(ctx context.Context, name string, args map[string]any) (string, error) {
 	if r == nil {
 		return "", fmt.Errorf("mcp registry not configured")
 	}

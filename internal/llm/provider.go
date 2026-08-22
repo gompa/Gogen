@@ -10,7 +10,7 @@ type Tool struct {
 	Type        string
 	Name        string
 	Description string
-	Parameters  map[string]interface{}
+	Parameters  map[string]any
 }
 
 // Usage reports token counts from the provider when available.
@@ -40,7 +40,7 @@ type ToolCall struct {
 	Index int // stream index from the provider, used to correlate streaming UI
 	ID    string
 	Name  string
-	Args  map[string]interface{}
+	Args  map[string]any
 	// ArgsStr is the exact JSON arguments string from the provider.
 	// Prefer this when re-sending history so prompt-cache prefixes stay byte-stable.
 	ArgsStr string

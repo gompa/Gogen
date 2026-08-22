@@ -20,25 +20,25 @@ import (
 //	nil:     toggle-only model (no effort control)
 func effortRegistry(t *testing.T, models map[string][]string) *modelinfo.Resolver {
 	t.Helper()
-	reg := map[string]interface{}{
-		"opencode": map[string]interface{}{
+	reg := map[string]any{
+		"opencode": map[string]any{
 			"id":     "opencode",
 			"api":    "https://opencode.ai/zen/v1",
-			"models": map[string]interface{}{},
+			"models": map[string]any{},
 		},
 	}
-	modelsMap := reg["opencode"].(map[string]interface{})["models"].(map[string]interface{})
+	modelsMap := reg["opencode"].(map[string]any)["models"].(map[string]any)
 	for id, efforts := range models {
-		entry := map[string]interface{}{
+		entry := map[string]any{
 			"id":    id,
 			"limit": map[string]int{"context": 200000},
 		}
 		if efforts == nil {
-			entry["reasoning_options"] = []map[string]interface{}{
+			entry["reasoning_options"] = []map[string]any{
 				{"type": "toggle"},
 			}
 		} else {
-			entry["reasoning_options"] = []map[string]interface{}{
+			entry["reasoning_options"] = []map[string]any{
 				{"type": "effort", "values": efforts},
 			}
 		}

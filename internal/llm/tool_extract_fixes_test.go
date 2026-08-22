@@ -54,7 +54,7 @@ func TestExtractToolCallsNestedJSONArgs(t *testing.T) {
 	if calls[0].Name != "read_file" {
 		t.Fatalf("expected read_file, got %q", calls[0].Name)
 	}
-	opts, ok := calls[0].Args["options"].(map[string]interface{})
+	opts, ok := calls[0].Args["options"].(map[string]any)
 	if !ok {
 		t.Fatalf("options should be a map, got %T: %v", calls[0].Args["options"], calls[0].Args)
 	}
@@ -96,7 +96,7 @@ func TestExtractToolCallsNestedJSONFallback(t *testing.T) {
 	if calls[0].Name != "search_code" {
 		t.Fatalf("expected search_code, got %q", calls[0].Name)
 	}
-	ctx, ok := calls[0].Args["context"].(map[string]interface{})
+	ctx, ok := calls[0].Args["context"].(map[string]any)
 	if !ok {
 		t.Fatalf("context should be a map, got %T: %v", calls[0].Args["context"], calls[0].Args)
 	}
@@ -116,7 +116,7 @@ func TestExtractToolCallsStandaloneJSONNested(t *testing.T) {
 	if calls[0].Name != "list_files" {
 		t.Fatalf("expected list_files, got %q", calls[0].Name)
 	}
-	filter, ok := calls[0].Args["filter"].(map[string]interface{})
+	filter, ok := calls[0].Args["filter"].(map[string]any)
 	if !ok {
 		t.Fatalf("filter should be a map, got %T: %v", calls[0].Args["filter"], calls[0].Args)
 	}

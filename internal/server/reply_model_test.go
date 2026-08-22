@@ -144,7 +144,7 @@ func TestModelUsedBroadcastForEveryRound(t *testing.T) {
 	stub.firstTools = []llm.ToolCall{{
 		ID:   "c1",
 		Name: "read_file",
-		Args: map[string]interface{}{"path": "x"},
+		Args: map[string]any{"path": "x"},
 	}}
 	s, _, _ := newContinuationServer(t, stub, dir)
 	srv := startWSServer(t, s)

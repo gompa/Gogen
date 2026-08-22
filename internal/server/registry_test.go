@@ -244,7 +244,7 @@ func TestWorkspaceNewSessionAgentFactory(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _ = writeFile(context.Background(), a, map[string]interface{}{"path": dir + "/f.txt", "content": "x"})
+		_, _ = writeFile(context.Background(), a, map[string]any{"path": dir + "/f.txt", "content": "x"})
 	}()
 	select {
 	case <-done:

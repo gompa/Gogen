@@ -363,7 +363,7 @@ func TestChildReportDeliversToParent(t *testing.T) {
 		p := llm.NewMockProvider()
 		p.StreamResults = []*llm.StreamResult{
 			{ToolCalls: []llm.ToolCall{{
-				ID: "c1", Name: "report", Args: map[string]interface{}{"message": "progress from child"},
+				ID: "c1", Name: "report", Args: map[string]any{"message": "progress from child"},
 			}}},
 			{Content: "done"},
 		}

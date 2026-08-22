@@ -296,23 +296,23 @@ func TestProbeReasoningEffortsFromProps(t *testing.T) {
 // the given URL (so provider base URL and registry key match).
 func effortRegistryAt(t *testing.T, api string, models map[string][]string) *modelinfo.Resolver {
 	t.Helper()
-	reg := map[string]interface{}{
-		"opencode": map[string]interface{}{
+	reg := map[string]any{
+		"opencode": map[string]any{
 			"id":     "opencode",
 			"api":    api,
-			"models": map[string]interface{}{},
+			"models": map[string]any{},
 		},
 	}
-	modelsMap := reg["opencode"].(map[string]interface{})["models"].(map[string]interface{})
+	modelsMap := reg["opencode"].(map[string]any)["models"].(map[string]any)
 	for id, efforts := range models {
-		entry := map[string]interface{}{
+		entry := map[string]any{
 			"id":    id,
 			"limit": map[string]int{"context": 200000},
 		}
 		if efforts == nil {
-			entry["reasoning_options"] = []map[string]interface{}{{"type": "toggle"}}
+			entry["reasoning_options"] = []map[string]any{{"type": "toggle"}}
 		} else {
-			entry["reasoning_options"] = []map[string]interface{}{{"type": "effort", "values": efforts}}
+			entry["reasoning_options"] = []map[string]any{{"type": "effort", "values": efforts}}
 		}
 		modelsMap[id] = entry
 	}

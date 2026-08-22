@@ -53,12 +53,12 @@ func TestPlanModeAllowedTools(t *testing.T) {
 
 func TestPlanModeBlocksExecute(t *testing.T) {
 	a := &Agent{Mode: ModePlan, Executor: &Executor{WorkingDir: t.TempDir()}}
-	_, err := a.executeTool(context.Background(), llmToolCall("execute_command", map[string]interface{}{"command": "echo hi"}))
+	_, err := a.executeTool(context.Background(), llmToolCall("execute_command", map[string]any{"command": "echo hi"}))
 	if err == nil {
 		t.Fatal("expected error")
 	}
 }
 
-func llmToolCall(name string, args map[string]interface{}) llm.ToolCall {
+func llmToolCall(name string, args map[string]any) llm.ToolCall {
 	return llm.ToolCall{Name: name, Args: args}
 }

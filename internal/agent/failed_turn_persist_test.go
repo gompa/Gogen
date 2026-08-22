@@ -79,7 +79,7 @@ func (p *toolRoundProvider) GenerateResponseStream(context.Context, []llm.Messag
 		ToolCalls: []llm.ToolCall{{
 			ID:   "call_1",
 			Name: "read_file",
-			Args: map[string]interface{}{"path": "x"},
+			Args: map[string]any{"path": "x"},
 		}},
 	}, nil
 }
@@ -192,7 +192,7 @@ func TestParallelToolCancelPersistsRound(t *testing.T) {
 	started := make(chan struct{})
 	var once sync.Once
 	a.SetToolHandlers(map[string]ToolHandler{
-		"read_file": func(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+		"read_file": func(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 			once.Do(func() { close(started) })
 			<-ctx.Done()
 			return "", ctx.Err()

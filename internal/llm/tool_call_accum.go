@@ -235,16 +235,16 @@ func mergeToolArgsDelta(existing, delta string, existingComplete bool) string {
 	return existing + delta
 }
 
-func parseToolCallArgs(argsStr string) (map[string]interface{}, error) {
+func parseToolCallArgs(argsStr string) (map[string]any, error) {
 	s := strings.TrimSpace(argsStr)
 	if s == "" {
-		return map[string]interface{}{}, nil
+		return map[string]any{}, nil
 	}
-	var args map[string]interface{}
+	var args map[string]any
 	err := json.Unmarshal([]byte(s), &args)
 	if err == nil {
 		if args == nil {
-			return map[string]interface{}{}, nil
+			return map[string]any{}, nil
 		}
 		return args, nil
 	}
@@ -266,7 +266,7 @@ func toolArgsFullyReceived(argsStr string) bool {
 	if !strings.HasPrefix(s, "{") || !strings.HasSuffix(s, "}") {
 		return false
 	}
-	var m map[string]interface{}
+	var m map[string]any
 	return json.Unmarshal([]byte(s), &m) == nil
 }
 

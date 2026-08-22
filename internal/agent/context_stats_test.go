@@ -221,7 +221,7 @@ func TestContextStatsConcurrentWithTurn(t *testing.T) {
 	// so the deep clone and in-place stabilization paths are exercised),
 	// extending counts, and recording usage.
 	for i := 0; i < 200; i++ {
-		tc := []llm.ToolCall{{ID: fmt.Sprintf("call_%d", i), Name: "read_file", Args: map[string]interface{}{"path": "a.go"}}}
+		tc := []llm.ToolCall{{ID: fmt.Sprintf("call_%d", i), Name: "read_file", Args: map[string]any{"path": "a.go"}}}
 		a.appendMessage(llm.Message{Role: "assistant", Content: "resp", ToolCalls: tc})
 		a.stabilizeToolArgs()
 		a.recordTurnUsage(&llm.Usage{PromptTokens: 10 + i, CompletionTokens: 1, TotalTokens: 11 + i})

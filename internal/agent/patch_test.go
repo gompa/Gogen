@@ -896,7 +896,7 @@ func TestPatchFailStreakSteersRetries(t *testing.T) {
 	patch := func(diff string) error {
 		_, err := a.executeTool(context.Background(), llm.ToolCall{
 			Name: "patch_file",
-			Args: map[string]interface{}{"diff": diff},
+			Args: map[string]any{"diff": diff},
 		})
 		return err
 	}
@@ -1381,7 +1381,7 @@ func TestPatchFailStreakIgnoresNonMismatchErrors(t *testing.T) {
 	patch := func(diff string) error {
 		_, err := a.executeTool(context.Background(), llm.ToolCall{
 			Name: "patch_file",
-			Args: map[string]interface{}{"diff": diff},
+			Args: map[string]any{"diff": diff},
 		})
 		return err
 	}
@@ -1520,7 +1520,7 @@ func TestPatchTurnStopMarkerOnlyDiff(t *testing.T) {
 
 	_, err := a.executeTool(context.Background(), llm.ToolCall{
 		Name: "patch_file",
-		Args: map[string]interface{}{"diff": "*** End of diff\n*** End of diff\n*** End of diff\n"},
+		Args: map[string]any{"diff": "*** End of diff\n*** End of diff\n*** End of diff\n"},
 	})
 	if !errors.Is(err, errPatchTurnStop) {
 		t.Fatalf("marker-only diff must stop the turn with errPatchTurnStop, got: %v", err)
@@ -1537,7 +1537,7 @@ func TestPatchTurnStopMarkerOnlyDiff(t *testing.T) {
 	}
 	_, err = a.executeTool(context.Background(), llm.ToolCall{
 		Name: "patch_file",
-		Args: map[string]interface{}{"diff": "--- a/main.go\n+++ b/main.go\n@@ -1,4 +1,5 @@\n package main\n\n+// x\n func main() {\n }\n*** End of diff\n*** Wait — the patch did not fully apply cleanly:\n*** Removed one hunk and applied the remainder.\n"},
+		Args: map[string]any{"diff": "--- a/main.go\n+++ b/main.go\n@@ -1,4 +1,5 @@\n package main\n\n+// x\n func main() {\n }\n*** End of diff\n*** Wait — the patch did not fully apply cleanly:\n*** Removed one hunk and applied the remainder.\n"},
 	})
 	if errors.Is(err, errPatchTurnStop) {
 		t.Fatalf("polluted-but-valid diff must not stop the turn, got: %v", err)
@@ -1563,7 +1563,7 @@ func TestPatchTurnStopAfterThreeMismatches(t *testing.T) {
 	patch := func() error {
 		_, err := a.executeTool(context.Background(), llm.ToolCall{
 			Name: "patch_file",
-			Args: map[string]interface{}{"diff": badDiff},
+			Args: map[string]any{"diff": badDiff},
 		})
 		return err
 	}
@@ -1585,7 +1585,7 @@ func TestPatchTurnStopAfterThreeMismatches(t *testing.T) {
 	goodDiff := "--- a/main.go\n+++ b/main.go\n@@ -1,4 +1,5 @@\n package main\n\n+// x\n func main() {\n }\n"
 	if _, err := a.executeTool(context.Background(), llm.ToolCall{
 		Name: "patch_file",
-		Args: map[string]interface{}{"diff": goodDiff},
+		Args: map[string]any{"diff": goodDiff},
 	}); err != nil {
 		t.Fatalf("successful patch should reset the budget, got: %v", err)
 	}
@@ -1616,7 +1616,7 @@ func TestPatchTurnStopDifferentDiffsDoNotStop(t *testing.T) {
 	patch := func(diff string) error {
 		_, err := a.executeTool(context.Background(), llm.ToolCall{
 			Name: "patch_file",
-			Args: map[string]interface{}{"diff": diff},
+			Args: map[string]any{"diff": diff},
 		})
 		return err
 	}
@@ -1655,8 +1655,8 @@ func TestRunToolRoundStoppedEndsTurn(t *testing.T) {
 	// First call: marker-only diff (stops the turn). Second call: a valid
 	// diff that must never execute — it gets a cancelled placeholder.
 	outcome, stopMsg := a.runToolRound(context.Background(), &llm.StreamHandlers{}, []llm.ToolCall{
-		{ID: "c1", Name: "patch_file", Args: map[string]interface{}{"diff": "*** End of diff\n*** End of diff\n*** End of diff\n"}},
-		{ID: "c2", Name: "patch_file", Args: map[string]interface{}{"diff": "--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-a\n+b\n"}},
+		{ID: "c1", Name: "patch_file", Args: map[string]any{"diff": "*** End of diff\n*** End of diff\n*** End of diff\n"}},
+		{ID: "c2", Name: "patch_file", Args: map[string]any{"diff": "--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-a\n+b\n"}},
 	})
 	if outcome != toolRoundStopped {
 		t.Fatalf("expected toolRoundStopped, got %v", outcome)

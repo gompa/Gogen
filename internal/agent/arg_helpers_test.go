@@ -12,7 +12,7 @@ import (
 func TestIntArgOptionalCoercion(t *testing.T) {
 	cases := []struct {
 		name string
-		val  interface{}
+		val  any
 		want int
 	}{
 		{"float64 whole", float64(3), 3},
@@ -23,7 +23,7 @@ func TestIntArgOptionalCoercion(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := intArgOptional(map[string]interface{}{"id": tc.val}, "id")
+			got, err := intArgOptional(map[string]any{"id": tc.val}, "id")
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -35,7 +35,7 @@ func TestIntArgOptionalCoercion(t *testing.T) {
 
 	errorCases := []struct {
 		name string
-		val  interface{}
+		val  any
 	}{
 		{"float fraction", float64(3.5)},
 		{"non-numeric text", "abc"},
@@ -45,7 +45,7 @@ func TestIntArgOptionalCoercion(t *testing.T) {
 	}
 	for _, tc := range errorCases {
 		t.Run("rejects "+tc.name, func(t *testing.T) {
-			_, err := intArgOptional(map[string]interface{}{"id": tc.val}, "id")
+			_, err := intArgOptional(map[string]any{"id": tc.val}, "id")
 			if err == nil {
 				t.Fatalf("expected error for %v", tc.val)
 			}
@@ -56,7 +56,7 @@ func TestIntArgOptionalCoercion(t *testing.T) {
 	}
 
 	t.Run("absent returns zero without error", func(t *testing.T) {
-		got, err := intArgOptional(map[string]interface{}{}, "id")
+		got, err := intArgOptional(map[string]any{}, "id")
 		if err != nil || got != 0 {
 			t.Fatalf("got (%d, %v), want (0, nil)", got, err)
 		}
@@ -70,7 +70,7 @@ func TestIntArgOptionalCoercion(t *testing.T) {
 func TestIntRequiredArg(t *testing.T) {
 	cases := []struct {
 		name string
-		val  interface{}
+		val  any
 		want int
 	}{
 		{"float64 whole", float64(3), 3},
@@ -81,7 +81,7 @@ func TestIntRequiredArg(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := intRequiredArg(map[string]interface{}{"id": tc.val}, "id")
+			got, err := intRequiredArg(map[string]any{"id": tc.val}, "id")
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -93,7 +93,7 @@ func TestIntRequiredArg(t *testing.T) {
 
 	errorCases := []struct {
 		name string
-		val  interface{}
+		val  any
 	}{
 		{"zero", float64(0)},
 		{"quoted zero", "0"},
@@ -106,7 +106,7 @@ func TestIntRequiredArg(t *testing.T) {
 	}
 	for _, tc := range errorCases {
 		t.Run("rejects "+tc.name, func(t *testing.T) {
-			_, err := intRequiredArg(map[string]interface{}{"id": tc.val}, "id")
+			_, err := intRequiredArg(map[string]any{"id": tc.val}, "id")
 			if err == nil {
 				t.Fatalf("expected error for %v", tc.val)
 			}
@@ -114,7 +114,7 @@ func TestIntRequiredArg(t *testing.T) {
 	}
 
 	t.Run("absent reports missing", func(t *testing.T) {
-		_, err := intRequiredArg(map[string]interface{}{}, "id")
+		_, err := intRequiredArg(map[string]any{}, "id")
 		if err == nil || !strings.Contains(err.Error(), `missing required argument "id"`) {
 			t.Fatalf("got %v, want missing-argument error", err)
 		}

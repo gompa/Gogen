@@ -12,11 +12,11 @@ import (
 type MCPToolRegistry interface {
 	Definitions() []llm.Tool
 	ToolNames() map[string]struct{}
-	CallTool(ctx context.Context, name string, args map[string]interface{}) (string, error)
+	CallTool(ctx context.Context, name string, args map[string]any) (string, error)
 }
 
 // ToolHandler executes a builtin tool given parsed arguments.
-type ToolHandler func(ctx context.Context, a *Agent, args map[string]interface{}) (string, error)
+type ToolHandler func(ctx context.Context, a *Agent, args map[string]any) (string, error)
 
 // BuiltinToolHandlers returns the registry of builtin tool implementations.
 // It is derived from builtinToolDefs, so every tool's schema and handler are
@@ -176,7 +176,7 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error
 	return res, err
 }
 
-func handleListFiles(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleListFiles(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	path, err := stringArg(args, "path")
 	if err != nil {
 		return "", err
@@ -186,7 +186,7 @@ func handleListFiles(ctx context.Context, a *Agent, args map[string]interface{})
 	return a.Executor.ListFiles(ctx, path, recursive, tracked)
 }
 
-func handleGlobFiles(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleGlobFiles(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	pattern, err := stringArg(args, "pattern")
 	if err != nil {
 		return "", err
@@ -196,11 +196,11 @@ func handleGlobFiles(ctx context.Context, a *Agent, args map[string]interface{})
 	return a.Executor.GlobFiles(ctx, pattern, subpath, tracked)
 }
 
-func handleRepoOverview(ctx context.Context, a *Agent, _ map[string]interface{}) (string, error) {
+func handleRepoOverview(ctx context.Context, a *Agent, _ map[string]any) (string, error) {
 	return a.Executor.RepoOverview(ctx)
 }
 
-func handleReadFile(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleReadFile(_ context.Context, a *Agent, args map[string]any) (string, error) {
 	// Prefer "path", fall back to deprecated "file_path".
 	path, err := stringArgOptional(args, "path")
 	if err != nil {
@@ -228,7 +228,7 @@ func handleReadFile(_ context.Context, a *Agent, args map[string]interface{}) (s
 	return a.Executor.ReadFileRange(path, offset, limit, search, lineNumbers)
 }
 
-func handleReadFiles(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleReadFiles(_ context.Context, a *Agent, args map[string]any) (string, error) {
 	paths, err := stringSliceArg(args, "paths")
 	if err != nil {
 		return "", err
@@ -236,7 +236,7 @@ func handleReadFiles(_ context.Context, a *Agent, args map[string]interface{}) (
 	return a.Executor.ReadFiles(paths)
 }
 
-func handleWriteFile(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleWriteFile(_ context.Context, a *Agent, args map[string]any) (string, error) {
 	path, err := stringArg(args, "path")
 	if err != nil {
 		return "", err
@@ -254,7 +254,7 @@ func handleWriteFile(_ context.Context, a *Agent, args map[string]interface{}) (
 	return result, nil
 }
 
-func handleExecuteCommand(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleExecuteCommand(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	command, err := stringArg(args, "command")
 	if err != nil {
 		return "", err
@@ -273,7 +273,7 @@ func handleExecuteCommand(ctx context.Context, a *Agent, args map[string]interfa
 	return a.Executor.ExecuteCommand(ctx, command)
 }
 
-func handleBackgroundJob(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleBackgroundJob(_ context.Context, a *Agent, args map[string]any) (string, error) {
 	action, err := stringArg(args, "action")
 	if err != nil {
 		return "", err
@@ -302,7 +302,7 @@ func handleBackgroundJob(_ context.Context, a *Agent, args map[string]interface{
 	}
 }
 
-func handleReplaceInFile(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleReplaceInFile(_ context.Context, a *Agent, args map[string]any) (string, error) {
 	path, err := stringArg(args, "path")
 	if err != nil {
 		return "", err
@@ -322,7 +322,7 @@ func handleReplaceInFile(_ context.Context, a *Agent, args map[string]interface{
 	return a.Executor.ReplaceInFile(path, search, replace, replaceAll)
 }
 
-func handlePatchFile(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handlePatchFile(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	diff, err := stringArg(args, "diff")
 	if err != nil {
 		return "", err
@@ -338,7 +338,7 @@ func handlePatchFile(ctx context.Context, a *Agent, args map[string]interface{})
 	return a.Executor.PatchFile(ctx, diff, dryRun, fuzzy)
 }
 
-func handleDelete(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleDelete(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	path, err := stringArg(args, "path")
 	if err != nil {
 		return "", err
@@ -346,7 +346,7 @@ func handleDelete(ctx context.Context, a *Agent, args map[string]interface{}) (s
 	return a.Executor.DeleteFile(ctx, path)
 }
 
-func handleShowDiff(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleShowDiff(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	subpath, _ := stringArgOptional(args, "path")
 	staged, err := boolArg(args, "staged", false)
 	if err != nil {
@@ -355,7 +355,7 @@ func handleShowDiff(ctx context.Context, a *Agent, args map[string]interface{}) 
 	return a.Executor.ShowDiff(ctx, subpath, staged)
 }
 
-func handleSearchCode(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleSearchCode(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	pattern, err := stringArg(args, "pattern")
 	if err != nil {
 		return "", err
@@ -373,7 +373,7 @@ func handleSearchCode(ctx context.Context, a *Agent, args map[string]interface{}
 	return a.Executor.SearchCode(ctx, pattern, subpath, glob, contextLines, ignoreCase)
 }
 
-func handleFindSymbol(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleFindSymbol(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	kind, err := stringArg(args, "kind")
 	if err != nil {
 		return "", err
@@ -394,7 +394,7 @@ func handleFindSymbol(ctx context.Context, a *Agent, args map[string]interface{}
 	}
 }
 
-func handleGitStage(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleGitStage(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	paths, err := stringSliceArgOptional(args, "paths")
 	if err != nil {
 		return "", err
@@ -402,7 +402,7 @@ func handleGitStage(ctx context.Context, a *Agent, args map[string]interface{}) 
 	return a.Executor.GitStage(ctx, paths)
 }
 
-func handleGitCommit(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleGitCommit(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	message, err := stringArg(args, "message")
 	if err != nil {
 		return "", err
@@ -410,7 +410,7 @@ func handleGitCommit(ctx context.Context, a *Agent, args map[string]interface{})
 	return a.Executor.GitCommit(ctx, message)
 }
 
-func handleGit(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleGit(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	action, err := stringArg(args, "action")
 	if err != nil {
 		return "", err
@@ -433,7 +433,7 @@ func handleGit(ctx context.Context, a *Agent, args map[string]interface{}) (stri
 	}
 }
 
-func handleGitBlame(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleGitBlame(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	file, err := stringArg(args, "file")
 	if err != nil {
 		return "", err
@@ -450,7 +450,7 @@ func handleGitBlame(ctx context.Context, a *Agent, args map[string]interface{}) 
 	return a.Executor.GitBlame(ctx, file, ref, lineStart, lineEnd)
 }
 
-func handleTodo(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleTodo(_ context.Context, a *Agent, args map[string]any) (string, error) {
 	action, err := stringArg(args, "action")
 	if err != nil {
 		return "", err
@@ -507,7 +507,7 @@ func handleTodo(_ context.Context, a *Agent, args map[string]interface{}) (strin
 	}
 }
 
-func handleListDefinitions(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleListDefinitions(_ context.Context, a *Agent, args map[string]any) (string, error) {
 	path, err := stringArg(args, "path")
 	if err != nil {
 		return "", err
@@ -515,7 +515,7 @@ func handleListDefinitions(_ context.Context, a *Agent, args map[string]interfac
 	return a.Executor.ListDefinitions(path)
 }
 
-func handleWebSearch(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleWebSearch(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	query, err := stringArg(args, "query")
 	if err != nil {
 		return "", err
@@ -527,7 +527,7 @@ func handleWebSearch(ctx context.Context, a *Agent, args map[string]interface{})
 	return a.Executor.WebSearch(ctx, query, maxResults)
 }
 
-func handleWebFetch(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleWebFetch(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	rawURL, err := stringArg(args, "url")
 	if err != nil {
 		return "", err
@@ -556,7 +556,7 @@ func handleWebFetch(ctx context.Context, a *Agent, args map[string]interface{}) 
 	})
 }
 
-func handleDownloadFile(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleDownloadFile(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	rawURL, err := stringArg(args, "url")
 	if err != nil {
 		return "", err
@@ -576,7 +576,7 @@ func handleDownloadFile(ctx context.Context, a *Agent, args map[string]interface
 	return a.Executor.DownloadFile(ctx, rawURL, path, maxBytes, overwrite)
 }
 
-func handleFindFile(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleFindFile(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	name, err := stringArg(args, "name")
 	if err != nil {
 		return "", err
@@ -586,7 +586,7 @@ func handleFindFile(ctx context.Context, a *Agent, args map[string]interface{}) 
 	return a.Executor.FindFile(ctx, name, subpath, limit)
 }
 
-func handleSessionRename(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleSessionRename(_ context.Context, a *Agent, args map[string]any) (string, error) {
 	label, err := stringArg(args, "label")
 	if err != nil {
 		return "", err
@@ -594,7 +594,7 @@ func handleSessionRename(_ context.Context, a *Agent, args map[string]interface{
 	return a.RenameSession(label)
 }
 
-func handleContextPinLast(_ context.Context, a *Agent, _ map[string]interface{}) (string, error) {
+func handleContextPinLast(_ context.Context, a *Agent, _ map[string]any) (string, error) {
 	if a.PinManager == nil {
 		// PinManager is unconditionally initialised in main(); this branch
 		// only fires in tests / custom embeds. Tell the LLM the tool is a
@@ -604,7 +604,7 @@ func handleContextPinLast(_ context.Context, a *Agent, _ map[string]interface{})
 	return "Pinned the last user message", a.pinLastUser()
 }
 
-func handleRenameSymbol(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleRenameSymbol(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	oldName, err := stringArg(args, "old_name")
 	if err != nil {
 		return "", err
@@ -619,7 +619,7 @@ func handleRenameSymbol(ctx context.Context, a *Agent, args map[string]interface
 	return a.Executor.RenameSymbol(ctx, oldName, newName, subpath, glob, dryRun)
 }
 
-func handleCallGraph(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleCallGraph(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	symbol, err := stringArg(args, "symbol")
 	if err != nil {
 		return "", err

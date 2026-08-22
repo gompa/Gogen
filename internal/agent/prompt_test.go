@@ -34,7 +34,7 @@ func TestReadFileSchemaDropsDeprecatedAlias(t *testing.T) {
 		if d.Definition.Name != "read_file" {
 			continue
 		}
-		props, ok := d.Definition.Parameters["properties"].(map[string]interface{})
+		props, ok := d.Definition.Parameters["properties"].(map[string]any)
 		if !ok {
 			t.Fatal("read_file schema has no properties")
 		}
@@ -72,11 +72,11 @@ func TestActionToolsHaveEnums(t *testing.T) {
 		if !ok {
 			t.Fatalf("tool %q missing from registry", tool)
 		}
-		props, ok := def.Parameters["properties"].(map[string]interface{})
+		props, ok := def.Parameters["properties"].(map[string]any)
 		if !ok {
 			t.Fatalf("%s: no properties", tool)
 		}
-		p, ok := props[param].(map[string]interface{})
+		p, ok := props[param].(map[string]any)
 		if !ok {
 			t.Fatalf("%s: missing %s param", tool, param)
 		}

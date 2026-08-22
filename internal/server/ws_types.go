@@ -64,9 +64,9 @@ type SessionEntry struct {
 }
 
 type HistoryToolCall struct {
-	ID   string                 `json:"id"`
-	Name string                 `json:"name"`
-	Args map[string]interface{} `json:"args,omitempty"`
+	ID   string         `json:"id"`
+	Name string         `json:"name"`
+	Args map[string]any `json:"args,omitempty"`
 }
 
 // BoardOpRequest is one kanban-tab operation sent client→server as a
@@ -179,22 +179,22 @@ type HistoryEntry struct {
 }
 
 type WSMessage struct {
-	Type            string                 `json:"type"`
-	Content         string                 `json:"content,omitempty"`
-	Tool            string                 `json:"tool,omitempty"`
-	TermID          string                 `json:"termId,omitempty"`
-	Cols            int                    `json:"cols,omitempty"`
-	Rows            int                    `json:"rows,omitempty"`
-	Code            int                    `json:"code,omitempty"`
-	ToolCallID      string                 `json:"toolCallId,omitempty"`
-	Index           int                    `json:"index,omitempty"`
-	ArgsDelta       string                 `json:"argsDelta,omitempty"`
-	Args            map[string]interface{} `json:"args,omitempty"`
-	Result          string                 `json:"result,omitempty"`
-	Success         bool                   `json:"success,omitempty"`
-	ResultTruncated bool                   `json:"resultTruncated,omitempty"`
-	WorkingDir      string                 `json:"workingDir,omitempty"`
-	Model           string                 `json:"model,omitempty"`
+	Type            string         `json:"type"`
+	Content         string         `json:"content,omitempty"`
+	Tool            string         `json:"tool,omitempty"`
+	TermID          string         `json:"termId,omitempty"`
+	Cols            int            `json:"cols,omitempty"`
+	Rows            int            `json:"rows,omitempty"`
+	Code            int            `json:"code,omitempty"`
+	ToolCallID      string         `json:"toolCallId,omitempty"`
+	Index           int            `json:"index,omitempty"`
+	ArgsDelta       string         `json:"argsDelta,omitempty"`
+	Args            map[string]any `json:"args,omitempty"`
+	Result          string         `json:"result,omitempty"`
+	Success         bool           `json:"success,omitempty"`
+	ResultTruncated bool           `json:"resultTruncated,omitempty"`
+	WorkingDir      string         `json:"workingDir,omitempty"`
+	Model           string         `json:"model,omitempty"`
 	// Pricing for the current model (USD per 1M tokens), populated from models.dev cache.
 	InputPricePer1M  float64 `json:"inputPricePer1M,omitempty"`
 	OutputPricePer1M float64 `json:"outputPricePer1M,omitempty"`

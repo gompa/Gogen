@@ -231,7 +231,7 @@ func wrapToolHandlers(handlers map[string]agent.ToolHandler, fsMu *sync.RWMutex)
 			continue
 		}
 		name, h := name, h
-		out[name] = func(ctx context.Context, a *agent.Agent, args map[string]interface{}) (string, error) {
+		out[name] = func(ctx context.Context, a *agent.Agent, args map[string]any) (string, error) {
 			fsMu.Lock()
 			defer fsMu.Unlock()
 			return h(ctx, a, args)

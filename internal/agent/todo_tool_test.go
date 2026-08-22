@@ -29,7 +29,7 @@ func TestTodoDoneIDSurvivesToolCall(t *testing.T) {
 
 	t.Run("numeric id marks done", func(t *testing.T) {
 		a, tm := newAgent()
-		out, err := a.executeTool(context.Background(), llmToolCall("todo", map[string]interface{}{
+		out, err := a.executeTool(context.Background(), llmToolCall("todo", map[string]any{
 			"action": "done",
 			"id":     float64(1), // JSON decode shape from a native tool call
 		}))
@@ -46,7 +46,7 @@ func TestTodoDoneIDSurvivesToolCall(t *testing.T) {
 
 	t.Run("int64 id removes", func(t *testing.T) {
 		a, tm := newAgent()
-		out, err := a.executeTool(context.Background(), llmToolCall("todo", map[string]interface{}{
+		out, err := a.executeTool(context.Background(), llmToolCall("todo", map[string]any{
 			"action": "remove",
 			"id":     int64(2),
 		}))
@@ -63,7 +63,7 @@ func TestTodoDoneIDSurvivesToolCall(t *testing.T) {
 
 	t.Run("quoted numeric string id is coerced", func(t *testing.T) {
 		a, tm := newAgent()
-		out, err := a.executeTool(context.Background(), llmToolCall("todo", map[string]interface{}{
+		out, err := a.executeTool(context.Background(), llmToolCall("todo", map[string]any{
 			"action": "done",
 			"id":     "1", // models sometimes quote numbers
 		}))
@@ -80,7 +80,7 @@ func TestTodoDoneIDSurvivesToolCall(t *testing.T) {
 
 	t.Run("non-numeric string id reports type error not missing", func(t *testing.T) {
 		a, _ := newAgent()
-		_, err := a.executeTool(context.Background(), llmToolCall("todo", map[string]interface{}{
+		_, err := a.executeTool(context.Background(), llmToolCall("todo", map[string]any{
 			"action": "done",
 			"id":     "abc",
 		}))
@@ -97,7 +97,7 @@ func TestTodoDoneIDSurvivesToolCall(t *testing.T) {
 
 	t.Run("absent id reports missing", func(t *testing.T) {
 		a, _ := newAgent()
-		_, err := a.executeTool(context.Background(), llmToolCall("todo", map[string]interface{}{
+		_, err := a.executeTool(context.Background(), llmToolCall("todo", map[string]any{
 			"action": "done",
 		}))
 		if err == nil {

@@ -325,11 +325,11 @@ func TestBoardChangedHook(t *testing.T) {
 	a.SetOnBoardChanged(func(msg string) { fired = append(fired, msg) })
 
 	// Read-only: no fire.
-	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{"action": "list"}}); err != nil {
+	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]any{"action": "list"}}); err != nil {
 		t.Fatal(err)
 	}
 	// Failed mutation: no fire.
-	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{"action": "move", "id": "99", "column": "done"}}); err == nil {
+	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]any{"action": "move", "id": "99", "column": "done"}}); err == nil {
 		t.Fatal("expected error for missing item")
 	}
 	if len(fired) != 0 {
@@ -337,13 +337,13 @@ func TestBoardChangedHook(t *testing.T) {
 	}
 
 	// Mutations: each fires exactly once with its output message.
-	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{"action": "add", "title": "hook test"}}); err != nil {
+	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]any{"action": "add", "title": "hook test"}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{"action": "claim", "id": "1"}}); err != nil {
+	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]any{"action": "claim", "id": "1"}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{"action": "done", "id": "1"}}); err != nil {
+	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]any{"action": "done", "id": "1"}}); err != nil {
 		t.Fatal(err)
 	}
 	if len(fired) != 3 {
@@ -421,7 +421,7 @@ func TestBoardToolGating(t *testing.T) {
 	if _, ok := a.AllowedToolNames()["board"]; ok {
 		t.Fatal("board must not be allowed when disabled")
 	}
-	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{"action": "list"}}); err == nil || !strings.Contains(err.Error(), "unknown tool") {
+	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]any{"action": "list"}}); err == nil || !strings.Contains(err.Error(), "unknown tool") {
 		t.Fatalf("expected unknown tool error, got %v", err)
 	}
 
@@ -440,7 +440,7 @@ func TestBoardToolGating(t *testing.T) {
 	if _, ok := a.AllowedToolNames()["board"]; !ok {
 		t.Fatal("board should be allowed when enabled")
 	}
-	out, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{"action": "list"}})
+	out, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]any{"action": "list"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -454,7 +454,7 @@ func TestBoardToolGating(t *testing.T) {
 	if err := a.checkPlanMode("board"); err != nil {
 		t.Fatalf("plan mode should allow board (D7): %v", err)
 	}
-	out, err = a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{"action": "add", "title": "plan-mode card"}})
+	out, err = a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]any{"action": "add", "title": "plan-mode card"}})
 	if err != nil {
 		t.Fatalf("board mutation in plan mode should work (D7): %v", err)
 	}
@@ -551,7 +551,7 @@ func TestBoardIDSurvivesToolCall(t *testing.T) {
 
 	t.Run("float64 id (JSON number) marks done", func(t *testing.T) {
 		a, _ := newAgent()
-		out, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{
+		out, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]any{
 			"action": "done",
 			"id":     float64(1), // native tool-call JSON decode shape
 		}})
@@ -569,7 +569,7 @@ func TestBoardIDSurvivesToolCall(t *testing.T) {
 
 	t.Run("int id moves", func(t *testing.T) {
 		a, _ := newAgent()
-		out, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{
+		out, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]any{
 			"action": "move",
 			"id":     1,
 			"column": "in_review",
@@ -584,7 +584,7 @@ func TestBoardIDSurvivesToolCall(t *testing.T) {
 
 	t.Run("quoted numeric string id claims", func(t *testing.T) {
 		a, _ := newAgent()
-		out, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{
+		out, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]any{
 			"action": "claim",
 			"id":     "1",
 		}})
@@ -598,7 +598,7 @@ func TestBoardIDSurvivesToolCall(t *testing.T) {
 
 	t.Run("non-numeric string id reports type error not missing", func(t *testing.T) {
 		a, _ := newAgent()
-		_, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{
+		_, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]any{
 			"action": "done",
 			"id":     "abc",
 		}})
@@ -615,7 +615,7 @@ func TestBoardIDSurvivesToolCall(t *testing.T) {
 
 	t.Run("zero id rejected", func(t *testing.T) {
 		a, _ := newAgent()
-		_, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{
+		_, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]any{
 			"action": "show",
 			"id":     0,
 		}})
@@ -626,7 +626,7 @@ func TestBoardIDSurvivesToolCall(t *testing.T) {
 
 	t.Run("absent id reports missing", func(t *testing.T) {
 		a, _ := newAgent()
-		_, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]interface{}{
+		_, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]any{
 			"action": "done",
 		}})
 		if err == nil {

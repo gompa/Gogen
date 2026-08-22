@@ -35,18 +35,18 @@ type ToolDef struct {
 }
 
 // toolProp creates a property definition for a tool parameter.
-func toolProp(typ, desc string) map[string]interface{} {
-	return map[string]interface{}{
+func toolProp(typ, desc string) map[string]any {
+	return map[string]any{
 		"type":        typ,
 		"description": desc,
 	}
 }
 
 // toolPropArray creates an array property definition for a tool parameter.
-func toolPropArray(itemType, desc string) map[string]interface{} {
-	return map[string]interface{}{
+func toolPropArray(itemType, desc string) map[string]any {
+	return map[string]any{
 		"type": "array",
-		"items": map[string]interface{}{
+		"items": map[string]any{
 			"type": itemType,
 		},
 		"description": desc,
@@ -58,8 +58,8 @@ func toolPropArray(itemType, desc string) map[string]interface{} {
 // values up front, so invalid ones fail argument validation instead of
 // round-tripping through the handler. An empty description omits the key
 // entirely — the enum array and the tool description already carry the values.
-func toolPropEnum(typ string, values []string, desc string) map[string]interface{} {
-	prop := map[string]interface{}{
+func toolPropEnum(typ string, values []string, desc string) map[string]any {
+	prop := map[string]any{
 		"type": typ,
 		"enum": values,
 	}
@@ -70,8 +70,8 @@ func toolPropEnum(typ string, values []string, desc string) map[string]interface
 }
 
 // toolSchema creates a tool parameter schema with optional required fields.
-func toolSchema(props map[string]interface{}, required ...string) map[string]interface{} {
-	schema := map[string]interface{}{
+func toolSchema(props map[string]any, required ...string) map[string]any {
+	schema := map[string]any{
 		"type":       "object",
 		"properties": props,
 	}
@@ -82,7 +82,7 @@ func toolSchema(props map[string]interface{}, required ...string) map[string]int
 }
 
 // toolDef creates a complete tool definition.
-func toolDef(name, desc string, params map[string]interface{}) llm.Tool {
+func toolDef(name, desc string, params map[string]any) llm.Tool {
 	return llm.Tool{
 		Name:        name,
 		Description: desc,
@@ -97,7 +97,7 @@ func toolDef(name, desc string, params map[string]interface{}) llm.Tool {
 var builtinToolDefs = []ToolDef{
 	{
 		Definition: toolDef("list_files", "List directory contents; recursive=true walks the tree (max 500 entries). Directories suffixed with /.",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"path":         toolProp("string", "Directory path"),
 				"recursive":    toolProp("boolean", "Walk tree recursively (max 500)"),
 				"tracked_only": toolProp("boolean", "Only git-tracked files"),
@@ -108,14 +108,14 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("repo_overview", "Summarize repo layout: top-level directories, file counts, root files.",
-			toolSchema(map[string]interface{}{})),
+			toolSchema(map[string]any{})),
 		Handler:     handleRepoOverview,
 		ReadOnly:    true,
 		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("glob", "Find files by glob pattern (e.g. *.go, **/*.md); dotfiles match, hidden dirs are skipped unless passed as path.",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"pattern":      toolProp("string", "Glob pattern"),
 				"path":         toolProp("string", "Subdirectory"),
 				"tracked_only": toolProp("boolean", "Only git-tracked files"),
@@ -126,7 +126,7 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("read_file", "Read file content; offset/limit for ranges, search for regex jump.",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"path":         toolProp("string", "File path"),
 				"offset":       toolProp("integer", "Start line; with search: context lines before the match (default 10)"),
 				"limit":        toolProp("integer", "Max lines (default all, max 10000); with search: caps total lines in the match window"),
@@ -139,7 +139,7 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("read_files", "Read multiple files (max 20, 512KB). Output: === path === headers.",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"paths": toolPropArray("string", "File paths"),
 			}, "paths")),
 		Handler:     handleReadFiles,
@@ -148,7 +148,7 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("list_definitions", "List functions/types in a file with line numbers (AST or text outline).",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"path": toolProp("string", "Source file path"),
 			}, "path")),
 		Handler:     handleListDefinitions,
@@ -157,7 +157,7 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("write_file", "Create a NEW file only (parent dirs ok); refuses existing paths — edit with patch_file/replace_in_file.",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"path":    toolProp("string", "File path"),
 				"content": toolProp("string", "Content"),
 			}, "path", "content")),
@@ -166,7 +166,7 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("execute_command", "Run a shell command (destructive patterns blocked).",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"command":    toolProp("string", "Command"),
 				"background": toolProp("boolean", "Run in the background; poll/cancel via background_job (default false)"),
 			}, "command")),
@@ -174,7 +174,7 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("replace_in_file", "Default edit tool: exact search/replace in an existing file. Copy the search block verbatim from read_file output; add surrounding context to disambiguate.",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"path":        toolProp("string", "File path"),
 				"search":      toolProp("string", "Exact string to find (must match exactly once unless replace_all=true)"),
 				"replace":     toolProp("string", "Replacement"),
@@ -185,7 +185,7 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("delete", "Delete a file or empty directory (requires approval); non-empty directories are refused.",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"path": toolProp("string", "File path"),
 			}, "path")),
 		Handler:   handleDelete,
@@ -193,7 +193,7 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("patch_file", "Apply unified diff(s); prefer replace_in_file for most edits. Use exact context lines from a fresh read_file, covering the entire edited region (never truncate before closing braces); keep hunks small and self-contained. Never include '***' markers, diff -c range headers, or copied patch-transcript text.",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"diff":    toolProp("string", "Unified diff: '--- a/x'/'+++ b/x' headers, '@@ -start,count +start,count @@' hunks (context=space, removed=-, added=+). Counts must match the hunk body. Multi-file: stack sections."),
 				"dry_run": toolProp("boolean", "Preview without writing"),
 				"fuzzy":   toolProp("boolean", "Tolerate whitespace/shift drift (default true; leave on)"),
@@ -203,7 +203,7 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("show_diff", "Show git diff (working tree or path).",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"path":   toolProp("string", "Optional file/dir path"),
 				"staged": toolProp("boolean", "Show staged changes only"),
 			})),
@@ -213,7 +213,7 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("search_code", "Search codebase (regex or literal, case-sensitive by default; set ignore_case to match any casing); returns file:line:content.",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"pattern":       toolProp("string", "Regex or literal"),
 				"path":          toolProp("string", "Subdirectory (required for hidden dirs)"),
 				"glob":          toolProp("string", "Glob filter (e.g. *.go)"),
@@ -226,7 +226,7 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("find_symbol", "Locate symbols: kind=def (definition) or refs (references).",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"kind":   toolPropEnum("string", []string{"def", "refs"}, ""),
 				"symbol": toolProp("string", "Symbol name"),
 				"path":   toolProp("string", "Subdirectory"),
@@ -238,7 +238,7 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("git", "Git history/status/diff (read-only): action=log (path, limit), status (path), or show (ref).",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"action": toolPropEnum("string", []string{"log", "status", "show"}, ""),
 				"path":   toolProp("string", "Scope to path (log/status)"),
 				"limit":  toolProp("integer", "Max commits for log (default 20, max 100)"),
@@ -250,7 +250,7 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("web_search", "Web search.",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"query":       toolProp("string", "Query"),
 				"max_results": toolProp("integer", "Max results (default 10, max 20)"),
 			}, "query")),
@@ -260,7 +260,7 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("web_fetch", "Fetch a web page: article as Markdown, full page if no article, raw for source/data files.",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"url":       toolProp("string", "URL (https)"),
 				"max_bytes": toolProp("integer", "Max bytes (default 262144)"),
 				"selector":  toolProp("string", "Optional CSS selector (article, pre, table…)"),
@@ -273,7 +273,7 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("download_file", "Download a file from a URL into the workspace (raw bytes, binary-safe). HTTPS-only; private/internal hosts blocked.",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"url":       toolProp("string", "URL (https)"),
 				"path":      toolProp("string", "Destination path"),
 				"max_bytes": toolProp("integer", "Max bytes (default 52428800, max 209715200)"),
@@ -284,21 +284,21 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("git_commit", "Commit (requires staged files).",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"message": toolProp("string", "Message"),
 			}, "message")),
 		Handler: handleGitCommit,
 	},
 	{
 		Definition: toolDef("git_stage", "Stage files (empty = stage all).",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"paths": toolPropArray("string", "File paths (empty = all)"),
 			})),
 		Handler: handleGitStage,
 	},
 	{
 		Definition: toolDef("todo", "Manage the todo list: add (text), list, done (id), remove (id), clear.",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"action": toolPropEnum("string", []string{"add", "list", "done", "remove", "clear"}, ""),
 				"text":   toolProp("string", "Text for action=add"),
 				"id":     toolProp("integer", "ID for action=done or action=remove"),
@@ -308,7 +308,7 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("find_file", "Find files by name (case-insensitive substring). Faster than glob for known filenames.",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"name":  toolProp("string", "Filename substring"),
 				"path":  toolProp("string", "Subdirectory"),
 				"limit": toolProp("integer", "Max results (default 50)"),
@@ -319,7 +319,7 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("session_rename", "Rename current session.",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"label": toolProp("string", "Label"),
 			}, "label")),
 		Handler:     handleSessionRename,
@@ -327,13 +327,13 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("context_pin_last", "Pin last user message to survive compaction.",
-			toolSchema(map[string]interface{}{})),
+			toolSchema(map[string]any{})),
 		Handler:     handleContextPinLast,
 		PlanAllowed: true,
 	},
 	{
 		Definition: toolDef("rename_symbol", "Rename symbol across files.",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"old_name": toolProp("string", "Current name"),
 				"new_name": toolProp("string", "New name"),
 				"path":     toolProp("string", "Subdirectory"),
@@ -345,7 +345,7 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("call_graph", "Call relationships for a symbol.",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"symbol":    toolProp("string", "Symbol"),
 				"path":      toolProp("string", "Subdirectory"),
 				"glob":      toolProp("string", "Glob filter"),
@@ -357,7 +357,7 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("background_job", "Inspect or feed a background job (execute_command background=true): action=status (full output tail), cancel, or input (write to the job's stdin; returns output produced since the last input).",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"action":         toolPropEnum("string", []string{"status", "cancel", "input"}, ""),
 				"job_id":         toolProp("string", "Job id returned by execute_command background=true"),
 				"input":          toolProp("string", "Text to write to the job's stdin (action=input)"),
@@ -367,7 +367,7 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("read_image", "Attach an image to this session's context (the model must support vision). The image stays in THIS session — a subagent calling read_image sees it, but the parent only receives this text report. png/jpeg/gif/webp up to 3.5 MB; SVG is XML text, use read_file. detail=low reduces vision cost.",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"path":   toolProp("string", "Image file path"),
 				"detail": toolPropEnum("string", []string{"auto", "low", "high"}, "Vision detail level (default auto)"),
 			}, "path")),
@@ -377,7 +377,7 @@ var builtinToolDefs = []ToolDef{
 	},
 	{
 		Definition: toolDef("git_blame", "Git blame for a file (read-only): shows which commit last modified each line (hash, author, date, content). Optional ref blames the file as of that commit instead of the working tree; pass line_start and line_end together to blame a range of a large file.",
-			toolSchema(map[string]interface{}{
+			toolSchema(map[string]any{
 				"file":       toolProp("string", "File path (workspace-relative)"),
 				"ref":        toolProp("string", "Blame as of this commit/ref instead of the working tree"),
 				"line_start": toolProp("integer", "First line of the blame range (requires line_end)"),

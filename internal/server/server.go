@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1871,7 +1870,7 @@ func (s *Server) persistConfigForced(cfg *config.Config) {
 // change is re-issued.
 func (s *Server) applyWorkingDirToAll(absDir string) (skipped []string) {
 	ids := s.registry.activeIDs()
-	sort.Strings(ids)
+	slices.Sort(ids)
 	// A working-dir change relocates every session's persisted state into the
 	// new directory: each agent's SetWorkingDir + AfterWorkingDirChange below
 	// forces a full save there, which would stamp Updated=now on every open

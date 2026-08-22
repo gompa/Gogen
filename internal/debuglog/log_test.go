@@ -13,7 +13,7 @@ func TestWriteNoOpWithoutEnv(t *testing.T) {
 		Configure("", "")
 		CloseLog()
 	})
-	Write("test.go:1", "msg", "H", map[string]interface{}{"k": "v"})
+	Write("test.go:1", "msg", "H", map[string]any{"k": "v"})
 }
 
 func TestWriteCreatesLogFile(t *testing.T) {
@@ -26,7 +26,7 @@ func TestWriteCreatesLogFile(t *testing.T) {
 		Configure("", "")
 	})
 
-	Write("test.go:1", "hello", "H", map[string]interface{}{"k": "v"})
+	Write("test.go:1", "hello", "H", map[string]any{"k": "v"})
 	CloseLog()
 
 	data, err := os.ReadFile(path)

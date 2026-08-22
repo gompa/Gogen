@@ -67,7 +67,7 @@ func TestStreamResultModelStampedOnAssistantMessage(t *testing.T) {
 func TestStreamResultModelStampedOnToolCallRound(t *testing.T) {
 	prov := llm.NewMockProvider()
 	prov.StreamResults = []*llm.StreamResult{
-		{ToolCalls: []llm.ToolCall{{ID: "c1", Name: "read_file", Args: map[string]interface{}{"path": "x"}}}, Model: "glm-4.6"},
+		{ToolCalls: []llm.ToolCall{{ID: "c1", Name: "read_file", Args: map[string]any{"path": "x"}}}, Model: "glm-4.6"},
 		{Content: "done", Model: "glm-4.6"},
 	}
 	exec := NewExecutor(t.TempDir())
@@ -107,7 +107,7 @@ func TestOnReplyModelFiredPerRoundBeforeStreamEnd(t *testing.T) {
 			return &llm.StreamResult{
 				Content: "partial ",
 				ToolCalls: []llm.ToolCall{{
-					ID: "c1", Name: "read_file", Args: map[string]interface{}{"path": "x"},
+					ID: "c1", Name: "read_file", Args: map[string]any{"path": "x"},
 				}},
 				Model: "glm-a",
 			}, nil

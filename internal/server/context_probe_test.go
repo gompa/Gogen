@@ -41,7 +41,7 @@ func (p *probeStreamStub) GenerateResponseStream(_ context.Context, _ []llm.Mess
 			ToolCalls: []llm.ToolCall{{
 				ID:   "c1",
 				Name: "read_file",
-				Args: map[string]interface{}{"path": "a.go"},
+				Args: map[string]any{"path": "a.go"},
 			}},
 			Usage: usage,
 		}, nil

@@ -38,11 +38,11 @@ type LLMResponseRecord struct {
 }
 
 type LLMToolCallRecord struct {
-	Index    int                    `json:"index,omitempty"`
-	ID       string                 `json:"id,omitempty"`
-	Name     string                 `json:"name"`
-	Args     map[string]interface{} `json:"args,omitempty"`
-	ArgsJSON string                 `json:"argsJson,omitempty"`
+	Index    int            `json:"index,omitempty"`
+	ID       string         `json:"id,omitempty"`
+	Name     string         `json:"name"`
+	Args     map[string]any `json:"args,omitempty"`
+	ArgsJSON string         `json:"argsJson,omitempty"`
 }
 
 type LLMDroppedToolRecord struct {

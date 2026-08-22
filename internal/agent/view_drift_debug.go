@@ -96,7 +96,7 @@ func (a *Agent) reportViewDrift(current []llm.Message, kind viewDriftKind, prevS
 		return // Shared prefix unchanged — cache-safe for in-session turns.
 	}
 
-	fields := map[string]interface{}{
+	fields := map[string]any{
 		"kind":               string(kind),
 		"turnNewCount":       len(current),
 		"turnPrevCount":      len(a.lastViewMessages),
@@ -231,10 +231,10 @@ func toolCallsWireEqual(a, b []llm.ToolCall) bool {
 	return true
 }
 
-func toolCallsDriftPreview(tcs []llm.ToolCall) []map[string]interface{} {
-	out := make([]map[string]interface{}, 0, len(tcs))
+func toolCallsDriftPreview(tcs []llm.ToolCall) []map[string]any {
+	out := make([]map[string]any, 0, len(tcs))
 	for i := range tcs {
-		out = append(out, map[string]interface{}{
+		out = append(out, map[string]any{
 			"id":             tcs[i].ID,
 			"name":           tcs[i].Name,
 			"argsStrLen":     len(tcs[i].ArgsStr),

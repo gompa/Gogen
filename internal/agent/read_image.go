@@ -43,7 +43,7 @@ var imageExtMIMEs = map[string]string{
 // context-scoped image sink; the tool-round coordinator appends the user
 // message after the tool result (see appendImageMessages). The returned
 // text is a short ack — the image itself travels in the user message.
-func handleReadImage(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleReadImage(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	path, err := stringArg(args, "path")
 	if err != nil {
 		return "", err

@@ -11,23 +11,23 @@ import (
 )
 
 func TestLookupModelsDevLimitFromDisk(t *testing.T) {
-	reg := map[string]interface{}{
-		"opencode": map[string]interface{}{
+	reg := map[string]any{
+		"opencode": map[string]any{
 			"id":  "opencode",
 			"api": "https://opencode.ai/zen/v1",
-			"models": map[string]interface{}{
-				"claude-opus-4-8": map[string]interface{}{
+			"models": map[string]any{
+				"claude-opus-4-8": map[string]any{
 					"id":          "claude-opus-4-8",
 					"description": "Claude Opus 4.8",
 					"limit":       map[string]int{"context": 1000000, "output": 128000},
 				},
 			},
 		},
-		"opencode-go": map[string]interface{}{
+		"opencode-go": map[string]any{
 			"id":  "opencode-go",
 			"api": "https://opencode.ai/zen/go/v1",
-			"models": map[string]interface{}{
-				"mimo-v2.5-pro": map[string]interface{}{
+			"models": map[string]any{
+				"mimo-v2.5-pro": map[string]any{
 					"id":    "mimo-v2.5-pro",
 					"limit": map[string]int{"context": 1048576, "output": 128000},
 				},

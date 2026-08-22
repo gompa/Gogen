@@ -586,7 +586,7 @@ func TestBackgroundJobToolInput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	out, err := handleBackgroundJob(context.Background(), a, map[string]interface{}{
+	out, err := handleBackgroundJob(context.Background(), a, map[string]any{
 		"action":         "input",
 		"job_id":         id,
 		"input":          "hi",
@@ -599,7 +599,7 @@ func TestBackgroundJobToolInput(t *testing.T) {
 		t.Fatalf("handler output = %q", out)
 	}
 
-	if _, err := handleBackgroundJob(context.Background(), a, map[string]interface{}{
+	if _, err := handleBackgroundJob(context.Background(), a, map[string]any{
 		"action": "input",
 		"job_id": id,
 	}); err == nil || !strings.Contains(err.Error(), "missing required argument") {

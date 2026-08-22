@@ -11,7 +11,7 @@ import (
 func TestShowDiffStagedRejectsNonBool(t *testing.T) {
 	a := &Agent{Mode: ModeAct, Executor: &Executor{WorkingDir: t.TempDir()}}
 
-	_, err := a.executeTool(context.Background(), llmToolCall("show_diff", map[string]interface{}{
+	_, err := a.executeTool(context.Background(), llmToolCall("show_diff", map[string]any{
 		"staged": "true", // string instead of bool
 	}))
 	if err == nil {
@@ -28,7 +28,7 @@ func TestShowDiffStagedRejectsNonBool(t *testing.T) {
 func TestShowDiffStagedBoolAccepted(t *testing.T) {
 	a := &Agent{Mode: ModeAct, Executor: &Executor{WorkingDir: t.TempDir()}}
 
-	_, err := a.executeTool(context.Background(), llmToolCall("show_diff", map[string]interface{}{
+	_, err := a.executeTool(context.Background(), llmToolCall("show_diff", map[string]any{
 		"staged": true,
 	}))
 	// We expect either success or a git-level error — but never an arg-type

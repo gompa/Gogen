@@ -119,7 +119,7 @@ func subagentToolDef(bg bool, maxConcurrent int) llm.Tool {
 		"Use for subtasks that would otherwise bloat this context. Subagents cannot " +
 		"spawn subagents by default. " +
 		fmt.Sprintf("At most %d may run concurrently.", maxConcurrent)
-	props := map[string]interface{}{
+	props := map[string]any{
 		"job":   toolProp("string", "Complete, self-contained task for the child agent"),
 		"model": toolProp("string", "Optional model override"),
 	}
@@ -141,7 +141,7 @@ func subagentForkToolDef() llm.Tool {
 		"Fork this session: the child starts with this transcript and runs a job; its edits and "+
 			"turns stay in the child, this conversation is untouched. Use to explore an alternative "+
 			"approach or continue this task without blocking. Foreground: returns the fork's final output.",
-		toolSchema(map[string]interface{}{
+		toolSchema(map[string]any{
 			"job": toolProp("string", "Optional job (default: continue this session)"),
 		}),
 	)
@@ -153,7 +153,7 @@ func listAgentsToolDef() llm.Tool {
 		"List this session's child subagents: id, label, status (running/idle/finished), depth. "+
 			"Read-only. Use to resolve agent ids for send_message/interrupt_agent or check background "+
 			"status. Finished children remain listed briefly.",
-		toolSchema(map[string]interface{}{}),
+		toolSchema(map[string]any{}),
 	)
 }
 
@@ -163,7 +163,7 @@ func sendMessageToolDef() llm.Tool {
 		"Send a message to a running background subagent (agent_id); queued if it is mid-turn. "+
 			"Its reply is injected into this session when it finishes. Use to steer a background subagent: "+
 			"new instructions, changed requirements, or stop-and-report.",
-		toolSchema(map[string]interface{}{
+		toolSchema(map[string]any{
 			"agent_id": toolProp("string", "Subagent id (from list_agents)"),
 			"message":  toolProp("string", "The message to deliver to the subagent"),
 		}, "agent_id", "message"),
@@ -176,7 +176,7 @@ func interruptAgentToolDef() llm.Tool {
 	return toolDef("interrupt_agent",
 		"Cancel a subagent's in-flight turn (agent_id); the session stays alive and can be messaged again. "+
 			"No-op when idle. Use when a background subagent is stuck or off-track.",
-		toolSchema(map[string]interface{}{
+		toolSchema(map[string]any{
 			"agent_id": toolProp("string", "Subagent id (from list_agents)"),
 		}, "agent_id"),
 	)
@@ -189,7 +189,7 @@ func reportToolDef() llm.Tool {
 	return toolDef("report",
 		"Send a progress update to the parent session (starts a turn there; queued if busy). Use to "+
 			"surface findings, hand back partial results, or ask the parent for input. Child-only.",
-		toolSchema(map[string]interface{}{
+		toolSchema(map[string]any{
 			"message": toolProp("string", "Progress update for the parent"),
 		}, "message"),
 	)
@@ -205,7 +205,7 @@ func (a *Agent) continuableSpawner() ContinuableSubagentSpawner {
 // handleSubagent executes a subagent tool call. Reachable only when the
 // subagent feature is enabled (all tool surfaces gate on SubagentsEnabled),
 // so the spawner nil-guard is the only check needed here.
-func handleSubagent(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleSubagent(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	spawner := a.SubagentSpawner()
 	if spawner == nil {
 		return "", fmt.Errorf("subagent spawner is not installed (subagents are unavailable in this mode)")
@@ -241,7 +241,7 @@ func handleSubagent(ctx context.Context, a *Agent, args map[string]interface{}) 
 
 // handleSubagentFork executes the fork tool (foreground). Reachable only
 // when the subagent feature is enabled and the spawner is continuable.
-func handleSubagentFork(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleSubagentFork(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 	cs := a.continuableSpawner()
 	if cs == nil {
 		return "", fmt.Errorf("subagent_fork is not supported in this mode")
@@ -255,7 +255,7 @@ func handleSubagentFork(ctx context.Context, a *Agent, args map[string]interface
 }
 
 // handleListAgents lists the caller's live children (read-only).
-func handleListAgents(_ context.Context, a *Agent, _ map[string]interface{}) (string, error) {
+func handleListAgents(_ context.Context, a *Agent, _ map[string]any) (string, error) {
 	cs := a.continuableSpawner()
 	if cs == nil {
 		return "", fmt.Errorf("list_agents is not supported in this mode")
@@ -264,7 +264,7 @@ func handleListAgents(_ context.Context, a *Agent, _ map[string]interface{}) (st
 }
 
 // handleSendMessage delivers a message to a live background subagent.
-func handleSendMessage(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleSendMessage(_ context.Context, a *Agent, args map[string]any) (string, error) {
 	cs := a.continuableSpawner()
 	if cs == nil {
 		return "", fmt.Errorf("send_message is not supported in this mode")
@@ -284,7 +284,7 @@ func handleSendMessage(_ context.Context, a *Agent, args map[string]interface{})
 }
 
 // handleInterruptAgent cancels a subagent's in-flight turn.
-func handleInterruptAgent(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleInterruptAgent(_ context.Context, a *Agent, args map[string]any) (string, error) {
 	cs := a.continuableSpawner()
 	if cs == nil {
 		return "", fmt.Errorf("interrupt_agent is not supported in this mode")
@@ -302,7 +302,7 @@ func handleInterruptAgent(_ context.Context, a *Agent, args map[string]interface
 // handleReport delivers a progress message from a child to its live parent.
 // Reachable only for nested children with an installed report hook (all
 // tool surfaces gate on that), so the hook nil-guard is the only check.
-func handleReport(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleReport(_ context.Context, a *Agent, args map[string]any) (string, error) {
 	message, err := stringArg(args, "message")
 	if err != nil {
 		return "", err

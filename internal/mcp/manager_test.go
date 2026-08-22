@@ -64,12 +64,12 @@ func TestRegistryDefinitionsPopulated(t *testing.T) {
 		"mcp_srv_fetch": {
 			server: "srv",
 			tool:   "fetch",
-			schema: llm.Tool{Name: "fetch", Description: "Fetch a URL", Parameters: map[string]interface{}{"type": "object"}},
+			schema: llm.Tool{Name: "fetch", Description: "Fetch a URL", Parameters: map[string]any{"type": "object"}},
 		},
 		"mcp_srv_search": {
 			server: "srv",
 			tool:   "search",
-			schema: llm.Tool{Name: "search", Description: "Search the web", Parameters: map[string]interface{}{"type": "object"}},
+			schema: llm.Tool{Name: "search", Description: "Search the web", Parameters: map[string]any{"type": "object"}},
 		},
 	}}
 	defs := r.Definitions()

@@ -18,14 +18,14 @@ func parseContextLimitFromJSON(raw string) int {
 	if raw == "" {
 		return 0
 	}
-	var doc map[string]interface{}
+	var doc map[string]any
 	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
 		return 0
 	}
 	if limit := contextLimitFromMap(doc); limit > 0 {
 		return limit
 	}
-	if meta, ok := doc["meta"].(map[string]interface{}); ok {
+	if meta, ok := doc["meta"].(map[string]any); ok {
 		if limit := contextLimitFromMap(meta); limit > 0 {
 			return limit
 		}
@@ -33,7 +33,7 @@ func parseContextLimitFromJSON(raw string) int {
 	return 0
 }
 
-func contextLimitFromMap(doc map[string]interface{}) int {
+func contextLimitFromMap(doc map[string]any) int {
 	for _, key := range contextFields {
 		if limit := jsonNumberToInt(doc[key]); limit > 0 {
 			return limit
@@ -42,7 +42,7 @@ func contextLimitFromMap(doc map[string]interface{}) int {
 	return 0
 }
 
-func jsonNumberToInt(v interface{}) int {
+func jsonNumberToInt(v any) int {
 	switch n := v.(type) {
 	case float64:
 		if n <= 0 || n > float64(math.MaxInt) {

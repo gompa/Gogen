@@ -220,14 +220,14 @@ func (a *streamAccumulator) buildResult() (*StreamResult, error) {
 		if acc.Name == "" {
 			continue
 		}
-		var args map[string]interface{}
+		var args map[string]any
 		var argsErr string
 		if strings.TrimSpace(acc.ArgsStr) == "" {
-			args = map[string]interface{}{}
+			args = map[string]any{}
 		} else {
 			parsed, parseErr := parseToolCallArgs(acc.ArgsStr)
 			if parseErr != nil {
-				args = map[string]interface{}{}
+				args = map[string]any{}
 				argsErr = parseErr.Error()
 			} else {
 				args = parsed

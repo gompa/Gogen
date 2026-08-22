@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 
 	"gogen/internal/treesitter"
@@ -149,7 +149,7 @@ func (e *Executor) findIndirectDependents(ctx context.Context, directDependents 
 	for file := range indirect {
 		result = append(result, file)
 	}
-	sort.Strings(result)
+	slices.Sort(result)
 
 	return result
 }

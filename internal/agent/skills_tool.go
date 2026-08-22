@@ -23,7 +23,7 @@ func skillsToolDef() llm.Tool {
 			"into context. Use when a task matches a listed skill; the body contains project-specific procedures, "+
 			"conventions, or checklists.",
 		toolSchema(
-			map[string]interface{}{
+			map[string]any{
 				"action": toolPropEnum("string", []string{"list", "read"}, "Skill action"),
 				"name":   toolProp("string", "Skill name (action=read)"),
 			},
@@ -35,7 +35,7 @@ func skillsToolDef() llm.Tool {
 // handleSkill executes a skill tool call. Reachable only when the skills
 // feature is enabled (all tool surfaces gate on SkillsEnabled), so the
 // manager nil-guard is the only check needed here.
-func handleSkill(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleSkill(_ context.Context, a *Agent, args map[string]any) (string, error) {
 	m := a.SkillsManager()
 	if m == nil {
 		return "", fmt.Errorf("skills manager is not initialized")

@@ -38,7 +38,7 @@ func (s *termStreamStubProvider) GenerateResponseStream(_ context.Context, _ []l
 			ToolCalls: []llm.ToolCall{{
 				ID:   "call_e2e",
 				Name: "execute_command",
-				Args: map[string]interface{}{"command": "sleep 0.2 && echo hello && echo world"},
+				Args: map[string]any{"command": "sleep 0.2 && echo hello && echo world"},
 			}},
 		}, nil
 	}

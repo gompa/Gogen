@@ -40,7 +40,7 @@ func TestReadImageAttachesImageAfterToolResult(t *testing.T) {
 	a := NewAgent(nil, exec, nil)
 	writeTestImage(t, filepath.Join(dir, "pic.png"), mustDecodePNG(t))
 
-	tc := llm.ToolCall{ID: "tc1", Name: "read_image", Args: map[string]interface{}{"path": "pic.png"}}
+	tc := llm.ToolCall{ID: "tc1", Name: "read_image", Args: map[string]any{"path": "pic.png"}}
 	a.appendMessage(llm.Message{Role: "assistant", Content: "", ToolCalls: []llm.ToolCall{tc}})
 
 	if outcome, _ := a.runToolRound(context.Background(), &llm.StreamHandlers{}, []llm.ToolCall{tc}); outcome != toolRoundContinue {
@@ -84,8 +84,8 @@ func TestReadImageParallelAppendsImagesInModelOrder(t *testing.T) {
 	writeTestImage(t, filepath.Join(dir, "b.png"), mustDecodePNG(t))
 
 	calls := []llm.ToolCall{
-		{ID: "tc1", Name: "read_image", Args: map[string]interface{}{"path": "a.png"}},
-		{ID: "tc2", Name: "read_image", Args: map[string]interface{}{"path": "b.png"}},
+		{ID: "tc1", Name: "read_image", Args: map[string]any{"path": "a.png"}},
+		{ID: "tc2", Name: "read_image", Args: map[string]any{"path": "b.png"}},
 	}
 	a.appendMessage(llm.Message{Role: "assistant", Content: "", ToolCalls: calls})
 
@@ -118,7 +118,7 @@ func TestReadImageRejectsPathEscape(t *testing.T) {
 	exec := NewExecutor(dir)
 	a := NewAgent(nil, exec, nil)
 
-	_, err := a.executeTool(context.Background(), llm.ToolCall{Name: "read_image", Args: map[string]interface{}{"path": "../outside.png"}})
+	_, err := a.executeTool(context.Background(), llm.ToolCall{Name: "read_image", Args: map[string]any{"path": "../outside.png"}})
 	if err == nil || !strings.Contains(err.Error(), "outside of allowed boundary") {
 		t.Fatalf("expected boundary error, got %v", err)
 	}
@@ -132,7 +132,7 @@ func TestReadImageRejectsOversized(t *testing.T) {
 	a := NewAgent(nil, exec, nil)
 	writeTestImage(t, filepath.Join(dir, "huge.png"), make([]byte, readImageMaxBytes+1))
 
-	_, err := a.executeTool(context.Background(), llm.ToolCall{Name: "read_image", Args: map[string]interface{}{"path": "huge.png"}})
+	_, err := a.executeTool(context.Background(), llm.ToolCall{Name: "read_image", Args: map[string]any{"path": "huge.png"}})
 	if err == nil || !strings.Contains(err.Error(), "supports files up to") {
 		t.Fatalf("expected size-cap error, got %v", err)
 	}
@@ -145,7 +145,7 @@ func TestReadImageRejectsNonImage(t *testing.T) {
 	a := NewAgent(nil, exec, nil)
 	writeTestImage(t, filepath.Join(dir, "notes.txt"), []byte("hello world, not an image"))
 
-	_, err := a.executeTool(context.Background(), llm.ToolCall{Name: "read_image", Args: map[string]interface{}{"path": "notes.txt"}})
+	_, err := a.executeTool(context.Background(), llm.ToolCall{Name: "read_image", Args: map[string]any{"path": "notes.txt"}})
 	if err == nil || !strings.Contains(err.Error(), "not a supported image") {
 		t.Fatalf("expected non-image error, got %v", err)
 	}
@@ -159,7 +159,7 @@ func TestReadImageRejectsSVG(t *testing.T) {
 	a := NewAgent(nil, exec, nil)
 	writeTestImage(t, filepath.Join(dir, "vector.svg"), []byte("<svg xmlns='http://www.w3.org/2000/svg'><rect width='1' height='1'/></svg>"))
 
-	_, err := a.executeTool(context.Background(), llm.ToolCall{Name: "read_image", Args: map[string]interface{}{"path": "vector.svg"}})
+	_, err := a.executeTool(context.Background(), llm.ToolCall{Name: "read_image", Args: map[string]any{"path": "vector.svg"}})
 	if err == nil || !strings.Contains(err.Error(), "use read_file") {
 		t.Fatalf("expected SVG rejection with read_file hint, got %v", err)
 	}
@@ -174,7 +174,7 @@ func TestReadImageRejectsDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := a.executeTool(context.Background(), llm.ToolCall{Name: "read_image", Args: map[string]interface{}{"path": "imgs"}})
+	_, err := a.executeTool(context.Background(), llm.ToolCall{Name: "read_image", Args: map[string]any{"path": "imgs"}})
 	if err == nil || !strings.Contains(err.Error(), "directory") {
 		t.Fatalf("expected directory error, got %v", err)
 	}
@@ -188,7 +188,7 @@ func TestReadImageDetailForwarding(t *testing.T) {
 	a := NewAgent(nil, exec, nil)
 	writeTestImage(t, filepath.Join(dir, "pic.png"), mustDecodePNG(t))
 
-	tc := llm.ToolCall{ID: "tc1", Name: "read_image", Args: map[string]interface{}{"path": "pic.png", "detail": "high"}}
+	tc := llm.ToolCall{ID: "tc1", Name: "read_image", Args: map[string]any{"path": "pic.png", "detail": "high"}}
 	a.appendMessage(llm.Message{Role: "assistant", Content: "", ToolCalls: []llm.ToolCall{tc}})
 	if outcome, _ := a.runToolRound(context.Background(), &llm.StreamHandlers{}, []llm.ToolCall{tc}); outcome != toolRoundContinue {
 		t.Fatal("tool round reported cancellation")
@@ -197,7 +197,7 @@ func TestReadImageDetailForwarding(t *testing.T) {
 		t.Fatalf("detail = %q, want high", got)
 	}
 
-	if _, err := a.executeTool(context.Background(), llm.ToolCall{Name: "read_image", Args: map[string]interface{}{"path": "pic.png", "detail": "bogus"}}); err == nil || !strings.Contains(err.Error(), "invalid detail") {
+	if _, err := a.executeTool(context.Background(), llm.ToolCall{Name: "read_image", Args: map[string]any{"path": "pic.png", "detail": "bogus"}}); err == nil || !strings.Contains(err.Error(), "invalid detail") {
 		t.Fatalf("expected invalid-detail error, got %v", err)
 	}
 }
@@ -212,7 +212,7 @@ func TestReadImageExtensionFallback(t *testing.T) {
 	// A NUL byte forces DetectContentType to application/octet-stream.
 	writeTestImage(t, filepath.Join(dir, "blob.png"), []byte{0x00, 0x01, 0x02, 0x03})
 
-	tc := llm.ToolCall{ID: "tc1", Name: "read_image", Args: map[string]interface{}{"path": "blob.png"}}
+	tc := llm.ToolCall{ID: "tc1", Name: "read_image", Args: map[string]any{"path": "blob.png"}}
 	a.appendMessage(llm.Message{Role: "assistant", Content: "", ToolCalls: []llm.ToolCall{tc}})
 	if outcome, _ := a.runToolRound(context.Background(), &llm.StreamHandlers{}, []llm.ToolCall{tc}); outcome != toolRoundContinue {
 		t.Fatal("tool round reported cancellation")
@@ -233,11 +233,11 @@ func TestReadImageSessionCap(t *testing.T) {
 	writeTestImage(t, filepath.Join(dir, "pic.png"), mustDecodePNG(t))
 
 	for i := 0; i < maxSessionImages; i++ {
-		if _, err := a.executeTool(ContextWithImageSink(context.Background(), &imageSink{}), llm.ToolCall{Name: "read_image", Args: map[string]interface{}{"path": "pic.png"}}); err != nil {
+		if _, err := a.executeTool(ContextWithImageSink(context.Background(), &imageSink{}), llm.ToolCall{Name: "read_image", Args: map[string]any{"path": "pic.png"}}); err != nil {
 			t.Fatalf("call %d: %v", i+1, err)
 		}
 	}
-	_, err := a.executeTool(ContextWithImageSink(context.Background(), &imageSink{}), llm.ToolCall{Name: "read_image", Args: map[string]interface{}{"path": "pic.png"}})
+	_, err := a.executeTool(ContextWithImageSink(context.Background(), &imageSink{}), llm.ToolCall{Name: "read_image", Args: map[string]any{"path": "pic.png"}})
 	if err == nil || !strings.Contains(err.Error(), "session image limit reached") {
 		t.Fatalf("expected session-limit error on the %d-th attachment, got %v", maxSessionImages+1, err)
 	}
@@ -252,7 +252,7 @@ func TestReadImageRequiresImageSink(t *testing.T) {
 	a := NewAgent(nil, exec, nil)
 	writeTestImage(t, filepath.Join(dir, "pic.png"), mustDecodePNG(t))
 
-	_, err := a.executeTool(context.Background(), llm.ToolCall{Name: "read_image", Args: map[string]interface{}{"path": "pic.png"}})
+	_, err := a.executeTool(context.Background(), llm.ToolCall{Name: "read_image", Args: map[string]any{"path": "pic.png"}})
 	if err == nil || !strings.Contains(err.Error(), "no image sink") {
 		t.Fatalf("expected missing-sink error, got %v", err)
 	}
@@ -268,12 +268,12 @@ func TestReadImageSessionCapResetsOnNewSession(t *testing.T) {
 	writeTestImage(t, filepath.Join(dir, "pic.png"), mustDecodePNG(t))
 
 	for i := 0; i < maxSessionImages; i++ {
-		if _, err := a.executeTool(ContextWithImageSink(context.Background(), &imageSink{}), llm.ToolCall{Name: "read_image", Args: map[string]interface{}{"path": "pic.png"}}); err != nil {
+		if _, err := a.executeTool(ContextWithImageSink(context.Background(), &imageSink{}), llm.ToolCall{Name: "read_image", Args: map[string]any{"path": "pic.png"}}); err != nil {
 			t.Fatalf("call %d: %v", i+1, err)
 		}
 	}
 	a.ResetSessionState()
-	if _, err := a.executeTool(ContextWithImageSink(context.Background(), &imageSink{}), llm.ToolCall{Name: "read_image", Args: map[string]interface{}{"path": "pic.png"}}); err != nil {
+	if _, err := a.executeTool(ContextWithImageSink(context.Background(), &imageSink{}), llm.ToolCall{Name: "read_image", Args: map[string]any{"path": "pic.png"}}); err != nil {
 		t.Fatalf("cap must reset with the session: %v", err)
 	}
 }

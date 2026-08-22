@@ -59,7 +59,7 @@ func TestContinuableToolGating(t *testing.T) {
 	}
 	for _, def := range a.llmTools() {
 		if def.Name == "subagent" {
-			if _, has := def.Parameters["properties"].(map[string]interface{})["run_in_background"]; has {
+			if _, has := def.Parameters["properties"].(map[string]any)["run_in_background"]; has {
 				t.Fatal("run_in_background must not appear with a plain spawner")
 			}
 		}
@@ -82,7 +82,7 @@ func TestContinuableToolGating(t *testing.T) {
 	for _, def := range a.llmTools() {
 		if def.Name == "subagent" {
 			seen = true
-			props := def.Parameters["properties"].(map[string]interface{})
+			props := def.Parameters["properties"].(map[string]any)
 			if _, has := props["run_in_background"]; !has {
 				t.Fatal("run_in_background must appear with a continuable spawner")
 			}
@@ -112,7 +112,7 @@ func TestContinuableToolExecution(t *testing.T) {
 	cs := &fakeContinuableSpawner{fakeSpawner: fakeSpawner{report: "r"}}
 	a.SetSubagentSpawner(cs)
 
-	out, err := a.executeTool(t.Context(), llm.ToolCall{Name: "subagent", Args: map[string]interface{}{"job": "j", "run_in_background": true}})
+	out, err := a.executeTool(t.Context(), llm.ToolCall{Name: "subagent", Args: map[string]any{"job": "j", "run_in_background": true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func TestContinuableToolExecution(t *testing.T) {
 		t.Fatalf("SpawnBackground calls = %d, want 1", cs.bgCalls)
 	}
 
-	if out, err = a.executeTool(t.Context(), llm.ToolCall{Name: "subagent", Args: map[string]interface{}{"job": "j"}}); err != nil {
+	if out, err = a.executeTool(t.Context(), llm.ToolCall{Name: "subagent", Args: map[string]any{"job": "j"}}); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out, "r") {
@@ -133,25 +133,25 @@ func TestContinuableToolExecution(t *testing.T) {
 		t.Fatalf("foreground call must not use SpawnBackground")
 	}
 
-	if out, err = a.executeTool(t.Context(), llm.ToolCall{Name: "subagent_fork", Args: map[string]interface{}{}}); err != nil {
+	if out, err = a.executeTool(t.Context(), llm.ToolCall{Name: "subagent_fork", Args: map[string]any{}}); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out, "fork report") {
 		t.Fatalf("fork output = %q", out)
 	}
-	if out, err = a.executeTool(t.Context(), llm.ToolCall{Name: "list_agents", Args: map[string]interface{}{}}); err != nil {
+	if out, err = a.executeTool(t.Context(), llm.ToolCall{Name: "list_agents", Args: map[string]any{}}); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out, "bg-child-1") {
 		t.Fatalf("list output = %q", out)
 	}
-	if out, err = a.executeTool(t.Context(), llm.ToolCall{Name: "send_message", Args: map[string]interface{}{"agent_id": "bg-child-1", "message": "hi"}}); err != nil {
+	if out, err = a.executeTool(t.Context(), llm.ToolCall{Name: "send_message", Args: map[string]any{"agent_id": "bg-child-1", "message": "hi"}}); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out, "delivered") {
 		t.Fatalf("send output = %q", out)
 	}
-	if out, err = a.executeTool(t.Context(), llm.ToolCall{Name: "interrupt_agent", Args: map[string]interface{}{"agent_id": "bg-child-1"}}); err != nil {
+	if out, err = a.executeTool(t.Context(), llm.ToolCall{Name: "interrupt_agent", Args: map[string]any{"agent_id": "bg-child-1"}}); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out, "Interrupted") {
@@ -162,7 +162,7 @@ func TestContinuableToolExecution(t *testing.T) {
 	called := false
 	a.SetParentID("parent-1")
 	a.SetReportHook(func(text string) error { called = true; return nil })
-	if out, err = a.executeTool(t.Context(), llm.ToolCall{Name: "report", Args: map[string]interface{}{"message": "progress"}}); err != nil {
+	if out, err = a.executeTool(t.Context(), llm.ToolCall{Name: "report", Args: map[string]any{"message": "progress"}}); err != nil {
 		t.Fatal(err)
 	}
 	if !called || !strings.Contains(out, "Reported") {
@@ -175,7 +175,7 @@ func TestContinuableToolExecution(t *testing.T) {
 		if _, ok := a.AllowedToolNames()[name]; ok {
 			t.Fatalf("%s must be blocked in plan mode", name)
 		}
-		if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: name, Args: map[string]interface{}{}}); err == nil {
+		if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: name, Args: map[string]any{}}); err == nil {
 			t.Fatalf("%s must fail in plan mode", name)
 		}
 	}

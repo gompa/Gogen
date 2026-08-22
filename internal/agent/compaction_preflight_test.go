@@ -84,7 +84,7 @@ func TestPreflightMidLoopForcedCompaction(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		a.appendMessage(llm.Message{Role: "user", Content: textOfTokens(t, 400)})
 	}
-	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "search_code", Args: map[string]interface{}{"pattern": "x"}}}})
+	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "search_code", Args: map[string]any{"pattern": "x"}}}})
 	a.appendMessage(llm.Message{Role: "tool", ToolCallID: "call_1", Content: "3 hits in main.go"})
 	_ = a.ContextStats(context.Background())
 	setLimitOverEstimate(t, a, mgr, 50)
@@ -131,9 +131,9 @@ func TestPreflightMidLoopPinnedTailProtocol(t *testing.T) {
 	a.appendMessage(llm.Message{Role: "user", Content: "hello"})
 	a.appendMessage(llm.Message{Role: "user", Content: textOfTokens(t, 800)})
 	a.appendMessage(llm.Message{Role: "user", Content: textOfTokens(t, 800)})
-	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "search_code", Args: map[string]interface{}{"pattern": "x"}}}})
+	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "search_code", Args: map[string]any{"pattern": "x"}}}})
 	a.appendMessage(llm.Message{Role: "tool", ToolCallID: "call_1", Content: "3 hits in main.go"})
-	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_2", Name: "read_file", Args: map[string]interface{}{"path": "main.go"}}}})
+	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_2", Name: "read_file", Args: map[string]any{"path": "main.go"}}}})
 	a.appendMessage(llm.Message{Role: "tool", ToolCallID: "call_2", Content: "package main"})
 	_ = a.ContextStats(context.Background())
 	setLimitOverEstimate(t, a, mgr, 50)
@@ -179,7 +179,7 @@ func TestPreflightCappingOnlyNoLLMCall(t *testing.T) {
 	})
 	a := NewAgent(provider, &Executor{WorkingDir: "."}, mgr)
 	a.appendMessage(llm.Message{Role: "user", Content: "hello"})
-	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "execute_command", Args: map[string]interface{}{"command": "ls -la"}}}})
+	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "execute_command", Args: map[string]any{"command": "ls -la"}}}})
 	a.appendMessage(llm.Message{Role: "tool", ToolCallID: "call_1", Content: strings.Repeat("y", 30000)})
 	_ = a.ContextStats(context.Background())
 	setLimitOverEstimate(t, a, mgr, 50)
@@ -212,7 +212,7 @@ func TestPreflightStrictShrinkAbort(t *testing.T) {
 	a, mgr, provider := newPreflightTestAgent(t)
 	a.appendMessage(llm.Message{Role: "user", Content: "hello"})
 	a.appendMessage(llm.Message{Role: "user", Content: textOfTokens(t, 800)})
-	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "search_code", Args: map[string]interface{}{"pattern": "x"}}}})
+	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "search_code", Args: map[string]any{"pattern": "x"}}}})
 	a.appendMessage(llm.Message{Role: "tool", ToolCallID: "call_1", Content: "3 hits in main.go"})
 	_ = a.ContextStats(context.Background())
 	setLimitOverEstimate(t, a, mgr, 50)
@@ -244,7 +244,7 @@ func TestPreflightStrictShrinkAbort(t *testing.T) {
 func TestPreflightDegenerateWindowNoOp(t *testing.T) {
 	a, mgr, provider := newPreflightTestAgent(t)
 	a.appendMessage(llm.Message{Role: "user", Content: "hello"})
-	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "search_code", Args: map[string]interface{}{"pattern": "x"}}}})
+	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "search_code", Args: map[string]any{"pattern": "x"}}}})
 	a.appendMessage(llm.Message{Role: "tool", ToolCallID: "call_1", Content: "3 hits in main.go"})
 	_ = a.ContextStats(context.Background())
 	mgr.SetContextLimit(1000)
@@ -271,7 +271,7 @@ func TestPreflightProgressGuardSuppressesRetry(t *testing.T) {
 	a, mgr, provider := newPreflightTestAgent(t)
 	a.appendMessage(llm.Message{Role: "user", Content: "hello"})
 	a.appendMessage(llm.Message{Role: "user", Content: textOfTokens(t, 400)})
-	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "search_code", Args: map[string]interface{}{"pattern": "x"}}}})
+	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "search_code", Args: map[string]any{"pattern": "x"}}}})
 	a.appendMessage(llm.Message{Role: "tool", ToolCallID: "call_1", Content: "3 hits in main.go"})
 	_ = a.ContextStats(context.Background())
 	setLimitOverEstimate(t, a, mgr, 50)
@@ -288,7 +288,7 @@ func TestPreflightProgressGuardSuppressesRetry(t *testing.T) {
 		t.Fatalf("same-count retry: %d -> %d summarization calls, want no new calls (progress guard)", calls1, got)
 	}
 	// Growth past the failed count re-arms the guard.
-	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_2", Name: "read_file", Args: map[string]interface{}{"path": "main.go"}}}})
+	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_2", Name: "read_file", Args: map[string]any{"path": "main.go"}}}})
 	a.appendMessage(llm.Message{Role: "tool", ToolCallID: "call_2", Content: "package main"})
 	a.prepareMessages(context.Background(), nil)
 	if got := atomic.LoadInt64(&provider.calls); got <= calls1 {
@@ -304,7 +304,7 @@ func TestPreflightBelowLimitNoOp(t *testing.T) {
 	a, mgr, provider := newPreflightTestAgent(t)
 	a.appendMessage(llm.Message{Role: "user", Content: "hello"})
 	a.appendMessage(llm.Message{Role: "user", Content: textOfTokens(t, 400)})
-	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "search_code", Args: map[string]interface{}{"pattern": "x"}}}})
+	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "search_code", Args: map[string]any{"pattern": "x"}}}})
 	a.appendMessage(llm.Message{Role: "tool", ToolCallID: "call_1", Content: "3 hits in main.go"})
 	_ = a.ContextStats(context.Background())
 	a.statsMu.RLock()
@@ -339,7 +339,7 @@ func TestPreflightStillOverHandsOff(t *testing.T) {
 	a.appendMessage(llm.Message{Role: "user", Content: "hello"})
 	a.appendMessage(llm.Message{Role: "user", Content: textOfTokens(t, 20)})
 	a.appendMessage(llm.Message{Role: "user", Content: textOfTokens(t, 20)})
-	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "search_code", Args: map[string]interface{}{"pattern": "x"}}}})
+	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "search_code", Args: map[string]any{"pattern": "x"}}}})
 	a.appendMessage(llm.Message{Role: "tool", ToolCallID: "call_1", Content: "3 hits in main.go"})
 	_ = a.ContextStats(context.Background())
 	// Derive the limit so the pre-compaction estimate is over the window

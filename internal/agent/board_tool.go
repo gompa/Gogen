@@ -26,7 +26,7 @@ func boardToolDef() llm.Tool {
 			"claim <id> (assign to self and move to in_progress), move <id> <column>, "+
 			"block <id> <reason>, comment <id> <text>, done <id>, remove <id> (delete a card entirely).",
 		toolSchema(
-			map[string]interface{}{
+			map[string]any{
 				"action":      toolPropEnum("string", []string{"list", "show", "add", "claim", "move", "block", "comment", "done", "remove"}, "Board action"),
 				"id":          toolProp("integer", "Board item id (show, claim, move, block, comment, done, remove)"),
 				"title":       toolProp("string", "Item title (add)"),
@@ -45,7 +45,7 @@ func boardToolDef() llm.Tool {
 // the board feature is enabled (llmTools/AllowedToolNames/executeTool all
 // gate on a.BoardEnabled()), so no extra flag check is needed here beyond the
 // manager nil-guard (mirrors the MCP registry contract).
-func handleBoard(_ context.Context, a *Agent, args map[string]interface{}) (string, error) {
+func handleBoard(_ context.Context, a *Agent, args map[string]any) (string, error) {
 	m := a.BoardManager()
 	if m == nil {
 		return "", fmt.Errorf("board manager is not initialized")

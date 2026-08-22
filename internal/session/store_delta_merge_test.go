@@ -105,6 +105,6 @@ func TestLoadDropsStaleDeltaAfterCrash(t *testing.T) {
 	}
 }
 
-func jsonMarshal(v interface{}) ([]byte, error) {
+func jsonMarshal(v any) ([]byte, error) {
 	return json.Marshal(v)
 }

@@ -85,7 +85,7 @@ func seedOverflowConversation(t *testing.T, a *Agent) *PinManager {
 	a.appendMessage(llm.Message{Role: "user", Content: "hello"})
 	a.appendMessage(llm.Message{Role: "user", Content: textOfTokens(t, 400)})
 	a.appendMessage(llm.Message{Role: "user", Content: textOfTokens(t, 400)})
-	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "search_code", Args: map[string]interface{}{"pattern": "x"}}}})
+	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "search_code", Args: map[string]any{"pattern": "x"}}}})
 	a.appendMessage(llm.Message{Role: "tool", ToolCallID: "call_1", Content: "3 hits in main.go"})
 	a.appendMessage(llm.Message{Role: "user", Content: textOfTokens(t, 400)})
 	_ = a.ContextStats(context.Background())

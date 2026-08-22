@@ -3,7 +3,7 @@ package contextmgr
 import (
 	"encoding/json"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 
@@ -55,12 +55,12 @@ func ComputeMessageTokens(msg llm.Message) int {
 	return computeMessageTokens(msg, messageCounterFor(), nil) + imageTokenEstimate(msg)
 }
 
-func sortedToolArgKeys(args map[string]interface{}) []string {
+func sortedToolArgKeys(args map[string]any) []string {
 	keys := make([]string, 0, len(args))
 	for k := range args {
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
+	slices.Sort(keys)
 	return keys
 }
 

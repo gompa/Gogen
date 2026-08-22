@@ -35,7 +35,7 @@ const maxDefinitions = 300
 // parserPool reuses tree-sitter parsers to avoid C FFI allocation overhead
 // on every parse call. Parsers are safe to reuse after SetLanguage.
 var parserPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return tree_sitter.NewParser()
 	},
 }

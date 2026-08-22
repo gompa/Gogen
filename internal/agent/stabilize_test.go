@@ -12,7 +12,7 @@ func TestStabilizeToolArgsPinsSharedBacking(t *testing.T) {
 		ToolCalls: []llm.ToolCall{{
 			ID:   "1",
 			Name: "read_file",
-			Args: map[string]interface{}{"path": "a.go"},
+			Args: map[string]any{"path": "a.go"},
 		}},
 	}}
 	a := &Agent{Messages: msgs}

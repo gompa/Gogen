@@ -79,7 +79,7 @@ func TestNoExtraNewlineBetweenRounds(t *testing.T) {
 	// Round 1: assistant text (with trailing newline) then a tool call.
 	m.handleStreamToken("I'll read a file.\n")
 	m.handleStreamToolCall(0, "tc0", "read_file")
-	m.handleStreamToolCallFinal(0, llm.ToolCall{Index: 0, ID: "tc0", Name: "read_file", Args: map[string]interface{}{"path": "x"}})
+	m.handleStreamToolCallFinal(0, llm.ToolCall{Index: 0, ID: "tc0", Name: "read_file", Args: map[string]any{"path": "x"}})
 	m.handleStreamToolResult("tc0", "read_file", "contents", true)
 	// OnStreamEnd fires handleStreamRoundEnd.
 	m.handleStreamRoundEnd()

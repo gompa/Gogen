@@ -835,7 +835,7 @@ func scanFileSinglePass(r io.Reader, relPath string, re *regexp.Regexp, contextL
 // binaryProbePool reuses 8KB buffers for binary-file detection to avoid
 // allocating a new buffer on every file walked during search.
 var binaryProbePool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		b := make([]byte, searchBinaryProbe)
 		return &b
 	},

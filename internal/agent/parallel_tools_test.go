@@ -21,7 +21,7 @@ type fakeMCPRegistry struct {
 
 func (f *fakeMCPRegistry) Definitions() []llm.Tool        { return f.defs }
 func (f *fakeMCPRegistry) ToolNames() map[string]struct{} { return f.names }
-func (f *fakeMCPRegistry) CallTool(context.Context, string, map[string]interface{}) (string, error) {
+func (f *fakeMCPRegistry) CallTool(context.Context, string, map[string]any) (string, error) {
 	return "", nil
 }
 
@@ -73,8 +73,8 @@ func TestExecuteToolCallsParallelStreamsToolOutput(t *testing.T) {
 		"printf 'alpha\\n'; printf 'beta\\n'",
 	}
 	toolCalls := []llm.ToolCall{
-		{ID: "c1", Name: "execute_command", Args: map[string]interface{}{"command": cmds[0]}},
-		{ID: "c2", Name: "execute_command", Args: map[string]interface{}{"command": cmds[1]}},
+		{ID: "c1", Name: "execute_command", Args: map[string]any{"command": cmds[0]}},
+		{ID: "c2", Name: "execute_command", Args: map[string]any{"command": cmds[1]}},
 	}
 
 	var mu sync.Mutex
@@ -152,9 +152,9 @@ func TestExecuteToolCallsParallelRunsReadOnlyToolsConcurrently(t *testing.T) {
 	prov.StreamResults = []*llm.StreamResult{
 		{
 			ToolCalls: []llm.ToolCall{
-				{ID: "c1", Name: "read_file", Args: map[string]interface{}{"path": "a.txt"}},
-				{ID: "c2", Name: "read_file", Args: map[string]interface{}{"path": "b.txt"}},
-				{ID: "c3", Name: "read_file", Args: map[string]interface{}{"path": "c.txt"}},
+				{ID: "c1", Name: "read_file", Args: map[string]any{"path": "a.txt"}},
+				{ID: "c2", Name: "read_file", Args: map[string]any{"path": "b.txt"}},
+				{ID: "c3", Name: "read_file", Args: map[string]any{"path": "c.txt"}},
 			},
 		},
 		{Content: "done"},
@@ -169,7 +169,7 @@ func TestExecuteToolCallsParallelRunsReadOnlyToolsConcurrently(t *testing.T) {
 	active, maxActive := 0, 0
 	builtin := BuiltinToolHandlers()
 	orig := builtin["read_file"]
-	builtin["read_file"] = func(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+	builtin["read_file"] = func(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 		mu.Lock()
 		active++
 		if active > maxActive {
@@ -240,8 +240,8 @@ func TestToolCallsParallelCancelStillClosesEveryToolCall(t *testing.T) {
 	prov.StreamResults = []*llm.StreamResult{
 		{
 			ToolCalls: []llm.ToolCall{
-				{ID: "c1", Name: "read_file", Args: map[string]interface{}{"path": "a.txt"}},
-				{ID: "c2", Name: "read_file", Args: map[string]interface{}{"path": "a.txt"}},
+				{ID: "c1", Name: "read_file", Args: map[string]any{"path": "a.txt"}},
+				{ID: "c2", Name: "read_file", Args: map[string]any{"path": "a.txt"}},
 			},
 		},
 		{Content: "done"},
@@ -252,7 +252,7 @@ func TestToolCallsParallelCancelStillClosesEveryToolCall(t *testing.T) {
 
 	builtin := BuiltinToolHandlers()
 	orig := builtin["read_file"]
-	builtin["read_file"] = func(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+	builtin["read_file"] = func(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 		// Block long enough for the cancel to land mid-flight.
 		select {
 		case <-ctx.Done():
@@ -306,7 +306,7 @@ func TestExecuteToolCallsParallelCancelKeepsCompletedResults(t *testing.T) {
 	orig := builtin["read_file"]
 	fastDone := make(chan struct{})
 	var once sync.Once
-	builtin["read_file"] = func(ctx context.Context, a *Agent, args map[string]interface{}) (string, error) {
+	builtin["read_file"] = func(ctx context.Context, a *Agent, args map[string]any) (string, error) {
 		if path, _ := args["path"].(string); path == "slow.txt" {
 			// Stay in flight until the test cancels the turn context.
 			<-ctx.Done()
@@ -319,8 +319,8 @@ func TestExecuteToolCallsParallelCancelKeepsCompletedResults(t *testing.T) {
 	a.SetToolHandlers(builtin)
 
 	toolCalls := []llm.ToolCall{
-		{ID: "c1", Name: "read_file", Args: map[string]interface{}{"path": "fast.txt"}},
-		{ID: "c2", Name: "read_file", Args: map[string]interface{}{"path": "slow.txt"}},
+		{ID: "c1", Name: "read_file", Args: map[string]any{"path": "fast.txt"}},
+		{ID: "c2", Name: "read_file", Args: map[string]any{"path": "slow.txt"}},
 	}
 
 	var mu sync.Mutex

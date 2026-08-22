@@ -31,7 +31,7 @@ func (s *toolOutputStubProvider) GenerateResponseStream(_ context.Context, _ []l
 			ToolCalls: []llm.ToolCall{{
 				ID:   "call_1",
 				Name: "execute_command",
-				Args: map[string]interface{}{"command": "echo hello"},
+				Args: map[string]any{"command": "echo hello"},
 			}},
 		}, nil
 	}

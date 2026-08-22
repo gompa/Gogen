@@ -104,19 +104,19 @@ func TestEstimateToolTokens(t *testing.T) {
 		Type:        "function",
 		Name:        "ping",
 		Description: "ping the service",
-		Parameters:  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+		Parameters:  map[string]any{"type": "object", "properties": map[string]any{}},
 	}
 	big := llm.Tool{
 		Type:        "function",
 		Name:        "do_work",
 		Description: strings.Repeat("a very long description of what the tool does ", 50),
-		Parameters: map[string]interface{}{
+		Parameters: map[string]any{
 			"type": "object",
-			"properties": map[string]interface{}{
-				"query":   map[string]interface{}{"type": "string", "description": "the query"},
-				"limit":   map[string]interface{}{"type": "integer"},
-				"verbose": map[string]interface{}{"type": "boolean"},
-				"filters": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+			"properties": map[string]any{
+				"query":   map[string]any{"type": "string", "description": "the query"},
+				"limit":   map[string]any{"type": "integer"},
+				"verbose": map[string]any{"type": "boolean"},
+				"filters": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 			},
 		},
 	}
@@ -183,11 +183,11 @@ func TestEstimateToolTokens(t *testing.T) {
 // does not depend on map construction/iteration order: the agent's
 // wire-overhead cache fingerprint relies on it for cache stability.
 func TestToolDefinitionStringStableAcrossMapOrder(t *testing.T) {
-	a := llm.Tool{Type: "function", Name: "t", Description: "d", Parameters: map[string]interface{}{
-		"type": "object", "x": 1, "y": "two", "z": []interface{}{"a", "b"},
+	a := llm.Tool{Type: "function", Name: "t", Description: "d", Parameters: map[string]any{
+		"type": "object", "x": 1, "y": "two", "z": []any{"a", "b"},
 	}}
-	b := llm.Tool{Type: "function", Name: "t", Description: "d", Parameters: map[string]interface{}{
-		"z": []interface{}{"a", "b"}, "type": "object", "y": "two", "x": 1,
+	b := llm.Tool{Type: "function", Name: "t", Description: "d", Parameters: map[string]any{
+		"z": []any{"a", "b"}, "type": "object", "y": "two", "x": 1,
 	}}
 	if got, want := ToolDefinitionString(a), ToolDefinitionString(b); got != want {
 		t.Fatalf("serialization not stable across map order:\n%q\n%q", got, want)

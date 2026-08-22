@@ -251,7 +251,7 @@ func toolCallArgumentsJSON(tc *ToolCall) string {
 	hadArgsStr := tc.ArgsStr != ""
 	if hadArgsStr {
 		debuglog.Write("llm/tool_args", "toolCallArgumentsJSON: ArgsStr invalid, remarsaling without overwrite",
-			"", map[string]interface{}{
+			"", map[string]any{
 				"name":       tc.Name,
 				"id":         tc.ID,
 				"argsStr":    tc.ArgsStr,
@@ -259,7 +259,7 @@ func toolCallArgumentsJSON(tc *ToolCall) string {
 			})
 	} else if len(tc.Args) > 0 {
 		debuglog.Write("llm/tool_args", "toolCallArgumentsJSON: ArgsStr empty, re-marshaling from map",
-			"", map[string]interface{}{
+			"", map[string]any{
 				"name": tc.Name,
 				"id":   tc.ID,
 			})
@@ -274,7 +274,7 @@ func toolCallArgumentsJSON(tc *ToolCall) string {
 
 // marshalToolArgsJSON encodes tool args without HTML escaping so remarsaled
 // bytes stay closer to typical provider JSON (`<` not `\u003c`).
-func marshalToolArgsJSON(args map[string]interface{}) string {
+func marshalToolArgsJSON(args map[string]any) string {
 	if args == nil {
 		return "{}"
 	}
@@ -328,7 +328,7 @@ func (p *OpenAIProvider) GenerateResponse(ctx context.Context, messages []Messag
 
 	var toolCalls []ToolCall
 	for _, tc := range resp.Choices[0].Message.ToolCalls {
-		var args map[string]interface{}
+		var args map[string]any
 		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
 			return Response{}, fmt.Errorf("failed to unmarshal tool call arguments: %w", err)
 		}

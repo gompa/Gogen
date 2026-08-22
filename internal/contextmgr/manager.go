@@ -909,7 +909,7 @@ func (m *Manager) summarizeMiddle(ctx context.Context, viewPrefix, prefix, middl
 		reqTokens += m.EstimateTokens([]llm.Message{instruction})
 	}
 	if reqTokens <= budget {
-		debuglog.Write("contextmgr/summarize", "continuation-summary request", "", map[string]interface{}{
+		debuglog.Write("contextmgr/summarize", "continuation-summary request", "", map[string]any{
 			"path":           "primary",
 			"middleMessages": len(middle),
 			"requestTokens":  reqTokens,
@@ -919,14 +919,14 @@ func (m *Manager) summarizeMiddle(ctx context.Context, viewPrefix, prefix, middl
 		if err == nil {
 			return summary, nil
 		}
-		debuglog.Write("contextmgr/summarize", "continuation-summary request failed; using flattened-text fallback", "", map[string]interface{}{
+		debuglog.Write("contextmgr/summarize", "continuation-summary request failed; using flattened-text fallback", "", map[string]any{
 			"path":           "fallback-after-error",
 			"error":          err.Error(),
 			"middleMessages": len(middle),
 		})
 		return m.summarizeMessagesDepth(ctx, middle, 0)
 	}
-	debuglog.Write("contextmgr/summarize", "summary request exceeds window; using flattened-text fallback", "", map[string]interface{}{
+	debuglog.Write("contextmgr/summarize", "summary request exceeds window; using flattened-text fallback", "", map[string]any{
 		"path":           "fallback",
 		"middleMessages": len(middle),
 		"requestTokens":  reqTokens,
@@ -1186,7 +1186,7 @@ func cloneMessage(msg llm.Message) llm.Message {
 		copy(out.ToolCalls, msg.ToolCalls)
 		for i := range out.ToolCalls {
 			if msg.ToolCalls[i].Args != nil {
-				out.ToolCalls[i].Args = make(map[string]interface{}, len(msg.ToolCalls[i].Args))
+				out.ToolCalls[i].Args = make(map[string]any, len(msg.ToolCalls[i].Args))
 				for k, v := range msg.ToolCalls[i].Args {
 					out.ToolCalls[i].Args[k] = cloneArgValue(v)
 				}
@@ -1199,16 +1199,16 @@ func cloneMessage(msg llm.Message) llm.Message {
 	return out
 }
 
-func cloneArgValue(v interface{}) interface{} {
+func cloneArgValue(v any) any {
 	switch x := v.(type) {
-	case map[string]interface{}:
-		out := make(map[string]interface{}, len(x))
+	case map[string]any:
+		out := make(map[string]any, len(x))
 		for k, val := range x {
 			out[k] = cloneArgValue(val)
 		}
 		return out
-	case []interface{}:
-		out := make([]interface{}, len(x))
+	case []any:
+		out := make([]any, len(x))
 		for i, val := range x {
 			out[i] = cloneArgValue(val)
 		}

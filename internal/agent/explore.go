@@ -7,7 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -118,7 +118,7 @@ func (e *Executor) ListFiles(ctx context.Context, path string, recursive, tracke
 	if err != nil && err != errExploreTruncated {
 		return "", err
 	}
-	sort.Strings(lines)
+	slices.Sort(lines)
 	if trackedOnly {
 		lines = filterTracked(e.GetWorkingDir(), lines)
 	}
@@ -234,7 +234,7 @@ func (e *Executor) GlobFiles(ctx context.Context, pattern, subpath string, track
 	if len(matches) == 0 {
 		return "No matches found", nil
 	}
-	sort.Strings(matches)
+	slices.Sort(matches)
 	if trackedOnly {
 		matches = filterTracked(e.GetWorkingDir(), matches)
 	}

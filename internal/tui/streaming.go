@@ -264,7 +264,7 @@ func (m *Model) closeThinkingBlock() {
 // not silently dropped. The mismatch is logged at debug level.
 func (m *Model) appendToStreamLine(lineIdx int, text string) {
 	if lineIdx < 0 || lineIdx >= len(m.chatLines) {
-		debuglog.Write("tui/stream", "appendToStreamLine: slot invalid", "stream-slot-lost", map[string]interface{}{
+		debuglog.Write("tui/stream", "appendToStreamLine: slot invalid", "stream-slot-lost", map[string]any{
 			"lineIdx":  lineIdx,
 			"chatLen":  len(m.chatLines),
 			"textSize": len(text),
@@ -286,7 +286,7 @@ func (m *Model) appendToStreamLine(lineIdx int, text string) {
 // recorded lineIdx is no longer valid, fall back to the last line and log.
 func (m *Model) replaceStreamLine(lineIdx int, text string) {
 	if lineIdx < 0 || lineIdx >= len(m.chatLines) {
-		debuglog.Write("tui/stream", "replaceStreamLine: slot invalid", "stream-slot-lost", map[string]interface{}{
+		debuglog.Write("tui/stream", "replaceStreamLine: slot invalid", "stream-slot-lost", map[string]any{
 			"lineIdx":  lineIdx,
 			"chatLen":  len(m.chatLines),
 			"textSize": len(text),
@@ -450,12 +450,12 @@ func (m *Model) handleStreamToolCallFinal(index int, tc llm.ToolCall) {
 
 // parseInlineJSONArgs attempts to parse incomplete streaming JSON args.
 // Returns the parsed map on success; nil+error when JSON is not yet complete.
-func parseInlineJSONArgs(raw string) (map[string]interface{}, error) {
+func parseInlineJSONArgs(raw string) (map[string]any, error) {
 	s := strings.TrimSpace(raw)
 	if s == "" || !strings.HasPrefix(s, "{") {
 		return nil, fmt.Errorf("incomplete")
 	}
-	var args map[string]interface{}
+	var args map[string]any
 	err := json.Unmarshal([]byte(s), &args)
 	return args, err
 }

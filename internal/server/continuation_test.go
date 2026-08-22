@@ -348,7 +348,7 @@ func TestApprovalAutoDeniedOnDetach(t *testing.T) {
 	stub.firstTools = []llm.ToolCall{{
 		ID:   "call_del",
 		Name: "delete",
-		Args: map[string]interface{}{"path": "victim.txt"},
+		Args: map[string]any{"path": "victim.txt"},
 	}}
 	s, a, _ := newContinuationServer(t, stub, dir)
 	srv := startWSServer(t, s)

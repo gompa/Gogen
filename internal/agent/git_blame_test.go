@@ -164,7 +164,7 @@ func TestGitBlameNotARepo(t *testing.T) {
 
 func TestHandleGitBlameRequiresFileArg(t *testing.T) {
 	a := &Agent{Executor: &Executor{WorkingDir: t.TempDir()}}
-	if _, err := handleGitBlame(context.Background(), a, map[string]interface{}{}); err == nil {
+	if _, err := handleGitBlame(context.Background(), a, map[string]any{}); err == nil {
 		t.Fatal("expected missing-argument error")
 	} else if !strings.Contains(err.Error(), "file") {
 		t.Fatalf("unexpected error: %v", err)

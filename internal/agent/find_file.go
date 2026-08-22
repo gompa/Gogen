@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -54,7 +54,7 @@ func (e *Executor) FindFile(ctx context.Context, name string, subpath string, li
 		return fmt.Sprintf("No files found matching name %q", name), nil
 	}
 
-	sort.Strings(matches)
+	slices.Sort(matches)
 
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("Files matching %q:\n", name))

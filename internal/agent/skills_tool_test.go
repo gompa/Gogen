@@ -43,7 +43,7 @@ func TestSkillToolGating(t *testing.T) {
 	if _, ok := a.AllowedToolNames()["skill"]; ok {
 		t.Fatal("skill must not be allowed when skills is off")
 	}
-	if _, err := a.executeToolCall(t, "skill", map[string]interface{}{"action": "list"}); err == nil {
+	if _, err := a.executeToolCall(t, "skill", map[string]any{"action": "list"}); err == nil {
 		t.Fatal("executeTool must reject skill when skills is off")
 	}
 
@@ -60,21 +60,21 @@ func TestSkillToolGating(t *testing.T) {
 	if _, ok := a.AllowedToolNames()["skill"]; !ok {
 		t.Fatal("skill must be allowed when skills is on")
 	}
-	out, err := a.executeToolCall(t, "skill", map[string]interface{}{"action": "list"})
+	out, err := a.executeToolCall(t, "skill", map[string]any{"action": "list"})
 	if err != nil {
 		t.Fatalf("skill list: %v", err)
 	}
 	if !strings.Contains(out, "review") || !strings.Contains(out, "Review checklist") {
 		t.Fatalf("skill list = %q", out)
 	}
-	out, err = a.executeToolCall(t, "skill", map[string]interface{}{"action": "read", "name": "review"})
+	out, err = a.executeToolCall(t, "skill", map[string]any{"action": "read", "name": "review"})
 	if err != nil {
 		t.Fatalf("skill read: %v", err)
 	}
 	if !strings.Contains(out, "Checklist") {
 		t.Fatalf("skill read = %q", out)
 	}
-	if _, err := a.executeToolCall(t, "skill", map[string]interface{}{"action": "read", "name": "missing"}); err == nil {
+	if _, err := a.executeToolCall(t, "skill", map[string]any{"action": "read", "name": "missing"}); err == nil {
 		t.Fatal("missing skill must error")
 	}
 }
@@ -87,7 +87,7 @@ func TestSkillToolPlanMode(t *testing.T) {
 	if _, ok := a.AllowedToolNames()["skill"]; !ok {
 		t.Fatal("skill must be allowed in plan mode (read-only)")
 	}
-	out, err := a.executeToolCall(t, "skill", map[string]interface{}{"action": "list"})
+	out, err := a.executeToolCall(t, "skill", map[string]any{"action": "list"})
 	if err != nil {
 		t.Fatalf("skill list in plan mode: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestSkillToolPlanMode(t *testing.T) {
 }
 
 // executeToolCall routes one tool call through the agent's executeTool.
-func (a *Agent) executeToolCall(t *testing.T, name string, args map[string]interface{}) (string, error) {
+func (a *Agent) executeToolCall(t *testing.T, name string, args map[string]any) (string, error) {
 	t.Helper()
 	tc := llm.ToolCall{ID: "c1", Name: name, Args: args}
 	return a.executeTool(t.Context(), tc)

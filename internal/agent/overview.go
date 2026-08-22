@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 )
 
@@ -52,7 +51,7 @@ func (e *Executor) RepoOverview(ctx context.Context) (string, error) {
 	slices.SortStableFunc(dirs, func(a, b dirCount) int {
 		return cmp.Or(cmp.Compare(b.files, a.files), cmp.Compare(a.name, b.name))
 	})
-	sort.Strings(rootFiles)
+	slices.Sort(rootFiles)
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "Repository overview (%s)\n", filepath.ToSlash(e.GetWorkingDir()))

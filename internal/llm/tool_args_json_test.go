@@ -9,7 +9,7 @@ func TestToolCallArgumentsJSONPrefersArgsStr(t *testing.T) {
 	raw := `{"path": "a.go", "offset":1}`
 	tc := ToolCall{
 		Name:    "read_file",
-		Args:    map[string]interface{}{"offset": 1.0, "path": "a.go"},
+		Args:    map[string]any{"offset": 1.0, "path": "a.go"},
 		ArgsStr: raw,
 	}
 	if got := toolCallArgumentsJSON(&tc); got != raw {
@@ -20,7 +20,7 @@ func TestToolCallArgumentsJSONPrefersArgsStr(t *testing.T) {
 func TestToolCallArgumentsJSONFallsBackToMarshal(t *testing.T) {
 	tc := ToolCall{
 		Name: "read_file",
-		Args: map[string]interface{}{"path": "a.go"},
+		Args: map[string]any{"path": "a.go"},
 	}
 	got := toolCallArgumentsJSON(&tc)
 	if got != `{"path":"a.go"}` {
@@ -35,7 +35,7 @@ func TestToolCallArgumentsJSONFallsBackOnInvalidArgsStr(t *testing.T) {
 	orig := `{"path":`
 	tc := ToolCall{
 		Name:    "read_file",
-		Args:    map[string]interface{}{"path": "a.go"},
+		Args:    map[string]any{"path": "a.go"},
 		ArgsStr: orig,
 	}
 	if got := toolCallArgumentsJSON(&tc); got != `{"path":"a.go"}` {
@@ -50,7 +50,7 @@ func TestToolCallArgumentsJSONFallsBackOnInvalidArgsStr(t *testing.T) {
 func TestToolCallArgumentsJSONDoesNotHTMLEscape(t *testing.T) {
 	tc := ToolCall{
 		Name: "read_file",
-		Args: map[string]interface{}{"path": "a<b>.go"},
+		Args: map[string]any{"path": "a<b>.go"},
 	}
 	got := toolCallArgumentsJSON(&tc)
 	if strings.Contains(got, `\u003c`) {
@@ -92,7 +92,7 @@ func TestToolCallArgumentsJSONPinsEmptyObject(t *testing.T) {
 func TestToolCallArgumentsJSONStableAcrossCalls(t *testing.T) {
 	tc := ToolCall{
 		Name: "read_file",
-		Args: map[string]interface{}{"z": 1.0, "a": 2.0, "m": 3.0},
+		Args: map[string]any{"z": 1.0, "a": 2.0, "m": 3.0},
 	}
 	first := toolCallArgumentsJSON(&tc)
 	second := toolCallArgumentsJSON(&tc)
@@ -120,7 +120,7 @@ func TestStabilizeToolCallArgsMemoizesValidity(t *testing.T) {
 		t.Fatalf("fast path returned %q", got)
 	}
 
-	invalid := ToolCall{Name: "read_file", ArgsStr: `{"path":`, Args: map[string]interface{}{"path": "a.go"}}
+	invalid := ToolCall{Name: "read_file", ArgsStr: `{"path":`, Args: map[string]any{"path": "a.go"}}
 	StabilizeToolCallArgs(&invalid)
 	if invalid.ArgsJSONValid {
 		t.Fatal("invalid ArgsStr must not be flagged valid")

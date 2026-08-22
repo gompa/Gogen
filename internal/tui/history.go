@@ -131,7 +131,7 @@ func renderToolResult(msg llm.Message, tcMap map[string]llm.ToolCall) []string {
 // spaces, truncating values longer than maxLen (in runes) with an ellipsis.
 // skip, when non-nil, omits keys for which it returns true. When no key
 // survives, returns "".
-func formatArgsMap(args map[string]interface{}, maxLen int, skip func(string) bool) string {
+func formatArgsMap(args map[string]any, maxLen int, skip func(string) bool) string {
 	if len(args) == 0 {
 		return ""
 	}
@@ -150,7 +150,7 @@ func formatArgsMap(args map[string]interface{}, maxLen int, skip func(string) bo
 }
 
 // formatToolArgs formats tool call arguments for display.
-func formatToolArgs(args map[string]interface{}) string {
+func formatToolArgs(args map[string]any) string {
 	return formatArgsMap(args, 80, nil)
 }
 

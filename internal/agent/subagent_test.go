@@ -55,7 +55,7 @@ func TestSubagentToolGating(t *testing.T) {
 	if _, ok := a.AllowedToolNames()["subagent"]; ok {
 		t.Fatal("subagent must not be allowed when disabled")
 	}
-	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "subagent", Args: map[string]interface{}{"job": "x"}}); err == nil || !strings.Contains(err.Error(), "unknown tool") {
+	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "subagent", Args: map[string]any{"job": "x"}}); err == nil || !strings.Contains(err.Error(), "unknown tool") {
 		t.Fatalf("expected unknown tool, got %v", err)
 	}
 
@@ -75,7 +75,7 @@ func TestSubagentToolGating(t *testing.T) {
 	if _, ok := a.AllowedToolNames()["subagent"]; !ok {
 		t.Fatal("subagent should be allowed when enabled")
 	}
-	out, err := a.executeTool(t.Context(), llm.ToolCall{Name: "subagent", Args: map[string]interface{}{"job": "do it"}})
+	out, err := a.executeTool(t.Context(), llm.ToolCall{Name: "subagent", Args: map[string]any{"job": "do it"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +122,7 @@ func TestSubagentToolDescriptionConcurrentLimit(t *testing.T) {
 func TestSubagentSpawnerNil(t *testing.T) {
 	a := newSubagentTestAgent(t)
 	a.SetSubagentsEnabled(true)
-	_, err := a.executeTool(t.Context(), llm.ToolCall{Name: "subagent", Args: map[string]interface{}{"job": "x"}})
+	_, err := a.executeTool(t.Context(), llm.ToolCall{Name: "subagent", Args: map[string]any{"job": "x"}})
 	if err == nil || !strings.Contains(err.Error(), "spawner is not installed") {
 		t.Fatalf("expected spawner-not-installed error, got %v", err)
 	}
@@ -137,7 +137,7 @@ func TestSubagentDepthLimit(t *testing.T) {
 	parent.SetSubagentSpawner(sp)
 
 	// Parent (depth 0) spawns fine.
-	if _, err := parent.executeTool(t.Context(), llm.ToolCall{Name: "subagent", Args: map[string]interface{}{"job": "parent job"}}); err != nil {
+	if _, err := parent.executeTool(t.Context(), llm.ToolCall{Name: "subagent", Args: map[string]any{"job": "parent job"}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -147,7 +147,7 @@ func TestSubagentDepthLimit(t *testing.T) {
 	child.SetSubagentsEnabled(true)
 	child.SetSubagentSpawner(sp)
 	child.SetSubagentDepth(1)
-	_, err := child.executeTool(t.Context(), llm.ToolCall{Name: "subagent", Args: map[string]interface{}{"job": "child job"}})
+	_, err := child.executeTool(t.Context(), llm.ToolCall{Name: "subagent", Args: map[string]any{"job": "child job"}})
 	if err == nil || !strings.Contains(err.Error(), "depth limit") {
 		t.Fatalf("expected depth-limit error, got %v", err)
 	}
@@ -157,7 +157,7 @@ func TestSubagentDepthLimit(t *testing.T) {
 
 	// Raising the limit re-enables nesting.
 	child.SetSubagentMaxDepth(3)
-	if _, err := child.executeTool(t.Context(), llm.ToolCall{Name: "subagent", Args: map[string]interface{}{"job": "child job"}}); err != nil {
+	if _, err := child.executeTool(t.Context(), llm.ToolCall{Name: "subagent", Args: map[string]any{"job": "child job"}}); err != nil {
 		t.Fatal(err)
 	}
 	if sp.calls != 2 || sp.last.depth != 1 {
@@ -170,7 +170,7 @@ func TestSubagentToolRequiresJob(t *testing.T) {
 	a := newSubagentTestAgent(t)
 	a.SetSubagentsEnabled(true)
 	a.SetSubagentSpawner(&fakeSpawner{report: "ok"})
-	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "subagent", Args: map[string]interface{}{}}); err == nil {
+	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "subagent", Args: map[string]any{}}); err == nil {
 		t.Fatal("missing job should fail")
 	}
 }

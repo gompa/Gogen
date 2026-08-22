@@ -46,7 +46,7 @@ func startDeleteApprovalTurn(t *testing.T, stub *blockingStub, conn *websocket.C
 	stub.firstTools = []llm.ToolCall{{
 		ID:   "call_del",
 		Name: "delete",
-		Args: map[string]interface{}{"path": path},
+		Args: map[string]any{"path": path},
 	}}
 	if err := conn.WriteJSON(WSMessage{Type: "message", Content: "delete it"}); err != nil {
 		t.Fatalf("send: %v", err)

@@ -225,7 +225,7 @@ func TestMidTurnAttachCarriesRewind(t *testing.T) {
 func TestMidTurnAttachCarriesToolCall(t *testing.T) {
 	dir := t.TempDir()
 	stub := newRewindStreamStub()
-	stub.streamTools = []llm.ToolCall{{ID: "call_1", Name: "read_file", Args: map[string]interface{}{"path": "/nonexistent"}}}
+	stub.streamTools = []llm.ToolCall{{ID: "call_1", Name: "read_file", Args: map[string]any{"path": "/nonexistent"}}}
 	stub.rawArgs = `{"path":"/nonexistent"}`
 	s, a, _ := newRewindServer(t, stub, dir)
 	srv := startWSServer(t, s)

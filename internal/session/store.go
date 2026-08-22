@@ -71,6 +71,10 @@ type StoreOptions struct {
 }
 
 // NewStore creates a session store with default retention.
+//
+// Exported convenience constructor: other packages' tests (e.g.
+// internal/server) build stores with it; production code uses
+// NewStoreWithOptions with config-driven retention.
 func NewStore(enabled bool) *Store {
 	return NewStoreWithOptions(enabled, StoreOptions{})
 }

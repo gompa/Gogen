@@ -47,14 +47,14 @@ func TestMCPToolShadowsFeatureTool(t *testing.T) {
 
 	// Execution: the MCP handler runs (fake returns ""), not the board
 	// tool's handler (which would return a board listing).
-	out, err := a.executeTool(context.Background(), llm.ToolCall{ID: "t1", Name: "board", Args: map[string]interface{}{"action": "list"}})
+	out, err := a.executeTool(context.Background(), llm.ToolCall{ID: "t1", Name: "board", Args: map[string]any{"action": "list"}})
 	if err != nil {
 		t.Fatalf("executeTool(board): %v", err)
 	}
 	if out != "" {
 		t.Fatalf("board tool executed the feature handler (out %q), want the MCP handler", out)
 	}
-	if _, err := a.executeTool(context.Background(), llm.ToolCall{ID: "t2", Name: "read_file", Args: map[string]interface{}{"path": "x"}}); err != nil {
+	if _, err := a.executeTool(context.Background(), llm.ToolCall{ID: "t2", Name: "read_file", Args: map[string]any{"path": "x"}}); err != nil {
 		t.Fatalf("MCP read_file should still resolve: %v", err)
 	}
 }

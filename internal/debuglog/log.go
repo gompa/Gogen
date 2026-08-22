@@ -75,12 +75,12 @@ func sessionID() string {
 }
 
 // Write appends a JSON debug entry when debug logging is configured.
-func Write(location, message, hypothesisID string, data map[string]interface{}) {
+func Write(location, message, hypothesisID string, data map[string]any) {
 	logPath := logPath()
 	if logPath == "" {
 		return
 	}
-	entry := map[string]interface{}{
+	entry := map[string]any{
 		"timestamp":    time.Now().UnixMilli(),
 		"location":     location,
 		"message":      message,

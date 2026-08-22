@@ -26,7 +26,7 @@ func TestSameMessageContent(t *testing.T) {
 		ToolCalls: []llm.ToolCall{{
 			ID:   "c1",
 			Name: "read_file",
-			Args: map[string]interface{}{"path": "main.go"},
+			Args: map[string]any{"path": "main.go"},
 		}},
 	}
 	if !sameMessageContent(base, base) {
@@ -53,7 +53,7 @@ func TestSameMessageContent(t *testing.T) {
 		{"imagesLen", func(m *llm.Message) { m.Images = nil }},
 		{"toolCallID2", func(m *llm.Message) { m.ToolCalls[0].ID = "c2" }},
 		{"toolCallName", func(m *llm.Message) { m.ToolCalls[0].Name = "search_code" }},
-		{"toolCallArgs", func(m *llm.Message) { m.ToolCalls[0].Args = map[string]interface{}{"path": "other.go"} }},
+		{"toolCallArgs", func(m *llm.Message) { m.ToolCalls[0].Args = map[string]any{"path": "other.go"} }},
 		{"toolCallArgsStr", func(m *llm.Message) { m.ToolCalls[0].ArgsStr = `{"path":"other.go"}` }},
 		{"toolCallsLen", func(m *llm.Message) {
 			m.ToolCalls = append(m.ToolCalls, llm.ToolCall{ID: "c2", Name: "list_files"})
@@ -82,7 +82,7 @@ func cloneForCompare(m llm.Message) llm.Message {
 		for i := range m.ToolCalls {
 			out.ToolCalls[i] = m.ToolCalls[i]
 			if m.ToolCalls[i].Args != nil {
-				out.ToolCalls[i].Args = make(map[string]interface{}, len(m.ToolCalls[i].Args))
+				out.ToolCalls[i].Args = make(map[string]any, len(m.ToolCalls[i].Args))
 				for k, v := range m.ToolCalls[i].Args {
 					out.ToolCalls[i].Args[k] = v
 				}

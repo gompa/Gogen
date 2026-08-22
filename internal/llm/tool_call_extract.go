@@ -132,7 +132,7 @@ func extractToolCallsFromTextMode(text string, allowBareJSON bool) []ToolCall {
 					if objStart > 0 && text[objStart-1] == '[' {
 						continue
 					}
-					var obj map[string]interface{}
+					var obj map[string]any
 					if err := json.Unmarshal([]byte(jsonStr), &obj); err != nil {
 						continue
 					}
@@ -170,7 +170,7 @@ func renumberExtractedToolCalls(toolCalls []ToolCall) {
 // Name-only objects, flattened shapes, and prose JSON such as
 // {"name": "service", "version": 2} are rejected, so they are never
 // mis-executed as phantom tool calls.
-func isToolCallObject(obj map[string]interface{}) bool {
+func isToolCallObject(obj map[string]any) bool {
 	if toolCallNameFromObject(obj) == "" {
 		return false
 	}
@@ -260,7 +260,7 @@ func extractToolCallsFromBlock(blockContent string) []ToolCall {
 // extractXMLToolCall tries multiple XML-based tool call formats and returns
 // the tool name, parsed args, and raw args string. Returns empty name if no
 // format matches.
-func extractXMLToolCall(blockContent string) (string, map[string]interface{}, string) {
+func extractXMLToolCall(blockContent string) (string, map[string]any, string) {
 	// Try each function-name extraction pattern (ordered most-specific first)
 	funcPatterns := []struct {
 		re   *regexp.Regexp
@@ -288,7 +288,7 @@ func extractXMLToolCall(blockContent string) (string, map[string]interface{}, st
 
 				// Try individual <parameter=name>value</parameter> (equals-sign format)
 				if paramEqMatches := toolCallParamEqRegex.FindAllStringSubmatch(blockContent, -1); len(paramEqMatches) > 0 {
-					argsMap := make(map[string]interface{})
+					argsMap := make(map[string]any)
 					for _, pm := range paramEqMatches {
 						if len(pm) >= 3 {
 							pName := pm[1]
@@ -302,7 +302,7 @@ func extractXMLToolCall(blockContent string) (string, map[string]interface{}, st
 
 				// Try individual <parameter name="name">value</parameter> (attribute format)
 				if paramAttrMatches := toolCallParamAttrRegex.FindAllStringSubmatch(blockContent, -1); len(paramAttrMatches) > 0 {
-					argsMap := make(map[string]interface{})
+					argsMap := make(map[string]any)
 					for _, pm := range paramAttrMatches {
 						if len(pm) >= 3 {
 							pName := pm[1]
@@ -322,16 +322,16 @@ func extractXMLToolCall(blockContent string) (string, map[string]interface{}, st
 					argsJSON = extractJSONArgValue(blockContent, "input")
 				}
 				if argsJSON != "" {
-					var parsedArgs map[string]interface{}
+					var parsedArgs map[string]any
 					if err := json.Unmarshal([]byte(argsJSON), &parsedArgs); err == nil {
 						return toolName, parsedArgs, argsJSON
 					}
 					// Fallback: wrap as input
-					return toolName, map[string]interface{}{"input": argsJSON}, argsJSON
+					return toolName, map[string]any{"input": argsJSON}, argsJSON
 				}
 
 				// No parameters found — return empty args
-				return toolName, map[string]interface{}{}, "{}"
+				return toolName, map[string]any{}, "{}"
 			}
 		}
 	}
@@ -369,25 +369,25 @@ func extractJSONArgValue(blockContent, key string) string {
 }
 
 // parseParamContent parses the content of a <parameters> tag, trying JSON first.
-func parseParamContent(paramContent string) (map[string]interface{}, string) {
+func parseParamContent(paramContent string) (map[string]any, string) {
 	// Try to parse as JSON
-	var parsedArgs map[string]interface{}
+	var parsedArgs map[string]any
 	if err := json.Unmarshal([]byte(paramContent), &parsedArgs); err == nil {
 		return parsedArgs, paramContent
 	}
 	// Try to extract JSON object from the parameter content
 	jsonStr, _ := extractJSONObject(paramContent, 0)
 	if jsonStr != "" {
-		var inner map[string]interface{}
+		var inner map[string]any
 		if err := json.Unmarshal([]byte(jsonStr), &inner); err == nil {
 			return inner, jsonStr
 		}
 	}
-	return map[string]interface{}{"input": paramContent}, paramContent
+	return map[string]any{"input": paramContent}, paramContent
 }
 
 // parseParamValue tries to interpret a parameter value as a typed Go value.
-func parseParamValue(v string) interface{} {
+func parseParamValue(v string) any {
 	switch strings.ToLower(v) {
 	case "true":
 		return true
@@ -457,7 +457,7 @@ func extractJSONObject(src string, start int) (string, int) {
 
 func parseToolCallFromJSONString(jsonStr string) []ToolCall {
 	// Try to unmarshal as a map
-	var obj map[string]interface{}
+	var obj map[string]any
 	if err := json.Unmarshal([]byte(jsonStr), &obj); err != nil {
 		return nil
 	}
@@ -468,7 +468,7 @@ func parseToolCallFromJSONString(jsonStr string) []ToolCall {
 // object. Note: Index and ID are assigned by the caller
 // (extractToolCallsFromBlock / extractToolCallsFromTextMode) to ensure they
 // are unique within the full result set.
-func parseToolCallFromObject(obj map[string]interface{}) []ToolCall {
+func parseToolCallFromObject(obj map[string]any) []ToolCall {
 	name := toolCallNameFromObject(obj)
 	if name == "" {
 		return nil
@@ -480,14 +480,14 @@ func parseToolCallFromObject(obj map[string]interface{}) []ToolCall {
 // toolCallNameFromObject extracts the tool name from a decoded JSON object:
 // the "name" field, or the "function" field when it is a string or an object
 // with its own "name". Returns "" when no usable name is present.
-func toolCallNameFromObject(obj map[string]interface{}) string {
+func toolCallNameFromObject(obj map[string]any) string {
 	if n, ok := obj["name"].(string); ok && n != "" {
 		return n
 	}
 	if n, ok := obj["function"].(string); ok && n != "" {
 		return n
 	}
-	if n, ok := obj["function"].(map[string]interface{}); ok {
+	if n, ok := obj["function"].(map[string]any); ok {
 		if nName, ok := n["name"].(string); ok && nName != "" {
 			return nName
 		}
@@ -499,7 +499,7 @@ func toolCallNameFromObject(obj map[string]interface{}) string {
 // object into the Args map and canonical ArgsStr. The "arguments" field wins;
 // when absent, "input" (or the first non-metadata key) is used, mirroring the
 // recovery shapes models emit.
-func normalizeToolCallArguments(obj map[string]interface{}) (map[string]interface{}, string) {
+func normalizeToolCallArguments(obj map[string]any) (map[string]any, string) {
 	arguments := obj["arguments"]
 	if arguments == nil {
 		// check if 'input' or the whole obj is the args
@@ -517,10 +517,10 @@ func normalizeToolCallArguments(obj map[string]interface{}) (map[string]interfac
 		}
 	}
 
-	argsMap := make(map[string]interface{})
+	argsMap := make(map[string]any)
 	argsStr := ""
 
-	if argsObj, ok := arguments.(map[string]interface{}); ok {
+	if argsObj, ok := arguments.(map[string]any); ok {
 		argsMap = argsObj
 		argsJSON, err := json.Marshal(argsObj)
 		if err == nil {
@@ -533,21 +533,21 @@ func normalizeToolCallArguments(obj map[string]interface{}) (map[string]interfac
 		if parsedArgs, err := parseToolCallArgs(argsStrVal); err == nil && strings.TrimSpace(argsStrVal) != "" {
 			argsMap = parsedArgs
 		} else {
-			argsMap = map[string]interface{}{"input": argsStrVal}
+			argsMap = map[string]any{"input": argsStrVal}
 		}
 	} else if arguments != nil {
 		// fallback: marshal the arguments
 		argsJSON, err := json.Marshal(arguments)
 		if err == nil {
 			argsStr = string(argsJSON)
-			var parsedArgs map[string]interface{}
+			var parsedArgs map[string]any
 			if json.Unmarshal(argsJSON, &parsedArgs) == nil {
 				argsMap = parsedArgs
 			} else {
-				argsMap = map[string]interface{}{"input": arguments}
+				argsMap = map[string]any{"input": arguments}
 			}
 		} else {
-			argsMap = map[string]interface{}{"input": arguments}
+			argsMap = map[string]any{"input": arguments}
 		}
 	}
 	return argsMap, argsStr
