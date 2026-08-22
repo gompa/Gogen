@@ -77,11 +77,6 @@ func responseLogPath() string {
 	return deriveResponseLogPath(logPath(), sessionID())
 }
 
-// ResponseLoggingEnabled reports whether full LLM response capture is active.
-func ResponseLoggingEnabled() bool {
-	return responseLogPath() != ""
-}
-
 // WriteLLMResponse appends a full model response record when response logging is enabled.
 func WriteLLMResponse(rec LLMResponseRecord) {
 	path := responseLogPath()
@@ -120,15 +115,4 @@ func WriteLLMResponse(rec LLMResponseRecord) {
 		responseFile = f
 	}
 	_, _ = responseFile.Write(line)
-}
-
-// CloseResponseLog closes the response log file (for tests).
-func CloseResponseLog() {
-	writeMu.Lock()
-	defer writeMu.Unlock()
-	if responseFile != nil {
-		_ = responseFile.Close()
-		responseFile = nil
-	}
-	responsePathCached = ""
 }

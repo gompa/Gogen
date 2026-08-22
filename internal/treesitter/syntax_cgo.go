@@ -5,7 +5,6 @@ package treesitter
 import (
 	"fmt"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"unsafe"
@@ -185,22 +184,6 @@ func compileQuery(langName, kind, src string) (*tree_sitter.Query, error) {
 	}
 	queryCache.Store(key, q)
 	return q, nil
-}
-
-// DefinitionQueryLanguages returns the canonical names of bundled languages
-// that have a definition query, sorted for stable output. Agent error
-// messages generate their "supported languages" list from this instead of a
-// hand-maintained literal.
-func DefinitionQueryLanguages() []string {
-	registryOnce.Do(initRegistry)
-	names := make([]string, 0, len(langSpecs))
-	for name, spec := range langSpecs {
-		if spec.defsQuery != "" {
-			names = append(names, name)
-		}
-	}
-	sort.Strings(names)
-	return names
 }
 
 func langNameForPath(path string) (string, bool) {

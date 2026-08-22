@@ -130,11 +130,6 @@ func GlobalBoardDir() string {
 	return filepath.Join(GlobalDataDir(), "board")
 }
 
-// GlobalModelsCachePath returns the path for the models.dev registry cache in global mode.
-func GlobalModelsCachePath() string {
-	return filepath.Join(GlobalDataDir(), "models.json")
-}
-
 // HomeDir returns the user's home directory. Returns "." if it cannot be determined.
 func HomeDir() string {
 	home, err := os.UserHomeDir()

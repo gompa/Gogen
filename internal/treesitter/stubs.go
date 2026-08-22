@@ -28,7 +28,3 @@ func checkSupported(path string, content []byte) []Issue {
 func BundledLanguages() []string {
 	return nil
 }
-
-func DefinitionQueryLanguages() []string {
-	return nil
-}

@@ -75,15 +75,3 @@ func ConfigFileHasSecrets(path string) bool {
 	}
 	return false
 }
-
-// GuidelinesHeader formats project guidelines for the system prompt.
-func GuidelinesHeader(path, guidelines string) string {
-	if guidelines == "" {
-		return ""
-	}
-	name := path
-	if name == "" {
-		name = "project file"
-	}
-	return "\n\nProject rules (" + name + "):\n" + guidelines
-}
