@@ -255,39 +255,20 @@ func (m *Model) View() tea.View {
 
 	// Modal overlay — renders on opaque background so nothing bleeds through
 	if m.modal != ModalNone {
-		return tea.NewView(renderModalOverlay(main, m.renderModal(), m.width, m.height))
+		return tea.NewView(renderModalOverlay(m.renderModal(), m.width, m.height))
 	}
 
 	return v
 }
 
-// renderModalOverlay dims the main view and centers the modal on top.
-func renderModalOverlay(main, modal string, width, height int) string {
-	modalWidth := lipgloss.Width(modal)
-	modalHeight := lipgloss.Height(modal)
-
-	// Pad horizontally to center
-	leftPad := max(0, (width-modalWidth)/2)
-
-	// Pad vertically to center
-	topPad := max(0, (height-modalHeight)/2)
-	bottomPad := max(0, height-modalHeight-topPad)
-
-	var b strings.Builder
-	for i := 0; i < topPad; i++ {
-		b.WriteString(strings.Repeat(" ", width) + "\n")
-	}
-	for _, line := range strings.Split(modal, "\n") {
-		b.WriteString(strings.Repeat(" ", leftPad))
-		b.WriteString(line)
-		b.WriteString(strings.Repeat(" ", max(0, width-leftPad-lipgloss.Width(line))))
-		b.WriteByte('\n')
-	}
-	for i := 0; i < bottomPad; i++ {
-		b.WriteString(strings.Repeat(" ", width) + "\n")
-	}
-
-	return ModalOverlayBackground.Render(strings.TrimRight(b.String(), "\n"))
+// renderModalOverlay covers the main view with an opaque background block
+// and centers the modal on top of it. lipgloss.Place is a noöp when the
+// modal exceeds the terminal in either dimension, matching the old manual
+// clamping; ModalOverlayBackground paints every cell, padding included.
+func renderModalOverlay(modal string, width, height int) string {
+	return ModalOverlayBackground.Render(
+		lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, modal),
+	)
 }
 
 // refocusInput restarts the textarea cursor blink after streaming (blink ticks
