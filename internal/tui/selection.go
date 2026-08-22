@@ -2,8 +2,6 @@ package tui
 
 import (
 	"fmt"
-	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -11,11 +9,8 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/atotto/clipboard"
-	"github.com/aymanbagabas/go-osc52/v2"
 	"github.com/charmbracelet/x/ansi"
 )
-
-var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 
 // sgrState tracks the SGR attributes active at a point inside a styled
 // string, in enough detail to re-emit them at a word-wrap point: foreground
@@ -208,9 +203,11 @@ func applySGRs(st *sgrState, s string) {
 	}
 }
 
-// stripANSI removes ANSI escape sequences from a string.
+// stripANSI removes ANSI escape sequences from a string. Uses ansi.Strip
+// (parser-based) rather than a regex so non-SGR escapes (OSC, etc.) are
+// removed as well.
 func stripANSI(s string) string {
-	return ansiRegex.ReplaceAllString(s, "")
+	return ansi.Strip(s)
 }
 
 // truncateRunes truncates s to at most maxRunes runes, returning the original
@@ -396,21 +393,29 @@ func (m *Model) finalizeSelection() {
 	}
 }
 
-// copySelection copies the current selection to the clipboard.
-// Returns true if a selection was present (even if copy failed).
-// On failure the selection is kept so the user can retry.
-func (m *Model) copySelection() bool {
+// copySelection copies the current selection to the clipboard. Returns true
+// if a selection was present, plus a tea.Cmd when copying had to fall back
+// to the terminal (OSC52 via tea.SetClipboard) — the caller must run it.
+//
+// The local-clipboard path clears the selection on success; the OSC52 path
+// keeps it, because OSC52 is fire-and-forget (no delivery ack) and a retry
+// should be one keystroke away.
+func (m *Model) copySelection() (bool, tea.Cmd) {
 	text := m.getSelectedText()
 	if text == "" {
-		return false
+		return false, nil
 	}
-	if err := copyToClipboard(text); err == nil {
+	if err := clipboard.WriteAll(text); err == nil {
 		m.statusMsg = fmt.Sprintf("✓ Copied %d chars to clipboard", utf8.RuneCountInString(text))
 		m.clearSelection()
-	} else {
-		m.statusMsg = fmt.Sprintf("Copy failed: %v", err)
+		return true, nil
 	}
-	return true
+	// Local clipboard unavailable (headless, SSH without xclip/xsel…):
+	// fall back to OSC52 through bubbletea's built-in support — most modern
+	// terminals (Alacritty, Kitty, iTerm2, GNOME Terminal, Windows
+	// Terminal, …) honor it even over SSH.
+	m.statusMsg = fmt.Sprintf("Sent %d chars to terminal clipboard", utf8.RuneCountInString(text))
+	return true, tea.SetClipboard(text)
 }
 
 // runeWidth returns the terminal cell width of r (at least 1 for printable).
@@ -693,18 +698,4 @@ func mapPlainToStyled(plainIdx int, styled string) int {
 		plainPos++
 	}
 	return len(styled)
-}
-
-// copyToClipboard tries clipboard.WriteAll first, then falls back to OSC52
-// (terminal escape sequence) which works in modern terminals without xclip/xsel.
-func copyToClipboard(text string) error {
-	if err := clipboard.WriteAll(text); err == nil {
-		return nil
-	}
-	// Fall back to OSC52: write escape sequence to stderr (stdout is TUI).
-	// Most modern terminals (Alacritty, Kitty, iTerm2, GNOME Terminal,
-	// Windows Terminal, etc.) support OSC52 even over SSH.
-	seq := osc52.New(text)
-	_, err := fmt.Fprint(os.Stderr, seq)
-	return err
 }

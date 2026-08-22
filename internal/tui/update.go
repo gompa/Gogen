@@ -139,8 +139,8 @@ func (m *Model) handleKeyMsg(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.statusMsg = ""
 	}
 	if key.Matches(msg, m.keys.CopySelection) {
-		m.copySelection()
-		return m, nil
+		_, cmd := m.copySelection()
+		return m, cmd
 	}
 	// Global hotkeys that work regardless of focus/modal
 	switch {

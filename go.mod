@@ -9,7 +9,6 @@ require (
 	codeberg.org/readeck/go-readability/v2 v2.1.2
 	github.com/JohannesKaufmann/html-to-markdown/v2 v2.5.2
 	github.com/atotto/clipboard v0.1.4
-	github.com/aymanbagabas/go-osc52/v2 v2.0.1
 	github.com/charmbracelet/x/ansi v0.11.8
 	github.com/creack/pty v1.1.24
 	github.com/ericchiang/css v1.4.0
