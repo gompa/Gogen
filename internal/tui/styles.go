@@ -52,9 +52,6 @@ func lipglossColor(hex string) color.Color {
 
 // Shared lipgloss styles for the TUI.
 var (
-	// Base
-	BaseStyle = lipgloss.NewStyle()
-
 	// Chat viewport
 	ViewportStyle = lipgloss.NewStyle().
 			PaddingLeft(1).
@@ -142,33 +139,6 @@ var (
 	ModalOverlayBackground = lipgloss.NewStyle().
 				Background(lipglossColor("#1a1a1a"))
 
-	ModalBorderStyle = lipgloss.NewStyle().
-				Border(lipgloss.RoundedBorder()).
-				BorderForeground(lipglossColor("#555555")).
-				Padding(1, 2)
-
-	ModalTitleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipglossColor("#00AAAA"))
-
-	ModalDimStyle = lipgloss.NewStyle().
-			Foreground(lipglossColor("#888888"))
-
-	ModalHighlightStyle = lipgloss.NewStyle().
-		// Uses foreground+bold instead of background to avoid
-		// color bleeding into the border padding of modal boxes.
-		Foreground(lipglossColor("#00AAAA")).
-		Bold(true)
-
-	ModalPromptStyle = lipgloss.NewStyle().
-				Foreground(lipglossColor("#CCAA00"))
-
-	// Help
-	HelpKeyStyle = lipgloss.NewStyle().
-			Foreground(lipglossColor("#00AAAA"))
-
-	HelpDescStyle = lipgloss.NewStyle()
-
 	// Error
 	ErrorStyle = lipgloss.NewStyle().
 			Foreground(lipglossColor("#AA0000"))
@@ -180,10 +150,6 @@ var (
 	// Divider
 	DividerStyle = lipgloss.NewStyle().
 			Foreground(lipglossColor("#555555"))
-
-	// Context line (right-aligned, dim)
-	ContextLineStyle = lipgloss.NewStyle().
-				Foreground(lipglossColor("#888888"))
 
 	// Diff rendering
 	DiffAddStyle = lipgloss.NewStyle().

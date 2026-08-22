@@ -73,20 +73,3 @@ var DefaultKeyMap = KeyMap{
 	Verbose:       key.NewBinding(key.WithKeys("ctrl+v"), key.WithHelp("ctrl+v", "toggle verbose")),
 	CopySelection: key.NewBinding(key.WithKeys("ctrl+shift+c"), key.WithHelp("ctrl+shift+c", "copy selection")),
 }
-
-// FullHelp returns keybindings for the full help view.
-func (k KeyMap) FullHelp() [][]key.Binding {
-	return [][]key.Binding{
-		{k.Submit, k.CancelTurn, k.Quit, k.Help, k.Verbose},
-		{k.BackwardWord, k.ForwardWord, k.KillToEnd, k.KillToStart, k.KillWord},
-		{k.LineStart, k.LineEnd, k.DeleteForward, k.DeleteBack, k.Completion},
-		{k.HistoryUp, k.HistoryDown},
-		{k.ViewportPageUp, k.ViewportPageDown, k.ViewportTop, k.ViewportBottom},
-		{k.FocusViewport, k.FocusInput},
-	}
-}
-
-// ShortHelp returns keybindings for the status bar.
-func (k KeyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Help, k.Quit}
-}
