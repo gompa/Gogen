@@ -7,6 +7,7 @@ import (
 	"charm.land/lipgloss/v2"
 
 	"gogen/internal/agent"
+	"gogen/internal/llm"
 	"gogen/internal/session"
 
 	tea "charm.land/bubbletea/v2"
@@ -439,20 +440,7 @@ func (m *Model) renderModelsModal() string {
 	}
 
 	// Model entries
-	for i := start; i < end; i++ {
-		mdl := m.modelList[i]
-		line := fmt.Sprintf("  %2d. %s", i+1, mdl.ID)
-		if mdl.ContextLimit > 0 {
-			line += fmt.Sprintf("  (context: %d tokens)", mdl.ContextLimit)
-		}
-		if mdl.Current {
-			line += " *"
-		}
-		rows = append(rows, styleLine{
-			text:      line,
-			highlight: i == m.modelCursor,
-		})
-	}
+	rows = append(rows, buildModelRows(m.modelList, start, end, m.modelCursor)...)
 
 	// Overflow indicator (bottom)
 	if end < len(m.modelList) {
@@ -468,6 +456,55 @@ func (m *Model) renderModelsModal() string {
 	})
 
 	return renderBorderedModal(rows)
+}
+
+// modelProviderName returns the registered provider profile that serves the
+// model, falling back to "default" for models served by the implicit legacy
+// single-endpoint profile. Matches the web model picker's grouping fallback.
+func modelProviderName(mi llm.ModelInfo) string {
+	if mi.Provider == "" {
+		return "default"
+	}
+	return mi.Provider
+}
+
+// buildModelRows renders the model entries for the visible scroll window
+// [start, end), grouped by serving provider: a header line precedes each run
+// of models from one profile (models arrive in profile order — default
+// first — so consecutive grouping matches the catalog, mirroring the web
+// model picker). Headers are decorative only: they are not cursor targets
+// and the 1-based numbering stays aligned with the full list so /models <n>
+// selects the same model as the modal.
+func buildModelRows(list []llm.ModelInfo, start, end, cursor int) []styleLine {
+	rows := make([]styleLine, 0, end-start+2)
+	lastProvider := ""
+	if start > 0 && start <= len(list) {
+		// Resuming mid-list: seed with the previous entry's provider so a
+		// group that began above the window emits no duplicate header.
+		lastProvider = modelProviderName(list[start-1])
+	}
+	for i := start; i < end && i < len(list); i++ {
+		mdl := list[i]
+		if prov := modelProviderName(mdl); prov != lastProvider {
+			rows = append(rows, styleLine{
+				text:      "  " + ansiCyanOn + prov + ansiReset,
+				preStyled: true,
+			})
+			lastProvider = prov
+		}
+		line := fmt.Sprintf("  %2d. %s", i+1, mdl.ID)
+		if mdl.ContextLimit > 0 {
+			line += fmt.Sprintf("  (context: %d tokens)", mdl.ContextLimit)
+		}
+		if mdl.Current {
+			line += " *"
+		}
+		rows = append(rows, styleLine{
+			text:      line,
+			highlight: i == cursor,
+		})
+	}
+	return rows
 }
 
 func (m *Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
