@@ -79,3 +79,29 @@ func TestStreamProcessInputAcceptsNormalContent(t *testing.T) {
 		t.Fatalf("assistant turn not persisted: %+v", a.Messages)
 	}
 }
+
+// TestStreamProcessInputReportsFinishReason verifies the ghost-turn error
+// carries the provider-reported finish_reason ("length" = output budget
+// exhausted, "stop" = ended after reasoning-only chunks) so truncated turns
+// are diagnosable without provider-side logs. Stubs that set no finish
+// reason keep the original message (see TestStreamProcessInputRejectsGhostResult).
+func TestStreamProcessInputReportsFinishReason(t *testing.T) {
+	provider := &statsStubProvider{
+		limit: 1000,
+		streamResult: &llm.StreamResult{
+			Reasoning:    "half a thought",
+			FinishReason: "length",
+		},
+	}
+	a := NewAgent(provider, &Executor{WorkingDir: "."}, nil)
+	_, err := a.StreamProcessInput(context.Background(), "investigate the flow", nil)
+	if err == nil {
+		t.Fatal("expected error for reasoning-only result")
+	}
+	if !strings.Contains(err.Error(), `finish_reason="length"`) {
+		t.Fatalf("error should carry the finish reason: %v", err)
+	}
+	if len(a.Messages) != 1 || a.Messages[0].Role != "user" {
+		t.Fatalf("ghost must not be appended; got %d messages: %+v", len(a.Messages), a.Messages)
+	}
+}

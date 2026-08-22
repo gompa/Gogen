@@ -1131,7 +1131,14 @@
         let nextPaneKey = 0;
         let activePaneKey = 0;
 
-        function makePane() {
+        // initialActivity seeds the output-recency stamp. Pass a saved
+        // session's updatedAt (epoch ms) when opening EXISTING history as a
+        // pane: activation must not fabricate recency, so the row keeps its
+        // earned position in the sidebar and moves again only on new output.
+        // Omit for genuinely new sessions (/new, sidebar New, /fork) —
+        // creation is their first recency event and they appear at the top
+        // once.
+        function makePane(initialActivity) {
             const pane = {
                 key: nextPaneKey++,
                 id: null, // session id (null until known)
@@ -1163,29 +1170,15 @@
                 reasoningEffortsUnsupported: false,
                 model: '',
                 _notifiedBusy: false,
+                // Epoch ms of this pane's latest OUTPUT event (stream/tool/
+                // turn markers). Drives sidebar session ordering (newest
+                // output first); focusing or activating a saved session
+                // does NOT reorder.
+                lastActivity: initialActivity || Date.now(),
             };
             panes.set(pane.key, pane);
-            // The new pane becomes the ACTIVE pane at every call site; put
-            // it at the front of the open-pane list so the sidebar shows
-            // the newest session at the top.
-            movePaneToFront(pane);
             refreshSidebarSessions();
             return pane;
-        }
-
-        // Move a pane to the FRONT of the panes map so the sidebar renders
-        // open panes most-recently-used first. JS Maps re-insert a deleted
-        // key at the END, so a front-move rebuilds the map with the target
-        // pane first and the rest in existing order.
-        function movePaneToFront(pane) {
-            if (!pane || panes.keys().next().value === pane.key) return;
-            const reordered = new Map();
-            reordered.set(pane.key, pane);
-            for (const [k, p] of panes) {
-                if (k !== pane.key) reordered.set(k, p);
-            }
-            panes.clear();
-            for (const [k, p] of reordered) panes.set(k, p);
         }
 
         function activePane() {
@@ -1198,6 +1191,18 @@
                 if (pane.id === id) return pane;
             }
             return null;
+        }
+
+        // The open pane with the newest output stamp, or null. The panes
+        // map holds creation order (the sidebar sorts by output recency —
+        // focusing no longer reorders), so close/detach fallbacks that used
+        // to rely on map-front == MRU scan stamps instead.
+        function mostRecentlyActivePane() {
+            let best = null;
+            for (const p of panes.values()) {
+                if (!best || (p.lastActivity || 0) > (best.lastActivity || 0)) best = p;
+            }
+            return best;
         }
 
         // Route a session-scoped server message to the pane it belongs to.
@@ -1321,6 +1326,23 @@
             if (oldId && !findPaneBySession(oldId) && ws && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ type: 'session_detach', sessionId: oldId }));
             }
+        }
+
+        // Sidebar open-pane ordering is by OUTPUT recency: a pane climbs
+        // only when it produced newer output than the rest. Focus is NOT
+        // activity — clicking a row highlights it without reordering — so
+        // only output-bearing message types stamp the pane. Attach/config/
+        // context echoes fire on every focus/switch and must not reorder.
+        const OUTPUT_ACTIVITY_TYPES = new Set([
+            'thinking', 'waiting', 'thinking_token',
+            'stream', 'stream_end',
+            'tool_call_start', 'tool_call_delta', 'tool_call', 'tool_execute', 'tool_result',
+            'term_opened', 'term_output', 'term_exit',
+            'turn_end', 'cancelled',
+        ]);
+
+        function touchPaneActivity(pane, type) {
+            if (pane && OUTPUT_ACTIVITY_TYPES.has(type)) pane.lastActivity = Date.now();
         }
 
         // Apply a session-scoped message to a background pane without touching
@@ -1472,9 +1494,6 @@
             if (key === activePaneKey) return;
             const pane = panes.get(key);
             if (!pane) return;
-            // Focusing counts as activity: the sidebar shows the focused
-            // pane at the top (most recently used first).
-            movePaneToFront(pane);
             saveActivePaneState();
             activePaneKey = key;
             // clearChat resets module-level DOM state; load the pane's state
@@ -1525,7 +1544,9 @@
                 if (panes.size === 0) {
                     replaceActivePane();
                 } else {
-                    focusPane(panes.keys().next().value);
+                    // Newest-output remaining pane (the map holds creation
+                    // order now that MRU reordering is gone).
+                    focusPane(mostRecentlyActivePane().key);
                 }
             } else {
                 refreshSidebarSessions();
@@ -1553,7 +1574,13 @@
                 return;
             }
             saveActivePaneState();
-            const pane = makePane();
+            // Seed the pane's recency stamp from the session's REAL last
+            // activity: activating a SAVED session must not jump it to the
+            // top of the sidebar. Its row keeps its earned position and
+            // moves again only when the session produces new output.
+            const savedEntry = (getLastSessions() || []).find((s) => s.id === id);
+            const seeded = savedEntry && savedEntry.updatedAt ? Date.parse(savedEntry.updatedAt) : NaN;
+            const pane = makePane(Number.isNaN(seeded) ? undefined : seeded);
             pane.id = id;
             activePaneKey = pane.key;
             // makePane refreshed the sidebar while the id was still unknown.
@@ -3486,6 +3513,9 @@
                     if (data.type === 'session_state') sendSessionDetach(data.sessionId);
                     return; // stale message for a closed session
                 }
+                // Stamp output recency for BOTH active and background panes
+                // (drives sidebar open-pane order); meta types are no-ops.
+                touchPaneActivity(msgPane, data.type);
                 if (msgPane !== activePane()) {
                     handleBackgroundMessage(msgPane, data);
                     return;
@@ -4036,7 +4066,7 @@
                     if (panes.size === 0) {
                         replaceActivePane();
                     } else {
-                        focusPane(panes.keys().next().value);
+                        focusPane(mostRecentlyActivePane().key);
                     }
                 } else {
                     refreshSidebarSessions();
@@ -4417,6 +4447,7 @@
                     job: '',
                     running: !!s.turnActive,
                     success: s.subagentStatus !== 'failed',
+                    active: !!s.active,
                     summary: s.subagentSummary || (s.turnActive ? '' : (s.messageCount ? s.messageCount + ' msgs' : '')),
                 }));
                 rendered.add(s.id);
@@ -4443,36 +4474,50 @@
             title.textContent = label;
             const meta = document.createElement('div');
             meta.className = 'session-row-meta';
-            // Same colored-dot indicator as the flat rows: a running child
-            // shows the amber responding dot, a finished child a green done
-            // dot (or a red failed dot), followed by the summary when one
-            // exists. The dot's class carries the state color; the label
-            // text renders next to it (muted).
+            // A colored dot means the child is LIVE somewhere — responding,
+            // open as a pane in this tab, or live-registered elsewhere —
+            // and its color carries the state: amber responding, red
+            // failed, green done. A settled child that is neither open nor
+            // live renders a muted TEXT status instead, so archived
+            // outcomes do not read as active sessions. Summary text still
+            // follows when one exists.
             const frags = [];
+            const live = !!pane || !!rec.active;
             let stateLabel = '';
             let stateClass = '';
+            let stateDot = false;
             if (running) {
                 stateLabel = 'responding';
                 stateClass = 'amber';
-            } else if (rec.success) {
-                stateLabel = 'done';
-                stateClass = 'green';
-            } else {
+                stateDot = true;
+            } else if (!rec.success) {
                 stateLabel = 'failed';
                 stateClass = 'red';
+                stateDot = live;
+            } else {
+                stateLabel = 'done';
+                stateClass = 'green';
+                stateDot = live;
             }
-            const group = document.createElement('span');
-            group.className = 'session-state';
-            const dot = document.createElement('span');
-            dot.className = 'session-state-dot ' + stateClass;
-            dot.title = stateLabel;
-            dot.setAttribute('aria-label', stateLabel);
-            const stateText = document.createElement('span');
-            stateText.className = 'session-state-label';
-            stateText.textContent = stateLabel;
-            group.appendChild(dot);
-            group.appendChild(stateText);
-            frags.push(group);
+            if (stateDot) {
+                const group = document.createElement('span');
+                group.className = 'session-state';
+                const dot = document.createElement('span');
+                dot.className = 'session-state-dot ' + stateClass;
+                dot.title = stateLabel;
+                dot.setAttribute('aria-label', stateLabel);
+                const stateText = document.createElement('span');
+                stateText.className = 'session-state-label';
+                stateText.textContent = stateLabel;
+                group.appendChild(dot);
+                group.appendChild(stateText);
+                frags.push(group);
+            } else if (stateLabel) {
+                const text = document.createElement('span');
+                text.className = 'session-state-label';
+                text.textContent = stateLabel;
+                frags.push(text);
+            }
             if (!running && rec.summary) frags.push(rec.summary.slice(0, 80));
             for (let i = 0; i < frags.length; i++) {
                 if (i > 0) meta.appendChild(document.createTextNode(' · '));
@@ -5361,7 +5406,10 @@
                 _repinRafPending = false;
                 if (stickToBottom) smartScroll();
                 else maybeRepinNearBottom();
-                updateTocActive();
+                // During a sidebar drag this per-frame probe is deferred to
+                // the single sidebarDragEnd pass on release (see the
+                // sidebarDragActive note above the ResizeObserver).
+                if (!sidebarDragActive) updateTocActive();
             });
         }
         window.addEventListener('gogen-colorized', scheduleRepinIfPinned);
@@ -5373,6 +5421,21 @@
         if (document.fonts && document.fonts.ready) {
             document.fonts.ready.then(() => scheduleRepinIfPinned());
         }
+        // True while a sidebar resize-handle drag is running (toggled by
+        // initSidebarResize below). Mid-drag we skip only the EXPENSIVE TOC
+        // work — updateTocActive's per-prompt getBoundingClientRect probe and
+        // syncTocRailBox's write/read interleave — while keeping
+        // scheduleRepinIfPinned alive, so a pinned chat still follows the
+        // bottom live while dragging. sidebarDragEnd runs one final sync on
+        // release (window blur covers a missed mouseup).
+        let sidebarDragActive = false;
+        function sidebarDragEnd() {
+            if (!sidebarDragActive) return;
+            sidebarDragActive = false;
+            updateTocActive();
+            syncTocRailBox();
+        }
+
         if (typeof ResizeObserver !== 'undefined') {
             // Fires when #messages' visible box changes (window/sidebar/composer
             // resize). scrollHeight growth is content, not the box, so the
@@ -5380,8 +5443,11 @@
             new ResizeObserver(() => {
                 scheduleRepinIfPinned();
                 if (!stickToBottom) updateScrollBottomBtn();
-                updateTocActive();
-                syncTocRailBox();
+                // No direct updateTocActive() here: scheduleRepinIfPinned's
+                // rAF already runs it exactly once per frame. Calling it in
+                // the callback too probed every .message.user rect twice per
+                // resize tick (sidebar drags made that per-pixel work).
+                if (!sidebarDragActive) syncTocRailBox();
             }).observe(messagesDiv);
         }
 
@@ -5466,27 +5532,58 @@
                     const startWidth = sidebar.getBoundingClientRect().width;
 
                     handle.classList.add('active');
+                    sidebarDragActive = true;
+                    // The flex lock is constant for the whole drag: write it
+                    // once here instead of on every mousemove (each redundant
+                    // style write dirties style state for no benefit).
+                    sidebar.style.flexGrow = '0';
+                    sidebar.style.flexShrink = '0';
 
-                    function onMouseMove(ev) {
-                        const delta = ev.clientX - startX;
+                    // rAF-gate the width write: mousemove can fire far more
+                    // often than frames are painted, and every unbatched
+                    // style.write forces a full flex relayout of the page
+                    // (sidebar + chat pane re-wrap) plus the ResizeObserver
+                    // cascade below it. Coalesce to at most one width apply
+                    // per animation frame, using only the latest pointer X.
+                    let rafId = 0;
+                    let latestClientX = e.clientX;
+
+                    function clampWidth(clientX) {
+                        const delta = clientX - startX;
                         let newWidth = startWidth + delta;
                         // Clamp percentage-of-viewport so it scales on 4K/8K screens
                         const minPct = 0.12;  // at least 12% of viewport
                         const maxPct = 0.50;  // at most 50% of viewport
                         const minW = Math.max(120, window.innerWidth * minPct);
                         const maxW = window.innerWidth * maxPct;
-                        newWidth = Math.max(minW, Math.min(maxW, newWidth));
-                        sidebar.style.width = newWidth + 'px';
-                        sidebar.style.flexGrow = '0';
-                        sidebar.style.flexShrink = '0';
+                        return Math.max(minW, Math.min(maxW, newWidth));
+                    }
+
+                    function applyWidth() {
+                        rafId = 0;
+                        sidebar.style.width = clampWidth(latestClientX) + 'px';
+                    }
+
+                    function onMouseMove(ev) {
+                        latestClientX = ev.clientX;
+                        if (!rafId) rafId = requestAnimationFrame(applyWidth);
                     }
 
                     function onMouseUp() {
                         handle.classList.remove('active');
                         document.removeEventListener('mousemove', onMouseMove);
                         document.removeEventListener('mouseup', onMouseUp);
+                        // Flush a pending frame synchronously so the DOM ends
+                        // up exactly where the user stopped before persisting.
+                        if (rafId) {
+                            cancelAnimationFrame(rafId);
+                            rafId = 0;
+                            applyWidth();
+                        }
                         // Persist the width
                         localStorage.setItem(targetId + '-width', sidebar.style.width);
+                        // One final TOC/rail sync against the settled layout.
+                        sidebarDragEnd();
                     }
 
                     document.addEventListener('mousemove', onMouseMove);
@@ -5503,6 +5600,10 @@
                     handle.dispatchEvent(mouseEvent);
                 }, { passive: true });
             });
+
+            // Safety net: if mouseup is missed (button released outside the
+            // window, alt-tab mid-drag), the flag must not freeze TOC updates.
+            window.addEventListener('blur', sidebarDragEnd);
         }
 
         initSidebarResize();

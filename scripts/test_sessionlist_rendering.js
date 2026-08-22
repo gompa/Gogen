@@ -48,19 +48,31 @@ function sessionRowClassAndMeta(s, panes, activePaneKey, explicitPane) {
 // store lists it), then saved sessions in server order.
 function mergedRows(panes, sessions, activePaneKey, nestedParentIds) {
   const list = sessions || [];
-  const rows = [];
-  const openIds = new Set();
+  // ONE list of SESSIONS: rows come from the payload; open panes overlay
+  // onto their session's row by id. Ordering key = last OUTPUT time =
+  // max(server updatedAt, pane.lastActivity) for every row; ties keep
+  // payload order (stable sort).
+  const paneById = new Map();
+  const idlessPanes = [];
   for (const pane of panes.values()) {
-    const entry = pane.id ? (list.find((s) => s.id === pane.id) || null) : null;
-    if (pane.id) openIds.add(pane.id);
-    rows.push({ pane, entry });
+    if (pane.id) paneById.set(pane.id, pane);
+    else idlessPanes.push(pane);
   }
+  const activityOf = (r) => Math.max(
+    r.entry && r.entry.updatedAt ? (Date.parse(r.entry.updatedAt) || 0) : 0,
+    r.pane && r.pane.lastActivity ? r.pane.lastActivity : 0,
+  );
+  const rows = [];
   for (const s of list) {
-    // Nested (subagent) rows render under their parent (appendNestedRows
-    // in app.js), never as flat rows.
     if (s.parentId) continue;
-    if (!openIds.has(s.id)) rows.push({ pane: null, entry: s });
+    rows.push({ pane: paneById.get(s.id) || null, entry: s });
   }
+  const seen = new Set(rows.map((r) => (r.entry ? r.entry.id : '')));
+  for (const [id, pane] of paneById) {
+    if (!seen.has(id)) rows.push({ pane, entry: null });
+  }
+  for (const pane of idlessPanes) rows.push({ pane, entry: null });
+  rows.sort((a, b) => activityOf(b) - activityOf(a));
   // A nested (subagent) child open as a pane renders under its parent, not
   // as a flat open-pane row; it falls back to a flat row only when the
   // parent's row is missing from this render. nestedParentIds models the
@@ -250,6 +262,64 @@ function assert(cond, msg) {
   const rows = mergedRows(panes, [], 0, { CHILD: 'PARENT' });
   assert(rows.length === 1 && rows[0].id === 'CHILD' && rows[0].title === 'subagent: fix bug',
     'nested child with missing parent row falls back to its flat row, got ' + JSON.stringify(rows));
+}
+
+// Ordering: open panes sort by OUTPUT recency, NOT by focus or creation —
+// a pane created first sinks below a pane that produced newer output.
+{
+  const panes = new Map();
+  panes.set(0, { id: 'A', label: 'A', turnActive: false, lastActivity: 1000 }); // older output
+  panes.set(1, { id: 'B', label: 'B', turnActive: false, lastActivity: 2000 }); // newer output
+  const rows = mergedRows(panes, [], 0);
+  assert(rows.length === 2 && rows[0].id === 'B' && rows[1].id === 'A',
+    'order: newest-output pane renders first despite later creation, got ' + JSON.stringify(rows.map((r) => r.id)));
+}
+
+// Ties keep creation order: panes without output stamps do not reshuffle
+// (focusing must not reorder — it only highlights).
+{
+  const panes = new Map();
+  panes.set(0, { id: 'A', label: 'A', turnActive: false });
+  panes.set(1, { id: 'B', label: 'B', turnActive: false });
+  const rows = mergedRows(panes, [], 1);
+  assert(rows.length === 2 && rows[0].id === 'A' && rows[1].id === 'B',
+    'order: unstamped panes keep creation order (focus does not reorder), got ' + JSON.stringify(rows.map((r) => r.id)));
+}
+
+// Activation must NOT reorder: opening a SAVED session as a pane seeds the
+// pane's stamp from the session's updatedAt, so the row keeps its earned
+// position (B's output is newer than A's whole history) and only gains the
+// current highlight.
+{
+  const tsA = '2026-01-01T00:00:00Z';
+  const tsB = '2026-01-02T00:00:00Z';
+  const panes = new Map();
+  panes.set(0, { id: 'A', label: 'A', turnActive: false, lastActivity: Date.parse(tsA) }); // just activated (seeded)
+  const sessions = [
+    { id: 'A', label: 'A', messageCount: 9, updatedAt: tsA },
+    { id: 'B', label: 'B', messageCount: 2, updatedAt: tsB },
+  ];
+  const rows = mergedRows(panes, sessions, 0);
+  assert(rows.length === 2 && rows[0].id === 'B' && rows[1].id === 'A',
+    'activation: opening an older saved session does NOT jump it to the top, got ' + JSON.stringify(rows.map((r) => r.id)));
+  assert(rows[1].rowClass.includes('current'),
+    'activation: the activated row is highlighted in place, got "' + rows[1].rowClass + '"');
+}
+
+// Output recency wins across sources: a background pane whose turn finished
+// AFTER every other session's last output climbs above them, even though its
+// on-disk updatedAt is older (the turn has not been re-fetched yet).
+{
+  const panes = new Map();
+  panes.set(0, { id: 'A', label: 'A', turnActive: false, lastActivity: Date.parse('2026-01-01T00:00:00Z') });
+  panes.set(1, { id: 'B', label: 'B', turnActive: false, lastActivity: Date.parse('2026-01-05T00:00:00Z') }); // fresh turn_end
+  const sessions = [
+    { id: 'A', messageCount: 1, updatedAt: '2026-01-03T00:00:00Z' },
+    { id: 'B', messageCount: 1, updatedAt: '2026-01-02T00:00:00Z' },
+  ];
+  const rows = mergedRows(panes, sessions, -1);
+  assert(rows.length === 2 && rows[0].id === 'B' && rows[1].id === 'A',
+    'output recency wins across sources: B climbed on its newer turn_end despite older disk stamp, got ' + JSON.stringify(rows.map((r) => r.id)));
 }
 
 // Saved nested children (not open) are excluded from the flat list: they

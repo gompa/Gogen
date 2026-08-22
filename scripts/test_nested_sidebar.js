@@ -166,6 +166,8 @@ async function main() {
   const metaE = rows[0] ? (rows[0].querySelector('.session-row-meta').textContent || '') : '';
   check('registered-but-idle restart child shows done (not failed)',
     metaE.includes('done') && !metaE.includes('failed') && !metaE.includes('responding'));
+  check('live-registered done child shows the green done dot',
+    !!rows[0] && !!rows[0].querySelector('.session-state-dot.green'));
 
   // 6b. The persisted outcome drives the fallback: a child that REALLY
   //     failed stays failed after a restart (subagentStatus is persisted
@@ -181,6 +183,7 @@ async function main() {
   const metaF = rows[0] ? (rows[0].querySelector('.session-row-meta').textContent || '') : '';
   check('failed payload child (subagentStatus failed) shows failed',
     metaF.includes('failed') && metaF.includes('boom'));
+  check('failed-but-inactive child shows NO colored dot', !!rows[0] && !rows[0].querySelector('.session-state-dot'));
 
   // 6c. Recursive nesting: grandchildren (depth >= 2) render under their
   //     child row, mirroring the server's cascade.
@@ -195,6 +198,10 @@ async function main() {
   rows = nestedRows();
   check('grandchild renders nested under its child row',
     rows.length === 2 && rows[0].dataset.sessionId === 'G' && rows[1].dataset.sessionId === 'H');
+  // G/H are settled (success status, active:false, not open): text status
+  // only — no colored dot.
+  check('settled closed child shows NO colored dot',
+    !!rows[0] && !rows[0].querySelector('.session-state-dot'));
 
   // 7. Cross-tab deletion: a child deleted elsewhere (session_removed
   //    broadcast) also stops rendering, and its open pane is replaced.
@@ -213,6 +220,7 @@ async function main() {
   check('second child renders nested', rows.length === 1 && rows[0].dataset.sessionId === 'D');
   check('running payload child (turnActive) shows responding',
     !!rows[0] && (rows[0].querySelector('.session-row-meta').textContent || '').includes('responding'));
+  check('running child shows the amber responding dot', !!rows[0] && !!rows[0].querySelector('.session-state-dot.amber'));
   rows[0].querySelector('.session-row-content').click();
   check('second child opened as a pane', sent('session_attach', 'D'));
   recv({ type: 'session_removed', sessionId: 'D' });

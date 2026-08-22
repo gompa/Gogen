@@ -67,27 +67,41 @@ export function renderSessionList(sessions) {
     lastSessions = sessions || [];
     sessionListDiv.innerHTML = '';
     const list = lastSessions;
-    // One unified list: open panes (client state) plus the server's
-    // saved-session payload. Open panes are merged in FIRST so an
-    // open session's row ALWAYS exists — even before the server's
-    // store lists it (fresh session, list lag) — and shows the LIVE
-    // pane label (kept current by config/context echoes). Open
-    // panes render most-recently-used first (movePaneToFront keeps
-    // the map in that order), then saved sessions in server order.
+    // ONE list of SESSIONS, not of panes. Rows come from the server's
+    // saved-session payload (one row per top-level session); an open
+    // pane overlays onto its session's row by id — focused/open/
+    // responding are ATTRIBUTES of the row (dot + highlight), never
+    // its position. Ordering is one key for every row: last OUTPUT
+    // time = max(server updatedAt, pane.lastActivity). Activating or
+    // focusing a session therefore never reorders the list; only new
+    // output does. Ties keep the server's recency order (stable sort).
+    // Panes missing from the payload (fresh id adoption / list lag)
+    // and id-less "creating…" panes still get fallback rows so they
+    // never disappear.
     const act = deps.getPane();
-    const rows = [];
-    const openIds = new Set();
+    const paneById = new Map();
+    const idlessPanes = [];
     for (const pane of deps.getPanes().values()) {
-        const entry = pane.id ? (list.find((s) => s.id === pane.id) || null) : null;
-        if (pane.id) openIds.add(pane.id);
-        rows.push({ pane, entry });
+        if (pane.id) paneById.set(pane.id, pane);
+        else idlessPanes.push(pane);
     }
+    const activityOf = (r) => Math.max(
+        r.entry && r.entry.updatedAt ? (Date.parse(r.entry.updatedAt) || 0) : 0,
+        r.pane && r.pane.lastActivity ? r.pane.lastActivity : 0,
+    );
+    const rows = [];
     for (const s of list) {
         // Nested (subagent) rows render under their parent below,
         // never as flat rows.
         if (s.parentId) continue;
-        if (!openIds.has(s.id)) rows.push({ pane: null, entry: s });
+        rows.push({ pane: paneById.get(s.id) || null, entry: s });
     }
+    const seen = new Set(rows.map((r) => (r.entry ? r.entry.id : '')));
+    for (const [id, pane] of paneById) {
+        if (!seen.has(id)) rows.push({ pane, entry: null });
+    }
+    for (const pane of idlessPanes) rows.push({ pane, entry: null });
+    rows.sort((a, b) => activityOf(b) - activityOf(a));
     // A nested (subagent) child open as a pane renders under its
     // parent via appendNestedRows below, NOT as a flat open-pane
     // row — opening a subagent must not make its row jump out of

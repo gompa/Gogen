@@ -1100,6 +1100,14 @@
             color: var(--fg);
         }
         #delete-approval-dialog h3 { margin-top: 0; color: var(--fg); }
+        /* Paths arrive as potentially unbreakable single-line tokens (a long
+           filename has no whitespace or slash to break at); without
+           break-anywhere they spill past the dialog edge. The multi-path
+           case keeps its line structure via the mono block's pre-wrap. */
+        #delete-approval-reason, #delete-approval-paths {
+            overflow-wrap: anywhere;
+            word-break: break-word; /* legacy engine fallback */
+        }
         #delete-approval-paths {
             font-family: var(--mono);
             background: var(--warn-bg);
@@ -2040,11 +2048,31 @@
             padding: 20px;
             max-width: 400px;
             width: 90%;
+            /* A long session title wraps the message into many lines; cap
+               the height and scroll so the action buttons stay reachable
+               instead of being centered off-screen by the flex overlay. */
+            max-height: 80vh;
+            overflow-y: auto;
+            /* Non-visible overflow-y forces overflow-x to auto too, so an
+               overflowing child would show a horizontal scrollbar inside
+               the dialog. Nothing may scroll sideways here — the text rules
+               below wrap unbreakable tokens; this is the safety net. */
+            overflow-x: hidden;
             box-shadow: 0 8px 32px rgba(0,0,0,0.45);
             color: var(--fg);
         }
         #close-tab-dialog h3, #session-delete-dialog h3 { margin: 0 0 12px; font-size: 1em; }
-        #close-tab-dialog p, #session-delete-dialog p { margin: 0 0 16px; font-size: 0.9em; color: var(--fg-muted); }
+        /* The dialog <p> carries dynamic single-line strings (session
+           labels, editor filenames). Normal wrapping only breaks at
+           whitespace, so one long unbreakable token overflowed the dialog
+           horizontally; break anywhere instead. */
+        #close-tab-dialog p, #session-delete-dialog p {
+            margin: 0 0 16px;
+            font-size: 0.9em;
+            color: var(--fg-muted);
+            overflow-wrap: anywhere;
+            word-break: break-word; /* legacy engine fallback */
+        }
         #close-tab-actions, #session-delete-actions { display: flex; gap: 10px; justify-content: flex-end; }
         #close-tab-actions button.discard, #session-delete-actions button.discard { background: var(--error-bg); border-color: #7a3030; color: #ff7b72; }
         #close-tab-actions button.keep, #session-delete-actions button.keep { background: var(--success-bg); border-color: #2d6a4f; color: var(--success); }

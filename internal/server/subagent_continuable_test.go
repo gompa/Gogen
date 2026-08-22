@@ -550,6 +550,17 @@ func TestConcurrentLimitCountsOnlyLiveChildren(t *testing.T) {
 	if id2 == id1 {
 		t.Fatal("expected a fresh child id")
 	}
+	// Both completion pipelines must be absorbed before the test returns.
+	// The notice delivery happens AFTER the child's outcome FlushSession,
+	// so observing BOTH notices in the parent transcript proves both child
+	// sessions are persisted; the waitForParentDeliveriesSettled cleanup
+	// then bounds the parent ack turns' final flushes. Without this, a
+	// child goroutine starved until after cleanup (Windows CI) writes its
+	// session file while t.TempDir() is being removed ("TempDir RemoveAll
+	// cleanup: ... The directory is not empty").
+	waitFor(t, 5*time.Second, func() bool {
+		return deliveredCount(a, "[subagent") >= 2
+	})
 }
 
 // TestInterruptFreesConcurrentSlot pins that the concurrent limit counts

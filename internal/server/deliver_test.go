@@ -42,7 +42,7 @@ func deliveredMessages(a *agent.Agent, needle string) bool {
 func TestDeliverToSessionIdle(t *testing.T) {
 	dir := t.TempDir()
 	stub := newBlockingStub()
-	s, a, _ := newContinuationServer(t, stub, dir)
+	s, a, store := newContinuationServer(t, stub, dir)
 	p := llm.NewMockProvider()
 	p.StreamResults = []*llm.StreamResult{{Content: "ack"}}
 	a.Provider = p
@@ -65,6 +65,23 @@ func TestDeliverToSessionIdle(t *testing.T) {
 		}
 		return false
 	})
+	// The turn's final flush must land before the test returns, or it races
+	// t.TempDir()'s removal (Windows flakes with "TempDir RemoveAll cleanup:
+	// ... directory is not empty"): the ack becomes memory-visible BEFORE the
+	// turn goroutine's closing persist. Same store-wait pattern as
+	// TestBoardStartStaleAgentLink.
+	waitFor(t, 10*time.Second, func() bool {
+		snap, err := store.LoadInWorkingDir(dir, a.SessionID)
+		if err != nil {
+			return false
+		}
+		for _, m := range snap.Messages {
+			if m.Role == "assistant" && strings.Contains(m.Content, "ack") {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 // TestDeliverToSessionBusyQueuesUntilIdle delivers while a turn is running:
@@ -73,7 +90,7 @@ func TestDeliverToSessionIdle(t *testing.T) {
 func TestDeliverToSessionBusyQueuesUntilIdle(t *testing.T) {
 	dir := t.TempDir()
 	stub := newBlockingStub()
-	s, a, _ := newContinuationServer(t, stub, dir)
+	s, a, store := newContinuationServer(t, stub, dir)
 	// The default provider is the blocking stub: the in-flight turn stays
 	// active until cancelled.
 	rt, ok := s.registry.get(a.SessionID)
@@ -98,6 +115,26 @@ func TestDeliverToSessionBusyQueuesUntilIdle(t *testing.T) {
 	rt.stream.cancelInFlight()
 	waitFor(t, 5*time.Second, func() bool {
 		return deliveredMessages(a, "queued notice")
+	})
+
+	// The queued notice started its OWN turn against the blocking stub
+	// (stream call 2), which blocks forever unless released. Release it and
+	// wait for the reply to be PERSISTED before returning: a turn still
+	// flushing its final state would race t.TempDir()'s removal and flake
+	// Windows with "TempDir RemoveAll cleanup: ... The directory is not
+	// empty" (same store-wait pattern as TestBoardStartStaleAgentLink).
+	stub.releaseN(2)
+	waitFor(t, 10*time.Second, func() bool {
+		snap, err := store.LoadInWorkingDir(dir, a.SessionID)
+		if err != nil {
+			return false
+		}
+		for _, m := range snap.Messages {
+			if m.Role == "assistant" && m.Content == "done" {
+				return true
+			}
+		}
+		return false
 	})
 }
 

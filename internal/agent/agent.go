@@ -1298,9 +1298,15 @@ func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, 
 			// output budget on reasoning). Persisting it would leave a ghost
 			// assistant message that renders as an empty reply, pollutes later
 			// turns, and becomes a fork point. Surface it as an error instead
-			// and let the user retry.
+			// and let the user retry. The provider-reported finish reason is
+			// included when known so these turns are diagnosable without
+			// provider-side logs ("length" = output budget exhausted,
+			// "stop" = stream ended after reasoning-only chunks).
 			if result.Content == "" && result.Refusal == "" {
-				return "", fmt.Errorf("model returned no output (response was truncated mid-reasoning); please try again")
+				if result.FinishReason == "" {
+					return "", fmt.Errorf("model returned no output (response was truncated mid-reasoning); please try again")
+				}
+				return "", fmt.Errorf("model returned no output (finish_reason=%q; response was truncated mid-reasoning); please try again", result.FinishReason)
 			}
 			a.appendMessage(llm.Message{
 				Role:      "assistant",

@@ -102,6 +102,12 @@ type StreamResult struct {
 	// differ from the requested alias on router/proxy endpoints such as
 	// OpenCode Zen). Empty when the provider did not report one.
 	Model string
+	// FinishReason is the provider-reported stop cause from the stream's
+	// final choice ("stop", "length", "tool_calls", ...); the streaming
+	// accumulator infers it when a provider omits the final chunk. Empty
+	// for results built outside the streaming accumulator (test stubs, the
+	// non-streaming fallback).
+	FinishReason string
 }
 
 // ModelInfo describes a model available from the provider endpoint.

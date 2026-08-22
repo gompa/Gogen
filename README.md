@@ -396,9 +396,13 @@ panes share one workspace, the working directory is a single server-wide
 setting: it can only be changed in global mode (`gogen --global`); in project
 mode it is fixed to the project directory and the input is hidden.
 
-- The sidebar lists **Open panes** on top and **saved sessions** below.
-  **New** opens a fresh pane alongside the current one (which keeps
-  streaming); clicking an open pane focuses it, and **✕** closes it — any
+- The sidebar is ONE list of sessions ordered by each session's last output
+  (most recent first). Whether a session is focused, open, or responding
+  shows as the row's status dot/highlight — never as a different position:
+  focusing or activating a session does not reorder the list, only new
+  output does. **New** opens a fresh pane alongside the current one (which
+  keeps streaming); clicking an open pane focuses it, and **✕** closes it —
+  any
   in-flight turn is cancelled and the session's live runtime is released, but
   it stays saved and can be resumed later. Deleting a saved session (✕, with
   confirmation) removes it permanently. Typed `/new`, `/resume <id>`, and
@@ -450,8 +454,11 @@ mode it is fixed to the project directory and the input is hidden.
   pre-fills on the next start; the start prompt template is editable in
   the settings modal (`board_start_prompt`).
 - With `subagent: on`, subagents appear as **nested rows** under their parent
-  session in the sidebar, each with a status dot — amber **responding** while
-  running, green **done** on success, red **failed** on error. Clicking a
+  session in the sidebar. A colored dot marks a live child — amber
+  **responding** while running, red **failed** on error, green **done** on
+  success — whether it is open as a pane here or live in another tab; a
+  settled child that is neither open nor live shows a muted text status
+  instead of a dot. Clicking a
   nested row opens the child as a normal pane (live transcript, Cancel, ✕),
   which is the escape hatch for a subagent stuck in a loop. The Agent tab's
   **Default subagent model** picker and the **System prompt** / **Subagent

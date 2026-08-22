@@ -187,6 +187,9 @@ func TestGenerateResponseStreamReasoningStopGraceFires(t *testing.T) {
 	if result.Content != "" {
 		t.Fatalf("Content should stay empty, got %q", result.Content)
 	}
+	if result.FinishReason != "stop" {
+		t.Fatalf("FinishReason = %q, want the provider-reported stop", result.FinishReason)
+	}
 	if elapsed > 2*time.Second {
 		t.Fatalf("grace did not bound the wait: elapsed %v", elapsed)
 	}

@@ -274,11 +274,12 @@ func (a *streamAccumulator) buildResult() (*StreamResult, error) {
 	}
 
 	return &StreamResult{
-		Content:   content,
-		Reasoning: a.fullReasoning.String(),
-		Refusal:   a.fullRefusal.String(),
-		ToolCalls: toolCalls,
-		Usage:     a.streamUsage,
-		Model:     a.model,
+		Content:      content,
+		Reasoning:    a.fullReasoning.String(),
+		Refusal:      a.fullRefusal.String(),
+		ToolCalls:    toolCalls,
+		Usage:        a.streamUsage,
+		Model:        a.model,
+		FinishReason: a.lastFinishReason,
 	}, nil
 }

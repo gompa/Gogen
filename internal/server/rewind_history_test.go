@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"gogen/internal/agent"
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
@@ -135,6 +137,22 @@ func (s *rewindStreamStub) ListModels(_ context.Context) ([]llm.ModelInfo, error
 func (s *rewindStreamStub) SetModel(string) error { return nil }
 func (s *rewindStreamStub) ModelName() string     { return "rewind-model" }
 
+// drainHandshakePayloads reads the connect handshake's asynchronous payload
+// frames (the basic and the full config, written after the history decision)
+// so the handshake goroutine is provably done before the test drives the
+// session. The payload goroutine snapshots the history WITHOUT the turn lock:
+// a goroutine starved until after the turn below started would deliver a
+// stale history frame whose rewind is empty (it snapshotted between the user
+// message append and the first streamed token), and the mid-turn attach read
+// would match that stale frame first — the send queue is FIFO (Windows CI
+// flake: "mid-turn history must carry a rewind").
+func drainHandshakePayloads(t *testing.T, conn *websocket.Conn) {
+	t.Helper()
+	for i := 0; i < 2; i++ {
+		readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" })
+	}
+}
+
 func newRewindServer(t *testing.T, stub *rewindStreamStub, dir string) (*Server, *agent.Agent, *session.Store) {
 	t.Helper()
 	exec := agent.NewExecutor(dir)
@@ -159,6 +177,7 @@ func TestMidTurnAttachCarriesRewind(t *testing.T) {
 	conn := dialWS(t, srv, "/ws")
 	defer conn.Close()
 	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+	drainHandshakePayloads(t, conn)
 	sid := a.SessionID
 
 	// Start a turn; the stub streams "the quick brown " + thinking and blocks.
@@ -215,6 +234,7 @@ func TestMidTurnAttachCarriesToolCall(t *testing.T) {
 	conn := dialWS(t, srv, "/ws")
 	defer conn.Close()
 	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+	drainHandshakePayloads(t, conn)
 	sid := a.SessionID
 
 	if err := conn.WriteJSON(WSMessage{Type: "message", Content: "q1", SessionID: sid}); err != nil {
@@ -259,6 +279,7 @@ func TestIdleAttachHasNoRewind(t *testing.T) {
 	conn := dialWS(t, srv, "/ws")
 	defer conn.Close()
 	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+	drainHandshakePayloads(t, conn)
 	sid := a.SessionID
 
 	// One completed turn.
