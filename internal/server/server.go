@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gogen/internal/agent"
@@ -77,6 +78,12 @@ type Server struct {
 	tlsKeyFile     string
 	wsConnsMu      sync.Mutex
 	wsConns        []*websocket.Conn
+	// httpSrv is the HTTP listener this Server instance is currently serving
+	// via Start. ForceClose closes it (without waiting for hijacked WebSocket
+	// handlers) on Ctrl+C / ctx cancel. It is per-instance rather than
+	// package-global so concurrent Servers — including the parallel tests that
+	// each call Start — cannot clobber one another's listener.
+	httpSrv        atomic.Pointer[http.Server]
 	connLimiter    *rateLimitState
 	upgradeLimiter *ipLimiter
 	// bootstrapLimiter throttles the unauthenticated ?token= / ?pair=

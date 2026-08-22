@@ -2,19 +2,14 @@ package server
 
 import (
 	"net/http"
-	"sync/atomic"
 )
 
-// httpSrv is the listener Start is serving; ForceClose closes it without
-// waiting for hijacked WebSocket handlers (unlike Shutdown).
-var httpSrv atomic.Pointer[http.Server]
-
 func (s *Server) trackHTTPServer(srv *http.Server) {
-	httpSrv.Store(srv)
+	s.httpSrv.Store(srv)
 }
 
 func (s *Server) untrackHTTPServer() {
-	httpSrv.Store(nil)
+	s.httpSrv.Store(nil)
 }
 
 // ForceClose closes tracked WebSockets and the HTTP listener immediately so
@@ -24,7 +19,7 @@ func (s *Server) ForceClose() {
 	if s != nil {
 		s.closeWSConns()
 	}
-	if srv := httpSrv.Load(); srv != nil {
+	if srv := s.httpSrv.Load(); srv != nil {
 		_ = srv.Close()
 	}
 }
