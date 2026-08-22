@@ -9,121 +9,133 @@ import (
 	tea "charm.land/bubbletea/v2"
 )
 
-func TestExtractLeadingSGR(t *testing.T) {
-	tests := []struct {
-		name      string
-		input     string
-		wantSGR   string
-		wantEmpty bool
-	}{
-		{
-			name:    "gray foreground",
-			input:   "\x1b[38;2;136;136;136m<thinking>test</thinking>\x1b[0m",
-			wantSGR: "\x1b[38;2;136;136;136m",
-		},
-		{
-			name:    "bold + color",
-			input:   "\x1b[1m\x1b[38;2;0;170;170mGoGen:\x1b[0m",
-			wantSGR: "\x1b[1m\x1b[38;2;0;170;170m",
-		},
-		{
-			name:      "plain text",
-			input:     "just plain text",
-			wantEmpty: true,
-		},
-		{
-			name:      "empty string",
-			input:     "",
-			wantEmpty: true,
-		},
-		{
-			name:      "SGR not at start",
-			input:     "hello \x1b[38mworld",
-			wantEmpty: true,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := extractLeadingSGR(tt.input)
-			if tt.wantEmpty {
-				if got != "" {
-					t.Fatalf("expected empty, got %q", got)
-				}
-				return
-			}
-			if got != tt.wantSGR {
-				t.Fatalf("expected %q, got %q", tt.wantSGR, got)
-			}
-		})
-	}
+func TestSGRState(t *testing.T) {
+	dim := "\x1b[38;2;136;136;136m"
+
+	t.Run("lipgloss v2 bare close resets everything", func(t *testing.T) {
+		// lipgloss v2 renders AssistantStyle.Render("GoGen:") exactly like
+		// this: merged params, closed with a bare CSI-m (not "\x1b[0m").
+		var st sgrState
+		applySGRs(&st, "\x1b[1;38;2;0;170;170mGoGen:\x1b[m hello")
+		if st.hasAttrs() {
+			t.Fatalf("bare \\x1b[m must reset, still active: %q", st.sequence())
+		}
+	})
+
+	t.Run("open style survives end of string", func(t *testing.T) {
+		var st sgrState
+		applySGRs(&st, dim+"<thinking>very long reasoning")
+		if got := st.sequence(); got != dim {
+			t.Fatalf("sequence = %q, want %q", got, dim)
+		}
+	})
+
+	t.Run("v1 full reset clears", func(t *testing.T) {
+		var st sgrState
+		applySGRs(&st, "\x1b[1m\x1b[38;2;0;170;170mGoGen:\x1b[0m long message")
+		if st.hasAttrs() {
+			t.Fatalf("\\x1b[0m must reset, still active: %q", st.sequence())
+		}
+	})
+
+	t.Run("property-specific reset keeps other attributes", func(t *testing.T) {
+		// Foreground default (\x1b[39m) closes only the color; bold stays.
+		var st sgrState
+		applySGRs(&st, "\x1b[1m\x1b[31mX\x1b[39m tail")
+		if got := st.sequence(); got != "\x1b[1m" {
+			t.Fatalf("sequence = %q, want bold only", got)
+		}
+	})
+
+	t.Run("bold-off leaves foreground", func(t *testing.T) {
+		var st sgrState
+		applySGRs(&st, "\x1b[1;38;2;0;170;170mGoGen:\x1b[22m rest")
+		if got := st.sequence(); got != "\x1b[38;2;0;170;170m" {
+			t.Fatalf("sequence = %q, want fg only", got)
+		}
+	})
+
+	t.Run("new foreground replaces old", func(t *testing.T) {
+		var st sgrState
+		applySGRs(&st, "\x1b[38;2;204;170;0m  →\x1b[0m name \x1b[38;2;136;136;136margs")
+		if got := st.sequence(); got != dim {
+			t.Fatalf("sequence = %q, want latest fg %q", got, dim)
+		}
+	})
+
+	t.Run("256-color form captured as one op", func(t *testing.T) {
+		var st sgrState
+		applySGRs(&st, "\x1b[38;5;99mX")
+		if got := st.sequence(); got != "\x1b[38;5;99m" {
+			t.Fatalf("sequence = %q, want \\x1b[38;5;99m", got)
+		}
+	})
+
+	t.Run("non-SGR CSI ignored", func(t *testing.T) {
+		var st sgrState
+		applySGRs(&st, "\x1b[2J\x1b[1mbold")
+		if got := st.sequence(); got != "\x1b[1m" {
+			t.Fatalf("sequence = %q, want bold only", got)
+		}
+	})
 }
 
 func TestSGRPropagation(t *testing.T) {
-	sgr := extractLeadingSGR("\x1b[38;2;136;136;136m<thinking>test</thinking>\x1b[0m")
-	if sgr == "" {
-		t.Fatal("expected non-empty SGR")
-	}
+	const cyanBold = "\x1b[1;38;2;0;170;170m"
+	const dim = "\x1b[38;2;136;136;136m"
 
-	t.Run("thinking block — SGR open at split", func(t *testing.T) {
-		// Simulate wordwrap splitting a fully-styled thinking line.
-		// Part 0 has no \x1b[0m → style is still open → propagate.
-		parts := []string{
-			"\x1b[38;2;136;136;136m<thinking>very long",
-			"reasoning text</thinking>\x1b[0m",
-		}
-		if strings.Contains(parts[0], "\x1b[0m") {
-			t.Fatal("part 0 should NOT have reset for this test to be meaningful")
+	t.Run("thinking block — style open at split propagates", func(t *testing.T) {
+		m := &Model{}
+		m.viewport.Width = 42
+		m.viewport.Style = ViewportStyle
+		line := dim + "<thinking>" + strings.Repeat("reasoning text ", 8)
+		parts := m.wrapLine(line)
+		if len(parts) < 2 {
+			t.Fatalf("expected wrapped parts, got %d", len(parts))
 		}
 		for i := 1; i < len(parts); i++ {
-			parts[i] = sgr + parts[i] + "\x1b[0m"
-		}
-		cont := parts[1]
-		if !strings.HasPrefix(cont, sgr) {
-			t.Fatalf("continuation missing SGR prefix: %q", cont)
-		}
-		if !strings.HasSuffix(cont, "\x1b[0m") {
-			t.Fatalf("continuation missing reset suffix: %q", cont)
+			if !strings.HasPrefix(parts[i], dim) {
+				t.Fatalf("part %d missing dim prefix: %q", i, parts[i])
+			}
+			if !strings.HasSuffix(parts[i], "\x1b[0m") {
+				t.Fatalf("part %d missing reset suffix: %q", i, parts[i])
+			}
 		}
 	})
 
-	t.Run("assistant message — SGR closed at split", func(t *testing.T) {
-		// Simulate wordwrap splitting a partially-styled line where
-		// the label SGR was already closed before the wrap point.
-		parts := []string{
-			"\x1b[1m\x1b[38;2;0;170;170mGoGen:\x1b[0m long",
-			"message text continues here",
+	t.Run("assistant label — closed style must NOT bleed onto continuations", func(t *testing.T) {
+		// Regression for the lipgloss-v2 migration: v2 closes the label
+		// with a bare "\x1b[m"; the old literal-reset heuristic treated the
+		// style as open and painted every continuation line cyan/bold.
+		m := &Model{}
+		m.viewport.Width = 42
+		m.viewport.Style = ViewportStyle
+		line := cyanBold + "GoGen:\x1b[m " + strings.Repeat("plain reply text ", 10)
+		parts := m.wrapLine(line)
+		if len(parts) < 2 {
+			t.Fatalf("expected wrapped parts, got %d", len(parts))
 		}
-		if !strings.Contains(parts[0], "\x1b[0m") {
-			t.Fatal("part 0 SHOULD have reset for this test to be meaningful")
-		}
-		// Fix: skip propagation for this case
-		shouldPropagate := !strings.Contains(parts[0], "\x1b[0m")
-		if shouldPropagate {
-			t.Fatal("should NOT propagate SGR when reset is present in part 0")
-		}
-		// Continuation line should remain unstyled
-		cont := parts[1]
-		if strings.HasPrefix(cont, "\x1b[") {
-			t.Fatalf("continuation should NOT have ANSI prefix: %q", cont)
+		for i := 1; i < len(parts); i++ {
+			if strings.Contains(parts[i], "38;2;0;170;170") {
+				t.Fatalf("part %d leaked label style into body text: %q", i, parts[i])
+			}
 		}
 	})
 
-	t.Run("tool call — multi-styled, SGR closed early", func(t *testing.T) {
-		// Tool call prefix SGR closes before the args start, but the args
-		// themselves have their own style.  The trailing SGR (args style)
-		// must be propagated so the continuation line keeps its dim color
-		// even when the first line scrolls out of view.
-		parts := []string{
-			"\x1b[38;2;204;170;0m  →\x1b[0m name \x1b[38;2;136;136;136mvery",
-			"long args here\x1b[0m",
+	t.Run("tool call — args style active at split propagates", func(t *testing.T) {
+		m := &Model{}
+		m.viewport.Width = 42
+		m.viewport.Style = ViewportStyle
+		line := "\x1b[38;2;204;170;0m  →\x1b[0m read_file " +
+			dim + strings.Repeat("very long argument text ", 6) + "\x1b[0m"
+		parts := m.wrapLine(line)
+		if len(parts) < 3 {
+			t.Fatalf("expected 3+ parts, got %d", len(parts))
 		}
-		lastReset := strings.LastIndex(parts[0], "\x1b[0m")
-		if lastReset < 0 {
-			t.Fatal("part 0 SHOULD have reset")
-		}
-		trailingSGR := extractTrailingSGR(parts[0])
-		if trailingSGR == "" {
-			t.Fatal("should propagate trailing SGR when active after last reset")
+		for i := 2; i < len(parts); i++ {
+			if !strings.HasPrefix(parts[i], dim) {
+				t.Fatalf("part %d lost dim args styling: %q", i, parts[i])
+			}
 		}
 	})
 

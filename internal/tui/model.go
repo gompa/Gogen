@@ -43,41 +43,39 @@ func (m *Model) wrapLine(line string) []string {
 		parts = parts[:len(parts)-1]
 	}
 	if len(parts) > 1 {
-		// Propagate the style that is active at each wrap point, tracked
-		// as a running state across every part rather than computed once
-		// from parts[0]. A styled segment can begin partway through a
-		// later continuation line (e.g. a plain tool-call prefix followed
-		// by dimmed args that themselves span several more wrapped
-		// lines), so the active style must be re-derived after each part
-		// — otherwise everything past the part where the style *first*
-		// turns up loses it entirely once earlier lines scroll out of
-		// view (and, when a line hands off between two different
-		// styles, a stale one can leak into text that should carry the
-		// next style instead).
-		active := extractTrailingSGR(parts[0])
-		if active == "" && !strings.Contains(parts[0], "\x1b[0m") {
-			// No reset in parts[0]: the leading style is still open.
-			active = extractLeadingSGR(line)
-		}
-		for i := 1; i < len(parts); i++ {
+		// Propagate the attributes that are still active at each wrap point,
+		// threaded as running SGR state across every part. A styled segment
+		// can begin partway through any line (e.g. a plain tool-call prefix
+		// followed by dimmed args spanning several wrapped lines), so state
+		// must be carried forward — not derived once from parts[0].
+		//
+		// The tracker is attribute-aware (applySGRs/sgrState): it handles
+		// lipgloss v2's bare "\x1b[m" close and per-property resets as well
+		// as v1's literal "\x1b[0m". Matching on the literal reset string
+		// broke under v2, making label styles "bleed" onto every
+		// continuation line.
+		var st sgrState
+		for i := range parts {
 			if parts[i] == "" {
-				continue // skip SGR on empty continuation lines
+				continue // skip styling on empty continuation lines
 			}
-			orig := parts[i]
-			if active != "" {
-				parts[i] = active + orig + "\x1b[0m"
+			var prefix string
+			if i > 0 && st.hasAttrs() {
+				prefix = st.sequence()
 			}
-			// Re-derive the active style for the *next* part from this
-			// part's own (pre-propagation) content.
-			if trailing := extractTrailingSGR(orig); trailing != "" {
-				active = trailing
-			} else if strings.Contains(orig, "\x1b[0m") {
-				// This part closes with its own reset and nothing
-				// styled after it: the style that was active has ended.
-				active = ""
+			// Advance the state over this part's own content first: the
+			// attributes open at its end are what the next part inherits.
+			applySGRs(&st, parts[i])
+			if i > 0 {
+				if prefix != "" {
+					parts[i] = prefix + parts[i]
+				}
+				if st.hasAttrs() {
+					// Close the line so trailing viewport padding does not
+					// inherit the style; the next part re-opens via prefix.
+					parts[i] += "\x1b[0m"
+				}
 			}
-			// else: orig has no SGR of its own at all — whatever was
-			// active carries over unchanged into the next part.
 		}
 	}
 	return parts

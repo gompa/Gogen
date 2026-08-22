@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -16,92 +17,195 @@ import (
 
 var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 
-// extractLeadingSGR returns the leading ANSI SGR sequence(s) from s.
-// Only call when s starts with "\x1b["; returns "" otherwise. The
-// return is safe to use as a prefix for continuation lines after
-// word-wrapping.
-func extractLeadingSGR(s string) string {
-	if !strings.HasPrefix(s, "\x1b[") {
-		return ""
-	}
-	// Scan consecutive escape sequences at the head of s. Lipgloss
-	// emits them as \x1b[##m \x1b[##m ... so we consume every one
-	// that follows directly.
-	end := 0
-	for end < len(s) {
-		if end+1 >= len(s) || s[end] != '\x1b' || s[end+1] != '[' {
-			break
-		}
-		j := end + 2 // past ESC[
-		for j < len(s) && s[j] != '\x1b' {
-			c := s[j]
-			// Terminator letters for SGR: m (lower/upper).
-			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
-				j++
-				break
-			}
-			// Digits, semicolons, colons (CSI parameter bytes).
-			if (c < '0' || c > '9') && c != ';' && c != ':' {
-				// Not a valid CSI byte — stop consuming this
-				// sequence and let the outer loop exit.
-				break
-			}
-			j++
-		}
-		end = j
-	}
-	return s[:end]
+// sgrState tracks the SGR attributes active at a point inside a styled
+// string, in enough detail to re-emit them at a word-wrap point: foreground
+// and background colors (basic, bright, and extended 256/truecolor forms)
+// plus the common attribute flags (bold, dim, italic, underline, blink,
+// reverse, hidden).
+//
+// It exists because wrap-point style propagation must know which attributes
+// are actually open — matching on a literal reset sequence does not work:
+// lipgloss v2 closes styles with a bare "\x1b[m" and property-specific
+// resets ("\x1b[22m", "\x1b[39m") instead of v1's "\x1b[0m".
+type sgrState struct {
+	// ops holds one entry per active attribute, each the raw SGR parameter
+	// string that set it ("1" for bold, "38;2;0;170;170" for a truecolor
+	// fg), in application order so sequence() reproduces them verbatim.
+	ops []string
 }
 
-// extractTrailingSGR returns the concatenated ANSI SGR sequences that are
-// still active at the end of s — i.e. every SGR sequence that appears after
-// the last \x1b[0m reset.  Returns "" when no SGR is active at the end.
-//
-// This is used to correctly propagate the *current* style at a wrap point,
-// which may differ from the leading style when a line contains multiple
-// independently-styled segments (e.g. a tool-call prefix followed by
-// dimmed arguments).
-func extractTrailingSGR(s string) string {
-	// Find the tail after the last reset.
-	lastReset := strings.LastIndex(s, "\x1b[0m")
-	start := 0
-	if lastReset >= 0 {
-		start = lastReset + 4
-	}
-	if start >= len(s) {
+// reset clears every active attribute.
+func (st *sgrState) reset() { st.ops = nil }
+
+// hasAttrs reports whether any attribute is active.
+func (st *sgrState) hasAttrs() bool { return len(st.ops) > 0 }
+
+// sequence renders the active attributes as a single SGR sequence, or ""
+// when nothing is active. The result is safe to prepend to a continuation
+// line to restore styling.
+func (st *sgrState) sequence() string {
+	if len(st.ops) == 0 {
 		return ""
 	}
-	tail := s[start:]
+	return "\x1b[" + strings.Join(st.ops, ";") + "m"
+}
 
-	// Scan the tail for SGR sequences — collect every one we find.
-	// Non-SGR text between them is allowed (e.g. " name \x1b[37margs").
-	idx := strings.Index(tail, "\x1b[")
-	if idx < 0 {
-		return ""
-	}
-	tail = tail[idx:] // skip any plain text before the first SGR in the tail
-
-	// Now collect consecutive SGR sequences from the head of what remains.
-	end := 0
-	for end < len(tail) {
-		if end+1 >= len(tail) || tail[end] != '\x1b' || tail[end+1] != '[' {
-			break
+// removeOps drops every active op whose class matches class of op code n.
+func (st *sgrState) removeOps(class sgrClass) {
+	kept := st.ops[:0]
+	for _, op := range st.ops {
+		if sgrOpClass(op) != class {
+			kept = append(kept, op)
 		}
-		j := end + 2
-		for j < len(tail) && tail[j] != '\x1b' {
-			c := tail[j]
-			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
-				j++
+	}
+	st.ops = kept
+}
+
+func (st *sgrState) addOp(op string) { st.ops = append(st.ops, op) }
+
+// sgrClass groups SGR codes into replaceable families: setting a new fg
+// replaces the previous fg rather than stacking with it.
+type sgrClass uint8
+
+const (
+	sgrClassOther   sgrClass = iota // flags (bold, italic, ...)
+	sgrClassReset                   // 0 / empty
+	sgrClassFlagOff                 // 22, 23, 24, ...
+	sgrClassFg                      // 30-37, 38, 90-97, 39
+	sgrClassBg                      // 40-47, 48, 100-107, 49
+)
+
+// sgrOpClass classifies a raw SGR parameter group (first token decides for
+// extended-color forms like "38;5;n").
+func sgrOpClass(op string) sgrClass {
+	n, err := strconv.Atoi(op)
+	if err != nil {
+		return sgrClassOther
+	}
+	switch {
+	case n == 0:
+		return sgrClassReset
+	case n == 39 || (n >= 30 && n <= 37) || (n >= 90 && n <= 97):
+		return sgrClassFg
+	case n == 49 || (n >= 40 && n <= 47) || (n >= 100 && n <= 107):
+		return sgrClassBg
+	case n == 38 || n == 48:
+		if n == 38 {
+			return sgrClassFg
+		}
+		return sgrClassBg
+	case n >= 21 && n <= 29: // attribute-offs: 22 bold/dim off, 23 italic off, ...
+		return sgrClassFlagOff
+	default:
+		return sgrClassOther
+	}
+}
+
+// flagOffTargets maps attribute-off codes to the on-codes they cancel
+// (22 cancels bold "1" and dim "2", 27 cancels reverse "7", etc.).
+var flagOffTargets = map[string][]string{
+	"22": {"1", "2"},
+	"23": {"3"},
+	"24": {"4"},
+	"25": {"5"},
+	"27": {"7"},
+	"28": {"8"},
+	"29": {"9"},
+}
+
+// apply applies one SGR sequence's parameters (the text between "\x1b["
+// and "m") to the state.
+func (st *sgrState) apply(params string) {
+	toks := strings.FieldsFunc(params, func(r rune) bool { return r == ';' })
+	if len(toks) == 0 {
+		// A bare "\x1b[m" or "\x1b[;m" is a full reset.
+		st.reset()
+		return
+	}
+	for i := 0; i < len(toks); i++ {
+		op := toks[i]
+		n, err := strconv.Atoi(op)
+		if err != nil {
+			continue // malformed parameter — skip
+		}
+		switch {
+		case n == 0:
+			st.reset()
+		case n == 38 || n == 48:
+			// Extended color: consume its argument tokens so they form one
+			// op — "38;5;<n>" (3 extra) or "38;2;<r>;<g>;<b>" (4 extra).
+			extra := 0
+			if i+1 < len(toks) {
+				switch toks[i+1] {
+				case "5":
+					extra = 2
+				case "2":
+					extra = 4
+				}
+			}
+			group := op
+			for k := 0; k < extra && i+1 < len(toks); k++ {
+				i++
+				group += ";" + toks[i]
+			}
+			st.removeOps(sgrClass(n))
+			st.addOp(group)
+		case n == 39:
+			st.removeOps(sgrClassFg) // default fg
+		case n == 49:
+			st.removeOps(sgrClassBg) // default bg
+		case (n >= 30 && n <= 37) || (n >= 90 && n <= 97):
+			st.removeOps(sgrClassFg)
+			st.addOp(op)
+		case (n >= 40 && n <= 47) || (n >= 100 && n <= 107):
+			st.removeOps(sgrClassBg)
+			st.addOp(op)
+		case n >= 21 && n <= 29:
+			for _, target := range flagOffTargets[op] {
+				st.removeExact(target)
+			}
+		default:
+			// Attribute flags (1 bold, 2 dim, 3 italic, 4 underline, 5 blink,
+			// 7 reverse, 8 hidden, 9 strike, plus rarely-used others).
+			st.addOp(op)
+		}
+	}
+}
+
+// removeExact removes the op equal to op (used by attribute-off codes).
+func (st *sgrState) removeExact(op string) {
+	kept := st.ops[:0]
+	for _, existing := range st.ops {
+		if existing != op {
+			kept = append(kept, existing)
+		}
+	}
+	st.ops = kept
+}
+
+// applySGRs advances st over all SGR sequences contained in s, leaving it
+// holding the attributes active at the end of s. Non-SGR CSI sequences are
+// ignored.
+func applySGRs(st *sgrState, s string) {
+	for i := 0; i+1 < len(s); i++ {
+		if s[i] != '\x1b' || s[i+1] != '[' {
+			continue
+		}
+		j := i + 2 // past ESC[
+		for j < len(s) {
+			c := s[j]
+			if c == 'm' {
+				st.apply(s[i+2 : j])
 				break
 			}
+			// Parameter bytes only; any other final byte ends a non-SGR CSI.
 			if (c < '0' || c > '9') && c != ';' && c != ':' {
 				break
 			}
 			j++
 		}
-		end = j
+		i = j // resume after the consumed sequence
 	}
-	return tail[:end]
 }
 
 // stripANSI removes ANSI escape sequences from a string.
