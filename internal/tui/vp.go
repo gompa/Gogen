@@ -4,8 +4,8 @@ import (
 	"math"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -225,19 +225,21 @@ func (v Viewport) Update(msg tea.Msg) (Viewport, tea.Cmd) {
 		return v, nil
 	}
 
-	mouseMsg, ok := msg.(tea.MouseMsg)
+	// v2: wheel events arrive as a dedicated MouseWheelMsg; the direction
+	// is carried in Button.
+	mouseMsg, ok := msg.(tea.MouseWheelMsg)
 	if !ok {
 		return v, nil
 	}
 
 	switch {
-	case mouseMsg.Button == tea.MouseButtonWheelUp:
+	case mouseMsg.Button == tea.MouseWheelUp:
 		v.LineUp(v.MouseWheelDelta)
-	case mouseMsg.Button == tea.MouseButtonWheelDown:
+	case mouseMsg.Button == tea.MouseWheelDown:
 		v.LineDown(v.MouseWheelDelta)
-	case mouseMsg.Button == tea.MouseButtonWheelLeft:
+	case mouseMsg.Button == tea.MouseWheelLeft:
 		v.scrollLeft(v.horizontalStep)
-	case mouseMsg.Button == tea.MouseButtonWheelRight:
+	case mouseMsg.Button == tea.MouseWheelRight:
 		v.scrollRight(v.horizontalStep)
 	}
 

@@ -9,7 +9,7 @@ import (
 	"gogen/internal/agent"
 	"gogen/internal/session"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // dispatchCommand handles slash commands and other special inputs.

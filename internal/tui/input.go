@@ -5,12 +5,12 @@ import (
 
 	"gogen/internal/agent"
 
-	"github.com/charmbracelet/bubbles/key"
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/key"
+	tea "charm.land/bubbletea/v2"
 )
 
 // handleInputKey dispatches key events when the input textarea has focus.
-func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Model) handleInputKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m2, cmd, ok := m.handleInputHelpKey(msg); ok {
 		return m2, cmd
 	}
@@ -46,7 +46,7 @@ func (m *Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // handleInputHelpKey opens the help modal on F1 in any mode (but NOT "?" — that
 // is a printable character).
-func (m *Model) handleInputHelpKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
+func (m *Model) handleInputHelpKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd, bool) {
 	// F1 opens help in any mode (but NOT ? — that's a printable character)
 	if key.Matches(msg, m.keys.Help) {
 		m.modal = ModalHelp
@@ -55,7 +55,7 @@ func (m *Model) handleInputHelpKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
 	return m, nil, false
 }
 
-func (m *Model) handleVerboseKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
+func (m *Model) handleVerboseKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd, bool) {
 	// Global: verbose toggle
 	if key.Matches(msg, m.keys.Verbose) {
 		m.verbose = !m.verbose
@@ -64,7 +64,7 @@ func (m *Model) handleVerboseKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
 	return m, nil, false
 }
 
-func (m *Model) handleCancelOrQuitKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
+func (m *Model) handleCancelOrQuitKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd, bool) {
 	// Cancel turn (ctrl+c) or quit
 	if key.Matches(msg, m.keys.CancelTurn) {
 		if m.streaming {
@@ -84,7 +84,7 @@ func (m *Model) handleCancelOrQuitKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool)
 	return m, nil, false
 }
 
-func (m *Model) handleSubmitKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
+func (m *Model) handleSubmitKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd, bool) {
 	// Submit (enter)
 	if key.Matches(msg, m.keys.Submit) {
 		if m.streaming {
@@ -118,7 +118,7 @@ func (m *Model) handleSubmitKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
 	return m, nil, false
 }
 
-func (m *Model) handleHistoryUpKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
+func (m *Model) handleHistoryUpKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd, bool) {
 	// History navigation
 	if key.Matches(msg, m.keys.HistoryUp) {
 		if len(m.inputHistory) == 0 {
@@ -138,7 +138,7 @@ func (m *Model) handleHistoryUpKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
 	return m, nil, false
 }
 
-func (m *Model) handleHistoryDownKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
+func (m *Model) handleHistoryDownKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd, bool) {
 	if key.Matches(msg, m.keys.HistoryDown) {
 		if m.historyIdx >= len(m.inputHistory) {
 			return m, nil, true
@@ -157,7 +157,7 @@ func (m *Model) handleHistoryDownKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) 
 	return m, nil, false
 }
 
-func (m *Model) handleInputCompletionKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
+func (m *Model) handleInputCompletionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd, bool) {
 	// Tab completion
 	if key.Matches(msg, m.keys.Completion) {
 		line := m.textarea.Value()
@@ -216,7 +216,7 @@ func (m *Model) handleInputCompletionKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bo
 	return m, nil, false
 }
 
-func (m *Model) handleDeleteForwardKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
+func (m *Model) handleDeleteForwardKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd, bool) {
 	// Ctrl+D on empty line = quit
 	if key.Matches(msg, m.keys.DeleteForward) {
 		val := strings.TrimSpace(m.textarea.Value())
@@ -232,7 +232,7 @@ func (m *Model) handleDeleteForwardKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool
 	return m, nil, false
 }
 
-func (m *Model) handleEscapeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
+func (m *Model) handleEscapeKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd, bool) {
 	// Escape to focus viewport
 	if msg.String() == "esc" {
 		m.focus = FocusViewport
@@ -244,7 +244,7 @@ func (m *Model) handleEscapeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
 }
 
 // handleViewportKey dispatches key events when the viewport has focus.
-func (m *Model) handleViewportKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Model) handleViewportKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// Help: F1 or ?
 	if key.Matches(msg, m.keys.Help) || msg.String() == "?" {
 		m.modal = ModalHelp
@@ -281,16 +281,15 @@ func (m *Model) handleViewportKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.textarea.Focus()
 	}
 
-	// Any printable character switches to input and passes the character through
-	if len(msg.Runes) == 1 {
-		r := msg.Runes[0]
-		if r >= 32 && r < 127 {
-			m.focus = FocusInput
-			focusCmd := m.textarea.Focus()
-			var updateCmd tea.Cmd
-			m.textarea, updateCmd = m.textarea.Update(msg)
-			return m, tea.Batch(focusCmd, updateCmd)
-		}
+	// Any printable character switches to input and passes the character through.
+	// v2: check the key code with no modifiers (v1's Runes field is gone;
+	// ctrl/alt-modified letters carry the same Code but must not type text).
+	if c := msg.Code; c >= 32 && c < 127 && msg.Mod == 0 {
+		m.focus = FocusInput
+		focusCmd := m.textarea.Focus()
+		var updateCmd tea.Cmd
+		m.textarea, updateCmd = m.textarea.Update(msg)
+		return m, tea.Batch(focusCmd, updateCmd)
 	}
 
 	// Viewport scrolling

@@ -7,8 +7,8 @@ import (
 
 	"gogen/internal/agent"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/muesli/reflow/wrap"
 )
@@ -194,13 +194,13 @@ func (m *Model) setViewportContent() {
 	m.wrappedContentDirty = false
 }
 
-func (m *Model) View() string {
+func (m *Model) View() tea.View {
 	if !m.ready {
-		return "Initializing..."
+		return tea.NewView("Initializing...")
 	}
 
 	if m.quitting {
-		return ""
+		return tea.NewView("")
 	}
 
 	// Viewport content: use selection-aware render when selecting,
@@ -251,12 +251,16 @@ func (m *Model) View() string {
 		m.renderStatusBar(),
 	)
 
+	v := tea.NewView(main)
+	// Mouse reporting: cell motion covers wheel scrolls and drag-selection.
+	v.MouseMode = tea.MouseModeCellMotion
+
 	// Modal overlay — renders on opaque background so nothing bleeds through
 	if m.modal != ModalNone {
-		return renderModalOverlay(main, m.renderModal(), m.width, m.height)
+		return tea.NewView(renderModalOverlay(main, m.renderModal(), m.width, m.height))
 	}
 
-	return main
+	return v
 }
 
 // renderModalOverlay dims the main view and centers the modal on top.

@@ -3,28 +3,20 @@ package tui
 import (
 	"gogen/internal/agent"
 
-	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/spinner"
-	"github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/spinner"
+	"charm.land/bubbletea/v2"
 )
 
 func (m *Model) Init() tea.Cmd {
 	return m.textarea.Focus()
 }
 
-// Update implements the Bubble Tea update contract. The per-message dispatch
-// lives in handleMsg; this wrapper only handles the undecoded ctrl+shift+c
-// sequence (kitty / xterm modifyOtherKeys) that never arrives as a KeyMsg.
+// Update implements the Bubble Tea update contract; the per-message dispatch
+// lives in handleMsg. On bubbletea v2 the terminal's key-disambiguation mode
+// (kitty protocol / xterm modifyOtherKeys) is negotiated automatically, so
+// ctrl+shift+c arrives as a normal KeyPressMsg and needs no special-casing.
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// Enhanced keyboard: ctrl+shift+c may arrive as an undecoded CSI sequence
-	// (kitty / xterm modifyOtherKeys) rather than a KeyMsg.
-	if _, ok := msg.(tea.KeyMsg); !ok && isCtrlShiftC(msg) {
-		if m.statusMsg != "" {
-			m.statusMsg = ""
-		}
-		m.copySelection()
-		return m, nil
-	}
 	return m.handleMsg(msg)
 }
 
@@ -44,7 +36,9 @@ func (m *Model) handleMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case spinner.TickMsg:
 		return m.handleSpinnerTick(msg)
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
+		// Only key presses are dispatched; key releases are ignored so a
+		// terminal reporting event types cannot double-trigger actions.
 		return m.handleKeyMsg(msg)
 
 	// Streaming messages
@@ -139,7 +133,7 @@ func (m *Model) handleSpinnerTick(msg spinner.TickMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Model) handleKeyMsg(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// Clear transient status message on any key press
 	if m.statusMsg != "" {
 		m.statusMsg = ""
@@ -289,9 +283,9 @@ func (m *Model) handleApprovalRequestMsg(msg approvalRequestMsg) (tea.Model, tea
 	return m, nil
 }
 
-func (m *Model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+func (m *Model) handleMouseMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Check for text selection first; wheel events fall through to viewport
-	if m.handleMouseSelection(msg) {
+	if ev, ok := normalizeMouseEvent(msg); ok && m.handleMouseSelection(ev) {
 		return m, nil
 	}
 	var cmd tea.Cmd

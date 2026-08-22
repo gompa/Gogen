@@ -6,7 +6,7 @@ import (
 
 	"gogen/internal/streamutil"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 func TestTokenBatcherPreservesThinkThenContentOrder(t *testing.T) {

@@ -9,7 +9,7 @@ import (
 	"gogen/internal/agent"
 	"gogen/internal/config"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 const assistantLabel = "GoGen:"
@@ -75,10 +75,11 @@ func (t *TUI) Run(ctx context.Context) {
 	m := NewModel(t.agent, t.cfg)
 	m.ctx = ctx
 
+	// v2: mouse reporting is requested declaratively from View()
+	// (MouseModeCellMotion), not via a program option.
 	p := tea.NewProgram(
 		m,
 		tea.WithContext(ctx),
-		tea.WithMouseCellMotion(),
 	)
 
 	m.program = p

@@ -9,11 +9,11 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/llm"
 
-	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/spinner"
-	"github.com/charmbracelet/bubbles/textarea"
-	"github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/spinner"
+	"charm.land/bubbles/v2/textarea"
+	"charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // FocusTarget indicates which component has keyboard focus.
@@ -191,10 +191,13 @@ func NewModel(a *agent.Agent, cfg *config.Config) *Model {
 	ta.SetHeight(3)
 	ta.MaxHeight = 8
 	ta.CharLimit = 0 // no limit
-	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
-	ta.BlurredStyle.CursorLine = lipgloss.NewStyle()
-	ta.FocusedStyle.Prompt = InputPromptStyle
-	ta.BlurredStyle.Prompt = InputPromptStyle
+	// v2: styles are immutable-by-convention; replace the whole Styles struct.
+	ts := textarea.DefaultStyles(true)
+	ts.Focused.CursorLine = lipgloss.NewStyle()
+	ts.Blurred.CursorLine = lipgloss.NewStyle()
+	ts.Focused.Prompt = InputPromptStyle
+	ts.Blurred.Prompt = InputPromptStyle
+	ta.SetStyles(ts)
 	ta.KeyMap.InsertNewline.SetEnabled(false) // we handle Enter ourselves
 
 	// Remap textarea keybindings to match our CLI conventions

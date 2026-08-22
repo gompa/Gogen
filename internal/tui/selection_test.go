@@ -5,7 +5,8 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/key"
+	tea "charm.land/bubbletea/v2"
 )
 
 func TestExtractLeadingSGR(t *testing.T) {
@@ -184,42 +185,38 @@ func TestWrapLineFitsWidth(t *testing.T) {
 	}
 }
 
-func TestIsCtrlShiftC(t *testing.T) {
+// TestCopySelectionBindingMatchesCtrlShiftC is the bubbletea-v2 migration
+// regression test. On v1, ctrl+shift+c was byte-identical to ctrl+c in
+// legacy terminal encoding (0x03), so pressing it quit the program instead
+// of copying. v2 negotiates key disambiguation, delivering a distinct
+// KeyPressMsg that the CopySelection binding must match — while plain
+// ctrl+c keeps its cancel/quit role.
+func TestCopySelectionBindingMatchesCtrlShiftC(t *testing.T) {
 	tests := []struct {
 		name string
-		msg  tea.Msg
+		msg  tea.KeyPressMsg
 		want bool
 	}{
 		{
-			name: "kitty CSI",
-			msg:  []byte("\x1b[99;6u"),
+			name: "ctrl+shift+c matches copy binding",
+			msg:  tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl | tea.ModShift},
 			want: true,
 		},
 		{
-			name: "xterm modifyOtherKeys",
-			msg:  []byte("\x1b[27;6;99~"),
-			want: true,
-		},
-		{
-			name: "plain ctrl+c key",
-			msg:  tea.KeyMsg{Type: tea.KeyCtrlC},
+			name: "plain ctrl+c does not match copy binding",
+			msg:  tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl},
 			want: false,
 		},
 		{
-			name: "unrelated CSI",
-			msg:  []byte("\x1b[99;5u"),
-			want: false,
-		},
-		{
-			name: "ctrl+shift+left key",
-			msg:  tea.KeyMsg{Type: tea.KeyCtrlShiftLeft},
+			name: "unmodified c does not match copy binding",
+			msg:  tea.KeyPressMsg{Code: 'c'},
 			want: false,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := isCtrlShiftC(tt.msg); got != tt.want {
-				t.Fatalf("isCtrlShiftC() = %v, want %v", got, tt.want)
+			if got := key.Matches(tt.msg, DefaultKeyMap.CopySelection); got != tt.want {
+				t.Fatalf("key.Matches(%q) = %v, want %v", tt.msg.String(), got, tt.want)
 			}
 		})
 	}
@@ -297,12 +294,11 @@ func TestMouseReleaseDoesNotClearSelection(t *testing.T) {
 		EndX:     5,
 		EndY:     0,
 	}
-	consumed := m.handleMouseSelection(tea.MouseMsg{
-		Action: tea.MouseActionRelease,
-		Button: tea.MouseButtonLeft,
-		X:      5,
-		Y:      0,
-	})
+	ev, ok := normalizeMouseEvent(tea.MouseReleaseMsg{X: 5, Y: 0, Button: tea.MouseLeft})
+	if !ok {
+		t.Fatal("expected release msg to normalize")
+	}
+	consumed := m.handleMouseSelection(ev)
 	if !consumed {
 		t.Fatal("expected release to be consumed")
 	}
@@ -333,13 +329,12 @@ func TestButtonNoneMotionDoesNotClearDrag(t *testing.T) {
 		EndX:     5,
 		EndY:     0,
 	}
-	// Some terminals emit ButtonNone motion while the button is down / on release.
-	consumed := m.handleMouseSelection(tea.MouseMsg{
-		Action: tea.MouseActionMotion,
-		Button: tea.MouseButtonNone,
-		X:      6,
-		Y:      0,
-	})
+	// Some terminals emit button-less motion while the button is down / on release.
+	ev, ok := normalizeMouseEvent(tea.MouseMotionMsg{X: 6, Y: 0, Button: tea.MouseNone})
+	if !ok {
+		t.Fatal("expected motion msg to normalize")
+	}
+	consumed := m.handleMouseSelection(ev)
 	if !consumed {
 		t.Fatal("expected motion to be consumed during drag")
 	}
@@ -368,12 +363,11 @@ func TestMousePressRestartsSelection(t *testing.T) {
 	}
 	// Left pad is 1 from ViewportStyle — click column 1+3 = content x 3
 	leftPad := m.viewport.Style.GetPaddingLeft()
-	consumed := m.handleMouseSelection(tea.MouseMsg{
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonLeft,
-		X:      leftPad + 3,
-		Y:      0,
-	})
+	ev, ok := normalizeMouseEvent(tea.MouseClickMsg{X: leftPad + 3, Y: 0, Button: tea.MouseLeft})
+	if !ok {
+		t.Fatal("expected click msg to normalize")
+	}
+	consumed := m.handleMouseSelection(ev)
 	if !consumed {
 		t.Fatal("expected press to be consumed")
 	}

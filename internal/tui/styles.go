@@ -1,9 +1,10 @@
 package tui
 
 import (
+	"image/color"
 	"os"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 )
 
 var (
@@ -42,7 +43,7 @@ var (
 	ansiReset       string // \x1b[39m\x1b[22m — fg+bold only
 )
 
-func lipglossColor(hex string) lipgloss.Color {
+func lipglossColor(hex string) color.Color {
 	if noColor {
 		return lipgloss.Color("")
 	}

@@ -4,12 +4,12 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 
 	"gogen/internal/agent"
 	"gogen/internal/session"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // renderModal renders the currently active modal.
@@ -32,7 +32,7 @@ func (m *Model) renderModal() string {
 }
 
 // handleModalKey dispatches keys when a modal is active.
-func (m *Model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Model) handleModalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch m.modal {
 	case ModalApproval:
 		return m.handleApprovalKey(msg)
@@ -91,7 +91,7 @@ func (m *Model) renderSubagentsModal() string {
 }
 
 // handleSubagentsKey closes the subagents modal on esc.
-func (m *Model) handleSubagentsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Model) handleSubagentsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
 		m.modal = ModalNone
@@ -147,7 +147,7 @@ func (m *Model) renderApprovalModal() string {
 	return renderBorderedModal(rows)
 }
 
-func (m *Model) handleApprovalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Model) handleApprovalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "left", "h":
 		if m.approvalUI.cursor > 0 {
@@ -286,7 +286,7 @@ func (m *Model) renderSessionsModal() string {
 	return renderBorderedModal(rows)
 }
 
-func (m *Model) handleSessionsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Model) handleSessionsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc", "q":
 		m.modal = ModalNone
@@ -470,7 +470,7 @@ func (m *Model) renderModelsModal() string {
 	return renderBorderedModal(rows)
 }
 
-func (m *Model) handleModelsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc", "q":
 		m.modal = ModalNone
@@ -612,7 +612,7 @@ func (m *Model) renderHelpModal() string {
 	return renderBorderedModal(rows)
 }
 
-func (m *Model) handleHelpKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Model) handleHelpKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// Any key dismisses the help overlay
 	m.modal = ModalNone
 	return m, nil
@@ -643,7 +643,7 @@ func (m *Model) renderCompletionModal() string {
 	})
 }
 
-func (m *Model) handleCompletionKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Model) handleCompletionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
 		m.modal = ModalNone

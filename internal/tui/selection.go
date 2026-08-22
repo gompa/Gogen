@@ -1,18 +1,16 @@
 package tui
 
 import (
-	"bytes"
 	"fmt"
 	"os"
-	"reflect"
 	"regexp"
 	"strings"
 	"unicode/utf8"
 
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/atotto/clipboard"
 	"github.com/aymanbagabas/go-osc52/v2"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -167,14 +165,49 @@ func (m *Model) hasSelection() bool {
 	return m.selection != nil && m.selection.Active && m.getSelectedText() != ""
 }
 
+// mouseEventKind identifies which bubbletea v2 mouse message a mouseEvent
+// was normalized from. (v1 carried everything in one MouseMsg with an
+// Action field; v2 splits events into distinct message types.)
+type mouseEventKind uint8
+
+const (
+	mousePress mouseEventKind = iota
+	mouseRelease
+	mouseMotion
+	mouseWheelEvent
+)
+
+// mouseEvent normalizes bubbletea v2's typed mouse messages into the single
+// shape the selection logic needs (the moral equivalent of v1's MouseMsg).
+type mouseEvent struct {
+	x, y   int
+	button tea.MouseButton
+	kind   mouseEventKind
+}
+
+// normalizeMouseEvent converts a typed bubbletea v2 mouse message into a
+// mouseEvent. Returns ok=false for non-mouse messages.
+func normalizeMouseEvent(msg tea.Msg) (mouseEvent, bool) {
+	switch ev := msg.(type) {
+	case tea.MouseClickMsg:
+		return mouseEvent{x: ev.X, y: ev.Y, button: ev.Button, kind: mousePress}, true
+	case tea.MouseReleaseMsg:
+		return mouseEvent{x: ev.X, y: ev.Y, button: ev.Button, kind: mouseRelease}, true
+	case tea.MouseMotionMsg:
+		return mouseEvent{x: ev.X, y: ev.Y, button: ev.Button, kind: mouseMotion}, true
+	case tea.MouseWheelMsg:
+		return mouseEvent{x: ev.X, y: ev.Y, button: ev.Button, kind: mouseWheelEvent}, true
+	}
+	return mouseEvent{}, false
+}
+
 // handleMouseSelection processes mouse events for text selection.
 // Returns true if the event was consumed (selection handled), false if
 // it should be passed through to the viewport for wheel scrolling.
-func (m *Model) handleMouseSelection(msg tea.MouseMsg) bool {
+func (m *Model) handleMouseSelection(ev mouseEvent) bool {
 	// Block wheel only while dragging so content coordinates stay stable.
 	// After release, scrolling is allowed and the highlight tracks content.
-	if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown ||
-		msg.Button == tea.MouseButtonWheelLeft || msg.Button == tea.MouseButtonWheelRight {
+	if ev.kind == mouseWheelEvent {
 		if m.selection != nil && m.selection.Dragging {
 			return true
 		}
@@ -183,38 +216,37 @@ func (m *Model) handleMouseSelection(msg tea.MouseMsg) bool {
 
 	vpHeight := m.viewport.Height
 	if m.selection != nil && m.selection.Active {
-		return m.handleActiveSelectionMouse(msg, vpHeight)
+		return m.handleActiveSelectionMouse(ev, vpHeight)
 	}
-	return m.startSelectionAt(msg, vpHeight)
+	return m.startSelectionAt(ev, vpHeight)
 }
 
 // handleActiveSelectionMouse processes mouse events while a selection is
 // active: drag updates the end point, release finalizes it, right-click
 // clears, and left-press restarts. Returns true when the event was consumed.
-func (m *Model) handleActiveSelectionMouse(msg tea.MouseMsg, vpHeight int) bool {
+func (m *Model) handleActiveSelectionMouse(ev mouseEvent, vpHeight int) bool {
 	switch {
-	case m.selection.Dragging && msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionMotion:
-		x, y := m.mouseToContent(msg.X, msg.Y)
+	case m.selection.Dragging && ev.button == tea.MouseLeft && ev.kind == mouseMotion:
+		x, y := m.mouseToContent(ev.x, ev.y)
 		if x >= 0 && y >= 0 {
 			m.selection.EndX = x
 			m.selection.EndY = y
 		}
 		return true
-	case m.selection.Dragging && msg.Action == tea.MouseActionRelease:
+	case m.selection.Dragging && ev.kind == mouseRelease:
 		m.finalizeSelection()
 		return true
-	case msg.Button == tea.MouseButtonRight &&
-		(msg.Action == tea.MouseActionPress || msg.Action == tea.MouseActionRelease):
+	case ev.button == tea.MouseRight && (ev.kind == mousePress || ev.kind == mouseRelease):
 		m.clearSelection()
 		m.statusMsg = ""
 		return true
-	case !m.selection.Dragging && msg.Button == tea.MouseButtonLeft &&
-		msg.Action == tea.MouseActionPress && msg.Y >= 0 && msg.Y < vpHeight:
+	case !m.selection.Dragging && ev.button == tea.MouseLeft &&
+		ev.kind == mousePress && ev.y >= 0 && ev.y < vpHeight:
 		// Replace the existing selection; start logic below the if handles it.
 		m.clearSelection()
-		return m.startSelectionAt(msg, vpHeight)
+		return m.startSelectionAt(ev, vpHeight)
 	case m.selection.Dragging:
-		// Ignore other events while dragging (e.g. ButtonNone motion that
+		// Ignore other events while dragging (e.g. button-less motion that
 		// some terminals emit). Do NOT clear — that was wiping the
 		// selection before the user could copy.
 		return true
@@ -225,10 +257,10 @@ func (m *Model) handleActiveSelectionMouse(msg tea.MouseMsg, vpHeight int) bool 
 
 // startSelectionAt begins a new selection on a left-press inside the
 // viewport. Returns true when the event was consumed.
-func (m *Model) startSelectionAt(msg tea.MouseMsg, vpHeight int) bool {
-	if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress &&
-		msg.Y >= 0 && msg.Y < vpHeight {
-		x, y := m.mouseToContent(msg.X, msg.Y)
+func (m *Model) startSelectionAt(ev mouseEvent, vpHeight int) bool {
+	if ev.button == tea.MouseLeft && ev.kind == mousePress &&
+		ev.y >= 0 && ev.y < vpHeight {
+		x, y := m.mouseToContent(ev.x, ev.y)
 		m.statusMsg = ""
 		if x >= 0 && y >= 0 {
 			m.selectionYOff = m.viewport.YOffset
@@ -275,42 +307,6 @@ func (m *Model) copySelection() bool {
 		m.statusMsg = fmt.Sprintf("Copy failed: %v", err)
 	}
 	return true
-}
-
-// isCtrlShiftC reports whether msg is Ctrl+Shift+C.
-// Bubble Tea v1 only decodes that combo for special keys; modern terminals
-// often send kitty/xterm CSI sequences that arrive as an opaque []byte-based msg.
-func isCtrlShiftC(msg tea.Msg) bool {
-	if km, ok := msg.(tea.KeyMsg); ok {
-		switch km.String() {
-		case "ctrl+shift+c", "ctrl+shift+C":
-			return true
-		}
-		return false
-	}
-	b := byteSliceMsg(msg)
-	if len(b) == 0 {
-		return false
-	}
-	// kitty keyboard protocol: CSI 99 ; 6 u  (99='c', 6=ctrl+shift)
-	// xterm modifyOtherKeys:   CSI 27 ; 6 ; 99 ~
-	return bytes.Equal(b, []byte("\x1b[99;6u")) ||
-		bytes.Equal(b, []byte("\x1b[99;6U")) ||
-		bytes.Equal(b, []byte("\x1b[27;6;99~"))
-}
-
-// byteSliceMsg extracts a []byte payload from msg.
-// Bubble Tea's unknownCSISequenceMsg is an unexported defined []byte type,
-// so a plain []byte assert is not enough — reflect handles that case.
-func byteSliceMsg(msg tea.Msg) []byte {
-	if b, ok := msg.([]byte); ok {
-		return b
-	}
-	v := reflect.ValueOf(msg)
-	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
-		return append([]byte(nil), v.Bytes()...)
-	}
-	return nil
 }
 
 // runeWidth returns the terminal cell width of r (at least 1 for printable).
