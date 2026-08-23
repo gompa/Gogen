@@ -3,9 +3,11 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	"gogen/internal/agent"
+	"gogen/internal/session"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -164,6 +166,34 @@ func (m *Model) View() tea.View {
 		return tea.NewView("")
 	}
 
+	main := m.renderMainColumn()
+
+	// Sidebar panel (live sessions) — only when visible AND the main
+	// column keeps its minimum width (mainWidth auto-hides otherwise).
+	if m.sidebarOffsetX() > 0 {
+		mainLines := strings.Count(main, "\n") + 1
+		main = lipgloss.JoinHorizontal(lipgloss.Top, m.renderSidebar(mainLines), main)
+	}
+
+	v := tea.NewView(main)
+	// Mouse reporting: cell motion covers wheel scrolls and drag-selection.
+	v.MouseMode = tea.MouseModeCellMotion
+	// Focus reporting: tea.FocusMsg / tea.BlurMsg drive the completion
+	// bell (bellIfBlurred) — it rings only while the window is blurred.
+	v.ReportFocus = true
+
+	// Modal overlay — renders on opaque background so nothing bleeds through
+	if m.modal != ModalNone {
+		return tea.NewView(renderModalOverlay(m.renderModal(), m.width, m.height))
+	}
+
+	return v
+}
+
+// renderMainColumn assembles the chat column (viewport, divider, input,
+// status bar) WITHOUT the sidebar. Kept separate so the sidebar can match
+// its exact row height in View.
+func (m *Model) renderMainColumn() string {
 	// Viewport content: use selection-aware render when selecting,
 	// otherwise use the stock viewport render.
 	var vpView string
@@ -182,46 +212,66 @@ func (m *Model) View() tea.View {
 	}
 
 	// Divider with focus indicator.  Cache the rendered string and only
-	// rebuild when width, focus, or streaming state change.
-	dividerDirty := m.dividerCacheWidth != m.width ||
+	// rebuild when width, focus, or streaming state change. Sized to the
+	// MAIN COLUMN (not the terminal): with the sidebar visible the column
+	// is narrower, and an over-wide divider would grow the combined frame
+	// past the terminal.
+	main := m.mainWidth()
+	dividerDirty := m.dividerCacheWidth != main ||
 		m.dividerCacheFocus != m.focus ||
 		m.dividerCacheStream != m.streaming
 	if dividerDirty {
 		if m.focus == FocusViewport {
 			indicator := " [SCROLL] Press i or Esc to return to input "
-			line := strings.Repeat("─", m.width)
-			keep := max(0, m.width-len(indicator))
+			line := strings.Repeat("─", main)
+			keep := max(0, main-len(indicator))
 			m.dividerCache = DividerStyle.Render(sliceByRuneCount(line, keep) + indicator)
 		} else if m.streaming {
-			m.dividerCache = DimStyle.Render(strings.Repeat("─", m.width))
+			m.dividerCache = DimStyle.Render(strings.Repeat("─", main))
 		} else {
-			m.dividerCache = DividerStyle.Render(strings.Repeat("─", m.width))
+			m.dividerCache = DividerStyle.Render(strings.Repeat("─", main))
 		}
-		m.dividerCacheWidth = m.width
+		m.dividerCacheWidth = main
 		m.dividerCacheFocus = m.focus
 		m.dividerCacheStream = m.streaming
 	}
 	divider := m.dividerCache
 
 	// Assemble
-	main := lipgloss.JoinVertical(
+	return lipgloss.JoinVertical(
 		lipgloss.Left,
 		vpView,
 		divider,
 		inputArea,
 		m.renderStatusBar(),
 	)
+}
 
-	v := tea.NewView(main)
-	// Mouse reporting: cell motion covers wheel scrolls and drag-selection.
-	v.MouseMode = tea.MouseModeCellMotion
-
-	// Modal overlay — renders on opaque background so nothing bleeds through
-	if m.modal != ModalNone {
-		return tea.NewView(renderModalOverlay(m.renderModal(), m.width, m.height))
+// refreshSavedSessions snapshots the persisted-session index backing the
+// sidebar's unified list (best-effort; errors leave the cache empty). The
+// store's 1 s list cache makes this cheap to call on every turn end.
+func (m *Model) refreshSavedSessions() {
+	if m.agent == nil {
+		return
 	}
+	ctx := m.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result, _, err := m.agent.HandleSessionCommand(ctx, "sessions", session.NewID())
+	if err != nil {
+		return
+	}
+	m.savedCache = result.Sessions
+}
 
-	return v
+// sliceRuneLen counts runes (sliceByRuneCount's measure companion).
+func sliceRuneLen(s string) int {
+	n := 0
+	for range s {
+		n++
+	}
+	return n
 }
 
 // renderModalOverlay covers the main view with an opaque background block
@@ -337,6 +387,17 @@ func (m *Model) flushAndQuit() {
 	if m.agent != nil {
 		m.agent.FlushSession()
 	}
+	// Fan out to background live sessions: each owns its persisted state,
+	// and the debounce window is per-agent — a session whose last turn
+	// ended just before quit would otherwise lose its tail.
+	if m.lives != nil {
+		for _, s := range m.lives.sessions {
+			if s.agent == nil || s.agent == m.agent {
+				continue
+			}
+			s.agent.FlushSession()
+		}
+	}
 }
 
 // checkPersistError surfaces any pending session-save error in the status
@@ -348,6 +409,25 @@ func (m *Model) checkPersistError() {
 	}
 	if err := m.agent.ConsumePersistError(); err != nil {
 		m.statusMsg = fmt.Sprintf("Warning: failed to save session: %v", err)
+	}
+}
+
+// bellIfBlurred rings the terminal bell while the window is NOT focused —
+// the TUI equivalent of the web's desktop notifications (turn end, turn
+// error, approval request). No bell while the user is looking at the
+// terminal; terminals that don't report focus never blur, so they never
+// bell.
+func (m *Model) bellIfBlurred() {
+	if !m.terminalBlurred {
+		return
+	}
+	m.bellsRung++
+	// BEL to the tty (the program's default output). A lone control
+	// character interleaved with renderer frames is harmless — the
+	// terminal emulates it, it never shifts the cursor. The program-nil
+	// guard keeps literal-built test models quiet.
+	if m.program != nil {
+		fmt.Fprint(os.Stdout, "\a")
 	}
 }
 
@@ -370,6 +450,7 @@ func (m *Model) handleStreamError(err error) {
 	if !wasStreaming && (err == context.Canceled || strings.Contains(err.Error(), "context canceled")) {
 		return
 	}
+	m.bellIfBlurred() // web parity: turn-error notification (cancels stay quiet)
 	m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Error: %v", err)))
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"gogen/internal/agent"
@@ -81,6 +82,63 @@ var tuiCommands = []tuiCommand{
 		return ok
 	}, run: cmdModels},
 	{match: func(input, trimmed string) bool { return strings.HasPrefix(trimmed, "dir ") }, run: cmdDir},
+	// Switch between actively hosted (live) sessions by number — the
+	// engine behind the future sessions-sidebar ACTIVE section.
+	{match: func(input, trimmed string) bool {
+		return trimmed == "switch" || trimmed == "/switch" ||
+			strings.HasPrefix(trimmed, "switch ") || strings.HasPrefix(trimmed, "/switch ")
+	}, run: cmdSwitch},
+	// Open a NEW live session through the shared web lifecycle core; it
+	// becomes the focused session and appears in /switch's list.
+	{match: func(input, trimmed string) bool {
+		return trimmed == "open" || trimmed == "/open" ||
+			strings.HasPrefix(trimmed, "open ") || strings.HasPrefix(trimmed, "/open ")
+	}, run: cmdOpen},
+}
+
+// cmdOpen handles /open [label]: spawn an additional live session via the
+// shared workspace factory and focus it immediately (the web sidebar's
+// "New" button, as a command).
+func cmdOpen(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
+	label := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(trimmed, "/open"), "open"))
+	if m.lives == nil {
+		m.appendChatLine(ErrorStyle.Render("Open: session hosting unavailable."))
+		return true, false, nil
+	}
+	cmd := m.openNewLiveSession(label)
+	m.appendChatLine(SystemStyle.Render("Switch back with /switch or the sessions panel."))
+	return true, false, cmd
+}
+
+// cmdSwitch handles /switch <n>: focus another live session, leaving any
+// running turn there in the background.
+func cmdSwitch(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
+	arg := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(trimmed, "/switch"), "switch"))
+	if m.lives == nil {
+		m.appendChatLine(ErrorStyle.Render("Switch: only one session is hosted."))
+		return true, false, nil
+	}
+	if arg == "" {
+		// Interactive: the ACTIVE-sessions browser (same registry the
+		// future sidebar renders).
+		m.liveCursor = m.lives.active
+		m.modal = ModalLiveSessions
+		return true, false, nil
+	}
+	n, err := strconv.Atoi(arg)
+	if err != nil || n < 1 || n > len(m.lives.sessions) {
+		m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Switch: invalid session %q (1-%d)", arg, len(m.lives.sessions))))
+		return true, false, nil
+	}
+	i := n - 1
+	if i == m.lives.active {
+		m.appendChatLine(SystemStyle.Render("Already focused."))
+		return true, false, nil
+	}
+	label := m.lives.sessions[i].label
+	cmd := m.switchToLive(i)
+	m.appendChatLine(SystemStyle.Render(fmt.Sprintf("Switched to session: %s", label)))
+	return true, false, cmd
 }
 
 // cmdSubagents opens the nested-session (subagent) list modal.
@@ -168,7 +226,16 @@ func cmdSession(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 		m.setViewportContent()
 		m.viewport.GotoBottom()
 		m.sessionID = m.agent.SessionID
+		// /new and /resume <id> rebind the focused agent: re-stamp the
+		// session's recency so the list does not reorder (see
+		// rebindActivity).
+		m.rebindActivity()
 		m.refreshContextStats()
+		// "resume del <current>" mutates the store on this early-return
+		// path (unlike /new and plain resume, which do not) — refresh so
+		// the deleted row does not linger in the sidebar until the next
+		// 30 s tick.
+		m.refreshSavedSessions()
 		return true, false, nil
 	} else if result.Sessions != nil {
 		// Show session list modal
@@ -185,6 +252,8 @@ func cmdSession(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 	}
 	// Session commands (new, resume, delete) persist.
 	m.checkPersistError()
+	// The store index just changed — refresh the sidebar's unified list.
+	m.refreshSavedSessions()
 	return true, false, nil
 }
 
@@ -265,10 +334,12 @@ func (m *Model) submitDeliveredText(text string) tea.Cmd {
 	m.resetStreamState(false)
 	startProgress := m.setProgress(progressThinking, "thinking")
 
+	sess := m.turnSession()
+	sess.streaming = true
 	streamCtx, cancelFn := context.WithCancel(m.ctx)
-	m.streamCancel = cancelFn
+	sess.cancel = cancelFn
 
-	adapter := NewStreamAdapter(m.program)
+	adapter := NewStreamAdapter(sess.id, m.program, sess)
 	a := m.agent
 	approver := m.makeDeleteApprover()
 
@@ -280,11 +351,11 @@ func (m *Model) submitDeliveredText(text string) tea.Cmd {
 			adapter.Handlers(),
 		)
 		if err != nil {
-			return streamErrorMsg{err: err}
+			return failOfStream(sess.id, err)
 		}
 		// Return streamEndMsg directly so handleStreamEnd refreshes context
 		// stats synchronously after Messages are final.
-		return streamEndMsg{}
+		return endOfStream(sess.id)
 	}
 	return tea.Batch(startProgress, streamCmd)
 }
@@ -332,11 +403,15 @@ func (m *Model) submitUserInput(input string) tea.Cmd {
 	m.resetStreamState(false)
 	startProgress := m.setProgress(progressThinking, "thinking")
 
-	// Create cancelable context for the LLM call
+	// Create cancelable context for the LLM call (no lastActive stamp:
+	// only a COMPLETED turn produces output — the web bumps a row on
+	// output, not on submit).
+	sess := m.turnSession()
+	sess.streaming = true
 	streamCtx, cancelFn := context.WithCancel(m.ctx)
-	m.streamCancel = cancelFn
+	sess.cancel = cancelFn
 
-	adapter := NewStreamAdapter(m.program)
+	adapter := NewStreamAdapter(sess.id, m.program, sess)
 	a := m.agent
 	approver := m.makeDeleteApprover()
 
@@ -348,11 +423,11 @@ func (m *Model) submitUserInput(input string) tea.Cmd {
 			adapter.Handlers(),
 		)
 		if err != nil {
-			return streamErrorMsg{err: err}
+			return failOfStream(sess.id, err)
 		}
 		// Return streamEndMsg directly so handleStreamEnd refreshes context
 		// stats synchronously after Messages are final.
-		return streamEndMsg{}
+		return endOfStream(sess.id)
 	}
 	return tea.Batch(startProgress, streamCmd)
 }

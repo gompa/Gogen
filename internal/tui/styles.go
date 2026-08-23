@@ -18,12 +18,14 @@ func init() {
 		ansiDimOn = ""
 		ansiPromptOn = ""
 		ansiCyanOn = ""
+		ansiGreenOn = ""
 		ansiReset = ""
 	} else {
 		ansiHighlightOn = "\x1b[1m\x1b[38;2;0;170;170m"
 		ansiDimOn = "\x1b[38;2;136;136;136m"
 		ansiPromptOn = "\x1b[38;2;204;170;0m"
 		ansiCyanOn = "\x1b[38;2;0;170;170m"
+		ansiGreenOn = "\x1b[38;2;0;170;0m"
 		// Only reset foreground + bold, never background.
 		// This keeps the overlay's #1a1a1a background alive past
 		// the end of styled text, preventing black gaps and bleed.
@@ -40,6 +42,7 @@ var (
 	ansiDimOn       string // gray
 	ansiPromptOn    string // yellow
 	ansiCyanOn      string // cyan (no bold)
+	ansiGreenOn     string // green (sidebar "active" state dot)
 	ansiReset       string // \x1b[39m\x1b[22m — fg+bold only
 )
 

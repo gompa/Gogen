@@ -4,10 +4,12 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"time"
 
 	"gogen/internal/agent"
 	"gogen/internal/config"
 	"gogen/internal/llm"
+	"gogen/internal/server"
 
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/spinner"
@@ -22,6 +24,7 @@ type FocusTarget int
 const (
 	FocusInput FocusTarget = iota
 	FocusViewport
+	FocusSidebar // sessions panel (tab from viewport; web-parity mouse clicks land here too)
 )
 
 // maxPendingDeliveries caps queued system deliveries (job notices,
@@ -40,6 +43,8 @@ const (
 	ModalHelp
 	ModalCompletion
 	ModalSubagents
+	ModalLiveSessions
+	ModalConfirm // generic yes/no confirmation (sidebar session delete)
 )
 
 // modelChangedMsg is sent by the TUI runner when a background agent state
@@ -57,20 +62,75 @@ type Model struct {
 	// Runtime
 	ctx     context.Context
 	program *tea.Program
+	// terminalBlurred tracks the terminal window's focus (tea.BlurMsg /
+	// FocusMsg, requested via View's ReportFocus). The completion bell
+	// rings only while blurred — the TUI equivalent of the web's desktop
+	// notifications (turn end, turn error, approval request). Terminals
+	// that don't report focus (or tmux without focus-events on) never
+	// blur, so they never bell: the conservative default.
+	terminalBlurred bool
+	// bellsRung counts completion bells fired (test hook; the tty write
+	// itself is not observable in tests).
+	bellsRung int
 
 	// Components
 	viewport Viewport
 	textarea textarea.Model
 
 	// State
-	focus        FocusTarget
-	modal        ModalKind
-	streamCancel context.CancelFunc // cancels the current streaming LLM call
-	streaming    bool
-	verbose      bool
-	width        int
-	height       int
-	quitting     bool
+	focus     FocusTarget
+	modal     ModalKind
+	streaming bool // mirror of lives.Active().streaming (input guards)
+	lives     *liveSessions
+
+	// Sidebar panel (unified session list — web parity). Resize keys live
+	// in viewport/sidebar focus so they never collide with text entry.
+	sidebarVisible bool
+	sidebarWidth   int
+	// sidebarDragging is true while the user drags the panel's right
+	// border to resize it (mouse press on the border column ±1).
+	sidebarDragging bool
+	// savedCache snapshots the persisted-session index; the unified list
+	// overlays live sessions onto it (refreshed on turn end, session
+	// changes, and the 30 s tick).
+	savedCache []agent.SessionInfo
+	// Sidebar navigation state (keyboard + mouse share the cursor).
+	sidebarCursor int // selected row in the unified list
+	sidebarScroll int // first visible row (list overflow)
+	// sidebarLastCursor is the cursor of the last render: the
+	// keep-in-window logic follows the cursor only when it actually moved
+	// (a wheel scroll moves the window, not the cursor, and must not be
+	// snapped back to it).
+	sidebarLastCursor int
+	sidebarMainLines  int // main-column row count of the last render (hit-testing)
+	// sidebarSeq is the persistent first-seen order per row id — the
+	// deterministic tie-break for equal activity (see sidebarSeqOf).
+	sidebarSeq     map[string]int
+	sidebarSeqNext int
+	// sidebarHover is the footer button under the mouse (sidebarFooterNew /
+	// sidebarFooterClose; sidebarFooterNone otherwise) for the hover
+	// highlight. Cell-motion mouse reporting is already on.
+	sidebarHover int
+	// sidebarHovering is true while the mouse is over the panel area —
+	// the border renders highlighted (tracked in handleMouseMsg).
+	sidebarHovering bool
+	// sessionActivity is the per-id recency map (web pane.lastActivity):
+	// session id → last in-process OUTPUT time (completed turn, session
+	// spawn, resume seed). Keyed by session id — not by live slot — so a
+	// session keeps its earned list position after it stops being focused
+	// (resume rebind, pane close) instead of falling back to the store's
+	// persist timestamp, which a flush rewrites to "now".
+	sessionActivity map[string]time.Time
+	// confirmText/confirmAction back ModalConfirm (sidebar session delete).
+	confirmText   string
+	confirmAction func() (tea.Model, tea.Cmd)
+	// workspace spawns additional live sessions (/open) through the shared
+	// web lifecycle core; nil keeps single-session hosting.
+	workspace *server.Workspace
+	verbose   bool
+	width     int
+	height    int
+	quitting  bool
 
 	// Wait indicator (input area) while a turn is in flight
 	spinner       spinner.Model
@@ -161,6 +221,7 @@ type Model struct {
 	modelList     []llm.ModelInfo
 	sessionCursor int
 	modelCursor   int
+	liveCursor    int // ModalLiveSessions selection over m.lives.sessions
 
 	// Keymap
 	keys KeyMap
@@ -256,7 +317,22 @@ func NewModel(a *agent.Agent, cfg *config.Config) *Model {
 	}
 
 	if a != nil {
+		m.lives = newLiveSessions(a)
 		m.sessionID = a.SessionID
+		// Creation is a fresh session's first recency event; a resumed
+		// session's stamp is re-pinned to its store timestamp by
+		// seedRootLastActive below.
+		m.touchSessionActivity(a.SessionID, time.Now())
+		// Web parity: the panel opens by default; only the width persists
+		// across restarts (the web sidebar is open by default too).
+		m.sidebarVisible = true
+		m.sidebarWidth = resolveSidebarStart(a.WorkingDir).SidebarWidth
+		if m.sidebarVisible {
+			m.refreshSavedSessions()
+		}
+		// A resumed session keeps its earned list position (its last
+		// OUTPUT time), not the process start.
+		m.seedRootLastActive()
 		// Build initial history
 		m.chatLines = renderMessages(a.Messages, a.WorkingDir, modelLine, a.Mode.String())
 		m.setViewportContent()
@@ -304,9 +380,10 @@ func (m *Model) SetSize(width, height int) {
 		vpHeight = 3
 	}
 
-	m.viewport.Width = width - 2 // padding
+	main := m.mainWidth()
+	m.viewport.Width = main - 2 // padding
 	m.viewport.Height = vpHeight
-	m.textarea.SetWidth(width - 2)
+	m.textarea.SetWidth(main - 2)
 	m.textarea.SetHeight(textareaHeight)
 
 	m.setViewportContent()

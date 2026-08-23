@@ -8,7 +8,6 @@ import (
 
 	"gogen/internal/agent"
 	"gogen/internal/llm"
-	"gogen/internal/session"
 
 	tea "charm.land/bubbletea/v2"
 )
@@ -20,6 +19,8 @@ func (m *Model) renderModal() string {
 		return m.renderApprovalModal()
 	case ModalSessions:
 		return m.renderSessionsModal()
+	case ModalLiveSessions:
+		return m.renderLiveSessionsModal()
 	case ModalModels:
 		return m.renderModelsModal()
 	case ModalHelp:
@@ -28,6 +29,8 @@ func (m *Model) renderModal() string {
 		return m.renderCompletionModal()
 	case ModalSubagents:
 		return m.renderSubagentsModal()
+	case ModalConfirm:
+		return m.renderConfirmModal()
 	}
 	return ""
 }
@@ -47,6 +50,115 @@ func (m *Model) handleModalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.handleCompletionKey(msg)
 	case ModalSubagents:
 		return m.handleSubagentsKey(msg)
+	case ModalLiveSessions:
+		return m.handleLiveSessionsKey(msg)
+	case ModalConfirm:
+		return m.handleConfirmKey(msg)
+	}
+	return m, nil
+}
+
+// renderConfirmModal renders the generic yes/no confirmation (sidebar
+// session delete — the web's delete-confirm dialog).
+func (m *Model) renderConfirmModal() string {
+	rows := []styleLine{{text: "Confirm", highlight: true}, {text: "", highlight: false}}
+	for _, l := range strings.Split(m.confirmText, "\n") {
+		rows = append(rows, styleLine{text: l})
+	}
+	rows = append(rows, styleLine{text: "", highlight: false},
+		styleLine{text: "y confirm   n/esc cancel", highlight: false})
+	return renderBorderedModal(rows)
+}
+
+// handleConfirmKey dispatches the confirm modal keys.
+func (m *Model) handleConfirmKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "y", "enter":
+		fn := m.confirmAction
+		m.confirmAction = nil
+		m.modal = ModalNone
+		if fn != nil {
+			return fn()
+		}
+	case "n", "esc", "q":
+		m.confirmAction = nil
+		m.modal = ModalNone
+	}
+	return m, nil
+}
+
+// renderLiveSessionsModal lists the actively hosted sessions (the registry
+// behind /open and the future sidebar): focused marker, per-session label,
+// and a streaming dot for background turns. enter focuses the selection
+// via switchToLive — the same rebind-and-rebuild contract as /resume.
+func (m *Model) renderLiveSessionsModal() string {
+	rows := []styleLine{{text: "Active Sessions", highlight: true}, {text: "", highlight: false}}
+	for i, s := range m.lives.sessions {
+		marker := "  "
+		if i == m.lives.active {
+			marker = "* "
+		}
+		state := "idle"
+		if s.streaming {
+			state = "● streaming"
+		}
+		cursor := " "
+		if i == m.liveCursor {
+			cursor = ">"
+		}
+		line := fmt.Sprintf("%s%s %-12s %-14s %s", cursor, marker, s.label, "("+s.id+")", state)
+		rows = append(rows, styleLine{text: line, highlight: i == m.liveCursor})
+	}
+	rows = append(rows, styleLine{text: "", highlight: false},
+		styleLine{text: "↑↓/jk move  enter focus  c cancel  d close  esc close", highlight: false})
+	return renderBorderedModal(rows)
+}
+
+// handleLiveSessionsKey navigates and focuses live sessions.
+func (m *Model) handleLiveSessionsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q":
+		m.modal = ModalNone
+	case "up", "k":
+		if m.liveCursor > 0 {
+			m.liveCursor--
+		}
+	case "down", "j":
+		if m.liveCursor < len(m.lives.sessions)-1 {
+			m.liveCursor++
+		}
+	case "enter":
+		var cmds []tea.Cmd
+		if i := m.liveCursor; i >= 0 && i < len(m.lives.sessions) && i != m.lives.active {
+			cmds = append(cmds, m.switchToLive(i))
+			m.appendChatLine(SystemStyle.Render(fmt.Sprintf("Switched to session: %s", m.lives.ByIndex(i).label)))
+		}
+		m.modal = ModalNone
+		return m, tea.Batch(cmds...)
+	case "c":
+		// Cancel the SELECTED session's in-flight turn (cancelActiveStream
+		// only reaches the focused one, so a background turn was otherwise
+		// uncancelable). The attributed streamErrorMsg lands later via
+		// handleTurnFinishedMsg and clears the flags — "d" works once it
+		// does.
+		if s := m.lives.ByIndex(m.liveCursor); s != nil {
+			if s.cancel != nil {
+				s.cancel()
+				m.statusMsg = "Cancelling " + s.label + "…"
+			} else {
+				m.statusMsg = "Cancel: " + s.label + " is idle"
+			}
+		}
+	case "d":
+		// Close a background session: flush + detach; it stays resumable
+		// under /resume.
+		if err := m.lives.Close(m.liveCursor); err != nil {
+			m.statusMsg = "Close: " + err.Error()
+			return m, nil
+		}
+		if m.liveCursor >= len(m.lives.sessions) {
+			m.liveCursor = len(m.lives.sessions) - 1
+		}
 	}
 	return m, nil
 }
@@ -165,9 +277,7 @@ func (m *Model) handleApprovalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.dismissApproval(false)
 		return m, nil
 	case "ctrl+c":
-		if m.streamCancel != nil {
-			m.streamCancel()
-		}
+		m.cancelActiveStream()
 		m.dismissApproval(false)
 		return m, nil
 	}
@@ -581,6 +691,8 @@ func (m *Model) renderHelpModal() string {
 			{"ctrl+\\", "Force quit"},
 			{"F1 / /help", "Show this help"},
 			{"ctrl+v", "Toggle verbose"},
+			{"ctrl+b", "Toggle sessions panel"},
+			{"tab (scroll mode)", "Focus sessions panel"},
 		}},
 		{"Input Editing", [][]string{
 			{"ctrl+a / home", "Line start"},
@@ -609,11 +721,25 @@ func (m *Model) renderHelpModal() string {
 			{"/context", "Context usage details"},
 			{"/new", "Start new session"},
 			{"/resume", "List/restore/delete sessions"},
+			{"/open", "Open a new live session"},
+			{"/switch", "Switch live sessions"},
 			{"/compact", "Compact history"},
 			{"/verbose", "Toggle verbose output"},
 			{"/save-config", "Write config to .gogen/"},
 			{"dir <path>", "Change working dir"},
 			{"/exit", "Quit GoGen"},
+		}},
+		{"Sessions Panel", [][]string{
+			{"click row", "Focus / resume session"},
+			{"click ✕", "Close (live, stays saved) / delete (saved)"},
+			{"wheel", "Scroll the list"},
+			{"↑ ↓ j k", "Move (tab from scroll mode)"},
+			{"enter", "Focus / resume"},
+			{"n", "New live session"},
+			{"x", "Close (stays saved)"},
+			{"d", "Delete (confirm)"},
+			{"[ / ]", "Resize panel"},
+			{"i / esc", "Back to input"},
 		}},
 		{"Text Selection", [][]string{
 			{"click+drag", "Select text in viewport"},
@@ -722,44 +848,14 @@ func (m *Model) handleCompletionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 // resumeSelectedSession resumes the session at sessionCursor from the sessions modal.
 func (m *Model) resumeSelectedSession() (tea.Model, tea.Cmd) {
 	id := m.sessionList[m.sessionCursor].ID
-	// Skip if already on this session.
-	if id == m.sessionID {
-		m.modal = ModalNone
-		return m, nil
-	}
-	result, _, err := m.agent.HandleSessionCommand(m.ctx, "resume "+id, session.NewID())
-	if err != nil {
-		m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Session: %v", err)))
-		m.modal = ModalNone
-		return m, nil
-	}
-	if result.Action == agent.SessionActionClearChat {
-		m.chatLines = nil
-		m.chatLines = append(m.chatLines, SystemStyle.Render(result.Output))
-		if len(result.History) > 0 {
-			m.chatLines = append(m.chatLines, renderMessages(result.History, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())...)
-		}
-		m.setViewportContent()
-		m.viewport.GotoBottom()
-		m.sessionID = m.agent.SessionID
-		m.modal = ModalNone
-		m.refreshContextStats()
-		return m, nil
-	}
 	m.modal = ModalNone
-	return m, nil
+	return m, m.resumeSavedRow(id)
 }
 
 // deleteSelectedSession deletes the session at sessionCursor from the sessions modal.
 func (m *Model) deleteSelectedSession() (tea.Model, tea.Cmd) {
 	id := m.sessionList[m.sessionCursor].ID
-	result, _, err := m.agent.HandleSessionCommand(m.ctx, "resume del "+id, session.NewID())
-	if err != nil {
-		m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Session: %v", err)))
-		m.modal = ModalNone
-		return m, nil
-	}
-	m.appendChatLine(SystemStyle.Render(result.Output))
+	cmd := m.deleteSavedRow(id)
 	// Remove from the local list.
 	m.sessionList = append(m.sessionList[:m.sessionCursor], m.sessionList[m.sessionCursor+1:]...)
 	if m.sessionCursor >= len(m.sessionList) {
@@ -771,15 +867,5 @@ func (m *Model) deleteSelectedSession() (tea.Model, tea.Cmd) {
 	if len(m.sessionList) == 0 {
 		m.modal = ModalNone
 	}
-	if result.Action == agent.SessionActionClearChat {
-		// The deleted session was the *current* one; start a new session.
-		m.chatLines = nil
-		m.chatLines = append(m.chatLines, SystemStyle.Render(result.Output))
-		m.setViewportContent()
-		m.viewport.GotoBottom()
-		m.sessionID = m.agent.SessionID
-		m.refreshContextStats()
-		return m, nil
-	}
-	return m, nil
+	return m, cmd
 }

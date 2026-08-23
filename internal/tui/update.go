@@ -9,7 +9,9 @@ import (
 )
 
 func (m *Model) Init() tea.Cmd {
-	return m.textarea.Focus()
+	// The sidebar tick loop runs for the whole program lifetime (a no-op
+	// while the panel is hidden) so toggling can never fork a second loop.
+	return tea.Batch(m.textarea.Focus(), sidebarTickCmd())
 }
 
 // Update implements the Bubble Tea update contract; the per-message dispatch
@@ -26,9 +28,26 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) handleMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
+	// Drop streaming render events whose owner lost focus between send and
+	// delivery (switch-boundary stragglers). Terminal msgs carry sid too
+	// and are routed by handleTurnFinishedMsg instead.
+	if sid, ok := streamEventSid(msg); ok && !m.ownsStream(sid) {
+		return m, nil
+	}
+
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		return m.handleWindowSizeMsg(msg)
+
+	// Terminal window focus (View's ReportFocus): the completion bell
+	// rings only while the window is blurred.
+	case tea.FocusMsg:
+		m.terminalBlurred = false
+		return m, nil
+
+	case tea.BlurMsg:
+		m.terminalBlurred = true
+		return m, nil
 
 	case modelChangedMsg:
 		return m.handleModelChangedMsg()
@@ -73,16 +92,23 @@ func (m *Model) handleMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleStreamRoundEndMsg()
 
 	case streamEndMsg:
-		return m.handleStreamEndMsg()
+		return m.handleTurnFinishedMsg(msg.sid, nil)
 
 	case streamErrorMsg:
-		return m.handleStreamErrorMsg(msg)
+		return m.handleTurnFinishedMsg(msg.sid, msg.err)
 
 	case condensedNoteMsg:
 		return m.handleCondensedNoteMsg(msg)
 
 	case contextStatsMsg:
 		return m.handleContextStatsMsg(msg)
+
+	case sidebarTickMsg:
+		// 30 s relative-time / store refresh (web's sidebar tick).
+		if m.sidebarVisible {
+			m.refreshSavedSessions()
+		}
+		return m, sidebarTickCmd()
 
 	// Approval request (show modal)
 	case approvalRequestMsg:
@@ -145,12 +171,19 @@ func (m *Model) handleKeyMsg(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// Global hotkeys that work regardless of focus/modal
 	switch {
 	case key.Matches(msg, m.keys.ForceQuit):
-		if m.streamCancel != nil {
-			m.streamCancel()
-		}
+		m.cancelActiveStream()
 		m.dismissApproval(false)
 		m.flushAndQuit()
 		return m, tea.Quit
+	case msg.String() == "ctrl+b" && m.modal == ModalNone:
+		m.toggleSidebar()
+		return m, nil
+	case (m.focus == FocusViewport || m.focus == FocusSidebar) && m.modal == ModalNone && msg.String() == "[":
+		m.resizeSidebar(-4)
+		return m, nil
+	case (m.focus == FocusViewport || m.focus == FocusSidebar) && m.modal == ModalNone && msg.String() == "]":
+		m.resizeSidebar(4)
+		return m, nil
 	}
 
 	// If a modal is active, handle modal keys
@@ -161,6 +194,15 @@ func (m *Model) handleKeyMsg(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// Dispatch based on focus
 	if m.focus == FocusViewport {
 		return m.handleViewportKey(msg)
+	}
+	if m.focus == FocusSidebar {
+		// Auto-hide (narrow terminal) can leave focus on an invisible
+		// panel — fall back to the input instead of swallowing keys.
+		if m.sidebarOffsetX() == 0 {
+			m.focus = FocusInput
+			return m, m.textarea.Focus()
+		}
+		return m.handleSidebarKey(msg)
 	}
 	return m.handleInputKey(msg)
 }
@@ -251,11 +293,7 @@ func (m *Model) handleStreamRoundEndMsg() (tea.Model, tea.Cmd) {
 func (m *Model) handleStreamEndMsg() (tea.Model, tea.Cmd) {
 	// Always process – resets streaming state
 	m.handleStreamEnd()
-	return m, tea.Batch(m.refocusInput(), m.drainDeliveries())
-}
-
-func (m *Model) handleStreamErrorMsg(msg streamErrorMsg) (tea.Model, tea.Cmd) {
-	m.handleStreamError(msg.err)
+	m.bellIfBlurred() // web parity: "Agent finished responding" notification
 	return m, tea.Batch(m.refocusInput(), m.drainDeliveries())
 }
 
@@ -280,13 +318,28 @@ func (m *Model) handleApprovalRequestMsg(msg approvalRequestMsg) (tea.Model, tea
 		cursor: 1, // default to Yes
 	}
 	m.modal = ModalApproval
+	m.bellIfBlurred() // web parity: "Approval needed" notification
 	return m, nil
 }
 
 func (m *Model) handleMouseMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// Check for text selection first; wheel events fall through to viewport
-	if ev, ok := normalizeMouseEvent(msg); ok && m.handleMouseSelection(ev) {
-		return m, nil
+	// Border drag-resize, panel clicks, and panel-area events take
+	// precedence over text selection; wheel events over the chat fall
+	// through to the viewport.
+	if ev, ok := normalizeMouseEvent(msg); ok {
+		if m.handleSidebarResizeMouse(ev) {
+			return m, nil
+		}
+		if m.handleSidebarMouse(ev) {
+			// The panel consumed the event: the mouse is over the panel
+			// area, so its border renders highlighted.
+			m.sidebarHovering = true
+			return m, nil
+		}
+		m.sidebarHovering = false
+		if m.handleMouseSelection(ev) {
+			return m, nil
+		}
 	}
 	var cmd tea.Cmd
 	m.viewport, cmd = m.viewport.Update(msg)

@@ -287,6 +287,12 @@ func cellsToRuneRange(s string, startCell, endCell int) (startRi, endRi int) {
 // content coordinates (line and cell column in the plain wrapped content).
 func (m *Model) mouseToContent(mouseX, mouseY int) (int, int) {
 	m.ensureWrappedLines()
+	// Chat column starts right of the sessions panel; presses on the panel
+	// itself never select chat text.
+	mouseX -= m.sidebarOffsetX()
+	if mouseX < 0 {
+		return -1, -1
+	}
 	// Account for viewport scroll position. While dragging, freeze to the
 	// YOffset captured at press so motion coordinates stay stable.
 	contentY := mouseY + m.viewport.YOffset

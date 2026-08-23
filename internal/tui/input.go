@@ -71,9 +71,7 @@ func (m *Model) handleCancelOrQuitKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd, 
 			m.streaming = false
 			m.clearProgress()
 			// Cancel the underlying LLM stream
-			if m.streamCancel != nil {
-				m.streamCancel()
-			}
+			m.cancelActiveStream()
 			m.resetStreamState(false)
 			m.appendChatLine(SystemStyle.Render("Cancelled."))
 			return m, m.refocusInput(), true
@@ -221,9 +219,7 @@ func (m *Model) handleDeleteForwardKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd,
 	if key.Matches(msg, m.keys.DeleteForward) {
 		val := strings.TrimSpace(m.textarea.Value())
 		if val == "" {
-			if m.streamCancel != nil {
-				m.streamCancel()
-			}
+			m.cancelActiveStream()
 			m.dismissApproval(false)
 			m.flushAndQuit()
 			return m, tea.Quit, true
@@ -257,9 +253,7 @@ func (m *Model) handleViewportKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.streaming = false
 			m.clearProgress()
 			// Cancel the underlying LLM stream
-			if m.streamCancel != nil {
-				m.streamCancel()
-			}
+			m.cancelActiveStream()
 			m.resetStreamState(false)
 			m.appendChatLine(SystemStyle.Render("Cancelled."))
 			// Stay on viewport focus; blink restarts when returning to input.
@@ -279,6 +273,13 @@ func (m *Model) handleViewportKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.clearSelection()
 		m.focus = FocusInput
 		return m, m.textarea.Focus()
+	case "tab":
+		// Keyboard access to the sessions panel (web parity is mouse;
+		// tab is the keyboard entry point). Tab is unused in viewport
+		// focus — in input focus it stays completion.
+		m.focus = FocusSidebar
+		m.sidebarCursor = m.sidebarFocusedRow()
+		return m, nil
 	}
 
 	// Any printable character switches to input and passes the character through.
@@ -300,7 +301,7 @@ func (m *Model) handleViewportKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "down", "j":
 		m.viewport.LineDown(1)
 		return m, nil
-	case "pgup", "ctrl+b":
+	case "pgup":
 		m.viewport.PageUp()
 		return m, nil
 	case "pgdown", "ctrl+f":

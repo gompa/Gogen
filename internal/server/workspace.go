@@ -496,6 +496,18 @@ func (ws *Workspace) NewSessionAgent(snap *agent.SessionSnapshot, id string) *ag
 	return a
 }
 
+// NewWorkspaceForHost builds a Workspace around an existing default-session
+// agent. It is the embedding seam for non-HTTP hosts (the TUI): the returned
+// workspace shares the web lifecycle core — NewSessionAgent seeding from the
+// shared store/board/skills/MCP managers, the live registered-provider list,
+// and runtime config — so both frontends drive one implementation.
+// NewServer builds its workspace via newWorkspaceFromAgent directly; this
+// wrapper exists so non-HTTP hosts get the same core without the HTTP
+// surface.
+func NewWorkspaceForHost(a *agent.Agent, cfg *config.Config) *Workspace {
+	return newWorkspaceFromAgent(a, cfg)
+}
+
 // newWorkspaceFromAgent builds a Workspace that shares the given agent's
 // executor and store. Used by NewServer while the server hosts the default
 // session (the agent itself is registered directly; NewSessionAgent is only

@@ -5,13 +5,16 @@ import (
 
 	"gogen/internal/agent"
 	"gogen/internal/config"
+	"gogen/internal/server"
 	"gogen/internal/tui"
 )
 
 // runTUI runs the interactive Bubble Tea interface until it quits. Model
 // validation runs in the background so the TUI can open immediately.
 func runTUI(ctx context.Context, a *agent.Agent, cfg *config.Config, restoredModel string) {
-	c := tui.New(a, cfg)
+	// Attach the shared web lifecycle core so /open can spawn additional
+	// live sessions (same seeding as web panes); nil-safe for tests.
+	c := tui.NewWithWorkspace(a, cfg, server.NewWorkspaceForHost(a, cfg))
 	// tui.New installs the model-change hook (ForceRender), so a background
 	// ValidateRestoredModel that clears or auto-selects a restored model
 	// re-renders the status bar even while the terminal is idle.

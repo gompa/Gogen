@@ -18,77 +18,123 @@ import (
 // --- Bubble Tea messages for streaming ---
 
 // streamStartMsg is sent when the agent first begins processing.
-type streamStartMsg struct{}
+type streamStartMsg struct{ sid string }
 
 // streamRoundStartMsg is sent at the start of each LLM round after the first.
-type streamRoundStartMsg struct{}
+type streamRoundStartMsg struct{ sid string }
 
-type streamTokenMsg struct{ token string }
-type streamThinkingMsg struct{ token string }
+type streamTokenMsg struct {
+	token string
+	sid   string
+}
+
+type streamThinkingMsg struct {
+	token string
+	sid   string
+}
+
 type streamToolCallMsg struct {
 	index int
 	id    string
 	name  string
+	sid   string
 }
+
 type streamToolCallArgsMsg struct {
 	index int
 	id    string
 	delta string
+	sid   string
 }
+
 type streamToolResultMsg struct {
 	id      string
 	name    string
 	result  string
 	success bool
+	sid     string
 }
 
 // streamToolCallFinalMsg is sent when tool call args are fully parsed.
 type streamToolCallFinalMsg struct {
 	index int
 	tc    llm.ToolCall
+	sid   string
 }
 
 // streamToolExecuteMsg is sent immediately before a tool runs.
 type streamToolExecuteMsg struct {
 	name string
+	sid  string
 }
 
 // streamRoundEndMsg is sent at the end of each streaming round
 // (including intermediate tool-call rounds). It resets buffers
 // but does NOT set streaming=false.
-type streamRoundEndMsg struct{}
+type streamRoundEndMsg struct{ sid string }
 
-// streamEndMsg is sent when all streaming is complete (final message from goroutine).
-type streamEndMsg struct{}
+// streamEndMsg is sent when all streaming is complete (final message from
+// goroutine). sid attributes the turn to its owning live session so a
+// background session's finish never mutates the focused transcript.
+type streamEndMsg struct{ sid string }
 
-type streamErrorMsg struct{ err error }
+type streamErrorMsg struct {
+	err error
+	sid string
+}
 
 // condensedNoteMsg carries the last-resort condensation announcement
 // (Phase 0e) for rendering as a system line.
-type condensedNoteMsg struct{ note string }
+type condensedNoteMsg struct {
+	note string
+	sid  string
+}
 
 type contextStatsMsg struct {
 	stats agent.TurnContext
 }
 
+// programSender is the minimal program surface the adapter needs;
+// *tea.Program satisfies it, and tests may record sends instead.
+type programSender interface {
+	Send(msg tea.Msg)
+}
+
 // StreamAdapter adapts llm.StreamHandlers to emit Bubble Tea messages
 // that can be processed by the Model's Update method.
 type StreamAdapter struct {
-	program *tea.Program
+	program programSender
+	// owner is the live-session id whose turn this adapter renders.
+	owner string
+	// sess is the owning live session. Focused → events go to the
+	// program; background → they are buffered for replay when focus
+	// arrives (the turn keeps running either way; completion stays
+	// attributed via sid).
+	sess *liveSession
 }
 
-// NewStreamAdapter creates a new StreamAdapter.
-func NewStreamAdapter(p *tea.Program) *StreamAdapter {
-	return &StreamAdapter{program: p}
+// NewStreamAdapter creates a new StreamAdapter for one live session's turn.
+func NewStreamAdapter(owner string, p programSender, sess *liveSession) *StreamAdapter {
+	return &StreamAdapter{program: p, owner: owner, sess: sess}
+}
+
+// send emits a rendering message, or buffers it while the session streams
+// in the background.
+func (s *StreamAdapter) send(msg tea.Msg) {
+	if s.sess != nil && !s.sess.focused.Load() {
+		s.sess.enqueue(msg)
+		return
+	}
+	s.program.Send(msg)
 }
 
 // Handlers returns a full set of stream handlers that emit tea.Msg values.
 func (s *StreamAdapter) Handlers() *llm.StreamHandlers {
 	tuiSend := func(think bool, text string) {
 		if think {
-			s.program.Send(streamThinkingMsg{token: text})
+			s.send(streamThinkingMsg{token: text, sid: s.owner})
 		} else {
-			s.program.Send(streamTokenMsg{token: text})
+			s.send(streamTokenMsg{token: text, sid: s.owner})
 		}
 	}
 	batch := streamutil.NewTokenBatcher(tuiSend, 32*time.Millisecond)
@@ -96,14 +142,14 @@ func (s *StreamAdapter) Handlers() *llm.StreamHandlers {
 	return &llm.StreamHandlers{
 		OnStart: func() {
 			batch.Reset()
-			s.program.Send(streamStartMsg{})
+			s.send(streamStartMsg{sid: s.owner})
 		},
 		OnCondensed: func(note string) {
-			s.program.Send(condensedNoteMsg{note: note})
+			s.send(condensedNoteMsg{note: note, sid: s.owner})
 		},
 		OnRoundStart: func() {
 			batch.Reset()
-			s.program.Send(streamRoundStartMsg{})
+			s.send(streamRoundStartMsg{sid: s.owner})
 		},
 		OnThinkingToken: func(token string) {
 			batch.ThinkToken(token)
@@ -114,23 +160,23 @@ func (s *StreamAdapter) Handlers() *llm.StreamHandlers {
 		OnStreamEnd: func() {
 			batch.Flush()
 			batch.Close()
-			s.program.Send(streamRoundEndMsg{})
+			s.send(streamRoundEndMsg{sid: s.owner})
 		},
 		OnToolCallStart: func(index int, id, name string) {
 			batch.Flush()
-			s.program.Send(streamToolCallMsg{index: index, id: id, name: name})
+			s.send(streamToolCallMsg{index: index, id: id, name: name, sid: s.owner})
 		},
 		OnToolCallArgsDelta: func(index int, id, name, argsDelta string) {
-			s.program.Send(streamToolCallArgsMsg{index: index, id: id, delta: argsDelta})
+			s.send(streamToolCallArgsMsg{index: index, id: id, delta: argsDelta, sid: s.owner})
 		},
 		OnToolCall: func(tc llm.ToolCall) {
-			s.program.Send(streamToolCallFinalMsg{index: tc.Index, tc: tc})
+			s.send(streamToolCallFinalMsg{index: tc.Index, tc: tc, sid: s.owner})
 		},
 		OnToolExecute: func(name string) {
-			s.program.Send(streamToolExecuteMsg{name: name})
+			s.send(streamToolExecuteMsg{name: name, sid: s.owner})
 		},
 		OnToolResult: func(id, name, result string, success bool) {
-			s.program.Send(streamToolResultMsg{id: id, name: name, result: result, success: success})
+			s.send(streamToolResultMsg{id: id, name: name, result: result, success: success, sid: s.owner})
 		},
 		OnRecoverPartialStream: func() {},
 	}

@@ -9,12 +9,16 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
+// The bar spans the MAIN COLUMN, not the terminal: with the sidebar
+// visible the column is narrower, and an over-wide bar would grow the
+// combined frame past the terminal width.
 func (m *Model) renderStatusBar() string {
-	if m.width <= 0 {
+	w := m.mainWidth()
+	if w <= 0 {
 		return ""
 	}
 	if m.agent == nil {
-		return StatusBarStyle.Width(m.width).Render("")
+		return StatusBarStyle.Width(w).Render("")
 	}
 
 	var leftParts []string
@@ -24,9 +28,9 @@ func (m *Model) renderStatusBar() string {
 		content := StatusBarDimStyle.Render(m.statusMsg)
 		// Center the message
 		msgWidth := lipgloss.Width(content)
-		padLeft := max(0, (m.width-msgWidth)/2)
+		padLeft := max(0, (w-msgWidth)/2)
 		result := strings.Repeat(" ", padLeft) + content
-		return StatusBarStyle.Width(m.width).Render(result)
+		return StatusBarStyle.Width(w).Render(result)
 	}
 
 	// Mode
@@ -85,7 +89,7 @@ func (m *Model) renderStatusBar() string {
 
 	// Layout: left and right with padding between. Prefer keeping the context
 	// indicator visible — truncate the left side first when the bar is tight.
-	availWidth := m.width - 2 // -2 for padding
+	availWidth := w - 2 // -2 for padding
 	leftWidth := lipgloss.Width(left)
 	rightWidth := lipgloss.Width(right)
 
@@ -107,5 +111,5 @@ func (m *Model) renderStatusBar() string {
 
 	content := left + strings.Repeat(" ", middleWidth) + right
 
-	return StatusBarStyle.Width(m.width).Render(content)
+	return StatusBarStyle.Width(w).Render(content)
 }

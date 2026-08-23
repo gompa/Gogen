@@ -22,6 +22,8 @@ var SlashCommands = []SlashCommand{
 	{Name: "/context", Description: "Context usage details", Web: true, TUI: true},
 	{Name: "/new", Description: "Start a new session", Web: true, TUI: true},
 	{Name: "/resume", Description: "List, restore, or delete sessions", Web: true, TUI: true},
+	{Name: "/open", Description: "Open a new live session (TUI)", Web: false, TUI: true},
+	{Name: "/switch", Description: "Switch between live sessions (TUI)", Web: false, TUI: true},
 	{Name: "/fork", Description: "Fork a new session from the last assistant message (or fork <N> from message N)", Web: true, TUI: true},
 	{Name: "/compact", Description: "Compact conversation history", Web: false, TUI: true},
 	{Name: "/verbose", Description: "Toggle verbose tool output", Web: false, TUI: true},

@@ -8,6 +8,7 @@ import (
 
 	"gogen/internal/agent"
 	"gogen/internal/config"
+	"gogen/internal/server"
 
 	tea "charm.land/bubbletea/v2"
 )
@@ -25,6 +26,11 @@ type TUI struct {
 	agent *agent.Agent
 	cfg   *config.Config
 
+	// workspace is the shared web lifecycle core (server.NewWorkspaceForHost):
+	// additional live sessions are spawned through its NewSessionAgent so
+	// both frontends drive one implementation. May be nil (tests/embedders).
+	workspace *server.Workspace
+
 	// program is the running Bubble Tea program, stored atomically: it is
 	// written in Run and read by ForceRender from the background
 	// validation goroutine.
@@ -36,7 +42,14 @@ type TUI struct {
 
 // New creates a new TUI runner.
 func New(a *agent.Agent, cfg *config.Config) *TUI {
-	t := &TUI{agent: a, cfg: cfg}
+	return NewWithWorkspace(a, cfg, nil)
+}
+
+// NewWithWorkspace is New with the shared web lifecycle core attached;
+// /open spawns additional live sessions through it. A nil workspace keeps
+// single-session behavior (New callers, tests).
+func NewWithWorkspace(a *agent.Agent, cfg *config.Config, ws *server.Workspace) *TUI {
+	t := &TUI{agent: a, cfg: cfg, workspace: ws}
 	// Background validation (ValidateRestoredModel) may clear or
 	// auto-select a restored session's model after the UI opened; hook it
 	// so the status bar re-renders even while the terminal is idle.
@@ -74,6 +87,7 @@ func (t *TUI) ForceRender() {
 func (t *TUI) Run(ctx context.Context) {
 	m := NewModel(t.agent, t.cfg)
 	m.ctx = ctx
+	m.workspace = t.workspace
 
 	// v2: mouse reporting is requested declaratively from View()
 	// (MouseModeCellMotion), not via a program option.
