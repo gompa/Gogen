@@ -17,13 +17,18 @@ import (
 
 // newAgent builds the provider, context manager, executor, agent, and
 // session store from the merged config, then restores the most recent saved
-// session and runs the legacy-todos migration. It returns the agent and the
+// session and runs the legacy-todos migration. It returns the agent, the
 // model name restored from disk (empty when session persistence is disabled
-// or nothing was saved). The caller owns the agent's lifecycle defers
-// (a.Close, a.FlushPending, MCP shutdown) so the existing shutdown order is
-// preserved. The session store stays internal to setup: main never reads it
-// after construction.
-func newAgent(cfg *config.Config, isGlobalMode bool) (*agent.Agent, string) {
+// or nothing was saved), and the startup notices every mode must surface:
+// non-TUI modes print them to stderr, while the TUI routes them through its
+// managed render path — a raw stderr line ahead of the inline-rendered,
+// terminal-height frame desyncs the renderer's cell diff from the real
+// screen (ghost cursors, stuck columns after scroll). The caller owns the
+// agent's lifecycle defers (a.Close, a.FlushPending, MCP shutdown) so the
+// existing shutdown order is preserved. The session store stays internal to
+// setup: main never reads it after construction.
+func newAgent(cfg *config.Config, isGlobalMode bool) (*agent.Agent, string, []string) {
+	var notices []string
 	// The provider carries ALL registered OpenAI-compatible profiles (the
 	// legacy fields form the implicit default profile), so the TUI's /models
 	// list and the web model picker both aggregate every endpoint, and each
@@ -93,7 +98,7 @@ func newAgent(cfg *config.Config, isGlobalMode bool) (*agent.Agent, string) {
 	a.SetInstructionsEnabled(cfg.AgentInstructionsEnabled())
 	a.RefreshWorkspaceInstructions(cfg.WorkingDir)
 	if cfg.DebugCompareMessages && !agent.ViewDriftCompiledIn() {
-		fmt.Fprintf(os.Stderr, "GOGEN_DEBUG_COMPARE_MESSAGES requires a debug build (-tags debug); ignoring\n")
+		notices = append(notices, "GOGEN_DEBUG_COMPARE_MESSAGES requires a debug build (-tags debug); ignoring")
 		a.DebugCompareMessages = false
 	}
 
@@ -116,19 +121,19 @@ func newAgent(cfg *config.Config, isGlobalMode bool) (*agent.Agent, string) {
 			if snap, err := store.LoadInWorkingDir(cfg.WorkingDir, latest); err == nil {
 				a.RestoreSession(snap, latest)
 				restoredModel = snap.Model
-				fmt.Fprintf(os.Stderr, "Session %s (%d msgs)\n", latest, len(a.Messages))
+				notices = append(notices, fmt.Sprintf("Session %s (%d msgs)", latest, len(a.Messages)))
 			}
 		}
 	}
 	// One-time migration: adopt project-global todos.json into the current
 	// session when it has no todos yet, then rename the legacy file.
 	if a.ImportLegacyTodos() {
-		fmt.Fprintf(os.Stderr, "Migrated legacy todos into session %s\n", a.SessionID)
+		notices = append(notices, fmt.Sprintf("Migrated legacy todos into session %s", a.SessionID))
 	}
 	if name := provider.ModelName(); name != "" {
-		fmt.Fprintf(os.Stderr, "Model: %s\n", name)
+		notices = append(notices, "Model: "+name)
 	} else {
-		fmt.Fprintf(os.Stderr, "No model selected; use /models to choose\n")
+		notices = append(notices, "No model selected; use /models to choose")
 	}
-	return a, restoredModel
+	return a, restoredModel, notices
 }

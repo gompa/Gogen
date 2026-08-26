@@ -64,7 +64,7 @@ func TestCompletionBellOnlyWhenBlurred(t *testing.T) {
 		m.lives.Add(&agent.Agent{}, "bg")
 		m.terminalBlurred = true
 		// "s2" is the background session; the focused one stays active.
-		m.handleTurnFinishedMsg("s2", nil)
+		m.handleTurnFinishedMsg("s2", 0, nil)
 		if m.bellsRung != 1 {
 			t.Fatalf("bells = %d, want 1 for a background finish", m.bellsRung)
 		}
@@ -74,7 +74,10 @@ func TestCompletionBellOnlyWhenBlurred(t *testing.T) {
 		m := newSidebarFullModel(t)
 		m.terminalBlurred = true
 		m.handleApprovalRequestMsg(approvalRequestMsg{
-			req: agent.DeleteRequest{Paths: []string{"f.txt"}, Reason: "test"},
+			ar: &approvalRequest{
+				req:   agent.DeleteRequest{Paths: []string{"f.txt"}, Reason: "test"},
+				reply: make(chan bool, 1),
+			},
 		})
 		if m.modal != ModalApproval {
 			t.Fatalf("modal = %v, want ModalApproval", m.modal)
@@ -88,7 +91,10 @@ func TestCompletionBellOnlyWhenBlurred(t *testing.T) {
 		m := newSidebarFullModel(t)
 		m.terminalBlurred = false
 		m.handleApprovalRequestMsg(approvalRequestMsg{
-			req: agent.DeleteRequest{Paths: []string{"f.txt"}, Reason: "test"},
+			ar: &approvalRequest{
+				req:   agent.DeleteRequest{Paths: []string{"f.txt"}, Reason: "test"},
+				reply: make(chan bool, 1),
+			},
 		})
 		if m.bellsRung != 0 {
 			t.Fatalf("bells = %d, want 0 while focused", m.bellsRung)

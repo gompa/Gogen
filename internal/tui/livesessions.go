@@ -1,11 +1,14 @@
 package tui
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,6 +55,34 @@ type liveSession struct {
 
 	cancel    context.CancelFunc // cancels the in-flight turn; nil when idle
 	streaming bool
+	// turnSeq is the generation of the in-flight turn: incremented on every
+	// submit, stamped on every stream message the turn's adapter emits.
+	// After cancel + resubmit the superseded turn's goroutine may still be
+	// unwinding; its stragglers (tokens AND the terminal) carry the old
+	// seq and are dropped by the Update thread instead of clobbering the
+	// new turn's state (cancel func, streaming flags, transcript).
+	// Mutated only on the Update thread.
+	turnSeq uint64
+
+	// /compact runs off the Update thread (it makes an LLM summarization
+	// call). compacting gates the FOCUSED session's input band + submit
+	// (mirrored onto Model.compacting like streaming); compactCancel lets
+	// ctrl+c abort the in-flight compaction instead of quitting;
+	// compactUserCancelled marks a user-initiated abort so the late
+	// compactResultMsg does not double-report its context error.
+	// Mutated only on the Update thread (like streaming).
+	compacting           bool
+	compactCancel        context.CancelFunc
+	compactUserCancelled bool
+	// compactSeq is the generation of the in-flight /compact: incremented
+	// by cmdCompact on every start and stamped on the result. After
+	// cancel + immediate restart the superseded run's goroutine may still
+	// be unwinding; its late compactResultMsg carries the old seq and is
+	// dropped instead of clearing the new run's flags (which would unlock
+	// input mid-compaction and orphan its cancel func) or reporting the
+	// old cancellation as a fresh failure. Mutated only on the Update
+	// thread.
+	compactSeq uint64
 
 	// lastActive is the last OUTPUT time (completed turn, session spawn) —
 	// the sidebar's ordering key for live sessions (web: pane.lastActivity,
@@ -63,10 +94,181 @@ type liveSession struct {
 	// UI. Read from stream goroutines (the adapter gate), hence atomic.
 	focused atomic.Bool
 
+	// progress is this session's wait-indicator state; the Model's
+	// progressPhase/progressLabel/activeToolName are the FOCUSED session's
+	// mirror of these fields. switchToLive restores them when focus returns
+	// to a streaming session, so the indicator shows the session's actual
+	// phase ("running execute_command…") instead of resetting to "thinking".
+	// Mutated only on the Update thread.
+	progressPhase progressPhase
+	progressLabel string
+	activeTool    string
+
 	// pending buffers rendering events emitted while this session streamed
-	// in the background; replayed on focus (mu guards cross-thread).
+	// in the background. On focus the buffer is drained and DISCARDED: a
+	// streaming target's join renders the full committed history from
+	// SnapshotMessages (every drained event is older than that snapshot),
+	// and an idle target's rebuild is authoritative. The drain is still
+	// mandatory — an undrained buffer would replay stale events on the
+	// NEXT join (mu guards cross-thread).
 	mu      sync.Mutex
 	pending []tea.Msg
+
+	// transcriptStale latches that the transcript shown for this session
+	// was rebuilt from a mid-turn join snapshot (joinStreamingSession) and
+	// lags the stream: the in-flight round's head was not in Messages at
+	// the join, and a commit/event straddle can duplicate one line. The
+	// turn-end convergence rebuild (handleTurnFinishedMsg) re-renders the
+	// authoritative history and clears it; the idle switch path clears it
+	// too (its rebuild is already authoritative). Mutated only on the
+	// Update thread.
+	transcriptStale bool
+
+	// roundMu guards round, the current round's in-flight LLM output
+	// buffer (see roundBuffer). Leaf lock: the stream goroutine appends,
+	// the Update thread snapshots on join; never held while taking mu.
+	roundMu sync.Mutex
+	round   roundBuffer
+}
+
+// roundBuffer accumulates the current round's in-flight LLM output so a
+// mid-turn join can render the current reply from its first character
+// (web parity: the server's liveTurnState / Rewind payload, registry.go).
+// The assistant message only reaches a.Messages when the round completes,
+// so without this buffer a join mid-round would show the committed history
+// with the in-flight reply missing until the turn-end rebuild.
+//
+// Appended by the stream adapter from round start REGARDLESS of focus (the
+// adapter sees every event; the pending buffer only accumulates while
+// unfocused — that is the gap this closes: watch A stream, switch away,
+// come back mid-round). Cleared at turn start, round start, and round end
+// (the adapter's OnStart/OnRoundStart/OnStreamEnd): the empty state IS the
+// "between rounds" marker (the liveRewind-returns-nil rule) — completed
+// content lives in Messages already, so a join between rounds must not
+// render it a second time.
+type roundBuffer struct {
+	thinking  strings.Builder
+	content   strings.Builder
+	toolNames map[int]string
+	toolIDs   map[int]string
+	toolArgs  map[int]*strings.Builder
+}
+
+// roundToolCall is one in-progress tool call in a roundSnapshot.
+type roundToolCall struct {
+	Index int
+	ID    string
+	Name  string
+	Args  string // raw args accumulated so far (may be incomplete JSON)
+}
+
+// roundSnapshot is the join-time copy of a roundBuffer.
+type roundSnapshot struct {
+	Thinking  string
+	Content   string
+	ToolCalls []roundToolCall
+}
+
+// roundReset clears the buffer (turn start, round start, round end).
+func (s *liveSession) roundReset() {
+	s.roundMu.Lock()
+	s.round.thinking.Reset()
+	s.round.content.Reset()
+	s.round.toolNames = nil
+	s.round.toolIDs = nil
+	s.round.toolArgs = nil
+	s.roundMu.Unlock()
+}
+
+// roundAppendContent records a streamed content token (OnToken).
+func (s *liveSession) roundAppendContent(text string) {
+	if text == "" {
+		return
+	}
+	s.roundMu.Lock()
+	s.round.content.WriteString(text)
+	s.roundMu.Unlock()
+}
+
+// roundAppendThinking records a streamed thinking token (OnThinkingToken).
+func (s *liveSession) roundAppendThinking(text string) {
+	if text == "" {
+		return
+	}
+	s.roundMu.Lock()
+	s.round.thinking.WriteString(text)
+	s.roundMu.Unlock()
+}
+
+// roundToolStart records the start of a streamed tool call (OnToolCallStart).
+func (s *liveSession) roundToolStart(index int, id, name string) {
+	s.roundMu.Lock()
+	if s.round.toolNames == nil {
+		s.round.toolNames = make(map[int]string)
+		s.round.toolIDs = make(map[int]string)
+		s.round.toolArgs = make(map[int]*strings.Builder)
+	}
+	s.round.toolNames[index] = name
+	s.round.toolIDs[index] = id
+	s.round.toolArgs[index] = &strings.Builder{}
+	s.roundMu.Unlock()
+}
+
+// roundToolArgsAppend records one args delta for a streaming tool call
+// (OnToolCallArgsDelta).
+func (s *liveSession) roundToolArgsAppend(index int, delta string) {
+	if delta == "" {
+		return
+	}
+	s.roundMu.Lock()
+	if s.round.toolArgs == nil {
+		s.round.toolNames = make(map[int]string)
+		s.round.toolIDs = make(map[int]string)
+		s.round.toolArgs = make(map[int]*strings.Builder)
+	}
+	b := s.round.toolArgs[index]
+	if b == nil {
+		b = &strings.Builder{}
+		s.round.toolArgs[index] = b
+	}
+	b.WriteString(delta)
+	s.roundMu.Unlock()
+}
+
+// roundSnapshot returns the in-flight round's output, or nil when the round
+// is empty — between rounds or before the first token (completed content
+// lives in Messages; same rule as the server's liveRewind returning nil).
+func (s *liveSession) roundSnapshot() *roundSnapshot {
+	s.roundMu.Lock()
+	defer s.roundMu.Unlock()
+	if s.round.content.Len() == 0 && s.round.thinking.Len() == 0 && len(s.round.toolNames) == 0 {
+		return nil
+	}
+	rw := &roundSnapshot{
+		Thinking: s.round.thinking.String(),
+		Content:  s.round.content.String(),
+	}
+	for idx, name := range s.round.toolNames {
+		args := ""
+		if b := s.round.toolArgs[idx]; b != nil {
+			args = b.String()
+		}
+		rw.ToolCalls = append(rw.ToolCalls, roundToolCall{
+			Index: idx, ID: s.round.toolIDs[idx], Name: name, Args: args,
+		})
+	}
+	slices.SortFunc(rw.ToolCalls, func(a, b roundToolCall) int {
+		return cmp.Compare(a.Index, b.Index)
+	})
+	return rw
+}
+
+// resetProgress clears the session's wait-indicator state (turn end,
+// cancel, error).
+func (s *liveSession) resetProgress() {
+	s.progressPhase = progressHidden
+	s.progressLabel = ""
+	s.activeTool = ""
 }
 
 // enqueue buffers one rendering event produced while this session streamed
@@ -88,6 +290,25 @@ func (s *liveSession) popAll() []tea.Msg {
 	out := s.pending
 	s.pending = nil
 	return out
+}
+
+// jobNoticeHookFor returns the focus-aware job-completion hook for s:
+// while s is focused the summary runs a normal delivery turn (deliver);
+// while s is backgrounded it is buffered as an attributed condensed note
+// and surfaced when focus returns (switchToLive replays an idle target's
+// notes). deliver runs on a background goroutine and must be safe to call
+// from one (e.g. tea.Program.Send).
+func jobNoticeHookFor(s *liveSession, deliver func(summary string)) func(summary string) {
+	return func(summary string) {
+		if s.focused.Load() {
+			deliver(summary)
+			return
+		}
+		// seq stays 0: the note is not part of any turn, and its replay
+		// path (switchToLive's manual filter) bypasses the staleTurn
+		// guard, which would otherwise drop it once turnSeq > 0.
+		s.enqueue(condensedNoteMsg{note: noticeLabel + " job finished: " + summary, sid: s.id})
+	}
 }
 
 // liveSessions hosts every active session. Index 0 is the startup agent;
@@ -121,6 +342,37 @@ func (ls *liveSessions) ByID(id string) *liveSession {
 		}
 	}
 	return nil
+}
+
+// ByAgent resolves the slot hosting the given agent (pointer identity);
+// nil when no live slot hosts it (e.g. the agent was rebound away or the
+// session closed). compactResultMsg carries the compacting agent, not a
+// slot id, so the result path needs this mapping. Read on the Update
+// thread like ByID.
+func (ls *liveSessions) ByAgent(a *agent.Agent) *liveSession {
+	for _, s := range ls.sessions {
+		if s.agent == a {
+			return s
+		}
+	}
+	return nil
+}
+
+// indexBySessionID returns the index of the slot hosting the given agent
+// SessionID, or -1 when no live slot hosts it. The slot ids ("s1", "s2")
+// are stream-routing ids, not session ids, so ByID does not apply — the
+// sidebar overlay (buildSidebarRows) and the resume guard both need this
+// mapping. Read on the Update thread like buildSidebarRows.
+func (ls *liveSessions) indexBySessionID(id string) int {
+	if id == "" {
+		return -1
+	}
+	for i, s := range ls.sessions {
+		if s.agent != nil && s.agent.SessionID == id {
+			return i
+		}
+	}
+	return -1
 }
 
 // Add registers a new live session WITHOUT switching focus. The caller
@@ -188,24 +440,29 @@ func (m *Model) switchToLive(i int) tea.Cmd {
 	// Drain the replay buffer on BOTH sides of the focus flip (see
 	// joinStreamingSession): before it, while the adapter gate is still
 	// closed, and after it, to catch events emitted in between. A single
-	// pre-flip drain would strand those straddlers in the buffer forever;
-	// a single post-flip drain would replay them after newer live events.
-	var pending []tea.Msg
-	if target.streaming {
-		pending = target.popAll()
-	}
+	// pre-flip drain would strand those straddlers in the buffer forever
+	// (they would surface on the NEXT join); a single post-flip drain
+	// would miss them entirely. The drained events are DISCARDED for a
+	// streaming target (its join snapshot renders everything committed)
+	// and only display-only notes are surfaced for an idle target — the
+	// drain is unconditional because those notes are not part of Messages.
+	pending := target.popAll()
 	m.lives.Switch(i)
-	if target.streaming {
-		pending = append(pending, target.popAll()...)
-	}
+	pending = append(pending, target.popAll()...)
+	// Was the OLD focused session animating? The tick decision below
+	// compares against this — the mirror is rebound before it runs.
+	wasAnimating := m.progressAnimating()
 	m.agent = target.agent
 	m.sessionID = target.agent.SessionID
+	// A background session's failed save is surfaced when it gains focus
+	// (the resume/delete paths already do this).
+	m.checkPersistError()
 	var cmds []tea.Cmd
 	if target.streaming {
-		// Joined mid-turn: Messages are owned by that session's stream
-		// goroutine, so no snapshot — show a join notice and replay the
-		// buffered events live; the authoritative history rebuild happens
-		// at end-of-turn convergence.
+		// Joined mid-turn: render the full committed history from a
+		// SnapshotMessages (web attach parity) and let the live tail flow
+		// in below it; the authoritative convergence rebuild happens at
+		// turn end (transcriptStale).
 		m.joinStreamingSession(target, pending)
 	} else {
 		// Rebuild transcript (mirrors cmdSession's clear-chat resume path).
@@ -216,71 +473,185 @@ func (m *Model) switchToLive(i int) tea.Cmd {
 			target.agent.Mode.String(),
 		)
 		m.resetStreamState(false)
+		// The rebuild is authoritative: heal any stale latch left by an
+		// earlier mid-turn join whose turn ended while this session was in
+		// the background (the focused turn-end path never ran for it).
+		target.transcriptStale = false
+		// An idle target's buffered STREAM events are already reflected in
+		// Messages (the rebuild above is authoritative — the turn
+		// finalized before streaming cleared), so replaying them would
+		// duplicate the finished turn: drop them. Only display-only notes
+		// (condensedNoteMsg, e.g. a background job notice) are not part of
+		// Messages and must be surfaced.
+		for _, msg := range pending {
+			if note, ok := msg.(condensedNoteMsg); ok {
+				m.appendChatLine(SystemStyle.Render(note.note))
+			}
+		}
 	}
-	// Sync the focused-streaming mirror + progress UI to the target.
+	// Sync the focused-session mirrors + progress UI to the target:
+	// m.streaming/m.compacting describe the FOCUSED session, so leaving a
+	// busy session unlocks input on the newly focused one, and joining a
+	// busy one locks it again.
 	m.streaming = target.streaming
+	m.compacting = target.compacting
 	if target.streaming {
-		cmds = append(cmds, m.setProgress(progressThinking, "thinking"))
+		if m.progressAnimating() && !wasAnimating {
+			cmds = append(cmds, m.spinner.Tick)
+		}
 	} else {
+		if target.compacting && !wasAnimating {
+			// The compacting indicator animates via the spinner loop
+			// (handleSpinnerTick ticks while compacting); restart it when
+			// the old focused session was not animating.
+			cmds = append(cmds, m.spinner.Tick)
+		}
 		m.clearProgress()
 	}
 	m.setViewportContent()
 	m.viewport.GotoBottom()
-	m.refreshContextStats()
+	// The target's token-count cache may be cold (a large restored
+	// session): probe off the Update thread, like the resume path — a
+	// synchronous probe would tokenize the whole history on the render
+	// loop. The indicator updates when contextStatsMsg lands.
+	cmds = append(cmds, m.requestContextStats())
 	// Keep the panel's cursor on the focused row (web: the focused row is
 	// the highlighted one).
 	m.sidebarCursor = m.sidebarFocusedRow()
 	return tea.Batch(cmds...)
 }
 
-// joinStreamingSession renders the join notice and replays the events the
-// session buffered while it streamed in the background; subsequent events
-// flow live because focus has already flipped.
+// joinStreamingSession renders the full committed history, the in-flight
+// round (when one is streaming), and — only when nothing is in flight — a
+// join notice; subsequent events flow live because focus has already
+// flipped.
 //
-// pending is drained by the caller AROUND the focus flip (see switchToLive):
-// once before it (adapter gate still closed) and once after (catching events
-// emitted between the two drains). Every replayed event is therefore older
-// than anything that reaches the program after the flip — total order is
-// preserved at the join boundary.
+// The history comes from SnapshotMessages — the documented, race-tested
+// contract the web attachSession uses (server.go): a mid-turn join shows
+// every prior message at once instead of a bare "joined" notice. The
+// in-flight round comes from the session's round buffer (web Rewind
+// parity): it accumulates the current round's output regardless of focus,
+// so the join shows the current reply from its first character and the
+// live tail continues seamlessly from the pre-seeded stream state. The
+// pending buffer is DISCARDED, not replayed: every drained event is older
+// than the snapshots, so its content is already rendered above and
+// replaying it would duplicate finished rounds. Accepted residual, healed
+// by the turn-end convergence rebuild (handleTurnFinishedMsg, latched via
+// transcriptStale):
+//   - a few tokens at the seam: tokens already program.Send-ed but not yet
+//     processed when the join ran (the web's batcher lag) briefly
+//     duplicate at the pre-seeded line; a Messages commit and its render
+//     event can likewise straddle the snapshot.
+//
+// pending is drained by the caller AROUND the focus flip (see
+// switchToLive): once before it (adapter gate still closed) and once after
+// (catching events emitted between the two drains). Both drains must stay:
+// an undrained buffer would replay stale events on the NEXT join.
 func (m *Model) joinStreamingSession(target *liveSession, pending []tea.Msg) {
-	m.chatLines = []string{
-		SystemStyle.Render("▍ joined \"" + target.label + "\" mid-turn — full history appears when the reply completes"),
-	}
+	// Capture the phase the session recorded BEFORE the rebind: the reset
+	// below wipes the mirror (and, via setActiveTool, the session's
+	// recorded tool name). Restoring first lets the indicator show the
+	// session's actual phase ("running X…") instead of a hardcoded
+	// "thinking".
+	phase, label, tool := target.progressPhase, target.progressLabel, target.activeTool
+	// Full committed history first (web attach parity): the snapshot is
+	// taken AFTER the caller's double drain, so every drained event is
+	// either already rendered here or is an accepted residual (see above).
+	m.chatLines = renderMessages(
+		target.agent.SnapshotMessages(),
+		target.agent.WorkingDir,
+		target.agent.CurrentModel(),
+		target.agent.Mode.String(),
+	)
+	// Reset BEFORE the round render: renderRoundBuffer pre-seeds the
+	// stream state this wipes (buffers, line indices, tool-call maps).
 	m.resetStreamState(false)
+	// In-flight round (web Rewind parity): render the current reply from
+	// its first character and pre-seed the stream state so the next live
+	// token appends seamlessly. Empty buffer == between rounds (or before
+	// the first token): the completed content is in the snapshot above,
+	// and the join notice marks the wait for the next round's output. The
+	// turn-end convergence rebuild replaces the whole transcript either
+	// way (notice included).
+	if rw := target.roundSnapshot(); rw != nil {
+		m.renderRoundBuffer(rw)
+	} else {
+		m.chatLines = append(m.chatLines, SystemStyle.Render("▍ joined \""+target.label+"\" mid-turn"))
+	}
+	// Latch the convergence: the transcript lags the stream until the
+	// turn-end rebuild re-renders the authoritative history.
+	target.transcriptStale = true
+	m.progressPhase = phase
+	m.progressLabel = label
+	m.activeToolName = tool
+	if phase == progressHidden {
+		// A streaming session records its phase at submit; hidden means
+		// the turn was just cancelled and its terminal has not landed yet
+		// — show the default wait (the old hardcoded behavior).
+		m.progressPhase, m.progressLabel = progressThinking, "thinking"
+	}
+	// Discard the drained STREAM events (their committed content is in the
+	// snapshot above). Display-only notes are not part of Messages and
+	// must still surface (idle-path parity).
 	for _, msg := range pending {
-		m.replayStreamEvent(msg)
+		if note, ok := msg.(condensedNoteMsg); ok {
+			m.chatLines = append(m.chatLines, SystemStyle.Render(note.note))
+		}
 	}
 }
 
-// replayStreamEvent applies one buffered rendering event through the normal
-// stream handlers. Only adapter output reaches here, so the cases mirror
-// Update's streaming subset (terminal msgs never enter the buffer — they
-// carry sid attribution instead).
-func (m *Model) replayStreamEvent(msg tea.Msg) {
-	switch v := msg.(type) {
-	case streamStartMsg:
-		m.handleStreamStart()
-	case streamRoundStartMsg:
-		m.handleStreamRoundStart()
-	case streamTokenMsg:
-		m.handleStreamToken(v.token)
-	case streamThinkingMsg:
-		m.handleStreamThinking(v.token)
-	case streamToolCallMsg:
-		m.handleStreamToolCall(v.index, v.id, v.name)
-	case streamToolCallArgsMsg:
-		m.handleStreamToolArgs(v.index, v.id, v.delta)
-	case streamToolCallFinalMsg:
-		m.handleStreamToolCallFinal(v.index, v.tc)
-	case streamToolExecuteMsg:
-		// Deliberately not replayed: a "running X" line surfaced after the
-		// fact would mislead (the tool already ran); its result line follows.
-	case streamToolResultMsg:
-		m.handleStreamToolResult(v.id, v.name, v.result, v.success)
-	case streamRoundEndMsg:
-		m.handleStreamRoundEnd()
-	case condensedNoteMsg:
-		m.appendChatLine(SystemStyle.Render(v.note))
+// renderRoundBuffer renders the in-flight round's accumulated output
+// (roundSnapshot) below the committed history and pre-seeds the stream
+// state so the next live event continues the round seamlessly (web Rewind
+// parity: the client renders the rewind through the normal stream
+// machinery and continues the live stream after it).
+//
+// The display mirrors what the focused live path would show at this
+// moment: the thinking block is OPEN only while nothing has followed it
+// (the first content token or tool call closes it exactly as in the live
+// path); tool-call lines show args only once the raw JSON is parseable
+// (the live path's handleStreamToolArgs rule) — the next args delta or
+// final re-renders the line from the seeded accumulation.
+//
+// Boundary: the Update-thread serialization orders the join-instant
+// snapshot strictly before the next delivered token EXCEPT for tokens
+// already program.Send-ed but not yet processed (the web's batcher lag,
+// a few tokens wide) — those briefly duplicate at the seam. The turn-end
+// convergence rebuild (transcriptStale) heals it.
+func (m *Model) renderRoundBuffer(rw *roundSnapshot) {
+	if rw.Thinking != "" {
+		if rw.Content == "" && len(rw.ToolCalls) == 0 {
+			// Thinking still open: seed it live. The next content token
+			// (or tool call) closes the block via closeThinkingBlock,
+			// exactly as in the focused path.
+			displayBuf := strings.TrimRight(rw.Thinking, "\n")
+			m.streamThinkingLine = len(m.chatLines)
+			m.chatLines = append(m.chatLines, renderStyledBlock(ThinkingStyle, "<thinking>"+displayBuf))
+			m.streamThinkingOpen = true
+			m.streamThinkingBuf.WriteString(rw.Thinking)
+		} else {
+			// Content or tool calls followed: the live path already
+			// closed the block — render it closed.
+			m.chatLines = append(m.chatLines, renderStyledBlock(ThinkingTagStyle, "<thinking>"+rw.Thinking+"</thinking>"))
+		}
+	}
+	if rw.Content != "" {
+		label := AssistantStyle.Render(assistantLabel)
+		m.streamAssistantLine = len(m.chatLines)
+		m.chatLines = append(m.chatLines, label+" "+rw.Content)
+		m.streamAssistantBuf.WriteString(rw.Content)
+	}
+	prefix := ToolCallStyle.Render("  →")
+	for _, tc := range rw.ToolCalls {
+		m.streamToolCallNames[tc.Index] = tc.Name
+		m.streamToolCallIDs[tc.Index] = tc.ID
+		m.streamToolCallArgs[tc.Index] = tc.Args
+		line := prefix + " " + tc.Name
+		if args, err := parseInlineJSONArgs(tc.Args); err == nil && len(args) > 0 {
+			line += " " + ToolCallArgsStyle.Render(formatToolArgs(args))
+		}
+		m.streamToolCallLines[tc.Index] = len(m.chatLines)
+		m.chatLines = append(m.chatLines, line)
 	}
 }
 
@@ -413,15 +784,69 @@ func streamEventSid(msg tea.Msg) (string, bool) {
 
 // endOfStream / failOfStream are the ONLY constructors for a turn's
 // terminal messages: they enforce that every terminal carries its owning
-// session id, so handleTurnFinishedMsg can always route finalization.
-// (A bare streamEndMsg{} would finalize nothing — ByID("") misses — and
-// brick the focused session's input forever.)
-func endOfStream(sid string) tea.Msg {
-	return streamEndMsg{sid: sid}
+// session id AND turn generation, so handleTurnFinishedMsg can always
+// route finalization and drop superseded turns. (A bare streamEndMsg{}
+// would finalize nothing — ByID("") misses — and brick the focused
+// session's input forever.)
+func endOfStream(sid string, seq uint64) tea.Msg {
+	return streamEndMsg{sid: sid, seq: seq}
 }
 
-func failOfStream(sid string, err error) tea.Msg {
-	return streamErrorMsg{err: err, sid: sid}
+func failOfStream(sid string, seq uint64, err error) tea.Msg {
+	return streamErrorMsg{err: err, sid: sid, seq: seq}
+}
+
+// streamEventAttribution reports the (sid, seq) turn attribution embedded
+// in a streaming message (ok=false for every other message kind). Unlike
+// streamEventSid it INCLUDES the terminal messages: a superseded turn's
+// terminal must be dropped too, not just its render events.
+func streamEventAttribution(msg tea.Msg) (sid string, seq uint64, ok bool) {
+	switch v := msg.(type) {
+	case streamStartMsg:
+		return v.sid, v.seq, true
+	case streamRoundStartMsg:
+		return v.sid, v.seq, true
+	case streamTokenMsg:
+		return v.sid, v.seq, true
+	case streamThinkingMsg:
+		return v.sid, v.seq, true
+	case streamToolCallMsg:
+		return v.sid, v.seq, true
+	case streamToolCallArgsMsg:
+		return v.sid, v.seq, true
+	case streamToolCallFinalMsg:
+		return v.sid, v.seq, true
+	case streamToolResultMsg:
+		return v.sid, v.seq, true
+	case streamToolExecuteMsg:
+		return v.sid, v.seq, true
+	case streamRoundEndMsg:
+		return v.sid, v.seq, true
+	case condensedNoteMsg:
+		return v.sid, v.seq, true
+	case streamEndMsg:
+		return v.sid, v.seq, true
+	case streamErrorMsg:
+		return v.sid, v.seq, true
+	}
+	return "", 0, false
+}
+
+// staleTurn reports whether an attributed event belongs to a SUPERSEDED
+// turn of a known session (its seq no longer matches the session's
+// current turnSeq). seq 0 means UNATTRIBUTED — produced outside any turn,
+// e.g. the job-notice hook enqueues condensed notes without a generation
+// (their replay-buffer path bypasses this guard by construction); such
+// events always pass through so normal ownership routing applies.
+// Production stream events never carry 0: every submit increments turnSeq
+// before constructing the adapter. Unknown sessions pass through: the
+// existing ownsStream / ByID-nil handling applies to them.
+func (m *Model) staleTurn(sid string, seq uint64) bool {
+	if m.lives == nil {
+		return false
+	}
+	s := m.lives.ByID(sid)
+	return s != nil && seq != 0 && s.turnSeq != seq
 }
 
 // ownsStream reports whether sid belongs to the focused session.
@@ -488,7 +913,8 @@ func (m *Model) sidebarMaxWidth() int {
 }
 
 // toggleSidebar shows/hides the panel and re-lays-out the chat column.
-func (m *Model) toggleSidebar() {
+// Returns the async saved-sessions refresh cmd when the panel is shown.
+func (m *Model) toggleSidebar() tea.Cmd {
 	m.sidebarVisible = !m.sidebarVisible
 	if m.sidebarVisible && m.sidebarWidth == 0 {
 		m.sidebarWidth = defaultSidebarWidth
@@ -496,13 +922,15 @@ func (m *Model) toggleSidebar() {
 	if m.width > 0 {
 		m.SetSize(m.width, m.height)
 	}
+	var cmd tea.Cmd
 	if m.sidebarVisible {
-		m.refreshSavedSessions()
+		cmd = m.requestSavedSessions()
 	} else if m.focus == FocusSidebar {
 		// Never strand keyboard focus on a hidden panel.
 		m.focus = FocusInput
 	}
 	m.persistSidebarPrefs()
+	return cmd
 }
 
 // resizeSidebar steps the panel width by delta (clamped to the live
@@ -530,13 +958,16 @@ func (m *Model) resizeSidebar(delta int) {
 }
 
 // onSidebarBorder reports whether a mouse event landed on the panel's
-// right border (±1 column) — the drag handle.
+// right border — the drag handle. The press zone is the border column plus
+// ONE column of tolerance to its left; the right side has no tolerance
+// because the next column is the chat area (a press there must start a text
+// selection, not a panel drag).
 func (m *Model) onSidebarBorder(ev mouseEvent) bool {
 	if !m.sidebarVisible || m.sidebarOffsetX() == 0 {
 		return false
 	}
 	bx := m.sidebarWidth - 1
-	return ev.x >= bx-1 && ev.x <= bx+1
+	return ev.x >= bx-1 && ev.x <= bx
 }
 
 // handleSidebarResizeMouse drives border-drag resizing. Returns true when
@@ -595,13 +1026,35 @@ func (m *Model) cancelActiveStream() {
 	}
 }
 
+// cancelCompactForQuit aborts an in-flight /compact on the FOCUSED
+// session at the quit paths (force quit / ctrl+d) so the summarization
+// call is cancelled with the process; the late compactResultMsg is
+// harmless (it only clears flags and, on success, persists — both safe
+// post-quit). Focused-only, matching cancelActiveStream's semantics: a
+// background session's compaction is left to finish (it persists on its
+// own).
+func (m *Model) cancelCompactForQuit() {
+	if !m.compacting {
+		return
+	}
+	if s := m.focusedSession(); s != nil {
+		s.compactUserCancelled = true
+		if s.compactCancel != nil {
+			s.compactCancel()
+		}
+		s.compacting = false
+		s.compactCancel = nil
+	}
+	m.compacting = false
+}
+
 // handleTurnFinishedMsg finalizes the owning session's turn. The FOCUSED
 // session runs the normal end-of-turn pipeline (transcript finalize,
 // context refresh, persist-error surfacing); a BACKGROUND session only
 // drops its runtime flags and reports completion via the status line —
 // its transcript is rebuilt from Messages whenever it is next focused
 // (the same converge-on-switch contract as the web UI's mid-turn attach).
-func (m *Model) handleTurnFinishedMsg(sid string, err error) (tea.Model, tea.Cmd) {
+func (m *Model) handleTurnFinishedMsg(sid string, seq uint64, err error) (tea.Model, tea.Cmd) {
 	if m.lives == nil {
 		// Degenerate single-session construction without a registry.
 		return m.finishFocusedTurn(err)
@@ -610,8 +1063,25 @@ func (m *Model) handleTurnFinishedMsg(sid string, err error) (tea.Model, tea.Cmd
 	if s == nil {
 		return m, nil
 	}
+	// Prune queued delete-approvals owned by the terminating turn — this
+	// terminal may itself be superseded (see the seq check below), but
+	// either way the named turn's tool executions have unwound, so its
+	// queued requests can never be answered usefully.
+	m.pruneQueuedApprovals(sid, seq)
+	if s.turnSeq != seq {
+		// Superseded turn (cancel + resubmit while the old goroutine was
+		// still unwinding): its late terminal must not clear the new
+		// turn's streaming flag, clobber its cancel func, or run the
+		// end-of-turn pipeline over the new turn's transcript.
+		return m, nil
+	}
 	s.streaming = false
 	s.cancel = nil
+	// Drop the session's recorded indicator state. For the FOCUSED session
+	// the end-of-turn pipeline's clearProgress does the same (idempotent);
+	// for a BACKGROUND session this is the only clear — without it a later
+	// join would restore a dead turn's phase.
+	s.resetProgress()
 	// Only a COMPLETED turn produced output: cancelled/failed turns must
 	// not bump the row (web parity — pane.lastActivity is written on
 	// output events only, never on focus or turn start).
@@ -624,8 +1094,9 @@ func (m *Model) handleTurnFinishedMsg(sid string, err error) (tea.Model, tea.Cmd
 		}
 	}
 	// The store index just changed (label derived from the first user
-	// message, message count, updatedAt) — refresh the unified list.
-	m.refreshSavedSessions()
+	// message, message count, updatedAt) — refresh the unified list off
+	// the Update thread.
+	refresh := m.requestSavedSessions()
 	if m.lives.Active() != s {
 		if err != nil {
 			m.statusMsg = "✗ " + s.label + ": " + err.Error()
@@ -633,9 +1104,32 @@ func (m *Model) handleTurnFinishedMsg(sid string, err error) (tea.Model, tea.Cmd
 			m.statusMsg = "✓ " + s.label + " finished"
 		}
 		m.bellIfBlurred() // web parity: background pane finished/failed
-		return m, nil
+		return m, refresh
 	}
-	return m.finishFocusedTurn(err)
+	// Turn-end convergence (web attach parity): a transcript rebuilt from a
+	// mid-turn join (transcriptStale) lags the stream — the in-flight
+	// round's head was not in Messages at the join, and a commit/event
+	// straddle can duplicate one line. The turn's goroutine has returned
+	// (the terminal message comes from it), so Messages is final: re-render
+	// the authoritative history. Normal focused turns never set the flag,
+	// so their incremental transcript (and scroll position) is preserved.
+	if s.transcriptStale {
+		s.transcriptStale = false
+		// The rebuilt transcript has no live assistant/thinking line: drop
+		// the join's stream indices so finishFocusedTurn's finalizers
+		// (handleStreamEnd's trailing trim) cannot touch a stale line.
+		m.resetStreamState(false)
+		if s.agent != nil {
+			m.chatLines = renderMessages(
+				s.agent.SnapshotMessages(),
+				s.agent.WorkingDir,
+				s.agent.CurrentModel(),
+				s.agent.Mode.String(),
+			)
+		}
+	}
+	finished, cmd := m.finishFocusedTurn(err)
+	return finished, tea.Batch(refresh, cmd)
 }
 
 // finishFocusedTurn runs the normal end-of-turn pipeline (success or

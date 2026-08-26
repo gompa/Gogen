@@ -120,10 +120,20 @@ func (m *Model) setViewportContent() {
 	}
 	var wrappedParts []string
 	var lastParts []string
+	// Prompt-rail anchors (web TOC parity): record where each user prompt
+	// starts in the wrapped content. wrapLine is deterministic, so the
+	// per-line wrap counts give the physical offsets.
+	anchors := m.tocAnchors[:0]
+	lineNo := 0
 	for _, line := range m.chatLines {
 		lastParts = m.wrapLine(line)
 		wrappedParts = append(wrappedParts, lastParts...)
+		if isUserPromptLine(line) {
+			anchors = append(anchors, tocAnchor{line: lineNo, text: promptTextOf(line)})
+		}
+		lineNo += len(lastParts)
 	}
+	m.tocAnchors = anchors
 	m.wrappedContent = strings.Join(wrappedParts, "\n")
 	m.wrappedLinesDirty = true // lazily compute on next selection access
 	m.clearSelection()
@@ -175,6 +185,10 @@ func (m *Model) View() tea.View {
 		main = lipgloss.JoinHorizontal(lipgloss.Top, m.renderSidebar(mainLines), main)
 	}
 
+	// Prompt rail (web TOC parity): dots + hover preview pasted into the
+	// frame; a no-op unless the pointer is in the rail's trigger strip.
+	main = m.applyTocOverlay(main)
+
 	v := tea.NewView(main)
 	// Mouse reporting: cell motion covers wheel scrolls and drag-selection.
 	v.MouseMode = tea.MouseModeCellMotion
@@ -205,9 +219,12 @@ func (m *Model) renderMainColumn() string {
 
 	// Textarea
 	var inputArea string
-	if m.streaming {
+	switch {
+	case m.streaming:
 		inputArea = m.renderProgressInput()
-	} else {
+	case m.compacting:
+		inputArea = m.renderCompactingInput()
+	default:
 		inputArea = m.textarea.View()
 	}
 
@@ -247,9 +264,11 @@ func (m *Model) renderMainColumn() string {
 	)
 }
 
-// refreshSavedSessions snapshots the persisted-session index backing the
-// sidebar's unified list (best-effort; errors leave the cache empty). The
-// store's 1 s list cache makes this cheap to call on every turn end.
+// refreshSavedSessions synchronously snapshots the persisted-session
+// index backing the sidebar's unified list (best-effort; errors leave the
+// cache empty). Reserved for paths where no program exists yet (NewModel)
+// or where a synchronous read is required (tests); runtime callers use
+// requestSavedSessions, which keeps the store I/O off the Update thread.
 func (m *Model) refreshSavedSessions() {
 	if m.agent == nil {
 		return
@@ -263,6 +282,56 @@ func (m *Model) refreshSavedSessions() {
 		return
 	}
 	m.savedCache = result.Sessions
+}
+
+// requestSavedSessions snapshots the persisted-session index off the
+// Update thread (the store List is disk I/O; it used to run inline on
+// every turn end, switch, and 30 s tick). The result arrives as
+// savedSessionsMsg; a stale response (an older request resolving after a
+// newer one) is dropped via savedReqSeq.
+func (m *Model) requestSavedSessions() tea.Cmd {
+	if m.agent == nil {
+		return nil
+	}
+	a := m.agent
+	ctx := m.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.savedReqSeq++
+	seq := m.savedReqSeq
+	return func() tea.Msg {
+		result, _, err := a.HandleSessionCommand(ctx, "sessions", session.NewID())
+		if err != nil {
+			return savedSessionsMsg{seq: seq, ok: false}
+		}
+		return savedSessionsMsg{seq: seq, sessions: result.Sessions, ok: true}
+	}
+}
+
+// requestContextStats probes context usage off the Update thread and
+// delivers it via the existing contextStatsMsg path. Used after
+// resume/fork, where the token-count cache is cold and the synchronous
+// probe would tokenize the whole restored conversation on the render
+// loop. Stream-boundary callers keep the synchronous variants (the
+// round-start rebase needs the value inline).
+func (m *Model) requestContextStats() tea.Cmd {
+	if m.agent == nil {
+		return nil
+	}
+	a := m.agent
+	// Tag the probe with the session it was requested for, on the Update
+	// thread: the agent's SessionID can change in place (resume) while the
+	// probe runs off-thread, and the handler drops the message once focus
+	// has moved to another session.
+	sid := a.SessionID
+	ctx := m.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return func() tea.Msg {
+		return contextStatsMsg{stats: a.ContextStats(ctx), sid: sid}
+	}
 }
 
 // sliceRuneLen counts runes (sliceByRuneCount's measure companion).

@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 
 	"gogen/internal/agent"
 	"gogen/internal/llm"
+	"gogen/internal/server"
 	"gogen/internal/session"
 )
 
@@ -182,7 +184,7 @@ func TestSidebarMouseClickFocusesAndSwitches(t *testing.T) {
 	}
 	// Click row 0's title: selects it and switches focus.
 	ev := mouseEvent{x: 5, y: 4, button: tea.MouseLeft, kind: mousePress}
-	if !m.handleSidebarMouse(ev) {
+	if consumed, _ := m.handleSidebarMouse(ev); !consumed {
 		t.Fatal("panel click not consumed")
 	}
 	if m.focus != FocusSidebar {
@@ -193,6 +195,34 @@ func TestSidebarMouseClickFocusesAndSwitches(t *testing.T) {
 	}
 	if m.sidebarCursor != 0 {
 		t.Fatalf("cursor = %d, want 0", m.sidebarCursor)
+	}
+}
+
+// Mouse-driven switching to a streaming session must propagate the
+// progress spinner tick cmd (the keyboard path always did; the mouse path
+// used to drop it, freezing the spinner on one static frame).
+func TestSidebarMouseOpenStreamingReturnsCmd(t *testing.T) {
+	m := newSidebarFullModel(t)
+	m.sidebarMainLines = 30
+	// The background session (row 0) is mid-turn.
+	m.lives.sessions[0].lastActive = time.Now().Add(-time.Minute)
+	bg := newSwitchTestAgent(t)
+	m.lives.Add(bg, "bg")
+	m.lives.sessions[1].streaming = true
+
+	ev := mouseEvent{x: 5, y: 4, button: tea.MouseLeft, kind: mousePress}
+	consumed, cmd := m.handleSidebarMouse(ev)
+	if !consumed {
+		t.Fatal("panel click not consumed")
+	}
+	if m.lives.active != 1 {
+		t.Fatalf("focus = %d, want 1", m.lives.active)
+	}
+	if cmd == nil {
+		t.Fatal("switching to a streaming session must return the spinner tick cmd")
+	}
+	if m.progressPhase != progressThinking {
+		t.Fatalf("progress = %v, want progressThinking", m.progressPhase)
 	}
 }
 
@@ -207,7 +237,7 @@ func TestSidebarMouseCloseAndDelete(t *testing.T) {
 	t.Run("close zone on background live row closes the pane", func(t *testing.T) {
 		// Row 0 (bg) title line is y=4; ✕ zone at sidebarWidth-3.
 		ev := mouseEvent{x: m.sidebarWidth - 3, y: 4, button: tea.MouseLeft, kind: mousePress}
-		if !m.handleSidebarMouse(ev) {
+		if consumed, _ := m.handleSidebarMouse(ev); !consumed {
 			t.Fatal("close click not consumed")
 		}
 		if len(m.lives.sessions) != 1 {
@@ -263,6 +293,9 @@ func TestSidebarMouseCloseAndDelete(t *testing.T) {
 		if m.modal != ModalNone {
 			t.Fatal("confirm must close the modal")
 		}
+		// The delete's list refresh is async; land it synchronously so
+		// the row assertions run against the fresh index.
+		m.refreshSavedSessions()
 		for _, si := range m.savedCache {
 			if si.ID == "abc" {
 				t.Fatal("deleted session still in the list")
@@ -369,6 +402,374 @@ func TestSidebarResumeSavedRow(t *testing.T) {
 	}
 }
 
+// Rebinding the focused agent (resume / delete-current) must be blocked
+// while the focused session has an in-flight turn or compaction — from
+// every entry point, not just the typed one: handleSubmitKey gates typed
+// input, but sidebar actions and the confirm-modal callback bypass it.
+func TestRebindBlockedWhileFocusedBusy(t *testing.T) {
+	newModel := func(t *testing.T) *Model {
+		t.Helper()
+		m := newSidebarFullModel(t)
+		m.sessionID = "cur" // NewModel mirrors a.SessionID; the harness skips it
+		for _, id := range []string{"abc", "cur"} {
+			if err := m.agent.SessionStore.Save(id, agent.SessionSnapshot{
+				WorkingDir: m.agent.WorkingDir,
+				Messages:   []llm.Message{{Role: "user", Content: "hello " + id}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		m.refreshSavedSessions()
+		return m
+	}
+	chatContains := func(t *testing.T, m *Model, needle string) {
+		t.Helper()
+		for _, l := range m.chatLines {
+			if strings.Contains(stripANSI(l), needle) {
+				return
+			}
+		}
+		t.Fatalf("chat missing %q:\n%s", needle, strings.Join(m.chatLines, "\n"))
+	}
+	storeHas := func(t *testing.T, m *Model, id string) bool {
+		t.Helper()
+		m.refreshSavedSessions()
+		for _, si := range m.savedCache {
+			if si.ID == id {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("resume blocked while streaming", func(t *testing.T) {
+		m := newModel(t)
+		m.streaming = true
+		m.resumeSavedRow("abc")
+		if m.sessionID != "cur" || m.agent.SessionID != "cur" {
+			t.Fatalf("agent must not rebind: sessionID=%q agent=%q", m.sessionID, m.agent.SessionID)
+		}
+		chatContains(t, m, "Resume: wait for the current turn to finish")
+	})
+
+	t.Run("resume blocked while compacting", func(t *testing.T) {
+		m := newModel(t)
+		m.compacting = true
+		m.resumeSavedRow("abc")
+		if m.sessionID != "cur" || m.agent.SessionID != "cur" {
+			t.Fatalf("agent must not rebind: sessionID=%q agent=%q", m.sessionID, m.agent.SessionID)
+		}
+		chatContains(t, m, "Resume: wait for compaction to finish")
+	})
+
+	t.Run("delete current blocked while streaming", func(t *testing.T) {
+		m := newModel(t)
+		m.streaming = true
+		m.deleteSavedRow("cur")
+		if m.agent.SessionID != "cur" {
+			t.Fatalf("agent must not rebind: %q", m.agent.SessionID)
+		}
+		if !storeHas(t, m, "cur") {
+			t.Fatal("current session file must survive the blocked delete")
+		}
+		chatContains(t, m, "Delete: wait for the current turn to finish")
+	})
+
+	t.Run("delete current blocked while compacting", func(t *testing.T) {
+		m := newModel(t)
+		m.compacting = true
+		m.deleteSavedRow("cur")
+		if m.agent.SessionID != "cur" {
+			t.Fatalf("agent must not rebind: %q", m.agent.SessionID)
+		}
+		if !storeHas(t, m, "cur") {
+			t.Fatal("current session file must survive the blocked delete")
+		}
+		chatContains(t, m, "Delete: wait for compaction to finish")
+	})
+
+	t.Run("delete non-current allowed while streaming", func(t *testing.T) {
+		m := newModel(t)
+		m.streaming = true
+		m.deleteSavedRow("abc")
+		if storeHas(t, m, "abc") {
+			t.Fatal("non-current delete must proceed while the focused session streams")
+		}
+		if m.agent.SessionID != "cur" {
+			t.Fatalf("focused agent must not rebind: %q", m.agent.SessionID)
+		}
+	})
+
+	t.Run("sidebar delete of focused row refuses before confirm", func(t *testing.T) {
+		m := newModel(t)
+		m.streaming = true
+		focusedRow := -1
+		for i, r := range m.buildSidebarRows() {
+			if r.focused {
+				focusedRow = i
+			}
+		}
+		if focusedRow < 0 {
+			t.Fatal("focused row missing from the list")
+		}
+		m.sidebarDeleteRow(focusedRow)
+		if m.modal != ModalNone {
+			t.Fatalf("modal = %v, want ModalNone (no confirm while busy)", m.modal)
+		}
+		if !strings.Contains(m.statusMsg, "Delete: wait for the current turn to finish") {
+			t.Fatalf("statusMsg = %q", m.statusMsg)
+		}
+	})
+
+	t.Run("idle rebind still works", func(t *testing.T) {
+		m := newModel(t)
+		m.resumeSavedRow("abc")
+		if m.sessionID != "abc" || m.agent.SessionID != "abc" {
+			t.Fatalf("idle resume must rebind: sessionID=%q agent=%q", m.sessionID, m.agent.SessionID)
+		}
+	})
+}
+
+// Resuming a session that is still hosted in a background slot must FOCUS
+// that slot (switchToLive), not rebind the focused agent onto the same
+// SessionID: two agents with one SessionID both persist to the same file,
+// and the rebound agent's first full save wipes the other's pending delta
+// (partial restore on the next load). The web dedupes in loadOrCreateRuntime.
+func TestResumeSavedRowLiveTargetSwitches(t *testing.T) {
+	m := newSidebarFullModel(t)
+	bg := newSwitchTestAgent(t)
+	bg.SessionStore = m.agent.SessionStore
+	bg.SessionID = "abc"
+	bg.Messages = []llm.Message{{Role: "user", Content: "bg hello"}}
+	if err := m.agent.SessionStore.Save("abc", agent.SessionSnapshot{
+		WorkingDir: m.agent.WorkingDir,
+		Messages:   []llm.Message{{Role: "user", Content: "bg hello"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.lives.Add(bg, "bg")
+
+	m.resumeSavedRow("abc")
+	if m.agent != bg || m.lives.active != 1 {
+		t.Fatalf("expected focus switch to the live slot: active=%d", m.lives.active)
+	}
+	if m.lives.sessions[0].agent.SessionID != "cur" {
+		t.Fatal("left-behind slot was rebound")
+	}
+	if bg.SessionID != "abc" || len(bg.Messages) != 1 {
+		t.Fatal("live slot's session state was clobbered")
+	}
+	if m.sessionID != "abc" {
+		t.Fatalf("sessionID = %q, want abc", m.sessionID)
+	}
+}
+
+// Resuming a SAVED session while the focused turn is in flight must be
+// blocked: the rebind would swap Messages out from under the running
+// stream goroutine (the left-behind session's in-flight reply would be
+// lost and the old turn's tail would land under the resumed session's id).
+func TestResumeSavedRowBlockedWhileStreaming(t *testing.T) {
+	m := newSidebarFullModel(t)
+	if err := m.agent.SessionStore.Save("abc", agent.SessionSnapshot{
+		WorkingDir: m.agent.WorkingDir,
+		Messages:   []llm.Message{{Role: "user", Content: "hello"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.sessionID = "cur"
+	m.streaming = true
+	m.lives.Active().streaming = true
+
+	m.resumeSavedRow("abc")
+	if m.agent.SessionID != "cur" || m.sessionID != "cur" {
+		t.Fatal("rebind happened while the focused turn was streaming")
+	}
+	if len(m.chatLines) == 0 || !strings.Contains(m.chatLines[len(m.chatLines)-1], "wait for the current turn") {
+		t.Fatalf("expected the blocked-resume notice, chatLines=%q", m.chatLines)
+	}
+}
+
+// Opening a saved session while the focused session is busy must NOT be
+// blocked (web openSessionPane parity): the saved session gets its OWN live
+// agent loaded from the store snapshot — the focused agent is never
+// rebound, so its in-flight turn keeps running in the background under its
+// own SessionID (a rebind would swap Messages out from under the running
+// stream goroutine and misattribute the turn's tail).
+func TestResumeSavedRowSpawnsWhileBusy(t *testing.T) {
+	newBusyModel := func(t *testing.T, compacting bool) *Model {
+		t.Helper()
+		m := newSidebarFullModel(t)
+		m.sessionID = "cur"
+		m.workspace = server.NewWorkspaceForHost(m.agent, nil)
+		if err := m.agent.SessionStore.Save("abc", agent.SessionSnapshot{
+			WorkingDir: m.agent.WorkingDir,
+			Messages:   []llm.Message{{Role: "user", Content: "hello abc"}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		m.refreshSavedSessions()
+		m.streaming = !compacting
+		m.lives.Active().streaming = !compacting
+		m.compacting = compacting
+		m.lives.Active().compacting = compacting
+		return m
+	}
+	for _, compacting := range []bool{false, true} {
+		kind := "streaming"
+		if compacting {
+			kind = "compacting"
+		}
+		t.Run("spawn allowed while "+kind, func(t *testing.T) {
+			m := newBusyModel(t, compacting)
+			m.resumeSavedRow("abc")
+			// The focused agent was NOT rebound: it keeps its session and
+			// its in-flight turn.
+			if m.lives.sessions[0].agent.SessionID != "cur" {
+				t.Fatalf("left-behind agent was rebound: %q", m.lives.sessions[0].agent.SessionID)
+			}
+			if m.lives.sessions[0].streaming != !compacting || m.lives.sessions[0].compacting != compacting {
+				t.Fatalf("left-behind busy flags clobbered: streaming=%v compacting=%v",
+					m.lives.sessions[0].streaming, m.lives.sessions[0].compacting)
+			}
+			if len(m.lives.sessions) != 2 || m.lives.active != 1 {
+				t.Fatalf("want a new focused live slot: sessions=%d active=%d", len(m.lives.sessions), m.lives.active)
+			}
+			focused := m.lives.Active()
+			if focused.agent.SessionID != "abc" {
+				t.Fatalf("focused agent = %q, want abc", focused.agent.SessionID)
+			}
+			if len(focused.agent.Messages) != 1 {
+				t.Fatalf("restored messages = %d, want 1", len(focused.agent.Messages))
+			}
+			if m.sessionID != "abc" {
+				t.Fatalf("sessionID = %q, want abc", m.sessionID)
+			}
+			// Joining an idle session unlocks the focused mirrors.
+			if m.streaming || m.compacting {
+				t.Fatalf("focused mirrors not unlocked: streaming=%v compacting=%v", m.streaming, m.compacting)
+			}
+			found := false
+			for _, l := range m.chatLines {
+				if strings.Contains(stripANSI(l), "Resumed session abc") {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("resume notice missing:\n%s", strings.Join(m.chatLines, "\n"))
+			}
+		})
+	}
+}
+
+// With a workspace, opening a saved session SPAWNS a live slot even when
+// the focused session is idle (web parity: one code path — the focused
+// agent is never rebound, so the left-behind session stays live instead of
+// becoming a saved row).
+func TestResumeSavedRowSpawnsWhenIdle(t *testing.T) {
+	m := newSidebarFullModel(t)
+	m.sessionID = "cur"
+	m.workspace = server.NewWorkspaceForHost(m.agent, nil)
+	if err := m.agent.SessionStore.Save("abc", agent.SessionSnapshot{
+		WorkingDir: m.agent.WorkingDir,
+		Messages:   []llm.Message{{Role: "user", Content: "hello abc"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.refreshSavedSessions()
+
+	m.resumeSavedRow("abc")
+	if len(m.lives.sessions) != 2 || m.lives.active != 1 {
+		t.Fatalf("want a new focused live slot: sessions=%d active=%d", len(m.lives.sessions), m.lives.active)
+	}
+	if m.lives.sessions[0].agent.SessionID != "cur" {
+		t.Fatalf("left-behind agent was rebound: %q", m.lives.sessions[0].agent.SessionID)
+	}
+	if m.sessionID != "abc" {
+		t.Fatalf("sessionID = %q, want abc", m.sessionID)
+	}
+
+	// Switching back focuses the original live slot (it was never saved
+	// away — it is still hosted).
+	i := m.lives.indexBySessionID("cur")
+	if i != 0 {
+		t.Fatalf("original session lost its live slot: index=%d", i)
+	}
+	m.switchToLive(i)
+	if m.agent.SessionID != "cur" || m.lives.active != 0 {
+		t.Fatalf("switch back failed: agent=%q active=%d", m.agent.SessionID, m.lives.active)
+	}
+	// Re-opening "abc" focuses ITS live slot instead of spawning a second
+	// agent for the same SessionID.
+	m.resumeSavedRow("abc")
+	if len(m.lives.sessions) != 2 || m.lives.active != 1 {
+		t.Fatalf("second open must focus the existing slot: sessions=%d active=%d", len(m.lives.sessions), m.lives.active)
+	}
+}
+
+// Typed /resume shares the resumeSavedRow guards: a live background target
+// is focused (not double-hosted), "resume latest" resolving to a live
+// background session focuses it, and a saved target still rebinds.
+func TestCmdSessionResumeGuards(t *testing.T) {
+	m := newSidebarFullModel(t)
+	bg := newSwitchTestAgent(t)
+	bg.SessionStore = m.agent.SessionStore
+	bg.SessionID = "abc"
+	if err := m.agent.SessionStore.Save("abc", agent.SessionSnapshot{
+		WorkingDir: m.agent.WorkingDir,
+		Messages:   []llm.Message{{Role: "user", Content: "hello"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.lives.Add(bg, "bg")
+
+	t.Run("typed resume of a live background session focuses it", func(t *testing.T) {
+		handled, quit, _ := m.dispatchCommand("resume abc")
+		if !handled || quit {
+			t.Fatalf("handled=%v quit=%v", handled, quit)
+		}
+		if m.agent != bg || m.lives.active != 1 {
+			t.Fatal("must focus the live slot, not rebind")
+		}
+		if m.lives.sessions[0].agent.SessionID != "cur" {
+			t.Fatal("left-behind slot was rebound")
+		}
+	})
+
+	t.Run("resume latest resolving to a live session focuses it", func(t *testing.T) {
+		// Focus is on "abc" now; switch back so "abc" is the background
+		// live target again.
+		m.switchToLive(0)
+		if m.lives.active != 0 {
+			t.Fatal("setup: switch back failed")
+		}
+		handled, _, _ := m.dispatchCommand("resume latest")
+		if !handled {
+			t.Fatal("not handled")
+		}
+		if m.agent != bg || m.lives.active != 1 {
+			t.Fatal("resume latest must focus the live background session")
+		}
+	})
+
+	t.Run("typed resume of a saved session still rebinds", func(t *testing.T) {
+		m2 := newSidebarFullModel(t)
+		if err := m2.agent.SessionStore.Save("def", agent.SessionSnapshot{
+			WorkingDir: m2.agent.WorkingDir,
+			Messages:   []llm.Message{{Role: "user", Content: "saved"}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		handled, _, _ := m2.dispatchCommand("resume def")
+		if !handled {
+			t.Fatal("not handled")
+		}
+		if m2.agent.SessionID != "def" || m2.sessionID != "def" {
+			t.Fatalf("rebind failed: agent=%q model=%q", m2.agent.SessionID, m2.sessionID)
+		}
+	})
+}
+
 // Selecting a saved session must not reorder the list (web parity:
 // activation keeps the earned position). The resumed session is pinned to
 // its store timestamp, and the left-behind session keeps its in-process
@@ -414,6 +815,9 @@ func TestSidebarResumeKeepsPositions(t *testing.T) {
 	m.agent.Messages = append(m.agent.Messages, llm.Message{Role: "user", Content: "hey"})
 	m.agent.SetMode(m.agent.Mode)
 	m.resumeSavedRow("abc")
+	// The resume's list refresh is async; land it synchronously so the
+	// ordering assertions run against the fresh index.
+	m.refreshSavedSessions()
 	after := ids()
 	if len(after) != 3 {
 		t.Fatalf("row count changed: %v -> %v", before, after)
@@ -467,12 +871,12 @@ func TestSidebarTurnEndStamping(t *testing.T) {
 	m.lives.sessions[0].lastActive = time.Now().Add(-time.Hour)
 	before := m.lives.sessions[0].lastActive
 
-	m.handleTurnFinishedMsg("s1", context.Canceled)
+	m.handleTurnFinishedMsg("s1", 0, context.Canceled)
 	if !m.lives.sessions[0].lastActive.Equal(before) {
 		t.Fatal("cancelled turn must not bump the row")
 	}
 
-	m.handleTurnFinishedMsg("s1", nil)
+	m.handleTurnFinishedMsg("s1", 0, nil)
 	if m.lives.sessions[0].lastActive.Equal(before) {
 		t.Fatal("completed turn must bump the row")
 	}
@@ -580,7 +984,7 @@ func TestSidebarFooterButtons(t *testing.T) {
 	})
 
 	t.Run("non-button footer parts are consumed but inert", func(t *testing.T) {
-		if !m.handleSidebarMouse(mouseEvent{x: 25, y: footerY, button: tea.MouseLeft, kind: mousePress}) {
+		if consumed, _ := m.handleSidebarMouse(mouseEvent{x: 25, y: footerY, button: tea.MouseLeft, kind: mousePress}); !consumed {
 			t.Fatal("footer click must be consumed")
 		}
 		if len(m.lives.sessions) != 2 || m.modal != ModalNone {
@@ -784,6 +1188,9 @@ func TestSidebarCloseFocusedRow(t *testing.T) {
 	if m.lives.active != 0 || m.agent != bg {
 		t.Fatal("focus must move to the remaining live session")
 	}
+	// The close's list refresh is async; land it synchronously so the
+	// saved-row assertion runs against the fresh index.
+	m.refreshSavedSessions()
 	// The closed session stays saved (flushed on close).
 	found := false
 	for _, si := range m.savedCache {
@@ -828,6 +1235,9 @@ func TestSidebarDeleteKey(t *testing.T) {
 	if m.modal != ModalNone {
 		t.Fatal("confirm must close the modal")
 	}
+	// The delete's list refresh is async; land it synchronously so the
+	// row assertion runs against the fresh index.
+	m.refreshSavedSessions()
 	for _, si := range m.savedCache {
 		if si.ID == "abc" {
 			t.Fatal("deleted session still in the list")
@@ -886,5 +1296,223 @@ func TestSidebarTickReschedules(t *testing.T) {
 	_, cmd = m.Update(sidebarTickMsg{})
 	if cmd == nil {
 		t.Fatal("tick keeps running while hidden (no-op), so it must still reschedule")
+	}
+}
+
+// ── Identity-based cursor: the selection follows the SESSION, not the slot ──
+
+// Regression: the list reorders at runtime (a background turn completing
+// bumps that session to the top). The cursor used to be a bare list index,
+// so after a reorder the highlight jumped to a different session and x/d
+// acted on the wrong one. The cursor must keep its session's identity.
+func TestSidebarCursorFollowsSessionAcrossReorder(t *testing.T) {
+	m := newSidebarFullModel(t)
+	m.sidebarMainLines = 30
+	m.focus = FocusSidebar
+	aB := newSwitchTestAgent(t)
+	aC := newSwitchTestAgent(t)
+	m.lives.Add(aB, "B")
+	m.lives.Add(aC, "C")
+	// Deterministic order: C (newest) row 0, B row 1, focused "cur" row 2.
+	m.lives.sessions[0].lastActive = time.Now().Add(-3 * time.Minute)
+	m.lives.sessions[1].lastActive = time.Now().Add(-2 * time.Minute)
+	m.lives.sessions[2].lastActive = time.Now().Add(-time.Minute)
+
+	rows := m.buildSidebarRows()
+	cRow, bRow := -1, -1
+	for i, r := range rows {
+		if r.liveIdx == 2 {
+			cRow = i // C
+		}
+		if r.liveIdx == 1 {
+			bRow = i // B
+		}
+	}
+	if cRow != 0 || bRow != 1 {
+		t.Fatalf("setup order wrong: C=%d B=%d, want 0/1", cRow, bRow)
+	}
+	cID := rows[cRow].id
+	m.setSidebarCursor(rows, cRow) // cursor on C (row 0)
+
+	// B's turn completes in the background → B jumps to the top, C slides
+	// from row 0 to row 1.
+	m.lives.sessions[1].lastActive = time.Now()
+
+	// The render resolves the cursor by identity: it must now point at row 1
+	// (still C), not stay pinned to row 0 (now B).
+	m.renderSidebar(30)
+	rows = m.buildSidebarRows()
+	if m.sidebarCursor != 1 || rows[1].id != cID {
+		t.Fatalf("cursor = %d (%q), want row 1 (%q) — it must follow C across the reorder",
+			m.sidebarCursor, rows[m.sidebarCursor].id, cID)
+	}
+
+	// x must close C (the selected session), not B, which slid into C's old
+	// slot.
+	m.handleSidebarKey(keyMsg("x"))
+	if m.lives.ByID("s3") != nil {
+		t.Fatal("C (the selected session) was not closed")
+	}
+	if m.lives.ByID("s2") == nil {
+		t.Fatal("B (the session that slid into the cursor's old slot) must stay open")
+	}
+	if len(m.lives.sessions) != 2 {
+		t.Fatalf("live sessions = %d, want 2", len(m.lives.sessions))
+	}
+}
+
+// A reorder that relocates the cursor outside the visible window must move
+// the window to it (the resolved position counts as a cursor move), so the
+// selection can never be stranded off-screen.
+func TestSidebarReorderKeepsCursorInWindow(t *testing.T) {
+	m := newSidebarFullModel(t)
+	m.sidebarMainLines = 30
+	// 9 live sessions → the 8-row window cannot show them all.
+	agents := make([]*agent.Agent, 9)
+	for i := range agents {
+		agents[i] = newSwitchTestAgent(t)
+		m.lives.Add(agents[i], fmt.Sprintf("s%d", i))
+	}
+	// Oldest first: agents[0] newest … agents[8] oldest (row 8, off-window).
+	for i := range agents {
+		m.lives.sessions[i+1].lastActive = time.Now().Add(time.Duration(i) * time.Minute)
+	}
+	m.lives.sessions[0].lastActive = time.Now().Add(-9 * time.Minute)
+	m.renderSidebar(30)
+
+	// Select the bottom row (row 8) — the window follows to show it.
+	rows := m.buildSidebarRows()
+	m.setSidebarCursor(rows, 8)
+	m.renderSidebar(30)
+	if m.sidebarScroll != 1 { // 8 - 8 + 1
+		t.Fatalf("scroll = %d, want 1 (window must follow the cursor)", m.sidebarScroll)
+	}
+
+	// Now the TOP session completes → everything slides down by one: the
+	// selected session moves from row 8 to row 9… it stays the last row,
+	// but its identity must survive and the window must keep showing it.
+	m.lives.sessions[0].lastActive = time.Now()
+	m.renderSidebar(30)
+	rows = m.buildSidebarRows()
+	selID := m.sidebarCursorID
+	if selID == "" {
+		t.Fatal("cursor identity lost after the reorder")
+	}
+	found := -1
+	for i, r := range rows {
+		if r.id == selID {
+			found = i
+			break
+		}
+	}
+	if found < 0 {
+		t.Fatal("selected session vanished from the list")
+	}
+	if m.sidebarCursor != found {
+		t.Fatalf("cursor = %d, want %d (the selected session's new position)", m.sidebarCursor, found)
+	}
+	if m.sidebarCursor < m.sidebarScroll || m.sidebarCursor >= m.sidebarScroll+m.sidebarVisibleRows(30) {
+		t.Fatalf("cursor %d outside visible window [%d,%d)", m.sidebarCursor, m.sidebarScroll, m.sidebarScroll+m.sidebarVisibleRows(30))
+	}
+}
+
+// Footer buttons hit EXACT columns: the two-column gaps between them (and
+// the "│ " prefix) must be inert — the old ±2 tolerance let a gap click
+// trigger the nearest button (e.g. "new session").
+func TestSidebarFooterGapClicksInert(t *testing.T) {
+	m := newSidebarFullModel(t)
+	m.sidebarMainLines = 30
+	footerY := m.sidebarMainLines - 2
+	// Zones: "n new" cols 2-6, "x close" 9-15, "d del" 18-22.
+	// Inert: prefix 0-1, gaps 7-8 and 16-17, tail 23+.
+	for _, x := range []int{0, 1, 7, 8, 16, 17, 23, 25} {
+		consumed, _ := m.handleSidebarMouse(mouseEvent{x: x, y: footerY, button: tea.MouseLeft, kind: mousePress})
+		if !consumed {
+			t.Fatalf("x=%d: footer click must be consumed", x)
+		}
+		if len(m.lives.sessions) != 1 {
+			t.Fatalf("x=%d: gap click spawned a session", x)
+		}
+		if m.modal != ModalNone {
+			t.Fatalf("x=%d: gap click opened a modal", x)
+		}
+		// Hover tracking must agree: a gap is not a button.
+		m.handleSidebarMouse(mouseEvent{x: x, y: footerY, button: tea.MouseNone, kind: mouseMotion})
+		if m.sidebarHover != sidebarFooterNone {
+			t.Fatalf("x=%d: hover = %d, want none over a gap", x, m.sidebarHover)
+		}
+	}
+	// The buttons themselves still work (exact columns).
+	m.handleSidebarMouse(mouseEvent{x: 4, y: footerY, button: tea.MouseNone, kind: mouseMotion})
+	if m.sidebarHover != sidebarFooterNew {
+		t.Fatal("hover over 'n new' must track")
+	}
+}
+
+// The border drag's press zone must not reach into the chat column: a press
+// on the first chat column starts a text selection, not a panel drag.
+func TestSidebarDragPressStaysInPanel(t *testing.T) {
+	m := dragModel(t)
+	press := func(x int) bool {
+		return m.handleSidebarResizeMouse(mouseEvent{x: x, y: 5, button: tea.MouseLeft, kind: mousePress})
+	}
+	release := func() {
+		m.handleSidebarResizeMouse(mouseEvent{kind: mouseRelease})
+	}
+
+	// First chat column (x == sidebarWidth): must NOT engage the drag.
+	if press(m.sidebarWidth) {
+		t.Fatal("press in the chat column must not start a border drag")
+	}
+	if m.sidebarDragging {
+		t.Fatal("dragging flag set by a chat-column press")
+	}
+	// Border column and its one-column left tolerance still engage.
+	if !press(m.sidebarWidth - 1) {
+		t.Fatal("border press must start the drag")
+	}
+	release()
+	if !press(m.sidebarWidth - 2) {
+		t.Fatal("left-tolerance press must start the drag")
+	}
+	release()
+	// Two columns left of the border is row content (the ✕ zone), not the
+	// handle: it must fall through to selection.
+	if press(m.sidebarWidth - 3) {
+		t.Fatal("press on the ✕ column must not start a border drag")
+	}
+}
+
+// Opening a live row from the sidebar must announce the switch with the
+// same system line /switch and the active-sessions modal print, so every
+// focus entry point gives the same feedback. The new-session path keeps
+// its own "Opened live session" line (it never goes through here).
+func TestSidebarOpenRowAnnouncesSwitch(t *testing.T) {
+	m := newSidebarFullModel(t)
+	a2 := newSwitchTestAgent(t)
+	a2.SessionID = "second-id" // NewAgent leaves it empty; the row keys on it
+	m.lives.Add(a2, "second")
+
+	rows := m.buildSidebarRows()
+	idx := -1
+	for i, r := range rows {
+		if r.id == a2.SessionID {
+			idx = i
+		}
+	}
+	if idx < 0 {
+		t.Fatal("second live session missing from sidebar rows")
+	}
+
+	m.sidebarOpenRow(idx)
+	if m.agent != a2 {
+		t.Fatal("sidebar open did not focus the live session")
+	}
+	if len(m.chatLines) == 0 {
+		t.Fatal("no chat lines after opening a live row")
+	}
+	last := m.chatLines[len(m.chatLines)-1]
+	if !strings.Contains(last, "Switched to session:") {
+		t.Fatalf("last chat line = %q, want the switch feedback line", last)
 	}
 }

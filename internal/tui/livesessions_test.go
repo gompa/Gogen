@@ -79,7 +79,7 @@ func TestHandleTurnFinishedBackgroundSession(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			m := newModel()
 			m.lives.ByID("s2").streaming = true
-			model, _ := m.handleTurnFinishedMsg(tt.sid, tt.err)
+			model, _ := m.handleTurnFinishedMsg(tt.sid, 0, tt.err)
 			got := model.(*Model)
 			if got.lives.ByID("s2").streaming {
 				t.Fatal("background session still marked streaming")
@@ -98,7 +98,7 @@ func TestHandleTurnFinishedBackgroundSession(t *testing.T) {
 
 	t.Run("unknown session id is a no-op", func(t *testing.T) {
 		m := newModel()
-		model, _ := m.handleTurnFinishedMsg("ghost", nil)
+		model, _ := m.handleTurnFinishedMsg("ghost", 0, nil)
 		if model.(*Model).statusMsg != "" {
 			t.Fatalf("unexpected status %q", model.(*Model).statusMsg)
 		}

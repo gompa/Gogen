@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"slices"
 	"strings"
@@ -340,13 +341,14 @@ func (m *Model) sidebarVisibleRows(mainLines int) int {
 	return v
 }
 
-// clampSidebarScroll keeps m.sidebarScroll within the current list bounds.
-func (m *Model) clampSidebarScroll() {
+// clampSidebarScrollTo keeps m.sidebarScroll within the bounds of a list
+// of n rows.
+func (m *Model) clampSidebarScrollTo(n int) {
 	if m.sidebarMainLines <= 0 {
 		m.sidebarScroll = 0
 		return
 	}
-	maxScroll := len(m.buildSidebarRows()) - m.sidebarVisibleRows(m.sidebarMainLines)
+	maxScroll := n - m.sidebarVisibleRows(m.sidebarMainLines)
 	if maxScroll < 0 {
 		maxScroll = 0
 	}
@@ -358,11 +360,56 @@ func (m *Model) clampSidebarScroll() {
 	}
 }
 
+// clampSidebarScroll keeps m.sidebarScroll within the current list bounds.
+func (m *Model) clampSidebarScroll() {
+	m.clampSidebarScrollTo(len(m.buildSidebarRows()))
+}
+
+// resolveSidebarCursor maps the identity-based cursor (sidebarCursorID) to
+// its current position in rows, keeping m.sidebarCursor in sync. The list
+// reorders at runtime (background completion, /open, store refresh), so
+// the id — not a stored index — decides where the cursor points: the
+// highlight follows the selected session and x/d act on it even after a
+// reorder. When the id no longer exists (row closed/deleted) the stale id
+// is dropped and the last positional cursor is kept (clamped).
+func (m *Model) resolveSidebarCursor(rows []sidebarRow) int {
+	if m.sidebarCursorID != "" {
+		for i, r := range rows {
+			if r.id == m.sidebarCursorID {
+				m.sidebarCursor = i
+				return i
+			}
+		}
+		m.sidebarCursorID = ""
+	}
+	if m.sidebarCursor < 0 {
+		m.sidebarCursor = 0
+	}
+	if m.sidebarCursor >= len(rows) {
+		m.sidebarCursor = max(0, len(rows)-1)
+	}
+	return m.sidebarCursor
+}
+
+// setSidebarCursor moves the panel cursor to rows[idx], recording the
+// row's identity so runtime reorders keep it on the same session (see
+// resolveSidebarCursor).
+func (m *Model) setSidebarCursor(rows []sidebarRow, idx int) {
+	if idx < 0 || idx >= len(rows) {
+		return
+	}
+	m.sidebarCursor = idx
+	m.sidebarCursorID = rows[idx].id
+}
+
 // sidebarFocusedRow is the list index of the focused session (for cursor
-// initialization when the panel gains keyboard focus).
+// initialization when the panel gains keyboard focus). It also records the
+// row's identity so the cursor survives later reorders.
 func (m *Model) sidebarFocusedRow() int {
-	for i, r := range m.buildSidebarRows() {
+	rows := m.buildSidebarRows()
+	for i, r := range rows {
 		if r.focused {
+			m.setSidebarCursor(rows, i)
 			return i
 		}
 	}
@@ -387,26 +434,28 @@ func (m *Model) renderSidebar(mainLines int) string {
 
 	rows := m.buildSidebarRows()
 	visible := m.sidebarVisibleRows(mainLines)
-	if m.sidebarCursor < 0 {
-		m.sidebarCursor = 0
-	}
-	if m.sidebarCursor >= len(rows) {
-		m.sidebarCursor = max(0, len(rows)-1)
-	}
+	// Resolve the identity-based cursor to its current position: the list
+	// may have reordered since the last render (background completion,
+	// /open, store refresh), and the cursor must follow its session, not
+	// its old slot. A resolved position change counts as a cursor move for
+	// the window-follow logic below, so a reorder can never strand the
+	// cursor outside the visible window.
+	cursor := m.resolveSidebarCursor(rows)
 	// Keep the cursor inside the visible window — but only when the
-	// cursor itself moved since the last render (keyboard/click nav). A
-	// wheel scroll moves the window away from the cursor and must not be
-	// snapped back to it on the next frame.
-	if m.sidebarCursor != m.sidebarLastCursor {
-		if m.sidebarCursor < m.sidebarScroll {
-			m.sidebarScroll = m.sidebarCursor
+	// cursor itself moved since the last render (keyboard/click nav, or a
+	// reorder that relocated it). A wheel scroll moves the window away
+	// from the cursor and must not be snapped back to it on the next
+	// frame.
+	if cursor != m.sidebarLastCursor {
+		if cursor < m.sidebarScroll {
+			m.sidebarScroll = cursor
 		}
-		if m.sidebarCursor >= m.sidebarScroll+visible {
-			m.sidebarScroll = m.sidebarCursor - visible + 1
+		if cursor >= m.sidebarScroll+visible {
+			m.sidebarScroll = cursor - visible + 1
 		}
 	}
-	m.sidebarLastCursor = m.sidebarCursor
-	m.clampSidebarScroll()
+	m.sidebarLastCursor = cursor
+	m.clampSidebarScrollTo(len(rows))
 
 	// dim pads a (possibly pre-styled) content string to the panel width.
 	// Measurement is ANSI-aware so styled meta lines truncate and pad by
@@ -433,7 +482,7 @@ func (m *Model) renderSidebar(mainLines int) string {
 
 	for i := 0; i < visible && m.sidebarScroll+i < len(rows); i++ {
 		r := rows[m.sidebarScroll+i]
-		add(m.renderSidebarTitle(r, i+m.sidebarScroll == m.sidebarCursor, inner))
+		add(m.renderSidebarTitle(r, i+m.sidebarScroll == cursor, inner))
 		add(dim(m.sidebarMeta(r)))
 		// Blank separator between consecutive sessions (none after the
 		// last rendered one).
@@ -523,10 +572,12 @@ func (m *Model) renderSidebarFooter(inner int) string {
 	return ansiDimOn + "│ " + line + strings.Repeat(" ", pad) + ansiReset
 }
 
-// sidebarFooterAt reports which footer button a position lands on
-// (sidebarFooterNew/sidebarFooterClose), with the same ±2 tolerance the row
-// ✕ zone uses. ok=false for the non-interactive footer parts, every other
-// row, and a panel too narrow to render the buttons.
+// sidebarFooterAt reports which footer button a position lands on. The
+// zones are EXACT columns: the buttons are separated by two-column gaps,
+// so any tolerance wider than the button itself would let a click in a
+// gap (or in the "│ " prefix) trigger the nearest button. ok=false for the
+// non-interactive footer parts, every other row, and a panel too narrow to
+// render the buttons.
 func (m *Model) sidebarFooterAt(x, y int) (button int, ok bool) {
 	if m.sidebarMainLines <= 0 || y != m.sidebarMainLines-sidebarBorderLines {
 		return sidebarFooterNone, false
@@ -535,7 +586,7 @@ func (m *Model) sidebarFooterAt(x, y int) (button int, ok bool) {
 		return sidebarFooterNone, false // buttons not rendered at this width
 	}
 	for _, z := range sidebarFooterZones() {
-		if x >= z.x0-2 && x <= z.x1+2 {
+		if x >= z.x0 && x <= z.x1 {
 			return z.button, true
 		}
 	}
@@ -647,10 +698,12 @@ func (m *Model) sidebarRowAt(x, y int) (row int, actionZone bool, ok bool) {
 	if i < 0 || i >= len(rows) {
 		return 0, false, false
 	}
-	// ✕ sits at content column inner-2 → terminal column sidebarWidth-3;
-	// accept a ±2 tolerance. The drag handle (sidebarWidth-2..+1) is
-	// consumed earlier by handleSidebarResizeMouse, so the zones are
-	// disjoint. The title line is the first line of each 3-line group.
+	// ✕ sits at terminal column sidebarWidth-3; the zone is the glyph plus
+	// two columns to its LEFT (sidebarWidth-5..sidebarWidth-3). The column
+	// right of the glyph (sidebarWidth-2) and the border (sidebarWidth-1)
+	// belong to the drag handle, which handleSidebarResizeMouse consumes
+	// earlier — the zones are disjoint. The title line is the first line
+	// of each 3-line group.
 	actionZone = (y-start)%3 == 0 &&
 		x >= m.sidebarWidth-5 && x <= m.sidebarWidth-3
 	return i, actionZone, true
@@ -662,9 +715,9 @@ func (m *Model) sidebarRowAt(x, y int) (row int, actionZone bool, ok bool) {
 // actions), and button-less motion tracks the footer-button hover
 // highlight. Returns true when the event was consumed (it must NOT start a
 // text selection or scroll the chat).
-func (m *Model) handleSidebarMouse(ev mouseEvent) bool {
+func (m *Model) handleSidebarMouse(ev mouseEvent) (bool, tea.Cmd) {
 	if m.modal != ModalNone || m.sidebarOffsetX() == 0 {
-		return false
+		return false, nil
 	}
 	switch {
 	case ev.kind == mouseWheelEvent && ev.x < m.sidebarOffsetX():
@@ -676,7 +729,7 @@ func (m *Model) handleSidebarMouse(ev mouseEvent) bool {
 			m.sidebarScroll++
 		}
 		m.clampSidebarScroll()
-		return true
+		return true, nil
 	case ev.kind == mouseMotion && ev.button == tea.MouseNone && ev.x < m.sidebarOffsetX():
 		// Hover highlight over the footer buttons (cell motion is on).
 		// Button-less motion never drives text selection, so consuming it
@@ -688,49 +741,52 @@ func (m *Model) handleSidebarMouse(ev mouseEvent) bool {
 		if hover != m.sidebarHover {
 			m.sidebarHover = hover
 		}
-		return true
+		return true, nil
 	case ev.kind == mousePress && ev.button == tea.MouseLeft && ev.x < m.sidebarOffsetX():
 		m.sidebarHover = sidebarFooterNone
 		// Footer buttons act like their keys: "n new" spawns a live
 		// session, "x close" closes the cursor row's pane (stays saved),
-		// "d del" deletes the cursor row with confirmation.
+		// "d del" deletes the cursor row with confirmation. The returned
+		// cmd (e.g. the progress spinner tick when a switch lands on a
+		// streaming session) must reach Update — dropping it here left
+		// the spinner frozen after mouse-driven switches.
 		if b, ok := m.sidebarFooterAt(ev.x, ev.y); ok {
 			switch b {
 			case sidebarFooterNew:
-				m.openNewLiveSession("")
-				return true
+				return true, m.openNewLiveSession("")
 			case sidebarFooterClose:
-				if len(m.buildSidebarRows()) > 0 {
-					m.sidebarCloseRow(m.sidebarCursor)
+				if rows := m.buildSidebarRows(); len(rows) > 0 {
+					return true, m.sidebarCloseRow(m.resolveSidebarCursor(rows))
 				}
-				return true
+				return true, nil
 			case sidebarFooterDelete:
-				if len(m.buildSidebarRows()) > 0 {
-					m.sidebarDeleteRow(m.sidebarCursor)
+				if rows := m.buildSidebarRows(); len(rows) > 0 {
+					return true, m.sidebarDeleteRow(m.resolveSidebarCursor(rows))
 				}
-				return true
+				return true, nil
 			}
 		}
 		row, actionZone, ok := m.sidebarRowAt(ev.x, ev.y)
 		if !ok {
-			return true // header/footer: consume, no selection
+			return true, nil // header/footer: consume, no selection
 		}
-		m.sidebarCursor = row
+		// Record the row's identity: a reorder before the next action must
+		// keep the cursor (and the ✕/x/d targets) on this session.
+		if rows := m.buildSidebarRows(); row < len(rows) {
+			m.setSidebarCursor(rows, row)
+		}
 		m.focus = FocusSidebar
 		if actionZone {
 			// Web parity: ✕ on a live row closes the pane (stays
 			// saved); ✕ on a saved row deletes it (with confirmation).
 			if rows := m.buildSidebarRows(); rows[row].live {
-				m.sidebarCloseRow(row)
-			} else {
-				m.sidebarDeleteRow(row)
+				return true, m.sidebarCloseRow(row)
 			}
-			return true
+			return true, m.sidebarDeleteRow(row)
 		}
-		m.sidebarOpenRow(row)
-		return true
+		return true, m.sidebarOpenRow(row)
 	}
-	return false
+	return false, nil
 }
 
 // handleSidebarKey dispatches keys when the sessions panel has focus.
@@ -742,56 +798,54 @@ func (m *Model) handleSidebarKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.modal = ModalHelp
 		return m, nil
 	}
+	// Cancel turn / compact or quit (shared handler; stays on sidebar
+	// focus — refocusInput is a no-op here).
 	if key.Matches(msg, m.keys.CancelTurn) {
-		if m.streaming {
-			m.streaming = false
-			m.clearProgress()
-			m.cancelActiveStream()
-			m.resetStreamState(false)
-			m.appendChatLine(SystemStyle.Render("Cancelled."))
-			return m, nil
-		}
-		m.flushAndQuit()
-		return m, tea.Quit
+		_, cmd, _ := m.handleCancelKey()
+		return m, cmd
 	}
 	rows := m.buildSidebarRows()
 	n := len(rows)
+	// Identity-based cursor: nav moves the cursor by position but records
+	// the target row's id, so a reorder between keypresses can never make
+	// enter/x/d act on a different session than the highlighted one.
+	cursor := m.resolveSidebarCursor(rows)
 	switch msg.String() {
 	case "up", "k":
-		if m.sidebarCursor > 0 {
-			m.sidebarCursor--
+		if cursor > 0 {
+			m.setSidebarCursor(rows, cursor-1)
 		}
 	case "down", "j":
-		if n > 0 && m.sidebarCursor < n-1 {
-			m.sidebarCursor++
+		if n > 0 && cursor < n-1 {
+			m.setSidebarCursor(rows, cursor+1)
 		}
 	case "pgup":
-		if m.sidebarCursor > 10 {
-			m.sidebarCursor -= 10
+		if cursor > 10 {
+			m.setSidebarCursor(rows, cursor-10)
 		} else {
-			m.sidebarCursor = 0
+			m.setSidebarCursor(rows, 0)
 		}
 	case "pgdown":
-		if n > 0 && m.sidebarCursor < n-10 {
-			m.sidebarCursor += 10
-		} else {
-			m.sidebarCursor = max(0, n-1)
+		if n > 0 && cursor < n-10 {
+			m.setSidebarCursor(rows, cursor+10)
+		} else if n > 0 {
+			m.setSidebarCursor(rows, n-1)
 		}
 	case "home", "g":
-		m.sidebarCursor = 0
+		m.setSidebarCursor(rows, 0)
 	case "end", "G":
 		if n > 0 {
-			m.sidebarCursor = n - 1
+			m.setSidebarCursor(rows, n-1)
 		}
 	case "enter":
-		return m, m.sidebarOpenRow(m.sidebarCursor)
+		return m, m.sidebarOpenRow(cursor)
 	case "x":
 		if n > 0 {
-			return m, m.sidebarCloseRow(m.sidebarCursor)
+			return m, m.sidebarCloseRow(cursor)
 		}
 	case "d":
 		if n > 0 {
-			return m, m.sidebarDeleteRow(m.sidebarCursor)
+			return m, m.sidebarDeleteRow(cursor)
 		}
 	case "n":
 		return m, m.openNewLiveSession("")
@@ -815,9 +869,9 @@ func (m *Model) handleSidebarKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// sidebarOpenRow focuses a live row (switchToLive) or resumes a saved row
-// (rebinds the focused agent — the same converge-on-switch contract as
-// /resume). No-op when the row is already the focused session.
+// sidebarOpenRow focuses a live row (switchToLive) or opens a saved row as
+// its own live session (web openSessionPane parity — safe even mid-turn).
+// No-op when the row is already the focused session.
 func (m *Model) sidebarOpenRow(row int) tea.Cmd {
 	rows := m.buildSidebarRows()
 	if row < 0 || row >= len(rows) {
@@ -828,7 +882,12 @@ func (m *Model) sidebarOpenRow(row int) tea.Cmd {
 		if r.liveIdx == m.lives.active {
 			return nil
 		}
-		return m.switchToLive(r.liveIdx)
+		cmd := m.switchToLive(r.liveIdx)
+		// Same feedback line as /switch and the active-sessions modal, so
+		// every focus entry point announces the switch (the new-session
+		// path prints its own "Opened live session" line instead).
+		m.appendChatLine(SystemStyle.Render(fmt.Sprintf("Switched to session: %s", r.label)))
+		return cmd
 	}
 	return m.resumeSavedRow(r.id)
 }
@@ -876,18 +935,16 @@ func (m *Model) sidebarCloseRow(row int) tea.Cmd {
 			return nil
 		}
 		m.statusMsg = "Closed " + r.label + " (still saved)"
-		m.refreshSavedSessions()
 		m.sidebarCursor = max(0, min(m.sidebarCursor, len(m.buildSidebarRows())-1))
-		return cmd
+		return tea.Batch(cmd, m.requestSavedSessions())
 	}
 	if err := m.lives.Close(r.liveIdx); err != nil {
 		m.statusMsg = "Close: " + err.Error()
 		return nil
 	}
 	m.statusMsg = "Closed " + r.label + " (still saved)"
-	m.refreshSavedSessions()
 	m.sidebarCursor = max(0, min(m.sidebarCursor, len(m.buildSidebarRows())-1))
-	return nil
+	return m.requestSavedSessions()
 }
 
 // sidebarDeleteRow asks for confirmation and PERMANENTLY deletes the row's
@@ -905,6 +962,16 @@ func (m *Model) sidebarDeleteRow(row int) tea.Cmd {
 		m.statusMsg = "Delete: close the session first (x), then delete it"
 		return nil
 	}
+	// The focused row deletes through the agent (rebind) — refuse up front
+	// while it is busy so the user is not asked to confirm a delete that
+	// cannot run yet. deleteSavedRow re-checks at execution time: the
+	// confirm modal can stay open while a turn starts in the meantime.
+	if r.focused {
+		if reason := m.rebindBlockReason("Delete"); reason != "" {
+			m.statusMsg = reason
+			return nil
+		}
+	}
 	m.confirmText = fmt.Sprintf("Delete session %q?\nIts message history will be permanently deleted.", r.label)
 	m.confirmAction = func() (tea.Model, tea.Cmd) {
 		m.modal = ModalNone
@@ -914,15 +981,69 @@ func (m *Model) sidebarDeleteRow(row int) tea.Cmd {
 	return nil
 }
 
-// resumeSavedRow attaches a saved session to the focused agent (the web's
-// openSessionPane). Shared by the sidebar and the /resume sessions modal.
+// rebindBlockReason reports why the focused agent must not be rebound or
+// reset right now ("" = safe). Rebinding mid-turn swaps Messages out from
+// under the running stream goroutine: the left-behind session's file
+// freezes at the rebind (its in-flight reply is never saved) and the old
+// turn's tail persists under the NEW session's id. Rebinding
+// mid-compaction lets the in-flight CompactHistory rewrite the session
+// that replaces the current one (it runs on the same agent object).
+// handleSubmitKey gates the TYPED entry points, but sidebar mouse/keyboard
+// actions and the confirm-modal callback run outside it — every rebind
+// entry point must check this (resumeSavedRow, deleteSavedRow).
+func (m *Model) rebindBlockReason(verb string) string {
+	switch {
+	case m.streaming:
+		return verb + ": wait for the current turn to finish (or cancel it first)."
+	case m.compacting:
+		return verb + ": wait for compaction to finish (or cancel it with ctrl+c)."
+	}
+	return ""
+}
+
+// resumeSavedRow opens a saved session (the web's openSessionPane). Shared
+// by the sidebar, the /resume sessions modal, and typed /resume (cmdSession
+// routes through here so every entry point gets the same guards).
+//
+// Web parity (loadOrCreateRuntime): a saved session gets its OWN live agent
+// loaded from the store snapshot — the focused agent is never rebound, so
+// opening a session is allowed at ANY time, even while the focused session
+// is mid-turn or mid-compaction (its turn keeps running in the background
+// under its own SessionID). Without a workspace (single-session host) the
+// only option is rebinding the focused agent, which stays gated on
+// rebindBlockReason.
 func (m *Model) resumeSavedRow(id string) tea.Cmd {
 	if id == "" || id == m.sessionID {
+		return nil
+	}
+	// A session still hosted in a background slot is FOCUSED, not opened
+	// again: a second agent with the same SessionID would both persist to
+	// the same file — the new agent's first save is a full snapshot that
+	// wipes the other's pending delta, and the load-time merge drops the
+	// mismatched writer's tail (the partial-restore bug). The web dedupes
+	// in loadOrCreateRuntime for exactly this reason. switchToLive is safe
+	// even mid-turn (it joins the running turn instead of rebinding).
+	if m.lives != nil {
+		if i := m.lives.indexBySessionID(id); i >= 0 {
+			return m.switchToLive(i)
+		}
+	}
+	if m.workspace != nil && m.lives != nil {
+		return m.spawnSavedSession(id)
+	}
+	// Single-session host (no workspace): the only option is rebinding the
+	// focused agent, which is unsafe mid-turn or mid-compaction (see
+	// rebindBlockReason).
+	if reason := m.rebindBlockReason("Resume"); reason != "" {
+		m.appendChatLine(ErrorStyle.Render(reason))
 		return nil
 	}
 	result, _, err := m.agent.HandleSessionCommand(m.ctx, "resume "+id, session.NewID())
 	if err != nil {
 		m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Session: %v", err)))
+		// The resume flushes the left-behind session before loading; a
+		// failed load can still leave a persist error behind.
+		m.checkPersistError()
 		return nil
 	}
 	if result.Action == agent.SessionActionClearChat {
@@ -934,20 +1055,90 @@ func (m *Model) resumeSavedRow(id string) tea.Cmd {
 		m.setViewportContent()
 		m.viewport.GotoBottom()
 		m.sessionID = m.agent.SessionID
-		m.refreshContextStats()
-		m.refreshSavedSessions()
+		// The resumed conversation has a cold token-count cache: probe
+		// off the Update thread (a synchronous probe would tokenize the
+		// whole history on the render loop).
+		cmds := []tea.Cmd{m.requestContextStats(), m.requestSavedSessions()}
 		// The resumed session keeps its earned position (web: makePane
 		// seeds initialActivity from the saved session's updatedAt); the
 		// left-behind session keeps its in-process output stamp.
 		m.rebindActivity()
 		m.sidebarCursor = m.sidebarFocusedRow()
+		// The resume flushed the left-behind session; surface a failed
+		// save instead of losing it silently (cmdSession's old contract).
+		m.checkPersistError()
+		return tea.Batch(cmds...)
 	}
 	return nil
+}
+
+// spawnSavedSession opens a saved session as a NEW live session — the TUI's
+// openSessionPane (web parity): the store snapshot is loaded into a fresh
+// agent through the shared workspace factory (the web's
+// loadOrCreateRuntime), the session is registered in the live registry, and
+// focus moves to it. The focused agent is NEVER rebound, so this is safe
+// even while the focused session is mid-turn or mid-compaction: its turn
+// keeps running in the background under its own SessionID and its
+// persistence is untouched (a rebind would swap Messages out from under
+// the running stream goroutine — see rebindBlockReason).
+func (m *Model) spawnSavedSession(id string) tea.Cmd {
+	if m.workspace.Store == nil {
+		m.appendChatLine(ErrorStyle.Render("Resume: session persistence disabled."))
+		return nil
+	}
+	snap, err := m.workspace.Store.LoadInWorkingDir(m.workspace.GetWorkingDir(), id)
+	if err != nil {
+		m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Session: %v", err)))
+		return nil
+	}
+	a := m.workspace.NewSessionAgent(&snap, id)
+	// Background validation (ValidateRestoredModel) may clear or
+	// auto-select the restored model after the UI opened; re-render when it
+	// lands (the TUI runner hooks the same event for the root agent).
+	if snap.Model != "" {
+		// Capture the sender HERE (Update thread): the hook fires from
+		// ValidateRestoredModel's goroutine, and m.program is written once
+		// in TUI.Run without synchronization — reading it inside the
+		// closure would race that write (the same hazard spawnLiveSession
+		// documents for its job-notice sender). Run assigns m.program
+		// before the event loop starts, so the captured value is final.
+		sender := m.program
+		a.OnModelChanged = func() {
+			if sender != nil {
+				sender.Send(modelChangedMsg{})
+			}
+		}
+		go a.ValidateRestoredModel(context.Background(), snap.Model)
+	}
+	m.spawnLiveSession(a)
+	i := len(m.lives.sessions) - 1
+	// switchToLive rebuilds the transcript from the restored Messages and
+	// rebinds every focused mirror; it is safe even mid-turn.
+	cmd := m.switchToLive(i)
+	m.appendChatLine(SystemStyle.Render(agent.ResumeOutputMessage(id, snap)))
+	// The resumed session keeps its earned position (web: makePane seeds
+	// initialActivity from the saved session's updatedAt); the left-behind
+	// session keeps its in-process output stamp.
+	m.rebindActivity()
+	return tea.Batch(cmd, m.requestSavedSessions())
 }
 
 // deleteSavedRow deletes a saved session by id (the web's deleteSession).
 // Shared by the sidebar ✕/x action and the /resume sessions modal.
 func (m *Model) deleteSavedRow(id string) tea.Cmd {
+	// Deleting the CURRENT session rebinds the focused agent (a fresh
+	// session starts in its place) — the same mid-turn / mid-compaction
+	// hazard as resume. Checked HERE, not only in sidebarDeleteRow,
+	// because the confirm modal can stay open while a delivery turn starts
+	// on the focused session in the meantime. Deleting a NON-current
+	// session rebinds nothing and is always safe. m.agent.SessionID is
+	// the source of truth (m.sessionID is its mirror).
+	if id == m.agent.SessionID {
+		if reason := m.rebindBlockReason("Delete"); reason != "" {
+			m.appendChatLine(ErrorStyle.Render(reason))
+			return nil
+		}
+	}
 	result, _, err := m.agent.HandleSessionCommand(m.ctx, "resume del "+id, session.NewID())
 	if err != nil {
 		m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Session: %v", err)))
@@ -969,9 +1160,41 @@ func (m *Model) deleteSavedRow(id string) tea.Cmd {
 	} else {
 		m.appendChatLine(SystemStyle.Render(result.Output))
 	}
-	m.refreshSavedSessions()
-	m.sidebarCursor = 0
-	return nil
+	// No cursor reset: the identity-based cursor keeps its session when the
+	// list changes, and falls back to the (clamped) old position when the
+	// deleted row was the cursor's — the row that slid into the slot.
+	return m.requestSavedSessions()
+}
+
+// spawnLiveSession registers a workspace-built agent as a new live session
+// and wires the per-session TUI extras both spawn paths (openNewLiveSession,
+// spawnSavedSession) need:
+//   - the parent-generic subagent spawner (the TUI spawner builds each
+//     child from the calling agent + shared cfg, so opened sessions get
+//     working subagents instead of "spawner not installed");
+//   - the focus-aware job-notice hook (the workspace deliverer is nil on
+//     the TUI host: focused → normal delivery turn; background → attributed
+//     system line via the replay buffer — a global delivery turn would run
+//     on whichever session is focused, not this one).
+//
+// Returns the new slot (always the last one).
+func (m *Model) spawnLiveSession(a *agent.Agent) *liveSession {
+	if m.cfg != nil && m.cfg.SubagentEnabled() {
+		a.SetSubagentSpawner(&tuiSubagentSpawner{cfg: m.cfg, m: m})
+	}
+	s := m.lives.Add(a, "")
+	if m.cfg != nil && m.cfg.JobNoticesEnabled() {
+		// Capture the sender HERE (Update thread): the hook fires from a
+		// background goroutine and must not read m.program, which is
+		// written once in TUI.Run without synchronization.
+		sender := m.program
+		a.SetJobNoticeHook(jobNoticeHookFor(s, func(summary string) {
+			if sender != nil {
+				sender.Send(deliveryRequestMsg{text: summary})
+			}
+		}))
+	}
+	return s
 }
 
 // openNewLiveSession spawns an additional live session through the shared
@@ -983,13 +1206,7 @@ func (m *Model) openNewLiveSession(label string) tea.Cmd {
 		return nil
 	}
 	a := m.workspace.NewSessionAgent(nil, session.NewID())
-	// Mirror NewModel's subagent wiring: the TUI spawner is parent-generic
-	// (it builds each child from the calling agent + shared cfg), so opened
-	// sessions get working subagents instead of "spawner not installed".
-	if m.cfg != nil && m.cfg.SubagentEnabled() {
-		a.SetSubagentSpawner(&tuiSubagentSpawner{cfg: m.cfg, m: m})
-	}
-	s := m.lives.Add(a, "")
+	s := m.spawnLiveSession(a)
 	// Creation is the fresh session's first recency event (web: makePane
 	// without initialActivity) — it starts at the top of the list.
 	m.touchSessionActivity(a.SessionID, time.Now())
@@ -999,30 +1216,12 @@ func (m *Model) openNewLiveSession(label string) tea.Cmd {
 		label = "session-" + strings.TrimPrefix(s.id, "s")
 	}
 	s.label = label
-	// Job-completion notices for opened sessions: the workspace deliverer
-	// is nil on the TUI host, so wire a focus-aware hook here. Focused →
-	// normal delivery turn; background → attributed system line via the
-	// replay buffer (a global delivery turn would run on whichever session
-	// is focused, not this one).
-	if m.cfg != nil && m.cfg.JobNoticesEnabled() {
-		// Capture the sender HERE (Update thread): the hook fires from a
-		// background goroutine and must not read m.program, which is
-		// written once in TUI.Run without synchronization.
-		sender := m.program
-		a.SetJobNoticeHook(func(summary string) {
-			if s.focused.Load() && sender != nil {
-				sender.Send(deliveryRequestMsg{text: summary})
-				return
-			}
-			s.enqueue(condensedNoteMsg{note: noticeLabel + " job finished: " + summary, sid: s.id})
-		})
-	}
 	i := len(m.lives.sessions) - 1
+	// switchToLive already moves the panel cursor (with identity) to the
+	// newly focused session's row, wherever it sorts.
 	cmd := m.switchToLive(i)
 	m.appendChatLine(SystemStyle.Render(fmt.Sprintf("Opened live session %q (%s).", label, s.id)))
-	m.refreshSavedSessions()
-	m.sidebarCursor = 0 // newest output sorts first
-	return cmd
+	return tea.Batch(cmd, m.requestSavedSessions())
 }
 
 // sidebarTickMsg re-renders the panel's relative-time labels and picks up

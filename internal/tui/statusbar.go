@@ -25,10 +25,18 @@ func (m *Model) renderStatusBar() string {
 
 	// Transient status message (e.g. "Copied N chars") takes priority
 	if m.statusMsg != "" {
-		content := StatusBarDimStyle.Render(m.statusMsg)
-		// Center the message
-		msgWidth := lipgloss.Width(content)
-		padLeft := max(0, (w-msgWidth)/2)
+		// Truncate to the bar's content area BEFORE centering: the styled
+		// Width below wraps rather than clips, so an over-long message
+		// (error text can be arbitrary — "✗ Compact failed: …", persist
+		// warnings) would wrap to extra lines, grow the frame past the
+		// terminal, and desync the inline renderer.
+		avail := max(0, w-2) // -2 for the bar's horizontal padding
+		msg := m.statusMsg
+		if lipgloss.Width(msg) > avail {
+			msg = ansi.Cut(msg, 0, avail)
+		}
+		content := StatusBarDimStyle.Render(msg)
+		padLeft := max(0, (avail-lipgloss.Width(msg))/2)
 		result := strings.Repeat(" ", padLeft) + content
 		return StatusBarStyle.Width(w).Render(result)
 	}

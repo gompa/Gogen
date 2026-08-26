@@ -107,7 +107,7 @@ func TestSidebarWheelScrollsList(t *testing.T) {
 		m.savedCache = append(m.savedCache, agent.SessionInfo{ID: "s" + itoa(i)})
 	}
 	down := mouseEvent{x: 3, y: 5, button: tea.MouseWheelDown, kind: mouseWheelEvent}
-	if !m.handleSidebarMouse(down) {
+	if consumed, _ := m.handleSidebarMouse(down); !consumed {
 		t.Fatal("wheel over panel must be consumed by the list")
 	}
 	if m.sidebarScroll != 6 {
@@ -120,7 +120,7 @@ func TestSidebarWheelScrollsList(t *testing.T) {
 	}
 	// Hidden panel: the wheel passes through to the chat viewport.
 	m.sidebarVisible = false
-	if m.handleSidebarMouse(down) {
+	if consumed, _ := m.handleSidebarMouse(down); consumed {
 		t.Fatal("wheel must pass through when sidebar hidden")
 	}
 }

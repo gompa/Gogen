@@ -64,20 +64,50 @@ func (m *Model) handleVerboseKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd, bool)
 	return m, nil, false
 }
 
+// handleCancelKey handles ctrl+c: cancel a running turn, cancel a running
+// /compact, or quit when idle. Shared by input, viewport, and sidebar
+// focus — the three copy-pasted variants diverged (the input variant
+// cleared m.streaming immediately while the others didn't), which is how
+// the cancel-then-resubmit race hid. The turn-epoch guard (liveSession.
+// turnSeq) makes clearing the mirror immediately safe: the superseded
+// turn's stragglers are dropped by seq.
+func (m *Model) handleCancelKey() (tea.Model, tea.Cmd, bool) {
+	if m.streaming {
+		m.streaming = false
+		m.clearProgress()
+		// Cancel the underlying LLM stream. The session's flags stay set
+		// until its attributed terminal arrives; if a newer turn has
+		// started by then, the epoch guard drops that terminal.
+		m.cancelActiveStream()
+		m.resetStreamState(false)
+		m.appendChatLine(SystemStyle.Render("Cancelled."))
+		// refocusInput is a no-op outside input focus (viewport/sidebar
+		// stay where they are).
+		return m, m.refocusInput(), true
+	}
+	if m.compacting {
+		// Cancel the FOCUSED session's compaction (m.compacting is its
+		// mirror); a background session's compaction is left running.
+		if s := m.focusedSession(); s != nil {
+			s.compactUserCancelled = true
+			if s.compactCancel != nil {
+				s.compactCancel()
+			}
+			s.compacting = false
+			s.compactCancel = nil
+		}
+		m.compacting = false
+		m.appendChatLine(SystemStyle.Render("Compact cancelled."))
+		return m, nil, true
+	}
+	m.flushAndQuit()
+	return m, tea.Quit, true
+}
+
 func (m *Model) handleCancelOrQuitKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd, bool) {
 	// Cancel turn (ctrl+c) or quit
 	if key.Matches(msg, m.keys.CancelTurn) {
-		if m.streaming {
-			m.streaming = false
-			m.clearProgress()
-			// Cancel the underlying LLM stream
-			m.cancelActiveStream()
-			m.resetStreamState(false)
-			m.appendChatLine(SystemStyle.Render("Cancelled."))
-			return m, m.refocusInput(), true
-		}
-		m.flushAndQuit()
-		return m, tea.Quit, true
+		return m.handleCancelKey()
 	}
 	return m, nil, false
 }
@@ -85,7 +115,9 @@ func (m *Model) handleCancelOrQuitKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd, 
 func (m *Model) handleSubmitKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd, bool) {
 	// Submit (enter)
 	if key.Matches(msg, m.keys.Submit) {
-		if m.streaming {
+		// A running /compact owns Messages until its result lands — a
+		// turn started now would race the compaction's history rewrite.
+		if m.streaming || m.compacting {
 			return m, nil, true
 		}
 		input := strings.TrimRight(m.textarea.Value(), "\n")
@@ -220,6 +252,7 @@ func (m *Model) handleDeleteForwardKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd,
 		val := strings.TrimSpace(m.textarea.Value())
 		if val == "" {
 			m.cancelActiveStream()
+			m.cancelCompactForQuit()
 			m.dismissApproval(false)
 			m.flushAndQuit()
 			return m, tea.Quit, true
@@ -247,20 +280,11 @@ func (m *Model) handleViewportKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Cancel turn or quit
+	// Cancel turn / compact or quit (shared handler; stays on viewport
+	// focus — refocusInput is a no-op here).
 	if key.Matches(msg, m.keys.CancelTurn) {
-		if m.streaming {
-			m.streaming = false
-			m.clearProgress()
-			// Cancel the underlying LLM stream
-			m.cancelActiveStream()
-			m.resetStreamState(false)
-			m.appendChatLine(SystemStyle.Render("Cancelled."))
-			// Stay on viewport focus; blink restarts when returning to input.
-			return m, nil
-		}
-		m.flushAndQuit()
-		return m, tea.Quit
+		_, cmd, _ := m.handleCancelKey()
+		return m, cmd
 	}
 
 	// Focus back to input
@@ -282,18 +306,20 @@ func (m *Model) handleViewportKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Any printable character switches to input and passes the character through.
-	// v2: check the key code with no modifiers (v1's Runes field is gone;
-	// ctrl/alt-modified letters carry the same Code but must not type text).
-	if c := msg.Code; c >= 32 && c < 127 && msg.Mod == 0 {
-		m.focus = FocusInput
-		focusCmd := m.textarea.Focus()
-		var updateCmd tea.Cmd
-		m.textarea, updateCmd = m.textarea.Update(msg)
-		return m, tea.Batch(focusCmd, updateCmd)
+	// [ / ] jump to the previous/next user prompt — the prompt rail's
+	// keyboard access (the web is mouse-only; the brackets follow the
+	// sidebar's bracket-key convention). No target → fall through and
+	// type the bracket like any other printable.
+	if msg.String() == "[" || msg.String() == "]" {
+		if m.tocJumpNext(msg.String() == "]") {
+			return m, nil
+		}
 	}
 
-	// Viewport scrolling
+	// Viewport scrolling — MUST run before the printable fall-through
+	// below: j/k/g/G are printable ASCII, and the typing check would
+	// steal them (while it came first, the vi-scroll keys were dead code
+	// and the documented "j/k scroll" binding typed into the input).
 	switch msg.String() {
 	case "up", "k":
 		m.viewport.LineUp(1)
@@ -324,6 +350,18 @@ func (m *Model) handleViewportKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if key.Matches(msg, m.keys.ViewportHalfDown) {
 		m.viewport.HalfPageDown()
 		return m, nil
+	}
+
+	// Any other printable character switches to input and passes the
+	// character through.
+	// v2: check the key code with no modifiers (v1's Runes field is gone;
+	// ctrl/alt-modified letters carry the same Code but must not type text).
+	if c := msg.Code; c >= 32 && c < 127 && msg.Mod == 0 {
+		m.focus = FocusInput
+		focusCmd := m.textarea.Focus()
+		var updateCmd tea.Cmd
+		m.textarea, updateCmd = m.textarea.Update(msg)
+		return m, tea.Batch(focusCmd, updateCmd)
 	}
 
 	return m, nil

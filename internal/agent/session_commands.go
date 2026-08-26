@@ -179,43 +179,67 @@ func (a *Agent) resumeSessionByID(ctx context.Context, id string) (string, error
 	// process startup) and must not block the resume WS response.
 	model := snap.Model
 	a.RestoreSession(snap, id)
-	label := llm.SessionLabel(snap.Messages)
-	var out string
-	if label != "" {
-		out = fmt.Sprintf("Resumed session %s (%d messages): \"%s\"", id, len(snap.Messages), label)
-	} else {
-		out = fmt.Sprintf("Resumed session %s (%d messages).", id, len(snap.Messages))
-	}
 	// Build the context brief before background model validation so we don't
 	// race Snapshot against RefreshAfterModelChange.
-	out = AppendContextBrief(ctx, a, out)
+	out := AppendContextBrief(ctx, a, ResumeOutputMessage(id, snap))
 	go a.ValidateRestoredModel(context.Background(), model)
 	return out, nil
 }
 
-func (a *Agent) resumeLatestSession(ctx context.Context) (string, error) {
+// ResumeOutputMessage formats the "Resumed session …" confirmation line for
+// a restored snapshot. Shared by resumeSessionByID (the rebind path) and the
+// TUI's spawn-on-open path (web openSessionPane parity) so every resume
+// entry point announces the resume identically.
+func ResumeOutputMessage(id string, snap SessionSnapshot) string {
+	label := llm.SessionLabel(snap.Messages)
+	if label != "" {
+		return fmt.Sprintf("Resumed session %s (%d messages): \"%s\"", id, len(snap.Messages), label)
+	}
+	return fmt.Sprintf("Resumed session %s (%d messages).", id, len(snap.Messages))
+}
+
+// ResolveResumeTarget resolves a /resume argument to a concrete session id
+// WITHOUT performing the resume: a plain id passes through (trimmed), and
+// "latest" resolves to the newest saved top-level session other than the
+// current one — the same rule resumeLatestSession applies, factored out so
+// hosts can route an already-live target to a focus switch instead of
+// rebinding a second agent onto the same SessionID (two agents with one
+// SessionID both persist to the same file; the web dedupes against its
+// registry in loadOrCreateRuntime for exactly this). "del" arguments are
+// not resume targets: callers filter them via ParseResumeDelArg first.
+func (a *Agent) ResolveResumeTarget(args string) (string, error) {
 	if a.SessionStore == nil {
 		return "", fmt.Errorf("session persistence disabled")
 	}
-	list, err := a.SessionStore.List(a.WorkingDir)
+	args = strings.TrimSpace(args)
+	if args == "latest" {
+		list, err := a.SessionStore.List(a.WorkingDir)
+		if err != nil {
+			return "", err
+		}
+		if len(list) == 0 {
+			return "", fmt.Errorf("no saved sessions")
+		}
+		// Nested (subagent) sessions are not part of the flat list:
+		// "resume latest" must never target a child (they are reachable
+		// only through their parent's sidebar row, D2).
+		for _, s := range list {
+			if s.ID != a.SessionID && s.ParentID == "" {
+				return s.ID, nil
+			}
+		}
+		return "", fmt.Errorf("no other saved sessions to resume")
+	}
+	if args == "" {
+		return "", fmt.Errorf("session id is required")
+	}
+	return args, nil
+}
+
+func (a *Agent) resumeLatestSession(ctx context.Context) (string, error) {
+	target, err := a.ResolveResumeTarget("latest")
 	if err != nil {
 		return "", err
-	}
-	if len(list) == 0 {
-		return "", fmt.Errorf("no saved sessions")
-	}
-	// Nested (subagent) sessions are not part of the flat list: "resume
-	// latest" must never target a child (they are reachable only through
-	// their parent's sidebar row, D2).
-	target := ""
-	for _, s := range list {
-		if s.ID != a.SessionID && s.ParentID == "" {
-			target = s.ID
-			break
-		}
-	}
-	if target == "" {
-		return "", fmt.Errorf("no other saved sessions to resume")
 	}
 	return a.resumeSessionByID(ctx, target)
 }

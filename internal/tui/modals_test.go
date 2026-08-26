@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"charm.land/lipgloss/v2"
+
 	"gogen/internal/llm"
 )
 
@@ -177,4 +179,92 @@ func TestRenderModelsModalEmpty(t *testing.T) {
 	if !strings.Contains(out, "No models available.") {
 		t.Fatalf("empty modal output unexpected:\n%s", out)
 	}
+}
+
+// The picker's width has three regimes: the fixed preferred default for
+// short catalogs (no hugging), growth to fit the biggest model name when
+// the terminal is wide enough, and truncation under the terminal clamp
+// when it is not. The probe measures the WHOLE list, so scrolling between
+// windows that include/exclude the longest entry must never resize the box.
+func TestRenderModelsModalStableWidth(t *testing.T) {
+	boxWidth := func(t *testing.T, list []llm.ModelInfo, termW int) int {
+		t.Helper()
+		m := &Model{modelList: list, width: termW, height: 40}
+		out := m.renderModelsModal()
+		lines := strings.Split(out, "\n")
+		top := lipgloss.Width(lines[0])
+		for i, l := range lines {
+			if w := lipgloss.Width(l); w != top {
+				t.Fatalf("ragged modal box at row %d: border %d vs row %d", i, top, w)
+			}
+		}
+		return top
+	}
+
+	short := []llm.ModelInfo{{ID: "m1"}, {ID: "m2"}}
+	longID := "anthropic/claude-sonnet-4-5-20250929-with-a-very-long-provider-qualified-identifier"
+	long := []llm.ModelInfo{{ID: longID, Provider: "default", ContextLimit: 200000}}
+
+	t.Run("short ids get the preferred width", func(t *testing.T) {
+		if got := boxWidth(t, short, 100); got != modelsModalInnerWidth+2 {
+			t.Fatalf("box = %d cells, want the preferred %d", got, modelsModalInnerWidth+2)
+		}
+	})
+
+	t.Run("biggest name fits when the terminal is wide enough", func(t *testing.T) {
+		const termW = 200
+		want := lipgloss.Width(modelEntryText(0, long[0])) + 6 // padding + borders
+		if got := boxWidth(t, long, termW); got != want {
+			t.Fatalf("box = %d cells, want %d (the longest entry fully visible)", got, want)
+		}
+		m := &Model{modelList: long, width: termW, height: 40}
+		if plain := stripANSI(m.renderModelsModal()); !strings.Contains(plain, longID+"  (context: 200000 tokens)") {
+			t.Fatal("wide terminal truncated an id that fits")
+		}
+	})
+
+	t.Run("names wider than the screen grow to the clamp and truncate there", func(t *testing.T) {
+		// limit = 100-6 inner -> total 96; the natural width exceeds it.
+		if got := boxWidth(t, long, 100); got != 96 {
+			t.Fatalf("box = %d cells, want the clamped %d", got, 100-4)
+		}
+		m := &Model{modelList: long, width: 100, height: 40}
+		plain := stripANSI(m.renderModelsModal())
+		// The 85-char id itself still fits inside the clamped row; what
+		// must be cut is the trailing context suffix beyond the budget.
+		if !strings.Contains(plain, longID) {
+			t.Fatal("clamped row lost an id that still fits within the clamp")
+		}
+		if strings.Contains(plain, "(context: 200000 tokens)") {
+			t.Fatal("row content beyond the terminal clamp was not truncated")
+		}
+	})
+
+	t.Run("width does not change while scrolling past the long entry", func(t *testing.T) {
+		list := make([]llm.ModelInfo, 0, 30)
+		for i := 0; i < 29; i++ {
+			list = append(list, llm.ModelInfo{ID: fmt.Sprintf("short-model-%d", i)})
+		}
+		list = append(list, llm.ModelInfo{ID: longID, ContextLimit: 200000})
+		atTop := boxWidth(t, list, 120) // window [0..27): excludes index 29
+		m := &Model{modelList: list, modelCursor: 29, width: 120, height: 40}
+		bottom := lipgloss.Width(strings.Split(m.renderModelsModal(), "\n")[0]) // includes index 29
+		if atTop != bottom {
+			t.Fatalf("box resized while scrolling: %d -> %d cells", atTop, bottom)
+		}
+	})
+
+	t.Run("empty catalog matches the populated picker width", func(t *testing.T) {
+		m := &Model{width: 100, height: 40}
+		if got := lipgloss.Width(m.renderModelsModal()); got != modelsModalInnerWidth+2 {
+			t.Fatalf("empty-catalog box = %d cells, want %d", got, modelsModalInnerWidth+2)
+		}
+	})
+
+	t.Run("narrow terminal still clamps", func(t *testing.T) {
+		// limit = 50-6 inner -> total 46; preferred 58 must give way.
+		if got := boxWidth(t, short, 50); got > 46 {
+			t.Fatalf("box = %d cells in a 50-col terminal, want <= 46", got)
+		}
+	})
 }

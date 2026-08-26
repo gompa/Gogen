@@ -17,20 +17,32 @@ import (
 
 // --- Bubble Tea messages for streaming ---
 
+// Every streaming message carries its owning session id (sid) and the
+// turn generation (seq) it was produced by; see streamEventAttribution
+// and liveSession.turnSeq for the drop rules.
+
 // streamStartMsg is sent when the agent first begins processing.
-type streamStartMsg struct{ sid string }
+type streamStartMsg struct {
+	sid string
+	seq uint64
+}
 
 // streamRoundStartMsg is sent at the start of each LLM round after the first.
-type streamRoundStartMsg struct{ sid string }
+type streamRoundStartMsg struct {
+	sid string
+	seq uint64
+}
 
 type streamTokenMsg struct {
 	token string
 	sid   string
+	seq   uint64
 }
 
 type streamThinkingMsg struct {
 	token string
 	sid   string
+	seq   uint64
 }
 
 type streamToolCallMsg struct {
@@ -38,6 +50,7 @@ type streamToolCallMsg struct {
 	id    string
 	name  string
 	sid   string
+	seq   uint64
 }
 
 type streamToolCallArgsMsg struct {
@@ -45,6 +58,7 @@ type streamToolCallArgsMsg struct {
 	id    string
 	delta string
 	sid   string
+	seq   uint64
 }
 
 type streamToolResultMsg struct {
@@ -53,6 +67,7 @@ type streamToolResultMsg struct {
 	result  string
 	success bool
 	sid     string
+	seq     uint64
 }
 
 // streamToolCallFinalMsg is sent when tool call args are fully parsed.
@@ -60,27 +75,39 @@ type streamToolCallFinalMsg struct {
 	index int
 	tc    llm.ToolCall
 	sid   string
+	seq   uint64
 }
 
 // streamToolExecuteMsg is sent immediately before a tool runs.
 type streamToolExecuteMsg struct {
 	name string
 	sid  string
+	seq  uint64
 }
 
 // streamRoundEndMsg is sent at the end of each streaming round
 // (including intermediate tool-call rounds). It resets buffers
 // but does NOT set streaming=false.
-type streamRoundEndMsg struct{ sid string }
+type streamRoundEndMsg struct {
+	sid string
+	seq uint64
+}
 
 // streamEndMsg is sent when all streaming is complete (final message from
 // goroutine). sid attributes the turn to its owning live session so a
-// background session's finish never mutates the focused transcript.
-type streamEndMsg struct{ sid string }
+// background session's finish never mutates the focused transcript; seq
+// attributes it to the turn generation so a superseded turn's late
+// terminal (cancel + resubmit) is dropped instead of clobbering the new
+// turn's state.
+type streamEndMsg struct {
+	sid string
+	seq uint64
+}
 
 type streamErrorMsg struct {
 	err error
 	sid string
+	seq uint64
 }
 
 // condensedNoteMsg carries the last-resort condensation announcement
@@ -88,10 +115,54 @@ type streamErrorMsg struct {
 type condensedNoteMsg struct {
 	note string
 	sid  string
+	seq  uint64
 }
 
 type contextStatsMsg struct {
 	stats agent.TurnContext
+	// sid is the session the probe was taken for, captured on the Update
+	// thread at request time: the probe runs off-thread, so a slow probe
+	// for a session that lost focus before it landed must not overwrite
+	// the focused session's indicator (handler drops it).
+	sid string
+}
+
+// compactResultMsg carries the outcome of an async /compact (cmdCompact)
+// back to the Update thread. agent is the compacted session — the focused
+// one may have changed while the summarization ran. seq identifies the
+// compaction generation: a result from a SUPERSEDED run (cancelled, then
+// restarted before the old goroutine finished unwinding) is dropped — it
+// must neither clear the new run's flags nor report the old cancellation.
+type compactResultMsg struct {
+	agent *agent.Agent
+	err   error
+	seq   uint64
+}
+
+// modelListMsg carries the async /models list result back to the Update
+// thread. agent is the listing session — the focused one may have changed
+// while the provider round trip ran (the list would then describe the
+// wrong endpoint).
+type modelListMsg struct {
+	agent *agent.Agent
+	list  []llm.ModelInfo
+	err   error
+}
+
+// modelSwitchMsg carries the async model-switch result (inline
+// /models <sel> or the models modal selection) back to the Update thread.
+type modelSwitchMsg struct {
+	agent *agent.Agent
+	out   string
+	err   error
+}
+
+// savedSessionsMsg carries an async persisted-session index snapshot
+// (requestSavedSessions) back to the Update thread.
+type savedSessionsMsg struct {
+	seq      uint64
+	sessions []agent.SessionInfo
+	ok       bool
 }
 
 // programSender is the minimal program surface the adapter needs;
@@ -106,6 +177,10 @@ type StreamAdapter struct {
 	program programSender
 	// owner is the live-session id whose turn this adapter renders.
 	owner string
+	// seq is the turn generation this adapter was created for; every
+	// emitted message carries it so the Update thread can drop stragglers
+	// from a superseded turn (see liveSession.turnSeq).
+	seq uint64
 	// sess is the owning live session. Focused → events go to the
 	// program; background → they are buffered for replay when focus
 	// arrives (the turn keeps running either way; completion stays
@@ -114,8 +189,10 @@ type StreamAdapter struct {
 }
 
 // NewStreamAdapter creates a new StreamAdapter for one live session's turn.
-func NewStreamAdapter(owner string, p programSender, sess *liveSession) *StreamAdapter {
-	return &StreamAdapter{program: p, owner: owner, sess: sess}
+// seq must be the session's turnSeq at submit time (the submit paths
+// increment it before constructing the adapter).
+func NewStreamAdapter(owner string, seq uint64, p programSender, sess *liveSession) *StreamAdapter {
+	return &StreamAdapter{program: p, owner: owner, seq: seq, sess: sess}
 }
 
 // send emits a rendering message, or buffers it while the session streams
@@ -132,51 +209,98 @@ func (s *StreamAdapter) send(msg tea.Msg) {
 func (s *StreamAdapter) Handlers() *llm.StreamHandlers {
 	tuiSend := func(think bool, text string) {
 		if think {
-			s.send(streamThinkingMsg{token: text, sid: s.owner})
+			s.send(streamThinkingMsg{token: text, sid: s.owner, seq: s.seq})
 		} else {
-			s.send(streamTokenMsg{token: text, sid: s.owner})
+			s.send(streamTokenMsg{token: text, sid: s.owner, seq: s.seq})
 		}
 	}
 	batch := streamutil.NewTokenBatcher(tuiSend, 32*time.Millisecond)
+	// Tool-call args arrive as a high-rate delta stream (one message per
+	// provider chunk); without coalescing the Update thread would do a
+	// transcript update per chunk. The batcher concatenates per-index
+	// deltas and flushes on a timer — the accumulated-args bookkeeping in
+	// handleStreamToolArgs is unaffected (it sums the same bytes).
+	argsBatch := newArgsBatcher(func(index int, id, delta string) {
+		s.send(streamToolCallArgsMsg{index: index, id: id, delta: delta, sid: s.owner, seq: s.seq})
+	}, 32*time.Millisecond)
 
+	// The round-buffer feeds (s.sess.round*) run on EVERY event regardless
+	// of focus — unlike send, which only enqueues while unfocused. The
+	// buffer must accumulate from round start even while the session is
+	// the focused one: that is the gap it closes (watch A stream, switch
+	// away, come back mid-round — web liveTurnState parity). The nil
+	// guards keep adapters built without a session (unit tests) quiet.
 	return &llm.StreamHandlers{
 		OnStart: func() {
+			if s.sess != nil {
+				s.sess.roundReset() // new turn: fresh buffer
+			}
 			batch.Reset()
-			s.send(streamStartMsg{sid: s.owner})
+			argsBatch.Reset()
+			s.send(streamStartMsg{sid: s.owner, seq: s.seq})
 		},
 		OnCondensed: func(note string) {
-			s.send(condensedNoteMsg{note: note, sid: s.owner})
+			s.send(condensedNoteMsg{note: note, sid: s.owner, seq: s.seq})
 		},
 		OnRoundStart: func() {
+			if s.sess != nil {
+				s.sess.roundReset() // new round: completed content is in Messages
+			}
 			batch.Reset()
-			s.send(streamRoundStartMsg{sid: s.owner})
+			argsBatch.Reset()
+			s.send(streamRoundStartMsg{sid: s.owner, seq: s.seq})
 		},
 		OnThinkingToken: func(token string) {
+			if s.sess != nil {
+				s.sess.roundAppendThinking(token)
+			}
 			batch.ThinkToken(token)
 		},
 		OnToken: func(token string) {
+			if s.sess != nil {
+				s.sess.roundAppendContent(token)
+			}
 			batch.StreamToken(token)
 		},
 		OnStreamEnd: func() {
 			batch.Flush()
 			batch.Close()
-			s.send(streamRoundEndMsg{sid: s.owner})
+			argsBatch.Flush()
+			argsBatch.Close()
+			if s.sess != nil {
+				// Round complete: the assistant message is appended to
+				// Messages immediately after, so the buffer only ever
+				// carries content a history snapshot would otherwise miss.
+				s.sess.roundReset()
+			}
+			s.send(streamRoundEndMsg{sid: s.owner, seq: s.seq})
 		},
 		OnToolCallStart: func(index int, id, name string) {
 			batch.Flush()
-			s.send(streamToolCallMsg{index: index, id: id, name: name, sid: s.owner})
+			argsBatch.Flush()
+			if s.sess != nil {
+				s.sess.roundToolStart(index, id, name)
+			}
+			s.send(streamToolCallMsg{index: index, id: id, name: name, sid: s.owner, seq: s.seq})
 		},
 		OnToolCallArgsDelta: func(index int, id, name, argsDelta string) {
-			s.send(streamToolCallArgsMsg{index: index, id: id, delta: argsDelta, sid: s.owner})
+			argsBatch.Add(index, id, argsDelta)
+			if s.sess != nil {
+				s.sess.roundToolArgsAppend(index, argsDelta)
+			}
 		},
 		OnToolCall: func(tc llm.ToolCall) {
-			s.send(streamToolCallFinalMsg{index: tc.Index, tc: tc, sid: s.owner})
+			// Deliver any buffered args deltas before the final so the
+			// Update thread sees the complete argument accumulation first.
+			argsBatch.Flush()
+			s.send(streamToolCallFinalMsg{index: tc.Index, tc: tc, sid: s.owner, seq: s.seq})
 		},
 		OnToolExecute: func(name string) {
-			s.send(streamToolExecuteMsg{name: name, sid: s.owner})
+			argsBatch.Flush()
+			s.send(streamToolExecuteMsg{name: name, sid: s.owner, seq: s.seq})
 		},
 		OnToolResult: func(id, name, result string, success bool) {
-			s.send(streamToolResultMsg{id: id, name: name, result: result, success: success, sid: s.owner})
+			s.send(streamToolResultMsg{id: id, name: name, result: result, success: success, sid: s.owner, seq: s.seq})
 		},
 		OnRecoverPartialStream: func() {},
 	}
@@ -196,6 +320,9 @@ func (m *Model) appendChatLine(line string) {
 		m.prefixLines = append(m.prefixLines, strings.Split(wrapped, "\n")...)
 	}
 	m.chatLines = append(m.chatLines, line)
+	if isUserPromptLine(line) {
+		m.tocAppendAnchor(line) // prompt rail: the web's appendTocDot
+	}
 	m.buildFromPrefix()
 	m.viewport.GotoBottom()
 }
@@ -208,6 +335,7 @@ func (m *Model) appendToLastLine(text string) {
 	}
 	// Only the last line changes — prefix stays unchanged.
 	m.chatLines[len(m.chatLines)-1] += text
+	m.tocRefreshLastPrompt()
 	m.buildFromPrefix()
 	m.viewport.GotoBottom()
 }
@@ -219,6 +347,7 @@ func (m *Model) replaceLastLine(text string) {
 	} else {
 		m.chatLines[len(m.chatLines)-1] = text
 	}
+	m.tocRefreshLastPrompt()
 	// Prefix is unchanged; only the last line may have been replaced.
 	m.buildFromPrefix()
 	m.viewport.GotoBottom()
@@ -356,7 +485,7 @@ func (m *Model) handleStreamToolCall(index int, id string, name string) {
 	m.streamAssistantBuf.Reset()
 	m.streamAssistantLine = -1
 	m.streamToolCallNames[index] = name
-	m.activeToolName = name
+	m.setActiveTool(name)
 	m.streamToolCallArgs[index] = ""
 	m.streamToolCallIDs[index] = id
 	m.streamToolCallLines[index] = len(m.chatLines) // appendChatLine will add at this index
@@ -512,7 +641,7 @@ func (m *Model) handleStreamToolResult(id string, name string, result string, su
 	var newLines []string
 	// The tool finished; the next indicator phase is "thinking" for the next
 	// model round (which re-announces any new tool via handleStreamToolCall).
-	m.activeToolName = ""
+	m.setActiveTool("")
 
 	newLines = append(newLines, toolResultStatusLine(name, success))
 
@@ -571,6 +700,9 @@ func (m *Model) appendChatLines(lines []string) {
 			m.prefixLines = append(m.prefixLines, strings.Split(wrapped, "\n")...)
 		}
 		m.chatLines = append(m.chatLines, line)
+		if isUserPromptLine(line) {
+			m.tocAppendAnchor(line)
+		}
 	}
 	m.buildFromPrefix()
 	m.viewport.GotoBottom()
@@ -590,7 +722,7 @@ func (m *Model) resetStreamState(keepToolDiffShown bool) {
 	m.streamToolCallArgs = make(map[int]string)
 	m.streamToolCallIDs = make(map[int]string)
 	m.streamToolCallLines = make(map[int]int)
-	m.activeToolName = ""
+	m.setActiveTool("")
 	m.toolCallDiffs = make(map[string]string)
 	m.streamToolDiffCount = make(map[int]int)
 	m.streamToolDiffStart = make(map[int]int)

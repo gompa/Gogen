@@ -7,8 +7,10 @@
             --border: #3c3c3c;
             --border-subtle: #2d2d2d;
             --fg: #d4d4d4;
-            --fg-muted: #858585;
-            --fg-dim: #6a6a6a;
+            /* Both pass WCAG AA on --bg (~5.2:1 / ~4.8:1); muted stays a step
+               above dim so the fg > muted > dim ladder survives the bump. */
+            --fg-muted: #909090;
+            --fg-dim: #8a8a8a;
             --accent: var(--user-accent, #569cd6);
             /* Soft accent derived from the accent via color-mix — no JS needed */
             --accent-soft: color-mix(in srgb, var(--accent) 18%, transparent);
@@ -18,6 +20,22 @@
             --error-bg: rgba(248, 81, 73, 0.18);
             --warn: #dcdcaa;
             --warn-bg: rgba(210, 153, 34, 0.18);
+            /* Text/border/filled-button variants of --error/--success: the
+               base hues drop below WCAG AA when used as small text on
+               elevated surfaces (badly so in the light theme), so each role
+               gets its own themed token. Dark values keep the exact tones
+               these rules hardcoded before tokenization. */
+            --error-fg: #ff7b72;
+            --error-border: #7a3030;
+            --success-fg: #7ee787;
+            --success-border: #2d6a4f;
+            --btn-danger-bg: #8b2020;
+            --btn-danger-bg-hover: #a32020;
+            --btn-danger-fg: #ff7b72;
+            /* Hover step for raised controls (buttons, tool-card headers):
+               brighter than their --bg-active rest state and distinct from
+               the flat-surface --bg-hover. */
+            --bg-btn-hover: #404045;
             /* Session-state indicator dots (sidebar session list). */
             --amber: #d29922;
             --violet: #bc8cff;
@@ -61,7 +79,7 @@
         #conn-indicator.connected { background: #3fb950; }
         #conn-indicator.disconnected { background: #f85149; }
         #conn-indicator.reconnecting {
-            background: #d29922;
+            background: var(--amber);
             animation: conn-pulse 1.2s ease-in-out infinite;
         }
         #global-mode-badge {
@@ -390,8 +408,8 @@
         #cancel-btn:disabled { opacity: 0.4; cursor: not-allowed; }
         #cancel-btn:not(:disabled) {
             background: var(--error-bg);
-            border-color: #7a3030;
-            color: #ff7b72;
+            border-color: var(--error-border);
+            color: var(--error-fg);
         }
         /* Swap Send/Cancel: only one shown at a time. */
         #input-area.turn-active #send-btn {
@@ -556,8 +574,8 @@
             background: conic-gradient(var(--ctx-color, var(--fg-muted)) var(--ctx-pct, 0%), var(--border) 0);
             flex-shrink: 0;
         }
-        .tb-context-badge[data-tone="warning"] { color: #d29922; }
-        .tb-context-badge[data-tone="warning"] .ctx-ring { --ctx-color: #d29922; }
+        .tb-context-badge[data-tone="warning"] { color: var(--amber); }
+        .tb-context-badge[data-tone="warning"] .ctx-ring { --ctx-color: var(--amber); }
         .tb-context-badge[data-tone="danger"] { color: var(--error); }
         .tb-context-badge[data-tone="danger"] .ctx-ring { --ctx-color: var(--error); }
 
@@ -861,7 +879,7 @@
             font-family: inherit;
         }
         input::placeholder { color: var(--fg-dim); }
-        input:focus, button:focus, select:focus {
+        input:focus, button:focus, select:focus, textarea:focus {
             outline: 1px solid var(--accent);
             outline-offset: -1px;
         }
@@ -869,7 +887,7 @@
             cursor: pointer;
             background: var(--bg-active);
         }
-        button:hover:not(:disabled) { background: #404045; }
+        button:hover:not(:disabled) { background: var(--bg-btn-hover); }
         #message-input { flex: 1; min-width: 0; width: 100%; }
         #working-dir-input { width: 100%; margin-bottom: 8px; }
         #working-dir-path {
@@ -909,7 +927,7 @@
             cursor: pointer;
             user-select: none;
         }
-        .tool-call-header:hover { background: #404045; }
+        .tool-call-header:hover { background: var(--bg-btn-hover); }
         .tool-icon { display: none; }
         .tool-name { font-weight: 600; font-family: var(--mono); color: var(--accent); }
         .tool-args {
@@ -969,7 +987,7 @@
             background: var(--bg);
             color: var(--fg);
         }
-        .tool-result-content.error-content { color: #ff7b72; }
+        .tool-result-content.error-content { color: var(--error-fg); }
         .tool-result-content.monaco-colorized {
             white-space: normal;
         }
@@ -1125,12 +1143,12 @@
         }
         #delete-approval-actions button.deny {
             background: var(--error-bg);
-            border-color: #7a3030;
-            color: #ff7b72;
+            border-color: var(--error-border);
+            color: var(--error-fg);
         }
         #delete-approval-actions button.allow {
             background: var(--success-bg);
-            border-color: #2d6a4f;
+            border-color: var(--success-border);
             color: var(--success);
         }
         #session-actions {
@@ -1253,8 +1271,8 @@
             box-shadow: 0 6px 20px rgba(0,0,0,0.4);
             animation: toast-in 0.15s ease-out;
         }
-        .toast.success { border-color: #2d6a4f; background: var(--success-bg); color: var(--success); }
-        .toast.error { border-color: #7a3030; background: var(--error-bg); color: #ff7b72; }
+        .toast.success { border-color: var(--success-border); background: var(--success-bg); color: var(--success); }
+        .toast.error { border-color: var(--error-border); background: var(--error-bg); color: var(--error-fg); }
         .toast.info { border-color: var(--border); }
         @keyframes toast-in {
             from { opacity: 0; transform: translateY(6px); }
@@ -1437,9 +1455,9 @@
             flex-shrink: 0;
         }
         .rp-line-old { color: var(--fg-muted); }
-        .rp-line-old .rp-highlight { background: rgba(255,80,80,0.25); color: #ff7b72; border-radius: 2px; }
+        .rp-line-old .rp-highlight { background: rgba(255,80,80,0.25); color: var(--error-fg); border-radius: 2px; }
         .rp-line-new { color: var(--fg); }
-        .rp-line-new .rp-highlight { background: rgba(80,200,120,0.25); color: #7ee787; border-radius: 2px; }
+        .rp-line-new .rp-highlight { background: rgba(80,200,120,0.25); color: var(--success-fg); border-radius: 2px; }
         .rp-arrow { color: var(--fg-muted); flex-shrink: 0; }
         #replace-preview-actions { display: flex; gap: 10px; justify-content: flex-end; }
         #replace-preview-actions button {
@@ -1450,8 +1468,8 @@
         }
         #rp-cancel { background: var(--bg); border: 1px solid var(--border); color: var(--fg); }
         #rp-cancel:hover { background: var(--bg-hover); }
-        #rp-confirm { background: #8b2020; border: 1px solid #7a3030; color: #ff7b72; }
-        #rp-confirm:hover { background: #a32020; }
+        #rp-confirm { background: var(--btn-danger-bg); border: 1px solid var(--error-border); color: var(--btn-danger-fg); }
+        #rp-confirm:hover { background: var(--btn-danger-bg-hover); }
 
         #find-in-files-results {
             overflow-y: auto;
@@ -1527,7 +1545,9 @@
         .board-card:hover .board-card-remove { opacity: 0.6; }
         .board-card-remove:hover { opacity: 1; background: var(--border); }
         .board-card-remove.armed {
-            opacity: 1; background: #d16969; color: #fff;
+            /* var(--error) is a mid red in both themes, so the white label
+               keeps ~3.5:1 on the chip exactly as before tokenization. */
+            opacity: 1; background: var(--error); color: #fff;
             font-size: 0.75em; text-transform: uppercase;
         }
         /* Touch-only "move card" button (HTML5 drag-and-drop does not work
@@ -1842,8 +1862,8 @@
             min-height: 20px;
             user-select: none;
         }
-        #editor-statusbar .status-problems-error { color: #f85149; }
-        #editor-statusbar .status-problems-warn { color: #d29922; }
+        #editor-statusbar .status-problems-error { color: var(--error-fg); }
+        #editor-statusbar .status-problems-warn { color: var(--amber); }
         #editor-tabs {
             display: flex;
             gap: 1px;
@@ -1896,8 +1916,8 @@
             color: var(--fg-muted);
             font-family: var(--mono);
         }
-        .file-tab-badge.has-errors { background: #f8514922; color: #f85149; }
-        .file-tab-badge.has-warnings { background: #d2992222; color: #d29922; }
+        .file-tab-badge.has-errors { background: var(--error-bg); color: var(--error-fg); }
+        .file-tab-badge.has-warnings { background: var(--warn-bg); color: var(--amber); }
         .gogen-ref-highlight {
             background: var(--accent-soft, rgba(86, 156, 214, 0.18));
             box-shadow: inset 2px 0 0 var(--accent);
@@ -2348,7 +2368,7 @@
             white-space: pre-wrap;
         }
         .settings-note.success { color: var(--accent); }
-        .settings-note.error { color: #e5484d; }
+        .settings-note.error { color: var(--error-fg); }
         #keybindings-overlay {
             display: none;
             position: fixed;
@@ -2422,7 +2442,7 @@
             --border-subtle: #e0e0e0;
             --fg: #1e1e1e;
             --fg-muted: #616161;
-            --fg-dim: #999999;
+            --fg-dim: #767676;
             --accent: var(--user-accent, #0066cc);
             --accent-soft: color-mix(in srgb, var(--accent) 12%, transparent);
             --success: #1a7f37;
@@ -2431,6 +2451,14 @@
             --error-bg: rgba(207, 34, 46, 0.12);
             --warn: #9a6700;
             --warn-bg: rgba(154, 103, 0, 0.12);
+            --error-fg: #b62324;
+            --error-border: rgba(207, 34, 46, 0.35);
+            --success-fg: #116329;
+            --success-border: rgba(26, 127, 55, 0.35);
+            --btn-danger-bg: #cf222e;
+            --btn-danger-bg-hover: #b31d1d;
+            --btn-danger-fg: #ffffff;
+            --bg-btn-hover: #c8c8c8;
             /* Session-state indicator dots (sidebar session list). */
             --amber: #9a6700;
             --violet: #8250df;
@@ -2587,8 +2615,8 @@
             background: var(--accent-soft);
         }
         .inline-edit-cancel:hover {
-            color: #f44;
-            border-color: #f44;
+            color: var(--error-fg);
+            border-color: var(--error-fg);
         }
 
         /* ===== Terminal panel (docked below the chat input bar; strip with

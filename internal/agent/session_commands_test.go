@@ -60,6 +60,7 @@ func (s *stubSessionStore) List(workingDir string) ([]SessionInfo, error) {
 			ID:           id,
 			MessageCount: len(snap.Messages),
 			Label:        llm.SessionLabel(snap.Messages),
+			ParentID:     snap.ParentID,
 		})
 	}
 	return out, nil
@@ -160,6 +161,68 @@ func TestHandleSessionCommandResumeLatest(t *testing.T) {
 	if !strings.Contains(result.Output, "older task") {
 		t.Fatalf("output=%q", result.Output)
 	}
+}
+
+func TestResolveResumeTarget(t *testing.T) {
+	t.Run("plain id passes through trimmed", func(t *testing.T) {
+		a := &Agent{WorkingDir: "/tmp", SessionStore: &stubSessionStore{}}
+		got, err := a.ResolveResumeTarget("  abc ")
+		if err != nil || got != "abc" {
+			t.Fatalf("got=%q err=%v", got, err)
+		}
+	})
+
+	t.Run("latest picks newest other top-level session", func(t *testing.T) {
+		store := &stubSessionStore{sessions: map[string]SessionSnapshot{
+			"newest": {Messages: []llm.Message{{Role: "user", Content: "newest"}}},
+			"older":  {Messages: []llm.Message{{Role: "user", Content: "older"}}},
+		}}
+		store.order = []string{"newest", "older"}
+		a := &Agent{WorkingDir: "/tmp", SessionStore: store, SessionID: "current"}
+		got, err := a.ResolveResumeTarget("latest")
+		if err != nil || got != "newest" {
+			t.Fatalf("got=%q err=%v", got, err)
+		}
+	})
+
+	t.Run("latest skips current and nested sessions", func(t *testing.T) {
+		store := &stubSessionStore{sessions: map[string]SessionSnapshot{
+			"current": {Messages: []llm.Message{{Role: "user", Content: "c"}}},
+			"child":   {Messages: []llm.Message{{Role: "user", Content: "n"}}, ParentID: "current"},
+			"older":   {Messages: []llm.Message{{Role: "user", Content: "o"}}},
+		}}
+		store.order = []string{"current", "child", "older"}
+		a := &Agent{WorkingDir: "/tmp", SessionStore: store, SessionID: "current"}
+		got, err := a.ResolveResumeTarget("latest")
+		if err != nil || got != "older" {
+			t.Fatalf("got=%q err=%v", got, err)
+		}
+	})
+
+	t.Run("latest with only the current session errors", func(t *testing.T) {
+		store := &stubSessionStore{sessions: map[string]SessionSnapshot{
+			"current": {Messages: []llm.Message{{Role: "user", Content: "c"}}},
+		}}
+		store.order = []string{"current"}
+		a := &Agent{WorkingDir: "/tmp", SessionStore: store, SessionID: "current"}
+		if _, err := a.ResolveResumeTarget("latest"); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("empty arg errors", func(t *testing.T) {
+		a := &Agent{WorkingDir: "/tmp", SessionStore: &stubSessionStore{}}
+		if _, err := a.ResolveResumeTarget("  "); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("no store errors", func(t *testing.T) {
+		a := &Agent{WorkingDir: "/tmp"}
+		if _, err := a.ResolveResumeTarget("abc"); err == nil {
+			t.Fatal("expected error")
+		}
+	})
 }
 
 func TestHandleSessionCommandResumeByID(t *testing.T) {

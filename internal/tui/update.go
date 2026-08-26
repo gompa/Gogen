@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"fmt"
+
 	"gogen/internal/agent"
 
 	"charm.land/bubbles/v2/key"
@@ -32,6 +34,14 @@ func (m *Model) handleMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// delivery (switch-boundary stragglers). Terminal msgs carry sid too
 	// and are routed by handleTurnFinishedMsg instead.
 	if sid, ok := streamEventSid(msg); ok && !m.ownsStream(sid) {
+		return m, nil
+	}
+	// Drop events from a SUPERSEDED turn (cancel + resubmit): the old
+	// turn's goroutine may still be unwinding, and its stragglers — tokens
+	// AND the terminal — carry the previous turnSeq. Letting them through
+	// would clobber the new turn's state (cancel func, streaming flags,
+	// transcript) and surface a stale "context canceled" error.
+	if sid, seq, ok := streamEventAttribution(msg); ok && m.staleTurn(sid, seq) {
 		return m, nil
 	}
 
@@ -92,10 +102,10 @@ func (m *Model) handleMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleStreamRoundEndMsg()
 
 	case streamEndMsg:
-		return m.handleTurnFinishedMsg(msg.sid, nil)
+		return m.handleTurnFinishedMsg(msg.sid, msg.seq, nil)
 
 	case streamErrorMsg:
-		return m.handleTurnFinishedMsg(msg.sid, msg.err)
+		return m.handleTurnFinishedMsg(msg.sid, msg.seq, msg.err)
 
 	case condensedNoteMsg:
 		return m.handleCondensedNoteMsg(msg)
@@ -103,12 +113,30 @@ func (m *Model) handleMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case contextStatsMsg:
 		return m.handleContextStatsMsg(msg)
 
+	case compactResultMsg:
+		return m.handleCompactResultMsg(msg)
+
+	case modelListMsg:
+		return m.handleModelListMsg(msg)
+
+	case modelSwitchMsg:
+		return m.handleModelSwitchMsg(msg)
+
+	case savedSessionsMsg:
+		// A stale response (an older request resolving after a newer
+		// one) must not clobber the fresh snapshot.
+		if msg.seq == m.savedReqSeq && msg.ok {
+			m.savedCache = msg.sessions
+		}
+		return m, nil
+
 	case sidebarTickMsg:
 		// 30 s relative-time / store refresh (web's sidebar tick).
+		var cmd tea.Cmd
 		if m.sidebarVisible {
-			m.refreshSavedSessions()
+			cmd = m.requestSavedSessions()
 		}
-		return m, sidebarTickCmd()
+		return m, tea.Batch(cmd, sidebarTickCmd())
 
 	// Approval request (show modal)
 	case approvalRequestMsg:
@@ -142,7 +170,21 @@ func (m *Model) handleMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleWindowSizeMsg(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
+	// Inline-mode shrink guard: the alt-screen renderer only forces a full
+	// repaint when the terminal SHRINKS in fullscreen mode; inline mode
+	// keeps its incremental cell diff, which cannot predict how a real
+	// terminal reflows wider rows after a shrink — the diff then desyncs
+	// from the screen (stale truncated rows above, the frame repainted at
+	// a shifted origin: stuck columns, ghost cursors). A shrunk layout must
+	// therefore request a full repaint via ClearScreen, which re-baselines
+	// renderer and terminal. Growth needs no clearing: new rows appear
+	// below the existing frame and the incremental path stays exact.
+	shrunk := m.ready && (msg.Width < m.width || msg.Height < m.height)
 	m.SetSize(msg.Width, msg.Height)
+	if shrunk {
+		// v2: ClearScreen is a Msg; wrap it in the command that returns it.
+		return m, func() tea.Msg { return tea.ClearScreen() }
+	}
 	return m, nil
 }
 
@@ -151,12 +193,130 @@ func (m *Model) handleModelChangedMsg() (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleSpinnerTick(msg spinner.TickMsg) (tea.Model, tea.Cmd) {
-	if !m.progressAnimating() {
+	// The spinner also animates the /compact wait indicator (compacting
+	// is not a turn, so progressAnimating does not cover it).
+	if !m.progressAnimating() && !m.compacting {
 		return m, nil
 	}
 	var cmd tea.Cmd
 	m.spinner, cmd = m.spinner.Update(msg)
 	return m, cmd
+}
+
+func (m *Model) handleCompactResultMsg(msg compactResultMsg) (tea.Model, tea.Cmd) {
+	// Clear the OWNING session's flags (resolved from the compacting
+	// agent, not the focused mirror): the result may land while another
+	// session is focused, and it must not touch that session's state.
+	var wasUserCancelled bool
+	if m.lives != nil && msg.agent != nil {
+		if s := m.lives.ByAgent(msg.agent); s != nil {
+			if msg.seq != s.compactSeq {
+				// Superseded compaction (cancelled, then restarted before
+				// the old goroutine finished unwinding): the late result is
+				// dropped entirely. It must not clear the new run's flags
+				// (input would unlock mid-compaction, ctrl+c would lose its
+				// target), not report the old cancellation as a fresh
+				// failure, and not flush — the new run may be rewriting
+				// Messages right now.
+				return m, m.drainDeliveries()
+			}
+			wasUserCancelled = s.compactUserCancelled
+			s.compacting = false
+			s.compactCancel = nil
+			s.compactUserCancelled = false
+			if m.lives.Active() == s {
+				m.compacting = false
+			}
+		}
+	}
+	if msg.agent == nil {
+		return m, m.drainDeliveries()
+	}
+	if msg.err != nil {
+		// A user-cancelled compact reports its context error; the cancel
+		// key already announced it — don't double-report.
+		if !wasUserCancelled {
+			if m.streaming {
+				// Never append mid-stream (the stream owns the line
+				// bookkeeping); the status line carries the failure.
+				m.statusMsg = "✗ Compact failed: " + msg.err.Error()
+			} else {
+				m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Compact failed: %v", msg.err)))
+			}
+		}
+		return m, m.drainDeliveries()
+	}
+	// Persist the compacted history regardless of focus (the 5 s save
+	// debounce could otherwise drop it).
+	msg.agent.FlushSession()
+	if m.agent != msg.agent || m.streaming {
+		// The focused session changed (or a turn started) while
+		// compaction ran: the compacted transcript is rebuilt from
+		// Messages whenever that session is next focused or the turn
+		// ends — rebuilding now would read Messages from under the
+		// stream goroutine.
+		m.statusMsg = "✓ History compacted"
+		return m, m.drainDeliveries()
+	}
+	m.checkPersistError()
+	// Compaction rewrote Messages: rebuild the transcript around the
+	// summary (the old inline path left the pre-compact history on
+	// screen, which no longer matched the agent's state).
+	m.chatLines = renderMessages(m.agent.Messages, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())
+	m.chatLines = append(m.chatLines, SystemStyle.Render(fmt.Sprintf("History compacted (%d messages remaining).", len(m.agent.Messages))))
+	m.setViewportContent()
+	m.viewport.GotoBottom()
+	m.refreshContextStats()
+	return m, m.drainDeliveries()
+}
+
+func (m *Model) handleModelListMsg(msg modelListMsg) (tea.Model, tea.Cmd) {
+	if m.agent != msg.agent {
+		// The focused session changed while the list was loading; a list
+		// from another endpoint would mislead the selector. Surface the
+		// outcome instead of silently swallowing the command — this also
+		// replaces the "Loading models…" hint, which would otherwise
+		// linger until the next keypress.
+		m.statusMsg = "Models: focus moved on — reopen /models here"
+		return m, nil
+	}
+	m.statusMsg = "" // the "Loading models…" hint is obsolete either way
+	if msg.err != nil {
+		m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Models: %v", msg.err)))
+		return m, nil
+	}
+	m.modelList = msg.list
+	m.modelCursor = 0
+	m.modal = ModalModels
+	return m, nil
+}
+
+func (m *Model) handleModelSwitchMsg(msg modelSwitchMsg) (tea.Model, tea.Cmd) {
+	if m.agent != msg.agent {
+		// The switch applied to a session that is no longer focused; its
+		// transcript (with the new model line) is rebuilt whenever it is
+		// next focused. Report via the status line — appending to
+		// chatLines would leak into ANOTHER session's transcript.
+		if msg.err != nil {
+			m.statusMsg = "✗ Models: " + msg.err.Error()
+		} else {
+			m.statusMsg = msg.out
+		}
+		return m, nil
+	}
+	if msg.err != nil {
+		m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Models: %v", msg.err)))
+		return m, nil
+	}
+	m.refreshContextStats()
+	// Re-render chat lines with the updated model line, THEN append the
+	// switch notice — the old order appended first and the rebuild wiped
+	// the line, so modal selections silently showed nothing.
+	m.chatLines = renderMessages(m.agent.Messages, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())
+	m.chatLines = append(m.chatLines, SystemStyle.Render(msg.out))
+	m.setViewportContent()
+	m.viewport.GotoBottom()
+	return m, nil
 }
 
 func (m *Model) handleKeyMsg(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -172,19 +332,19 @@ func (m *Model) handleKeyMsg(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case key.Matches(msg, m.keys.ForceQuit):
 		m.cancelActiveStream()
+		m.cancelCompactForQuit()
 		m.dismissApproval(false)
 		m.flushAndQuit()
 		return m, tea.Quit
 	case msg.String() == "ctrl+b" && m.modal == ModalNone:
-		m.toggleSidebar()
-		return m, nil
-	case (m.focus == FocusViewport || m.focus == FocusSidebar) && m.modal == ModalNone && msg.String() == "[":
-		m.resizeSidebar(-4)
-		return m, nil
-	case (m.focus == FocusViewport || m.focus == FocusSidebar) && m.modal == ModalNone && msg.String() == "]":
-		m.resizeSidebar(4)
-		return m, nil
+		return m, m.toggleSidebar()
 	}
+	// NOTE: [ / ] are deliberately NOT global hotkeys — they mean
+	// different things per focus (viewport: prompt-rail jump, sidebar:
+	// panel resize) and are handled in handleViewportKey /
+	// handleSidebarKey. A global intercept here shadowed the viewport's
+	// tocJumpNext and made the documented "[ / ] previous/next prompt"
+	// keybinding dead.
 
 	// If a modal is active, handle modal keys
 	if m.modal != ModalNone {
@@ -306,19 +466,48 @@ func (m *Model) handleCondensedNoteMsg(msg condensedNoteMsg) (tea.Model, tea.Cmd
 
 func (m *Model) handleContextStatsMsg(msg contextStatsMsg) (tea.Model, tea.Cmd) {
 	// Optional async refresh (session commands); stream end updates sync.
+	// Drop a probe that landed after focus moved on: the request runs
+	// off-thread, so a slow probe for the previous session must not
+	// overwrite the focused session's indicator.
+	if m.agent != nil && msg.sid != "" && msg.sid != m.agent.SessionID {
+		return m, nil
+	}
 	m.contextStats = msg.stats
 	m.contextLine = agent.FormatContextBrief(msg.stats)
 	return m, nil
 }
 
 func (m *Model) handleApprovalRequestMsg(msg approvalRequestMsg) (tea.Model, tea.Cmd) {
-	m.approvalUI = &approvalUIState{
-		paths:  msg.req.Paths,
-		reason: msg.req.Reason,
-		cursor: 1, // default to Yes
+	// Stamp the requesting turn's generation NOW (Update thread): the
+	// approver closure runs on the stream goroutine and must never read
+	// liveSession fields, but turn-end pruning (pruneQueuedApprovals)
+	// needs the generation to recognize a dead queued request.
+	if msg.ar != nil && msg.ar.sid != "" && m.lives != nil {
+		if s := m.lives.ByID(msg.ar.sid); s != nil {
+			msg.ar.turnSeq = s.turnSeq
+		}
 	}
-	m.modal = ModalApproval
-	m.bellIfBlurred() // web parity: "Approval needed" notification
+	if m.approvalUI == nil {
+		// Take over whatever modal is open (the requesting turn is blocked
+		// on the answer); the previous modal's data stays on the Model, so
+		// it is restored when the approval queue drains (dismissApproval).
+		if m.modal != ModalNone && m.modal != ModalApproval {
+			m.modalBeforeApproval = m.modal
+		}
+		m.approvalUI = &approvalUIState{
+			paths:  msg.ar.req.Paths,
+			reason: msg.ar.req.Reason,
+			cursor: 1, // default to Yes
+			ar:     msg.ar,
+		}
+		m.modal = ModalApproval
+		m.bellIfBlurred() // web parity: "Approval needed" notification
+		return m, nil
+	}
+	// An approval is already on screen: queue this one behind it. Its
+	// requester stays blocked on its own reply channel until promoted.
+	m.pendingApprovals = append(m.pendingApprovals, msg.ar)
+	m.statusMsg = "Another delete approval is queued…"
 	return m, nil
 }
 
@@ -330,13 +519,16 @@ func (m *Model) handleMouseMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.handleSidebarResizeMouse(ev) {
 			return m, nil
 		}
-		if m.handleSidebarMouse(ev) {
+		if consumed, cmd := m.handleSidebarMouse(ev); consumed {
 			// The panel consumed the event: the mouse is over the panel
 			// area, so its border renders highlighted.
 			m.sidebarHovering = true
-			return m, nil
+			return m, cmd
 		}
 		m.sidebarHovering = false
+		if m.handleTocMouse(ev) {
+			return m, nil
+		}
 		if m.handleMouseSelection(ev) {
 			return m, nil
 		}

@@ -1,10 +1,12 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"gogen/internal/agent"
 	"gogen/internal/llm"
@@ -67,22 +69,26 @@ func (m *Model) renderConfirmModal() string {
 	}
 	rows = append(rows, styleLine{text: "", highlight: false},
 		styleLine{text: "y confirm   n/esc cancel", highlight: false})
-	return renderBorderedModal(rows)
+	return m.renderBorderedModal(rows)
 }
 
-// handleConfirmKey dispatches the confirm modal keys.
+// handleConfirmKey dispatches the confirm modal keys. On exit (confirm or
+// cancel) the modal returns to confirmRestore — ModalNone for the sidebar
+// path, or the modal the dialog was opened from (the sessions list).
 func (m *Model) handleConfirmKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "y", "enter":
 		fn := m.confirmAction
 		m.confirmAction = nil
-		m.modal = ModalNone
+		m.modal = m.confirmRestore
+		m.confirmRestore = ModalNone
 		if fn != nil {
 			return fn()
 		}
 	case "n", "esc", "q":
 		m.confirmAction = nil
-		m.modal = ModalNone
+		m.modal = m.confirmRestore
+		m.confirmRestore = ModalNone
 	}
 	return m, nil
 }
@@ -111,7 +117,7 @@ func (m *Model) renderLiveSessionsModal() string {
 	}
 	rows = append(rows, styleLine{text: "", highlight: false},
 		styleLine{text: "↑↓/jk move  enter focus  c cancel  d close  esc close", highlight: false})
-	return renderBorderedModal(rows)
+	return m.renderBorderedModal(rows)
 }
 
 // handleLiveSessionsKey navigates and focuses live sessions.
@@ -170,7 +176,7 @@ func (m *Model) renderSubagentsModal() string {
 	list := append([]subagentRecord(nil), m.subagents...)
 	m.subagentMu.Unlock()
 	if len(list) == 0 {
-		return renderBorderedModal([]styleLine{
+		return m.renderBorderedModal([]styleLine{
 			{text: "Subagents", highlight: true},
 			{text: "", highlight: false},
 			{text: "No subagents have run in this session.", highlight: false},
@@ -189,8 +195,11 @@ func (m *Model) renderSubagentsModal() string {
 		if r.err != nil {
 			summary = r.err.Error()
 		}
-		if len(summary) > 120 {
-			summary = summary[:120] + "…"
+		// Rune-safe truncation: byte slicing split multi-byte runes
+		// mid-sequence, emitting invalid UTF-8 into the modal (mojibake,
+		// wrong visible-width math downstream).
+		if r := []rune(summary); len(r) > 120 {
+			summary = string(r[:120]) + "…"
 		}
 		if summary != "" {
 			lines = append(lines, styleLine{text: "  " + summary, highlight: false})
@@ -200,7 +209,7 @@ func (m *Model) renderSubagentsModal() string {
 		}
 	}
 	lines = append(lines, styleLine{text: "", highlight: false}, styleLine{text: "Press esc to close", highlight: false})
-	return renderBorderedModal(lines)
+	return m.renderBorderedModal(lines)
 }
 
 // handleSubagentsKey closes the subagents modal on esc.
@@ -214,10 +223,68 @@ func (m *Model) handleSubagentsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 // --- Approval Modal ---
 
+// approvalRequest is one delete-approval exchange. Each request owns its
+// reply channel — there is no shared channel or in-flight flag — so the
+// approver (which runs on the stream goroutine during tool execution)
+// never touches Model state: it sends the request to the Update thread
+// (thread-safe program.Send) and blocks on its own reply. Concurrent
+// approvals (focused + background sessions) cannot steal each other's
+// answers.
+type approvalRequest struct {
+	req agent.DeleteRequest
+	sid string // requesting live session id ("" = unknown)
+	// turnSeq is the requesting turn's generation, stamped on FIRST
+	// delivery (handleApprovalRequestMsg, Update thread) so turn-end
+	// pruning can tell a finished turn's queued request from a resubmitted
+	// successor's without the stream goroutine ever reading liveSession
+	// state. 0 = unstamped (no registry, or unknown session).
+	turnSeq uint64
+	// reply is buffered 1: a reply after the approver left is dropped.
+	reply chan bool
+}
+
+// pruneQueuedApprovals drops queued delete-approvals requested by sid's
+// generation seq or OLDER — that turn has terminated, so its queued
+// requests are dead (each approver has left via its reply or ctx.Done) and
+// promoting one later would show a modal whose answer goes nowhere.
+// Requests stamped with a newer generation belong to a resubmitted
+// successor turn and survive a stale terminal. Update-thread only.
+func (m *Model) pruneQueuedApprovals(sid string, seq uint64) {
+	if len(m.pendingApprovals) == 0 {
+		return
+	}
+	kept := m.pendingApprovals[:0] // reused; pendingApprovals is Update-thread-only
+	for _, ar := range m.pendingApprovals {
+		if ar.sid == sid && ar.turnSeq <= seq {
+			continue
+		}
+		kept = append(kept, ar)
+	}
+	m.pendingApprovals = kept
+}
+
 type approvalUIState struct {
 	paths  []string
 	reason string
 	cursor int // 0 = No, 1 = Yes
+	ar     *approvalRequest
+}
+
+// approvalSessionLabel names the requesting session when it is NOT the
+// focused one (a background turn's delete request); "" for the focused
+// session or unknown ids (keeps the classic title).
+func (m *Model) approvalSessionLabel() string {
+	if m.approvalUI == nil || m.approvalUI.ar == nil || m.lives == nil {
+		return ""
+	}
+	sid := m.approvalUI.ar.sid
+	if sid == "" || sid == m.lives.Active().id {
+		return ""
+	}
+	if s := m.lives.ByID(sid); s != nil {
+		return s.label
+	}
+	return ""
 }
 
 func (m *Model) renderApprovalModal() string {
@@ -227,8 +294,13 @@ func (m *Model) renderApprovalModal() string {
 
 	var rows []styleLine
 
-	// Title
-	rows = append(rows, styleLine{text: "Delete Approval Required", highlight: true})
+	// Title — a background session's request names its session so the
+	// answer is not misattributed to the focused transcript.
+	title := "Delete Approval Required"
+	if label := m.approvalSessionLabel(); label != "" {
+		title += " — " + label
+	}
+	rows = append(rows, styleLine{text: title, highlight: true})
 	rows = append(rows, styleLine{text: "", highlight: false})
 
 	// Reason
@@ -257,7 +329,7 @@ func (m *Model) renderApprovalModal() string {
 		"]  [" + yesStyle + "Yes" + ansiReset + "]"
 	rows = append(rows, styleLine{text: promptLine, preStyled: true})
 
-	return renderBorderedModal(rows)
+	return m.renderBorderedModal(rows)
 }
 
 func (m *Model) handleApprovalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -284,34 +356,48 @@ func (m *Model) handleApprovalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// dismissApproval closes the approval modal and sends a non-blocking result.
+// dismissApproval replies to the on-screen approval request, then promotes
+// the next queued one (keeping the modal up) or restores the modal that
+// was open before the approval took over.
 func (m *Model) dismissApproval(approved bool) {
-	// Only honour a dismissal if a request is currently in flight. Without
-	// this guard a stale modal-dismissal (e.g. user pressed ctrl+c after the
-	// stream was cancelled) could write into the shared channel and either
-	// leak as a stuck approver waiting on a value that will never arrive, or
-	// be silently dropped, depending on timing.
-	if m.modal != ModalApproval && m.approvalUI == nil {
+	// Only honour a dismissal if a request is currently on screen. Without
+	// this guard a stale dismissal (e.g. user pressed ctrl+c after the
+	// stream was cancelled) would reply to nothing and close a modal that
+	// is not the approval's.
+	if m.approvalUI == nil {
 		return
 	}
+	ar := m.approvalUI.ar
 	m.approvalUI = nil
-	m.modal = ModalNone
-	if m.approvalResult == nil || !m.approvalInFlight {
+	if ar != nil {
+		select {
+		case ar.reply <- approved:
+		default:
+			// Approver already left (turn cancelled) — drop rather than
+			// block the UI thread.
+		}
+	}
+	if len(m.pendingApprovals) > 0 {
+		next := m.pendingApprovals[0]
+		m.pendingApprovals = m.pendingApprovals[1:]
+		m.approvalUI = &approvalUIState{
+			paths:  next.req.Paths,
+			reason: next.req.Reason,
+			cursor: 1, // default to Yes
+			ar:     next,
+		}
+		m.bellIfBlurred()
 		return
 	}
-	m.approvalInFlight = false
-	select {
-	case m.approvalResult <- approved:
-	default:
-		// Buffer full or no waiter — drop rather than block the UI thread.
-	}
+	m.modal = m.modalBeforeApproval
+	m.modalBeforeApproval = ModalNone
 }
 
 // --- Sessions Modal ---
 
 func (m *Model) renderSessionsModal() string {
 	if len(m.sessionList) == 0 {
-		return renderBorderedModal([]styleLine{
+		return m.renderBorderedModal([]styleLine{
 			{text: "Saved Sessions", highlight: true},
 			{text: "", highlight: false},
 			{text: "No saved sessions.", highlight: false},
@@ -394,7 +480,7 @@ func (m *Model) renderSessionsModal() string {
 		text: "↑↓/jk navigate  pgup/pgdn  enter resume  d delete  esc close", highlight: false,
 	})
 
-	return renderBorderedModal(rows)
+	return m.renderBorderedModal(rows)
 }
 
 func (m *Model) handleSessionsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -446,12 +532,40 @@ type styleLine struct {
 	preStyled bool // if true, text already contains ANSI; don't add prefix
 }
 
-// renderBorderedModal draws a plain border box around styled text lines.
-// Uses ansiHighlightOn / ansiDimOn + ansiReset (foreground-only reset,
-// never touches background) so the overlay's #1a1a1a background survives
-// through the entire line, including right-hand padding.
-// When preStyled is true the line is emitted as-is (caller embeds ANSI).
-func renderBorderedModal(rows []styleLine) string {
+// renderBorderedModal draws a plain border box around styled text lines,
+// sized to the longest row. See renderBorderedModalWidth for the
+// preferred-width variant and the shared clamping contract.
+func (m *Model) renderBorderedModal(rows []styleLine) string {
+	return m.renderBorderedModalWidth(rows, 0)
+}
+
+// modelsModalInnerWidth is the models picker's default inner width
+// (content + padding; total box = inner + 2 border cells). It is the
+// FLOOR for modelsModalInner: short catalogs keep this stable, roomy
+// geometry instead of hugging their longest row ("  3. gpt-4o" would
+// otherwise give a ~30-cell box), while long entries grow the box up to
+// the terminal clamp so the biggest model name fits when the screen can
+// show it. See modelsModalInner.
+const modelsModalInnerWidth = 58
+
+// renderBorderedModalWidth is renderBorderedModal with a fixed inner
+// width: minInner > 0 PINS the box — shorter rows get trailing padding,
+// longer rows are ANSI-aware truncated, so the modal never resizes with
+// its content. minInner == 0 keeps the hug-the-longest-row sizing. Uses
+// ansiHighlightOn / ansiDimOn + ansiReset (foreground-only reset, never
+// touches background) so the overlay's #1a1a1a background survives through
+// the entire line, including right-hand padding. When preStyled is true
+// the line is emitted as-is (caller embeds ANSI).
+//
+// The box is clamped to the terminal in both dimensions: a modal wider or
+// taller than the screen makes the inline renderer scroll and desync
+// (lipgloss.Place passes oversized content through untouched). Rows are
+// ANSI-aware truncated to the clamped width, and clampModalRows caps the
+// row count. Models built without SetSize (width/height zero — tests)
+// keep the unclamped layout.
+func (m *Model) renderBorderedModalWidth(rows []styleLine, minInner int) string {
+	rows = m.clampModalRows(rows)
+
 	// Compute max visible width of plain text (strip ANSI for measurement).
 	maxW := 0
 	for _, r := range rows {
@@ -461,6 +575,22 @@ func renderBorderedModal(rows []styleLine) string {
 		}
 	}
 	innerW := maxW + 4
+	if minInner > 0 {
+		// Pinned width: content wider than this truncates below rather
+		// than resizing the box (the terminal clamp still applies).
+		innerW = minInner
+	}
+	if m != nil && m.width > 0 {
+		// Border(2) plus one cell of margin on each side(4).
+		limit := m.width - 6
+		if limit < 6 {
+			limit = 6 // degenerate terminals: bounded, not unbounded
+		}
+		if innerW > limit {
+			innerW = limit
+		}
+	}
+	contentW := innerW - 4
 
 	top := "╭" + strings.Repeat("─", innerW) + "╮"
 	bot := "╰" + strings.Repeat("─", innerW) + "╯"
@@ -469,21 +599,27 @@ func renderBorderedModal(rows []styleLine) string {
 	b.WriteString(top)
 	b.WriteByte('\n')
 	for _, r := range rows {
+		text := r.text
+		// Truncate ANSI-aware to the clamped content width before any
+		// styling or padding so every row fits the box budget.
+		if lipgloss.Width(text) > contentW {
+			text = ansi.Cut(text, 0, contentW)
+		}
 		b.WriteString("│  ")
 		if r.preStyled {
 			// Caller already embedded ANSI — emit verbatim.
-			b.WriteString(r.text)
+			b.WriteString(text)
 		} else {
 			if r.highlight {
 				b.WriteString(ansiHighlightOn)
 			} else {
 				b.WriteString(ansiDimOn)
 			}
-			b.WriteString(r.text)
+			b.WriteString(text)
 			b.WriteString(ansiReset)
 		}
 		// Fill remaining content width after text.
-		pad := maxW - lipgloss.Width(r.text)
+		pad := contentW - lipgloss.Width(text)
 		if pad > 0 {
 			b.WriteString(strings.Repeat(" ", pad))
 		}
@@ -494,17 +630,50 @@ func renderBorderedModal(rows []styleLine) string {
 	return b.String()
 }
 
+// clampModalRows caps a modal's row list so the bordered box (rows + top
+// and bottom border) never outgrows the terminal height. Everything past
+// the first maxRows-2 rows collapses into one overflow indicator, and the
+// LAST row is always preserved: every current caller ends its list with a
+// footer/hint/prompt line (nav hints, "Press esc to close", the approval
+// Yes/No prompt) that must stay visible for the modal to make sense. A
+// zero or unset height (literal-built models in tests) skips the clamp,
+// preserving the historical unclamped output there.
+func (m *Model) clampModalRows(rows []styleLine) []styleLine {
+	if m == nil || m.height <= 0 || len(rows) == 0 {
+		return rows
+	}
+	maxRows := m.height - 4 // border(2) + one row of margin top and bottom
+	const minRows = 4       // some content + indicator + footer survive even on tiny terminals
+	if maxRows < minRows {
+		maxRows = minRows
+	}
+	if maxRows >= len(rows) {
+		return rows
+	}
+	kept := rows[:maxRows-2]
+	hidden := len(rows) - len(kept) - 1 // minus the preserved footer row
+	out := make([]styleLine, 0, maxRows)
+	out = append(out, kept...)
+	out = append(out, styleLine{
+		text: fmt.Sprintf("  ⋯ %d more lines (terminal too short)", hidden),
+	})
+	out = append(out, rows[len(rows)-1])
+	return out
+}
+
 // --- Models Modal ---
 
 func (m *Model) renderModelsModal() string {
 	if len(m.modelList) == 0 {
-		return renderBorderedModal([]styleLine{
+		// Same preferred width as the populated picker so opening /models
+		// on an empty catalog does not flash a narrower box.
+		return m.renderBorderedModalWidth([]styleLine{
 			{text: "Available Models", highlight: true},
 			{text: "", highlight: false},
 			{text: "No models available.", highlight: false},
 			{text: "", highlight: false},
 			{text: "Press esc to close", highlight: false},
-		})
+		}, modelsModalInnerWidth)
 	}
 
 	// Constrain visible area to fit the terminal.
@@ -565,7 +734,10 @@ func (m *Model) renderModelsModal() string {
 		text: "↑↓/jk navigate  enter load  esc close", highlight: false,
 	})
 
-	return renderBorderedModal(rows)
+	// Width: the preferred default as a floor, grown to fit the longest
+	// entry in the catalog when the terminal has room (the renderer's
+	// clamp truncates rows only when even that is not enough).
+	return m.renderBorderedModalWidth(rows, modelsModalInner(m.modelList))
 }
 
 // modelProviderName returns the registered provider profile that serves the
@@ -576,6 +748,44 @@ func modelProviderName(mi llm.ModelInfo) string {
 		return "default"
 	}
 	return mi.Provider
+}
+
+// modelsModalInner is the picker's inner width for a catalog: the fixed
+// preferred width as the floor, grown to fit the longest row in the WHOLE
+// list (provider headers and entries — numbering, id, context suffix,
+// current marker) so the box neither hugs short entries nor resizes while
+// the user scrolls through windows that happen to exclude the longest one.
+// renderBorderedModalWidth still clamps the result to the terminal and
+// truncates rows only when even that width cannot fit them.
+func modelsModalInner(list []llm.ModelInfo) int {
+	inner := modelsModalInnerWidth
+	for i, mdl := range list {
+		// Provider header: two-space prefix (buildModelRows's "  "+name),
+		// plus the renderer's four content-padding cells.
+		if w := lipgloss.Width("  "+modelProviderName(mdl)) + 4; w > inner {
+			inner = w
+		}
+		// Entry row at its real index: the %2d numbering width depends on
+		// the position, so the probe must use it.
+		if w := lipgloss.Width(modelEntryText(i, mdl)) + 4; w > inner {
+			inner = w
+		}
+	}
+	return inner
+}
+
+// modelEntryText composes one picker entry's plain text — the exact string
+// buildModelRows styles and emits. Shared with modelsModalInner so the
+// measured width always matches what is rendered.
+func modelEntryText(i int, mdl llm.ModelInfo) string {
+	line := fmt.Sprintf("  %2d. %s", i+1, mdl.ID)
+	if mdl.ContextLimit > 0 {
+		line += fmt.Sprintf("  (context: %d tokens)", mdl.ContextLimit)
+	}
+	if mdl.Current {
+		line += " *"
+	}
+	return line
 }
 
 // buildModelRows renders the model entries for the visible scroll window
@@ -602,15 +812,8 @@ func buildModelRows(list []llm.ModelInfo, start, end, cursor int) []styleLine {
 			})
 			lastProvider = prov
 		}
-		line := fmt.Sprintf("  %2d. %s", i+1, mdl.ID)
-		if mdl.ContextLimit > 0 {
-			line += fmt.Sprintf("  (context: %d tokens)", mdl.ContextLimit)
-		}
-		if mdl.Current {
-			line += " *"
-		}
 		rows = append(rows, styleLine{
-			text:      line,
+			text:      modelEntryText(i, mdl),
 			highlight: i == cursor,
 		})
 	}
@@ -650,7 +853,11 @@ func (m *Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// loadSelectedModel switches to the model at modelCursor from the models modal.
+// loadSelectedModel switches to the model at modelCursor from the models
+// modal. SelectModel hits the network (model list + context-limit probe),
+// so the modal closes immediately and the switch runs in the background;
+// the result arrives as modelSwitchMsg (handleModelSwitchMsg applies the
+// transcript rebuild + context refresh).
 func (m *Model) loadSelectedModel() (tea.Model, tea.Cmd) {
 	mdl := m.modelList[m.modelCursor]
 	// Skip if already on this model.
@@ -658,24 +865,19 @@ func (m *Model) loadSelectedModel() (tea.Model, tea.Cmd) {
 		m.modal = ModalNone
 		return m, nil
 	}
-	if err := m.agent.SelectModel(m.ctx, mdl.ID); err != nil {
-		m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Models: %v", err)))
-		m.modal = ModalNone
-		return m, nil
-	}
-	limit := m.agent.ContextLimit()
-	msg := fmt.Sprintf("Switched to model: %s", m.agent.CurrentModel())
-	if limit > 0 {
-		msg += fmt.Sprintf(" (context: %d tokens)", limit)
-	}
-	m.appendChatLine(SystemStyle.Render(msg))
-	m.refreshContextStats()
-	// Re-render chat lines with updated model line
-	m.chatLines = renderMessages(m.agent.Messages, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())
-	m.setViewportContent()
-	m.viewport.GotoBottom()
 	m.modal = ModalNone
-	return m, nil
+	a := m.agent
+	id := mdl.ID
+	base := m.ctx
+	if base == nil {
+		base = context.Background()
+	}
+	return m, func() tea.Msg {
+		// HandleModelsCommand shares the inline /models <sel> path: same
+		// switch, same "Switched to model: …" line.
+		out, _, err := a.HandleModelsCommand(base, "/models "+id)
+		return modelSwitchMsg{agent: a, out: out, err: err}
+	}
 }
 
 // --- Help Modal ---
@@ -709,7 +911,9 @@ func (m *Model) renderHelpModal() string {
 			{"↑ ↓ j k", "Scroll line"},
 			{"pgup / pgdn", "Scroll page"},
 			{"home / end", "Top / bottom"},
+			{"[ / ]", "Previous / next prompt"},
 			{"mouse wheel", "Scroll viewport"},
+			{"mouse (right edge)", "Prompt rail: hover = preview, click = jump"},
 			{"i / enter", "Return to input"},
 		}},
 		{"Slash Commands", [][]string{
@@ -772,7 +976,7 @@ func (m *Model) renderHelpModal() string {
 	// Footer
 	rows = append(rows, styleLine{text: "any key to close", highlight: false})
 
-	return renderBorderedModal(rows)
+	return m.renderBorderedModal(rows)
 }
 
 func (m *Model) handleHelpKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -801,7 +1005,7 @@ func (m *Model) renderCompletionModal() string {
 			b.WriteString("  ")
 		}
 	}
-	return renderBorderedModal([]styleLine{
+	return m.renderBorderedModal([]styleLine{
 		{text: b.String(), preStyled: true},
 	})
 }
@@ -852,20 +1056,34 @@ func (m *Model) resumeSelectedSession() (tea.Model, tea.Cmd) {
 	return m, m.resumeSavedRow(id)
 }
 
-// deleteSelectedSession deletes the session at sessionCursor from the sessions modal.
+// deleteSelectedSession asks for confirmation and deletes the session at
+// sessionCursor from the sessions modal — the same ModalConfirm contract
+// as the sidebar's delete (sidebarDeleteRow): a permanent deletion must
+// never be a single keystroke. The sessions list stays open behind the
+// dialog (confirmRestore) and is updated in place on confirm.
 func (m *Model) deleteSelectedSession() (tea.Model, tea.Cmd) {
-	id := m.sessionList[m.sessionCursor].ID
-	cmd := m.deleteSavedRow(id)
-	// Remove from the local list.
-	m.sessionList = append(m.sessionList[:m.sessionCursor], m.sessionList[m.sessionCursor+1:]...)
-	if m.sessionCursor >= len(m.sessionList) {
-		m.sessionCursor = len(m.sessionList) - 1
+	s := m.sessionList[m.sessionCursor]
+	label := s.Label
+	if label == "" {
+		label = s.ID
 	}
-	if m.sessionCursor < 0 {
-		m.sessionCursor = 0
+	m.confirmText = fmt.Sprintf("Delete session %q?\nIts message history will be permanently deleted.", label)
+	m.confirmRestore = ModalSessions
+	m.confirmAction = func() (tea.Model, tea.Cmd) {
+		cmd := m.deleteSavedRow(s.ID)
+		// Remove from the local list.
+		m.sessionList = append(m.sessionList[:m.sessionCursor], m.sessionList[m.sessionCursor+1:]...)
+		if m.sessionCursor >= len(m.sessionList) {
+			m.sessionCursor = len(m.sessionList) - 1
+		}
+		if m.sessionCursor < 0 {
+			m.sessionCursor = 0
+		}
+		if len(m.sessionList) == 0 {
+			m.modal = ModalNone
+		}
+		return m, cmd
 	}
-	if len(m.sessionList) == 0 {
-		m.modal = ModalNone
-	}
-	return m, cmd
+	m.modal = ModalConfirm
+	return m, nil
 }

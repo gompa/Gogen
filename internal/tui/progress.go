@@ -35,16 +35,43 @@ func (m *Model) progressAnimating() bool {
 	return m.streaming && (m.progressPhase == progressThinking || m.progressPhase == progressTool)
 }
 
+// focusedSession returns the focused live session, or nil when the Model
+// has no registry (unit-test constructions). Progress mirroring is a
+// no-op in that case.
+func (m *Model) focusedSession() *liveSession {
+	if m.lives == nil {
+		return nil
+	}
+	return m.lives.Active()
+}
+
 // setProgress updates the wait indicator. Returns a spinner tick when animation
 // should (re)start after being stopped.
+//
+// The phase/label are mirrored onto the focused live session so the state
+// survives a focus switch: switchToLive restores the target session's
+// recorded phase instead of hardcoding "thinking".
 func (m *Model) setProgress(phase progressPhase, label string) tea.Cmd {
 	wasAnimating := m.progressAnimating()
 	m.progressPhase = phase
 	m.progressLabel = label
+	if s := m.focusedSession(); s != nil {
+		s.progressPhase = phase
+		s.progressLabel = label
+	}
 	if m.progressAnimating() && !wasAnimating {
 		return m.spinner.Tick
 	}
 	return nil
+}
+
+// setActiveTool names the tool being prepared/executed for the progress
+// indicator; mirrored onto the focused session like setProgress.
+func (m *Model) setActiveTool(name string) {
+	m.activeToolName = name
+	if s := m.focusedSession(); s != nil {
+		s.activeTool = name
+	}
 }
 
 func (m *Model) clearProgress() {
@@ -52,6 +79,9 @@ func (m *Model) clearProgress() {
 	m.progressLabel = ""
 	// No tool is being prepared/executed any more (turn end, cancel, error).
 	m.activeToolName = ""
+	if s := m.focusedSession(); s != nil {
+		s.resetProgress()
+	}
 }
 
 // renderProgressInput draws the wait indicator in the input band.
@@ -85,6 +115,14 @@ func (m *Model) renderProgressInput() string {
 		// when streaming is true, but handle defensively).
 		line = ""
 	}
+	return padInputBand(line, m.textarea.Height())
+}
+
+// renderCompactingInput draws the /compact wait indicator in the input
+// band. The compaction runs off the Update thread; the spinner animates
+// via handleSpinnerTick, which also ticks while compacting.
+func (m *Model) renderCompactingInput() string {
+	line := DimStyle.Render("  " + m.spinner.View() + " compacting history…")
 	return padInputBand(line, m.textarea.Height())
 }
 

@@ -223,6 +223,15 @@ func TestSessionAttachLoadsInactiveSession(t *testing.T) {
 	if got := userMessageCount(rt.agent); got != 2 {
 		t.Fatalf("disk-session user message count = %d, want 2 (message routed to attached pane)", got)
 	}
+	// Drain the turn before returning: user_acked fires while the turn is
+	// still running, and its final FlushSession writes the session file —
+	// without this wait that write races t.TempDir's RemoveAll cleanup
+	// (the flaky "directory not empty" failure). turn_end is broadcast
+	// after StreamProcessInput returns, so it bounds all of the turn's
+	// persistence writes.
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool {
+		return m.Type == "turn_end" && m.SessionID == rt.agent.SessionID
+	})
 }
 
 // TestSessionAttachUnknownSessionRemoved verifies that attaching a session
@@ -350,6 +359,15 @@ func TestTypedNewOverWS(t *testing.T) {
 	if got := userMessageCount(rt.agent); got != 1 {
 		t.Fatalf("new session user message count = %d, want 1 (message routed to new default)", got)
 	}
+	// Drain the turn before returning: user_acked fires while the turn is
+	// still running, and its final FlushSession writes the session file —
+	// without this wait that write races t.TempDir's RemoveAll cleanup
+	// (the flaky "directory not empty" failure). turn_end is broadcast
+	// after StreamProcessInput returns, so it bounds all of the turn's
+	// persistence writes.
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool {
+		return m.Type == "turn_end" && m.SessionID == cfg.SessionID
+	})
 }
 
 // userMessageCount returns the number of user-role messages in the agent's

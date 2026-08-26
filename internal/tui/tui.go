@@ -38,6 +38,14 @@ type TUI struct {
 	// modelChanged records a background model change (restore validation)
 	// that arrived before Run started, so the first render reflects it.
 	modelChanged atomic.Bool
+	// startupNotices holds setup-phase messages (model selection, session
+	// restore) surfaced through the managed render path instead of raw
+	// stderr: the inline renderer owns every row of the terminal-height
+	// frame, and an untracked line above it desyncs the cell diff from the
+	// real screen (ghost cursors, stale columns). Set before Run via
+	// SetStartupNotices; delivered via Println in order once the program's
+	// event loop starts consuming.
+	startupNotices []string
 }
 
 // New creates a new TUI runner.
@@ -56,18 +64,34 @@ func NewWithWorkspace(a *agent.Agent, cfg *config.Config, ws *server.Workspace) 
 	if a != nil {
 		a.OnModelChanged = t.ForceRender
 	}
-	// Job-completion notices: queue a delivery message on the tea loop
-	// (deliveryRequestMsg) so the notice renders and runs a turn at the
-	// next idle boundary. The program may not have started yet (a job
-	// finishing before Run) — then the notice is dropped (at-most-once).
-	if a != nil && cfg != nil && cfg.JobNoticesEnabled() {
-		a.SetJobNoticeHook(func(summary string) {
-			if p := t.program.Load(); p != nil {
-				p.Send(deliveryRequestMsg{text: summary})
-			}
-		})
-	}
+	// The job-notice hook is installed in Run: it needs the root
+	// liveSession (focus gate + replay buffer), which exists only once the
+	// Model is built. A job finishing before Run is dropped (at-most-once,
+	// same as when the program had not started yet).
 	return t
+}
+
+// installJobNoticeHook makes the root session's job-completion notices
+// focus-aware (the same contract openNewLiveSession applies to opened
+// sessions): while the root slot is focused, the summary runs a normal
+// delivery turn via deliver; while it is backgrounded, the summary is
+// buffered as an attributed condensed note on the root slot and surfaced
+// when focus returns (switchToLive). No-op unless job_notices is
+// explicitly enabled and the model hosts a live registry.
+func (t *TUI) installJobNoticeHook(m *Model, deliver func(summary string)) {
+	if t.agent == nil || t.cfg == nil || !t.cfg.JobNoticesEnabled() || m == nil || m.lives == nil {
+		return
+	}
+	root := m.lives.Active()
+	t.agent.SetJobNoticeHook(jobNoticeHookFor(root, deliver))
+}
+
+// SetStartupNotices stores pre-TUI messages (setup banners) that Run
+// delivers through tea's managed above-frame channel rather than raw
+// stderr, whose untracked lines ahead of the inline frame desync the
+// renderer. Call before Run.
+func (t *TUI) SetStartupNotices(notices []string) {
+	t.startupNotices = notices
 }
 
 // ForceRender schedules a re-render after a background state change (e.g.
@@ -98,6 +122,29 @@ func (t *TUI) Run(ctx context.Context) {
 
 	m.program = p
 	t.program.Store(p)
+	// Startup notices must never hit the terminal as raw stderr writes: the
+	// inline renderer owns every row of the terminal-height frame, and an
+	// untracked line above it forces unaccounted scrolls that desync the
+	// cell diff from the real screen (ghost cursors, stuck columns).
+	// Println sends on the program's unbuffered message channel, so this
+	// goroutine delivers the notices in order as soon as Run's event loop
+	// starts consuming; if the program exits first, process teardown
+	// reclaims the blocked send.
+	if len(t.startupNotices) > 0 {
+		notes := t.startupNotices
+		go func() {
+			for _, n := range notes {
+				p.Println(n)
+			}
+		}()
+	}
+	// Job-completion notices are focus-aware: a focused root session gets
+	// the normal delivery turn (deliveryRequestMsg on the tea loop); a
+	// backgrounded one buffers an attributed condensed note that
+	// switchToLive surfaces when focus returns.
+	t.installJobNoticeHook(m, func(summary string) {
+		p.Send(deliveryRequestMsg{text: summary})
+	})
 	// A validation finishing before Run started would have missed the
 	// program; drain the pending flag so the first render already reflects
 	// the change.

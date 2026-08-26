@@ -92,11 +92,23 @@ type Model struct {
 	sidebarDragging bool
 	// savedCache snapshots the persisted-session index; the unified list
 	// overlays live sessions onto it (refreshed on turn end, session
-	// changes, and the 30 s tick).
+	// changes, and the 30 s tick). Written only on the Update thread
+	// (savedSessionsMsg).
 	savedCache []agent.SessionInfo
+	// savedReqSeq guards against a stale savedSessionsMsg (an older
+	// request resolving after a newer one) clobbering the fresh snapshot.
+	savedReqSeq uint64
 	// Sidebar navigation state (keyboard + mouse share the cursor).
-	sidebarCursor int // selected row in the unified list
-	sidebarScroll int // first visible row (list overflow)
+	// sidebarCursor is the cursor's CURRENT list position; sidebarCursorID
+	// is its identity (the selected row's session id). The unified list
+	// reorders at runtime (background completion, /open, store refresh),
+	// so the id is the source of truth and the position is re-resolved
+	// from it (resolveSidebarCursor) — otherwise the highlight would jump
+	// to a different session and x/d would act on the wrong one. Empty id
+	// = positional cursor (fresh models, tests).
+	sidebarCursor   int
+	sidebarCursorID string
+	sidebarScroll   int // first visible row (list overflow)
 	// sidebarLastCursor is the cursor of the last render: the
 	// keep-in-window logic follows the cursor only when it actually moved
 	// (a wheel scroll moves the window, not the cursor, and must not be
@@ -114,6 +126,19 @@ type Model struct {
 	// sidebarHovering is true while the mouse is over the panel area —
 	// the border renders highlighted (tracked in handleMouseMsg).
 	sidebarHovering bool
+	// Prompt rail (web TOC parity): one anchor per user prompt — the
+	// wrapped line where it starts plus the raw text for the hover
+	// preview. Rebuilt on full transcript rebuilds, extended by the
+	// append funnels (see toc.go).
+	tocAnchors []tocAnchor
+	// tocHover is true while the pointer is in the rail's trigger strip
+	// (the chat column's rightmost four cells, above the input row) —
+	// the rail renders only then, so transcript text is never covered
+	// at rest.
+	tocHover bool
+	// tocPreview is the anchor index under the pointer (-1 = none); its
+	// dot gets the hover preview box.
+	tocPreview int
 	// sessionActivity is the per-id recency map (web pane.lastActivity):
 	// session id → last in-process OUTPUT time (completed turn, session
 	// spawn, resume seed). Keyed by session id — not by live slot — so a
@@ -122,8 +147,12 @@ type Model struct {
 	// persist timestamp, which a flush rewrites to "now".
 	sessionActivity map[string]time.Time
 	// confirmText/confirmAction back ModalConfirm (sidebar session delete).
-	confirmText   string
-	confirmAction func() (tea.Model, tea.Cmd)
+	// confirmRestore is the modal to return to when the dialog closes
+	// (ModalNone for the sidebar path; ModalSessions when the dialog was
+	// opened from the sessions list, which stays open behind it).
+	confirmText    string
+	confirmAction  func() (tea.Model, tea.Cmd)
+	confirmRestore ModalKind
 	// workspace spawns additional live sessions (/open) through the shared
 	// web lifecycle core; nil keeps single-session hosting.
 	workspace *server.Workspace
@@ -132,10 +161,21 @@ type Model struct {
 	height    int
 	quitting  bool
 
-	// Wait indicator (input area) while a turn is in flight
+	// Wait indicator (input area) while a turn is in flight.
+	// progressPhase/progressLabel/activeToolName are the FOCUSED session's
+	// mirror of its liveSession progress fields (see liveSession.progress*);
+	// switchToLive rebinds them to the target session on a focus change.
 	spinner       spinner.Model
 	progressPhase progressPhase
 	progressLabel string
+
+	// /compact runs off the Update thread (it makes an LLM summarization
+	// call — running it inline froze the whole UI for the request's
+	// duration). compacting is the FOCUSED session's mirror of its
+	// liveSession compacting flag (see liveSession.compacting); switchToLive
+	// rebinds it on a focus change, like m.streaming. The cancel func and
+	// user-cancelled flag live on the owning session, not here.
+	compacting bool
 
 	// Chat content buffer (lines to render)
 	chatLines        []string
@@ -203,10 +243,20 @@ type Model struct {
 	completionIdx  int
 	completionLine string // the full line at time of tab press
 
-	// Approval state
-	approvalResult   chan bool
-	approvalUI       *approvalUIState
-	approvalInFlight bool
+	// Approval state. Each request owns its reply channel
+	// (approvalRequest), so the approver — which runs on the turn's stream
+	// goroutine during tool execution — never touches these fields; they
+	// are Update-thread-only.
+	approvalUI *approvalUIState
+	// pendingApprovals queues concurrent delete requests behind the one on
+	// screen (focused + background turns can both request deletes); the
+	// head is promoted on dismiss. Requests whose requesting turn has
+	// terminated are pruned there (pruneQueuedApprovals) — promoting one
+	// would show a modal whose answer goes nowhere.
+	pendingApprovals []*approvalRequest
+	// modalBeforeApproval is the modal an approval took over; restored
+	// when the approval queue drains.
+	modalBeforeApproval ModalKind
 
 	// System message deliveries (job notices, subagent reports) queued by
 	// program.Send(deliveryRequestMsg) from background goroutines; drained
@@ -239,7 +289,13 @@ type Model struct {
 	dividerCacheWidth  int
 	dividerCacheFocus  FocusTarget
 	dividerCacheStream bool
-	statusMsg          string // transient message (e.g. "Copied N chars")
+	// preferredInputLines is the textarea height the layout was first
+	// sized with (captured on the first SetSize). Short terminals shrink
+	// the input band to keep the frame within the terminal; this field is
+	// the value to restore when the terminal grows again — reading the
+	// live textarea height instead would make a once-shrunk band permanent.
+	preferredInputLines int
+	statusMsg           string // transient message (e.g. "Copied N chars")
 }
 
 // NewModel creates a new TUI model. Returns a pointer: Model contains a
@@ -309,7 +365,6 @@ func NewModel(a *agent.Agent, cfg *config.Config) *Model {
 		toolDiffShown:       make(map[string]bool),
 		keys:                DefaultKeyMap,
 		sessionID:           "",
-		approvalResult:      make(chan bool, 1),
 		selectionYOff:       -1,
 		selection:           nil,
 		wrappedLines:        nil,
@@ -365,20 +420,40 @@ func (m *Model) SetSize(width, height int) {
 	m.height = height
 	m.ready = true
 
-	// Layout: status bar (1 line) at bottom, textarea above it, viewport fills rest
+	// Layout: status bar (1 line) at bottom, textarea above it, viewport fills rest.
+	//
+	// The composed frame must never exceed the terminal: the renderer runs
+	// inline (alt-screen off) and an over-tall frame scrolls the screen and
+	// desyncs the incremental cell diff. On short terminals the input band
+	// gives way FIRST, then the viewport floors at one row — the old
+	// unconditional viewport floor of 3 made the minimum frame 8 lines no
+	// matter the terminal height.
 	statusBarHeight := 1
-	textareaHeight := m.textarea.Height()
-	if textareaHeight > 8 {
-		textareaHeight = 8
+	if m.preferredInputLines == 0 {
+		m.preferredInputLines = m.textarea.Height()
 	}
-	if textareaHeight < 1 {
-		textareaHeight = 1
+	inputLines := m.preferredInputLines
+	if inputLines > 8 {
+		inputLines = 8
+	}
+	if inputLines < 1 {
+		inputLines = 1
 	}
 
-	vpHeight := height - statusBarHeight - textareaHeight - 1 // -1 for textarea border
+	vpHeight := height - statusBarHeight - inputLines - 1 // -1 for divider
 	if vpHeight < 3 {
-		vpHeight = 3
+		// Short terminal: shrink the input band before taking rows from
+		// the chat viewport, then floor the viewport at a single row.
+		inputLines -= 3 - vpHeight
+		if inputLines < 1 {
+			inputLines = 1
+		}
+		vpHeight = height - statusBarHeight - inputLines - 1
+		if vpHeight < 1 {
+			vpHeight = 1 // under ~4 rows nothing fits; best effort
+		}
 	}
+	textareaHeight := inputLines
 
 	main := m.mainWidth()
 	m.viewport.Width = main - 2 // padding

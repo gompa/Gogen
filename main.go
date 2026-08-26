@@ -132,12 +132,18 @@ func run() error {
 	}
 
 	var pf *projectfile.ProjectFile
+	// startupNotices collects pre-TUI messages (config adoption, API-key
+	// warning, agent setup) so they can be surfaced through each mode's
+	// proper channel: stderr for non-interactive modes, the TUI's managed
+	// render path for interactive mode (a raw line ahead of the inline
+	// frame desyncs the renderer).
+	var startupNotices []string
 	if isGlobalMode {
 		pf = projectfile.LoadGlobalConfig()
 		if pf != nil {
-			fmt.Fprintf(os.Stderr, "Using global config from %s\n", pf.Path)
+			startupNotices = append(startupNotices, "Using global config from "+pf.Path)
 		} else {
-			fmt.Fprintf(os.Stderr, "Global mode: no global config found at %s, using defaults\n", projectfile.GlobalConfigPath())
+			startupNotices = append(startupNotices, "Global mode: no global config found at "+projectfile.GlobalConfigPath()+", using defaults")
 		}
 	} else {
 		var loadErr error
@@ -169,7 +175,7 @@ func run() error {
 	// .gogen/gogen.md.
 
 	if cfg.OpenAIKey == "" {
-		fmt.Fprintf(os.Stderr, "Warning: OPENAI_API_KEY is not set. Some endpoints may require an API key.\n")
+		startupNotices = append(startupNotices, "Warning: OPENAI_API_KEY is not set. Some endpoints may require an API key.")
 	}
 
 	applyRuntimeConfig(cfg)
@@ -178,7 +184,8 @@ func run() error {
 	// does not block on the ~2.6 MB init overhead.
 	contextmgr.WarmTokenizer()
 
-	a, restoredModel := newAgent(cfg, isGlobalMode)
+	a, restoredModel, agentNotices := newAgent(cfg, isGlobalMode)
+	startupNotices = append(startupNotices, agentNotices...)
 	// Background jobs (execute_command background=true) are owned by the
 	// session and killed when it closes; this defer covers the TUI, CLI, and
 	// web default-session agents at process exit (web session agents are
@@ -195,17 +202,29 @@ func run() error {
 	defer a.FlushPending()
 
 	if opts.prompt != "" {
+		printStartupNotices(startupNotices)
 		go a.ValidateRestoredModel(context.Background(), restoredModel)
 		return runSinglePrompt(ctx, a, opts.prompt, cfg)
 	}
 
 	if opts.web {
+		printStartupNotices(startupNotices)
 		return runWeb(ctx, a, cfg, restoredModel, webTokenStatePath(isGlobalMode, workingDir))
 	}
 
-	// Default: TUI mode.
-	runTUI(ctx, a, cfg, restoredModel)
+	// Default: TUI mode. Notices go through the TUI's managed render path
+	// (tea.Println), never raw stderr — see tui.SetStartupNotices.
+	runTUI(ctx, a, cfg, restoredModel, startupNotices)
 	return nil
+}
+
+// printStartupNotices writes startup notices to stderr for the non-TUI
+// modes: they have no managed render surface, so direct stderr output is
+// correct there and preserves the historical behavior.
+func printStartupNotices(notices []string) {
+	for _, n := range notices {
+		fmt.Fprintln(os.Stderr, n)
+	}
 }
 
 // runSinglePrompt processes one user prompt. It returns the error so the

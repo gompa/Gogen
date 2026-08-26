@@ -158,14 +158,45 @@ func cmdExit(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 }
 
 func cmdCompact(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
-	if err := m.agent.CompactHistory(m.ctx); err != nil {
-		m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Compact failed: %v", err)))
-	} else {
-		m.appendChatLine(SystemStyle.Render(fmt.Sprintf("History compacted (%d messages remaining).", len(m.agent.Messages))))
-		m.agent.FlushSession()
-		m.checkPersistError()
+	if m.agent == nil {
+		return true, false, nil
 	}
-	return true, false, nil
+	if m.streaming {
+		m.appendChatLine(ErrorStyle.Render("Compact: wait for the current turn to finish (or cancel it first)."))
+		return true, false, nil
+	}
+	if m.compacting {
+		m.appendChatLine(ErrorStyle.Render("Compact: already running — cancel it with ctrl+c."))
+		return true, false, nil
+	}
+	// CompactHistory makes an LLM summarization call; run it off the
+	// Update thread so the UI stays responsive (the old inline call froze
+	// the whole TUI for the request's duration). The result arrives as
+	// compactResultMsg.
+	base := m.ctx
+	if base == nil {
+		base = context.Background()
+	}
+	ctx, cancel := context.WithCancel(base)
+	// The flags live on the FOCUSED live session (per-session compaction,
+	// mirroring the streaming pattern); m.compacting is its mirror.
+	sess := m.turnSession()
+	sess.compacting = true
+	sess.compactUserCancelled = false
+	sess.compactCancel = cancel
+	// Bump the generation BEFORE the goroutine starts: the result carries
+	// the seq, so a later cancel + restart supersedes it cleanly (see
+	// liveSession.compactSeq).
+	sess.compactSeq++
+	seq := sess.compactSeq
+	m.compacting = true
+	a := m.agent
+	compactCmd := func() tea.Msg {
+		defer cancel()
+		err := a.CompactHistory(ctx)
+		return compactResultMsg{agent: a, err: err, seq: seq}
+	}
+	return true, false, tea.Batch(m.spinner.Tick, compactCmd)
 }
 
 func cmdVerbose(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
@@ -208,6 +239,25 @@ func cmdContext(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 }
 
 func cmdSession(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
+	// /resume <target> (and the "sessions <target>" alias) routes through
+	// resumeSavedRow so every TUI resume entry point shares the same
+	// guards: a target still hosted in a background slot is FOCUSED
+	// (switchToLive) instead of rebound onto a second agent — two agents
+	// with one SessionID both persist to the same file and the rebound
+	// agent's first full save wipes the other's pending delta (partial
+	// restore on the next load; the web dedupes in loadOrCreateRuntime).
+	// "del" and malformed arguments keep going through the agent for the
+	// canonical usage errors.
+	if cmd, args := agent.ParseSessionCommand(input); (cmd == "resume" || cmd == "sessions") && args != "" {
+		if _, isDel, perr := agent.ParseResumeDelArg(args); !isDel && perr == nil {
+			target, rerr := m.agent.ResolveResumeTarget(args)
+			if rerr != nil {
+				m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Session: %v", rerr)))
+				return true, false, nil
+			}
+			return true, false, m.resumeSavedRow(target)
+		}
+	}
 	result, _, err := m.agent.HandleSessionCommand(m.ctx, input, session.NewID())
 	if err != nil {
 		m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Session: %v", err)))
@@ -230,13 +280,15 @@ func cmdSession(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 		// session's recency so the list does not reorder (see
 		// rebindActivity).
 		m.rebindActivity()
-		m.refreshContextStats()
+		// A resumed/restored conversation has a cold token-count cache:
+		// probe off the Update thread (a synchronous probe would tokenize
+		// the whole history on the render loop).
+		cmds := []tea.Cmd{m.requestContextStats(), m.requestSavedSessions()}
 		// "resume del <current>" mutates the store on this early-return
 		// path (unlike /new and plain resume, which do not) — refresh so
 		// the deleted row does not linger in the sidebar until the next
 		// 30 s tick.
-		m.refreshSavedSessions()
-		return true, false, nil
+		return true, false, tea.Batch(cmds...)
 	} else if result.Sessions != nil {
 		// Show session list modal
 		m.sessionList = result.Sessions
@@ -252,9 +304,9 @@ func cmdSession(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 	}
 	// Session commands (new, resume, delete) persist.
 	m.checkPersistError()
-	// The store index just changed — refresh the sidebar's unified list.
-	m.refreshSavedSessions()
-	return true, false, nil
+	// The store index just changed — refresh the sidebar's unified list
+	// off the Update thread.
+	return true, false, m.requestSavedSessions()
 }
 
 func cmdSaveConfig(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
@@ -265,27 +317,33 @@ func cmdSaveConfig(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 }
 
 func cmdModels(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
-	out, _, err := m.agent.HandleModelsCommand(m.ctx, input)
-	// If no selector, show interactive modal
-	arg := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(trimmed, "/models"), "models"))
-	if arg == "" {
-		list, listErr := m.agent.ListModels(m.ctx)
-		if listErr != nil {
-			m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Models: %v", listErr)))
-		} else {
-			m.modelList = list
-			m.modelCursor = 0
-			m.modal = ModalModels
-		}
+	if m.agent == nil {
 		return true, false, nil
 	}
-	// Has selector — do inline switch
-	if err != nil {
-		m.appendChatLine(ErrorStyle.Render(fmt.Sprintf("Models: %v", err)))
-	} else {
-		m.appendChatLine(SystemStyle.Render(out))
+	// Both paths hit the network (the provider /models endpoint, and the
+	// context-limit probe inside SelectModel); run them off the Update
+	// thread so the UI stays responsive during the round trip. The old
+	// no-arg path even made the list call twice (HandleModelsCommand +
+	// ListModels); the split below makes exactly one.
+	arg := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(trimmed, "/models"), "models"))
+	a := m.agent
+	base := m.ctx
+	if base == nil {
+		base = context.Background()
 	}
-	return true, false, nil
+	if arg == "" {
+		// If no selector, show interactive modal (on modelListMsg).
+		m.statusMsg = "Loading models…"
+		return true, false, func() tea.Msg {
+			list, err := a.ListModels(base)
+			return modelListMsg{agent: a, list: list, err: err}
+		}
+	}
+	// Has selector — do the inline switch in the background.
+	return true, false, func() tea.Msg {
+		out, _, err := a.HandleModelsCommand(base, input)
+		return modelSwitchMsg{agent: a, out: out, err: err}
+	}
 }
 
 func cmdDir(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
@@ -336,12 +394,14 @@ func (m *Model) submitDeliveredText(text string) tea.Cmd {
 
 	sess := m.turnSession()
 	sess.streaming = true
+	sess.turnSeq++
+	seq := sess.turnSeq
 	streamCtx, cancelFn := context.WithCancel(m.ctx)
 	sess.cancel = cancelFn
 
-	adapter := NewStreamAdapter(sess.id, m.program, sess)
+	adapter := NewStreamAdapter(sess.id, seq, m.program, sess)
 	a := m.agent
-	approver := m.makeDeleteApprover()
+	approver := m.makeDeleteApprover(sess.id, m.program)
 
 	streamCmd := func() tea.Msg {
 		defer cancelFn()
@@ -351,20 +411,21 @@ func (m *Model) submitDeliveredText(text string) tea.Cmd {
 			adapter.Handlers(),
 		)
 		if err != nil {
-			return failOfStream(sess.id, err)
+			return failOfStream(sess.id, seq, err)
 		}
 		// Return streamEndMsg directly so handleStreamEnd refreshes context
 		// stats synchronously after Messages are final.
-		return endOfStream(sess.id)
+		return endOfStream(sess.id, seq)
 	}
 	return tea.Batch(startProgress, streamCmd)
 }
 
 // drainDeliveries starts the next queued system delivery when the TUI is
-// idle. Returns nil when nothing is queued or a turn is running; the next
-// delivery (if any) drains at the next stream end.
+// idle. Returns nil when nothing is queued or a turn (or an async
+// /compact) is running; the next delivery (if any) drains at the next
+// stream end.
 func (m *Model) drainDeliveries() tea.Cmd {
-	if m.streaming {
+	if m.streaming || m.compacting {
 		return nil
 	}
 	if m.deliveryDrops > 0 {
@@ -408,12 +469,17 @@ func (m *Model) submitUserInput(input string) tea.Cmd {
 	// output, not on submit).
 	sess := m.turnSession()
 	sess.streaming = true
+	// Bump the turn generation BEFORE the goroutine starts: every message
+	// this turn emits (and its terminal) carries the new seq, so a later
+	// cancel + resubmit supersedes it cleanly.
+	sess.turnSeq++
+	seq := sess.turnSeq
 	streamCtx, cancelFn := context.WithCancel(m.ctx)
 	sess.cancel = cancelFn
 
-	adapter := NewStreamAdapter(sess.id, m.program, sess)
+	adapter := NewStreamAdapter(sess.id, seq, m.program, sess)
 	a := m.agent
-	approver := m.makeDeleteApprover()
+	approver := m.makeDeleteApprover(sess.id, m.program)
 
 	streamCmd := func() tea.Msg {
 		defer cancelFn()
@@ -423,38 +489,44 @@ func (m *Model) submitUserInput(input string) tea.Cmd {
 			adapter.Handlers(),
 		)
 		if err != nil {
-			return failOfStream(sess.id, err)
+			return failOfStream(sess.id, seq, err)
 		}
 		// Return streamEndMsg directly so handleStreamEnd refreshes context
 		// stats synchronously after Messages are final.
-		return endOfStream(sess.id)
+		return endOfStream(sess.id, seq)
 	}
 	return tea.Batch(startProgress, streamCmd)
 }
 
 // makeDeleteApprover creates a delete approver that shows a modal.
-func (m *Model) makeDeleteApprover() agent.DeleteApprover {
+// sessID attributes the request to its live session so the modal can name
+// a background requester.
+//
+// The closure runs on the turn's stream goroutine (tool execution), so it
+// must not touch Model state — it only sends the request to the Update
+// thread (program.Send is thread-safe) and blocks on its OWN reply
+// channel. The per-request channel replaces the old shared channel +
+// in-flight flag, which raced the Update thread's dismissApproval and let
+// concurrent approvals steal each other's answers.
+func (m *Model) makeDeleteApprover(sessID string, send programSender) agent.DeleteApprover {
 	return func(ctx context.Context, req agent.DeleteRequest) (bool, error) {
 		if ctx.Err() != nil {
 			return false, ctx.Err()
 		}
-		// Mark this approval as in-flight BEFORE draining/sending so a stale
-		// dismissal from a previous cancelled approval cannot masquerade as
-		// this approval's response.
-		m.approvalInFlight = true
-		defer func() { m.approvalInFlight = false }()
-		// Drain stale value from previous approval (e.g. context cancelled
-		// while user still responded to modal). The flag above guarantees
-		// any value sitting in the channel belongs to the previous approver.
-		select {
-		case <-m.approvalResult:
-		default:
+		ar := &approvalRequest{
+			req:   req,
+			sid:   sessID,
+			reply: make(chan bool, 1),
 		}
-		// Show approval modal via Bubble Tea
-		m.program.Send(approvalRequestMsg{req: req})
-		// Wait for result from the channel
+		// Show the approval modal via Bubble Tea. The Update thread queues
+		// concurrent requests (handleApprovalRequestMsg) and replies on
+		// ar.reply when the user answers or the turn unwinds.
+		if send != nil {
+			send.Send(approvalRequestMsg{ar: ar})
+		}
+		// Wait for the result on this request's own channel.
 		select {
-		case approved := <-m.approvalResult:
+		case approved := <-ar.reply:
 			return approved, nil
 		case <-ctx.Done():
 			return false, ctx.Err()
@@ -464,5 +536,5 @@ func (m *Model) makeDeleteApprover() agent.DeleteApprover {
 
 // approvalRequestMsg is an internal message to trigger the approval modal.
 type approvalRequestMsg struct {
-	req agent.DeleteRequest
+	ar *approvalRequest
 }
