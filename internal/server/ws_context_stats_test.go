@@ -24,14 +24,14 @@ func TestApplyContextStatsWireFormat(t *testing.T) {
 	}{
 		{
 			name:      "fresh session: limit known, used zero",
-			snap:      contextmgr.ContextSnapshot{Limit: 200000, MessageCount: 0},
+			snap:      contextmgr.ContextSnapshot{Limit: 200000, LimitResolved: true, MessageCount: 0},
 			wantLimit: 200000,
 			wantUsed:  0,
 			wantJSON:  []string{`"contextLimit":200000`, `"usedTokens":0`},
 		},
 		{
 			name:      "mid-session: both set",
-			snap:      contextmgr.ContextSnapshot{Limit: 200000, Used: 1234, MessageCount: 3, Percent: 0.006},
+			snap:      contextmgr.ContextSnapshot{Limit: 200000, LimitResolved: true, Used: 1234, MessageCount: 3, Percent: 0.006},
 			wantLimit: 200000,
 			wantUsed:  1234,
 			wantJSON:  []string{`"contextLimit":200000`, `"usedTokens":1234`},
@@ -39,6 +39,17 @@ func TestApplyContextStatsWireFormat(t *testing.T) {
 		{
 			name:      "no context manager: limit unknown, used zero",
 			snap:      contextmgr.ContextSnapshot{MessageCount: 0},
+			wantLimit: 0,
+			wantUsed:  0,
+			wantJSON:  []string{`"usedTokens":0`},
+			notInJSON: []string{`"contextLimit"`},
+		},
+		{
+			name: "unresolved limit: display fallback must not masquerade as the model window",
+			snap: contextmgr.ContextSnapshot{Limit: 128000, MessageCount: 0},
+			// Limit is the 128k fallback but LimitResolved is false: the
+			// wire must stay silent (absent = unknown) so the client can
+			// seed the badge from the model list instead.
 			wantLimit: 0,
 			wantUsed:  0,
 			wantJSON:  []string{`"usedTokens":0`},

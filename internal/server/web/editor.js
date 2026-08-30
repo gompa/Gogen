@@ -282,6 +282,10 @@ export async function initMonaco() {
         { token: 'markup.deleted', foreground: 'F14C4C' },
       ],
       colors: {
+        // Match the app chrome (--bg in styles.css :root) so editor and
+        // diff surfaces blend with the page instead of showing the
+        // vs-dark default #1e1e1e.
+        'editor.background': '#131418',
         'diffEditor.insertedTextBackground': '#2ea04340',
         'diffEditor.removedTextBackground': '#f8514940',
         'diffEditor.insertedLineBackground': '#2ea04326',
@@ -303,6 +307,8 @@ export async function initMonaco() {
         { token: 'markup.deleted', foreground: 'CF222E' },
       ],
       colors: {
+        // Match the app chrome (--bg in styles.css :root.light).
+        'editor.background': '#f7f8fa',
         'diffEditor.insertedTextBackground': '#dafbe180',
         'diffEditor.removedTextBackground': '#ffebe980',
         'diffEditor.insertedLineBackground': '#dafbe140',
@@ -1444,6 +1450,8 @@ async function saveAll() {
 
 async function openUnstagedDiff(path) {
   await initMonaco();
+  const prevPath = activePath;
+  const prevMode = mode;
   if (activePath && editor && mode === 'edit') {
     const cur = buffers.get(activePath);
     if (cur) cur.viewState = editor.saveViewState();
@@ -1465,7 +1473,15 @@ async function openUnstagedDiff(path) {
     }
   } catch (err) {
     toast(`Diff failed: ${err.message}`, 'error');
-    showEditPane();
+    // Restore the pre-call state. Neither editor was touched on failure
+    // (diff models are only swapped in on success, and the edit editor
+    // keeps its previous model), so only activePath and the visible pane
+    // need to go back. Without this the path label would name the failed
+    // diff path while the editor shows the previous file, and Ctrl+S
+    // would hit a path with no buffer and silently no-op.
+    activePath = prevPath;
+    if (prevMode === 'diff') showDiffPane();
+    else showEditPane();
   }
   updateDirtyIndicators();
 }

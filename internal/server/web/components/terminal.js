@@ -9,6 +9,8 @@
 // chat-socket handlers (term_opened/term_output/term_exit and the
 // user_term_* messages) call the exported terminal* functions.
 
+import { icon } from '/components/icons.js';
+
 let deps = null;
 
 let terminalPanel = null;
@@ -81,9 +83,10 @@ function terminalIsMobile() {
 function terminalTheme() {
     const cs = getComputedStyle(document.documentElement);
     return {
-        background: cs.getPropertyValue('--bg').trim() || '#1e1e1e',
-        foreground: cs.getPropertyValue('--fg').trim() || '#d4d4d4',
-        cursor: cs.getPropertyValue('--accent').trim() || '#569cd6',
+        // Fallbacks mirror the :root palette in styles.css.
+        background: cs.getPropertyValue('--bg').trim() || '#131418',
+        foreground: cs.getPropertyValue('--fg').trim() || '#e4e6eb',
+        cursor: cs.getPropertyValue('--accent').trim() || '#7aa2f7',
     };
 }
 
@@ -135,7 +138,7 @@ function terminalSetExpanded(expanded) {
     } else {
         terminalPanel.style.height = '';
     }
-    terminalChevron.textContent = expanded ? '▾' : '▴';
+    terminalChevron.innerHTML = icon(expanded ? 'chevron-down' : 'chevron-up');
     terminalSaveState();
     terminalRefreshStripVar();
     if (expanded) {
@@ -157,8 +160,15 @@ function terminalUpdateHint() {
 //   closable      — show a close button (agent tabs yes, user tab no)
 //   user          — interactive terminal (stdin enabled) vs read-only
 function terminalCreateTab(id, opts = {}) {
+    // Created inactive and hidden: terminalSelect is the sole authority
+    // over which tab is .active and which host is visible. A caller may
+    // legitimately skip selection (an agent tab opened while the user's
+    // shell has focus must not take it over), so a fresh tab must never
+    // be visible on its own — .term-host is absolute inset:0 and would
+    // paint over the current terminal, and a pre-marked .active would
+    // leave two tabs highlighted at once.
     const tab = document.createElement('div');
-    tab.className = 'term-tab active' + (opts.user ? ' user-tab' : '');
+    tab.className = 'term-tab' + (opts.user ? ' user-tab' : '');
     tab.title = opts.tooltip || opts.title || '';
     const titleEl = document.createElement('span');
     titleEl.className = 'term-tab-title';
@@ -167,7 +177,7 @@ function terminalCreateTab(id, opts = {}) {
     statusEl.className = 'term-tab-status';
     const restartEl = document.createElement('span');
     restartEl.className = 'term-tab-restart';
-    restartEl.textContent = '↻';
+    restartEl.innerHTML = icon('rotate');
     restartEl.title = 'Restart shell';
     restartEl.hidden = true;
     restartEl.addEventListener('click', (e) => {
@@ -176,7 +186,7 @@ function terminalCreateTab(id, opts = {}) {
     });
     const closeEl = document.createElement('span');
     closeEl.className = 'term-tab-close';
-    closeEl.textContent = '✕';
+    closeEl.innerHTML = icon('x');
     if (opts.closable === false) {
         closeEl.style.display = 'none';
     } else {
@@ -194,6 +204,7 @@ function terminalCreateTab(id, opts = {}) {
 
     const host = document.createElement('div');
     host.className = 'term-host';
+    host.style.display = 'none'; // revealed by terminalSelect (see above)
     const inst = document.createElement('div');
     inst.className = 'term-instance';
     host.appendChild(inst);
@@ -508,7 +519,7 @@ function terminalMoreRender() {
         if (t.closable) {
             const close = document.createElement('span');
             close.className = 'term-more-close';
-            close.textContent = '✕';
+            close.innerHTML = icon('x');
             close.title = 'Close terminal';
             close.addEventListener('click', (e) => {
                 e.stopPropagation();
@@ -665,7 +676,7 @@ export function initTerminal(d) {
             terminalHeight = Math.min(terminalHeight, terminalMaxHeight());
             terminalPanel.style.height = terminalHeight + 'px';
         }
-        terminalChevron.textContent = terminalExpanded ? '▾' : '▴';
+        terminalChevron.innerHTML = icon(terminalExpanded ? 'chevron-down' : 'chevron-up');
         if (terminalIsMobile()) terminalCloseMobile();
         // The user shell is the default terminal: pinned tab, selected now.
         terminalEnsureUserTab();

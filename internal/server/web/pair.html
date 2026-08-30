@@ -15,32 +15,35 @@
   occurrence, and a placeholder in the comment would swallow the message.
 -->
 <style>
-  :root { color-scheme: light dark; }
+  /* Palette mirrors styles.css :root (graphite ramp + blue accent); this
+     page must stay self-contained, so tokens are inlined as literals. */
+  :root { color-scheme: dark; }
   body {
     margin: 0; min-height: 100vh;
     display: flex; align-items: center; justify-content: center;
-    background: #1e1e1e; color: #d4d4d4;
+    background: #131418; color: #e4e6eb;
     font-family: system-ui, -apple-system, sans-serif;
   }
   .card {
-    background: #252526; border: 1px solid #3c3c3c; border-radius: 8px;
+    background: #1a1c20; border: 1px solid #2c2f36; border-radius: 12px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
     padding: 24px; width: min(360px, 90vw); box-sizing: border-box;
   }
   h1 { font-size: 18px; margin: 0 0 8px; }
   p.msg { margin: 0 0 16px; font-size: 14px; line-height: 1.5; }
   input[type="text"] {
     width: 100%; box-sizing: border-box; padding: 10px;
-    border: 1px solid #3c3c3c; border-radius: 4px;
-    background: #1e1e1e; color: #d4d4d4;
+    border: 1px solid #2c2f36; border-radius: 8px;
+    background: #131418; color: #e4e6eb;
     font-family: ui-monospace, SFMono-Regular, monospace; font-size: 14px;
   }
   button {
     margin-top: 10px; width: 100%; padding: 10px;
-    border: none; border-radius: 4px;
-    background: #0e639c; color: #fff; font-size: 14px; cursor: pointer;
+    border: none; border-radius: 8px;
+    background: #2e6fe0; color: #fff; font-size: 14px; cursor: pointer;
   }
-  button:hover { background: #1177bb; }
-  p.hint { margin: 14px 0 0; font-size: 12px; color: #8a8a8a; line-height: 1.5; }
+  button:hover { background: #3d7bea; }
+  p.hint { margin: 14px 0 0; font-size: 12px; color: #71767f; line-height: 1.5; }
 </style>
 </head>
 <body>

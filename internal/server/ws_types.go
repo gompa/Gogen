@@ -440,7 +440,13 @@ type WSMessage struct {
 
 func applyContextStats(msg *WSMessage, stats agent.TurnContext, accum *agent.UsageAccumulator) {
 	snap := stats.Snapshot
-	if snap.Limit > 0 {
+	// An unresolved limit is the snapshot's 128k display fallback, not the
+	// model's window: omit contextLimit to keep the wire contract
+	// (absent = unknown), so clients can show their own best estimate
+	// (the model list's per-model limit) instead of a wrong-but-plausible
+	// number. The first resolved message (turn start, model switch,
+	// session restore) carries the real value and overwrites it.
+	if snap.Limit > 0 && snap.LimitResolved {
 		msg.ContextLimit = snap.Limit
 	}
 	// Always report the used count (0 for a fresh session) so clients can
@@ -462,7 +468,7 @@ func applyContextStats(msg *WSMessage, stats agent.TurnContext, accum *agent.Usa
 	if stats.LastUsage != nil && stats.LastUsage.PromptTokens > 0 {
 		msg.UsedSource = "api"
 	}
-	if snap.Limit > 0 {
+	if msg.ContextLimit > 0 {
 		msg.UsedPercent = snap.Percent
 	}
 	if accum != nil {

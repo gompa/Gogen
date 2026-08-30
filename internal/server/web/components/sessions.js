@@ -28,6 +28,7 @@
 //   deps.getMessageRawStore()          — the per-message raw-text WeakMap
 
 import { openModal, closeModal } from '/editor.js';
+import { icon } from '/components/icons.js';
 
 let deps = null;
 
@@ -254,7 +255,7 @@ function buildSessionRow(pane, entry, act) {
     // saved session); a saved session's ✕ deletes it.
     const closeBtn = document.createElement('button');
     closeBtn.className = 'session-row-del';
-    closeBtn.textContent = '✕';
+    closeBtn.innerHTML = icon('x');
     if (pane) {
         closeBtn.title = 'Close session (stays saved)';
         closeBtn.onclick = (e) => {

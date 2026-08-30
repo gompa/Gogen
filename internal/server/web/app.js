@@ -28,6 +28,7 @@
         // used by the toolbar, the settings subagent picker and the board
         // "Start agent" popover.
         import { createPopover } from '/components/popover.js';
+        import { icon } from '/components/icons.js';
         import {
             createModelThinkingPicker,
             createThinkingChips,
@@ -651,7 +652,7 @@
             currentMode = (mode || 'act').toLowerCase();
             if (!tbModeBtn) return;
             const label = currentMode === 'plan' ? 'Plan' : 'Act';
-            tbModeBtn.innerHTML = `${label} <span class="tb-arrow">▾</span>`;
+            tbModeBtn.innerHTML = `${icon('pen')} <span class="tb-mode-label">${label}</span> <span class="tb-arrow">${icon('chevron-down')}</span>`;
             // Highlight active option in popover
             document.querySelectorAll('#tb-mode-list .tb-model-row').forEach((r) => {
                 r.classList.toggle('active', r.dataset.mode === currentMode);
@@ -675,7 +676,7 @@
                 tbModelBtn.appendChild(document.createTextNode(name + ' '));
                 const arrow = document.createElement('span');
                 arrow.className = 'tb-arrow';
-                arrow.textContent = '▾';
+                arrow.innerHTML = icon('chevron-down');
                 tbModelBtn.appendChild(arrow);
                 // Hover tooltip: models.dev description of the current model.
                 if (description) {
@@ -774,6 +775,18 @@
             condensedBanner.hidden = true;
         });
 
+        // The server omits contextLimit until the session's window is
+        // resolved (first turn, model switch, or session restore). Until
+        // then the badge seeds from the model list's per-model
+        // contextLimit — the best known estimate; the first resolved
+        // context message carries the authoritative value and overwrites
+        // it. Returns 0 when the catalog has no entry for the model.
+        function catalogContextLimit(model) {
+            if (!model || !availableModels.length) return 0;
+            const m = availableModels.find((x) => x.id === model);
+            return (m && m.contextLimit) || 0;
+        }
+
         function updateContextInfo(data) {
             lastContextData = data || lastContextData;
             // warnNearCompact drives the banner (early warning); the server
@@ -783,10 +796,20 @@
                 nearCompactBanner.hidden = nearCompactDismissed || !data.warnNearCompact;
             }
             const used = data.usedTokens || 0;
-            const limit = data.contextLimit || 0;
+            // A server-provided limit is authoritative; an absent one means
+            // the window is unresolved yet — seed from the model list and
+            // stamp it onto data so the badge and its tooltip agree.
+            contextLimitResolved = !!data.contextLimit;
+            let limit = data.contextLimit || 0;
+            if (!limit) {
+                limit = catalogContextLimit(activePane() && activePane().model);
+                if (limit) data.contextLimit = limit;
+            }
             if (data.usedSource !== 'estimated') {
                 contextBaseUsed = used;
-                contextLimit = limit;
+                // Server value only (0 until resolved) — the display seed
+                // must not leak into the live-estimation state.
+                contextLimit = contextLimitResolved ? data.contextLimit : 0;
                 contextEstAdded = 0;
             }
 
@@ -1013,6 +1036,10 @@
         let contextBaseUsed = 0;
         let contextLimit = 0;
         let contextEstAdded = 0;
+        // True once the server has resolved the session's context window
+        // (a context echo carried contextLimit). While false the badge may
+        // show the model-list seed (catalogContextLimit) instead.
+        let contextLimitResolved = false;
         let lastContextData = null;
         // Coalesces per-token context badge updates into one rAF pass.
         let ctxEstimateRafPending = false;
@@ -1109,7 +1136,16 @@
                 const used = contextBaseUsed + contextEstAdded;
                 const data = Object.assign({}, lastContextData || {}, {
                     usedTokens: used,
-                    contextLimit: contextLimit || (lastContextData && lastContextData.contextLimit) || 0,
+                    // Module state only — never lastContextData.contextLimit,
+                    // which may hold the catalog seed (stamped by
+                    // updateContextInfo for display). Feeding the seed back
+                    // here would leak it into the live-estimation state and
+                    // flip contextLimitResolved true (updateContextInfo reads
+                    // it from this object) although the server never resolved
+                    // the window. Display is unaffected: updateContextInfo
+                    // re-derives the seed for the badge/tooltip from the
+                    // catalog when contextLimit is absent.
+                    contextLimit: contextLimit,
                     usedSource: 'estimated',
                     usedPercent: contextLimit > 0 ? used / contextLimit : 0,
                     toolTruncated: false,
@@ -1165,6 +1201,7 @@
                 contextBaseUsed: 0,
                 contextLimit: 0,
                 contextEstAdded: 0,
+                contextLimitResolved: false,
                 mode: 'act',
                 thinkingLevel: 'off',
                 reasoningEffortsUnsupported: false,
@@ -1273,6 +1310,7 @@
             pane.contextBaseUsed = contextBaseUsed;
             pane.contextLimit = contextLimit;
             pane.contextEstAdded = contextEstAdded;
+            pane.contextLimitResolved = contextLimitResolved;
         }
 
         function loadActivePaneState() {
@@ -1288,6 +1326,11 @@
             contextBaseUsed = pane.contextBaseUsed;
             contextLimit = pane.contextLimit;
             contextEstAdded = pane.contextEstAdded;
+            // The flag mirrors the active pane too: a stale value across a
+            // switch could make the handleModels re-seed stamp the catalog
+            // seed onto a resolved pane (or skip an unresolved one) before
+            // the re-attach context echo corrects it.
+            contextLimitResolved = !!pane.contextLimitResolved;
             _prevTurnActive = turnActive;
             if (cancelBtn) cancelBtn.disabled = !turnActive;
             document.getElementById('input-area').classList.toggle('turn-active', turnActive);
@@ -1778,6 +1821,19 @@
                 const wrap = document.createElement('div');
                 wrap.className = 'code-block-wrap';
                 pre.parentNode.insertBefore(wrap, pre);
+                // Header bar: language chip (when marked tagged the fence)
+                // on the left, copy button on the right.
+                const head = document.createElement('div');
+                head.className = 'code-block-head';
+                const codeEl = pre.querySelector('code');
+                const langMatch = codeEl && codeEl.className.match(/language-([\w+#.-]+)/);
+                if (langMatch) {
+                    const lang = document.createElement('span');
+                    lang.className = 'code-lang';
+                    lang.textContent = langMatch[1];
+                    head.appendChild(lang);
+                }
+                wrap.appendChild(head);
                 wrap.appendChild(pre);
                 const btn = document.createElement('button');
                 btn.type = 'button';
@@ -1797,7 +1853,7 @@
                         showToast('Copy failed', 'error');
                     }
                 });
-                wrap.appendChild(btn);
+                head.appendChild(btn);
             });
         }
 
@@ -2203,7 +2259,7 @@
             const resendBtn = document.createElement('button');
             resendBtn.className = 'resend-btn';
             resendBtn.type = 'button';
-            resendBtn.innerHTML = '↻';
+            resendBtn.innerHTML = icon('rotate');
             resendBtn.title = 'Resend this message';
             resendBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
@@ -2217,7 +2273,7 @@
             const editBtn = document.createElement('button');
             editBtn.className = 'edit-btn';
             editBtn.type = 'button';
-            editBtn.innerHTML = '✎';
+            editBtn.innerHTML = icon('pen');
             editBtn.title = 'Edit and resend';
             editBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
@@ -2254,7 +2310,7 @@
             const sendBtn2 = document.createElement('button');
             sendBtn2.className = 'inline-edit-send';
             sendBtn2.type = 'button';
-            sendBtn2.innerHTML = '▶';
+            sendBtn2.innerHTML = icon('play');
             sendBtn2.title = 'Send (Enter)';
             const cancelBtn2 = document.createElement('button');
             cancelBtn2.className = 'inline-edit-cancel';
@@ -2352,7 +2408,7 @@
                 applyReplyModelChip(msgDiv);
                 const forkBtn = document.createElement('button');
                 forkBtn.className = 'fork-btn';
-                forkBtn.textContent = '⑂';
+                forkBtn.innerHTML = icon('fork');
                 forkBtn.title = 'Fork session from this message';
                 forkBtn.addEventListener('click', (e) => {
                     e.stopPropagation();
@@ -2455,7 +2511,7 @@
             label.style.fontStyle = 'italic';
             label.textContent = 'Thinking';
             const toggle = document.createElement('span');
-            toggle.textContent = '▾';
+            toggle.innerHTML = icon('chevron-down');
             toggle.style.fontSize = '0.8em';
             header.appendChild(label);
             header.appendChild(toggle);
@@ -2473,7 +2529,7 @@
             header.addEventListener('click', () => {
                 const collapsed = body.style.display === 'none';
                 body.style.display = collapsed ? '' : 'none';
-                toggle.textContent = collapsed ? '▾' : '▸';
+                toggle.innerHTML = icon(collapsed ? 'chevron-down' : 'chevron-right');
             });
 
             smartScroll();
@@ -2619,7 +2675,7 @@
                 currentStreamDiv.dataset.msgIdx = idx;
                 const forkBtn = document.createElement('button');
                 forkBtn.className = 'fork-btn';
-                forkBtn.textContent = '⑂';
+                forkBtn.innerHTML = icon('fork');
                 forkBtn.title = 'Fork session from this message';
                 forkBtn.addEventListener('click', (e) => {
                     e.stopPropagation();
@@ -2813,8 +2869,10 @@
         function buildToolCardHeader(name, args, streaming) {
             const header = document.createElement('div');
             header.className = 'tool-call-header';
-            const icon = document.createElement('span');
-            icon.className = 'tool-icon';
+            // Named iconEl (not `icon`) so it cannot shadow the imported
+            // icon() helper used for the chevron toggle below.
+            const iconEl = document.createElement('span');
+            iconEl.className = 'tool-icon';
             const toolName = document.createElement('span');
             toolName.className = 'tool-name';
             toolName.textContent = name;
@@ -2824,8 +2882,8 @@
             else toolArgs.appendChild(formatToolArgsFragment(args));
             const toggle = document.createElement('span');
             toggle.className = 'tool-toggle';
-            toggle.textContent = '▾';
-            header.appendChild(icon);
+            toggle.innerHTML = icon('chevron-down');
+            header.appendChild(iconEl);
             header.appendChild(toolName);
             header.appendChild(toolArgs);
             header.appendChild(toggle);
@@ -3210,7 +3268,7 @@
                         label.style.fontStyle = 'italic';
                         label.textContent = 'Thinking';
                         const toggle = document.createElement('span');
-                        toggle.textContent = '▾';
+                        toggle.innerHTML = icon('chevron-down');
                         toggle.style.fontSize = '0.8em';
                         header.appendChild(label);
                         header.appendChild(toggle);
@@ -3223,7 +3281,7 @@
                         header.addEventListener('click', () => {
                             const collapsed = body.style.display === 'none';
                             body.style.display = collapsed ? '' : 'none';
-                            toggle.textContent = collapsed ? '▾' : '▸';
+                            toggle.innerHTML = icon(collapsed ? 'chevron-down' : 'chevron-right');
                         });
                         if (h.createdAt) {
                             div.title = formatExactTime(msgDate(h.createdAt));
@@ -4207,6 +4265,16 @@
                 // effort options come from the catalog's per-model
                 // reasoningEfforts too).
                 if (isSettingsOpen()) subagentPicker.render();
+                // The catalog loads lazily (idle callback) and can arrive
+                // AFTER the attach context message: re-seed the badge if
+                // the window is still unresolved.
+                if (!contextLimitResolved) {
+                    const seed = catalogContextLimit(activePane() && activePane().model);
+                    if (seed) {
+                        lastContextData = Object.assign({}, lastContextData, { contextLimit: seed });
+                        updateToolbarContext(lastContextData);
+                    }
+                }
             } else if (data.model) {
                 updateModelInfo(data.model, availableModels.find((m) => m.id === data.model)?.description);
             }
@@ -4541,7 +4609,7 @@
             // agent server-side.
             const closeBtn = document.createElement('button');
             closeBtn.className = 'session-row-del';
-            closeBtn.textContent = '✕';
+            closeBtn.innerHTML = icon('x');
             if (pane) {
                 closeBtn.title = 'Close session (stays saved)';
                 closeBtn.onclick = (e) => {
@@ -4663,7 +4731,7 @@
                 const remove = document.createElement('button');
                 remove.type = 'button';
                 remove.className = 'attachment-remove';
-                remove.textContent = '✕';
+                remove.innerHTML = icon('x');
                 remove.title = 'Remove image';
                 remove.setAttribute('aria-label', 'Remove image');
                 remove.addEventListener('click', () => removeAttachment(i));

@@ -4,23 +4,57 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <!-- Address-bar color; kept in sync with the theme by app.js (applyTheme). -->
-    <meta name="theme-color" content="#1e1e1e">
+    <meta name="theme-color" content="#131418">
     <title>GoGen AI Agent</title>
     <link rel="stylesheet" href="/styles.css">
     <link rel="stylesheet" href="/xterm/xterm.css">
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤖</text></svg>">
 </head>
 <body>
+    <!-- Icon sprite: referenced app-wide via <use href="#i-…"> (see
+         components/icons.js). Stroke-based symbols; the .icon class paints
+         them with currentColor. Keep width/height 0 so it never affects
+         layout while staying referable. -->
+    <svg xmlns="http://www.w3.org/2000/svg" style="position:absolute;width:0;height:0" aria-hidden="true">
+        <defs>
+            <symbol id="i-chat" viewBox="0 0 24 24"><path d="M4 5h16v11H9l-5 4V5z"/></symbol>
+            <symbol id="i-code" viewBox="0 0 24 24"><path d="M8 8l-4 4 4 4M16 8l4 4-4 4"/></symbol>
+            <symbol id="i-board" viewBox="0 0 24 24"><rect x="4" y="4" width="4.5" height="16" rx="1"/><rect x="9.75" y="4" width="4.5" height="11" rx="1"/><rect x="15.5" y="4" width="4.5" height="7" rx="1"/></symbol>
+            <symbol id="i-terminal" viewBox="0 0 24 24"><path d="M5 7l5 5-5 5M12 17h7"/></symbol>
+            <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M21 4h-7M10 4H3M21 12h-9M8 12H3M21 20h-5M12 20H3M14 2v4M8 10v4M16 18v4"/></symbol>
+            <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
+            <symbol id="i-paperclip" viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 21 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
+            <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.6 3.8 5.7 3.8 9s-1.3 6.4-3.8 9c-2.5-2.6-3.8-5.7-3.8-9S9.5 5.6 12 3z"/></symbol>
+            <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+            <symbol id="i-chevron-up" viewBox="0 0 24 24"><path d="M6 15l6-6 6 6"/></symbol>
+            <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></symbol>
+            <symbol id="i-chevron-left" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></symbol>
+            <symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+            <symbol id="i-chevrons-right" viewBox="0 0 24 24"><path d="M7 6l6 6-6 6M14 6l6 6-6 6"/></symbol>
+            <symbol id="i-arrow-up" viewBox="0 0 24 24"><path d="M12 19V5M6 11l6-6 6 6"/></symbol>
+            <symbol id="i-arrow-down" viewBox="0 0 24 24"><path d="M12 5v14M6 13l6 6 6-6"/></symbol>
+            <symbol id="i-fork" viewBox="0 0 24 24"><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M6 15V3M6 3a3 3 0 0 1 3 3v1c0 3 2 5 6 5.5"/></symbol>
+            <symbol id="i-pen" viewBox="0 0 24 24"><path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></symbol>
+            <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3zM19 15l.7 1.8L21.5 17.5l-1.8.7L19 20l-.7-1.8-1.8-.7 1.8-.7L19 15z"/></symbol>
+            <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01"/></symbol>
+            <symbol id="i-rotate" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></symbol>
+            <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 5l12 7-12 7V5z"/></symbol>
+            <symbol id="i-swap" viewBox="0 0 24 24"><path d="M4 8h13M14 5l3 3-3 3M20 16H7M10 13l-3 3 3 3"/></symbol>
+            <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></symbol>
+        </defs>
+    </svg>
     <div id="top-tabs">
-        <button type="button" class="main-tab active" data-pane="chat">Chat</button>
-        <button type="button" class="main-tab" data-pane="editor">Editor</button>
+        <!-- Brand mark doubles as the connection indicator: one dot,
+             semantic color (green/red/amber) driven by app.js by id. -->
+        <div id="brand" title="GoGen"><span id="conn-indicator" class="disconnected" title="Disconnected" role="status" aria-live="polite" aria-label="Disconnected"></span><span class="brand-text">GoGen</span></div>
+        <button type="button" class="main-tab active" data-pane="chat"><svg class="icon"><use href="#i-chat"></use></svg><span>Chat</span></button>
+        <button type="button" class="main-tab" data-pane="editor"><svg class="icon"><use href="#i-code"></use></svg><span>Editor</span></button>
         <!-- Board tab: hidden until the server's config push reports the
              board feature enabled (app.js applyFeatureSettings). -->
-        <button type="button" class="main-tab" id="board-tab" data-pane="board" title="Kanban board" hidden>Board</button>
-        <button type="button" class="main-tab" id="terminal-tab" data-pane="terminal" title="Terminal">Terminal<span id="terminal-tab-badge" hidden></span></button>
-        <span id="global-mode-badge" title="Global mode active — agent is not scoped to working directory">🌐 Global</span>
-        <span id="conn-indicator" class="disconnected" title="Disconnected" role="status" aria-live="polite" aria-label="Disconnected"></span>
-        <button type="button" id="settings-btn" title="Settings">⚙</button>
+        <button type="button" class="main-tab" id="board-tab" data-pane="board" title="Kanban board" hidden><svg class="icon"><use href="#i-board"></use></svg><span>Board</span></button>
+        <button type="button" class="main-tab" id="terminal-tab" data-pane="terminal" title="Terminal"><svg class="icon"><use href="#i-terminal"></use></svg><span>Terminal</span><span id="terminal-tab-badge" hidden></span></button>
+        <span id="global-mode-badge" title="Global mode active — agent is not scoped to working directory"><svg class="icon"><use href="#i-globe"></use></svg> Global</span>
+        <button type="button" id="settings-btn" title="Settings" aria-label="Settings"><svg class="icon"><use href="#i-sliders"></use></svg></button>
     </div>
     <div id="main-panes">
         <div id="chat-pane" class="pane active">
@@ -47,9 +81,9 @@
             </div>
             <div class="sidebar-resize-handle" data-target="sidebar" title="Drag to resize sidebar"></div>
             <div id="chat-container">
-                <button type="button" id="sidebar-toggle" title="Toggle sidebar">☰</button>
+                <button type="button" id="sidebar-toggle" title="Toggle sidebar" aria-label="Toggle sidebar"><svg class="icon"><use href="#i-menu"></use></svg></button>
                 <div id="messages" tabindex="-1"></div>
-                <button type="button" id="scroll-bottom-btn">↓ New messages</button>
+                <button type="button" id="scroll-bottom-btn"><svg class="icon"><use href="#i-arrow-down"></use></svg> New messages</button>
                 <!-- Conversation TOC rail: one dot per user prompt (built by
                      app.js appendTocDot/rebuildToc). Overlay on the right
                      edge of the chat, revealed on hover (app.js toggles
@@ -60,7 +94,7 @@
                 </nav>
                 <div id="composer-toolbar">
                     <div class="tb-group">
-                        <button type="button" id="tb-model-btn" class="tb-btn" title="Select model">— <span class="tb-arrow">▾</span></button>
+                        <button type="button" id="tb-model-btn" class="tb-btn" title="Select model">— <span class="tb-arrow"><svg class="icon"><use href="#i-chevron-down"></use></svg></span></button>
                         <div id="tb-model-popover" class="tb-popover">
                             <div class="tb-popover-section" id="tb-thinking-section">
                                 <div class="tb-popover-heading">Thinking level</div>
@@ -74,7 +108,7 @@
                         </div>
                     </div>
                     <div id="tb-mode-picker" class="tb-group">
-                        <button type="button" id="tb-mode-btn" class="tb-btn">📝 Coding <span class="tb-arrow">▾</span></button>
+                        <button type="button" id="tb-mode-btn" class="tb-btn"><svg class="icon"><use href="#i-pen"></use></svg> <span class="tb-mode-label">Act</span> <span class="tb-arrow"><svg class="icon"><use href="#i-chevron-down"></use></svg></span></button>
                         <div id="tb-mode-popover" class="tb-popover">
                             <div class="tb-popover-section">
                                 <div class="tb-popover-heading">Mode</div>
@@ -93,11 +127,11 @@
                 <div id="near-compact-banner" hidden>
                     <span id="ncb-text">Context is nearly full — compact to keep responses focused.</span>
                     <button type="button" id="ncb-compact-btn">Compact now</button>
-                    <button type="button" id="ncb-dismiss-btn" title="Dismiss" aria-label="Dismiss">✕</button>
+                    <button type="button" id="ncb-dismiss-btn" title="Dismiss" aria-label="Dismiss"><svg class="icon"><use href="#i-x"></use></svg></button>
                 </div>
                 <div id="condensed-banner" hidden>
                     <span id="condensed-banner-text"></span>
-                    <button type="button" id="condensed-banner-dismiss" title="Dismiss" aria-label="Dismiss">✕</button>
+                    <button type="button" id="condensed-banner-dismiss" title="Dismiss" aria-label="Dismiss"><svg class="icon"><use href="#i-x"></use></svg></button>
                 </div>
                 <div id="input-area">
                     <div id="attachment-preview" hidden></div>
@@ -109,9 +143,9 @@
                             <span class="progress-label"></span>
                         </div>
                     </div>
-                    <button type="button" id="attach-btn" title="Attach image (or paste an image into the input)" aria-label="Attach image">📎</button>
+                    <button type="button" id="attach-btn" title="Attach image (or paste an image into the input)" aria-label="Attach image"><svg class="icon"><use href="#i-paperclip"></use></svg></button>
                     <input type="file" id="image-upload" accept="image/*" multiple hidden>
-                    <button id="send-btn">Send</button>
+                    <button id="send-btn" title="Send" aria-label="Send"><svg class="icon"><use href="#i-arrow-up"></use></svg></button>
                     <button id="cancel-btn" disabled title="Cancel current turn">Cancel</button>
                 </div>
                 <!-- Terminal strip: docked below the input bar at the bottom
@@ -120,9 +154,9 @@
                 <div id="terminal-panel" aria-label="Terminal">
                     <div id="terminal-resize-handle" title="Drag to resize terminal"></div>
                     <div id="terminal-tabbar">
-                        <button type="button" id="terminal-chevron" title="Collapse or expand terminal (Ctrl+`)">▴</button>
+                        <button type="button" id="terminal-chevron" title="Collapse or expand terminal (Ctrl+`)" aria-label="Collapse or expand terminal"><svg class="icon"><use href="#i-chevron-up"></use></svg></button>
                         <div id="terminal-tabs"></div>
-                        <button type="button" id="terminal-more" title="All terminals" hidden>»</button>
+                        <button type="button" id="terminal-more" title="All terminals" hidden><svg class="icon"><use href="#i-chevrons-right"></use></svg></button>
                         <span id="terminal-hint">Terminal unavailable (xterm.js failed to load)</span>
                         <div id="terminal-more-menu" hidden></div>
                     </div>
@@ -135,7 +169,7 @@
                 <div id="find-in-files-wrap">
                     <div id="find-in-files-header">
                         <label for="find-in-files-input">Find in files</label>
-                        <button type="button" id="btn-toggle-replace" title="Toggle replace (Ctrl+Shift+H)">Replace ▾</button>
+                        <button type="button" id="btn-toggle-replace" title="Toggle replace (Ctrl+Shift+H)">Replace <svg class="icon"><use href="#i-chevron-down"></use></svg></button>
                     </div>
                     <input type="search" id="find-in-files-input" placeholder="Search codebase…" autocomplete="off">
                     <div id="find-in-files-replace-row">
@@ -160,7 +194,7 @@
                         <input type="checkbox" id="stage-all"> Stage all before commit
                     </label>
                     <div id="commit-buttons-row">
-                        <button type="button" id="btn-commit-ai" title="Generate a commit message from the staged diff with AI">✨ AI</button>
+                        <button type="button" id="btn-commit-ai" title="Generate a commit message from the staged diff with AI"><svg class="icon"><use href="#i-sparkle"></use></svg> AI</button>
                         <button type="button" id="btn-commit" class="primary" title="Commit the staged changes">Commit</button>
                         <button type="button" id="btn-push" title="Push the current branch to origin">Push</button>
                     </div>
@@ -171,13 +205,13 @@
                 <div id="editor-toolbar">
                     <!-- Mobile-only: opens the file explorer sidebar as an
                          overlay drawer (styles.css / editor.js). -->
-                    <button type="button" id="editor-sidebar-toggle" title="Toggle file explorer">☰</button>
+                    <button type="button" id="editor-sidebar-toggle" title="Toggle file explorer" aria-label="Toggle file explorer"><svg class="icon"><use href="#i-menu"></use></svg></button>
                     <span id="editor-path-label">No file open</span>
                     <button type="button" id="btn-undo" title="Undo (Ctrl+Z)" disabled>Undo</button>
                     <button type="button" id="btn-redo" title="Redo (Ctrl+Shift+Z)" disabled>Redo</button>
                     <button type="button" id="btn-diff-layout" title="Toggle DiffEditor side-by-side vs inline">Side-by-side</button>
-                    <button type="button" id="btn-diff-prev" class="toolbar-icon-btn" title="Previous change" disabled>‹</button>
-                    <button type="button" id="btn-diff-next" class="toolbar-icon-btn" title="Next change" disabled>›</button>
+                    <button type="button" id="btn-diff-prev" class="toolbar-icon-btn" title="Previous change" aria-label="Previous change" disabled><svg class="icon"><use href="#i-chevron-left"></use></svg></button>
+                    <button type="button" id="btn-diff-next" class="toolbar-icon-btn" title="Next change" aria-label="Next change" disabled><svg class="icon"><use href="#i-chevron-right"></use></svg></button>
                     <button type="button" id="btn-format" title="Format document (Shift+Alt+F)" disabled>Format</button>
                     <button type="button" id="btn-save-file">Save</button>
                     <button type="button" id="btn-save-all">Save all</button>
@@ -266,7 +300,7 @@
         <div id="settings-dialog" role="dialog" aria-label="Settings">
             <div class="settings-header">
                 <h3>Settings</h3>
-                <button type="button" id="settings-close-btn" title="Close (Esc)" aria-label="Close settings">✕</button>
+                <button type="button" id="settings-close-btn" title="Close (Esc)" aria-label="Close settings"><svg class="icon"><use href="#i-x"></use></svg></button>
             </div>
             <div class="settings-layout">
                 <nav class="settings-sidebar" aria-label="Settings sections">
@@ -364,7 +398,7 @@
                 <div class="setting-row">
                     <div>
                         <label>Accent color</label>
-                        <input type="color" id="accent-color-input" value="#569cd6" aria-label="Accent color">
+                        <input type="color" id="accent-color-input" value="#7aa2f7" aria-label="Accent color">
                         <button type="button" id="accent-reset-btn" class="settings-btn-secondary">Default</button>
                     </div>
                 </div>
@@ -735,7 +769,8 @@
                      test_provider. Keys are stored in the config file — the
                      warning below renders the actual path from the server. -->
                 <p class="settings-warning" id="provider-key-warning">
-                    ⚠ Provider API keys are stored in the config file (<span id="provider-config-path"></span>, readable only by your user).
+                    <svg class="icon"><use href="#i-alert"></use></svg>
+                    Provider API keys are stored in the config file (<span id="provider-config-path"></span>, readable only by your user).
                 </p>
                 <div id="provider-list"></div>
                 <div class="provider-form">
@@ -758,7 +793,7 @@
         <div id="keybindings-dialog" role="dialog" aria-label="Keyboard shortcuts">
             <div class="settings-header">
                 <h3>Keyboard shortcuts</h3>
-                <button type="button" id="keybindings-close-btn" title="Close (Esc)" aria-label="Close shortcuts">✕</button>
+                <button type="button" id="keybindings-close-btn" title="Close (Esc)" aria-label="Close shortcuts"><svg class="icon"><use href="#i-x"></use></svg></button>
             </div>
             <table class="keybindings-table">
                 <thead>

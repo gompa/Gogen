@@ -148,6 +148,9 @@ func NewManager(provider llm.LLMProvider, settings Settings) *Manager {
 		minMiddleTokens:      defaultMinMiddleTokens,
 		requireSummaryShrink: true,
 		manualContextLimit:   manual,
+		// A manually configured limit is resolved by construction (same
+		// semantics as UpdateSettings): it needs no provider probe.
+		limitResolved: settings.ContextLimit > 0,
 	}
 }
 
@@ -461,6 +464,11 @@ type ContextSnapshot struct {
 	// Unlike NearCompact it tracks the warning threshold, not the trigger.
 	WarnNearCompact bool
 	Percent         float64
+	// LimitResolved is true when Limit is a real value for this session
+	// (provider probe, restore snapshot, or manual pin) and false when it
+	// is the DefaultContextLimit display fallback for an unresolved window.
+	// Wire consumers use it to keep "unknown" from masquerading as 128k.
+	LimitResolved bool
 }
 
 // Snapshot estimates token usage for canonical history and the LLM view.
@@ -487,6 +495,7 @@ func (m *Manager) SnapshotWithCounts(canonical, llmView []llm.Message, canonical
 func (m *Manager) snapshot(canonical, llmView []llm.Message, stored int) ContextSnapshot {
 	m.mu.RLock()
 	limit := m.Settings.ContextLimit
+	limitResolved := m.limitResolved
 	if limit <= 0 {
 		limit = config.DefaultContextLimit
 	}
@@ -509,7 +518,9 @@ func (m *Manager) snapshot(canonical, llmView []llm.Message, stored int) Context
 			warnAt = compactAt // small windows: warn exactly when compaction would trigger
 		}
 	}
-	return m.buildSnapshot(limit, compactAt, warnAt, stored, used, len(canonical), hasTruncatedToolResults(canonical))
+	snap := m.buildSnapshot(limit, compactAt, warnAt, stored, used, len(canonical), hasTruncatedToolResults(canonical))
+	snap.LimitResolved = limitResolved
+	return snap
 }
 
 // buildSnapshot creates a ContextSnapshot from computed values.

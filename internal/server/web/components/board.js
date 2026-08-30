@@ -21,6 +21,7 @@
 //                                   "Workspace default" row)
 
 import { createPopover } from '/components/popover.js';
+import { icon } from '/components/icons.js';
 import { createModelThinkingPicker } from '/components/model-picker.js';
 
 let deps = null;
@@ -48,7 +49,7 @@ function boardMoveCancel() {
     document.querySelectorAll('.board-card-move.active')
         .forEach((b) => {
             b.classList.remove('active');
-            b.textContent = '⇄';
+            b.innerHTML = icon('swap');
             b.title = 'Move card to another column';
         });
     const cols = document.getElementById('board-columns');
@@ -270,7 +271,7 @@ function buildBoardCard(item) {
     moveBtn.type = 'button';
     moveBtn.className = 'board-card-move';
     moveBtn.title = 'Move card to another column';
-    moveBtn.textContent = '⇄';
+    moveBtn.innerHTML = icon('swap');
     moveBtn.addEventListener('click', (e) => {
         e.stopPropagation();
         if (boardMoveId === item.id) {
@@ -281,7 +282,7 @@ function buildBoardCard(item) {
         boardMoveId = item.id;
         card.classList.add('move-source');
         moveBtn.classList.add('active');
-        moveBtn.textContent = '✕';
+        moveBtn.innerHTML = icon('x');
         moveBtn.title = 'Cancel — tap a column header to move the card';
         const cols = document.getElementById('board-columns');
         if (cols) cols.classList.add('move-mode');
@@ -308,7 +309,7 @@ function buildBoardCard(item) {
             deps.onOpenAgent(item.agentSession);
         });
     } else {
-        startBtn.textContent = '▶ Start';
+        startBtn.innerHTML = icon('play') + ' Start';
         if (item.assignee) {
             startBtn.disabled = true;
             startBtn.title = 'Claimed by ' + item.assignee;
@@ -464,7 +465,7 @@ function buildBoardStartPopover() {
     const closeBtn = document.createElement('button');
     closeBtn.type = 'button';
     closeBtn.className = 'board-start-close';
-    closeBtn.textContent = '✕';
+    closeBtn.innerHTML = icon('x');
     closeBtn.title = 'Close';
     closeBtn.addEventListener('click', (e) => {
         e.stopPropagation();
@@ -562,7 +563,7 @@ function buildBoardStartPopover() {
     const penBtn = document.createElement('button');
     penBtn.type = 'button';
     penBtn.className = 'board-start-pen';
-    penBtn.textContent = '✎';
+    penBtn.innerHTML = icon('pen');
     penBtn.title = 'Edit the prompt';
     penBtn.addEventListener('click', (e) => {
         e.stopPropagation();
@@ -573,7 +574,7 @@ function buildBoardStartPopover() {
     const goBtn = document.createElement('button');
     goBtn.type = 'button';
     goBtn.className = 'board-card-start';
-    goBtn.textContent = '▶ Start';
+    goBtn.innerHTML = icon('play') + ' Start';
     goBtn.addEventListener('click', (e) => {
         e.stopPropagation();
         if (!boardStartState) return;

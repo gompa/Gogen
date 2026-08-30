@@ -39,6 +39,10 @@ const ROOT = path.join(__dirname, '..');
 
 // Component modules app.js imports, in eval (dependency) order.
 const COMPONENT_MODULES = [
+  // Leaf module (no imports of its own); first because several components
+  // and app.js call icon() — its top-level declaration must land in the
+  // global scope before any of them eval.
+  'internal/server/web/components/icons.js',
   'internal/server/web/components/popover.js',
   'internal/server/web/components/model-picker.js',
   'internal/server/web/components/board.js',

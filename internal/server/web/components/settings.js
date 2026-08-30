@@ -28,6 +28,7 @@
 
 import { openModal, closeModal, setMonacoTheme, applyEditorPrefs } from '/editor.js';
 import { requestBoardState, setBoardStartPrompt } from '/components/board.js';
+import { icon } from '/components/icons.js';
 
 let deps = null;
 
@@ -319,7 +320,14 @@ export function applyRuntimeSettings(data) {
     const banner = document.getElementById('restart-banner');
     if (banner) {
         if (Array.isArray(data.restartRequired) && data.restartRequired.length > 0) {
-            banner.textContent = '⚠ Restart gogen for these to take effect: ' + data.restartRequired.join(', ');
+            // Icon + text nodes (no innerHTML: the list is server data).
+            const warnIcon = document.createElement('span');
+            warnIcon.className = 'banner-icon';
+            warnIcon.innerHTML = icon('alert');
+            banner.replaceChildren(
+                warnIcon,
+                ' Restart gogen for these to take effect: ' + data.restartRequired.join(', ')
+            );
             banner.hidden = false;
         } else {
             banner.hidden = true;
@@ -588,7 +596,8 @@ function applyTheme(preference) {
     if (themeSelect.value !== preference) themeSelect.value = preference;
     // Address-bar color follows the theme.
     const themeMeta = document.querySelector('meta[name="theme-color"]');
-    if (themeMeta) themeMeta.setAttribute('content', resolved === 'light' ? '#ffffff' : '#1e1e1e');
+    // Keep in sync with --bg in styles.css (:root / :root.light).
+    if (themeMeta) themeMeta.setAttribute('content', resolved === 'light' ? '#f7f8fa' : '#131418');
     // Switch Monaco theme to match
     setMonacoTheme(resolved === 'light');
 }
@@ -741,14 +750,82 @@ export function getShowReplyModelPref() {
 // === Accent color: persist and apply ===
 const accentInput = document.getElementById('accent-color-input');
 
-// The soft accent variant is derived in CSS via color-mix, so JS only
-// needs to set the base --user-accent (see styles.css).
+// The soft accent variant is derived in CSS via color-mix, but the
+// FILLED variant (--accent-bg, primary buttons) must keep white label
+// text at WCAG AA (4.5:1) for ANY accent the user picks — a fixed
+// per-theme fill cannot follow an arbitrary hue. So JS computes it:
+// the accent's hue darkened until white text passes (see accentBgFor).
+// Without a custom accent the CSS fallbacks in styles.css apply.
 function applyAccentColor(hex) {
     if (!hex) {
         document.documentElement.style.removeProperty('--user-accent');
+        document.documentElement.style.removeProperty('--user-accent-bg');
         return;
     }
     document.documentElement.style.setProperty('--user-accent', hex);
+    const bg = accentBgFor(hex);
+    if (bg) document.documentElement.style.setProperty('--user-accent-bg', bg);
+}
+
+// Returns the filled-accent color for the given hex: same hue, darkened
+// (in HSL lightness) until white text reaches 4.5:1 contrast. Starts at
+// the accent's own lightness (capped at 50% so it never lightens) — a
+// dark enough accent is used as-is. Black always passes, so the loop
+// always converges; the final return is unreachable except for
+// malformed input that slipped past the hex check.
+function accentBgFor(hex) {
+    const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || '').trim());
+    if (!m) return null;
+    const r0 = parseInt(m[1].slice(0, 2), 16) / 255;
+    const g0 = parseInt(m[1].slice(2, 4), 16) / 255;
+    const b0 = parseInt(m[1].slice(4, 6), 16) / 255;
+    const [h, s, l] = rgbToHsl(r0, g0, b0);
+    for (let light = Math.min(l, 0.5); light >= 0; light -= 0.02) {
+        const [r, g, b] = hslToRgb(h, s, light);
+        if (contrastAgainstWhite(r, g, b) >= 4.5) return toHex(r, g, b);
+    }
+    return '#000000';
+}
+
+function rgbToHsl(r, g, b) {
+    const max = Math.max(r, g, b), min = Math.min(r, g, b);
+    const l = (max + min) / 2;
+    if (max === min) return [0, 0, l];
+    const d = max - min;
+    const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    let h;
+    if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    return [h * 60, s, l];
+}
+
+function hslToRgb(h, s, l) {
+    h = (((h % 360) + 360) % 360) / 360;
+    if (s === 0) return [l, l, l];
+    const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+    const p = 2 * l - q;
+    const f = (t) => {
+        if (t < 0) t += 1;
+        if (t > 1) t -= 1;
+        if (t < 1 / 6) return p + (q - p) * 6 * t;
+        if (t < 1 / 2) return q;
+        if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+        return p;
+    };
+    return [f(h + 1 / 3), f(h), f(h - 1 / 3)];
+}
+
+// WCAG contrast of white text on the given sRGB color (0..1 channels).
+function contrastAgainstWhite(r, g, b) {
+    const lin = (c) => (c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
+    const L = 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+    return 1.05 / (L + 0.05);
+}
+
+function toHex(r, g, b) {
+    const h = (v) => Math.round(v * 255).toString(16).padStart(2, '0');
+    return '#' + h(r) + h(g) + h(b);
 }
 
 const savedAccent = localStorage.getItem('gogen-accent-color') || '';
@@ -775,9 +852,11 @@ window.addEventListener('storage', function (e) {
 document.getElementById('accent-reset-btn').addEventListener('click', function () {
     localStorage.removeItem('gogen-accent-color');
     document.documentElement.style.removeProperty('--user-accent');
+    document.documentElement.style.removeProperty('--user-accent-bg');
     // Reset picker to the current theme's default accent
     const isLight = document.documentElement.classList.contains('light');
-    accentInput.value = isLight ? '#0066cc' : '#569cd6';
+    // Theme default accents — keep in sync with --accent fallbacks in styles.css.
+    accentInput.value = isLight ? '#2563eb' : '#7aa2f7';
     accentInput.blur();
 });
 

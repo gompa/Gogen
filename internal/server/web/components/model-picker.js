@@ -7,6 +7,8 @@
 // the three stay identical; app.js wires each instance to its own state
 // and message channel through the factory configs.
 
+import { icon } from '/components/icons.js';
+
 // Labels for the default reasoning_effort levels (off/low/medium/high).
 // Values outside the defaults (e.g. a model's "max" from models.dev)
 // derive their label by title-casing.
@@ -81,7 +83,7 @@ function buildModelRow(m, current, onSelect) {
     if (active) {
         const check = document.createElement('span');
         check.className = 'tb-check';
-        check.textContent = '✓';
+        check.innerHTML = icon('check');
         row.appendChild(check);
     }
     row.addEventListener('click', (e) => {
@@ -289,7 +291,7 @@ export function createModelThinkingPicker(cfg) {
             if (s.model === '') {
                 const check = document.createElement('span');
                 check.className = 'tb-check';
-                check.textContent = '✓';
+                check.innerHTML = icon('check');
                 defaultRow.appendChild(check);
             }
             defaultRow.addEventListener('click', (e) => {
