@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"gogen/internal/contextmgr"
 	"gogen/internal/randhex"
 )
 
@@ -187,8 +188,8 @@ const maxBackgroundInputBytes = 16 * 1024
 
 // maxShowBytes caps the output tail a background_job status result embeds,
 // so a chatty job cannot bloat the transcript. The tail cut is rune-safe
-// (runeSafeTailStart), so the shown tail can be a few bytes smaller than
-// this cap.
+// (contextmgr.RuneSafeTailStart), so the shown tail can be a few bytes
+// smaller than this cap.
 const maxShowBytes = 8 * 1024
 
 // defaultBackgroundUnreadCap bounds the per-job output delta retained for
@@ -308,7 +309,7 @@ func formatJobOutput(job *BackgroundJob, running bool) string {
 		// invalid UTF-8 into the tool result — the same bug class the head
 		// cuts fix. Back off to a rune boundary; the reported byte count is
 		// the actually-shown length, which can be a few bytes smaller.
-		tail := out[runeSafeTailStart([]byte(out), maxShowBytes):]
+		tail := out[contextmgr.RuneSafeTailStart([]byte(out), maxShowBytes):]
 		return fmt.Sprintf("Output (last %d bytes of %d):\n%s", len(tail), len(out), tail)
 	}
 	return "Output:\n" + out

@@ -418,6 +418,27 @@ func TruncateRuneSafe(s string, max int) string {
 	return s[:max]
 }
 
+// RuneSafeTailStart returns the byte offset at which a tail capped at max
+// bytes of data may start without splitting a UTF-8 rune: the raw cut point
+// (len(data)-max) is advanced forward over continuation bytes until it lands
+// on a rune boundary. A raw byte cut can split a multi-byte character at the
+// start of the shown tail and inject invalid UTF-8 into the tool result —
+// the tail-cut mirror of TruncateRuneSafe (which makes head cuts rune-safe).
+// data is assumed valid UTF-8 (command output usually is; for invalid input
+// the result is never worse than a raw byte cut). The []byte signature
+// exists so callers backed by bytes.Buffer can pass the offset straight to
+// Buffer.Next. Returns 0 when the data fits within max, or max <= 0 (no cap).
+func RuneSafeTailStart(data []byte, max int) int {
+	if max <= 0 || len(data) <= max {
+		return 0
+	}
+	start := len(data) - max
+	for start < len(data) && !utf8.RuneStart(data[start]) {
+		start++
+	}
+	return start
+}
+
 // TruncateMarked caps s to at most max bytes with a rune-safe head cut and
 // appends marker when a cut was made. Unlike truncateToolResult the marker
 // is NOT reserved inside the budget: the capped result may exceed max by

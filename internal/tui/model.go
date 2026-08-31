@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"gogen/internal/agent"
+	"gogen/internal/contextmgr"
 	"gogen/internal/session"
 
 	tea "charm.land/bubbletea/v2"
@@ -362,21 +363,6 @@ func (m *Model) refocusInput() tea.Cmd {
 	return m.textarea.Focus()
 }
 
-// estimateTokenCount is a cheap, tokenizer-free approximation (~4 chars per
-// token for English-like text) used only to keep the context indicator
-// moving live during streaming. It is intentionally rough — the exact count
-// is restored by refreshContextStats() as soon as streaming ends.
-func estimateTokenCount(s string) int {
-	if s == "" {
-		return 0
-	}
-	n := (len(s) + 3) / 4
-	if n < 1 {
-		n = 1
-	}
-	return n
-}
-
 // bumpContextEstimate updates the status-bar context indicator with an
 // approximate running total while a turn is streaming. It never reads
 // a.Messages (which would race with the streaming goroutine mutating it) —
@@ -392,7 +378,10 @@ func (m *Model) bumpContextEstimate(delta string) {
 		// meaningful to show until refreshContextStats() runs.
 		return
 	}
-	m.contextStreamEstAdded += estimateTokenCount(delta)
+	// contextmgr.HeuristicTokenCount is the shared bytes/4 approximation
+	// (tokenizer-free, so it stays cheap mid-stream). The exact count is
+	// restored by refreshContextStats() as soon as streaming ends.
+	m.contextStreamEstAdded += contextmgr.HeuristicTokenCount(delta)
 	snap := m.contextStats.Snapshot
 	snap.Used = m.contextStreamBaseUsed + m.contextStreamEstAdded
 	if snap.Limit > 0 {

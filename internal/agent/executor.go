@@ -12,7 +12,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
@@ -634,26 +633,6 @@ func (e *Executor) applyToolOutputCap(content string) string {
 	return contextmgr.TruncateRuneSafe(content, cap-len(marker)) + marker
 }
 
-// runeSafeTailStart returns the byte offset at which a tail capped at max
-// bytes of data may start without splitting a UTF-8 rune: the raw cut point
-// (len(data)-max) is advanced forward over continuation bytes until it lands
-// on a rune boundary. A raw byte cut can split a multi-byte character at the
-// start of the shown tail and inject invalid UTF-8 into the tool result —
-// the tail-cut mirror of contextmgr.TruncateRuneSafe (which makes head cuts
-// rune-safe). data is assumed valid UTF-8 (command output usually is; for
-// invalid input the result is never worse than a raw byte cut). Returns 0
-// when the data fits within max, or max <= 0 (no cap).
-func runeSafeTailStart(data []byte, max int) int {
-	if max <= 0 || len(data) <= max {
-		return 0
-	}
-	start := len(data) - max
-	for start < len(data) && !utf8.RuneStart(data[start]) {
-		start++
-	}
-	return start
-}
-
 // outputBuffer is a mutex-guarded byte buffer shared by the command output
 // accumulators. exec copies stdout and stderr to the same writer from
 // separate goroutines, so every mutation is serialized.
@@ -676,7 +655,7 @@ func (b *outputBuffer) append(p []byte, max int, after func()) {
 	defer b.mu.Unlock()
 	b.buf.Write(p)
 	if max > 0 {
-		b.buf.Next(runeSafeTailStart(b.buf.Bytes(), max))
+		b.buf.Next(contextmgr.RuneSafeTailStart(b.buf.Bytes(), max))
 	}
 	if after != nil {
 		after()

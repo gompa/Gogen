@@ -135,6 +135,54 @@ func TestTruncateRuneSafe(t *testing.T) {
 	}
 }
 
+// TestRuneSafeTailStart verifies the tail-cut counterpart of
+// TruncateRuneSafe: for every byte cap, the tail starting at the returned
+// offset is at most max bytes, valid UTF-8, and begins on a rune boundary
+// (never with a split multi-byte character).
+func TestRuneSafeTailStart(t *testing.T) {
+	const s = "日本語テキスト" // 7 runes × 3 bytes = 21 bytes
+	data := []byte(s)
+	for max := 1; max <= len(data); max++ {
+		start := RuneSafeTailStart(data, max)
+		tail := data[start:]
+		if len(tail) > max {
+			t.Fatalf("max %d: tail length %d exceeds max", max, len(tail))
+		}
+		if !utf8.Valid(tail) {
+			t.Fatalf("max %d: tail %q is not valid UTF-8", max, tail)
+		}
+		if len(tail) > 0 && !utf8.RuneStart(tail[0]) {
+			t.Fatalf("max %d: tail %q starts mid-rune", max, tail)
+		}
+	}
+	// Exact cuts: the tail keeps the LAST bytes, backed off to a rune
+	// boundary when the raw cut lands inside a rune.
+	for _, tc := range []struct {
+		max  int
+		want string
+	}{
+		{3, "ト"},  // raw cut at byte 18 lands on a rune start
+		{5, "ト"},  // raw cut at byte 16 lands inside ス (bytes 15-17); backs off to 18
+		{6, "スト"}, // raw cut at byte 15 lands on a rune start
+		{9, "キスト"},
+		{21, s},
+	} {
+		if got := string(data[RuneSafeTailStart(data, tc.max):]); got != tc.want {
+			t.Errorf("max %d: got %q, want %q", tc.max, got, tc.want)
+		}
+	}
+	// No-op cases.
+	if got := RuneSafeTailStart(data, len(data)); got != 0 {
+		t.Errorf("max == len: got %d, want 0", got)
+	}
+	if got := RuneSafeTailStart(data, 100); got != 0 {
+		t.Errorf("max > len: got %d, want 0", got)
+	}
+	if got := RuneSafeTailStart(data, 0); got != 0 {
+		t.Errorf("max 0 (no cap): got %d, want 0", got)
+	}
+}
+
 // TestTruncateToolResultRuneSafe verifies the context-window truncation keeps
 // valid UTF-8 when the cut would otherwise split a multi-byte rune.
 func TestTruncateToolResultRuneSafe(t *testing.T) {

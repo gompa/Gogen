@@ -158,7 +158,7 @@ func messageCounterFor() messageCounter {
 	if count, ok := exactMessageCounter(); ok {
 		return count
 	}
-	return heuristicCountString
+	return HeuristicTokenCount
 }
 
 // exactMessageCounter returns a tokenizer-backed messageCounter, or ok=false
@@ -178,8 +178,11 @@ func exactMessageCounter() (messageCounter, bool) {
 	}, true
 }
 
-// heuristicCountString approximates tokens as bytes/4 for a single string.
-func heuristicCountString(s string) int {
+// HeuristicTokenCount approximates tokens as bytes/4 for a single string.
+// It is the tokenizer-free fallback of EstimateTokens and is also the
+// shared cheap estimator for live UI indicators (the TUI streaming
+// context estimate) that must not pay tokenizer cost mid-stream.
+func HeuristicTokenCount(s string) int {
 	return (len(s) + 3) / 4
 }
 
