@@ -29,7 +29,7 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 	msg := WSMessage{
 		Type: "config",
 		ConfigFields: []string{
-			"commandSafety", "commandAllowlist", "deleteApproval", "commandSandbox", "commandTimeoutSecs",
+			"commandSafety", "commandAllowlist", "deleteApproval", "commandSandbox", "commandIdleTimeoutSecs",
 			"contextLimit", "compactThreshold", "compactKeepRecentMessages", "maxToolResultBytes", "compactReserveTokens", "compactLastResort",
 			"webFetch", "webSearch", "treesitter", "preserveReasoning",
 			"sessionMaxCount", "sessionMaxAgeDays", "webApprovalHoldSecs",
@@ -39,7 +39,7 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 		CommandAllowlist:          "ls, cat",
 		DeleteApproval:            "off",
 		CommandSandbox:            "bwrap",
-		CommandTimeoutSecs:        45,
+		CommandIdleTimeoutSecs:    45,
 		ContextLimitConfig:        20000,
 		CompactThreshold:          0.5,
 		CompactKeepRecentMessages: 3,
@@ -74,7 +74,8 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 		return len(m.ConfigFields) == 0 && m.CommandSafetyMode == "allowlist"
 	})
 	if cfg.CommandAllowlist != "ls, cat" || cfg.DeleteApproval != "off" || cfg.CommandSandbox != "bwrap" ||
-		cfg.CommandTimeoutSecs != 45 || cfg.ContextLimitConfig != 20000 || cfg.CompactThreshold != 0.5 ||
+		cfg.CommandIdleTimeoutSecs != 45 ||
+		cfg.ContextLimitConfig != 20000 || cfg.CompactThreshold != 0.5 ||
 		cfg.CompactKeepRecentMessages != 3 || cfg.MaxToolResultBytes != 65536 || cfg.CompactReserveTokens != 1000 ||
 		cfg.CompactLastResort != "error" ||
 		cfg.WebFetch != "off" || cfg.WebSearch != "off" || cfg.TreeSitter != "off" ||
@@ -96,8 +97,8 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 	if s.ws.Exec.SandboxMode() != "bwrap" {
 		t.Fatalf("sandbox = %q, want bwrap", s.ws.Exec.SandboxMode())
 	}
-	if s.ws.Exec.CommandTimeoutDuration() != 45*time.Second {
-		t.Fatalf("timeout = %v, want 45s", s.ws.Exec.CommandTimeoutDuration())
+	if s.ws.Exec.IdleTimeoutDuration() != 45*time.Second {
+		t.Fatalf("idle timeout = %v, want 45s", s.ws.Exec.IdleTimeoutDuration())
 	}
 	snap := a.Context.SettingsSnapshot()
 	if snap.ContextLimit != 20000 || snap.CompactThreshold != 0.5 || snap.CompactKeepRecentMessages != 3 ||
@@ -131,7 +132,7 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"command_safety: allowlist", "command_allowlist: ls, cat", `delete_approval: "off"`, "context_limit: 20000", "session_max_count: 4", "web_approval_hold_secs: 7", "subagent_model: gpt-4o-mini", "subagent_thinking_level: high", "board_start_prompt: board tmpl {title}", "system_prompt: sys tmpl {working_dir}", "subagent_prompt: sub tmpl {job}"} {
+	for _, want := range []string{"command_safety: allowlist", "command_allowlist: ls, cat", `delete_approval: "off"`, "command_idle_timeout_secs: 45", "context_limit: 20000", "session_max_count: 4", "web_approval_hold_secs: 7", "subagent_model: gpt-4o-mini", "subagent_thinking_level: high", "board_start_prompt: board tmpl {title}", "system_prompt: sys tmpl {working_dir}", "subagent_prompt: sub tmpl {job}"} {
 		if !strings.Contains(string(data), want) {
 			t.Fatalf("expected %q in persisted config:\n%s", want, data)
 		}
@@ -207,7 +208,8 @@ func TestRuntimeConfigRejectsInvalid(t *testing.T) {
 	drainHandshake(t, conn)
 
 	bad := []WSMessage{
-		{Type: "config", ConfigFields: []string{"commandSafety", "commandTimeoutSecs"}, CommandSafetyMode: "maybe", CommandTimeoutSecs: 30},
+		{Type: "config", ConfigFields: []string{"commandSafety"}, CommandSafetyMode: "maybe"},
+		{Type: "config", ConfigFields: []string{"commandIdleTimeoutSecs"}, CommandIdleTimeoutSecs: -1},
 		{Type: "config", ConfigFields: []string{"compactThreshold"}, CompactThreshold: 1.5},
 		{Type: "config", ConfigFields: []string{"webFetch"}, WebFetch: "sometimes"},
 		{Type: "config", ConfigFields: []string{"deleteApproval"}, DeleteApproval: "maybe"},

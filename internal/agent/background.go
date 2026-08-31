@@ -77,11 +77,24 @@ func newBackgroundJobID() string {
 // cancelled via CancelBackgroundJob or killed when the session closes
 // (Agent.Close). Finished jobs stay registered for a bounded retention
 // window, then the reaper removes them.
-func (a *Agent) StartBackgroundCommand(command string) (string, error) {
+//
+// ctx is the starting tool call's context: when it carries a live-output
+// sink and end callback (the web UI's terminal streaming), every output
+// chunk is forwarded to the sink for the job's WHOLE lifetime — the job
+// outlives the turn that started it — and end fires when the process
+// exits so the UI closes the terminal with the real exit status. The
+// empty-chunk sink call right after launch opens the terminal (and the
+// chat card's command echo) before the tool result is reported.
+func (a *Agent) StartBackgroundCommand(ctx context.Context, command string) (string, error) {
 	if a.Executor == nil {
 		return "", fmt.Errorf("no executor configured")
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sink := ToolOutputFromContext(ctx)
+	end := ToolOutputEndFromContext(ctx)
+	jobCtx, cancel := context.WithCancel(context.Background())
 	job := &BackgroundJob{
 		ID:      newBackgroundJobID(),
 		Command: command,
@@ -103,9 +116,16 @@ func (a *Agent) StartBackgroundCommand(command string) (string, error) {
 	// an in-memory stdin pipe on Windows (no external sh required). Every
 	// output chunk lands in both the tail and the unread delta buffer; the
 	// MultiWriter preserves per-stream write order, and stdout/stderr
-	// interleaving follows the child's write order.
-	stdin, wait, err := a.Executor.launchBackground(ctx, command,
-		io.MultiWriter(job.output, job.unread), io.MultiWriter(job.output, job.unread))
+	// interleaving follows the child's write order. A live-output sink
+	// rides along as a third writer: it is never capped (like the
+	// foreground path), so the UI sees the full log while the tail stays
+	// bounded.
+	writers := []io.Writer{job.output, job.unread}
+	if sink != nil {
+		writers = append(writers, sinkWriter{command: command, sink: sink})
+	}
+	combined := io.MultiWriter(writers...)
+	stdin, wait, err := a.Executor.launchBackground(jobCtx, command, combined, combined)
 	if err != nil {
 		a.bgMu.Lock()
 		delete(a.bgJobs, job.ID)
@@ -114,6 +134,13 @@ func (a *Agent) StartBackgroundCommand(command string) (string, error) {
 		return "", err
 	}
 	job.stdin = stdin
+	// Open the UI's live terminal now (before the tool result is
+	// reported): the empty chunk carries no output, only the command
+	// echo. A first real chunk that wins the race opens it instead —
+	// the server-side handler is idempotent per tool call id.
+	if sink != nil {
+		sink(command, "")
+	}
 	go func() {
 		waitErr := wait()
 		job.mu.Lock()
@@ -121,9 +148,33 @@ func (a *Agent) StartBackgroundCommand(command string) (string, error) {
 		job.finishedAt = time.Now()
 		job.mu.Unlock()
 		close(job.done)
+		// The output stream is over: close the UI's terminal with the
+		// real exit status. May fire long after the starting turn ended
+		// (the sink/end closures outlive it); a cancelled job reports
+		// failure.
+		if end != nil {
+			end(waitErr == nil)
+		}
 		a.onJobFinished(job)
 	}()
 	return job.ID, nil
+}
+
+// sinkWriter forwards each background-job output chunk to a ToolOutputSink.
+// It is shared by the job's stdout and stderr MultiWriters, so per-stream
+// write order is preserved by exec's pipe-copy goroutines exactly as for
+// the tail buffers.
+type sinkWriter struct {
+	command string
+	sink    ToolOutputSink
+}
+
+func (w sinkWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	w.sink(w.command, string(p))
+	return len(p), nil
 }
 
 // maxBackgroundInputBytes caps a single action=input write. The kernel pipe

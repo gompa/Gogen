@@ -217,8 +217,8 @@ func TestConfigDefaults(t *testing.T) {
 	if d.MaxToolResultBytes != 262144 {
 		t.Errorf("default max tool result bytes = %d, want 262144", d.MaxToolResultBytes)
 	}
-	if d.CommandTimeoutSecs != 120 {
-		t.Errorf("default command timeout = %d, want 120", d.CommandTimeoutSecs)
+	if d.CommandIdleTimeoutSecs != 120 {
+		t.Errorf("default command idle timeout = %d, want 120", d.CommandIdleTimeoutSecs)
 	}
 	if d.SessionMaxCount != 50 {
 		t.Errorf("default session max count = %d, want 50", d.SessionMaxCount)

@@ -188,14 +188,23 @@ func parseYAMLFrontMatter(yamlText string) (FileConfig, error) {
 // Aliased values are cleared so they never leak into other paths (e.g. a
 // --save-config regeneration, which renders a separate projection struct).
 func (cfg *FileConfig) applyLegacyKeyAliases() {
-	if cfg.KeepRecentMessages == nil {
-		return
+	if cfg.KeepRecentMessages != nil {
+		log.Printf("warning: keep_recent_messages is deprecated; use compact_keep_recent_messages instead")
+		if cfg.CompactKeepRecentMessages == nil {
+			cfg.CompactKeepRecentMessages = cfg.KeepRecentMessages
+		}
+		cfg.KeepRecentMessages = nil
 	}
-	log.Printf("warning: keep_recent_messages is deprecated; use compact_keep_recent_messages instead")
-	if cfg.CompactKeepRecentMessages == nil {
-		cfg.CompactKeepRecentMessages = cfg.KeepRecentMessages
+	if cfg.CommandTimeoutSecs != nil {
+		log.Printf("warning: command_timeout_secs is deprecated; use command_idle_timeout_secs instead")
+		// CommandIdleTimeoutSecs is a plain int (0 = use the default), so
+		// "current key absent" means zero. An explicit legacy 0 is a no-op
+		// either way.
+		if cfg.CommandIdleTimeoutSecs == 0 {
+			cfg.CommandIdleTimeoutSecs = *cfg.CommandTimeoutSecs
+		}
+		cfg.CommandTimeoutSecs = nil
 	}
-	cfg.KeepRecentMessages = nil
 }
 
 // validateMCPServers enforces the required fields on each MCP server entry.

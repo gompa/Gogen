@@ -137,6 +137,31 @@ type OpenAIProvider struct {
 	// model cache. Used for picker grouping, models.dev resolution, and the
 	// /props probe target.
 	modelProfile map[string]modelProfileInfo
+	// modelOwner records the OWNING profile of each model (model ID →
+	// profile name) under the sticky-ownership rule (see applyRouting): the
+	// earliest-listing profile, except a model the user runs on one endpoint
+	// is not re-homed while that endpoint serves it, and a downed owner is
+	// not displaced by a same-ID model on another endpoint. Unlike
+	// modelClient it is NOT wholesale cleared by SetProfiles — records for
+	// profiles that are still registered survive the swap, so a model keeps
+	// routing to its owner across a provider-settings save even while the
+	// owner's catalog is unreachable (clientForModel's owner fallback).
+	// Guarded by modelsMu.
+	modelOwner map[string]string
+	// modelCoListed records, per model, the profiles observed listing it in
+	// a round where its owner was up (model ID → profile names). When the
+	// owner later goes down, a surviving lister is a legitimate failover
+	// target only if it is in this set — a same-ID model on an endpoint
+	// that never co-listed is a collision, not ownership (see
+	// applyRouting). Guarded by modelsMu.
+	modelCoListed map[string]map[string]struct{}
+	// ownerRegistry is the process-shared model→profile record (see
+	// OwnerRegistry): sibling providers (other sessions, subagents) publish
+	// the owners they learn, and a provider whose own routing for a model is
+	// unknown consults it before falling back to the default profile. Nil
+	// for standalone providers. Set at construction time via
+	// SetOwnerRegistry, before the provider serves requests.
+	ownerRegistry *OwnerRegistry
 	// promptCacheKey scopes provider-side prompt caching (defaults to none).
 	promptCacheKey param.Opt[string]
 	// modelInfo resolves context limits from models.dev (optional enrichment).
@@ -314,6 +339,8 @@ func newOpenAIProvider(profiles []*providerProfile, model string, resolver *mode
 	p := &OpenAIProvider{
 		model:          model,
 		modelClient:    make(map[string]*openai.Client),
+		modelOwner:     make(map[string]string),
+		modelCoListed:  make(map[string]map[string]struct{}),
 		modelInfo:      resolver,
 		profiles:       profiles,
 		effortsDerived: make(map[string]derivedEfforts),
@@ -367,6 +394,32 @@ func ProjectPromptCacheKey(workingDir string) string {
 	return hex.EncodeToString(b[:])
 }
 
+// SetOwnerRegistry installs the process-shared model→profile owner record
+// (see OwnerRegistry). Construction-time setter, like SetPromptCacheKey:
+// call it before the provider serves requests. A nil argument detaches the
+// provider from any shared record (standalone behavior).
+func (p *OpenAIProvider) SetOwnerRegistry(r *OwnerRegistry) {
+	if p == nil {
+		return
+	}
+	p.modelsMu.Lock()
+	p.ownerRegistry = r
+	p.modelsMu.Unlock()
+}
+
+// OwnerRegistry returns the shared owner record installed by
+// SetOwnerRegistry (nil for standalone providers). The TUI subagent spawner
+// uses it to share the parent's record with the child provider, so a child
+// whose owning endpoint is down still routes inherited models there.
+func (p *OpenAIProvider) OwnerRegistry() *OwnerRegistry {
+	if p == nil {
+		return nil
+	}
+	p.modelsMu.RLock()
+	defer p.modelsMu.RUnlock()
+	return p.ownerRegistry
+}
+
 // SetModel updates the provider model ID and invalidates template capability
 // caches that may differ across models.
 func (p *OpenAIProvider) SetModel(id string) error {
@@ -385,6 +438,14 @@ func (p *OpenAIProvider) SetModel(id string) error {
 // routable when its profile is still registered, otherwise clientForModel
 // falls back to the default client and requireModelSelected re-validates it
 // on the next turn.
+//
+// The sticky-ownership records (modelOwner/modelCoListed) are pruned, not
+// cleared: records naming profiles that are still registered survive the
+// swap, so a model keeps routing to its owner across a settings save even
+// while the owner's catalog is unreachable (clientForModel's owner fallback
+// resolves the rebuilt client). Records for removed profiles are dropped —
+// their models fall through to the default fallback and re-validation
+// surfaces the gap.
 //
 // The legacy client fields (client, catalogClient, zen/go twins) are NOT
 // rewritten: constructor-built providers route through the profile set, and
@@ -418,9 +479,44 @@ func (p *OpenAIProvider) SetProfiles(profiles []ProviderProfile) error {
 	p.modelsCachedAt = time.Time{}
 	p.modelProfile = nil
 	p.modelClient = make(map[string]*openai.Client)
+	pruneOwnerRecords(p.modelOwner, p.modelCoListed, built)
 	p.modelsFetchFailedAt = time.Time{}
 	p.modelsMu.Unlock()
 	return nil
+}
+
+// pruneOwnerRecords drops sticky-ownership records that name profiles absent
+// from the rebuilt set (their models can no longer route there and fall
+// through to the default fallback); records for still-registered profiles
+// survive. Mutates the maps in place; caller holds modelsMu.
+func pruneOwnerRecords(owner map[string]string, coListed map[string]map[string]struct{}, built []*providerProfile) {
+	if len(owner) == 0 && len(coListed) == 0 {
+		return
+	}
+	for id, name := range owner {
+		if !hasProfileName(built, name) {
+			delete(owner, id)
+			delete(coListed, id)
+		}
+	}
+	for _, co := range coListed {
+		for name := range co {
+			if !hasProfileName(built, name) {
+				delete(co, name)
+			}
+		}
+	}
+}
+
+// hasProfileName reports whether the built profile set contains a profile
+// registered under name.
+func hasProfileName(profiles []*providerProfile, name string) bool {
+	for _, prof := range profiles {
+		if prof.name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // defaultBaseURL returns the base URL of the default profile (profiles[0])

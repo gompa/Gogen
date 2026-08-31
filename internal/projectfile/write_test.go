@@ -14,7 +14,7 @@ import (
 // regardless of the developer's shell environment.
 var configEnvKeys = []string{
 	"GOGEN_BOARD", "GOGEN_SUBAGENT", "GOGEN_SUBAGENT_MAX_DEPTH", "GOGEN_SUBAGENT_MAX_CONCURRENT",
-	"GOGEN_COMMAND_SANDBOX", "GOGEN_COMMAND_TIMEOUT_SECS",
+	"GOGEN_COMMAND_SANDBOX", "GOGEN_COMMAND_IDLE_TIMEOUT_SECS", "GOGEN_COMMAND_TIMEOUT_SECS",
 	"GOGEN_SESSION_MAX_COUNT", "GOGEN_SESSION_MAX_AGE_DAYS",
 	"GOGEN_WEB_MAX_ACTIVE_SESSIONS", "GOGEN_WEB_APPROVAL_HOLD_SECS",
 	"GOGEN_WEB_BIND", "GOGEN_AGENT_INSTRUCTIONS", "GOGEN_SKILLS", "GOGEN_JOB_NOTICES",
@@ -76,7 +76,7 @@ func TestSaveConfigOmitsDefaults(t *testing.T) {
 	for _, key := range []string{
 		"board:", "subagent:", "subagent_max_depth:", "subagent_max_concurrent:",
 		"subagent_thinking_level:",
-		"command_sandbox:", "command_timeout_secs:", "session_max_count:",
+		"command_sandbox:", "command_idle_timeout_secs:", "session_max_count:",
 		"session_max_age_days:", "web_max_active_sessions:",
 		"web_approval_hold_secs:", "web_bind:",
 	} {
@@ -91,7 +91,8 @@ func TestSaveConfigOmitsDefaults(t *testing.T) {
 	}
 	merged := Merge(pf, FlagOverrides{})
 	def := config.Defaults()
-	if merged.CommandSandbox != def.CommandSandbox || merged.CommandTimeoutSecs != def.CommandTimeoutSecs ||
+	if merged.CommandSandbox != def.CommandSandbox ||
+		merged.CommandIdleTimeoutSecs != def.CommandIdleTimeoutSecs ||
 		merged.Board != def.Board || merged.Subagent != def.Subagent ||
 		merged.SubagentDepth() != config.DefaultSubagentMaxDepth ||
 		merged.SubagentLimit() != config.DefaultSubagentMaxConcurrent ||
@@ -116,7 +117,7 @@ func TestSaveConfigOmitsExplicitDefaults(t *testing.T) {
 	cfg.SubagentMaxDepth = config.DefaultSubagentMaxDepth
 	cfg.SubagentMaxConcurrent = config.DefaultSubagentMaxConcurrent
 	cfg.CommandSandbox = "off"
-	cfg.CommandTimeoutSecs = config.DefaultCommandTimeoutSecs
+	cfg.CommandIdleTimeoutSecs = config.DefaultCommandIdleTimeoutSecs
 	cfg.SessionMaxCount = config.DefaultSessionMaxCount
 	cfg.SessionMaxAgeDays = config.DefaultSessionMaxAgeDays
 	cfg.WebMaxActiveSessions = config.DefaultWebMaxActiveSessions
@@ -130,7 +131,7 @@ func TestSaveConfigOmitsExplicitDefaults(t *testing.T) {
 	}
 	for _, key := range []string{
 		"board:", "subagent:", "subagent_max_depth:", "subagent_max_concurrent:",
-		"command_sandbox:", "command_timeout_secs:", "session_max_count:",
+		"command_sandbox:", "command_idle_timeout_secs:", "session_max_count:",
 		"session_max_age_days:", "web_max_active_sessions:", "web_bind:",
 	} {
 		if strings.Contains(string(data), key) {
@@ -153,7 +154,7 @@ func TestSaveConfigWritesNonDefaults(t *testing.T) {
 	cfg.SubagentMaxDepth = 3
 	cfg.SubagentMaxConcurrent = 5
 	cfg.CommandSandbox = "bwrap"
-	cfg.CommandTimeoutSecs = 180
+	cfg.CommandIdleTimeoutSecs = 300
 	cfg.SessionMaxCount = 60
 	cfg.SessionMaxAgeDays = -1
 	cfg.WebMaxActiveSessions = 4
@@ -169,7 +170,7 @@ func TestSaveConfigWritesNonDefaults(t *testing.T) {
 	for _, want := range []string{
 		`board: "on"`, `subagent: "on"`, "subagent_max_depth: 3",
 		"subagent_max_concurrent: 5",
-		"command_sandbox: bwrap", "command_timeout_secs: 180",
+		"command_sandbox: bwrap", "command_idle_timeout_secs: 300",
 		"session_max_count: 60", "session_max_age_days: -1",
 		"web_max_active_sessions: 4", "web_approval_hold_secs: 5",
 		"web_bind: 0.0.0.0:9090",
@@ -185,10 +186,49 @@ func TestSaveConfigWritesNonDefaults(t *testing.T) {
 	merged := Merge(pf, FlagOverrides{})
 	if merged.Board != "on" || merged.Subagent != "on" || merged.SubagentDepth() != 3 ||
 		merged.SubagentLimit() != 5 ||
-		merged.CommandSandbox != "bwrap" || merged.CommandTimeoutSecs != 180 ||
+		merged.CommandSandbox != "bwrap" || merged.CommandIdleTimeoutSecs != 300 ||
 		merged.SessionMaxCount != 60 || merged.SessionMaxAgeDays != -1 ||
 		merged.WebMaxActiveSessions != 4 || merged.WebApprovalHoldSecs != 5 ||
 		merged.WebBind != "0.0.0.0:9090" {
 		t.Fatalf("round-trip lost custom values: %+v", merged)
+	}
+}
+
+// TestSaveConfigNeverWritesLegacyCommandTimeoutKey pins that --save-config
+// regeneration emits only the renamed key: a config whose effective idle
+// timeout came from the legacy command_timeout_secs spelling must be
+// rewritten under command_idle_timeout_secs, never under the old key.
+func TestSaveConfigNeverWritesLegacyCommandTimeoutKey(t *testing.T) {
+	unsetConfigEnvs(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gogen.conf")
+
+	// Start from a legacy-spelled file, round-trip it through the effective
+	// config, and re-save.
+	legacy := "command_timeout_secs: 300\n"
+	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pf, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pf.Config.CommandIdleTimeoutSecs != 300 {
+		t.Fatalf("legacy key not aliased before save: %d, want 300", pf.Config.CommandIdleTimeoutSecs)
+	}
+	cfg := Merge(pf, FlagOverrides{})
+	if err := SaveConfig(path, "", cfg, "", WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(data)
+	if !strings.Contains(body, "command_idle_timeout_secs: 300") {
+		t.Fatalf("saved config missing renamed key:\n%s", body)
+	}
+	if strings.Contains(body, "command_timeout_secs:") {
+		t.Fatalf("legacy key leaked into saved config:\n%s", body)
 	}
 }

@@ -338,6 +338,18 @@ export async function deleteSession(id, label) {
     const displayName = label || id;
     const confirmed = await showSessionDeleteModal(displayName);
     if (!confirmed) return;
+    // The modal await above yields to the event loop for as long as the
+    // user takes to decide, so the socket may have closed in the meantime.
+    // Re-check BEFORE mutating anything: send() on a non-open socket throws
+    // an uncaught InvalidStateError, and setting the pending flag first
+    // would block the next session change ("Session change already in
+    // progress") until the next reconnect/turn_end cleared it. This check
+    // is airtight, not just best-effort: everything from here to the send
+    // below runs synchronously in one microtask, and the socket's
+    // readyState can only change while a task runs (the close event, a
+    // reconnect replacing the socket) — neither can preempt this block —
+    // so OPEN here still holds at the send.
+    if (!deps.ensureConnected()) return;
     // Deleting the active pane's session interrupts its turn; a
     // background session's delete leaves the active turn running.
     const active = deps.getPane();

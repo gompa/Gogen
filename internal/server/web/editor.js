@@ -2373,49 +2373,146 @@ function diffAtBottom(ed) {
 export function updateDiffFallback(container, value) {
   if (!container) return;
   let pre = container.querySelector('.diff-fallback');
+  const text = value || '';
   if (!pre) {
     pre = document.createElement('pre');
     pre.className = 'diff-fallback';
     container.appendChild(pre);
   }
-  // Rebuilding the <pre> resets its scroll position; preserve it by keeping
-  // the same distance from the bottom (streaming content grows append-only,
-  // so the visible lines stay put).
-  const distFromBottom = Math.max(0, pre.scrollHeight - pre.scrollTop - pre.clientHeight);
-  const text = value || '';
-  pre.textContent = '';
-  const nums = diffLineNumbers(text);
   const lines = text.split('\n');
   if (lines.length && lines[lines.length - 1] === '') lines.pop(); // trailing newline
+  const prev = pre._renderedText;
+  if (text === prev) return; // unchanged — nothing to (re)render
+  if (prev !== undefined && text.startsWith(prev) && pre._scrollHeight != null) {
+    // Append-only delta (the normal streaming case): the content only ever
+    // grows at the end, so keep the already-rendered rows and add just the
+    // new trailing ones. Rebuilding every row per delta was O(n^2) DOM work
+    // (plus a forced layout read) for an n-line diff.
+    const top = pre.scrollTop; // scroll-offset read; no layout flush
+    appendDiffRows(pre, text, lines);
+    // Scroll preservation without a pre-mutation layout read: the content
+    // only grew, so shift scrollTop by the growth. That keeps the same
+    // distance from the bottom as the full rebuild below (pinned-to-bottom
+    // stays pinned; a reader scrolled up into the diff is not yanked). One
+    // layout read, after the write. _scrollHeight is re-cached on every
+    // call, so a viewport/width change between deltas costs at most one
+    // delta of drift before the cache refreshes.
+    const h = pre.scrollHeight;
+    const growth = Math.max(0, h - pre._scrollHeight);
+    pre._scrollHeight = h;
+    const maxTop = h - pre.clientHeight;
+    pre.scrollTop = maxTop > 0 ? Math.min(Math.max(top + growth, 0), maxTop) : 0;
+    return;
+  }
+  // First render, or the rare non-append rewrite (server re-sent a
+  // corrected diff): full rebuild. Rebuilding the <pre> resets its scroll
+  // position; preserve it by keeping the same distance from the bottom
+  // (streaming content grows append-only, so the visible lines stay put).
+  const distFromBottom = Math.max(0, pre.scrollHeight - pre.scrollTop - pre.clientHeight);
+  pre.textContent = '';
+  const state = { oldN: 0, newN: 0, inHunk: false };
+  const nums = new Array(lines.length);
   // Colorize plain-text fallback so diffs stay readable if Monaco fails or
   // in static (tokenizer) mode. Each line is a row with a file-line-number
-  // gutter, matching the Monaco viewer's numbering.
+  // gutter, matching the Monaco viewer's numbering. An incomplete trailing
+  // line is only previewed (see appendDiffRows for the invariant).
+  const incompleteTail = text !== '' && text.charAt(text.length - 1) !== '\n';
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const row = document.createElement('div');
-    row.className = 'diff-row';
-    const num = document.createElement('span');
-    num.className = 'diff-num';
-    num.textContent = nums[i] || '';
-    const code = document.createElement('span');
-    code.className = 'diff-code';
-    if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('diff ') || line.startsWith('index ')) {
-      code.classList.add('gogen-diff-meta');
-    } else if (line.startsWith('@@')) {
-      code.classList.add('gogen-diff-hunk');
-    } else if (line.startsWith('+')) {
-      code.classList.add('gogen-diff-add');
-    } else if (line.startsWith('-')) {
-      code.classList.add('gogen-diff-del');
-    }
-    code.textContent = line;
-    row.appendChild(num);
-    row.appendChild(code);
-    pre.appendChild(row);
+    const incomplete = incompleteTail && i === lines.length - 1;
+    nums[i] = diffLineNumbersStep(incomplete ? { ...state } : state, lines[i]);
+    pre.appendChild(makeDiffRow(nums[i], lines[i]));
   }
   // Restore the previous reading position (clamped to the new bounds).
   const maxTop = pre.scrollHeight - pre.clientHeight;
   pre.scrollTop = maxTop > 0 ? Math.min(Math.max(maxTop - distFromBottom, 0), maxTop) : 0;
+  pre._renderedText = text;
+  pre._renderedLines = lines.length;
+  pre._nums = nums;
+  pre._numsState = state;
+  pre._scrollHeight = pre.scrollHeight;
+}
+
+// Appends the new trailing lines of an append-only delta to the fallback
+// <pre> (see updateDiffFallback). pre._renderedText/_renderedLines/_nums/
+// _numsState describe what is already rendered; all four are refreshed.
+//
+// Number-scan invariant: the scan state (pre._numsState) is only advanced
+// past COMPLETE lines. An incomplete trailing line (the text does not end
+// with '\n' while it streams in) gets a preview number — computed on a
+// state copy — and the state advances past it only once it completes. This
+// matters because the hunk-header regex only matches the complete line:
+// scanning a partial header would leave inHunk/oldN/newN stale and number
+// every following line wrong.
+function appendDiffRows(pre, text, lines) {
+  const start = pre._renderedLines;
+  const prev = pre._renderedText;
+  const state = pre._numsState;
+  let nums;
+  if (prev !== '' && !prev.endsWith('\n')) {
+    // The last rendered line was incomplete (number previewed, scan state
+    // held back). It has either grown in place or just completed with the
+    // incoming newline. The gutter number is unchanged by growth
+    // (numbering depends only on the line's first char and the unchanged
+    // prefix), but its diff class can change, so re-derive both from the
+    // full line.
+    const line = lines[start - 1];
+    const num = diffLineNumbersStep({ ...state }, line);
+    const row = pre.children[start - 1];
+    if (row) {
+      const code = row.lastElementChild;
+      code.className = 'diff-code';
+      applyDiffLineClass(code, line);
+      code.textContent = line;
+      row.firstElementChild.textContent = num || '';
+    }
+    nums = pre._nums.slice(start - 1);
+    nums[0] = num;
+    if (text.indexOf('\n', prev.length) !== -1) {
+      // The line just completed (the delta carries its terminating newline):
+      // advance the scan past it now.
+      diffLineNumbersStep(state, line);
+    }
+  } else {
+    nums = pre._nums.slice(start);
+  }
+  for (let i = start; i < lines.length; i++) {
+    const line = lines[i];
+    const incomplete = i === lines.length - 1 && text.charAt(text.length - 1) !== '\n';
+    nums.push(diffLineNumbersStep(incomplete ? { ...state } : state, line));
+    pre.appendChild(makeDiffRow(nums[nums.length - 1], line));
+  }
+  pre._renderedText = text;
+  pre._renderedLines = lines.length;
+  pre._nums = nums;
+}
+
+// One fallback row: file-line-number gutter + colored code span.
+function makeDiffRow(num, line) {
+  const row = document.createElement('div');
+  row.className = 'diff-row';
+  const numEl = document.createElement('span');
+  numEl.className = 'diff-num';
+  numEl.textContent = num || '';
+  const code = document.createElement('span');
+  code.className = 'diff-code';
+  applyDiffLineClass(code, line);
+  code.textContent = line;
+  row.appendChild(numEl);
+  row.appendChild(code);
+  return row;
+}
+
+// Per-line color class for the plain-text fallback (meta/hunk/add/del).
+function applyDiffLineClass(code, line) {
+  if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('diff ') || line.startsWith('index ')) {
+    code.classList.add('gogen-diff-meta');
+  } else if (line.startsWith('@@')) {
+    code.classList.add('gogen-diff-hunk');
+  } else if (line.startsWith('+')) {
+    code.classList.add('gogen-diff-add');
+  } else if (line.startsWith('-')) {
+    code.classList.add('gogen-diff-del');
+  }
 }
 
 // Map each line of a unified diff to a file line number for display. Header
@@ -2424,32 +2521,33 @@ export function updateDiffFallback(container, value) {
 // standard diff viewers number unified diffs.
 export function diffLineNumbers(text) {
   const lines = String(text || '').split('\n');
-  const out = new Array(lines.length).fill('');
-  let oldN = 0;
-  let newN = 0;
-  let inHunk = false;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const h = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
-    if (h) {
-      oldN = parseInt(h[1], 10);
-      newN = parseInt(h[2], 10);
-      inHunk = true;
-      continue;
-    }
-    if (!inHunk) continue;
-    const c = line.charAt(0);
-    if (c === '-') {
-      out[i] = String(oldN++);
-    } else if (c === '+') {
-      out[i] = String(newN++);
-    } else if (c === ' ') {
-      out[i] = String(newN++);
-      oldN++;
-    }
-    // '\ No newline at end of file' and anything else: no number.
-  }
+  const state = { oldN: 0, newN: 0, inHunk: false };
+  const out = new Array(lines.length);
+  for (let i = 0; i < lines.length; i++) out[i] = diffLineNumbersStep(state, lines[i]);
   return out;
+}
+
+// One step of the diffLineNumbers scan: returns the displayed number for
+// `line` and advances `state` ({ oldN, newN, inHunk }). updateDiffFallback
+// drives this incrementally so appended lines don't re-scan the whole diff.
+function diffLineNumbersStep(state, line) {
+  const h = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+  if (h) {
+    state.oldN = parseInt(h[1], 10);
+    state.newN = parseInt(h[2], 10);
+    state.inHunk = true;
+    return '';
+  }
+  if (!state.inHunk) return '';
+  const c = line.charAt(0);
+  if (c === '-') return String(state.oldN++);
+  if (c === '+') return String(state.newN++);
+  if (c === ' ') {
+    state.oldN++;
+    return String(state.newN++);
+  }
+  // '\ No newline at end of file' and anything else: no number.
+  return '';
 }
 
 // Returns the chat diff editor whose DOM node contains the event target, or

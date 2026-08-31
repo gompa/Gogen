@@ -1635,7 +1635,7 @@ func (s *Server) effectiveConfig() *config.Config {
 	out.CommandAllowlist = r.CommandAllowlist
 	out.DeleteApproval = r.DeleteApproval
 	out.CommandSandbox = r.CommandSandbox
-	out.CommandTimeoutSecs = r.CommandTimeoutSecs
+	out.CommandIdleTimeoutSecs = r.CommandIdleTimeoutSecs
 	out.TreeSitter = r.TreeSitter
 	out.TreeSitterLangs = r.TreeSitterLangs
 	out.WebFetch = r.WebFetch
@@ -1730,7 +1730,7 @@ func (s *Server) decorateConfig(msg *WSMessage) {
 	msg.CommandAllowlist = r.CommandAllowlist
 	msg.DeleteApproval = r.DeleteApproval
 	msg.CommandSandbox = r.CommandSandbox
-	msg.CommandTimeoutSecs = r.CommandTimeoutSecs
+	msg.CommandIdleTimeoutSecs = r.CommandIdleTimeoutSecs
 	msg.ContextLimitConfig = r.ContextLimit
 	msg.CompactThreshold = r.CompactThreshold
 	msg.CompactKeepRecentMessages = r.CompactKeepRecentMessages
@@ -2279,6 +2279,25 @@ func (rt *sessionRuntime) runTurnBody(ctx context.Context, content string, image
 		}
 	}, wsTokenFlushInterval)
 
+	// Tool-call argument deltas: the highest-rate callback in a
+	// tool-heavy turn (a patch_file diff arrives as hundreds of ~1KB
+	// fragments), so they get the same coalescing as content tokens
+	// instead of one WebSocket frame per provider chunk. Each flushed
+	// segment is stamped with the end offset of the text it carries
+	// (liveToolArgsSegmentEnd), not the buffer length — the client's
+	// trimToEnd merge relies on endPos - text.length matching the
+	// previous endPos exactly.
+	argsBatch := streamutil.NewArgsBatcher(func(index int, id, name, text string) {
+		write(WSMessage{
+			Type:       "tool_call_delta",
+			Tool:       name,
+			ToolCallID: id,
+			Index:      index,
+			ArgsDelta:  text,
+			ArgsPos:    rt.liveToolArgsSegmentEnd(index, text),
+		})
+	}, wsTokenFlushInterval)
+
 	// Live terminal tabs for shell tools: a tab is opened lazily on the
 	// first output chunk (which carries the exact command string), fed by
 	// a per-tool batcher, and closed on tool end. Both maps are keyed by
@@ -2289,18 +2308,20 @@ func (rt *sessionRuntime) runTurnBody(ctx context.Context, content string, image
 	termBatches := map[string]*streamutil.TokenBatcher{}
 	termOpened := map[string]struct{}{}
 
-	handlers := rt.buildStreamHandlers(appCtx, write, tokens, &termMu, termBatches, termOpened)
+	handlers := rt.buildStreamHandlers(appCtx, write, tokens, argsBatch, &termMu, termBatches, termOpened)
 
 	out, err := rt.agent.StreamProcessInputWithImages(appCtx, content, images, handlers)
 	if err != nil {
 		if appCtx.Err() != nil {
 			tokens.Flush()
+			argsBatch.Flush()
 			// Broadcast directly (not via write, which early-returns on a
 			// cancelled ctx) so the cancellation reaches attached clients.
 			rt.broadcast(WSMessage{Type: "cancelled", Content: "Cancelled.", SessionID: rt.agent.SessionID})
 			return out, err
 		}
 		tokens.Flush()
+		argsBatch.Flush()
 		write(WSMessage{Type: "stream_end"})
 		write(WSMessage{Type: "response", Content: fmt.Sprintf("Error: %v", err)})
 		if o.reportErr {
@@ -2327,6 +2348,7 @@ func (rt *sessionRuntime) runTurnBody(ctx context.Context, content string, image
 		write(WSMessage{Type: "response", Content: fmt.Sprintf("Warning: failed to save session: %v", persistErr)})
 	}
 	tokens.Flush()
+	argsBatch.Flush()
 	// No trailing stream_end here: every round already wrote one via the
 	// OnStreamEnd handler above, and turn_end marks the turn boundary.
 	if ctxMsg.Type != "" {
@@ -2339,7 +2361,13 @@ func (rt *sessionRuntime) runTurnBody(ctx context.Context, content string, image
 // batcher to the agent's stream callbacks. write fans out to every attached
 // socket with session tagging; the terminal-tab maps are mutex-guarded
 // (accessed from the exec pipe and the stream goroutines).
-func (rt *sessionRuntime) buildStreamHandlers(ctx context.Context, write func(WSMessage), tokens *streamutil.TokenBatcher, termMu *sync.Mutex, termBatches map[string]*streamutil.TokenBatcher, termOpened map[string]struct{}) *llm.StreamHandlers {
+//
+// argsBatch coalesces tool-call argument deltas (see runTurnBody); the
+// batcher's send callback emits the tool_call_delta frame, so this function
+// only feeds it (Add) and flushes it at the boundaries where the client must
+// have seen the complete args: before a tool_call_start/tool_call/tool_execute
+// frame and at stream end.
+func (rt *sessionRuntime) buildStreamHandlers(ctx context.Context, write func(WSMessage), tokens *streamutil.TokenBatcher, argsBatch *streamutil.ArgsBatcher, termMu *sync.Mutex, termBatches map[string]*streamutil.TokenBatcher, termOpened map[string]struct{}) *llm.StreamHandlers {
 	return &llm.StreamHandlers{
 		OnCompacting: func() {
 			write(WSMessage{Type: "compacting"})
@@ -2352,6 +2380,12 @@ func (rt *sessionRuntime) buildStreamHandlers(ctx context.Context, write func(WS
 		OnStart: func() {
 			// Reset the live-turn buffer for the new turn.
 			rt.liveTurnBegin()
+			// A new turn: the live buffer is cleared, so any args still
+			// pending in the batcher belong to the previous turn and
+			// would be stamped against a reset position counter. Drop
+			// them and re-arm the batcher for the new turn.
+			argsBatch.Close()
+			argsBatch.Reset()
 			// Tell the client the server-side index of the user message
 			// that StreamProcessInput just appended (for edit/resend).
 			// Index goes in Content because WSMessage.Index has omitempty
@@ -2368,6 +2402,11 @@ func (rt *sessionRuntime) buildStreamHandlers(ctx context.Context, write func(WS
 		},
 		OnRoundStart: func() {
 			rt.liveRoundBegin()
+			// Same reasoning as OnStart: the round buffer is cleared, so
+			// pending args from the previous round are dropped and the
+			// batcher is re-armed.
+			argsBatch.Close()
+			argsBatch.Reset()
 			write(WSMessage{Type: "thinking"})
 			if ctx.Err() != nil {
 				return
@@ -2388,6 +2427,10 @@ func (rt *sessionRuntime) buildStreamHandlers(ctx context.Context, write func(WS
 		},
 		OnStreamEnd: func() {
 			tokens.Flush()
+			// Deliver the round's trailing args BEFORE stream_end (the
+			// send queue is FIFO) and before liveRoundEnd clears the
+			// position counters.
+			argsBatch.Flush()
 			rt.liveRoundEnd()
 			write(WSMessage{Type: "stream_end"})
 		},
@@ -2406,6 +2449,10 @@ func (rt *sessionRuntime) buildStreamHandlers(ctx context.Context, write func(WS
 		},
 		OnToolCallStart: func(index int, id, name string) {
 			tokens.Flush()
+			// Flush pending args from any PREVIOUS index first: the
+			// client must see them before this call's start frame (FIFO),
+			// and liveToolStart resets only this index's counters.
+			argsBatch.Flush()
 			rt.liveToolStart(index, id, name)
 			write(WSMessage{
 				Type:       "tool_call_start",
@@ -2415,19 +2462,19 @@ func (rt *sessionRuntime) buildStreamHandlers(ctx context.Context, write func(WS
 			})
 		},
 		OnToolCallArgsDelta: func(index int, id, name, argsDelta string) {
-			tokens.Flush()
-			argsPos := rt.liveToolArgsAppend(index, argsDelta)
-			write(WSMessage{
-				Type:       "tool_call_delta",
-				Tool:       name,
-				ToolCallID: id,
-				Index:      index,
-				ArgsDelta:  argsDelta,
-				ArgsPos:    argsPos,
-			})
+			// Buffered synchronously (liveRewind must see the complete
+			// args), but the frame is emitted by the batcher's send
+			// callback: one tool_call_delta per flush interval instead of
+			// one per provider chunk. No tokens.Flush() here — it fired on
+			// every chunk before, forcing an extra stream frame per delta
+			// in a content+tool interleaving. The boundaries below flush
+			// both batchers exactly once.
+			rt.liveToolArgsAppend(index, argsDelta)
+			argsBatch.Add(index, id, name, argsDelta)
 		},
 		OnToolCall: func(tc llm.ToolCall) {
 			tokens.Flush()
+			argsBatch.Flush()
 			write(WSMessage{
 				Type:       "tool_call",
 				Tool:       tc.Name,
@@ -2437,6 +2484,9 @@ func (rt *sessionRuntime) buildStreamHandlers(ctx context.Context, write func(WS
 			})
 		},
 		OnToolExecute: func(name string) {
+			// The tool is about to run: the client's card must show the
+			// complete args first (the args stream is over at this point).
+			argsBatch.Flush()
 			write(WSMessage{Type: "tool_execute", Tool: name})
 		},
 		OnToolOutput: func(id, name, command, chunk string) {
@@ -2462,10 +2512,15 @@ func (rt *sessionRuntime) buildStreamHandlers(ctx context.Context, write func(WS
 			}
 			b.StreamToken(chunk)
 		},
-		OnToolResult: func(id, name, result string, success bool) {
+		OnToolOutputEnd: func(id string, success bool) {
 			// Close this tool call's live terminal tab, if one was
 			// opened. Flush first so buffered chunks land before
-			// term_exit (the send queue is FIFO).
+			// term_exit (the send queue is FIFO). Fired by the executor
+			// when a foreground command finishes (right before
+			// OnToolResult) and by the background job's wait goroutine
+			// when the job exits — possibly long after the turn ended;
+			// the send queue is FIFO, so the flush still lands first.
+			// A no-op when the command produced no output (no tab).
 			termMu.Lock()
 			b := termBatches[id]
 			delete(termBatches, id)
@@ -2479,6 +2534,12 @@ func (rt *sessionRuntime) buildStreamHandlers(ctx context.Context, write func(WS
 			if opened {
 				write(WSMessage{Type: "term_exit", TermID: id, ToolCallID: id, Success: success})
 			}
+		},
+		OnToolResult: func(id, name, result string, success bool) {
+			// The terminal is closed by OnToolOutputEnd, not here: for
+			// background jobs (execute_command background=true) the
+			// output stream outlives this result, and closing it here
+			// would kill the tab while the job is still running.
 			write(WSMessage{
 				Type:            "tool_result",
 				Tool:            name,

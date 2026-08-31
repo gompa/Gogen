@@ -27,6 +27,12 @@ let tocTooltipLabel = null;
 let tocTooltipBody = null;
 
 let lastTocActive = -1;
+// Cache of the .message.user elements in document order. Dots are 1:1
+// with user messages (appendTocDot/rebuildToc), so the list is
+// refreshed lazily when its length no longer matches the dot count —
+// updateTocActive runs on every pin/repin/scroll frame and must not
+// pay for a querySelectorAll (or a forced layout) each time.
+let cachedUserMsgs = null;
 let tocHideTimer = null;
 const TOC_TOOLTIP_HIDE_MS = 120; // debounce: sliding across dots must not flicker
 const TOC_PREVIEW_MAX_CHARS = 300;
@@ -57,12 +63,26 @@ export function rebuildToc() {
     if (!tocRail || !tocDots) return;
     tocDots.innerHTML = '';
     lastTocActive = -1;
+    // clearChat re-creates the message elements, so the cached list is
+    // stale even when its length still matches the dot count.
+    cachedUserMsgs = null;
     const messagesDiv = deps.getMessages();
     for (const m of messagesDiv.querySelectorAll('.message.user')) appendTocDot(m);
     const hasDots = tocDots.children.length > 0;
     tocRail.classList.toggle('has-dots', hasDots);
     if (!hasDots) hideTocRail();
     updateTocActive();
+}
+
+// The cached .message.user list, refreshed lazily: dots are 1:1 with
+// user messages, so a length mismatch with the dot column means the
+// transcript changed (new prompt appended or rail rebuilt).
+function getUserMsgs(messagesDiv) {
+    const dotCount = tocDots ? tocDots.children.length : 0;
+    if (!cachedUserMsgs || cachedUserMsgs.length !== dotCount) {
+        cachedUserMsgs = Array.from(messagesDiv.querySelectorAll('.message.user'));
+    }
+    return cachedUserMsgs;
 }
 
 // Highlight the dot of the prompt currently in view: the last user
@@ -73,10 +93,19 @@ export function rebuildToc() {
 // dot changes, so streaming never churns the rail).
 export function updateTocActive(d) {
     const messagesDiv = deps.getMessages();
-    const users = messagesDiv.querySelectorAll('.message.user');
     const dots = tocDots ? tocDots.children : null;
-    if (!users.length || !dots || !dots.length) return;
-    if (d === undefined) d = deps.getDistanceFromBottom();
+    if (!dots || !dots.length) return;
+    const users = getUserMsgs(messagesDiv);
+    if (!users.length) return;
+    if (deps.isPinned() && d === undefined) {
+        // Pinned at the bottom: the active dot is unconditionally the
+        // last prompt, so the distance value is never used below. Skip
+        // getDistanceFromBottom() (a forced layout) entirely and bail
+        // out before any layout read when nothing changed.
+        if (users.length - 1 === lastTocActive) return;
+    } else if (d === undefined) {
+        d = deps.getDistanceFromBottom();
+    }
     let active = users.length - 1;
     if (!deps.isPinned() && d > deps.getNearBottomPx()) {
         const viewTop = messagesDiv.getBoundingClientRect().top;

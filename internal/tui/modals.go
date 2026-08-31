@@ -664,20 +664,43 @@ func (m *Model) clampModalRows(rows []styleLine) []styleLine {
 // --- Models Modal ---
 
 func (m *Model) renderModelsModal() string {
+	rows, _ := m.modelsModalContent()
+	return m.renderBorderedModalWidth(rows, m.modelsModalInner())
+}
+
+// modelsModalContent builds the models modal's content rows (title,
+// thinking section, model entries, footer) and maps each model entry's
+// content-row index to its list index (mouse hit-testing). The renderer
+// wraps the rows in the border box; the hit-tester uses the map, so the
+// two can't drift.
+func (m *Model) modelsModalContent() ([]styleLine, map[int]int) {
+	modelRowAt := make(map[int]int)
+
+	// Title
+	rows := []styleLine{{text: "Available Models", highlight: true}}
+
+	// Thinking section (web toolbar popover parity): a heading plus the
+	// staged chip row, hidden when the model under the cursor has no
+	// reasoning-effort control.
+	if levels, supported := m.modelsModalThinkingLevels(); supported {
+		rows = append(rows, styleLine{text: "  Thinking level", highlight: false})
+		chipText, _ := buildThinkingChipRow(levels, thinkingChipCursor(levels, m.thinkingSel))
+		rows = append(rows, styleLine{text: chipText, preStyled: true})
+	}
+
+	rows = append(rows, styleLine{text: "", highlight: false})
+
 	if len(m.modelList) == 0 {
-		// Same preferred width as the populated picker so opening /models
-		// on an empty catalog does not flash a narrower box.
-		return m.renderBorderedModalWidth([]styleLine{
-			{text: "Available Models", highlight: true},
-			{text: "", highlight: false},
-			{text: "No models available.", highlight: false},
-			{text: "", highlight: false},
-			{text: "Press esc to close", highlight: false},
-		}, modelsModalInnerWidth)
+		rows = append(rows,
+			styleLine{text: "No models available.", highlight: false},
+			styleLine{text: "", highlight: false},
+			styleLine{text: "Press esc to close", highlight: false},
+		)
+		return rows, modelRowAt
 	}
 
 	// Constrain visible area to fit the terminal.
-	reserved := 13 // border(2) + title(2) + footer(4) + top/bottom margin(5)
+	reserved := 15 // border(2) + title(1) + thinking(2) + footer(2) + margins(5) + slack(3)
 	maxVisible := max(3, m.height-reserved)
 
 	// Clamp cursor.
@@ -704,13 +727,6 @@ func (m *Model) renderModelsModal() string {
 		end = len(m.modelList)
 	}
 
-	// Build plain-text lines first so we can compute the max content width.
-	var rows []styleLine
-
-	// Title
-	rows = append(rows, styleLine{text: "Available Models", highlight: true})
-	rows = append(rows, styleLine{text: "", highlight: false})
-
 	// Overflow indicator (top)
 	if start > 0 {
 		rows = append(rows, styleLine{
@@ -719,7 +735,13 @@ func (m *Model) renderModelsModal() string {
 	}
 
 	// Model entries
-	rows = append(rows, buildModelRows(m.modelList, start, end, m.modelCursor)...)
+	entryRows, rowToModel := buildModelRows(m.modelList, start, end, m.modelCursor)
+	for i, r := range entryRows {
+		rows = append(rows, r)
+		if idx, ok := rowToModel[i]; ok {
+			modelRowAt[len(rows)-1] = idx
+		}
+	}
 
 	// Overflow indicator (bottom)
 	if end < len(m.modelList) {
@@ -731,13 +753,212 @@ func (m *Model) renderModelsModal() string {
 	// Footer
 	rows = append(rows, styleLine{text: "", highlight: false})
 	rows = append(rows, styleLine{
-		text: "↑↓/jk navigate  enter load  esc close", highlight: false,
+		text: "↑↓/jk models  ←→/h/l thinking  enter apply  esc close", highlight: false,
 	})
 
-	// Width: the preferred default as a floor, grown to fit the longest
-	// entry in the catalog when the terminal has room (the renderer's
-	// clamp truncates rows only when even that is not enough).
-	return m.renderBorderedModalWidth(rows, modelsModalInner(m.modelList))
+	return rows, modelRowAt
+}
+
+// modelsModalThinkingLevelsFor returns the thinking levels the models
+// modal's chip row offers for modelID: "off" (omit) plus the model's
+// accepted reasoning-effort values. supported=false means the model has
+// no reasoning-effort control (a known toggle-only entry, or a llama.cpp
+// /props probe reporting no support): the section is hidden, mirroring
+// the web's reasoningEffortsUnsupported handling.
+func (m *Model) modelsModalThinkingLevelsFor(modelID string) (levels []agent.ThinkingLevel, supported bool) {
+	if m.agent == nil {
+		// Literal-built models (tests): the default closed set.
+		return []agent.ThinkingLevel{agent.ThinkingOff, agent.ThinkingLow, agent.ThinkingMedium, agent.ThinkingHigh}, true
+	}
+	levels = m.agent.ThinkingLevelsForModel(modelID)
+	return levels, len(levels) > 1
+}
+
+// modelsModalThinkingLevels is the chip row's level set for the model
+// under the cursor; with an empty catalog it falls back to the current
+// model's levels (web parity: the toolbar chips are anchored to the
+// active model, not the catalog).
+func (m *Model) modelsModalThinkingLevels() ([]agent.ThinkingLevel, bool) {
+	id := ""
+	if m.modelCursor >= 0 && m.modelCursor < len(m.modelList) {
+		id = m.modelList[m.modelCursor].ID
+	} else if m.agent != nil {
+		id = m.agent.CurrentModel()
+	}
+	return m.modelsModalThinkingLevelsFor(id)
+}
+
+// thinkingChipLabel is a chip's display text, following the web
+// toolbar's rule: "Off" for the omit state, short forms (L/M/H) for the
+// closed default set, the full title-cased label for model-specific
+// values ("Max").
+func thinkingChipLabel(l agent.ThinkingLevel) string {
+	if l == agent.ThinkingOff {
+		return "Off"
+	}
+	switch l {
+	case agent.ThinkingLow, agent.ThinkingMedium, agent.ThinkingHigh:
+		return l.ShortLabel()
+	}
+	return l.Label()
+}
+
+// thinkingChipSpan is one chip's column range on the chip row, relative
+// to the content area (0 = first column after the box border and the
+// renderer's two-cell content padding).
+type thinkingChipSpan struct {
+	value agent.ThinkingLevel
+	x0    int
+	x1    int
+}
+
+// buildThinkingChipRow renders the chip row — "    [Off]  [L]  [M]  [H]"
+// with the chip at cursor highlighted — and returns each chip's column
+// span for mouse hit-testing. The hit-tester calls this with the same
+// state, so rendering and hit-testing can't drift.
+func buildThinkingChipRow(levels []agent.ThinkingLevel, cursor int) (string, []thinkingChipSpan) {
+	const indent = "    "
+	var b strings.Builder
+	var spans []thinkingChipSpan
+	b.WriteString(indent)
+	w := lipgloss.Width(indent)
+	for i, l := range levels {
+		if i > 0 {
+			b.WriteString("  ")
+			w += 2
+		}
+		label := "[" + thinkingChipLabel(l) + "]"
+		spans = append(spans, thinkingChipSpan{value: l, x0: w, x1: w + lipgloss.Width(label)})
+		if i == cursor {
+			b.WriteString(ansiHighlightOn + label + ansiReset)
+		} else {
+			b.WriteString(ansiDimOn + label + ansiReset)
+		}
+		w += lipgloss.Width(label)
+	}
+	return b.String(), spans
+}
+
+// thinkingChipCursor finds the staged level's chip index; -1 when the
+// staged level is not among the offered levels (policy B: no chip
+// highlighted = nothing would be sent).
+func thinkingChipCursor(levels []agent.ThinkingLevel, sel agent.ThinkingLevel) int {
+	for i, l := range levels {
+		if l == sel {
+			return i
+		}
+	}
+	return -1
+}
+
+// modelsModalSyncThinking keeps the staged thinking selection valid for
+// the model under the cursor after the cursor moves: a staged level the
+// model does not accept resets to off (the web subagent picker's
+// resetStaleThinking), so the highlighted chip is always what enter
+// would apply.
+func (m *Model) modelsModalSyncThinking() {
+	if m.thinkingSel == "" || m.thinkingSel == agent.ThinkingOff {
+		return
+	}
+	levels, _ := m.modelsModalThinkingLevels()
+	for _, l := range levels {
+		if l == m.thinkingSel {
+			return
+		}
+	}
+	m.thinkingSel = agent.ThinkingOff
+}
+
+// modelsModalStepThinking moves the staged thinking selection by dir
+// chips (clamped at the ends).
+func (m *Model) modelsModalStepThinking(dir int) {
+	levels, supported := m.modelsModalThinkingLevels()
+	if !supported {
+		return
+	}
+	idx := thinkingChipCursor(levels, m.thinkingSel)
+	if idx < 0 {
+		idx = 0
+	}
+	next := idx + dir
+	if next < 0 {
+		next = 0
+	}
+	if next >= len(levels) {
+		next = len(levels) - 1
+	}
+	m.thinkingSel = levels[next]
+}
+
+// modelsModalEnter applies the staged selection: the model under the
+// cursor plus the staged thinking level. Same model + same level just
+// closes; same model + different level applies the level inline; a
+// different model runs the async switch and applies the level after it
+// lands (validation then runs against the new model's accepted set).
+func (m *Model) modelsModalEnter() (tea.Model, tea.Cmd) {
+	if len(m.modelList) == 0 || m.modelCursor < 0 || m.modelCursor >= len(m.modelList) {
+		m.modal = ModalNone
+		return m, nil
+	}
+	mdl := m.modelList[m.modelCursor]
+	sel := m.thinkingSel
+	if sel == "" {
+		sel = agent.ThinkingOff
+	}
+	if mdl.Current {
+		if m.agent != nil && string(sel) != string(m.agent.ThinkingLevel) {
+			if out, _ := m.agent.HandleThinkingCommand("/think " + string(sel)); out != "" {
+				m.appendChatLine(SystemStyle.Render(out))
+			}
+		}
+		m.modal = ModalNone
+		return m, nil
+	}
+	return m.loadSelectedModel(sel)
+}
+
+// handleModelsModalMouse handles mouse events over the models modal: a
+// left click on a thinking chip stages that level, a left click on a
+// model entry moves the cursor there (enter still confirms — click
+// stages, enter applies). Returns true when the event was consumed.
+func (m *Model) handleModelsModalMouse(ev mouseEvent) bool {
+	if m.modal != ModalModels || ev.kind != mousePress || ev.button != tea.MouseLeft {
+		return false
+	}
+	if m.width <= 0 || m.height <= 0 {
+		return false
+	}
+	// The overlay centers the box in the terminal (renderModalOverlay);
+	// measure the rendered box to recover its origin.
+	modal := m.renderModelsModal()
+	boxW := lipgloss.Width(modal)
+	boxH := lipgloss.Height(modal)
+	ox := (m.width - boxW) / 2
+	oy := (m.height - boxH) / 2
+	if ev.x < ox || ev.x >= ox+boxW || ev.y < oy || ev.y >= oy+boxH {
+		return false
+	}
+	relX := ev.x - ox - 3 // border(1) + content padding(2)
+	relY := ev.y - oy - 1 // top border
+	if levels, supported := m.modelsModalThinkingLevels(); supported {
+		// Content rows: 0 title, 1 thinking heading, 2 chip row.
+		if relY == 2 {
+			_, spans := buildThinkingChipRow(levels, thinkingChipCursor(levels, m.thinkingSel))
+			for _, s := range spans {
+				if relX >= s.x0 && relX < s.x1 {
+					m.thinkingSel = s.value
+					return true
+				}
+			}
+		}
+	}
+	_, modelRowAt := m.modelsModalContent()
+	if idx, ok := modelRowAt[relY]; ok {
+		m.modelCursor = idx
+		m.modelsModalSyncThinking()
+		return true
+	}
+	return false
 }
 
 // modelProviderName returns the registered provider profile that serves the
@@ -750,16 +971,18 @@ func modelProviderName(mi llm.ModelInfo) string {
 	return mi.Provider
 }
 
-// modelsModalInner is the picker's inner width for a catalog: the fixed
-// preferred width as the floor, grown to fit the longest row in the WHOLE
-// list (provider headers and entries — numbering, id, context suffix,
-// current marker) so the box neither hugs short entries nor resizes while
-// the user scrolls through windows that happen to exclude the longest one.
-// renderBorderedModalWidth still clamps the result to the terminal and
-// truncates rows only when even that width cannot fit them.
-func modelsModalInner(list []llm.ModelInfo) int {
+// modelsModalInner is the picker's inner width: the fixed preferred
+// width as the floor, grown to fit the longest row in the WHOLE list
+// (provider headers, entries — numbering, id, context suffix, current
+// marker — and every model's thinking chip row) so the box neither hugs
+// short entries nor resizes while the user scrolls through windows that
+// happen to exclude the longest one or moves the cursor between models
+// with different accepted efforts. renderBorderedModalWidth still clamps
+// the result to the terminal and truncates rows only when even that
+// width cannot fit them.
+func (m *Model) modelsModalInner() int {
 	inner := modelsModalInnerWidth
-	for i, mdl := range list {
+	for i, mdl := range m.modelList {
 		// Provider header: two-space prefix (buildModelRows's "  "+name),
 		// plus the renderer's four content-padding cells.
 		if w := lipgloss.Width("  "+modelProviderName(mdl)) + 4; w > inner {
@@ -769,6 +992,23 @@ func modelsModalInner(list []llm.ModelInfo) int {
 		// the position, so the probe must use it.
 		if w := lipgloss.Width(modelEntryText(i, mdl)) + 4; w > inner {
 			inner = w
+		}
+		// Thinking chip row for this model's accepted efforts.
+		if levels, supported := m.modelsModalThinkingLevelsFor(mdl.ID); supported {
+			text, _ := buildThinkingChipRow(levels, -1)
+			if w := lipgloss.Width(text) + 4; w > inner {
+				inner = w
+			}
+		}
+	}
+	if len(m.modelList) == 0 {
+		// Empty catalog: the chip row still renders (the current
+		// model's levels) — probe it too.
+		if levels, supported := m.modelsModalThinkingLevels(); supported {
+			text, _ := buildThinkingChipRow(levels, -1)
+			if w := lipgloss.Width(text) + 4; w > inner {
+				inner = w
+			}
 		}
 	}
 	return inner
@@ -794,9 +1034,12 @@ func modelEntryText(i int, mdl llm.ModelInfo) string {
 // first — so consecutive grouping matches the catalog, mirroring the web
 // model picker). Headers are decorative only: they are not cursor targets
 // and the 1-based numbering stays aligned with the full list so /models <n>
-// selects the same model as the modal.
-func buildModelRows(list []llm.ModelInfo, start, end, cursor int) []styleLine {
+// selects the same model as the modal. The returned map links each rendered
+// row's index to its model list index (mouse hit-testing); header rows are
+// not in the map.
+func buildModelRows(list []llm.ModelInfo, start, end, cursor int) ([]styleLine, map[int]int) {
 	rows := make([]styleLine, 0, end-start+2)
+	modelRowAt := make(map[int]int)
 	lastProvider := ""
 	if start > 0 && start <= len(list) {
 		// Resuming mid-list: seed with the previous entry's provider so a
@@ -816,8 +1059,9 @@ func buildModelRows(list []llm.ModelInfo, start, end, cursor int) []styleLine {
 			text:      modelEntryText(i, mdl),
 			highlight: i == cursor,
 		})
+		modelRowAt[len(rows)-1] = i
 	}
-	return rows
+	return rows, modelRowAt
 }
 
 func (m *Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -828,10 +1072,12 @@ func (m *Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "up", "k":
 		if m.modelCursor > 0 {
 			m.modelCursor--
+			m.modelsModalSyncThinking()
 		}
 	case "down", "j":
 		if m.modelCursor < len(m.modelList)-1 {
 			m.modelCursor++
+			m.modelsModalSyncThinking()
 		}
 	case "pgup":
 		page := max(1, m.height-20)
@@ -839,26 +1085,31 @@ func (m *Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if m.modelCursor < 0 {
 			m.modelCursor = 0
 		}
+		m.modelsModalSyncThinking()
 	case "pgdown":
 		page := max(1, m.height-20)
 		m.modelCursor += page
 		if m.modelCursor >= len(m.modelList) {
 			m.modelCursor = len(m.modelList) - 1
 		}
+		m.modelsModalSyncThinking()
+	case "left", "h":
+		m.modelsModalStepThinking(-1)
+	case "right", "l":
+		m.modelsModalStepThinking(1)
 	case "enter":
-		if len(m.modelList) > 0 && m.modelCursor >= 0 && m.modelCursor < len(m.modelList) {
-			return m.loadSelectedModel()
-		}
+		return m.modelsModalEnter()
 	}
 	return m, nil
 }
 
 // loadSelectedModel switches to the model at modelCursor from the models
-// modal. SelectModel hits the network (model list + context-limit probe),
-// so the modal closes immediately and the switch runs in the background;
-// the result arrives as modelSwitchMsg (handleModelSwitchMsg applies the
-// transcript rebuild + context refresh).
-func (m *Model) loadSelectedModel() (tea.Model, tea.Cmd) {
+// modal, carrying the staged thinking level. SelectModel hits the network
+// (model list + context-limit probe), so the modal closes immediately and
+// the switch runs in the background; the result arrives as modelSwitchMsg
+// (handleModelSwitchMsg applies the transcript rebuild + context refresh,
+// then the staged level).
+func (m *Model) loadSelectedModel(thinking agent.ThinkingLevel) (tea.Model, tea.Cmd) {
 	mdl := m.modelList[m.modelCursor]
 	// Skip if already on this model.
 	if mdl.Current {
@@ -876,7 +1127,7 @@ func (m *Model) loadSelectedModel() (tea.Model, tea.Cmd) {
 		// HandleModelsCommand shares the inline /models <sel> path: same
 		// switch, same "Switched to model: …" line.
 		out, _, err := a.HandleModelsCommand(base, "/models "+id)
-		return modelSwitchMsg{agent: a, out: out, err: err}
+		return modelSwitchMsg{agent: a, out: out, err: err, thinking: thinking}
 	}
 }
 
@@ -921,7 +1172,7 @@ func (m *Model) renderHelpModal() string {
 			{"/plan / /act", "Toggle plan/act mode"},
 			{"/mode", "Show current mode"},
 			{"/think", "Set thinking level"},
-			{"/models", "List/switch models"},
+			{"/models", "List/switch models + thinking level"},
 			{"/context", "Context usage details"},
 			{"/new", "Start new session"},
 			{"/resume", "List/restore/delete sessions"},

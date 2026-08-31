@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -23,7 +24,7 @@ func TestJobNoticeFiresOnNaturalExit(t *testing.T) {
 		}
 	})
 
-	if _, err := a.StartBackgroundCommand("echo notice-me"); err != nil {
+	if _, err := a.StartBackgroundCommand(context.Background(), "echo notice-me"); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -51,7 +52,7 @@ func TestJobNoticeNotOnCancel(t *testing.T) {
 		fired <- struct{}{}
 	})
 
-	id, err := a.StartBackgroundCommand("sleep 30")
+	id, err := a.StartBackgroundCommand(context.Background(), "sleep 30")
 	if err != nil {
 		t.Fatal(err)
 	}

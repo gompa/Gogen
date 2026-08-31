@@ -287,6 +287,13 @@ func (m *Model) handleModelListMsg(msg modelListMsg) (tea.Model, tea.Cmd) {
 	}
 	m.modelList = msg.list
 	m.modelCursor = 0
+	// Stage the current level (web subagent-picker seeding) and drop it
+	// when the model under the cursor does not accept it.
+	m.thinkingSel = m.agent.ThinkingLevel
+	if m.thinkingSel == "" {
+		m.thinkingSel = agent.ThinkingOff
+	}
+	m.modelsModalSyncThinking()
 	m.modal = ModalModels
 	return m, nil
 }
@@ -314,6 +321,14 @@ func (m *Model) handleModelSwitchMsg(msg modelSwitchMsg) (tea.Model, tea.Cmd) {
 	// the line, so modal selections silently showed nothing.
 	m.chatLines = renderMessages(m.agent.Messages, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())
 	m.chatLines = append(m.chatLines, SystemStyle.Render(msg.out))
+	// Staged thinking level (models modal): apply AFTER the switch so
+	// HandleThinkingCommand's validation runs against the new model's
+	// accepted set.
+	if msg.thinking != "" && string(msg.thinking) != string(m.agent.ThinkingLevel) {
+		if out, _ := m.agent.HandleThinkingCommand("/think " + string(msg.thinking)); out != "" {
+			m.chatLines = append(m.chatLines, SystemStyle.Render(out))
+		}
+	}
 	m.setViewportContent()
 	m.viewport.GotoBottom()
 	return m, nil
@@ -517,6 +532,12 @@ func (m *Model) handleMouseMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// through to the viewport.
 	if ev, ok := normalizeMouseEvent(msg); ok {
 		if m.handleSidebarResizeMouse(ev) {
+			return m, nil
+		}
+		// The models modal's chips/rows are clickable; consume before the
+		// panel and selection handlers (a click over the overlay must not
+		// start a text selection under it).
+		if m.handleModelsModalMouse(ev) {
 			return m, nil
 		}
 		if consumed, cmd := m.handleSidebarMouse(ev); consumed {

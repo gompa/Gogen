@@ -125,7 +125,7 @@ func TestWindowsBackgroundJobInterp(t *testing.T) {
 	a := NewAgent(nil, exec, nil)
 	defer a.Close()
 
-	id, err := a.StartBackgroundCommand("while read line; do echo \"got: $line\"; done")
+	id, err := a.StartBackgroundCommand(context.Background(), "while read line; do echo \"got: $line\"; done")
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}

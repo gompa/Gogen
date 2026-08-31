@@ -89,6 +89,10 @@ func keyMsg(s string) tea.KeyPressMsg {
 		return tea.KeyPressMsg{Code: tea.KeyEnter}
 	case "esc":
 		return tea.KeyPressMsg{Code: tea.KeyEscape}
+	case "left":
+		return tea.KeyPressMsg{Code: tea.KeyLeft}
+	case "right":
+		return tea.KeyPressMsg{Code: tea.KeyRight}
 	default:
 		return tea.KeyPressMsg{Code: rune(s[0])}
 	}

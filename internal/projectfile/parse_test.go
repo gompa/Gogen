@@ -113,6 +113,51 @@ func TestParseLegacyKeyNotWritten(t *testing.T) {
 	}
 }
 
+// The pre-rename command_timeout_secs key must keep working, with the
+// current key winning when both are present, and the legacy field must be
+// cleared after parsing so it never leaks elsewhere.
+func TestParseLegacyCommandTimeoutKey(t *testing.T) {
+	pf, err := ParseContent("GOGEN.md", "---\ncommand_timeout_secs: 300\n---\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pf.Config.CommandIdleTimeoutSecs != 300 {
+		t.Fatalf("legacy key not aliased: CommandIdleTimeoutSecs = %d, want 300", pf.Config.CommandIdleTimeoutSecs)
+	}
+	if pf.Config.CommandTimeoutSecs != nil {
+		t.Fatalf("legacy field not cleared after aliasing: %v", *pf.Config.CommandTimeoutSecs)
+	}
+
+	// Current key wins when both are present.
+	pfBoth, err := ParseContent("GOGEN.md", "---\ncommand_timeout_secs: 300\ncommand_idle_timeout_secs: 90\n---\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pfBoth.Config.CommandIdleTimeoutSecs != 90 {
+		t.Fatalf("current key should win: CommandIdleTimeoutSecs = %d, want 90", pfBoth.Config.CommandIdleTimeoutSecs)
+	}
+	if pfBoth.Config.CommandTimeoutSecs != nil {
+		t.Fatalf("legacy field not cleared when both keys present: %v", *pfBoth.Config.CommandTimeoutSecs)
+	}
+
+	// The alias also applies to pure-YAML .conf files.
+	cfg, err := ParseConfigFile("gogen.conf", "command_timeout_secs: 45\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Config.CommandIdleTimeoutSecs != 45 {
+		t.Fatalf(".conf legacy key not aliased: CommandIdleTimeoutSecs = %d, want 45", cfg.Config.CommandIdleTimeoutSecs)
+	}
+
+	// End-to-end through Merge: the aliased value reaches the runtime config.
+	os.Unsetenv("GOGEN_COMMAND_IDLE_TIMEOUT_SECS")
+	os.Unsetenv("GOGEN_COMMAND_TIMEOUT_SECS")
+	merged := Merge(pf, FlagOverrides{})
+	if merged.CommandIdleTimeoutSecs != 300 {
+		t.Fatalf("Merge did not carry the aliased legacy value: %d, want 300", merged.CommandIdleTimeoutSecs)
+	}
+}
+
 func TestParseMissingClosingDelimiter(t *testing.T) {
 	_, err := ParseContent("GOGEN.md", "---\ncommand_safety: off\n# no close")
 	if err == nil {

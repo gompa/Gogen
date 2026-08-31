@@ -137,8 +137,13 @@ func (a *Agent) runToolRound(ctx context.Context, h *llm.StreamHandlers, toolCal
 		toolCtx := ctx
 		imgSink := &imageSink{}
 		if h.OnToolOutput != nil {
-			toolCtx = ContextWithToolOutput(ctx, func(command, chunk string) {
+			toolCtx = ContextWithToolOutput(toolCtx, func(command, chunk string) {
 				h.OnToolOutput(tc.ID, tc.Name, command, chunk)
+			})
+		}
+		if h.OnToolOutputEnd != nil {
+			toolCtx = ContextWithToolOutputEnd(toolCtx, func(success bool) {
+				h.OnToolOutputEnd(tc.ID, success)
 			})
 		}
 		toolCtx = ContextWithImageSink(toolCtx, imgSink)

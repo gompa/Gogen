@@ -196,6 +196,15 @@ type liveTurnState struct {
 	toolIDs       map[int]string
 	toolArgs      map[int]*strings.Builder
 	toolArgsUnits map[int]int
+	// toolArgsSent tracks, per tool-call index, the end offset of the
+	// last args segment flushed to the wire. Unlike contentSent (which
+	// the rewind payload reads), the rewind payload keeps reporting the
+	// FULL buffer length in toolArgsUnits: the client's rewind merge
+	// (appendStreamingToolArgs + trimToEnd) recovers any delta it already
+	// received beyond the snapshot, so a partial position here would
+	// drop the tail. toolArgsSent exists solely to stamp the exact end
+	// offset on each outgoing tool_call_delta frame.
+	toolArgsSent map[int]int
 }
 
 // liveToolCallState is one in-progress tool call carried in a rewind payload.
@@ -253,6 +262,7 @@ func (rt *sessionRuntime) resetLiveLocked() {
 	rt.live.toolIDs = nil
 	rt.live.toolArgs = nil
 	rt.live.toolArgsUnits = nil
+	rt.live.toolArgsSent = nil
 }
 
 // liveUTF16Len returns the number of UTF-16 code units in s — the unit the
@@ -328,12 +338,26 @@ func (rt *sessionRuntime) liveToolStart(index int, id, name string) {
 		rt.live.toolArgsUnits = make(map[int]int)
 	}
 	rt.live.toolArgsUnits[index] = 0
+	// A fresh call at a recycled index must restart the sent marker too:
+	// the client's card was created by tool_call_start, which always
+	// precedes the first delta, so both counters start at 0.
+	if rt.live.toolArgsSent != nil {
+		delete(rt.live.toolArgsSent, index)
+	}
 	rt.liveMu.Unlock()
 }
 
 // liveToolArgsAppend records one args delta for a streaming tool call
-// (OnToolCallArgsDelta) and returns the call's accumulated args length.
-func (rt *sessionRuntime) liveToolArgsAppend(index int, delta string) int {
+// (OnToolCallArgsDelta) in the live-turn buffer. It runs synchronously on
+// every delta (not at flush time) so liveRewind always reports the complete
+// args the client will eventually receive: the client's rewind merge
+// (appendStreamingToolArgs + trimToEnd) uses the stamped ArgsPos to recover
+// the tail it already painted, so a snapshot that lagged the wire would
+// leave a permanent gap in the card.
+func (rt *sessionRuntime) liveToolArgsAppend(index int, delta string) {
+	if delta == "" {
+		return
+	}
 	rt.liveMu.Lock()
 	if rt.live.toolArgs == nil {
 		rt.live.toolArgs = make(map[int]*strings.Builder)
@@ -349,7 +373,22 @@ func (rt *sessionRuntime) liveToolArgsAppend(index int, delta string) int {
 	}
 	b.WriteString(delta)
 	rt.live.toolArgsUnits[index] += liveUTF16Len(delta)
-	pos := rt.live.toolArgsUnits[index]
+	rt.liveMu.Unlock()
+}
+
+// liveToolArgsSegmentEnd advances the sent-args marker for one flushed
+// coalesced segment and returns the segment's end offset in that tool
+// call's args stream. Called from the args batcher's send callback (the
+// args analogue of liveContentSegmentEnd): the batcher lags the buffer by up
+// to one flush interval, so the frame must carry the offset of the text it
+// actually carries, not the buffer length.
+func (rt *sessionRuntime) liveToolArgsSegmentEnd(index int, text string) int {
+	rt.liveMu.Lock()
+	if rt.live.toolArgsSent == nil {
+		rt.live.toolArgsSent = make(map[int]int)
+	}
+	rt.live.toolArgsSent[index] += liveUTF16Len(text)
+	pos := rt.live.toolArgsSent[index]
 	rt.liveMu.Unlock()
 	return pos
 }

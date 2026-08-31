@@ -37,6 +37,13 @@ func newAgent(cfg *config.Config, isGlobalMode bool) (*agent.Agent, string, []st
 		llm.ProviderProfiles(cfg.OpenAIKey, cfg.OpenAIModel, cfg.OpenAIURL, cfg.OpenAIProviders),
 		cfg.OpenAIModel, cfg.WorkingDir, nil)
 
+	// Process-shared model→profile owner record: the TUI subagent spawner
+	// extracts it from the parent so a child provider whose owning endpoint
+	// is down still routes inherited models to that endpoint instead of
+	// falling back to the default profile. The web server replaces it with
+	// the workspace's registry (shared by every session) in NewServer.
+	provider.SetOwnerRegistry(llm.NewOwnerRegistry())
+
 	// Derive a stable prompt-cache key from the working directory so
 	// provider-side prefix caches survive sequential requests.
 	provider.SetPromptCacheKey(llm.ProjectPromptCacheKey(cfg.WorkingDir))
@@ -58,8 +65,8 @@ func newAgent(cfg *config.Config, isGlobalMode bool) (*agent.Agent, string, []st
 	// context manager later applies to tool results; 0 (explicit "no cap")
 	// passes through unbounded.
 	exec.SetMaxToolOutputBytes(cfg.MaxToolResultBytes)
-	if cfg.CommandTimeoutSecs > 0 {
-		exec.SetCommandTimeout(time.Duration(cfg.CommandTimeoutSecs) * time.Second)
+	if cfg.CommandIdleTimeoutSecs > 0 {
+		exec.SetIdleTimeout(time.Duration(cfg.CommandIdleTimeoutSecs) * time.Second)
 	}
 	if isGlobalMode {
 		// In global mode, relax the path boundary to the user's home directory.

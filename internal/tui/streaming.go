@@ -155,6 +155,12 @@ type modelSwitchMsg struct {
 	agent *agent.Agent
 	out   string
 	err   error
+	// thinking is the models modal's staged thinking level, applied AFTER
+	// a successful switch ("" = none, e.g. the inline /models <sel>
+	// path). The modal validated it against the new model's accepted set
+	// before the switch ran; applying it post-switch makes
+	// HandleThinkingCommand's validation run against that same model.
+	thinking agent.ThinkingLevel
 }
 
 // savedSessionsMsg carries an async persisted-session index snapshot
@@ -220,7 +226,9 @@ func (s *StreamAdapter) Handlers() *llm.StreamHandlers {
 	// transcript update per chunk. The batcher concatenates per-index
 	// deltas and flushes on a timer — the accumulated-args bookkeeping in
 	// handleStreamToolArgs is unaffected (it sums the same bytes).
-	argsBatch := newArgsBatcher(func(index int, id, delta string) {
+	// Shared with the WebSocket frontend (streamutil.ArgsBatcher) so both
+	// coalesce identically.
+	argsBatch := streamutil.NewArgsBatcher(func(index int, id, _ string, delta string) {
 		s.send(streamToolCallArgsMsg{index: index, id: id, delta: delta, sid: s.owner, seq: s.seq})
 	}, 32*time.Millisecond)
 
@@ -284,7 +292,7 @@ func (s *StreamAdapter) Handlers() *llm.StreamHandlers {
 			s.send(streamToolCallMsg{index: index, id: id, name: name, sid: s.owner, seq: s.seq})
 		},
 		OnToolCallArgsDelta: func(index int, id, name, argsDelta string) {
-			argsBatch.Add(index, id, argsDelta)
+			argsBatch.Add(index, id, name, argsDelta)
 			if s.sess != nil {
 				s.sess.roundToolArgsAppend(index, argsDelta)
 			}

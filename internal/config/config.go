@@ -30,8 +30,10 @@ const (
 	// that cannot fit the context window; "error" returns a diagnostic
 	// instead.
 	DefaultCompactLastResort = "condense"
-	// DefaultCommandTimeoutSecs is the maximum duration for execute_command.
-	DefaultCommandTimeoutSecs = 120
+	// DefaultCommandIdleTimeoutSecs is the maximum time a foreground
+	// execute_command may run without producing any output before it is
+	// killed; 0 in the config falls back to this default.
+	DefaultCommandIdleTimeoutSecs = 120
 	// DefaultSessionMaxCount is the maximum saved sessions per working dir.
 	DefaultSessionMaxCount = 50
 	// DefaultSessionMaxAgeDays is the retention window for saved sessions.
@@ -165,8 +167,8 @@ type Config struct {
 	WebAllowedDomains string // comma-separated domain suffix allowlist
 	WebFetchMode      string // https, all
 
-	CommandSandbox     string // off, bwrap (bubblewrap when available)
-	CommandTimeoutSecs int    // execute_command timeout; 0 = default 120s
+	CommandSandbox         string // off, bwrap (bubblewrap when available)
+	CommandIdleTimeoutSecs int    // execute_command idle (no-output) timeout; 0 = default 120s
 
 	// PreserveReasoning controls chat_template_kwargs.preserve_reasoning for
 	// self-hosted OpenAI-compatible servers: auto (probe /props), on, off.
@@ -272,7 +274,7 @@ func Defaults() Config {
 		WebAllowedDomains:         "",
 		WebFetchMode:              "https",
 		CommandSandbox:            "off",
-		CommandTimeoutSecs:        DefaultCommandTimeoutSecs,
+		CommandIdleTimeoutSecs:    DefaultCommandIdleTimeoutSecs,
 		PreserveReasoning:         "auto",
 		Board:                     "off",
 		Subagent:                  "off",

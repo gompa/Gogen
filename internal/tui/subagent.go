@@ -44,6 +44,13 @@ func (sp *tuiSubagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, jo
 	prov := llm.NewOpenAIProviderWithProfiles(
 		llm.ProviderProfiles(cfg.OpenAIKey, cfg.OpenAIModel, cfg.OpenAIURL, cfg.OpenAIProviders),
 		cfg.OpenAIModel, parent.WorkingDir, nil)
+	// Share the parent's model→profile owner record: a child provider whose
+	// owning endpoint is down still routes inherited models to that endpoint
+	// instead of falling back to the default profile (the child's own
+	// catalog merge cannot map the model while the owner is unreachable).
+	if pp, ok := parent.Provider.(*llm.OpenAIProvider); ok {
+		prov.SetOwnerRegistry(pp.OwnerRegistry())
+	}
 	if model != "" {
 		_ = prov.SetModel(model)
 	} else if m := cfg.SubagentModel; m != "" {

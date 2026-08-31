@@ -266,7 +266,7 @@ func TestJobNoticeDeliveredToSession(t *testing.T) {
 	p.StreamResults = []*llm.StreamResult{{Content: "ack"}}
 	a.Provider = p
 
-	if _, err := a.StartBackgroundCommand("echo job-done"); err != nil {
+	if _, err := a.StartBackgroundCommand(context.Background(), "echo job-done"); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, 10*time.Second, func() bool {

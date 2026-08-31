@@ -44,7 +44,7 @@ func (p *OpenAIProvider) listModels(ctx context.Context) ([]openai.Model, error)
 	gen := p.profilesGen
 	p.modelsMu.Unlock()
 
-	models, routing, profileFor, err := p.fetchModelsWithProfiles(ctx)
+	models, profileFor, perProfile, err := p.fetchModelsWithProfiles(ctx)
 
 	p.modelsMu.Lock()
 	f.models, f.err = models, err
@@ -53,21 +53,20 @@ func (p *OpenAIProvider) listModels(ctx context.Context) ([]openai.Model, error)
 			p.modelsCache = models
 			p.modelsCachedAt = time.Now()
 			p.modelProfile = profileFor
-			if routing != nil {
-				// Merge, don't replace: clientForModel caches fallback entries for
-				// models absent from the catalog (unknown/custom models resolved
-				// via models.dev or the primary client). A wholesale replacement
-				// would drop those entries and force a fresh lookup + inference on
-				// every request after each catalog refresh. Catalog entries win
-				// for IDs they cover; entries for models a future catalog removes
-				// linger until the model reappears (they only point at the
-				// endpoint that used to serve it, so this is a minor risk).
-				if p.modelClient == nil {
-					p.modelClient = routing
-				} else {
-					for id, c := range routing {
-						p.modelClient[id] = c
-					}
+			// Merge, don't replace: clientForModel caches fallback entries for
+			// models absent from the catalog (unknown/custom models resolved
+			// via models.dev or the primary client). A wholesale replacement
+			// would drop those entries and force a fresh lookup + inference on
+			// every request after each catalog refresh. applyRouting keeps
+			// entries for models the round does not cover (they only point at
+			// the endpoint that used to serve it, so this is a minor risk).
+			p.applyRouting(perProfile, models, profileFor)
+			// Publish the effective owners to the shared record so sibling
+			// providers (fresh sessions, subagents) route a model to its owner
+			// even while the owner's catalog is unreachable.
+			if p.ownerRegistry != nil {
+				for id, owner := range p.modelOwner {
+					p.ownerRegistry.Record(id, owner)
 				}
 			}
 		}
@@ -113,16 +112,30 @@ func waitModelsFetch(ctx context.Context, f *modelsFetch) ([]openai.Model, error
 	}
 }
 
+// profileFetchResult is one profile's catalog outcome for a fetch round:
+// its name, the model → stream-client routing it contributed (empty when
+// the query failed), and the query error. listModels applies the
+// sticky-ownership rule (applyRouting) over the per-profile results — the
+// merged winner alone cannot tell a downed owner's model from a same-ID
+// collision on a surviving endpoint.
+type profileFetchResult struct {
+	name    string
+	routing map[string]*openai.Client
+	err     error
+}
+
 // fetchModelsWithProfiles loads the merged catalog from every registered
 // provider endpoint: each profile's catalog is queried in parallel (an
 // OpenCode profile queries its zen and go endpoints in parallel with
 // Go-over-Zen precedence, exactly like the single-endpoint shape), then the
 // per-profile lists are merged in PROFILE ORDER — the first profile wins on
-// duplicate model IDs (the default profile first), so what /models shows and
-// where the request actually goes always agree. The returned profileFor map
-// records each model's owning profile (name + base URL) for picker grouping
-// and per-endpoint models.dev / props resolution.
-func (p *OpenAIProvider) fetchModelsWithProfiles(ctx context.Context) ([]openai.Model, map[string]*openai.Client, map[string]modelProfileInfo, error) {
+// duplicate model IDs (the default profile first), so what /models shows
+// agrees with the routing for models with no prior owner. The returned
+// profileFor map records each model's winning profile (name + base URL) for
+// picker grouping and per-endpoint models.dev / props resolution, and the
+// perProfile slice carries every profile's own outcome (including failures)
+// for the sticky-ownership merge.
+func (p *OpenAIProvider) fetchModelsWithProfiles(ctx context.Context) ([]openai.Model, map[string]modelProfileInfo, []profileFetchResult, error) {
 	type result struct {
 		models  []openai.Model
 		routing map[string]*openai.Client
@@ -246,19 +259,19 @@ func (p *OpenAIProvider) fetchModelsWithProfiles(ctx context.Context) ([]openai.
 	<-done
 
 	models := make([]openai.Model, 0)
-	routing := make(map[string]*openai.Client)
 	profileFor := make(map[string]modelProfileInfo)
 	seen := make(map[string]struct{})
 	var errs []error
+	perProfile := make([]profileFetchResult, 0, len(profiles))
 	for i, prof := range profiles {
 		res := results[i]
+		perProfile = append(perProfile, profileFetchResult{name: prof.name, routing: res.routing, err: res.err})
 		if res.err != nil {
 			errs = append(errs, res.err)
 			continue
 		}
-		// Add this profile's models and their routing in one pass: the
-		// routing entry for a winning model must come from the SAME profile
-		// that contributed it (an earlier profile's duplicate wins).
+		// Add this profile's models in profile order: the FIRST profile to
+		// list a model ID wins the merged list (the default profile first).
 		for _, m := range res.models {
 			if _, dup := seen[m.ID]; dup {
 				continue // earlier profile wins
@@ -266,13 +279,10 @@ func (p *OpenAIProvider) fetchModelsWithProfiles(ctx context.Context) ([]openai.
 			seen[m.ID] = struct{}{}
 			models = append(models, m)
 			profileFor[m.ID] = modelProfileInfo{name: prof.name, baseURL: prof.baseURL}
-			if c, ok := res.routing[m.ID]; ok {
-				routing[m.ID] = c
-			}
 		}
 	}
 	if len(models) == 0 && len(errs) > 0 {
-		return nil, nil, nil, errors.Join(errs...)
+		return nil, nil, perProfile, errors.Join(errs...)
 	}
 	if len(errs) > 0 {
 		// Partial failure: serve the catalogs that succeeded and say which
@@ -281,7 +291,99 @@ func (p *OpenAIProvider) fetchModelsWithProfiles(ctx context.Context) ([]openai.
 		log.Printf("model catalog: %d of %d provider(s) failed, serving %d models: %v",
 			len(errs), len(profiles), len(models), errors.Join(errs...))
 	}
-	return models, routing, profileFor, nil
+	return models, profileFor, perProfile, nil
+}
+
+// applyRouting rebuilds the model → client routing from one fetch round's
+// per-profile results under the sticky-ownership rule:
+//
+//   - A model's owner is the earliest profile that lists it (profile-order
+//     precedence, as before) — UNLESS the model already has an owner that is
+//     up this round and still lists it: the owner stays. A model the user
+//     runs on one endpoint is not re-homed to an earlier-listing endpoint
+//     mid-session.
+//   - When the owner is down for the round, the model fails over to a
+//     surviving lister only if that lister was observed listing the model in
+//     a round where the owner was up (modelCoListed — a genuine co-listed
+//     endpoint). A same-ID model on an endpoint that never co-listed is a
+//     collision, not ownership: the downed owner is kept, and
+//     clientForModel's owner fallback resolves its client.
+//   - When the owner is up but no longer lists the model, the model moved:
+//     the earliest surviving lister takes over.
+//
+// Entries for models no surviving profile lists linger (as before): they
+// only point at the endpoint that used to serve them. Caller holds modelsMu
+// (the shared-registry publish happens in listModels, which may then take
+// the registry lock — see OwnerRegistry's lock-ordering note).
+func (p *OpenAIProvider) applyRouting(perProfile []profileFetchResult, models []openai.Model, profileFor map[string]modelProfileInfo) {
+	if p.modelClient == nil {
+		p.modelClient = make(map[string]*openai.Client)
+	}
+	if p.modelOwner == nil {
+		p.modelOwner = make(map[string]string)
+	}
+	if p.modelCoListed == nil {
+		p.modelCoListed = make(map[string]map[string]struct{})
+	}
+	byName := make(map[string]*profileFetchResult, len(perProfile))
+	for i := range perProfile {
+		byName[perProfile[i].name] = &perProfile[i]
+	}
+	for _, m := range models {
+		id := m.ID
+		if id == "" {
+			continue
+		}
+		winner := profileFor[id].name
+		old, known := p.modelOwner[id]
+		owner := winner
+		if known && old != winner {
+			oldRes := byName[old]
+			switch {
+			case oldRes != nil && oldRes.err == nil:
+				if _, still := oldRes.routing[id]; still {
+					owner = old // sticky: the owner is up and still serves it
+				}
+				// else: the owner is up but no longer lists the model — it
+				// moved; the earliest surviving lister takes over.
+			case coListedKnown(p.modelCoListed[id], winner):
+				owner = winner // failover to a known co-listed endpoint
+			default:
+				owner = old // sticky: the owner is down, no co-list known
+			}
+		}
+		p.modelOwner[id] = owner
+		ownerRes := byName[owner]
+		if ownerRes == nil || ownerRes.err != nil {
+			// The owner is down for this round: keep any existing entry (it
+			// points at the owner's last client) and the last co-list
+			// observation.
+			continue
+		}
+		if c, ok := ownerRes.routing[id]; ok {
+			p.modelClient[id] = c
+		}
+		// The owner is up: every up lister of this model is now a known
+		// co-list — a legitimate failover target if the owner later goes
+		// down.
+		co := make(map[string]struct{})
+		for i := range perProfile {
+			r := &perProfile[i]
+			if r.err != nil {
+				continue
+			}
+			if _, ok := r.routing[id]; ok {
+				co[r.name] = struct{}{}
+			}
+		}
+		p.modelCoListed[id] = co
+	}
+}
+
+// coListedKnown reports whether name is in the co-list set for a model.
+func coListedKnown(co map[string]struct{}, name string) bool {
+	_, ok := co[name]
+	return ok
 }
 
 // resolvedProfiles returns the endpoint set to query: the registered

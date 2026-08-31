@@ -67,7 +67,7 @@ type FileConfig struct {
 	WebMaxActiveSessions      int                   `yaml:"web_max_active_sessions"`
 	WebApprovalHoldSecs       int                   `yaml:"web_approval_hold_secs"`
 	CommandSandbox            string                `yaml:"command_sandbox"`
-	CommandTimeoutSecs        int                   `yaml:"command_timeout_secs"`
+	CommandIdleTimeoutSecs    int                   `yaml:"command_idle_timeout_secs"`
 	PreserveReasoning         string                `yaml:"preserve_reasoning"`
 	Board                     string                `yaml:"board"`
 	Subagent                  string                `yaml:"subagent"`
@@ -85,6 +85,10 @@ type FileConfig struct {
 	// compact_keep_recent_messages, accepted for back-compat with a
 	// deprecation warning and cleared by parseYAMLFrontMatter after aliasing.
 	KeepRecentMessages *int `yaml:"keep_recent_messages"`
+	// CommandTimeoutSecs is the pre-rename spelling of
+	// command_idle_timeout_secs, accepted for back-compat with a
+	// deprecation warning and cleared by parseYAMLFrontMatter after aliasing.
+	CommandTimeoutSecs *int `yaml:"command_timeout_secs"`
 }
 
 // ProjectFile is a loaded combined config + guidelines file.

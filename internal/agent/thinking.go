@@ -85,11 +85,17 @@ func (a *Agent) CurrentModelDescription() string {
 	return ""
 }
 
-// AvailableThinkingLevels returns the thinking levels selectable for the
-// current model: "off" (omit) plus the model's accepted reasoning-effort
-// values in the provider's order. Toggle-only models yield just "off".
-func (a *Agent) AvailableThinkingLevels() []ThinkingLevel {
-	efforts := a.CurrentModelEfforts()
+// ThinkingLevelsForModel returns the thinking levels selectable for
+// modelID: "off" (omit) plus the model's accepted reasoning-effort values
+// in the provider's order. Toggle-only models (no effort control) yield
+// just "off". Never blocks on the network.
+func (a *Agent) ThinkingLevelsForModel(modelID string) []ThinkingLevel {
+	var efforts []string
+	if p, ok := a.Provider.(llm.ReasoningEffortsProvider); ok {
+		efforts = p.ModelReasoningEfforts(modelID)
+	} else {
+		efforts = llm.DefaultReasoningEfforts
+	}
 	out := make([]ThinkingLevel, 0, len(efforts)+1)
 	out = append(out, ThinkingOff)
 	for _, e := range efforts {
@@ -99,6 +105,12 @@ func (a *Agent) AvailableThinkingLevels() []ThinkingLevel {
 		out = append(out, ThinkingLevel(e))
 	}
 	return out
+}
+
+// AvailableThinkingLevels returns the thinking levels selectable for the
+// current model (ThinkingLevelsForModel(a.CurrentModel())).
+func (a *Agent) AvailableThinkingLevels() []ThinkingLevel {
+	return a.ThinkingLevelsForModel(a.CurrentModel())
 }
 
 // IsThinkingLevelActive reports whether the stored thinking level is currently

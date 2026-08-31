@@ -63,10 +63,16 @@ func TestFetchModelsGoTakesPrecedenceOverZen(t *testing.T) {
 		modelClient: make(map[string]*openai.Client),
 	}
 
-	models, routing, _, err := p.fetchModelsWithProfiles(context.Background())
+	models, _, perProfile, err := p.fetchModelsWithProfiles(context.Background())
 	if err != nil {
 		t.Fatalf("fetchModelsWithProfiles: %v", err)
 	}
+	// Direct-construction shape: one synthesized profile whose routing is
+	// the merged zen/go result (Go precedence).
+	if len(perProfile) != 1 {
+		t.Fatalf("perProfile has %d entries, want 1 (single synthesized profile)", len(perProfile))
+	}
+	routing := perProfile[0].routing
 	if len(models) != 3 {
 		t.Fatalf("merged list has %d entries, want 3 (overlap deduped)", len(models))
 	}

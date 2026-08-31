@@ -215,7 +215,7 @@ const RUNTIME_CONTROLS = [
     { id: 'command-allowlist-input', field: 'commandAllowlist' },
     { id: 'delete-approval-select', field: 'deleteApproval' },
     { id: 'command-sandbox-select', field: 'commandSandbox' },
-    { id: 'command-timeout-input', field: 'commandTimeoutSecs' },
+    { id: 'command-idle-timeout-input', field: 'commandIdleTimeoutSecs' },
     // Context
     { id: 'context-limit-input', field: 'contextLimit', prop: 'contextLimitConfig' },
     { id: 'compact-threshold-input', field: 'compactThreshold' },

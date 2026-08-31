@@ -21,7 +21,7 @@ func TestBackgroundCommandLifecycle(t *testing.T) {
 	a := NewAgent(nil, exec, nil)
 	defer a.Close()
 
-	id, err := a.StartBackgroundCommand("echo hello-background")
+	id, err := a.StartBackgroundCommand(context.Background(), "echo hello-background")
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestBackgroundCommandGuardApplies(t *testing.T) {
 	// Default guard is blocklist mode; rm -rf / is blocked.
 	a := NewAgent(nil, exec, nil)
 	defer a.Close()
-	if _, err := a.StartBackgroundCommand("rm -rf /"); err == nil {
+	if _, err := a.StartBackgroundCommand(context.Background(), "rm -rf /"); err == nil {
 		t.Fatal("expected blocklisted background command to be rejected")
 	}
 	if len(a.bgJobs) != 0 {
@@ -85,7 +85,7 @@ func TestBackgroundJobCancel(t *testing.T) {
 	a := NewAgent(nil, exec, nil)
 	defer a.Close()
 
-	id, err := a.StartBackgroundCommand("sleep 60")
+	id, err := a.StartBackgroundCommand(context.Background(), "sleep 60")
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestBackgroundJobExitCode(t *testing.T) {
 	a := NewAgent(nil, exec, nil)
 	defer a.Close()
 
-	id, err := a.StartBackgroundCommand("exit 7")
+	id, err := a.StartBackgroundCommand(context.Background(), "exit 7")
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestCloseKillsBackgroundJobs(t *testing.T) {
 	a := NewAgent(nil, exec, nil)
 
 	marker := filepath.Join(dir, "marker")
-	id, err := a.StartBackgroundCommand("sleep 30; echo done > " + marker)
+	id, err := a.StartBackgroundCommand(context.Background(), "sleep 30; echo done > "+marker)
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestBackgroundJobReapedAfterRetention(t *testing.T) {
 	defer a.Close()
 	a.bgRetain = 50 * time.Millisecond
 
-	id, err := a.StartBackgroundCommand("echo reaped-soon")
+	id, err := a.StartBackgroundCommand(context.Background(), "echo reaped-soon")
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestFinishedJobCapReapsOldest(t *testing.T) {
 	sleeps := []string{"0.05", "0.04", "0.03", "0.02", "0.01"}
 	jobs := make([]*BackgroundJob, 0, len(sleeps))
 	for i, s := range sleeps {
-		id, err := a.StartBackgroundCommand("sleep " + s)
+		id, err := a.StartBackgroundCommand(context.Background(), "sleep "+s)
 		if err != nil {
 			t.Fatalf("start %d: %v", i, err)
 		}
@@ -326,7 +326,7 @@ func TestBackgroundJobInputEcho(t *testing.T) {
 
 	// No nested sh -c: the executor wraps the command in its own shell on
 	// Unix and runs it through the embedded interpreter on Windows.
-	id, err := a.StartBackgroundCommand("while read line; do echo \"got: $line\"; done")
+	id, err := a.StartBackgroundCommand(context.Background(), "while read line; do echo \"got: $line\"; done")
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -363,7 +363,7 @@ func TestBackgroundJobInputAppendNewline(t *testing.T) {
 	a := NewAgent(nil, exec, nil)
 	defer a.Close()
 
-	id, err := a.StartBackgroundCommand("read -r line; echo \"got:$line\"")
+	id, err := a.StartBackgroundCommand(context.Background(), "read -r line; echo \"got:$line\"")
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -409,7 +409,7 @@ func TestBackgroundJobInputDelta(t *testing.T) {
 	a := NewAgent(nil, exec, nil)
 	defer a.Close()
 
-	id, err := a.StartBackgroundCommand("echo marker; sleep 30")
+	id, err := a.StartBackgroundCommand(context.Background(), "echo marker; sleep 30")
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -453,7 +453,7 @@ func TestBackgroundJobInputFinished(t *testing.T) {
 	a := NewAgent(nil, exec, nil)
 	defer a.Close()
 
-	id, err := a.StartBackgroundCommand("echo done")
+	id, err := a.StartBackgroundCommand(context.Background(), "echo done")
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -479,7 +479,7 @@ func TestBackgroundJobInputOversized(t *testing.T) {
 	a := NewAgent(nil, exec, nil)
 	defer a.Close()
 
-	id, err := a.StartBackgroundCommand("sleep 5")
+	id, err := a.StartBackgroundCommand(context.Background(), "sleep 5")
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -516,7 +516,7 @@ func TestBackgroundJobInputStdinClosed(t *testing.T) {
 	// writes would never EPIPE and the test would spin until `sleep`
 	// exits.) The shell then keeps running (sleep), so the job is alive
 	// while its stdin is gone.
-	id, err := a.StartBackgroundCommand("exec 0<&-; sleep 3")
+	id, err := a.StartBackgroundCommand(context.Background(), "exec 0<&-; sleep 3")
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -582,7 +582,7 @@ func TestBackgroundJobToolInput(t *testing.T) {
 	a := NewAgent(nil, exec, nil)
 	defer a.Close()
 
-	id, err := a.StartBackgroundCommand("sleep 5")
+	id, err := a.StartBackgroundCommand(context.Background(), "sleep 5")
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}

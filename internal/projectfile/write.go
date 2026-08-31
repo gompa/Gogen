@@ -116,7 +116,7 @@ type configYAML struct {
 	CommandAllowlist          string                        `yaml:"command_allowlist,omitempty"`
 	DeleteApproval            string                        `yaml:"delete_approval"`
 	CommandSandbox            string                        `yaml:"command_sandbox,omitempty"`
-	CommandTimeoutSecs        int                           `yaml:"command_timeout_secs,omitempty"`
+	CommandIdleTimeoutSecs    int                           `yaml:"command_idle_timeout_secs,omitempty"`
 	TreeSitter                string                        `yaml:"treesitter"`
 	TreeSitterLangs           string                        `yaml:"treesitter_langs,omitempty"`
 	TestCommand               string                        `yaml:"test_command,omitempty"`
@@ -198,7 +198,7 @@ func buildConfigYAML(cfg *config.Config, opts WriteOptions) (string, error) {
 		CommandAllowlist:          cfg.CommandAllowlist,
 		DeleteApproval:            cfg.DeleteApproval,
 		CommandSandbox:            omitDefaultString(cfg.CommandSandbox, def.CommandSandbox),
-		CommandTimeoutSecs:        omitDefaultInt(cfg.CommandTimeoutSecs, def.CommandTimeoutSecs),
+		CommandIdleTimeoutSecs:    omitDefaultInt(cfg.CommandIdleTimeoutSecs, def.CommandIdleTimeoutSecs),
 		TreeSitter:                cfg.TreeSitter,
 		TreeSitterLangs:           cfg.TreeSitterLangs,
 		TestCommand:               cfg.TestCommand,

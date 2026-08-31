@@ -205,6 +205,43 @@
         }
         setToastHandler(showToast);
 
+        // Legacy copy path for non-secure contexts: the Clipboard API is
+        // only available in secure contexts (https / localhost), but the UI
+        // is also served over plain http on the LAN (the phone QR pairing
+        // flow), where navigator.clipboard is undefined. A temporary
+        // textarea + execCommand('copy') works there (and in the remaining
+        // browsers that lack the async API).
+        function copyTextLegacy(text) {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.setAttribute('readonly', '');
+            // Off-screen but rendered: unrendered (display:none) nodes
+            // refuse selection in some mobile browsers.
+            ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;';
+            document.body.appendChild(ta);
+            ta.select();
+            ta.setSelectionRange(0, ta.value.length);
+            let ok = false;
+            try { ok = document.execCommand('copy'); } catch (_) { ok = false; }
+            ta.remove();
+            return ok;
+        }
+
+        // Copy text to the clipboard, preferring the async Clipboard API and
+        // falling back to execCommand in non-secure contexts. Resolves true
+        // on success so callers can toast the real outcome instead of
+        // assuming (an unguarded navigator.clipboard access would throw an
+        // uncaught TypeError on plain-HTTP LAN access).
+        async function copyTextToClipboard(text) {
+            if (navigator.clipboard && window.isSecureContext) {
+                try {
+                    await navigator.clipboard.writeText(text);
+                    return true;
+                } catch (_) { /* fall through to the legacy path */ }
+            }
+            return copyTextLegacy(text);
+        }
+
         function setConnState(state) {
             if (!connIndicator) return;
             connIndicator.classList.remove('connected', 'disconnected', 'reconnecting');
@@ -243,7 +280,10 @@
 
         function hideSlashSuggest() {
             slashSuggest.classList.remove('open');
-            slashSuggest.innerHTML = '';
+            // hideSlashSuggest runs on every keystroke via
+            // updateSlashSuggest; skip the innerHTML write when the box is
+            // already empty so the common (non-slash) path is a true no-op.
+            if (slashSuggest.childElementCount > 0) slashSuggest.innerHTML = '';
             slashMatches = [];
             slashIndex = 0;
         }
@@ -886,6 +926,13 @@
             rebuildToc();
             enableFollow();
             msgIdxCounter = 0;
+            // The transcript is gone: pending-ack entries point at
+            // detached bubbles, and the re-attach re-derives every
+            // histIdx from server history, so the tracking starts fresh.
+            pendingAcks.length = 0;
+            pendingCancels.length = 0;
+            cancelTarget.clear();
+            lastCancelTarget = null;
 
             streamRafPending = false;
             streamLastRender = 0;
@@ -896,6 +943,7 @@
             thinkingRafPending = false;
             streamingToolCards = {};
             pendingToolCards = {};
+            bgTermCards = {};
             historyToolCallArgs = {};
             toolsStartedThisTurn = false;
             streamContentPos = 0;
@@ -973,6 +1021,90 @@
         // Count of cancel→turn_end pairs to ignore so a cancelled turn's turn_end
         // cannot clobber an in-flight resend/send (pendingSessionResponse / turnActive).
         let suppressTurnEnds = 0;
+        // ── pending-ack tracking ─────────────────────────────────────────
+        // user_acked carries only the server-side index, so the client
+        // must remember WHICH bubble the ack belongs to. pendingAcks is a
+        // FIFO of user bubbles awaiting their ack, in send order. Acks
+        // arrive in send order (same-socket FIFO), and the server writes
+        // a turn's terminal frame (cancelled / error response) before the
+        // next turn's ack, so the oldest still-pending bubble is the next
+        // ack's target. Sends that never ack — a turn cancelled before the
+        // server emitted the frame, a busy/error rejection, a typed
+        // command that starts no turn — are dropped when their terminal
+        // frame arrives, so a stale flag can never steal a later ack and
+        // stamp the wrong bubble.
+        const pendingAcks = [];
+        // One record per local cancel (cancelActiveTurn), consumed 1:1 by
+        // the "cancelled" frame it produces: the pendingAcks entry of the
+        // cancelled turn, or null when its ack had already arrived. The
+        // record's entry is stale exactly when it is still queued at
+        // frame time — an in-flight ack always arrives before the frame
+        // (same-socket FIFO) and leaves the queue first.
+        const pendingCancels = [];
+        // Which pending entry each send cancelled (the turn that was
+        // active when it was sent), for the terminal-frame drop rule in
+        // dropPendingForTerminal.
+        const cancelTarget = new Map();
+        let lastCancelTarget = null;
+
+        /** Mark a freshly sent user bubble as awaiting its user_acked frame. */
+        function markPendingAck(el) {
+            if (!el) return;
+            el.dataset.pendingAck = '1';
+            cancelTarget.set(el, lastCancelTarget);
+            lastCancelTarget = null;
+            pendingAcks.push(el);
+        }
+
+        /** Remove a bubble from pending-ack tracking and clear its flag. */
+        function dropPendingAck(el) {
+            const i = pendingAcks.indexOf(el);
+            if (i !== -1) pendingAcks.splice(i, 1);
+            cancelTarget.delete(el);
+            if (el) delete el.dataset.pendingAck;
+        }
+
+        /** Drop queue entries whose bubble left the DOM (pane switch / re-render). */
+        function prunePendingAcks() {
+            while (pendingAcks.length && !pendingAcks[0].isConnected) pendingAcks.shift();
+        }
+
+        /**
+         * The next ack's target: the oldest still-pending bubble. Entries
+         * whose bubble left the DOM are unresolvable here and are
+         * dropped; the DOM fallback covers re-rendered transcripts, where
+         * every user bubble already carries its server index.
+         */
+        function resolveAckTarget() {
+            prunePendingAcks();
+            const el = pendingAcks[0];
+            if (el && el.dataset.histIdx === undefined) return el;
+            return messagesDiv.querySelector('.message.user[data-pending-ack="1"]')
+                || [...messagesDiv.querySelectorAll('.message.user:not([data-hist-idx])')].at(-1);
+        }
+
+        /**
+         * Drop the pending entries a `response` / `models` frame
+         * terminates. The frame replies to the newest send processed no
+         * later than its write: every entry at or before that send is
+         * stale (an older entry's ack, if ever written, arrived before
+         * the frame — same-socket FIFO — and left the queue). The cut is
+         * the newest entry that cancelled a still-queued turn — its
+         * terminal is this frame or the pending "cancelled" frame — or,
+         * when no entry cancelled anything live, the newest entry
+         * itself (rejection, or a command sent with no active turn).
+         * Entries newer than the cut are live (their turns start after
+         * the frame's write) and are kept.
+         */
+        function dropPendingForTerminal() {
+            prunePendingAcks();
+            let cut = pendingAcks.length - 1;
+            for (let i = pendingAcks.length - 1; i >= 0; i--) {
+                const target = cancelTarget.get(pendingAcks[i]);
+                if (target && pendingAcks.includes(target)) { cut = i; break; }
+            }
+            for (let i = 0; i <= cut; i++) dropPendingAck(pendingAcks[0]);
+        }
         // Error text of the most recent turn's failed model reply (a `response`
         // message whose content starts with "Error:"). Consumed by setTurnActive
         // to fire an error-specific turn-end notification instead of the generic
@@ -1019,6 +1151,11 @@
         let thinkingRafPending = false;
         let thinkingLastRender = 0;
         let pendingToolCards = {};
+        // Cards of background jobs (execute_command background=true): their
+        // output streams AFTER the tool result (the job outlives the turn),
+        // so the card must stay reachable by term id once it leaves
+        // pendingToolCards. Cleared with pendingToolCards at every reset.
+        let bgTermCards = {};
         let streamingToolCards = {};
         let toolCallCounter = 0;
         let turnActive = false;
@@ -1048,6 +1185,14 @@
         // True while replayHistory() rebuilds the pane; suppresses per-message
         // smartScroll so the rebuild doesn't force O(n) layout passes.
         let replayInProgress = false;
+        // Active-pane WS events that arrive while a chunked history replay is
+        // in flight. The replay yields to rAF between batches, so live
+        // stream/thinking/tool events could interleave mid-rebuild and garble
+        // the transcript. They are buffered here and flushed in arrival order
+        // after the replay (and its rewind merge) completes — the same
+        // ordering the old single-task synchronous replay had, when no event
+        // could run until the whole rebuild finished.
+        let replayEventBuffer = [];
         // Tool-result colorize requests made while a history replay is in
         // flight are deferred until the replay finishes and first paint lands,
         // so Monaco tokenization doesn't fight the transcript rebuild for
@@ -1732,7 +1877,7 @@
                 const copyBtn = document.createElement('button');
                 copyBtn.className = 'tool-result-copy';
                 copyBtn.textContent = 'Copy';
-                copyBtn.onclick = () => { navigator.clipboard.writeText(full).then(() => showToast('Copied', 'success')).catch(() => showToast('Copy failed', 'error')); };
+                copyBtn.onclick = () => { copyTextToClipboard(full).then((ok) => showToast(ok ? 'Copied' : 'Copy failed', ok ? 'success' : 'error')); };
                 body.appendChild(copyBtn);
             }
 
@@ -1845,11 +1990,11 @@
                     e.stopPropagation();
                     const code = pre.querySelector('code') || pre;
                     const text = code.textContent || '';
-                    try {
-                        await navigator.clipboard.writeText(text);
+                    const ok = await copyTextToClipboard(text);
+                    if (ok) {
                         btn.textContent = 'Copied';
                         setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
-                    } catch (err) {
+                    } else {
                         showToast('Copy failed', 'error');
                     }
                 });
@@ -2193,6 +2338,15 @@
             if (!turnActive || !ws || ws.readyState !== WebSocket.OPEN) return;
             if (!activePane() || !activePane().id) return;
             suppressTurnEnds++;
+            // Record the cancelled turn's pending-ack entry (the newest
+            // send, if still awaiting its ack) so the trailing
+            // "cancelled" frame can drop it: a turn cancelled before the
+            // server emitted user_acked never acks, and its stale flag
+            // would otherwise steal the next ack. lastCancelTarget is
+            // picked up by the markPendingAck of the send that follows
+            // (every cancelActiveTurn here precedes one).
+            lastCancelTarget = pendingAcks.length ? pendingAcks[pendingAcks.length - 1] : null;
+            pendingCancels.push(lastCancelTarget);
             ws.send(JSON.stringify({ type: 'cancel', sessionId: activePane().id }));
             setTurnActive(false);
             abortInFlightUI(null);
@@ -2239,9 +2393,10 @@
             if (activePane()) activePane().needsFreshHistory = false;
             if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
             const el = appendMessage('user', text);
-            if (el) el.dataset.pendingAck = '1';
+            markPendingAck(el);
             streamingToolCards = {};
             pendingToolCards = {};
+            bgTermCards = {};
             toolsStartedThisTurn = false;
             contextEstAdded = 0;
             ws.send(JSON.stringify({ type: 'message', content: text, sessionId: activePane().id }));
@@ -3172,11 +3327,15 @@
                         language: languageFromPath(path),
                     });
                     card.appendChild(body);
-                } else if (cardInfo.liveOutput && cardInfo.liveOutputText) {
+                } else if (cardInfo.liveOutput && cardInfo.liveOutputText
+                    && !(cardInfo.args && cardInfo.args.background === true)) {
                     // The output already streamed into the card while the
                     // command ran; appending the final result again would
                     // duplicate it. Keep the streamed log as the result body
                     // (plus a copy affordance / truncation note).
+                    // Background jobs are the exception: their result is the
+                    // job id / poll hint, NOT a duplicate of the streamed
+                    // output (which keeps streaming after this result).
                     appendStreamedResultBody(body, cardInfo);
                     card.appendChild(body);
                 } else {
@@ -3201,7 +3360,7 @@
             copyBtn.className = 'tool-result-copy';
             copyBtn.textContent = 'Copy';
             copyBtn.onclick = () => {
-                navigator.clipboard.writeText(liveText).then(() => showToast('Copied', 'success')).catch(() => showToast('Copy failed', 'error'));
+                copyTextToClipboard(liveText).then((ok) => showToast(ok ? 'Copied' : 'Copy failed', ok ? 'success' : 'error'));
             };
             body.appendChild(copyBtn);
             if (cardInfo.liveOutputTruncated) {
@@ -3218,21 +3377,61 @@
         // no-op: the view silently stops following new messages. The watchdog
         // clears the flag and pins so the UI recovers even if a restore hangs.
         const REPLAY_WATCHDOG_MS = 20000;
+        // Messages rendered per rAF batch during a chunked replay. Small
+        // enough that each batch stays within a frame budget, so the
+        // transcript paints incrementally instead of one giant dirty region.
+        const REPLAY_CHUNK_SIZE = 12;
+        // Per-batch watchdog allowance: covers frame stalls (low refresh
+        // rate, slow machines) on top of the base deadline.
+        const REPLAY_CHUNK_BUDGET_MS = 100;
         let replayWatchdog = null;
-        function armReplayWatchdog() {
+        function armReplayWatchdog(historyLength) {
             clearTimeout(replayWatchdog);
+            // The chunked replay yields one frame per batch, so a very large
+            // history can legitimately take many frames: scale the deadline
+            // with the number of batches instead of weakening the base.
+            const batches = Math.ceil((historyLength || 0) / REPLAY_CHUNK_SIZE);
             replayWatchdog = setTimeout(() => {
                 replayWatchdog = null;
                 if (!replayInProgress) return;
                 console.warn('history replay watchdog fired; re-enabling scroll follow');
                 replayInProgress = false;
                 flushDeferredResultColorize();
+                flushReplayEventBuffer();
                 pinToBottom();
-            }, REPLAY_WATCHDOG_MS);
+            }, REPLAY_WATCHDOG_MS + batches * REPLAY_CHUNK_BUDGET_MS);
         }
         function disarmReplayWatchdog() {
             clearTimeout(replayWatchdog);
             replayWatchdog = null;
+        }
+
+        // Flush live events buffered during a chunked replay, in arrival
+        // order. Called from handleHistory's afterHistory — AFTER the rewind
+        // merge, so stream positions are seeded before the live tokens are
+        // appended (appendStreamToken drops tokens with no stream bubble) —
+        // and from the watchdog, so events are not lost if a replay hangs.
+        function flushReplayEventBuffer() {
+            while (replayEventBuffer.length) {
+                if (replayInProgress) {
+                    // A nested replay started (a buffered history payload for
+                    // a session switch): hand the buffer to that replay's
+                    // afterHistory flush.
+                    return;
+                }
+                const data = replayEventBuffer.shift();
+                const handler = WS_HANDLERS[data.type];
+                if (!handler) continue;
+                // The active pane may have changed while the replay ran:
+                // route exactly as ws.onmessage would.
+                const pane = paneForMessage(data);
+                if (!pane) {
+                    if (data.type === 'session_state') sendSessionDetach(data.sessionId);
+                    continue;
+                }
+                if (pane === activePane()) handler(data);
+                else handleBackgroundMessage(pane, data);
+            }
         }
 
         async function replayHistory(history) {
@@ -3244,17 +3443,18 @@
             // having run clearChat() first.
             streamingToolCards = {};
             pendingToolCards = {};
+            bgTermCards = {};
             toolsStartedThisTurn = false;
             // Suppress per-message smartScroll while rebuilding; the final
             // pinToBottom() below does a single scroll pass instead of O(n)
             // forced layouts. The history handler's error fallback also resets
             // this so a failed replay still scrolls while re-appending.
             replayInProgress = true;
-            armReplayWatchdog();
+            armReplayWatchdog(history.length);
             function msgDate(createdAt) {
                 return createdAt ? new Date(createdAt) : new Date();
             }
-            for (const h of history) {
+            function renderHistoryEntry(h) {
                 if (h.role === 'user') {
                     appendMessageAtTime('user', h.content || '', msgDate(h.createdAt), h.index, h.images);
                 } else if (h.role === 'assistant') {
@@ -3305,14 +3505,14 @@
                                     cardInfo.waiting.remove();
                                     cardInfo.waiting = null;
                                 }
-                                // NOT awaited: the replay loop must stay
-                                // synchronous. ensurePatchViewer renders the
-                                // static fallback immediately and mounts the
-                                // Monaco diff editor in the background; an
-                                // await here would yield to the event loop
-                                // mid-rebuild, letting live stream events and
-                                // other panes' messages interleave with the
-                                // transcript (garbled or "never loads").
+                                // NOT awaited: the per-message render path
+                                // stays synchronous within its batch.
+                                // ensurePatchViewer renders the static
+                                // fallback immediately and mounts the Monaco
+                                // diff editor in the background. (The
+                                // chunk-level rAF yields below are safe:
+                                // live events arriving during them are
+                                // buffered and flushed after the replay.)
                                 ensurePatchViewer(cardInfo, tc.args.diff).catch(() => {});
                             }
                             if (tc.id) pendingToolCards[tc.id] = cardInfo;
@@ -3332,6 +3532,27 @@
                     if (id) delete pendingToolCards[id];
                     const success = !String(h.content || '').trim().startsWith('Error:');
                     updateToolCardWithResult(cardInfo, h.content || '', success, false, cardInfo.toolName);
+                }
+            }
+            // Chunked: render REPLAY_CHUNK_SIZE entries per synchronous
+            // batch, then yield one frame so the rebuild paints in small
+            // tasks instead of one giant dirty region (the forced-reflow
+            // spike in the profiler). Live events arriving during a yield
+            // are buffered in ws.onmessage and flushed in arrival order
+            // after the replay (flushReplayEventBuffer), so they can't
+            // interleave mid-rebuild.
+            for (let i = 0; i < history.length; i += REPLAY_CHUNK_SIZE) {
+                const end = Math.min(i + REPLAY_CHUNK_SIZE, history.length);
+                for (let j = i; j < end; j++) renderHistoryEntry(history[j]);
+                if (end < history.length) {
+                    // rAF aligns each batch with a paint; the timeout keeps
+                    // the replay moving when rAF is throttled (hidden tab),
+                    // where the old synchronous loop would have completed
+                    // anyway.
+                    await new Promise((r) => {
+                        requestAnimationFrame(r);
+                        setTimeout(r, 50);
+                    });
                 }
             }
             replayInProgress = false;
@@ -3579,7 +3800,16 @@
                     return;
                 }
                 const handler = WS_HANDLERS[data.type];
-                if (handler) handler(data);
+                if (!handler) return;
+                if (replayInProgress) {
+                    // The chunked replay yields to rAF between batches:
+                    // buffer the event and flush it in arrival order after
+                    // the replay (and its rewind merge) completes, so live
+                    // stream events can't interleave mid-rebuild.
+                    replayEventBuffer.push(data);
+                    return;
+                }
+                handler(data);
             };
 
             ws.onclose = () => {
@@ -3587,8 +3817,13 @@
                 endStream();
                 streamingToolCards = {};
                 pendingToolCards = {};
+                bgTermCards = {};
                 clearPendingResend();
                 suppressTurnEnds = 0;
+                // Acks in flight during the disconnect are lost with the
+                // socket; the re-attach re-derives histIdx from history.
+                pendingAcks.length = 0;
+                pendingCancels.length = 0;
                 pendingSessionResponse = false;
                 compacting = false;
                 setTurnActive(false);
@@ -3839,6 +4074,13 @@
                     data.tool || cardInfo.toolName
                 );
                 delete pendingToolCards[data.toolCallId];
+                // A background job's output keeps streaming AFTER this
+                // result (the job outlives the turn): keep the card
+                // reachable by term id so handleTermOutput keeps mirroring
+                // into its live region until term_exit.
+                if (cardInfo.args && cardInfo.args.background === true) {
+                    bgTermCards[data.toolCallId] = cardInfo;
+                }
             } else {
                 appendMessage('system', `[${data.tool}] ${data.result}`);
             }
@@ -3850,8 +4092,10 @@
             terminalOpen(data.termId, data.tool || '', data.content || '');
             // Mirror the command echo into the pending tool card so
             // shell output streams into the chat, not just the
-            // (collapsed-by-default) terminal dock.
-            const cardInfo = pendingToolCards[data.termId];
+            // (collapsed-by-default) terminal dock. bgTermCards covers
+            // background jobs, whose terminal can open around the tool
+            // result (the job outlives the turn).
+            const cardInfo = pendingToolCards[data.termId] || bgTermCards[data.termId];
             if (cardInfo && data.content) {
                 // Echo the command like the terminal tab does, on its
                 // own line ("$ ..." then the streaming output).
@@ -3863,7 +4107,10 @@
         function handleTermOutput(data) {
 
             terminalWrite(data.termId, data.content || '');
-            const cardInfo = pendingToolCards[data.termId];
+            // bgTermCards fallback: a background job's tool result already
+            // cleared the card from pendingToolCards while the job (and its
+            // output stream) is still running.
+            const cardInfo = pendingToolCards[data.termId] || bgTermCards[data.termId];
             if (cardInfo) {
                 appendToolCardLiveOutput(cardInfo, data.content || '');
             }
@@ -3876,11 +4123,15 @@
             // marks the tab as ok; anything else is a failure.
             terminalExit(data.termId, data.success === true);
             terminalFitSoon();
-            const cardInfo = pendingToolCards[data.termId];
+            const cardInfo = pendingToolCards[data.termId] || bgTermCards[data.termId];
             if (cardInfo && cardInfo.liveOutput) {
                 cardInfo.liveOutput.classList.add('done');
                 cardInfo.liveOutput.classList.add(data.success === true ? 'success' : 'error');
             }
+            // The job's output stream is over: drop the post-result mirror
+            // reference (also covers a term_exit that raced ahead of the
+            // tool result for a fast job).
+            delete bgTermCards[data.termId];
 
         }
 
@@ -3905,6 +4156,29 @@
 
         function handleCancelled(data) {
 
+            // A turn cancelled before the server emitted its user_acked
+            // frame never acks: drop its pending entry now, or the stale
+            // flag steals the next ack (stamping the new message's index
+            // onto the old bubble). A local cancel always leaves
+            // suppressTurnEnds > 0 at frame time (its increment is
+            // released only by the follow-up turn_end), so a suppressed
+            // frame consumes the record cancelActiveTurn pushed: the
+            // record's entry is stale exactly when it is still queued
+            // (an in-flight ack arrives before this frame — same-socket
+            // FIFO — and leaves the queue first). An unsuppressed frame
+            // (another tab/TUI cancelled the turn) targets the current
+            // turn, whose un-acked send is the only pending bubble.
+            if (suppressTurnEnds > 0) {
+                const rec = pendingCancels.shift();
+                if (rec && pendingAcks.includes(rec)) dropPendingAck(rec);
+            } else if (pendingAcks.length === 1) {
+                dropPendingAck(pendingAcks[0]);
+            }
+            // The cancel this frame belongs to is resolved: a later send
+            // must not inherit its target (covers the standalone
+            // cancel-button path, which has no markPendingAck to consume
+            // it).
+            lastCancelTarget = null;
             // Stale cancel from a turn we replaced with resend/send — ignore.
             if (suppressTurnEnds > 0) return;
             abortInFlightUI(data.content || 'Cancelled.');
@@ -3980,10 +4254,14 @@
             // Server assigned the Messages index for the user turn just started.
             // Index is in content so 0 is not dropped by JSON omitempty.
             const idx = parseInt(data.content, 10);
-            const el = messagesDiv.querySelector('.message.user[data-pending-ack="1"]')
-                || [...messagesDiv.querySelectorAll('.message.user:not([data-hist-idx])')].at(-1);
-            if (el && Number.isFinite(idx) && idx >= 0) {
-                delete el.dataset.pendingAck;
+            if (!Number.isFinite(idx) || idx < 0) return;
+            // The ack belongs to the oldest still-pending bubble (see
+            // pendingAcks) — NOT the first flagged bubble in the DOM,
+            // which a stale flag from a cancelled/rejected turn would
+            // poison.
+            const el = resolveAckTarget();
+            if (el) {
+                dropPendingAck(el);
                 el.dataset.histIdx = String(idx);
                 ensureUserResendActions(el);
             }
@@ -4136,6 +4414,12 @@
 
         function handleResponse(data) {
 
+            // A response frame is the terminal for a send that never
+            // acked (command reply, busy/error rejection, or a turn that
+            // failed before its first stream round): drop the entries it
+            // terminates, or their stale flags steal the next ack (see
+            // dropPendingForTerminal for the cut rule).
+            dropPendingForTerminal();
             finalizeThinking();
             endStream();
             // A session command (typed /new, /resume, /fork, resend)
@@ -4253,6 +4537,11 @@
 
         function handleModels(data) {
 
+            // A models frame is the terminal for a bare /models list,
+            // which starts no turn and never acks: drop the entries it
+            // terminates like handleResponse does (see
+            // dropPendingForTerminal).
+            dropPendingForTerminal();
             if (data.content) {
                 finalizeThinking();
                 endStream();
@@ -4347,6 +4636,12 @@
                 // the replay path pins (updateTocActive in pinToBottom), the
                 // fallback path has no scroll event to trigger it.
                 updateTocActive();
+                // Live events that arrived during the chunked replay are
+                // flushed last — after the rewind merge, matching the old
+                // ordering where the synchronous replay blocked the event
+                // loop until the whole rebuild (and this afterHistory
+                // microtask) had run.
+                flushReplayEventBuffer();
                 // NOTE: the resend message is flushed from the config
                 // handler, which adopts the new session id first (the
                 // server sends history before config).
@@ -4826,9 +5121,10 @@
             }
             const images = pendingAttachments.map((a) => ({ dataUrl: a.dataUrl }));
             const el = appendMessage('user', text, undefined, undefined, images);
-            if (el) el.dataset.pendingAck = '1';
+            markPendingAck(el);
             streamingToolCards = {};
             pendingToolCards = {};
+            bgTermCards = {};
             toolsStartedThisTurn = false;
             contextEstAdded = 0;
             const payload = { type: 'message', content: text, sessionId: activePane().id };
@@ -5267,8 +5563,12 @@
             return messagesDiv.scrollHeight - messagesDiv.scrollTop - messagesDiv.clientHeight;
         }
 
-        function updateScrollBottomBtn() {
-            scrollBottomBtn.classList.toggle('visible', !stickToBottom || distanceFromBottom() > NEAR_BOTTOM_PX);
+        // d: optional pre-computed distance from bottom (callers that already
+        // measured it in this frame pass it in to avoid a second forced
+        // layout on #messages).
+        function updateScrollBottomBtn(d) {
+            if (d === undefined) d = distanceFromBottom();
+            scrollBottomBtn.classList.toggle('visible', !stickToBottom || d > NEAR_BOTTOM_PX);
         }
 
         function unpinFromBottom() {
@@ -5300,7 +5600,10 @@
             // (prevents anchoring from fighting smartScroll's scroll-to-bottom).
             messagesDiv.classList.add('no-anchor');
             ignoreScrollEvent = true;
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            // scrollTo with a top far beyond the max offset clamps to the
+            // bottom without a prior scrollHeight read (which would force a
+            // layout flush on every streaming frame).
+            messagesDiv.scrollTo({ top: 1 << 30 });
             requestAnimationFrame(() => { ignoreScrollEvent = false; });
             scrollBottomBtn.classList.remove('visible');
             updateTocActive();
@@ -5435,7 +5738,9 @@
                 }
                 // 8 < d <= NEAR_BOTTOM_PX: leave stickToBottom alone so a small
                 // upward scroll after wheel-unpin is not immediately re-pinned.
-                updateScrollBottomBtn();
+                // Pass the already-measured distance: both helpers would
+                // otherwise each force a second layout in this frame.
+                updateScrollBottomBtn(d);
                 updateTocActive(d);
             });
         });
@@ -5458,6 +5763,10 @@
         // can still be >8px from the scroll bottom. If content grew while they
         // are within ~2 lines of the bottom, they were effectively at the
         // bottom — pull them to the new bottom.
+        // Returns the measured distance from bottom when it had to measure
+        // (undefined on early bail), so callers can hand it to
+        // updateTocActive and avoid a duplicate forced layout in the same
+        // frame.
         function maybeRepinNearBottom() {
             if (stickToBottom || replayInProgress) return;
             // Don't yank the chat while the user is composing: typing resizes
@@ -5465,19 +5774,24 @@
             // bottom — that's not scroll intent and shouldn't trigger re-pin.
             if (document.activeElement === inputArea) return;
             if (performance.now() - lastUnpinAt <= UNPIN_REPIN_GRACE_MS) return;
-            if (distanceFromBottom() <= NEAR_BOTTOM_PX) pinToBottom();
+            const d = distanceFromBottom();
+            if (d <= NEAR_BOTTOM_PX) pinToBottom();
+            return d;
         }
         function scheduleRepinIfPinned() {
             if (_repinRafPending) return;
             _repinRafPending = true;
             requestAnimationFrame(() => {
                 _repinRafPending = false;
+                let d;
                 if (stickToBottom) smartScroll();
-                else maybeRepinNearBottom();
+                else d = maybeRepinNearBottom();
                 // During a sidebar drag this per-frame probe is deferred to
                 // the single sidebarDragEnd pass on release (see the
                 // sidebarDragActive note above the ResizeObserver).
-                if (!sidebarDragActive) updateTocActive();
+                // Pass the distance measured above (when any) so the TOC
+                // probe doesn't force a second layout in this frame.
+                if (!sidebarDragActive) updateTocActive(d);
             });
         }
         window.addEventListener('gogen-colorized', scheduleRepinIfPinned);
@@ -5535,7 +5849,10 @@
             // next frame (scroll events are dispatched as tasks before the next
             // rendering update's rAF callbacks run).
             ignoreScrollEvent = true;
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            // scrollTo with a top far beyond the max offset clamps to the
+            // bottom without a prior scrollHeight read (which would force a
+            // layout flush on every streaming frame).
+            messagesDiv.scrollTo({ top: 1 << 30 });
             requestAnimationFrame(() => { ignoreScrollEvent = false; });
             // Late layout (async Monaco mounting, syntax highlighting, image
             // or font loads, composer height changes) can grow the DOM after
@@ -5547,7 +5864,7 @@
                 _smartScrollRafPending = false;
                 if (!stickToBottom || replayInProgress) return;
                 ignoreScrollEvent = true;
-                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                messagesDiv.scrollTo({ top: 1 << 30 });
                 requestAnimationFrame(() => { ignoreScrollEvent = false; });
             });
         }

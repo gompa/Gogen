@@ -58,10 +58,14 @@ func (p *OpenAIProvider) clientForModel(ctx context.Context) *openai.Client {
 			return c
 		}
 		// Model is not listed on any endpoint — fall through to the
-		// deterministic fallback (models.dev, then the default client).
+		// last-known owner, then the deterministic fallback (models.dev,
+		// then the default client).
 	}
 
-	chosen := p.inferOpenCodeEndpoint(model)
+	chosen, ownerName := p.ownerClientForModel(model)
+	if chosen == nil {
+		chosen = p.inferOpenCodeEndpoint(model)
+	}
 	if chosen == nil {
 		chosen = p.fallbackClient()
 	}
@@ -76,6 +80,14 @@ func (p *OpenAIProvider) clientForModel(ctx context.Context) *openai.Client {
 		return c
 	}
 	p.modelClient[model] = chosen
+	// Record the owner for a fallback resolved through the ownership record
+	// (it may have come from the shared registry, not this provider's own
+	// record): the next catalog merge must apply the sticky-ownership rule
+	// to this model instead of treating it as ownerless and letting a
+	// surviving endpoint's same-ID model steal it.
+	if ownerName != "" {
+		p.modelOwner[model] = ownerName
+	}
 	p.modelsMu.Unlock()
 	return chosen
 }
@@ -121,6 +133,58 @@ func (p *OpenAIProvider) inferOpenCodeEndpoint(model string) *openai.Client {
 		return p.zenClient
 	}
 	return nil
+}
+
+// ownerClientForModel returns the stream client of the profile that last
+// served model (and that profile's name), when the profile is still
+// registered: the provider's own sticky-ownership record (modelOwner, from
+// its successful catalog fetches) first, then the process-shared
+// OwnerRegistry (owners learned by sibling providers — a fresh session or
+// subagent provider inherits routing knowledge it cannot gain itself while
+// its owning endpoint is down). This runs BEFORE the models.dev inference
+// and the default-client fallback: a model the user's local endpoint served
+// must keep going there while that endpoint is unreachable, not be re-homed
+// to the default profile (which may be a remote gateway that does not serve
+// it). Returns a nil client when no owner is known or the owner profile is
+// no longer registered, in which case the caller falls through to the
+// deterministic fallback.
+func (p *OpenAIProvider) ownerClientForModel(model string) (*openai.Client, string) {
+	if model == "" {
+		return nil, ""
+	}
+	p.modelsMu.RLock()
+	name, ok := p.modelOwner[model]
+	profiles := p.profiles
+	reg := p.ownerRegistry
+	p.modelsMu.RUnlock()
+	if !ok && reg != nil {
+		name, ok = reg.Owner(model)
+	}
+	if !ok {
+		return nil, ""
+	}
+	for _, prof := range profiles {
+		if prof.name != name {
+			continue
+		}
+		if prof.zenStream != nil && prof.goStream != nil {
+			// OpenCode profile: pick the twin the registry says serves the
+			// model (a Go-subscription model must not hit the Zen endpoint);
+			// a cold registry falls back to the profile's configured
+			// endpoint.
+			if p.modelInfo != nil {
+				if _, _, _, _, err := p.modelInfo.Resolve(openCodeGoBaseURL, model); err == nil {
+					return prof.goStream, name
+				}
+				if _, _, _, _, err := p.modelInfo.Resolve(openCodeZenBaseURL, model); err == nil {
+					return prof.zenStream, name
+				}
+			}
+			return prof.stream, name
+		}
+		return prof.stream, name
+	}
+	return nil, ""
 }
 
 func toolsToOpenAI(tools []Tool, allowed map[string]struct{}) []openai.ChatCompletionToolParam {

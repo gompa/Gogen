@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -74,7 +75,7 @@ func TestInstallJobNoticeHook(t *testing.T) {
 
 		got := make(chan string, 1)
 		tui.installJobNoticeHook(m, func(summary string) { got <- summary })
-		if _, err := a.StartBackgroundCommand("echo tui-notice"); err != nil {
+		if _, err := a.StartBackgroundCommand(context.Background(), "echo tui-notice"); err != nil {
 			t.Fatal(err)
 		}
 		select {
@@ -98,7 +99,7 @@ func TestInstallJobNoticeHook(t *testing.T) {
 			t.Error("deliver must not run for a backgrounded root")
 		})
 		m.lives.Switch(1) // root backgrounded
-		if _, err := a.StartBackgroundCommand("echo tui-bg-notice"); err != nil {
+		if _, err := a.StartBackgroundCommand(context.Background(), "echo tui-bg-notice"); err != nil {
 			t.Fatal(err)
 		}
 		root := m.lives.sessions[0]
@@ -130,7 +131,7 @@ func TestInstallJobNoticeHook(t *testing.T) {
 		tui.installJobNoticeHook(m, func(string) {
 			t.Error("deliver must not run when job_notices is off")
 		})
-		if _, err := a.StartBackgroundCommand("echo tui-off"); err != nil {
+		if _, err := a.StartBackgroundCommand(context.Background(), "echo tui-off"); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(500 * time.Millisecond)

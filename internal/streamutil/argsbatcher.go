@@ -1,4 +1,4 @@
-package tui
+package streamutil
 
 import (
 	"sort"
@@ -7,22 +7,27 @@ import (
 	"time"
 )
 
-// argsBatcher coalesces tool-call argument deltas so the Update thread is
-// not flooded with one rendering event per provider chunk. Deltas are
+// ArgsBatcher coalesces tool-call argument deltas so the consumer is not
+// flooded with one rendering event per provider chunk. Deltas are
 // accumulated per tool-call index and flushed together on a timer (or at
 // explicit boundaries: tool-call start/final, tool execute, round/stream
 // end). The send callback is called once per index at flush time with the
 // concatenated delta, in index order.
 //
-// Mirrors streamutil.TokenBatcher's concurrency contract: the timer
-// goroutine (time.AfterFunc) and explicit callers can invoke Flush
-// concurrently, and flushMu serializes the grab-and-send phase so a later
-// flush's deltas never overtake an earlier one's on the wire.
-type argsBatcher struct {
+// It is the tool-args counterpart of TokenBatcher: the argument stream is
+// the highest-rate callback in a tool-heavy turn (a patch_file diff arrives
+// as hundreds of ~1KB fragments), and both frontends (TUI Update thread,
+// WebSocket frames) need the same coalescing so they stay in sync.
+//
+// Mirrors TokenBatcher's concurrency contract: the timer goroutine
+// (time.AfterFunc) and explicit callers can invoke Flush concurrently, and
+// flushMu serializes the grab-and-send phase so a later flush's deltas
+// never overtake an earlier one's on the wire.
+type ArgsBatcher struct {
 	mu   sync.Mutex
-	send func(index int, id, delta string)
-	// pending holds, per tool-call index, the accumulated arg deltas and
-	// the call id (the id repeats per delta; the last non-empty wins).
+	send func(index int, id, name, delta string)
+	// pending holds, per tool-call index, the accumulated arg deltas plus
+	// the call id/name (they repeat per delta; the last non-empty wins).
 	pending map[int]*argsPending
 	// flushMu serializes the grab-and-send phase of Flush.
 	flushMu  sync.Mutex
@@ -32,17 +37,18 @@ type argsBatcher struct {
 }
 
 type argsPending struct {
-	id string
+	id   string
+	name string
 	// chunks accumulates delta strings without copying; the delta text is
 	// joined once at flush time (per-delta string concatenation would copy
 	// the whole accumulation every chunk — quadratic on large diffs).
 	chunks []string
 }
 
-// newArgsBatcher creates a batcher that flushes every interval.
+// NewArgsBatcher creates a batcher that flushes every interval.
 // The send callback may be called from a different goroutine (the timer).
-func newArgsBatcher(send func(index int, id, delta string), interval time.Duration) *argsBatcher {
-	return &argsBatcher{
+func NewArgsBatcher(send func(index int, id, name, delta string), interval time.Duration) *ArgsBatcher {
+	return &ArgsBatcher{
 		send:     send,
 		pending:  map[int]*argsPending{},
 		interval: interval,
@@ -51,7 +57,7 @@ func newArgsBatcher(send func(index int, id, delta string), interval time.Durati
 
 // Add enqueues an argument delta for the tool call at index. Safe to call
 // concurrently with Flush / Close. After Close, Add is a no-op.
-func (b *argsBatcher) Add(index int, id, delta string) {
+func (b *ArgsBatcher) Add(index int, id, name, delta string) {
 	if delta == "" {
 		return
 	}
@@ -68,6 +74,9 @@ func (b *argsBatcher) Add(index int, id, delta string) {
 	if id != "" {
 		p.id = id
 	}
+	if name != "" {
+		p.name = name
+	}
 	p.chunks = append(p.chunks, delta)
 	if b.timer == nil {
 		b.timer = time.AfterFunc(b.interval, b.Flush)
@@ -77,7 +86,7 @@ func (b *argsBatcher) Add(index int, id, delta string) {
 // Flush emits all pending deltas immediately (one send per index, in index
 // order). Safe to call concurrently with Add. After Close, Flush is a
 // no-op.
-func (b *argsBatcher) Flush() {
+func (b *ArgsBatcher) Flush() {
 	b.flushMu.Lock()
 	defer b.flushMu.Unlock()
 	b.mu.Lock()
@@ -104,7 +113,7 @@ func (b *argsBatcher) Flush() {
 	for _, i := range idxs {
 		p := pending[i]
 		if text := strings.Join(p.chunks, ""); text != "" {
-			b.send(i, p.id, text)
+			b.send(i, p.id, p.name, text)
 		}
 	}
 }
@@ -112,7 +121,7 @@ func (b *argsBatcher) Flush() {
 // Close discards pending deltas, stops the timer, and marks the batcher as
 // closed so any late-arriving timer goroutine flush is a no-op. Callers
 // that need delivery of pending deltas should call Flush before Close.
-func (b *argsBatcher) Close() {
+func (b *ArgsBatcher) Close() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.pending = nil
@@ -128,7 +137,7 @@ func (b *argsBatcher) Close() {
 
 // Reset clears the closed state so the batcher can be reused for a new
 // stream round (the adapter calls this on OnStart / OnRoundStart).
-func (b *argsBatcher) Reset() {
+func (b *ArgsBatcher) Reset() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.closed = false

@@ -264,7 +264,10 @@ func handleExecuteCommand(ctx context.Context, a *Agent, args map[string]any) (s
 		return "", err
 	}
 	if background {
-		id, err := a.StartBackgroundCommand(command)
+		// ctx carries the tool call's live-output sink/end callbacks:
+		// the job streams to the UI's terminal for its whole lifetime
+		// (it outlives this turn), not just while the call is in flight.
+		id, err := a.StartBackgroundCommand(ctx, command)
 		if err != nil {
 			return "", err
 		}

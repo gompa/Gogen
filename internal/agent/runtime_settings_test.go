@@ -17,11 +17,11 @@ func TestExecutorRuntimeSetters(t *testing.T) {
 	if got := exec.commandGuard(); got == nil || got.Mode != "blocklist" {
 		t.Fatalf("default guard = %+v, want blocklist", got)
 	}
-	if exec.commandTimeout() <= 0 {
-		t.Fatal("default timeout should be positive")
-	}
 	if exec.sandbox() != "off" {
 		t.Fatalf("default sandbox = %q, want off", exec.sandbox())
+	}
+	if exec.idleTimeout() != 0 {
+		t.Fatalf("default idle timeout = %v, want 0 (meaning: the built-in default)", exec.idleTimeout())
 	}
 
 	exec.SetCommandGuard("allowlist", []string{"ls", "cat"})
@@ -42,13 +42,13 @@ func TestExecutorRuntimeSetters(t *testing.T) {
 		t.Fatal("deleteApprovalRequired(ctx) should be true again")
 	}
 
-	exec.SetCommandTimeout(45 * time.Second)
-	if exec.commandTimeout() != 45*time.Second {
-		t.Fatalf("timeout = %v, want 45s", exec.commandTimeout())
-	}
-
 	exec.SetSandbox("bwrap")
 	if exec.sandbox() != "bwrap" {
 		t.Fatalf("sandbox = %q, want bwrap", exec.sandbox())
+	}
+
+	exec.SetIdleTimeout(45 * time.Second)
+	if exec.idleTimeout() != 45*time.Second {
+		t.Fatalf("idle timeout = %v, want 45s", exec.idleTimeout())
 	}
 }

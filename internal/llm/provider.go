@@ -87,6 +87,7 @@ type StreamHandlers struct {
 	OnRecoverPartialStream func()                                      // reset UI after stream error mid-tool-call
 	OnToolExecute          func(name string)                           // called immediately before a tool runs (may block)
 	OnToolOutput           func(id, name, command, chunk string)       // live combined stdout/stderr chunks from shell tools while they run
+	OnToolOutputEnd        func(id string, success bool)               // the tool call's live output stream terminated (foreground: when the command finishes; background job: when the job exits, possibly long after the turn ended)
 	OnToolResult           func(id, name, result string, success bool) // called after a tool executes
 }
 

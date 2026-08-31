@@ -272,6 +272,10 @@ type Model struct {
 	sessionCursor int
 	modelCursor   int
 	liveCursor    int // ModalLiveSessions selection over m.lives.sessions
+	// thinkingSel is the models modal's staged thinking level (web
+	// subagent-picker parity): moved with ←/→ or a chip click, applied
+	// together with the model on enter. Off = "no reasoning_effort sent".
+	thinkingSel agent.ThinkingLevel
 
 	// Keymap
 	keys KeyMap

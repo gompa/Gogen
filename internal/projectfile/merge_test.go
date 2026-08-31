@@ -114,6 +114,58 @@ func TestMergeLegacyKeepRecentFileKey(t *testing.T) {
 	}
 }
 
+// The pre-rename GOGEN_COMMAND_TIMEOUT_SECS env var must keep working, with
+// the renamed env var winning when both are set.
+func TestMergeLegacyCommandTimeoutEnv(t *testing.T) {
+	os.Unsetenv("GOGEN_COMMAND_IDLE_TIMEOUT_SECS")
+	t.Setenv("GOGEN_COMMAND_TIMEOUT_SECS", "300")
+	cfg := Merge(nil, FlagOverrides{})
+	if cfg.CommandIdleTimeoutSecs != 300 {
+		t.Fatalf("legacy env not honored: %d, want 300", cfg.CommandIdleTimeoutSecs)
+	}
+
+	t.Setenv("GOGEN_COMMAND_IDLE_TIMEOUT_SECS", "90")
+	cfgBoth := Merge(nil, FlagOverrides{})
+	if cfgBoth.CommandIdleTimeoutSecs != 90 {
+		t.Fatalf("renamed env should win: %d, want 90", cfgBoth.CommandIdleTimeoutSecs)
+	}
+}
+
+// An invalid legacy env value falls back to the default with a warning,
+// matching the renamed env's behavior.
+func TestMergeLegacyCommandTimeoutEnvInvalid(t *testing.T) {
+	os.Unsetenv("GOGEN_COMMAND_IDLE_TIMEOUT_SECS")
+	t.Setenv("GOGEN_COMMAND_TIMEOUT_SECS", "bogus")
+	cfg := Merge(nil, FlagOverrides{})
+	if cfg.CommandIdleTimeoutSecs != config.DefaultCommandIdleTimeoutSecs {
+		t.Fatalf("invalid legacy env should fall back to default: %d, want %d", cfg.CommandIdleTimeoutSecs, config.DefaultCommandIdleTimeoutSecs)
+	}
+}
+
+// The file key aliasing flows through Merge: a project file using the legacy
+// key reaches the runtime config even when both env vars are unset, and the
+// legacy env var still loses to a file value's new-key sibling per the env >
+// file precedence.
+func TestMergeLegacyCommandTimeoutFileKey(t *testing.T) {
+	os.Unsetenv("GOGEN_COMMAND_IDLE_TIMEOUT_SECS")
+	os.Unsetenv("GOGEN_COMMAND_TIMEOUT_SECS")
+	pf, err := ParseContent("GOGEN.md", "---\ncommand_timeout_secs: 300\n---\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Merge(pf, FlagOverrides{})
+	if cfg.CommandIdleTimeoutSecs != 300 {
+		t.Fatalf("legacy file key not honored through Merge: %d, want 300", cfg.CommandIdleTimeoutSecs)
+	}
+
+	// Env (even the legacy spelling) beats the file value.
+	t.Setenv("GOGEN_COMMAND_TIMEOUT_SECS", "60")
+	cfgEnv := Merge(pf, FlagOverrides{})
+	if cfgEnv.CommandIdleTimeoutSecs != 60 {
+		t.Fatalf("legacy env should beat file value: %d, want 60", cfgEnv.CommandIdleTimeoutSecs)
+	}
+}
+
 func TestMergeFloatOptPreservesExplicitZero(t *testing.T) {
 	os.Unsetenv("GOGEN_TEST_OPTF")
 	zero := 0.0

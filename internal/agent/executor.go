@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -23,8 +24,9 @@ const (
 	readFileMaxLines  = 10000
 )
 
-// defaultCommandTimeout is the default maximum duration for command execution.
-const defaultCommandTimeout = time.Duration(config.DefaultCommandTimeoutSecs) * time.Second
+// defaultCommandIdleTimeout is the default maximum time a foreground command
+// may run without producing any output before it is killed.
+const defaultCommandIdleTimeout = time.Duration(config.DefaultCommandIdleTimeoutSecs) * time.Second
 
 type Executor struct {
 	wdMu         sync.RWMutex
@@ -42,9 +44,9 @@ type Executor struct {
 	// pointer after unlocking.
 	guard          *CommandGuard
 	deleteApproval bool
-	cmdTimeout     time.Duration // 0 = default 2 minutes
 	sandboxMode    string        // off, bwrap
 	maxToolOutput  int           // max bytes retained in-memory per command (0 = unbounded)
+	cmdIdleTimeout time.Duration // max no-output duration for foreground commands (0 = default)
 	liveMu         sync.RWMutex
 }
 
@@ -60,7 +62,6 @@ func NewExecutorWithGuard(wd string, guard *CommandGuard) *Executor {
 		WorkingDir:     wd,
 		guard:          guard,
 		deleteApproval: true,
-		cmdTimeout:     defaultCommandTimeout,
 		sandboxMode:    "off",
 		PathBoundary:   "",
 	}
@@ -98,21 +99,6 @@ func (e *Executor) DeleteApprovalRequired() bool {
 	return e.deleteApproval
 }
 
-// SetCommandTimeout sets the maximum duration for command execution
-// (web settings modal command_timeout_secs; <= 0 = the default).
-func (e *Executor) SetCommandTimeout(timeout time.Duration) {
-	e.liveMu.Lock()
-	e.cmdTimeout = timeout
-	e.liveMu.Unlock()
-}
-
-// commandTimeout returns the current command timeout (0 = default).
-func (e *Executor) commandTimeout() time.Duration {
-	e.liveMu.RLock()
-	defer e.liveMu.RUnlock()
-	return e.cmdTimeout
-}
-
 // SetSandbox sets the command sandbox mode (web settings modal
 // command_sandbox: off / bwrap).
 func (e *Executor) SetSandbox(mode string) {
@@ -145,6 +131,31 @@ func (e *Executor) maxToolOutputBytes() int {
 	return e.maxToolOutput
 }
 
+// SetIdleTimeout sets the maximum time a foreground execute_command may run
+// without producing any output before it is killed (config
+// command_idle_timeout_secs; <= 0 = the default). Any output resets the
+// window, so a slow command that keeps printing runs to completion; there
+// is no wall-clock cap. Background jobs are unaffected.
+func (e *Executor) SetIdleTimeout(timeout time.Duration) {
+	e.liveMu.Lock()
+	e.cmdIdleTimeout = timeout
+	e.liveMu.Unlock()
+}
+
+// idleTimeout returns the current idle timeout (0 = default).
+func (e *Executor) idleTimeout() time.Duration {
+	e.liveMu.RLock()
+	defer e.liveMu.RUnlock()
+	return e.cmdIdleTimeout
+}
+
+// IdleTimeoutDuration returns the current foreground-command idle timeout
+// (0 = the built-in default). Runtime-safe read, used by the web settings
+// push and tests.
+func (e *Executor) IdleTimeoutDuration() time.Duration {
+	return e.idleTimeout()
+}
+
 // CommandGuardMode returns the current command guard's mode ("blocklist",
 // "allowlist", "off"; "" when no guard is set). Runtime-safe read — the web
 // settings push and tests use it.
@@ -159,13 +170,6 @@ func (e *Executor) CommandGuardMode() string {
 // Runtime-safe read.
 func (e *Executor) SandboxMode() string {
 	return e.sandbox()
-}
-
-// CommandTimeoutDuration returns the current command execution timeout
-// (0 = the default). Runtime-safe read, used by the web settings push and
-// tests.
-func (e *Executor) CommandTimeoutDuration() time.Duration {
-	return e.commandTimeout()
 }
 
 // GetWorkingDir returns the current working directory.
@@ -530,35 +534,48 @@ func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	timeout := e.commandTimeout()
-	if timeout <= 0 {
-		timeout = defaultCommandTimeout
-	}
-	if deadline, ok := ctx.Deadline(); ok {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return "", ctx.Err()
-		}
-		if remaining < timeout {
-			timeout = remaining
-		}
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 
 	// Combined-output writer: accumulates the output returned to the model
 	// (bounded by maxToolOutputBytes when configured) while streaming each
 	// chunk to the optional ToolOutputSink so frontends can render live
 	// terminal output.
 	out := newCommandOutputWriter(command, ToolOutputFromContext(ctx), e.maxToolOutputBytes())
-	err := e.runCommand(ctx, command, nil, out, out)
+
+	// Idle timeout: a foreground command that produces no output for the
+	// configured window is killed. Any output resets the window, so a
+	// slow-but-alive command (a long build that keeps printing) runs to
+	// completion, while a hung one cannot block the turn forever — there
+	// is no wall-clock cap.
+	idle := e.idleTimeout()
+	if idle <= 0 {
+		idle = defaultCommandIdleTimeout
+	}
+	cmdCtx, cancelIdle := context.WithCancel(ctx)
+	defer cancelIdle()
+	done := make(chan struct{})
+	defer close(done)
+	var idleKilled atomic.Bool
+	go watchCommandIdle(out, idle, cancelIdle, done, &idleKilled)
+
+	err := e.runCommand(cmdCtx, command, nil, out, out)
+	// The output stream is over: runCommand's Wait has closed the pipes,
+	// so every chunk has reached the sink. Fire the end callback (the
+	// UI's term_exit) BEFORE the caller reports the tool result — the
+	// foreground mirror of the background job's exit, which fires from
+	// the job's wait goroutine instead.
+	if end := ToolOutputEndFromContext(ctx); end != nil {
+		end(err == nil)
+	}
 	outStr := out.String()
 	if out.overflowed {
 		outStr = e.applyToolOutputCap(outStr)
 	}
 	if err != nil {
+		if idleKilled.Load() {
+			return outStr, fmt.Errorf("command idle for %s with no output: %s", idle.Round(time.Second), command)
+		}
 		if ctx.Err() == context.DeadlineExceeded {
-			return outStr, fmt.Errorf("command timed out after %s: %s", timeout.Round(time.Second), command)
+			return outStr, fmt.Errorf("command timed out: %s", command)
 		}
 		if ctx.Err() == context.Canceled {
 			return outStr, fmt.Errorf("command cancelled: %s", command)
@@ -566,6 +583,36 @@ func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, 
 		return outStr, err
 	}
 	return outStr, nil
+}
+
+// watchCommandIdle kills the command (via cancel) when it has produced no
+// output for the full idle window. It polls the writer's last-activity
+// timestamp on a ticker (idle/4, clamped to [250ms, idle]) and exits when
+// done is closed (the command finished): a cancel after finish is a no-op,
+// and killed is only observed on the error path, so a kill that races the
+// command's own exit is harmless.
+func watchCommandIdle(out *commandOutputWriter, idle time.Duration, cancel context.CancelFunc, done <-chan struct{}, killed *atomic.Bool) {
+	tick := idle / 4
+	if tick < 250*time.Millisecond {
+		tick = 250 * time.Millisecond
+	}
+	if tick > idle {
+		tick = idle
+	}
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			if time.Since(out.lastActivity()) >= idle {
+				killed.Store(true)
+				cancel()
+				return
+			}
+		}
+	}
 }
 
 // applyToolOutputCap appends the truncation marker when the bounded writer
@@ -674,16 +721,24 @@ type commandOutputWriter struct {
 	overflowed bool
 	command    string
 	sink       ToolOutputSink
+	// lastActive is the monotonic-free unix-nano timestamp of the most
+	// recent output write (the command's start when it has produced no
+	// output yet). Updated atomically: Write runs on exec's pipe-copy
+	// goroutines while the idle watcher reads it from its own goroutine.
+	lastActive atomic.Int64
 }
 
 func newCommandOutputWriter(command string, sink ToolOutputSink, max int) *commandOutputWriter {
-	return &commandOutputWriter{command: command, sink: sink, max: max}
+	w := &commandOutputWriter{command: command, sink: sink, max: max}
+	w.lastActive.Store(time.Now().UnixNano())
+	return w
 }
 
 func (w *commandOutputWriter) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
+	w.lastActive.Store(time.Now().UnixNano())
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.max > 0 {
@@ -704,6 +759,12 @@ func (w *commandOutputWriter) Write(p []byte) (int, error) {
 		w.sink(w.command, string(p))
 	}
 	return len(p), nil
+}
+
+// lastActivity returns the time of the most recent output write (the
+// command's start when it has produced no output yet).
+func (w *commandOutputWriter) lastActivity() time.Time {
+	return time.Unix(0, w.lastActive.Load())
 }
 
 // String returns the accumulated output. Safe to call after Wait returns

@@ -17,7 +17,7 @@ import (
 // empty/zero values.
 var runtimeConfigFields = map[string]bool{
 	"commandSafety": true, "commandAllowlist": true, "deleteApproval": true,
-	"commandSandbox": true, "commandTimeoutSecs": true,
+	"commandSandbox": true, "commandIdleTimeoutSecs": true,
 	"contextLimit": true, "compactThreshold": true, "compactKeepRecentMessages": true,
 	"maxToolResultBytes": true, "compactReserveTokens": true, "compactLastResort": true,
 	"webFetch": true, "webSearch": true, "webSearchBackend": true, "webSearchApiKey": true,
@@ -102,12 +102,12 @@ func (s *Server) handleWSRuntimeConfig(ws *wsConn, msg WSMessage) {
 				return
 			}
 			r.CommandSandbox = mode
-		case "commandTimeoutSecs":
-			if msg.CommandTimeoutSecs < 0 {
-				writeNoticeError(ws, "settings", "Error: commandTimeoutSecs must be >= 0")
+		case "commandIdleTimeoutSecs":
+			if msg.CommandIdleTimeoutSecs < 0 {
+				writeNoticeError(ws, "settings", "Error: commandIdleTimeoutSecs must be >= 0")
 				return
 			}
-			r.CommandTimeoutSecs = msg.CommandTimeoutSecs
+			r.CommandIdleTimeoutSecs = msg.CommandIdleTimeoutSecs
 		case "contextLimit":
 			if msg.ContextLimitConfig < 0 {
 				writeNoticeError(ws, "settings", "Error: contextLimit must be >= 0")
@@ -242,8 +242,8 @@ func (s *Server) handleWSRuntimeConfig(ws *wsConn, msg WSMessage) {
 	if set("commandSandbox") {
 		s.ws.Exec.SetSandbox(r.CommandSandbox)
 	}
-	if set("commandTimeoutSecs") {
-		s.ws.Exec.SetCommandTimeout(time.Duration(r.CommandTimeoutSecs) * time.Second)
+	if set("commandIdleTimeoutSecs") {
+		s.ws.Exec.SetIdleTimeout(time.Duration(r.CommandIdleTimeoutSecs) * time.Second)
 	}
 	if set("webFetch") || set("webFetchMode") || set("webAllowedDomains") {
 		agent.ConfigureWebFetch(parseOnOffValue(r.WebFetch), r.WebFetchMode, r.WebAllowedDomains)

@@ -1483,8 +1483,13 @@ func (a *Agent) executeToolCallsParallel(ctx context.Context, h *llm.StreamHandl
 			tc := toolCalls[i]
 			toolCtx := ctx
 			if h.OnToolOutput != nil {
-				toolCtx = ContextWithToolOutput(ctx, func(command, chunk string) {
+				toolCtx = ContextWithToolOutput(toolCtx, func(command, chunk string) {
 					h.OnToolOutput(tc.ID, tc.Name, command, chunk)
+				})
+			}
+			if h.OnToolOutputEnd != nil {
+				toolCtx = ContextWithToolOutputEnd(toolCtx, func(success bool) {
+					h.OnToolOutputEnd(tc.ID, success)
 				})
 			}
 			toolCtx = ContextWithImageSink(toolCtx, sinks[i])

@@ -327,7 +327,7 @@ type WSMessage struct {
 	CommandAllowlist          string  `json:"commandAllowlist,omitempty"`
 	DeleteApproval            string  `json:"deleteApproval,omitempty"`
 	CommandSandbox            string  `json:"commandSandbox,omitempty"`
-	CommandTimeoutSecs        int     `json:"commandTimeoutSecs,omitempty"`
+	CommandIdleTimeoutSecs    int     `json:"commandIdleTimeoutSecs,omitempty"`
 	ContextLimitConfig        int     `json:"contextLimitConfig,omitempty"` // 0 = auto (provider resolution)
 	CompactThreshold          float64 `json:"compactThreshold,omitempty"`
 	CompactKeepRecentMessages int     `json:"compactKeepRecentMessages,omitempty"`

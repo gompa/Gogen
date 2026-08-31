@@ -56,16 +56,37 @@ const COMPONENT_MODULES = [
 //   - import { a, b } from '...'  (multi-line, as in app.js's editor.js import)
 //   - import X from '...'
 //   - export function/async function/const/let/var/class declarations
+//   - export { a, b }; re-export lists (e.g. editor.js's `export { monaco };`)
 function stripModuleSyntax(src) {
   return src
     .replace(/import\s*\{[^}]*\}\s*from\s*['"][^'"]+['"];\s*/gs, '')
     .replace(/import\s+[A-Za-z_$][\w$]*\s+from\s*['"][^'"]+['"];\s*/g, '')
-    .replace(/\bexport\s+(?=function|async\s+function|const|let|var|class)\s*/g, '');
+    .replace(/\bexport\s+(?=function|async\s+function|const|let|var|class)\s*/g, '')
+    .replace(/\bexport\s*\{[^}]*\};\s*/g, '');
+}
+
+// jsdom does not implement Element.scrollTo/scrollBy, but app.js's
+// pinToBottom/smartScroll use `messagesDiv.scrollTo({ top: 1 << 30 })`
+// (browser clamps to the bottom). Emulate the clamped assignment so the
+// old `scrollTop = scrollHeight` semantics hold under test (jsdom has no
+// layout, so everything clamps to 0).
+function installScrollStubs(window) {
+  if (typeof window.Element.prototype.scrollTo === 'function') return;
+  window.Element.prototype.scrollTo = function (opts) {
+    const top = opts && typeof opts === 'object' ? opts.top : opts;
+    const max = Math.max(0, this.scrollHeight - this.clientHeight);
+    this.scrollTop = Math.min(Math.max(Number(top) || 0, 0), max);
+  };
+  window.Element.prototype.scrollBy = function (opts) {
+    const dy = opts && typeof opts === 'object' ? opts.top : opts;
+    this.scrollTop += Number(dy) || 0;
+  };
 }
 
 // Evals the component modules (dependency order), then app.js, into the
 // given jsdom window. APPJS env override (as before) for app.js only.
 function loadAppJs(window) {
+  installScrollStubs(window);
   for (const rel of COMPONENT_MODULES) {
     window.eval(stripModuleSyntax(fs.readFileSync(path.join(ROOT, rel), 'utf8')));
   }
@@ -73,4 +94,4 @@ function loadAppJs(window) {
   window.eval(stripModuleSyntax(fs.readFileSync(appJs, 'utf8')));
 }
 
-module.exports = { ROOT, COMPONENT_MODULES, stripModuleSyntax, loadAppJs, EDITOR_STUBS, installEditorStubs };
+module.exports = { ROOT, COMPONENT_MODULES, stripModuleSyntax, loadAppJs, EDITOR_STUBS, installEditorStubs, installScrollStubs };

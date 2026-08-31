@@ -62,7 +62,7 @@ func Merge(pf *ProjectFile, flags FlagOverrides) *config.Config {
 		WebAllowedDomains:         mergeString("GOGEN_WEB_ALLOWED_DOMAINS", file.WebAllowedDomains, def.WebAllowedDomains),
 		WebFetchMode:              mergeString("GOGEN_WEB_FETCH_MODE", file.WebFetchMode, def.WebFetchMode),
 		CommandSandbox:            mergeString("GOGEN_COMMAND_SANDBOX", file.CommandSandbox, def.CommandSandbox),
-		CommandTimeoutSecs:        mergeInt("GOGEN_COMMAND_TIMEOUT_SECS", file.CommandTimeoutSecs, def.CommandTimeoutSecs),
+		CommandIdleTimeoutSecs:    mergeCommandIdleTimeout(file, def.CommandIdleTimeoutSecs),
 		PreserveReasoning:         mergeString("GOGEN_PRESERVE_REASONING", file.PreserveReasoning, def.PreserveReasoning),
 		Board:                     mergeString("GOGEN_BOARD", file.Board, def.Board),
 		Subagent:                  mergeString("GOGEN_SUBAGENT", file.Subagent, def.Subagent),
@@ -185,6 +185,28 @@ func mergeCompactKeepRecentMessages(file FileConfig, def int) int {
 		return *file.CompactKeepRecentMessages
 	}
 	return def
+}
+
+// mergeCommandIdleTimeout merges the command_idle_timeout_secs setting,
+// honoring the pre-rename GOGEN_COMMAND_TIMEOUT_SECS env var for back-compat
+// (the file key command_timeout_secs is already aliased onto
+// CommandIdleTimeoutSecs by parseYAMLFrontMatter). The renamed env var wins
+// when both are set; the legacy env var logs a deprecation warning instead
+// of being silently dropped. Precedence: env > file > default.
+func mergeCommandIdleTimeout(file FileConfig, def int) int {
+	if v, ok := envInt("GOGEN_COMMAND_IDLE_TIMEOUT_SECS", def); ok {
+		return v
+	}
+	if v, ok := os.LookupEnv("GOGEN_COMMAND_TIMEOUT_SECS"); ok {
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			log.Printf("warning: GOGEN_COMMAND_TIMEOUT_SECS=%q is not a valid integer; using default %d", v, def)
+			return def
+		}
+		log.Printf("warning: GOGEN_COMMAND_TIMEOUT_SECS is deprecated; use GOGEN_COMMAND_IDLE_TIMEOUT_SECS (value %d used)", n)
+		return n
+	}
+	return config.Effective(file.CommandIdleTimeoutSecs, def)
 }
 
 func cloneStringMap(in map[string]string) map[string]string {

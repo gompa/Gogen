@@ -709,6 +709,15 @@
             word-break: break-word;
             flex-shrink: 0;
             border: 1px solid var(--border-subtle);
+            /* Skip rendering off-screen messages. Long transcripts with tool
+               cards, Monaco diff viewers and xterm make every reflow cover
+               the whole #messages box; content-visibility: auto lets the
+               browser skip layout/paint for messages outside the viewport.
+               `auto` remembers each message's last rendered height, so the
+               scrollbar and TOC scrollIntoView jumps stay stable; the 120px
+               fallback approximates a typical text bubble before first paint. */
+            content-visibility: auto;
+            contain-intrinsic-size: auto 120px;
         }
         .user {
             background: var(--user-bg);
@@ -969,6 +978,11 @@
             overflow: hidden;
             font-size: 0.9em;
             flex-shrink: 0;
+            /* Off-screen tool cards (often holding Monaco/xterm output) are the
+               most expensive to reflow; skip them until near the viewport.
+               Taller than a plain message, so a larger fallback. */
+            content-visibility: auto;
+            contain-intrinsic-size: auto 200px;
         }
         .tool-call-header {
             display: flex;
@@ -1997,6 +2011,9 @@
             align-self: flex-start;
             color: var(--fg-muted);
             box-sizing: border-box;
+            /* Off-screen thinking blocks: skip layout/paint until in view. */
+            content-visibility: auto;
+            contain-intrinsic-size: auto 100px;
         }
         .btn-link {
             margin: 4px 12px 8px;
