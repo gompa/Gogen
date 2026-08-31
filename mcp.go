@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 	"time"
 
 	"gogen/internal/agent"
@@ -11,11 +12,24 @@ import (
 	"gogen/internal/mcp"
 )
 
-// mcpHandle owns the asynchronous MCP manager initialization. mgr is written
-// by the init goroutine and must not be read until done is closed; closeMCP
-// enforces that (bounded by a 3s timeout), preserving the original main.go
-// shutdown handshake. Manager Close is bounded by a 2s timeout.
+// Bounded waits for the MCP shutdown handshake. Package-level vars so tests
+// can shrink them; production values preserve the original main.go behavior.
+var (
+	mcpInitWait  = 3 * time.Second
+	mcpCloseWait = 2 * time.Second
+)
+
+// newMCPManager is the manager constructor used by startMCP (test hook).
+var newMCPManager = mcp.NewManager
+
+// mcpHandle owns the asynchronous MCP manager initialization. mgr is guarded
+// by mu: the init goroutine may still be writing it when closeMCP gives up
+// waiting (init can legitimately outlive the bounded wait, since per-server
+// init timeouts in internal/mcp exceed it), so every read and write of mgr
+// goes through the lock. The timeout does NOT establish happens-before; the
+// mutex does. Manager Close is bounded by mcpCloseWait.
 type mcpHandle struct {
+	mu   sync.Mutex // guards mgr
 	mgr  *mcp.Manager
 	done chan struct{}
 }
@@ -41,11 +55,15 @@ func startMCP(a *agent.Agent, cfg *config.Config) *mcpHandle {
 			}
 			return
 		}
-		var mcpErr error
-		h.mgr, mcpErr = mcp.NewManager(servers)
+		m, mcpErr := newMCPManager(servers)
 		if mcpErr != nil {
 			fmt.Fprintf(os.Stderr, "MCP init error: %v\n", mcpErr)
-		} else if reg := h.mgr.Registry(); reg != nil {
+			return
+		}
+		h.mu.Lock()
+		h.mgr = m
+		h.mu.Unlock()
+		if reg := m.Registry(); reg != nil {
 			a.SetMCPRegistry(reg)
 			fmt.Fprintf(os.Stderr, "MCP tools: %d\n", len(reg.ToolNames()))
 		}
@@ -58,20 +76,23 @@ func startMCP(a *agent.Agent, cfg *config.Config) *mcpHandle {
 func closeMCP(h *mcpHandle) {
 	select {
 	case <-h.done:
-	case <-time.After(3 * time.Second):
+	case <-time.After(mcpInitWait):
 		log.Printf("mcp shutdown: timed out waiting for init")
 	}
-	if h.mgr == nil {
+	h.mu.Lock()
+	mgr := h.mgr
+	h.mu.Unlock()
+	if mgr == nil {
 		return
 	}
 	done := make(chan struct{})
 	go func() {
-		_ = h.mgr.Close()
+		_ = mgr.Close()
 		close(done)
 	}()
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(mcpCloseWait):
 		log.Printf("mcp shutdown: timed out closing manager")
 	}
 }

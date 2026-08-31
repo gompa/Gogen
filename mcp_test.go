@@ -1,0 +1,69 @@
+package main
+
+import (
+	"testing"
+	"time"
+
+	"gogen/internal/config"
+	"gogen/internal/mcp"
+)
+
+// mcpTestConfig returns a config that enables MCP with one valid server
+// entry (the command is never executed: tests inject the constructor).
+func mcpTestConfig(t *testing.T) *config.Config {
+	t.Helper()
+	return &config.Config{
+		MCP:        "on",
+		MCPServers: []config.MCPServerConfig{{Name: "slow", Command: "true"}},
+	}
+}
+
+// TestCloseMCPWhileInitStillRunning reproduces the race window from the
+// MCP shutdown ticket: init outlives the bounded wait in closeMCP, so
+// closeMCP times out and reads h.mgr while the init goroutine is still
+// running; the goroutine then writes h.mgr afterwards. The write is not
+// ordered with closeMCP's read (no synchronization edge between them),
+// which -race flagged before h.mgr was guarded by the handle mutex.
+func TestCloseMCPWhileInitStillRunning(t *testing.T) {
+	// Constructor sleeps past the shrunken init wait, so its h.mgr
+	// write lands after closeMCP has already read the field and
+	// returned.
+	origNew := newMCPManager
+	t.Cleanup(func() { newMCPManager = origNew })
+	newMCPManager = func(servers []config.MCPServerConfig) (*mcp.Manager, error) {
+		time.Sleep(30 * time.Millisecond)
+		return &mcp.Manager{}, nil
+	}
+
+	origWait := mcpInitWait
+	t.Cleanup(func() { mcpInitWait = origWait })
+	mcpInitWait = 10 * time.Millisecond
+
+	// a is nil: the injected manager's registry is nil, so
+	// SetMCPRegistry is never reached.
+	h := startMCP(nil, mcpTestConfig(t))
+
+	// closeMCP times out at 10ms and reads mgr (nil) while the
+	// constructor is still sleeping; it must return cleanly even
+	// though init never completed.
+	closeMCP(h)
+
+	// The constructor's write happens at ~30ms; wait for init to
+	// finish so the goroutine cannot outlive the test.
+	<-h.done
+}
+
+// TestCloseMCPAfterInitCompletes covers the fast path: init finished
+// before closeMCP is called, so the wait is skipped and the manager
+// is closed.
+func TestCloseMCPAfterInitCompletes(t *testing.T) {
+	origNew := newMCPManager
+	t.Cleanup(func() { newMCPManager = origNew })
+	newMCPManager = func(servers []config.MCPServerConfig) (*mcp.Manager, error) {
+		return &mcp.Manager{}, nil
+	}
+
+	h := startMCP(nil, mcpTestConfig(t))
+	<-h.done
+	closeMCP(h) // must not block or panic
+}
