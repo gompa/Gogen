@@ -3,33 +3,17 @@ package server
 import (
 	"fmt"
 	"strings"
-	"time"
 
-	"gogen/internal/agent"
 	"gogen/internal/config"
 	"gogen/internal/llm"
-	"gogen/internal/treesitter"
 )
 
 // runtimeConfigFields are the config option names the runtime-config branch
 // accepts (client→server "config" with ConfigFields). A name in the list
 // means the corresponding WSMessage value is applied — including explicit
-// empty/zero values.
-var runtimeConfigFields = map[string]bool{
-	"commandSafety": true, "commandAllowlist": true, "deleteApproval": true,
-	"commandSandbox": true, "commandIdleTimeoutSecs": true,
-	"contextLimit": true, "compactThreshold": true, "compactKeepRecentMessages": true,
-	"maxToolResultBytes": true, "compactReserveTokens": true, "compactLastResort": true,
-	"webFetch": true, "webSearch": true, "webSearchBackend": true, "webSearchApiKey": true,
-	"webAllowedDomains": true, "webFetchMode": true,
-	"treesitter": true, "treesitterLangs": true, "preserveReasoning": true,
-	"sessionMaxCount": true, "sessionMaxAgeDays": true, "webApprovalHoldSecs": true,
-	"webBind": true, "webAllowedOrigins": true, "webAuthToken": true,
-	"webTLSCertFile": true, "webTLSKeyFile": true, "webMaxActiveSessions": true,
-	"mcp":           true,
-	"subagentModel": true, "subagentThinkingLevel": true,
-	"boardStartPrompt": true, "systemPrompt": true, "subagentPrompt": true,
-}
+// empty/zero values. Derived from the field registry (configFields): do not
+// maintain a separate literal list.
+var runtimeConfigFields = clientSettableFields()
 
 // maxPromptTemplateLen caps the configurable prompt templates (settings
 // modal). The RENDERED prompts can exceed this via ticket content; the cap
@@ -38,16 +22,10 @@ const maxPromptTemplateLen = 8192
 
 // restartStagedFields are the options that cannot apply to the running
 // process: they are persisted and take effect on the next start (A0b). The
-// value is the config-key name shown to the user (toast + banner).
-var restartStagedFields = map[string]string{
-	"webBind":              "web_bind",
-	"webAllowedOrigins":    "web_allowed_origins",
-	"webAuthToken":         "web_auth_token",
-	"webTLSCertFile":       "web_tls_cert_file",
-	"webTLSKeyFile":        "web_tls_key_file",
-	"webMaxActiveSessions": "web_max_active_sessions",
-	"mcp":                  "mcp",
-}
+// value is the config-key name shown to the user (toast + banner). Derived
+// from the field registry (configFields): do not maintain a separate
+// literal list.
+var restartStagedFields = stagedFields()
 
 // handleWSRuntimeConfig applies the settings-modal config options: each name
 // in msg.ConfigFields names a value to apply (explicit empty/zero values are
@@ -73,222 +51,46 @@ func (s *Server) handleWSRuntimeConfig(ws *wsConn, msg WSMessage) {
 		}
 		seen[name] = true
 	}
-	set := func(name string) bool { return seen[name] }
-
 	r := s.ws.GetRuntimeConfig()
 	var restartChanged []string
 	for name := range seen {
-		switch name {
-		case "commandSafety":
-			mode := strings.ToLower(strings.TrimSpace(msg.CommandSafetyMode))
-			if mode != "blocklist" && mode != "allowlist" && mode != "off" {
-				writeNoticeError(ws, "settings", fmt.Sprintf("Error: invalid commandSafety %q (want blocklist, allowlist, or off)", msg.CommandSafetyMode))
-				return
-			}
-			r.CommandSafetyMode = mode
-		case "commandAllowlist":
-			r.CommandAllowlist = msg.CommandAllowlist
-		case "deleteApproval":
-			mode := strings.ToLower(strings.TrimSpace(msg.DeleteApproval))
-			if mode != "required" && mode != "off" {
-				writeNoticeError(ws, "settings", fmt.Sprintf("Error: invalid deleteApproval %q (want required or off)", msg.DeleteApproval))
-				return
-			}
-			r.DeleteApproval = mode
-		case "commandSandbox":
-			mode := strings.ToLower(strings.TrimSpace(msg.CommandSandbox))
-			if mode != "off" && mode != "bwrap" {
-				writeNoticeError(ws, "settings", fmt.Sprintf("Error: invalid commandSandbox %q (want off or bwrap)", msg.CommandSandbox))
-				return
-			}
-			r.CommandSandbox = mode
-		case "commandIdleTimeoutSecs":
-			if msg.CommandIdleTimeoutSecs < 0 {
-				writeNoticeError(ws, "settings", "Error: commandIdleTimeoutSecs must be >= 0")
-				return
-			}
-			r.CommandIdleTimeoutSecs = msg.CommandIdleTimeoutSecs
-		case "contextLimit":
-			if msg.ContextLimitConfig < 0 {
-				writeNoticeError(ws, "settings", "Error: contextLimit must be >= 0")
-				return
-			}
-			r.ContextLimit = msg.ContextLimitConfig
-		case "compactThreshold":
-			if msg.CompactThreshold < 0 || msg.CompactThreshold > 1 {
-				writeNoticeError(ws, "settings", "Error: compactThreshold must be between 0 and 1")
-				return
-			}
-			r.CompactThreshold = msg.CompactThreshold
-		case "compactLastResort":
-			// The last-resort condensation mode (Phase 0e): condense
-			// (default) or error (diagnostic instead of condensing).
-			v := strings.ToLower(strings.TrimSpace(msg.CompactLastResort))
-			if v != "condense" && v != "error" {
-				writeNoticeError(ws, "settings", fmt.Sprintf("Error: invalid compactLastResort %q (want condense or error)", msg.CompactLastResort))
-				return
-			}
-			r.CompactLastResort = v
-		case "sessionMaxAgeDays":
-			// -1 = "keep sessions forever" (the store's retention sentinel);
-			// the merge path preserves it so it survives a restart.
-			v := configValueFor(name, msg)
-			if v < -1 {
-				writeNoticeError(ws, "settings", "Error: sessionMaxAgeDays must be >= -1 (-1 = keep sessions forever)")
-				return
-			}
-			applyConfigInt(&r, name, v)
-		case "compactKeepRecentMessages", "maxToolResultBytes", "compactReserveTokens", "sessionMaxCount", "webApprovalHoldSecs", "webMaxActiveSessions":
-			v := configValueFor(name, msg)
-			if v < 0 {
-				writeNoticeError(ws, "settings", fmt.Sprintf("Error: %s must be >= 0", name))
-				return
-			}
-			applyConfigInt(&r, name, v)
-		case "webFetch":
-			if err := applyOnOff(&r.WebFetch, "webFetch", msg.WebFetch, ws); err != nil {
-				return
-			}
-		case "webSearch":
-			if err := applyOnOff(&r.WebSearch, "webSearch", msg.WebSearch, ws); err != nil {
-				return
-			}
-		case "treesitter":
-			if err := applyOnOff(&r.TreeSitter, "treesitter", msg.TreeSitter, ws); err != nil {
-				return
-			}
-		case "webSearchBackend":
-			v := strings.ToLower(strings.TrimSpace(msg.WebSearchBackend))
-			if v != "" && v != "brave" {
-				writeNoticeError(ws, "settings", fmt.Sprintf("Error: invalid webSearchBackend %q (want brave or empty)", msg.WebSearchBackend))
-				return
-			}
-			r.WebSearchBackend = v
-		case "webSearchApiKey":
-			r.WebSearchAPIKey = msg.WebSearchAPIKey
-		case "webAllowedDomains", "webFetchMode", "treesitterLangs", "preserveReasoning", "webBind", "webAllowedOrigins", "webAuthToken", "webTLSCertFile", "webTLSKeyFile":
-			applyConfigString(&r, name, stringValueFor(name, msg))
-		case "subagentModel":
-			// The default model for spawned subagents; empty clears back to
-			// "inherit the parent's model". Any model id string is accepted —
-			// catalog validation is fail-open at spawn time (the spawner
-			// falls back to the workspace default when unselectable).
-			raw := ""
-			if msg.SubagentModel != nil {
-				raw = *msg.SubagentModel
-			}
-			v := strings.TrimSpace(raw)
-			if raw != "" && v == "" {
-				writeNoticeError(ws, "settings", "Error: subagentModel must be a model id or empty (inherit)")
-				return
-			}
-			r.SubagentModel = v
-		case "subagentThinkingLevel":
-			// The reasoning-effort level for spawned subagents; empty
-			// clears back to "inherit the parent's level". Normalized to a
-			// literal reasoning_effort value; validity against the
-			// subagent's final model is fail-open at spawn time (a value
-			// the model does not accept is omitted — the tool's model
-			// argument can override the configured model, so the server
-			// cannot validate it here).
-			raw := ""
-			if msg.SubagentThinkingLevel != nil {
-				raw = *msg.SubagentThinkingLevel
-			}
-			v := string(agent.NormalizeThinkingLevel(raw))
-			if raw != "" && v == "" {
-				writeNoticeError(ws, "settings", "Error: subagentThinkingLevel must be a reasoning-effort value or empty (inherit)")
-				return
-			}
-			r.SubagentThinkingLevel = v
-		case "mcp":
-			v := strings.ToLower(strings.TrimSpace(msg.MCP))
-			if _, ok := parseOnOff(v); !ok {
-				writeNoticeError(ws, "settings", fmt.Sprintf("Error: invalid mcp %q (want on or off)", msg.MCP))
-				return
-			}
-			r.MCP = v
-		case "boardStartPrompt", "systemPrompt", "subagentPrompt":
-			raw := stringValueFor(name, msg)
-			v := strings.TrimSpace(raw)
-			if len(v) > maxPromptTemplateLen {
-				writeNoticeError(ws, "settings", fmt.Sprintf("Error: %s exceeds %d characters", name, maxPromptTemplateLen))
-				return
-			}
-			// Saving the default text verbatim stores nothing (no bake-in):
-			// resolution applies the same rule to hand-edited files/env.
-			switch name {
-			case "boardStartPrompt":
-				r.BoardStartPrompt = agent.NormalizePromptTemplate(v, agent.DefaultBoardStartPrompt)
-			case "systemPrompt":
-				r.SystemPrompt = agent.NormalizePromptTemplate(v, agent.DefaultSystemPromptTemplate())
-			case "subagentPrompt":
-				r.SubagentPrompt = agent.NormalizePromptTemplate(v, agent.DefaultSubagentPrompt)
-			}
+		f := configFields[name]
+		raw := f.fromMsg(&msg)
+		var err string
+		if f.normalize != nil {
+			raw, err = f.normalize(raw)
 		}
-		if display, ok := restartStagedFields[name]; ok {
-			restartChanged = append(restartChanged, display)
+		if err != "" {
+			writeNoticeError(ws, "settings", err)
+			return
+		}
+		f.set(&r, raw)
+		if f.restartDisplay != "" {
+			restartChanged = append(restartChanged, f.restartDisplay)
 		}
 	}
 	s.ws.SetRuntimeConfig(r)
 
-	// Apply to the runtime targets (live tier only).
-	if set("commandSafety") || set("commandAllowlist") {
-		s.ws.Exec.SetCommandGuard(r.CommandSafetyMode, agent.ParseAllowlist(r.CommandAllowlist))
-	}
-	if set("deleteApproval") {
-		s.ws.Exec.SetDeleteApproval(!strings.EqualFold(r.DeleteApproval, "off"))
-	}
-	if set("commandSandbox") {
-		s.ws.Exec.SetSandbox(r.CommandSandbox)
-	}
-	if set("commandIdleTimeoutSecs") {
-		s.ws.Exec.SetIdleTimeout(time.Duration(r.CommandIdleTimeoutSecs) * time.Second)
-	}
-	if set("webFetch") || set("webFetchMode") || set("webAllowedDomains") {
-		agent.ConfigureWebFetch(parseOnOffValue(r.WebFetch), r.WebFetchMode, r.WebAllowedDomains)
-	}
-	if set("webSearch") {
-		agent.ConfigureWebSearchEnabled(parseOnOffValue(r.WebSearch))
-	}
-	if set("webSearchBackend") || set("webSearchApiKey") {
-		agent.ConfigureWebSearch(r.WebSearchBackend, r.WebSearchAPIKey)
-	}
-	if set("treesitter") || set("treesitterLangs") {
-		treesitter.Configure(parseOnOffValue(r.TreeSitter), r.TreeSitterLangs)
-	}
-	if set("preserveReasoning") {
-		s.applyPreserveReasoningToAll(r.PreserveReasoning)
-	}
-	if set("contextLimit") || set("compactThreshold") || set("compactKeepRecentMessages") || set("maxToolResultBytes") || set("compactReserveTokens") || set("compactLastResort") {
-		s.applyContextSettingsToAll(r, set)
-	}
-	if set("maxToolResultBytes") {
-		// The executor bounds in-memory command output at the same cap the
-		// context managers apply to tool results (0 = no cap, pass-through).
-		s.ws.Exec.SetMaxToolOutputBytes(r.MaxToolResultBytes)
-	}
-	if set("sessionMaxCount") || set("sessionMaxAgeDays") {
-		if s.ws.Store != nil {
-			s.ws.Store.SetRetention(r.SessionMaxCount, r.SessionMaxAgeDays)
-			s.pruneSessions()
+	// Apply to the runtime targets (live tier only). Each field's applyLive
+	// closure names its target (executor, process globals, per-session
+	// context managers, session store); the per-field context merge only
+	// takes the fields this request named.
+	for name := range seen {
+		if f := configFields[name]; f.applyLive != nil {
+			f.applyLive(s, &r)
 		}
-	}
-	if set("systemPrompt") {
-		// Live for every agent (subagents included): the next turn's system
-		// message resolves the configured template.
-		agent.ConfigureSystemPrompt(r.SystemPrompt)
-	}
-	if set("subagentPrompt") {
-		// Live for every spawner (web + TUI): jobs are wrapped at spawn time.
-		agent.ConfigureSubagentPrompt(r.SubagentPrompt)
 	}
 
 	// Persist + broadcast off the read loop (file write + fan-out). A staged
 	// web_auth_token is user-entered in the UI, so the write forces secrets
 	// (0600) like provider saves — the token must survive the restart it is
 	// staged for. Restart-staged changes get a success notice listing them.
-	forceSecrets := set("webAuthToken")
+	forceSecrets := false
+	for name := range seen {
+		if configFields[name].forceSecrets {
+			forceSecrets = true
+		}
+	}
 	go func() {
 		if s.config != nil {
 			if forceSecrets {
@@ -302,142 +104,6 @@ func (s *Server) handleWSRuntimeConfig(ws *wsConn, msg WSMessage) {
 	if len(restartChanged) > 0 {
 		writeNotice(ws, "settings", true, "Saved — restart gogen for these to take effect: "+strings.Join(restartChanged, ", "))
 	}
-}
-
-// applyOnOff validates an on/off value and stores it; it writes the error
-// notice and returns non-nil on invalid input.
-func applyOnOff(dst *string, name, v string, ws *wsConn) error {
-	on, ok := parseOnOff(v)
-	if !ok {
-		writeNoticeError(ws, "settings", fmt.Sprintf("Error: invalid %s %q (want on or off)", name, v))
-		return fmt.Errorf("invalid %s", name)
-	}
-	*dst = onOff(on)
-	return nil
-}
-
-// applyConfigString writes a string runtime-config field by name.
-func applyConfigString(r *config.Config, name, v string) {
-	switch name {
-	case "commandAllowlist":
-		r.CommandAllowlist = v
-	case "webAllowedDomains":
-		r.WebAllowedDomains = v
-	case "webFetchMode":
-		r.WebFetchMode = v
-	case "treesitterLangs":
-		r.TreeSitterLangs = v
-	case "preserveReasoning":
-		r.PreserveReasoning = v
-	case "webBind":
-		r.WebBind = v
-	case "webAllowedOrigins":
-		r.WebAllowedOrigins = v
-	case "webAuthToken":
-		r.WebAuthToken = v
-	case "webTLSCertFile":
-		r.WebTLSCertFile = v
-	case "webTLSKeyFile":
-		r.WebTLSKeyFile = v
-	}
-}
-
-// applyConfigInt writes an int runtime-config field by name.
-func applyConfigInt(r *config.Config, name string, v int) {
-	switch name {
-	case "compactKeepRecentMessages":
-		r.CompactKeepRecentMessages = v
-	case "maxToolResultBytes":
-		r.MaxToolResultBytes = v
-	case "compactReserveTokens":
-		r.CompactReserveTokens = v
-	case "sessionMaxCount":
-		r.SessionMaxCount = v
-	case "sessionMaxAgeDays":
-		r.SessionMaxAgeDays = v
-	case "webApprovalHoldSecs":
-		r.WebApprovalHoldSecs = v
-	case "webMaxActiveSessions":
-		r.WebMaxActiveSessions = v
-	}
-}
-
-// configValueFor returns the int runtime-config value for a validated name.
-func configValueFor(name string, msg WSMessage) int {
-	switch name {
-	case "compactKeepRecentMessages":
-		return msg.CompactKeepRecentMessages
-	case "maxToolResultBytes":
-		return msg.MaxToolResultBytes
-	case "compactReserveTokens":
-		return msg.CompactReserveTokens
-	case "sessionMaxCount":
-		return msg.SessionMaxCount
-	case "sessionMaxAgeDays":
-		return msg.SessionMaxAgeDays
-	case "webApprovalHoldSecs":
-		return msg.WebApprovalHoldSecs
-	case "webMaxActiveSessions":
-		return msg.WebMaxActiveSessions
-	}
-	return 0
-}
-
-// stringValueFor returns the string runtime-config value for a validated
-// name.
-func stringValueFor(name string, msg WSMessage) string {
-	switch name {
-	case "commandSafety":
-		return msg.CommandSafetyMode
-	case "commandAllowlist":
-		return msg.CommandAllowlist
-	case "deleteApproval":
-		return msg.DeleteApproval
-	case "commandSandbox":
-		return msg.CommandSandbox
-	case "webFetch":
-		return msg.WebFetch
-	case "webSearch":
-		return msg.WebSearch
-	case "webSearchBackend":
-		return msg.WebSearchBackend
-	case "webSearchApiKey":
-		return msg.WebSearchAPIKey
-	case "webAllowedDomains":
-		return msg.WebAllowedDomains
-	case "webFetchMode":
-		return msg.WebFetchMode
-	case "treesitter":
-		return msg.TreeSitter
-	case "treesitterLangs":
-		return msg.TreeSitterLangs
-	case "preserveReasoning":
-		return msg.PreserveReasoning
-	case "webBind":
-		return msg.WebBind
-	case "webAllowedOrigins":
-		return msg.WebAllowedOrigins
-	case "webAuthToken":
-		return msg.WebAuthToken
-	case "webTLSCertFile":
-		return msg.WebTLSCertFile
-	case "webTLSKeyFile":
-		return msg.WebTLSKeyFile
-	case "boardStartPrompt":
-		return msg.BoardStartPrompt
-	case "systemPrompt":
-		return msg.SystemPrompt
-	case "subagentPrompt":
-		return msg.SubagentPrompt
-	}
-	return ""
-}
-
-// parseOnOffValue renders an on/off string as a boolean (parseOnOff with a
-// validated input never fails).
-func parseOnOffValue(v string) bool {
-	on, _ := parseOnOff(v)
-	return on
 }
 
 // applyContextSettingsToAll pushes the live context settings to every live
