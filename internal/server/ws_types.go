@@ -7,6 +7,7 @@ import (
 
 	"gogen/internal/agent"
 	"gogen/internal/llm"
+	"gogen/internal/streambuf"
 )
 
 type ModelEntry struct {
@@ -195,6 +196,10 @@ type WSMessage struct {
 	ResultTruncated bool           `json:"resultTruncated,omitempty"`
 	WorkingDir      string         `json:"workingDir,omitempty"`
 	Model           string         `json:"model,omitempty"`
+	// TokensPerSec is the shared streamutil.SpeedMeter's smoothed token
+	// rate on stream_stats frames (content, thinking, and tool-args
+	// deltas alike).
+	TokensPerSec float64 `json:"tokensPerSec,omitempty"`
 	// Pricing for the current model (USD per 1M tokens), populated from models.dev cache.
 	InputPricePer1M  float64 `json:"inputPricePer1M,omitempty"`
 	OutputPricePer1M float64 `json:"outputPricePer1M,omitempty"`
@@ -409,7 +414,10 @@ type WSMessage struct {
 	HistoryEpoch uint64 `json:"historyEpoch,omitempty"`
 	// Rewind carries the in-flight turn's partial output on a mid-turn
 	// attach/resume history payload (nil when nothing has streamed yet).
-	Rewind *liveRewindState `json:"rewind,omitempty"`
+	// It is the shared streambuf.Snapshot — the same struct the TUI renders
+	// on a mid-turn join — so the wire shape and the join render cannot
+	// drift (the JSON tags are pinned by rewind_wire_test.go).
+	Rewind *streambuf.Snapshot `json:"rewind,omitempty"`
 	// Filesystem / git editor APIs
 	Path       string           `json:"path,omitempty"`
 	Pattern    string           `json:"pattern,omitempty"`
