@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"gogen/internal/config"
+	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
 )
 
@@ -19,13 +20,6 @@ var runtimeConfigFields = clientSettableFields()
 // modal). The RENDERED prompts can exceed this via ticket content; the cap
 // bounds the templates themselves.
 const maxPromptTemplateLen = 8192
-
-// restartStagedFields are the options that cannot apply to the running
-// process: they are persisted and take effect on the next start (A0b). The
-// value is the config-key name shown to the user (toast + banner). Derived
-// from the field registry (configFields): do not maintain a separate
-// literal list.
-var restartStagedFields = stagedFields()
 
 // handleWSRuntimeConfig applies the settings-modal config options: each name
 // in msg.ConfigFields names a value to apply (explicit empty/zero values are
@@ -106,16 +100,20 @@ func (s *Server) handleWSRuntimeConfig(ws *wsConn, msg WSMessage) {
 	}
 }
 
-// applyContextSettingsToAll pushes the live context settings to every live
-// session's context manager, merging per field: only the options named by
-// apply are taken from r, everything else keeps the session's CURRENT
-// values (each manager's SettingsSnapshot). A wholesale replace would
-// clobber per-session state — most notably a restored session's resolved
-// ContextLimit (set via SetContextLimit on restore, which is not a manual
-// limit): changing only compact_threshold must not reset a restored
+// applyContextField pushes ONE live context setting (the copy closure from
+// the field registry) to every live session's context manager, merging:
+// only the field copy takes from r, everything else keeps the session's
+// CURRENT values (each manager's SettingsSnapshot). A wholesale replace
+// would clobber per-session state — most notably a restored session's
+// resolved ContextLimit (set via SetContextLimit on restore, which is not a
+// manual limit): changing only compact_threshold must not reset a restored
 // session's limit back to provider resolution. All Manager methods are
 // internally synchronized, so no turn locks are needed.
-func (s *Server) applyContextSettingsToAll(r config.Config, apply func(name string) bool) {
+//
+// The copy closure is passed in rather than looked up in configFields: a
+// reference from the registry builder to a function that ranges over
+// configFields would be a package-initialization cycle.
+func (s *Server) applyContextField(r *config.Config, copy func(next *contextmgr.Settings, r *config.Config)) {
 	for _, id := range s.registry.activeIDs() {
 		rt, ok := s.registry.get(id)
 		if !ok {
@@ -125,24 +123,7 @@ func (s *Server) applyContextSettingsToAll(r config.Config, apply func(name stri
 			continue
 		}
 		next := rt.agent.Context.SettingsSnapshot()
-		if apply("contextLimit") {
-			next.ContextLimit = r.ContextLimit
-		}
-		if apply("compactThreshold") {
-			next.CompactThreshold = r.CompactThreshold
-		}
-		if apply("compactKeepRecentMessages") {
-			next.CompactKeepRecentMessages = r.CompactKeepRecentMessages
-		}
-		if apply("maxToolResultBytes") {
-			next.MaxToolResultBytes = r.MaxToolResultBytes
-		}
-		if apply("compactReserveTokens") {
-			next.CompactReserveTokens = r.CompactReserveTokens
-		}
-		if apply("compactLastResort") {
-			next.CompactLastResort = r.CompactLastResort
-		}
+		copy(&next, r)
 		rt.agent.Context.UpdateSettings(next)
 	}
 }

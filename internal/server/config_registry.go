@@ -121,21 +121,21 @@ func promptNormalize(name string, def func() string) func(any) (any, string) {
 	}
 }
 
-// contextApply returns the applyLive closure for a context-manager field:
-// it sweeps every live session's context manager, merging ONLY this field
-// (a wholesale replace would clobber per-session state — most notably a
-// restored session's resolved ContextLimit).
-func contextApply(name string) func(s *Server, r *config.Config) {
+// contextApplyLive returns the applyLive closure for a context-manager
+// field: it sweeps every live session's context manager, merging ONLY this
+// field (see applyContextField for why the copy closure is passed in
+// instead of looked up in the registry).
+func contextApplyLive(copy func(next *contextmgr.Settings, r *config.Config)) func(s *Server, r *config.Config) {
 	return func(s *Server, r *config.Config) {
-		s.applyContextSettingsToAll(*r, func(n string) bool { return n == name })
+		s.applyContextField(r, copy)
 	}
 }
 
 // configFields is the runtime-config field registry: every option the
 // settings modal can set (client-settable: fromMsg non-nil) plus
 // the overlay-only provider-profile fields the persistence projection must
-// carry. The allowlist (runtimeConfigFields) and the restart-staged map
-// (restartStagedFields) derive from it — do not maintain them separately.
+// carry. The settings-modal allowlist (runtimeConfigFields) derives from
+// it — do not maintain a separate literal list.
 var configFields = buildConfigFields()
 
 func buildConfigFields() map[string]fieldSpec {
@@ -228,8 +228,8 @@ func buildConfigFields() map[string]fieldSpec {
 		func(m *WSMessage) int { return m.ContextLimitConfig },
 		func(m *WSMessage, v int) { m.ContextLimitConfig = v })
 	f.normalize = nonNegInt("contextLimit")
-	f.applyLive = contextApply("contextLimit")
 	f.setContext = func(next *contextmgr.Settings, r *config.Config) { next.ContextLimit = r.ContextLimit }
+	f.applyLive = contextApplyLive(f.setContext)
 	f.sample = 20000
 	add(f)
 
@@ -247,10 +247,10 @@ func buildConfigFields() map[string]fieldSpec {
 			}
 			return x, ""
 		},
-		applyLive:  contextApply("compactThreshold"),
 		setContext: func(next *contextmgr.Settings, r *config.Config) { next.CompactThreshold = r.CompactThreshold },
 		sample:     0.5,
 	}
+	f.applyLive = contextApplyLive(f.setContext)
 	add(f)
 
 	f = intSpec("compactKeepRecentMessages",
@@ -259,8 +259,10 @@ func buildConfigFields() map[string]fieldSpec {
 		func(m *WSMessage) int { return m.CompactKeepRecentMessages },
 		func(m *WSMessage, v int) { m.CompactKeepRecentMessages = v })
 	f.normalize = nonNegInt("compactKeepRecentMessages")
-	f.applyLive = contextApply("compactKeepRecentMessages")
-	f.setContext = func(next *contextmgr.Settings, r *config.Config) { next.CompactKeepRecentMessages = r.CompactKeepRecentMessages }
+	f.setContext = func(next *contextmgr.Settings, r *config.Config) {
+		next.CompactKeepRecentMessages = r.CompactKeepRecentMessages
+	}
+	f.applyLive = contextApplyLive(f.setContext)
 	f.sample = 3
 	add(f)
 
@@ -270,13 +272,14 @@ func buildConfigFields() map[string]fieldSpec {
 		func(m *WSMessage) int { return m.MaxToolResultBytes },
 		func(m *WSMessage, v int) { m.MaxToolResultBytes = v })
 	f.normalize = nonNegInt("maxToolResultBytes")
+	f.setContext = func(next *contextmgr.Settings, r *config.Config) { next.MaxToolResultBytes = r.MaxToolResultBytes }
+	copyContext := f.setContext // capture the value: f is reused for later fields
 	f.applyLive = func(s *Server, r *config.Config) {
-		s.applyContextSettingsToAll(*r, func(n string) bool { return n == "maxToolResultBytes" })
+		s.applyContextField(r, copyContext)
 		// The executor bounds in-memory command output at the same cap the
 		// context managers apply to tool results (0 = no cap, pass-through).
 		s.ws.Exec.SetMaxToolOutputBytes(r.MaxToolResultBytes)
 	}
-	f.setContext = func(next *contextmgr.Settings, r *config.Config) { next.MaxToolResultBytes = r.MaxToolResultBytes }
 	f.sample = 65536
 	add(f)
 
@@ -286,8 +289,8 @@ func buildConfigFields() map[string]fieldSpec {
 		func(m *WSMessage) int { return m.CompactReserveTokens },
 		func(m *WSMessage, v int) { m.CompactReserveTokens = v })
 	f.normalize = nonNegInt("compactReserveTokens")
-	f.applyLive = contextApply("compactReserveTokens")
 	f.setContext = func(next *contextmgr.Settings, r *config.Config) { next.CompactReserveTokens = r.CompactReserveTokens }
+	f.applyLive = contextApplyLive(f.setContext)
 	f.sample = 1000
 	add(f)
 
@@ -304,8 +307,8 @@ func buildConfigFields() map[string]fieldSpec {
 		}
 		return mode, ""
 	}
-	f.applyLive = contextApply("compactLastResort")
 	f.setContext = func(next *contextmgr.Settings, r *config.Config) { next.CompactLastResort = r.CompactLastResort }
+	f.applyLive = contextApplyLive(f.setContext)
 	f.sample = "error"
 	add(f)
 
@@ -702,20 +705,6 @@ func clientSettableFields() map[string]bool {
 	for name, f := range configFields {
 		if f.fromMsg != nil {
 			m[name] = true
-		}
-	}
-	return m
-}
-
-// stagedFields returns the options that cannot apply to the running process:
-// they are persisted and take effect on the next start, keyed by the
-// config-key name shown to the user (toast + banner). Derived from the
-// registry.
-func stagedFields() map[string]string {
-	m := make(map[string]string)
-	for name, f := range configFields {
-		if f.restartDisplay != "" {
-			m[name] = f.restartDisplay
 		}
 	}
 	return m

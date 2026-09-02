@@ -2,10 +2,59 @@ package server
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
+
+// TestConfigFieldProjections is the permanent drift guard between the
+// runtime overlay and the two projections: every registry field must
+// reflect the overlay in the persistence snapshot (effectiveConfig) and,
+// for client-settable fields, the decorated push must be sensitive to the
+// overlay value (a field dropped from decorateConfig would stop changing
+// when the overlay changes).
+func TestConfigFieldProjections(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, _, _ := newContinuationServer(t, stub, dir)
+
+	for name, f := range configFields {
+		t.Run(name, func(t *testing.T) {
+			// Set a sample value on the overlay.
+			r := s.ws.GetRuntimeConfig()
+			f.set(&r, f.sample)
+			s.ws.SetRuntimeConfig(r)
+
+			// Persistence projection: effectiveConfig must reflect it.
+			eff := s.effectiveConfig()
+			if eff == nil {
+				t.Fatal("effectiveConfig nil with a startup config")
+			}
+			if got, want := f.get(eff), f.sample; !reflect.DeepEqual(got, want) {
+				t.Fatalf("effectiveConfig = %v, want %v", got, want)
+			}
+
+			if f.fromMsg == nil {
+				return // overlay-only field: no client push projection
+			}
+
+			// Client push projection: the decorated msg must differ
+			// between the sample and the zero overlay value.
+			var setMsg WSMessage
+			s.decorateConfig(&setMsg)
+			zeroVal := reflect.Zero(reflect.TypeOf(f.sample)).Interface()
+			r0 := s.ws.GetRuntimeConfig()
+			f.set(&r0, zeroVal)
+			s.ws.SetRuntimeConfig(r0)
+			var zeroMsg WSMessage
+			s.decorateConfig(&zeroMsg)
+			if reflect.DeepEqual(f.msgGet(&setMsg), f.msgGet(&zeroMsg)) {
+				t.Fatalf("push projection insensitive to overlay value (msgGet = %v)", f.msgGet(&setMsg))
+			}
+		})
+	}
+}
 
 // TestRuntimeConfigFieldErrors pins the EXACT validation error string for
 // every client-settable runtime-config option (the settings modal displays
