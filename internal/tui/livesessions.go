@@ -1,13 +1,12 @@
 package tui
 
 import (
-	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +15,7 @@ import (
 	"charm.land/bubbletea/v2"
 
 	"gogen/internal/agent"
+	"gogen/internal/streambuf"
 )
 
 // maxPendingStreamEvents bounds one background session's replay buffer
@@ -103,6 +103,12 @@ type liveSession struct {
 	progressPhase progressPhase
 	progressLabel string
 	activeTool    string
+	// streamSpeedLine is this session's rendered token rate ("42 tok/s")
+	// for the progress line, updated by handleStreamStatsMsg (the shared
+	// streamutil.SpeedMeter) while the session is focused. Mirrored onto
+	// the Model like the progress fields above; joinStreamingSession
+	// restores it when focus returns mid-round.
+	streamSpeedLine string
 
 	// pending buffers rendering events emitted while this session streamed
 	// in the background. On focus the buffer is drained and DISCARDED: a
@@ -124,144 +130,31 @@ type liveSession struct {
 	// Update thread.
 	transcriptStale bool
 
-	// roundMu guards round, the current round's in-flight LLM output
-	// buffer (see roundBuffer). Leaf lock: the stream goroutine appends,
-	// the Update thread snapshots on join; never held while taking mu.
-	roundMu sync.Mutex
-	round   roundBuffer
+	// round is the current round's in-flight LLM output buffer (see
+	// streambuf.RoundBuffer): self-synchronizing leaf state — the stream
+	// goroutine appends, the Update thread snapshots on join.
+	round streambuf.RoundBuffer
 }
 
-// roundBuffer accumulates the current round's in-flight LLM output so a
-// mid-turn join can render the current reply from its first character
-// (web parity: the server's liveTurnState / Rewind payload, registry.go).
-// The assistant message only reaches a.Messages when the round completes,
-// so without this buffer a join mid-round would show the committed history
+// The session's round buffer (s.round, streambuf.RoundBuffer) accumulates
+// the current round's in-flight LLM output so a mid-turn join can render
+// the current reply from its first character. The web server's attach
+// rewind is the SAME buffer's snapshot: WSMessage.Rewind is a
+// streambuf.Snapshot (registry.go), and the join here renders that same
+// struct — the payload shape cannot drift between the two hosts. The
+// assistant message only reaches a.Messages when the round completes, so
+// without this buffer a join mid-round would show the committed history
 // with the in-flight reply missing until the turn-end rebuild.
 //
-// Appended by the stream adapter from round start REGARDLESS of focus (the
+// Fed by the stream adapter from round start REGARDLESS of focus (the
 // adapter sees every event; the pending buffer only accumulates while
 // unfocused — that is the gap this closes: watch A stream, switch away,
 // come back mid-round). Cleared at turn start, round start, and round end
-// (the adapter's OnStart/OnRoundStart/OnStreamEnd): the empty state IS the
-// "between rounds" marker (the liveRewind-returns-nil rule) — completed
-// content lives in Messages already, so a join between rounds must not
-// render it a second time.
-type roundBuffer struct {
-	thinking  strings.Builder
-	content   strings.Builder
-	toolNames map[int]string
-	toolIDs   map[int]string
-	toolArgs  map[int]*strings.Builder
-}
-
-// roundToolCall is one in-progress tool call in a roundSnapshot.
-type roundToolCall struct {
-	Index int
-	ID    string
-	Name  string
-	Args  string // raw args accumulated so far (may be incomplete JSON)
-}
-
-// roundSnapshot is the join-time copy of a roundBuffer.
-type roundSnapshot struct {
-	Thinking  string
-	Content   string
-	ToolCalls []roundToolCall
-}
-
-// roundReset clears the buffer (turn start, round start, round end).
-func (s *liveSession) roundReset() {
-	s.roundMu.Lock()
-	s.round.thinking.Reset()
-	s.round.content.Reset()
-	s.round.toolNames = nil
-	s.round.toolIDs = nil
-	s.round.toolArgs = nil
-	s.roundMu.Unlock()
-}
-
-// roundAppendContent records a streamed content token (OnToken).
-func (s *liveSession) roundAppendContent(text string) {
-	if text == "" {
-		return
-	}
-	s.roundMu.Lock()
-	s.round.content.WriteString(text)
-	s.roundMu.Unlock()
-}
-
-// roundAppendThinking records a streamed thinking token (OnThinkingToken).
-func (s *liveSession) roundAppendThinking(text string) {
-	if text == "" {
-		return
-	}
-	s.roundMu.Lock()
-	s.round.thinking.WriteString(text)
-	s.roundMu.Unlock()
-}
-
-// roundToolStart records the start of a streamed tool call (OnToolCallStart).
-func (s *liveSession) roundToolStart(index int, id, name string) {
-	s.roundMu.Lock()
-	if s.round.toolNames == nil {
-		s.round.toolNames = make(map[int]string)
-		s.round.toolIDs = make(map[int]string)
-		s.round.toolArgs = make(map[int]*strings.Builder)
-	}
-	s.round.toolNames[index] = name
-	s.round.toolIDs[index] = id
-	s.round.toolArgs[index] = &strings.Builder{}
-	s.roundMu.Unlock()
-}
-
-// roundToolArgsAppend records one args delta for a streaming tool call
-// (OnToolCallArgsDelta).
-func (s *liveSession) roundToolArgsAppend(index int, delta string) {
-	if delta == "" {
-		return
-	}
-	s.roundMu.Lock()
-	if s.round.toolArgs == nil {
-		s.round.toolNames = make(map[int]string)
-		s.round.toolIDs = make(map[int]string)
-		s.round.toolArgs = make(map[int]*strings.Builder)
-	}
-	b := s.round.toolArgs[index]
-	if b == nil {
-		b = &strings.Builder{}
-		s.round.toolArgs[index] = b
-	}
-	b.WriteString(delta)
-	s.roundMu.Unlock()
-}
-
-// roundSnapshot returns the in-flight round's output, or nil when the round
-// is empty — between rounds or before the first token (completed content
-// lives in Messages; same rule as the server's liveRewind returning nil).
-func (s *liveSession) roundSnapshot() *roundSnapshot {
-	s.roundMu.Lock()
-	defer s.roundMu.Unlock()
-	if s.round.content.Len() == 0 && s.round.thinking.Len() == 0 && len(s.round.toolNames) == 0 {
-		return nil
-	}
-	rw := &roundSnapshot{
-		Thinking: s.round.thinking.String(),
-		Content:  s.round.content.String(),
-	}
-	for idx, name := range s.round.toolNames {
-		args := ""
-		if b := s.round.toolArgs[idx]; b != nil {
-			args = b.String()
-		}
-		rw.ToolCalls = append(rw.ToolCalls, roundToolCall{
-			Index: idx, ID: s.round.toolIDs[idx], Name: name, Args: args,
-		})
-	}
-	slices.SortFunc(rw.ToolCalls, func(a, b roundToolCall) int {
-		return cmp.Compare(a.Index, b.Index)
-	})
-	return rw
-}
+// via the shared streambuf.RoundSink (the adapter's OnStart/OnRoundStart/
+// OnStreamEnd — the same timing the web server's wsStreamSink calls): the
+// empty state IS the "between rounds" marker (Snapshot returns nil) —
+// completed content lives in Messages already, so a join between rounds
+// must not render it a second time.
 
 // resetProgress clears the session's wait-indicator state (turn end,
 // cancel, error).
@@ -269,6 +162,7 @@ func (s *liveSession) resetProgress() {
 	s.progressPhase = progressHidden
 	s.progressLabel = ""
 	s.activeTool = ""
+	s.streamSpeedLine = ""
 }
 
 // enqueue buffers one rendering event produced while this session streamed
@@ -400,26 +294,12 @@ func (ls *liveSessions) Switch(i int) {
 func nextLiveID(ls *liveSessions) string {
 	n := len(ls.sessions) + 1
 	for {
-		id := "s" + itoa(n)
+		id := "s" + strconv.Itoa(n)
 		if ls.ByID(id) == nil {
 			return id
 		}
 		n++
 	}
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var b [20]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(b[i:])
 }
 
 // switchToLive focuses live session i and rebinds every piece of focused
@@ -573,7 +453,7 @@ func (m *Model) joinStreamingSession(target *liveSession, pending []tea.Msg) {
 	// and the join notice marks the wait for the next round's output. The
 	// turn-end convergence rebuild replaces the whole transcript either
 	// way (notice included).
-	if rw := target.roundSnapshot(); rw != nil {
+	if rw := target.round.Snapshot(); rw != nil {
 		m.renderRoundBuffer(rw)
 	} else {
 		m.chatLines = append(m.chatLines, SystemStyle.Render("▍ joined \""+target.label+"\" mid-turn"))
@@ -584,6 +464,7 @@ func (m *Model) joinStreamingSession(target *liveSession, pending []tea.Msg) {
 	m.progressPhase = phase
 	m.progressLabel = label
 	m.activeToolName = tool
+	m.streamSpeedLine = target.streamSpeedLine
 	if phase == progressHidden {
 		// A streaming session records its phase at submit; hidden means
 		// the turn was just cancelled and its terminal has not landed yet
@@ -601,7 +482,7 @@ func (m *Model) joinStreamingSession(target *liveSession, pending []tea.Msg) {
 }
 
 // renderRoundBuffer renders the in-flight round's accumulated output
-// (roundSnapshot) below the committed history and pre-seeds the stream
+// (streambuf.Snapshot) below the committed history and pre-seeds the stream
 // state so the next live event continues the round seamlessly (web Rewind
 // parity: the client renders the rewind through the normal stream
 // machinery and continues the live stream after it).
@@ -618,7 +499,7 @@ func (m *Model) joinStreamingSession(target *liveSession, pending []tea.Msg) {
 // already program.Send-ed but not yet processed (the web's batcher lag,
 // a few tokens wide) — those briefly duplicate at the seam. The turn-end
 // convergence rebuild (transcriptStale) heals it.
-func (m *Model) renderRoundBuffer(rw *roundSnapshot) {
+func (m *Model) renderRoundBuffer(rw *streambuf.Snapshot) {
 	if rw.Thinking != "" {
 		if rw.Content == "" && len(rw.ToolCalls) == 0 {
 			// Thinking still open: seed it live. The next content token
@@ -764,6 +645,8 @@ func streamEventSid(msg tea.Msg) (string, bool) {
 		return v.sid, true
 	case streamThinkingMsg:
 		return v.sid, true
+	case streamStatsMsg:
+		return v.sid, true
 	case streamToolCallMsg:
 		return v.sid, true
 	case streamToolCallArgsMsg:
@@ -809,6 +692,8 @@ func streamEventAttribution(msg tea.Msg) (sid string, seq uint64, ok bool) {
 	case streamTokenMsg:
 		return v.sid, v.seq, true
 	case streamThinkingMsg:
+		return v.sid, v.seq, true
+	case streamStatsMsg:
 		return v.sid, v.seq, true
 	case streamToolCallMsg:
 		return v.sid, v.seq, true

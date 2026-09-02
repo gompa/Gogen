@@ -9,6 +9,7 @@ import (
 	"gogen/internal/agent"
 	"gogen/internal/debuglog"
 	"gogen/internal/llm"
+	"gogen/internal/streambuf"
 	"gogen/internal/streamutil"
 
 	tea "charm.land/bubbletea/v2"
@@ -43,6 +44,16 @@ type streamThinkingMsg struct {
 	token string
 	sid   string
 	seq   uint64
+}
+
+// streamStatsMsg carries the shared streamutil.SpeedMeter's smoothed
+// token rate (tokens/sec over content, thinking, and tool-args deltas)
+// for the progress line. It is timer-driven (at most a few per second),
+// not per-token, and always precedes the round's terminal messages.
+type streamStatsMsg struct {
+	toksPerSec float64
+	sid        string
+	seq        uint64
 }
 
 type streamToolCallMsg struct {
@@ -192,13 +203,22 @@ type StreamAdapter struct {
 	// arrives (the turn keeps running either way; completion stays
 	// attributed via sid).
 	sess *liveSession
+	// rounds feeds the owning session's round buffer from the stream
+	// callbacks (shared reset/append timing with the web server — see
+	// streambuf.RoundSink); a zero sink (adapters built without a
+	// session) is a no-op.
+	rounds streambuf.RoundSink
 }
 
 // NewStreamAdapter creates a new StreamAdapter for one live session's turn.
 // seq must be the session's turnSeq at submit time (the submit paths
 // increment it before constructing the adapter).
 func NewStreamAdapter(owner string, seq uint64, p programSender, sess *liveSession) *StreamAdapter {
-	return &StreamAdapter{program: p, owner: owner, seq: seq, sess: sess}
+	var rounds streambuf.RoundSink
+	if sess != nil {
+		rounds = streambuf.RoundSink{Buf: &sess.round}
+	}
+	return &StreamAdapter{program: p, owner: owner, seq: seq, sess: sess, rounds: rounds}
 }
 
 // send emits a rendering message, or buffers it while the session streams
@@ -212,6 +232,9 @@ func (s *StreamAdapter) send(msg tea.Msg) {
 }
 
 // Handlers returns a full set of stream handlers that emit tea.Msg values.
+// The shared streamutil.BuildStreamHandlers owns the batcher
+// flush/reset/close ordering (identical to the WebSocket frontend); the
+// StreamAdapter's Sink methods below are the transport-specific half.
 func (s *StreamAdapter) Handlers() *llm.StreamHandlers {
 	tuiSend := func(think bool, text string) {
 		if think {
@@ -231,87 +254,107 @@ func (s *StreamAdapter) Handlers() *llm.StreamHandlers {
 	argsBatch := streamutil.NewArgsBatcher(func(index int, id, _ string, delta string) {
 		s.send(streamToolCallArgsMsg{index: index, id: id, delta: delta, sid: s.owner, seq: s.seq})
 	}, 32*time.Millisecond)
+	// Shared rate meter (same type, interval, and estimator as the
+	// WebSocket frontend): the builder feeds it every delta and emits
+	// OnStreamStats a few times per second while the round streams.
+	speed := streamutil.NewSpeedMeter(streamutil.StatsInterval)
 
-	// The round-buffer feeds (s.sess.round*) run on EVERY event regardless
-	// of focus — unlike send, which only enqueues while unfocused. The
-	// buffer must accumulate from round start even while the session is
-	// the focused one: that is the gap it closes (watch A stream, switch
-	// away, come back mid-round — web liveTurnState parity). The nil
-	// guards keep adapters built without a session (unit tests) quiet.
-	return &llm.StreamHandlers{
-		OnStart: func() {
-			if s.sess != nil {
-				s.sess.roundReset() // new turn: fresh buffer
-			}
-			batch.Reset()
-			argsBatch.Reset()
-			s.send(streamStartMsg{sid: s.owner, seq: s.seq})
-		},
-		OnCondensed: func(note string) {
-			s.send(condensedNoteMsg{note: note, sid: s.owner, seq: s.seq})
-		},
-		OnRoundStart: func() {
-			if s.sess != nil {
-				s.sess.roundReset() // new round: completed content is in Messages
-			}
-			batch.Reset()
-			argsBatch.Reset()
-			s.send(streamRoundStartMsg{sid: s.owner, seq: s.seq})
-		},
-		OnThinkingToken: func(token string) {
-			if s.sess != nil {
-				s.sess.roundAppendThinking(token)
-			}
-			batch.ThinkToken(token)
-		},
-		OnToken: func(token string) {
-			if s.sess != nil {
-				s.sess.roundAppendContent(token)
-			}
-			batch.StreamToken(token)
-		},
-		OnStreamEnd: func() {
-			batch.Flush()
-			batch.Close()
-			argsBatch.Flush()
-			argsBatch.Close()
-			if s.sess != nil {
-				// Round complete: the assistant message is appended to
-				// Messages immediately after, so the buffer only ever
-				// carries content a history snapshot would otherwise miss.
-				s.sess.roundReset()
-			}
-			s.send(streamRoundEndMsg{sid: s.owner, seq: s.seq})
-		},
-		OnToolCallStart: func(index int, id, name string) {
-			batch.Flush()
-			argsBatch.Flush()
-			if s.sess != nil {
-				s.sess.roundToolStart(index, id, name)
-			}
-			s.send(streamToolCallMsg{index: index, id: id, name: name, sid: s.owner, seq: s.seq})
-		},
-		OnToolCallArgsDelta: func(index int, id, name, argsDelta string) {
-			argsBatch.Add(index, id, name, argsDelta)
-			if s.sess != nil {
-				s.sess.roundToolArgsAppend(index, argsDelta)
-			}
-		},
-		OnToolCall: func(tc llm.ToolCall) {
-			// Deliver any buffered args deltas before the final so the
-			// Update thread sees the complete argument accumulation first.
-			argsBatch.Flush()
-			s.send(streamToolCallFinalMsg{index: tc.Index, tc: tc, sid: s.owner, seq: s.seq})
-		},
-		OnToolExecute: func(name string) {
-			argsBatch.Flush()
-			s.send(streamToolExecuteMsg{name: name, sid: s.owner, seq: s.seq})
-		},
-		OnToolResult: func(id, name, result string, success bool) {
-			s.send(streamToolResultMsg{id: id, name: name, result: result, success: success, sid: s.owner, seq: s.seq})
-		},
-		OnRecoverPartialStream: func() {},
-	}
+	return streamutil.BuildStreamHandlers(s, streamutil.HandlersConfig{Tokens: batch, Args: argsBatch, Speed: speed})
+}
+
+// The StreamAdapter is the TUI's streamutil.Sink: each method emits the
+// tea.Msg for one stream event and feeds the session's round buffer. The
+// round-buffer feeds (s.rounds, streambuf.RoundSink) run on EVERY event
+// regardless of focus — unlike send, which only enqueues while unfocused.
+// The buffer must accumulate from round start even while the session is
+// the focused one: that is the gap it closes (watch A stream, switch
+// away, come back mid-round). The reset/append timing is the shared
+// streambuf.RoundSink rule — the same one the web server's wsStreamSink
+// calls — so the two hosts cannot drift. A zero sink (adapters built
+// without a session, unit tests) is a no-op.
+//
+// The intentionally-empty methods are the callbacks the TUI does not
+// consume: OnStreamOpened/OnStreamActivity/OnStreamStall are
+// connection-level signals with no TUI surface, OnCompacting/OnReplyModel
+// have no TUI indicator yet, and OnToolOutput/OnToolOutputEnd are unused
+// because the TUI renders only the final tool result (no live terminal
+// tabs). They are explicit no-ops, not omissions.
+var _ streamutil.Sink = (*StreamAdapter)(nil)
+
+func (s *StreamAdapter) OnStart() {
+	s.rounds.TurnBegin() // new turn: fresh buffer
+	s.send(streamStartMsg{sid: s.owner, seq: s.seq})
+}
+
+func (s *StreamAdapter) OnRoundStart() {
+	s.rounds.RoundBegin() // new round: completed content is in Messages
+	s.send(streamRoundStartMsg{sid: s.owner, seq: s.seq})
+}
+
+func (s *StreamAdapter) OnStreamOpened() {}
+
+func (s *StreamAdapter) OnStreamActivity() {}
+
+func (s *StreamAdapter) OnCompacting() {}
+
+func (s *StreamAdapter) OnCondensed(note string) {
+	s.send(condensedNoteMsg{note: note, sid: s.owner, seq: s.seq})
+}
+
+func (s *StreamAdapter) OnStreamStall() {}
+
+func (s *StreamAdapter) OnThinkingToken(token string) {
+	s.rounds.Thinking(token)
+}
+
+// OnStreamStats emits the smoothed token rate for the progress line.
+// Timer-driven (see streamutil.SpeedMeter): a few messages per second
+// while the round streams, none during tool execution or between turns.
+func (s *StreamAdapter) OnStreamStats(toksPerSec float64) {
+	s.send(streamStatsMsg{toksPerSec: toksPerSec, sid: s.owner, seq: s.seq})
+}
+
+func (s *StreamAdapter) OnToken(token string) {
+	s.rounds.Token(token)
+}
+
+func (s *StreamAdapter) OnStreamEnd() {
+	// Round complete: the assistant message is appended to
+	// Messages immediately after, so the buffer only ever
+	// carries content a history snapshot would otherwise miss.
+	s.rounds.RoundEnd()
+	s.send(streamRoundEndMsg{sid: s.owner, seq: s.seq})
+}
+
+func (s *StreamAdapter) OnReplyModel(model string) {}
+
+func (s *StreamAdapter) OnToolCallStart(index int, id, name string) {
+	s.rounds.ToolStart(index, id, name)
+	s.send(streamToolCallMsg{index: index, id: id, name: name, sid: s.owner, seq: s.seq})
+}
+
+func (s *StreamAdapter) OnToolCallArgsDelta(index int, id, name, argsDelta string) {
+	s.rounds.ToolArgs(index, argsDelta)
+}
+
+func (s *StreamAdapter) OnToolCall(tc llm.ToolCall) {
+	// The builder flushed the token/args batchers before this call, so
+	// the Update thread sees the complete argument accumulation first.
+	s.send(streamToolCallFinalMsg{index: tc.Index, tc: tc, sid: s.owner, seq: s.seq})
+}
+
+func (s *StreamAdapter) OnRecoverPartialStream() {}
+
+func (s *StreamAdapter) OnToolExecute(name string) {
+	s.send(streamToolExecuteMsg{name: name, sid: s.owner, seq: s.seq})
+}
+
+func (s *StreamAdapter) OnToolOutput(id, name, command, chunk string) {}
+
+func (s *StreamAdapter) OnToolOutputEnd(id string, success bool) {}
+
+func (s *StreamAdapter) OnToolResult(id, name, result string, success bool) {
+	s.send(streamToolResultMsg{id: id, name: name, result: result, success: success, sid: s.owner, seq: s.seq})
 }
 
 // appendChatLine adds a line to the chat buffer and updates the viewport.
@@ -741,10 +784,10 @@ func (m *Model) resetStreamState(keepToolDiffShown bool) {
 
 func (m *Model) handleStreamStart() {
 	m.resetStreamState(false)
+	m.clearStreamSpeed()
 	// Snapshot the last authoritative context usage as the baseline for the
 	// live streaming estimate (see bumpContextEstimate).
-	m.contextStreamBaseUsed = m.contextStats.Snapshot.Used
-	m.contextStreamEstAdded = 0
+	m.contextEst.Rebase(m.contextStats.Snapshot.Used)
 }
 
 func (m *Model) handleStreamRoundStart() {
@@ -757,11 +800,24 @@ func (m *Model) handleStreamRoundStart() {
 	// messages). Re-basing from the stale end-of-previous-turn mirror
 	// instead made the (est.) indicator visibly drop back to the
 	// pre-reply level at every round boundary of a multi-round
-	// (tool-calling) reply. Resetting contextStreamEstAdded keeps the
-	// (est.) indicator incrementally accurate across multi-round turns.
+	// (tool-calling) reply. Re-basing (which discards the accumulated
+	// estimate) keeps the (est.) indicator incrementally accurate across
+	// multi-round turns.
 	m.refreshContextStatsMidTurn()
-	m.contextStreamBaseUsed = m.contextStats.Snapshot.Used
-	m.contextStreamEstAdded = 0
+	m.contextEst.Rebase(m.contextStats.Snapshot.Used)
+	// The server re-arms its rate meter per round: drop the previous
+	// round's last rate so the thinking indicator never shows a stale one.
+	m.clearStreamSpeed()
+}
+
+// clearStreamSpeed drops the displayed token rate (turn/round start). The
+// focused session's mirror is cleared too so a focus switch cannot restore
+// the previous round's rate.
+func (m *Model) clearStreamSpeed() {
+	m.streamSpeedLine = ""
+	if s := m.focusedSession(); s != nil {
+		s.streamSpeedLine = ""
+	}
 }
 
 func (m *Model) handleStreamRoundEnd() {

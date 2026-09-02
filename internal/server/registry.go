@@ -205,23 +205,6 @@ type liveTurnState struct {
 	toolArgsSent map[int]int
 }
 
-// liveTurnBegin resets the buffer for a new turn (OnStart).
-func (rt *sessionRuntime) liveTurnBegin() {
-	rt.live.resetAll()
-}
-
-// liveRoundBegin resets the buffer for a new round (OnRoundStart).
-func (rt *sessionRuntime) liveRoundBegin() {
-	rt.live.resetAll()
-}
-
-// liveRoundEnd clears the buffer (OnStreamEnd). The round's assistant
-// message is appended to a.Messages immediately after, so the buffer only
-// ever carries content a history snapshot would otherwise miss.
-func (rt *sessionRuntime) liveRoundEnd() {
-	rt.live.resetAll()
-}
-
 // resetAll clears the round buffer AND the sent markers. The two leaf locks
 // are taken sequentially, never held together: a rewind snapshot (buffer
 // lock only) and a SegmentEnd (sentMu only) can interleave with the reset
@@ -233,16 +216,6 @@ func (st *liveTurnState) resetAll() {
 	st.thinkingSent = 0
 	st.toolArgsSent = nil
 	st.sentMu.Unlock()
-}
-
-// liveAppendContent records a streamed content token (OnToken).
-func (rt *sessionRuntime) liveAppendContent(text string) {
-	rt.live.AppendContent(text)
-}
-
-// liveAppendThinking records a streamed thinking token (OnThinkingToken).
-func (rt *sessionRuntime) liveAppendThinking(text string) {
-	rt.live.AppendThinking(text)
 }
 
 // liveContentSegmentEnd advances the sent-content marker by one flushed
@@ -263,30 +236,6 @@ func (rt *sessionRuntime) liveThinkingSegmentEnd(text string) int {
 	pos := rt.live.thinkingSent
 	rt.live.sentMu.Unlock()
 	return pos
-}
-
-// liveToolStart records the start of a streamed tool call (OnToolCallStart).
-func (rt *sessionRuntime) liveToolStart(index int, id, name string) {
-	rt.live.ToolStart(index, id, name)
-	// A fresh call at a recycled index must restart the sent marker too:
-	// the client's card was created by tool_call_start, which always
-	// precedes the first delta, so both counters start at 0.
-	rt.live.sentMu.Lock()
-	if rt.live.toolArgsSent != nil {
-		delete(rt.live.toolArgsSent, index)
-	}
-	rt.live.sentMu.Unlock()
-}
-
-// liveToolArgsAppend records one args delta for a streaming tool call
-// (OnToolCallArgsDelta) in the live-turn buffer. It runs synchronously on
-// every delta (not at flush time) so liveRewind always reports the complete
-// args the client will eventually receive: the client's rewind merge
-// (appendStreamingToolArgs + trimToEnd) uses the stamped ArgsPos to recover
-// the tail it already painted, so a snapshot that lagged the wire would
-// leave a permanent gap in the card.
-func (rt *sessionRuntime) liveToolArgsAppend(index int, delta string) {
-	rt.live.AppendToolArgs(index, delta)
 }
 
 // liveToolArgsSegmentEnd advances the sent-args marker for one flushed
