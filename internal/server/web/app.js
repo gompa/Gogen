@@ -121,6 +121,16 @@
             showMCPTest,
             showProviderTest,
         } from '/components/settings.js';
+        // Command palette (components/palette.js): the Ctrl+K overlay,
+        // fuzzy filtering and keyboard navigation. app.js keeps the
+        // command catalog and the global shortcuts, and hands the
+        // catalog to initPalette.
+        import {
+            closePalette,
+            initPalette,
+            isPaletteOpen,
+            openPalette,
+        } from '/components/palette.js';
         import { marked } from '/vendor/marked.esm.js';
         import DOMPurify from '/vendor/dompurify.esm.js';
 
@@ -167,9 +177,6 @@
         const deletePaths = document.getElementById('delete-approval-paths');
         const deleteAllowBtn = document.getElementById('delete-allow-btn');
         const deleteDenyBtn = document.getElementById('delete-deny-btn');
-        const paletteOverlay = document.getElementById('command-palette-overlay');
-        const paletteInput = document.getElementById('command-palette-input');
-        const paletteList = document.getElementById('command-palette-list');
         const toastHost = document.getElementById('toast-host');
         // The conversation TOC rail (one dot per user prompt) and its
         // hover preview tooltip live in components/toc.js (initToc
@@ -5508,86 +5515,10 @@
                 },
             });
         }
-        let paletteMatches = [];
-        let paletteIndex = 0;
-
-        function closePalette() {
-            closeModal(paletteOverlay, { className: 'open' });
-            paletteInput.value = '';
-            paletteList.innerHTML = '';
-        }
-
-        function openPalette() {
-            openModal(paletteOverlay, { className: 'open', focusSelector: '#command-palette-input' });
-            paletteInput.value = '';
-            paletteIndex = 0;
-            renderPalette();
-        }
-
-        function renderPalette() {
-            const q = paletteInput.value.trim().toLowerCase();
-            paletteMatches = PALETTE_COMMANDS.filter((c) => !q || c.label.toLowerCase().includes(q) || c.id.includes(q));
-            if (q) {
-                // Prefix matches rank above substring matches (stable sort,
-                // so equal-rank entries keep array order).
-                paletteMatches.sort((a, b) => {
-                    const aPre = a.label.toLowerCase().startsWith(q);
-                    const bPre = b.label.toLowerCase().startsWith(q);
-                    if (aPre !== bPre) return aPre ? -1 : 1;
-                    return 0;
-                });
-            }
-            if (paletteIndex >= paletteMatches.length) paletteIndex = 0;
-            if (paletteIndex < 0) paletteIndex = Math.max(0, paletteMatches.length - 1);
-            paletteList.innerHTML = '';
-            paletteMatches.forEach((cmd, i) => {
-                const el = document.createElement('div');
-                el.className = 'palette-item' + (i === paletteIndex ? ' active' : '');
-                el.setAttribute('role', 'option');
-                el.innerHTML = '<span class="palette-item-label"></span><span class="palette-item-hint"></span>';
-                el.querySelector('.palette-item-label').textContent = cmd.label;
-                el.querySelector('.palette-item-hint').textContent = cmd.hint || '';
-                el.onmousedown = (e) => {
-                    e.preventDefault();
-                    closePalette();
-                    cmd.run();
-                };
-                paletteList.appendChild(el);
-            });
-        }
 
         document.getElementById('session-new-btn')?.addEventListener('click', () => newSession());
         // Auto-refreshed on session mutations — no manual refresh button needed
         document.getElementById('export-chat-btn')?.addEventListener('click', () => exportChat());
-
-        paletteInput.addEventListener('input', () => {
-            paletteIndex = 0;
-            renderPalette();
-        });
-        paletteInput.addEventListener('keydown', (e) => {
-            if (e.key === 'ArrowDown') {
-                e.preventDefault();
-                paletteIndex = (paletteIndex + 1) % Math.max(1, paletteMatches.length);
-                renderPalette();
-            } else if (e.key === 'ArrowUp') {
-                e.preventDefault();
-                paletteIndex = (paletteIndex - 1 + Math.max(1, paletteMatches.length)) % Math.max(1, paletteMatches.length);
-                renderPalette();
-            } else if (e.key === 'Enter') {
-                e.preventDefault();
-                const cmd = paletteMatches[paletteIndex];
-                if (cmd) {
-                    closePalette();
-                    cmd.run();
-                }
-            } else if (e.key === 'Escape') {
-                e.preventDefault();
-                closePalette();
-            }
-        });
-        paletteOverlay.addEventListener('mousedown', (e) => {
-            if (e.target === paletteOverlay) closePalette();
-        });
 
         document.addEventListener('keydown', (e) => {
             const mod = e.ctrlKey || e.metaKey;
@@ -5596,7 +5527,7 @@
 
             if (mod && e.key.toLowerCase() === 'k') {
                 e.preventDefault();
-                if (paletteOverlay.classList.contains('open')) closePalette();
+                if (isPaletteOpen()) closePalette();
                 else openPalette();
                 return;
             }
@@ -5635,7 +5566,7 @@
                     closeModal(kbOverlay);
                     return;
                 }
-                if (paletteOverlay.classList.contains('open')) {
+                if (isPaletteOpen()) {
                     e.preventDefault();
                     closePalette();
                     return;
@@ -5857,6 +5788,11 @@
         initScroll({
             isReplaying: () => replayInProgress,
         });
+
+        // === Command palette (components/palette.js) ===
+        // The catalog array is passed by reference: the slash-command
+        // prefill entries were already pushed at top level above.
+        initPalette({ commands: PALETTE_COMMANDS });
 
         // === Settings modal + persisted preferences (components/settings.js) ===
         // The tabbed settings overlay, the server-backed feature/runtime

@@ -50,6 +50,8 @@ const COMPONENT_MODULES = [
   // Imports toc.js (updateTocActive / syncTocRailBox / hideTocTooltip) and
   // editor.js (chatDiffWheelEdge, stubbed above).
   'internal/server/web/components/scroll.js',
+  // Command palette; imports editor.js (openModal / closeModal, stubbed).
+  'internal/server/web/components/palette.js',
   'internal/server/web/components/terminal.js',
   'internal/server/web/components/sessions.js',
   'internal/server/web/components/settings.js',
