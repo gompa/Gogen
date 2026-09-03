@@ -44,6 +44,9 @@ const COMPONENT_MODULES = [
   // global scope before any of them eval.
   'internal/server/web/components/icons.js',
   'internal/server/web/components/popover.js',
+  // Markdown rendering pipeline; imports editor.js (colorizeNode /
+  // openFileAtLine, stubbed) and the marked / DOMPurify vendor stubs.
+  'internal/server/web/components/markdown.js',
   'internal/server/web/components/model-picker.js',
   'internal/server/web/components/board.js',
   'internal/server/web/components/toc.js',
