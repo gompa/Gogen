@@ -131,6 +131,13 @@
             isPaletteOpen,
             openPalette,
         } from '/components/palette.js';
+        // Delete-approval queue + confirm modal (components/delete-approval.js):
+        // owns the pendingDeleteApprovals queue; app.js keeps the ws dispatch
+        // (delete_approval) and forwards payloads to showDeleteApproval.
+        import {
+            initDeleteApproval,
+            showDeleteApproval,
+        } from '/components/delete-approval.js';
         import { marked } from '/vendor/marked.esm.js';
         import DOMPurify from '/vendor/dompurify.esm.js';
 
@@ -172,11 +179,6 @@
         let isGlobalMode = false;
         const inputProgress = document.getElementById('input-progress');
         const globalModeBadge = document.getElementById('global-mode-badge');
-        const deleteOverlay = document.getElementById('delete-approval-overlay');
-        const deleteReason = document.getElementById('delete-approval-reason');
-        const deletePaths = document.getElementById('delete-approval-paths');
-        const deleteAllowBtn = document.getElementById('delete-allow-btn');
-        const deleteDenyBtn = document.getElementById('delete-deny-btn');
         const toastHost = document.getElementById('toast-host');
         // The conversation TOC rail (one dot per user prompt) and its
         // hover preview tooltip live in components/toc.js (initToc
@@ -197,14 +199,6 @@
         const condensedBannerDismiss = document.getElementById('condensed-banner-dismiss');
         const tbModeBtn = document.getElementById('tb-mode-btn');
         const tbContextBadge = document.getElementById('tb-context-badge');
-
-        // Pending delete approvals, queued so a second session's approval
-        // request (e.g. a background pane) cannot orphan the first: the modal
-        // is single-slot, and overwriting the pending id would leave the
-        // first session's turn waiting forever on a channel that is never
-        // resolved. Each entry carries its sessionId so the response routes
-        // to the right session's runtime.
-        let pendingDeleteApprovals = []; // {approvalId, sessionId, reason, paths}
         let messageRawStore = new WeakMap();
 
         // Bounded toast stack: a burst of events (copy feedback, connection
@@ -390,74 +384,6 @@
         });
 
         setupEditorUI();
-
-        function respondDeleteApproval(approved) {
-            deleteOverlay.removeEventListener('keydown', deleteApprovalEsc);
-            if (!pendingDeleteApprovals.length || !ws || ws.readyState !== WebSocket.OPEN) {
-                pendingDeleteApprovals = [];
-                inputArea.disabled = false;
-                sendBtn.disabled = false;
-                closeModal(deleteOverlay);
-                return;
-            }
-            const current = pendingDeleteApprovals.shift();
-            ws.send(JSON.stringify({
-                type: 'delete_approval_response',
-                approvalId: current.approvalId,
-                approved: approved,
-                sessionId: current.sessionId || undefined
-            }));
-            if (pendingDeleteApprovals.length) {
-                // More approvals queued — show the next one.
-                renderDeleteApproval(pendingDeleteApprovals[0]);
-                // The keydown listener was removed above; re-arm it so Esc
-                // keeps resolving queued approvals too.
-                deleteOverlay.addEventListener('keydown', deleteApprovalEsc);
-            } else {
-                inputArea.disabled = false;
-                sendBtn.disabled = false;
-                closeModal(deleteOverlay);
-            }
-        }
-
-        function deleteApprovalEsc(e) {
-            if (e.key === 'Escape') {
-                e.stopPropagation(); // keep the document handler from cancelling the agent turn
-                respondDeleteApproval(false);
-            }
-        }
-
-        deleteAllowBtn.onclick = () => respondDeleteApproval(true);
-        deleteDenyBtn.onclick = () => respondDeleteApproval(false);
-
-        function renderDeleteApproval(data) {
-            deleteReason.textContent = data.reason ? `Requested by: ${data.reason}` : 'The agent wants to delete files.';
-            deletePaths.textContent = (data.paths || []).map(p => `- ${p}`).join('\n');
-        }
-
-        function showDeleteApproval(data) {
-            const first = pendingDeleteApprovals.length === 0;
-            pendingDeleteApprovals.push({
-                approvalId: data.approvalId,
-                sessionId: data.sessionId || null,
-                reason: data.reason,
-                paths: data.paths || [],
-            });
-            if (!first) {
-                // The modal already shows an earlier approval; this one is
-                // queued and renders when the current one resolves.
-                return;
-            }
-            renderDeleteApproval(pendingDeleteApprovals[0]);
-            inputArea.disabled = true;
-            sendBtn.disabled = true;
-            openModal(deleteOverlay);
-            deleteOverlay.addEventListener('keydown', deleteApprovalEsc);
-            // Always notify: delete approval requires user action even when
-            // the tab is backgrounded.
-            const paths = (data.paths || []).join(', ');
-            sendNotification('GoGen — Approval needed', `File delete requested: ${paths}`, 'gogen-delete-approval');
-        }
 
         // ── Toolbar: model picker popover ──
         let modelFilterQuery = '';
@@ -5793,6 +5719,11 @@
         // The catalog array is passed by reference: the slash-command
         // prefill entries were already pushed at top level above.
         initPalette({ commands: PALETTE_COMMANDS });
+
+        // === Delete-approval modal (components/delete-approval.js) ===
+        initDeleteApproval({
+            getWs: () => ws,
+        });
 
         // === Settings modal + persisted preferences (components/settings.js) ===
         // The tabbed settings overlay, the server-backed feature/runtime

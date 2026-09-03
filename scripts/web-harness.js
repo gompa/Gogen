@@ -55,6 +55,9 @@ const COMPONENT_MODULES = [
   'internal/server/web/components/terminal.js',
   'internal/server/web/components/sessions.js',
   'internal/server/web/components/settings.js',
+  // Delete-approval modal; imports editor.js (openModal / closeModal,
+  // stubbed) and settings.js (sendNotification) — last, after both.
+  'internal/server/web/components/delete-approval.js',
 ];
 
 // Strips the module syntax the tests run as classic scripts:
