@@ -47,6 +47,9 @@ const COMPONENT_MODULES = [
   'internal/server/web/components/model-picker.js',
   'internal/server/web/components/board.js',
   'internal/server/web/components/toc.js',
+  // Imports toc.js (updateTocActive / syncTocRailBox / hideTocTooltip) and
+  // editor.js (chatDiffWheelEdge, stubbed above).
+  'internal/server/web/components/scroll.js',
   'internal/server/web/components/terminal.js',
   'internal/server/web/components/sessions.js',
   'internal/server/web/components/settings.js',
