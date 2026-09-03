@@ -174,7 +174,8 @@ type OpenAIProvider struct {
 	// on SetModel because router/multi-model hosts may change the template.
 	// The cache is keyed by endpoint (propsBaseURL): with multiple
 	// registered profiles, the probe must hit the CURRENT model's owning
-	// endpoint.
+	// endpoint. Only completed probes (200 + parseable JSON) are cached;
+	// failures are not, so a later request re-probes.
 	propsMu                sync.Mutex
 	propsChecked           bool
 	propsBaseURL           string

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -290,6 +291,55 @@ func TestProbeReasoningEffortsFromProps(t *testing.T) {
 			t.Fatalf("props hits = %d, want 2 (failures are not cached)", propsHits.Load())
 		}
 	})
+}
+
+func TestProbeEffortValuesViaApplyTemplateSendsModel(t *testing.T) {
+	t.Parallel()
+
+	var bodyMu sync.Mutex
+	var gotBody map[string]any
+	var gotModelParam string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/props":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"chat_template_caps": map[string]bool{"supports_reasoning_effort": true},
+				"chat_template":      effortTemplateWithoutValidation,
+			})
+		case "/apply-template":
+			bodyMu.Lock()
+			gotModelParam = r.URL.Query().Get("model")
+			_ = json.NewDecoder(r.Body).Decode(&gotBody)
+			bodyMu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"prompt": "hi"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	p := NewOpenAIProviderWithProfiles(
+		[]ProviderProfile{{Name: "default", BaseURL: srv.URL + "/v1", APIKey: "k"}},
+		"qwen3.8", t.TempDir(), nil)
+	if _, err := p.ProbeReasoningEfforts(context.Background(), "qwen3.8"); err != nil {
+		t.Fatal(err)
+	}
+
+	bodyMu.Lock()
+	defer bodyMu.Unlock()
+	if gotModelParam != "qwen3.8" {
+		t.Fatalf("apply-template ?model= %q, want qwen3.8", gotModelParam)
+	}
+	if gotBody["model"] != "qwen3.8" {
+		t.Fatalf("body model = %v, want qwen3.8", gotBody["model"])
+	}
+	if _, ok := gotBody["messages"]; !ok {
+		t.Fatalf("body missing messages: %v", gotBody)
+	}
+	kwargs, _ := gotBody["chat_template_kwargs"].(map[string]any)
+	if kwargs["reasoning_effort"] != "__gogen_probe__" {
+		t.Fatalf("body chat_template_kwargs = %v, want sentinel", gotBody["chat_template_kwargs"])
+	}
 }
 
 // effortRegistryAt writes a models.dev-style registry whose provider api is

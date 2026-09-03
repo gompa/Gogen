@@ -27,11 +27,10 @@ type SearchMatch struct {
 }
 
 const (
-	searchMaxMatches      = 200
-	searchMaxOutputBytes  = 512 * 1024
-	searchMaxFileBytes    = 1_000_000
-	searchBinaryProbe     = 8192
-	searchMaxContextLines = 20
+	searchMaxMatches     = 200
+	searchMaxOutputBytes = 512 * 1024
+	searchMaxFileBytes   = 1_000_000
+	searchBinaryProbe    = 8192
 )
 
 // searchTimeout bounds a single SearchCode call.
@@ -135,9 +134,10 @@ func (e *Executor) SearchCode(ctx context.Context, pattern, subpath, glob string
 	if contextLines < 0 {
 		return "", fmt.Errorf("context_lines must be non-negative")
 	}
-	if contextLines > searchMaxContextLines {
-		contextLines = searchMaxContextLines
-	}
+	// contextLines is not pre-clamped: the searchMaxOutputBytes cap (with its
+	// truncation notice) is the output backstop. A silent per-argument clamp
+	// returned byte-identical output for every larger request, which sent
+	// models into retry loops incrementing context_lines forever.
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -546,13 +546,22 @@ func prefixRelPaths(body, relPrefix string) string {
 			b.WriteByte('\n')
 			continue
 		}
-		idx := strings.IndexByte(line, ':')
-		if idx <= 0 {
-			b.WriteString(filepath.ToSlash(filepath.Join(relPrefix, line)))
-		} else {
-			b.WriteString(filepath.ToSlash(filepath.Join(relPrefix, line[:idx])))
-			b.WriteString(line[idx:])
+		// Join ONLY the path portion with relPrefix. The old code split on
+		// the first ':' alone, so context lines ("path-NUM-content", no ':'
+		// before the content) fed the WHOLE line into filepath.Join — and
+		// filepath.Clean collapsed "//" in the content to "/" (Go comments
+		// arrived at the model as "/ comment"). splitSearchLineParts handles both
+		// separators and is the same parse compactSearchOutput applies.
+		file, sep1, num, sep2, tail, ok := splitSearchLineParts(line)
+		if !ok {
+			// Not a structured line; pass through unchanged.
+			b.WriteString(line)
+			b.WriteByte('\n')
+			continue
 		}
+		b.WriteString(filepath.ToSlash(filepath.Join(relPrefix, file)))
+		b.WriteByte(sep1)
+		b.WriteString(num + string(sep2) + tail)
 		b.WriteByte('\n')
 	}
 	return strings.TrimSuffix(b.String(), "\n")

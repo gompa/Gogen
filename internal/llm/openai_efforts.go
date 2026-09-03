@@ -180,7 +180,7 @@ func (p *OpenAIProvider) ProbeReasoningEfforts(ctx context.Context, modelID stri
 	}
 	p.effortsMu.Unlock()
 
-	efforts, err := p.probeEffortsOnce(ctx, baseURL)
+	efforts, err := p.probeEffortsOnce(ctx, baseURL, modelID)
 	if err != nil {
 		return false, err
 	}
@@ -210,8 +210,8 @@ func (p *OpenAIProvider) ProbeReasoningEfforts(ctx context.Context, modelID stri
 // reports no reasoning-effort control. Returns errEffortsUnavailable when the
 // vocabulary cannot be derived (non-llama.cpp endpoint, missing caps,
 // probe failure) — callers must not cache that state.
-func (p *OpenAIProvider) probeEffortsOnce(ctx context.Context, baseURL string) ([]string, error) {
-	propsURL := llamaPropsURL(baseURL)
+func (p *OpenAIProvider) probeEffortsOnce(ctx context.Context, baseURL, modelID string) ([]string, error) {
+	propsURL := llamaPropsURL(baseURL, modelID)
 	if propsURL == "" {
 		return nil, errEffortsUnavailable
 	}
@@ -248,19 +248,29 @@ func (p *OpenAIProvider) probeEffortsOnce(ctx context.Context, baseURL string) (
 	// value. Validating templates reject it and enumerate the accepted
 	// values in the error message; non-validating templates render it
 	// (accepting any value → the default set is the pragmatic choice).
-	return p.probeEffortValuesViaApplyTemplate(ctx, baseURL)
+	return p.probeEffortValuesViaApplyTemplate(ctx, baseURL, modelID)
 }
 
 // probeEffortValuesViaApplyTemplate POSTs one sentinel render to llama.cpp's
 // /apply-template endpoint (template rendering only — no inference, no
 // tokens) and derives the accepted values from the outcome.
-func (p *OpenAIProvider) probeEffortValuesViaApplyTemplate(ctx context.Context, baseURL string) ([]string, error) {
-	applyURL := llamaApplyTemplateURL(baseURL)
+func (p *OpenAIProvider) probeEffortValuesViaApplyTemplate(ctx context.Context, baseURL, modelID string) ([]string, error) {
+	applyURL := llamaApplyTemplateURL(baseURL, modelID)
 	if applyURL == "" {
 		return nil, errEffortsUnavailable
 	}
-	const body = `{"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"reasoning_effort":"__gogen_probe__"},"add_generation_prompt":false}`
-	status, respBody, err := p.propsRequest(ctx, http.MethodPost, applyURL, body)
+	// "model" is a standard field that direct llama.cpp servers accept;
+	// router-style hosts (llama-route) require it to resolve the upstream.
+	probeBody, err := json.Marshal(map[string]any{
+		"model":                 modelID,
+		"messages":              []map[string]string{{"role": "user", "content": "hi"}},
+		"chat_template_kwargs":  map[string]string{"reasoning_effort": "__gogen_probe__"},
+		"add_generation_prompt": false,
+	})
+	if err != nil {
+		return nil, errEffortsUnavailable
+	}
+	status, respBody, err := p.propsRequest(ctx, http.MethodPost, applyURL, string(probeBody))
 	if err != nil {
 		return nil, errEffortsUnavailable
 	}
@@ -336,11 +346,15 @@ func llamaEndpointBase(baseURL string) string {
 
 // llamaApplyTemplateURL maps an OpenAI-compatible base URL (.../v1) to the
 // llama.cpp POST /apply-template endpoint (template render without
-// inference).
-func llamaApplyTemplateURL(baseURL string) string {
+// inference). A non-empty modelID selects the model on router-style hosts;
+// single-model servers ignore the parameter.
+func llamaApplyTemplateURL(baseURL, modelID string) string {
 	base := llamaEndpointBase(baseURL)
 	if base == "" {
 		return ""
+	}
+	if modelID != "" {
+		return base + "/apply-template?model=" + url.QueryEscape(modelID)
 	}
 	return base + "/apply-template"
 }

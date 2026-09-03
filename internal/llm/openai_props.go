@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 
@@ -115,6 +116,13 @@ func (p *OpenAIProvider) acceptedReasoningEfforts() []string {
 // probe hits the CURRENT model's owning profile (with multiple registered
 // providers, /props must be asked of the endpoint that actually serves the
 // request). Failures / missing caps → false.
+//
+// Only a completed exchange (200 with parseable JSON) is cached; transport
+// errors, timeouts, non-200 responses, and unparseable bodies return false
+// for this call WITHOUT caching, so the next request re-probes (same
+// convention as the efforts probe: failures are not cached). This keeps a
+// cold-start probe — fired before the router has loaded the model — from
+// pinning "off" for the process lifetime.
 func (p *OpenAIProvider) templateSupportsPreserveReasoning(ctx context.Context) bool {
 	baseURL := p.propsBaseURLForCurrentModel()
 	p.propsMu.Lock()
@@ -125,7 +133,11 @@ func (p *OpenAIProvider) templateSupportsPreserveReasoning(ctx context.Context) 
 	}
 	p.propsMu.Unlock()
 
-	supported := p.probePreserveReasoning(ctx, baseURL)
+	supported, ok := p.probePreserveReasoning(ctx, baseURL, p.currentModel())
+	if !ok {
+		// Incomplete probe: don't pin the negative result.
+		return false
+	}
 
 	p.propsMu.Lock()
 	// Another goroutine may have filled the cache while we probed.
@@ -167,35 +179,43 @@ func (p *OpenAIProvider) invalidatePropsCaps() {
 }
 
 // probePreserveReasoning GETs /props on baseURL and reads
-// supports_preserve_reasoning. Returns false on any error, non-200, or
-// missing capability key.
-func (p *OpenAIProvider) probePreserveReasoning(ctx context.Context, baseURL string) bool {
-	propsURL := llamaPropsURL(baseURL)
+// supports_preserve_reasoning. ok=false (any error, non-200, or unparseable
+// body) means the probe did not complete — the caller must not cache the
+// negative result. A 200 response lacking the caps key is a completed probe
+// reporting "unsupported" (ok=true, supported=false).
+func (p *OpenAIProvider) probePreserveReasoning(ctx context.Context, baseURL, modelID string) (supported, ok bool) {
+	propsURL := llamaPropsURL(baseURL, modelID)
 	if propsURL == "" {
-		return false
+		return false, false
 	}
 	status, body, err := p.propsRequest(ctx, http.MethodGet, propsURL, "")
 	if err != nil || status != http.StatusOK {
-		return false
+		return false, false
 	}
 	return parsePreserveReasoningCap(body)
 }
 
-func parsePreserveReasoningCap(body []byte) bool {
+func parsePreserveReasoningCap(body []byte) (supported, ok bool) {
 	var props struct {
 		ChatTemplateCaps map[string]bool `json:"chat_template_caps"`
 	}
 	if err := json.Unmarshal(body, &props); err != nil {
-		return false
+		return false, false
 	}
-	return props.ChatTemplateCaps["supports_preserve_reasoning"]
+	return props.ChatTemplateCaps["supports_preserve_reasoning"], true
 }
 
-// llamaPropsURL maps an OpenAI-compatible base URL (.../v1) to llama.cpp GET /props.
-func llamaPropsURL(baseURL string) string {
+// llamaPropsURL maps an OpenAI-compatible base URL (.../v1) to llama.cpp GET
+// /props. A non-empty modelID selects the model on router-style hosts
+// (llama.cpp router mode, llama-route); single-model servers ignore the
+// parameter.
+func llamaPropsURL(baseURL, modelID string) string {
 	base := llamaEndpointBase(baseURL)
 	if base == "" {
 		return ""
+	}
+	if modelID != "" {
+		return base + "/props?model=" + url.QueryEscape(modelID)
 	}
 	return base + "/props"
 }

@@ -217,7 +217,7 @@ var builtinToolDefs = []ToolDef{
 				"pattern":       toolProp("string", "Regex or literal"),
 				"path":          toolProp("string", "Subdirectory (required for hidden dirs)"),
 				"glob":          toolProp("string", "Glob filter (e.g. *.go)"),
-				"context_lines": toolProp("integer", "Context lines (max 20)"),
+				"context_lines": toolProp("integer", "Context lines before/after each match"),
 				"ignore_case":   toolProp("boolean", "Case-insensitive matching (default false)"),
 			}, "pattern")),
 		Handler:     handleSearchCode,

@@ -423,7 +423,8 @@ type WebFetchOptions struct {
 	// returned instead of the full text. Composes with Selector.
 	Query string
 	// Context is the number of context lines around each Query match
-	// (default searchDefaultContext, capped at searchMaxContextLines).
+	// (default webFetchSearchDefaultContext, capped at
+	// webFetchSearchMaxContextLines).
 	Context int
 }
 

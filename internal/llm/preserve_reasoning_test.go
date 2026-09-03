@@ -15,12 +15,14 @@ func TestApplyChatCompletionExtrasUsesPropsCapability(t *testing.T) {
 	t.Parallel()
 
 	var hits atomic.Int32
+	var gotModel atomic.Value
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/props" {
 			http.NotFound(w, r)
 			return
 		}
 		hits.Add(1)
+		gotModel.Store(r.URL.Query().Get("model"))
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"chat_template_caps": map[string]bool{
 				"supports_preserve_reasoning": true,
@@ -30,8 +32,14 @@ func TestApplyChatCompletionExtrasUsesPropsCapability(t *testing.T) {
 	defer srv.Close()
 
 	p := &OpenAIProvider{profiles: []*providerProfile{{name: "default", baseURL: srv.URL + "/v1"}}}
+	if err := p.SetModel("test-model"); err != nil {
+		t.Fatal(err)
+	}
 	params := openai.ChatCompletionNewParams{Model: "test-model"}
 	p.applyChatCompletionExtras(context.Background(), &params)
+	if got := gotModel.Load(); got != "test-model" {
+		t.Fatalf("probe ?model= %v, want test-model", got)
+	}
 
 	b, err := json.Marshal(params)
 	if err != nil {
@@ -266,33 +274,116 @@ func TestSetModelInvalidatesPropsCaps(t *testing.T) {
 func TestLlamaPropsURL(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		in, want string
+		base, model, want string
 	}{
-		{"http://127.0.0.1:8080/v1", "http://127.0.0.1:8080/props"},
-		{"http://127.0.0.1:8080/v1/", "http://127.0.0.1:8080/props"},
-		{"http://127.0.0.1:8080", "http://127.0.0.1:8080/props"},
-		{"", ""},
+		{"http://127.0.0.1:8080/v1", "", "http://127.0.0.1:8080/props"},
+		{"http://127.0.0.1:8080/v1/", "", "http://127.0.0.1:8080/props"},
+		{"http://127.0.0.1:8080", "", "http://127.0.0.1:8080/props"},
+		{"", "", ""},
+		{"http://127.0.0.1:8080/v1", "qwen3.8", "http://127.0.0.1:8080/props?model=qwen3.8"},
+		{"http://127.0.0.1:8080/v1", "my model", "http://127.0.0.1:8080/props?model=my+model"},
 	}
 	for _, tc := range cases {
-		if got := llamaPropsURL(tc.in); got != tc.want {
-			t.Fatalf("llamaPropsURL(%q)=%q, want %q", tc.in, got, tc.want)
+		if got := llamaPropsURL(tc.base, tc.model); got != tc.want {
+			t.Fatalf("llamaPropsURL(%q, %q)=%q, want %q", tc.base, tc.model, got, tc.want)
+		}
+	}
+}
+
+func TestLlamaApplyTemplateURL(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		base, model, want string
+	}{
+		{"http://127.0.0.1:8080/v1", "", "http://127.0.0.1:8080/apply-template"},
+		{"", "", ""},
+		{"http://127.0.0.1:8080/v1", "qwen3.8", "http://127.0.0.1:8080/apply-template?model=qwen3.8"},
+	}
+	for _, tc := range cases {
+		if got := llamaApplyTemplateURL(tc.base, tc.model); got != tc.want {
+			t.Fatalf("llamaApplyTemplateURL(%q, %q)=%q, want %q", tc.base, tc.model, got, tc.want)
 		}
 	}
 }
 
 func TestParsePreserveReasoningCap(t *testing.T) {
 	t.Parallel()
-	if !parsePreserveReasoningCap([]byte(`{"chat_template_caps":{"supports_preserve_reasoning":true}}`)) {
-		t.Fatal("expected true")
+	cases := []struct {
+		name      string
+		body      string
+		supported bool
+		ok        bool
+	}{
+		{"cap-true", `{"chat_template_caps":{"supports_preserve_reasoning":true}}`, true, true},
+		{"cap-false", `{"chat_template_caps":{"supports_preserve_reasoning":false}}`, false, true},
+		{"missing-caps", `{}`, false, true},
+		{"bad-json", `not-json`, false, false},
 	}
-	if parsePreserveReasoningCap([]byte(`{"chat_template_caps":{"supports_preserve_reasoning":false}}`)) {
-		t.Fatal("expected false")
+	for _, tc := range cases {
+		supported, ok := parsePreserveReasoningCap([]byte(tc.body))
+		if supported != tc.supported || ok != tc.ok {
+			t.Fatalf("%s: got (%v, %v), want (%v, %v)", tc.name, supported, ok, tc.supported, tc.ok)
+		}
 	}
-	if parsePreserveReasoningCap([]byte(`{}`)) {
-		t.Fatal("expected false for missing caps")
+}
+
+// TestApplyChatCompletionExtrasFailedProbeNotCached verifies the cold-start
+// fix: a probe that does not complete (404 here) must not pin "off" for the
+// endpoint's lifetime — the next request re-probes and picks up the
+// capability once the endpoint recovers.
+func TestApplyChatCompletionExtrasFailedProbeNotCached(t *testing.T) {
+	t.Parallel()
+
+	var status atomic.Int32
+	status.Store(http.StatusNotFound)
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if s := status.Load(); s != http.StatusOK {
+			http.Error(w, "nope", int(s))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"chat_template_caps": map[string]bool{"supports_preserve_reasoning": true},
+		})
+	}))
+	defer srv.Close()
+
+	p := &OpenAIProvider{profiles: []*providerProfile{{name: "default", baseURL: srv.URL + "/v1"}}}
+
+	// First probe fails: no kwargs, and the negative result is NOT cached.
+	params := openai.ChatCompletionNewParams{Model: "test-model"}
+	p.applyChatCompletionExtras(context.Background(), &params)
+	assertNoChatTemplateKwargs(t, params)
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("/props hits = %d, want 1", got)
 	}
-	if parsePreserveReasoningCap([]byte(`not-json`)) {
-		t.Fatal("expected false for bad json")
+
+	// Endpoint recovers: the next request re-probes and sends the kwargs.
+	status.Store(http.StatusOK)
+	params2 := openai.ChatCompletionNewParams{Model: "test-model"}
+	p.applyChatCompletionExtras(context.Background(), &params2)
+	b, err := json.Marshal(params2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(b, &body); err != nil {
+		t.Fatal(err)
+	}
+	kwargs, ok := body["chat_template_kwargs"].(map[string]any)
+	if !ok || kwargs["preserve_reasoning"] != true {
+		t.Fatalf("expected preserve_reasoning=true after recovery, got %s", b)
+	}
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("/props hits = %d, want 2 (failed probe not cached)", got)
+	}
+
+	// The successful probe IS cached: no further hits.
+	params3 := openai.ChatCompletionNewParams{Model: "test-model"}
+	p.applyChatCompletionExtras(context.Background(), &params3)
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("/props hits = %d, want 2 (success cached)", got)
 	}
 }
 

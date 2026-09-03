@@ -178,9 +178,80 @@ func TestPrefixRelPaths(t *testing.T) {
 
 func TestPrefixRelPathsPreservesEmptyLines(t *testing.T) {
 	got := prefixRelPaths("a.go:1:line\n\nb.go:2:other", "pkg")
-	want := "pkg/a.go:1:line\n\npkg/b.go:2:other"
+	if got != "pkg/a.go:1:line\n\npkg/b.go:2:other" {
+		t.Fatalf("got %q want %q", got, "pkg/a.go:1:line\n\npkg/b.go:2:other")
+	}
+}
+
+// TestPrefixRelPathsContextLines pins the context-line ("path-NUM-content")
+// handling: the relPrefix joins ONLY the path portion. The old code split on
+// the first ':' alone, so a context line without a ':' fed the whole line
+// into filepath.Join and filepath.Clean collapsed "//" in the content to
+// "/" — Go comments reached the model as "/ comment".
+func TestPrefixRelPathsContextLines(t *testing.T) {
+	got := prefixRelPaths("view.go-52-// stream handlers for the round\nview.go:57:func prepareMessages()\nview.go-58-\tvar view []llm.Message", "internal/agent")
+	want := "internal/agent/view.go-52-// stream handlers for the round\n" +
+		"internal/agent/view.go:57:func prepareMessages()\n" +
+		"internal/agent/view.go-58-\tvar view []llm.Message"
 	if got != want {
 		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+// TestPrefixRelPathsContextLineColonInContent covers a context line whose
+// content contains a ':' after the line number: the path is still everything
+// before the "NUM-" separator, and the content (including the colon) is
+// preserved verbatim.
+func TestPrefixRelPathsContextLineColonInContent(t *testing.T) {
+	got := prefixRelPaths("view.go-54-// \"error\" (compact_last_resort=error): the diagnostic", "internal/agent")
+	want := "internal/agent/view.go-54-// \"error\" (compact_last_resort=error): the diagnostic"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+// TestSearchCodeContextLinesUnclamped pins the removal of the
+// context_lines pre-clamp: a request far above the old cap of 20 must be
+// honored as-is (the searchMaxOutputBytes cap with its truncation notice is
+// the output backstop). The silent clamp returned byte-identical output for
+// every larger request and drove retry loops incrementing context_lines.
+func TestSearchCodeContextLinesUnclamped(t *testing.T) {
+	if _, err := exec.LookPath("rg"); err != nil {
+		t.Skip("rg not installed (context-line separators differ in the go fallback)")
+	}
+
+	dir := t.TempDir()
+	var sb strings.Builder
+	sb.WriteString("package a\n")
+	for i := 0; i < 60; i++ {
+		fmt.Fprintf(&sb, "line%02d filler\n", i)
+	}
+	sb.WriteString("func needleTarget() {}\n")
+	for i := 0; i < 60; i++ {
+		fmt.Fprintf(&sb, "tail%02d filler\n", i)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte(sb.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exec := NewExecutor(dir)
+
+	// 50 context lines on each side of the match (line 62): the window is
+	// lines 12-112. The old cap of 20 would have shown only lines 42-82, so
+	// the first/last context lines below prove the request was honored.
+	out, err := exec.SearchCode(context.Background(), "needleTarget", "", "", 50, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"12-line10 filler", "112-tail49 filler"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("context_lines=50 not honored (missing %q):\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "1:package a") {
+		t.Fatalf("context window exceeded the request (line 1 is 61 lines above the match):\n%s", out)
+	}
+	if strings.Contains(out, "clamped") {
+		t.Fatalf("unexpected clamp notice: %q", out)
 	}
 }
 
