@@ -58,6 +58,8 @@ const COMPONENT_MODULES = [
   // Delete-approval modal; imports editor.js (openModal / closeModal,
   // stubbed) and settings.js (sendNotification) — last, after both.
   'internal/server/web/components/delete-approval.js',
+  // Composer input helpers (slash suggest + attachments); imports icons.js.
+  'internal/server/web/components/composer.js',
 ];
 
 // Strips the module syntax the tests run as classic scripts:
