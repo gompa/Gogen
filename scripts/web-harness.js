@@ -47,6 +47,8 @@ const COMPONENT_MODULES = [
   // Markdown rendering pipeline; imports editor.js (colorizeNode /
   // openFileAtLine, stubbed) and the marked / DOMPurify vendor stubs.
   'internal/server/web/components/markdown.js',
+  // Tool-result rendering; imports editor.js (colorizeElement, stubbed).
+  'internal/server/web/components/tool-result.js',
   'internal/server/web/components/model-picker.js',
   'internal/server/web/components/board.js',
   'internal/server/web/components/toc.js',

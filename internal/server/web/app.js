@@ -162,6 +162,18 @@
             setMessageMarkdown,
             renderStreamMarkdown,
         } from '/components/markdown.js';
+        // Tool-result rendering (components/tool-result.js): the expandable
+        // result body, the deferred-during-replay colorize queue, and the
+        // compact tool-args formatters. The tool-card DOM + streaming state
+        // stay here.
+        import {
+            appendExpandableResult,
+            bigArgChars,
+            flushDeferredResultColorize,
+            formatArgsCompact,
+            initToolResult,
+            readFilePathFromArgs,
+        } from '/components/tool-result.js';
         import { marked } from '/vendor/marked.esm.js';
         import DOMPurify from '/vendor/dompurify.esm.js';
 
@@ -1077,11 +1089,6 @@
         // ordering the old single-task synchronous replay had, when no event
         // could run until the whole rebuild finished.
         let replayEventBuffer = [];
-        // Tool-result colorize requests made while a history replay is in
-        // flight are deferred until the replay finishes and first paint lands,
-        // so Monaco tokenization doesn't fight the transcript rebuild for
-        // main-thread time. Same colorize output, just later.
-        let deferredResultColorize = [];
         // Monotonic counter for message positions (used for forking)
         let msgIdxCounter = 0;
 
@@ -1674,152 +1681,6 @@
             // Same as focusPane: the sidebar click took focus away from the
             // composer — return it so the user can type immediately.
             inputArea.focus();
-        }
-
-        // Collapse only when output is genuinely large (DOM / scroll cost).
-        const BIG_RESULT_CHARS = 32000;
-        const BIG_RESULT_LINES = 400;
-        const BIG_ARG_CHARS = 4000;
-
-        function isResultReallyBig(text) {
-            const s = text || '';
-            if (!s) return false;
-            if (s.length > BIG_RESULT_CHARS) return true;
-            // Avoid split on huge strings when length already qualifies.
-            let lines = 1;
-            for (let i = 0; i < s.length; i++) {
-                if (s.charCodeAt(i) === 10) {
-                    lines++;
-                    if (lines > BIG_RESULT_LINES) return true;
-                }
-            }
-            return false;
-        }
-
-        function summarizeResult(result, success) {
-            const trimmed = (result || '').trim();
-            if (!trimmed) return success ? '(empty)' : '(no output)';
-            // Show full output unless it's really big.
-            if (!isResultReallyBig(trimmed)) return trimmed;
-            const lines = trimmed.split('\n').length;
-            const chars = trimmed.length;
-            if (!success) {
-                let first = trimmed.split('\n')[0];
-                if (first.length > 200) first = first.slice(0, 197) + '...';
-                return `${first}\n\n… (${lines} lines, ${chars} chars)`;
-            }
-            return `(large output: ${lines} lines, ${chars} chars)`;
-        }
-
-        // Tool-result syntax highlighting (Monaco tokenization) is deferred
-        // while a history replay is rebuilding the pane: restored sessions
-        // paint the transcript first, then colorize in idle-time slices.
-        // The colorize itself is unchanged, so restored cards end up looking
-        // identical to live ones.
-        function scheduleResultColorize(el, language) {
-            if (replayInProgress) {
-                deferredResultColorize.push(() => colorizeElement(el, language));
-                return;
-            }
-            colorizeElement(el, language);
-        }
-
-        // Run deferred tool-result colorizes after the replay finishes, in
-        // ~12ms idle slices so a session with many large results doesn't jank
-        // the main thread in one block. Each job is awaited so the slice
-        // deadline actually bounds the synchronous tokenization work.
-        function flushDeferredResultColorize() {
-            if (!deferredResultColorize.length) return;
-            const jobs = deferredResultColorize;
-            deferredResultColorize = [];
-            let i = 0;
-            const runSlice = async () => {
-                const deadline = performance.now() + 12;
-                while (i < jobs.length && performance.now() < deadline) {
-                    try { await jobs[i](); } catch (_) { /* keep going */ }
-                    i++;
-                }
-                if (i < jobs.length) {
-                    if (typeof requestIdleCallback === 'function') {
-                        requestIdleCallback(runSlice, { timeout: 100 });
-                    } else {
-                        setTimeout(runSlice, 0);
-                    }
-                }
-            };
-            if (typeof requestIdleCallback === 'function') {
-                requestIdleCallback(runSlice, { timeout: 400 });
-            } else {
-                setTimeout(runSlice, 50);
-            }
-        }
-
-        function appendExpandableResult(body, result, success, truncated, options = {}) {
-            const { language = '' } = options;
-            const content = document.createElement('div');
-            content.className = `tool-result-content ${success ? '' : 'error-content'}`;
-            const full = result || '';
-            const summary = summarizeResult(full, success);
-            content.textContent = summary;
-            body.appendChild(content);
-
-            // Copy button on tool results
-            if (full.trim()) {
-                const copyBtn = document.createElement('button');
-                copyBtn.className = 'tool-result-copy';
-                copyBtn.textContent = 'Copy';
-                copyBtn.onclick = () => { copyTextToClipboard(full).then((ok) => showToast(ok ? 'Copied' : 'Copy failed', ok ? 'success' : 'error')); };
-                body.appendChild(copyBtn);
-            }
-
-            const canHighlight = success && language && language !== 'plaintext';
-            const showingFull = summary === full.trim();
-            if (canHighlight && showingFull) {
-                scheduleResultColorize(content, language);
-            }
-
-            if (summary !== full.trim() && (full.trim() || truncated)) {
-                const expandBtn = document.createElement('button');
-                expandBtn.textContent = truncated ? 'Show received output' : 'Show full output';
-                expandBtn.className = 'btn-link';
-                expandBtn.onclick = () => {
-                    content.textContent = full;
-                    content.classList.remove('monaco-colorized');
-                    delete content.dataset.monacoColorized;
-                    if (canHighlight) colorizeElement(content, language);
-                    expandBtn.remove();
-                };
-                body.appendChild(expandBtn);
-            }
-        }
-
-        function readFilePathFromArgs(args) {
-            if (!args || typeof args !== 'object') return '';
-            const p = args.file_path || args.path || '';
-            return typeof p === 'string' ? p : '';
-        }
-
-        function parseInlineJSONArgs(raw) {
-            const s = (raw || '').trim();
-            if (!s.startsWith('{')) return null;
-            try {
-                return JSON.parse(s);
-            } catch (_) {
-                return null;
-            }
-        }
-
-        function formatArgsCompact(rawJSON, maxLen = BIG_ARG_CHARS) {
-            const args = parseInlineJSONArgs(rawJSON);
-            if (!args || typeof args !== 'object') return '';
-            const parts = [];
-            for (const [k, v] of Object.entries(args)) {
-                if (k === 'diff') continue;
-                let val = typeof v === 'string' ? v : String(v);
-                if (val.length > maxLen) val = val.slice(0, maxLen - 3) + '...';
-                parts.push(`${k}=${JSON.stringify(val)}`);
-            }
-            return parts.length ? `(${parts.join(', ')})` : '';
         }
 
         function abortInFlightUI(message) {
@@ -2546,8 +2407,8 @@
                     continue;
                 }
                 let displayValue;
-                if (typeof value === 'string' && value.length > BIG_ARG_CHARS) {
-                    displayValue = `"${value.substring(0, BIG_ARG_CHARS - 3)}..."`;
+                if (typeof value === 'string' && value.length > bigArgChars()) {
+                    displayValue = `"${value.substring(0, bigArgChars() - 3)}..."`;
                 } else if (typeof value === 'string') {
                     displayValue = `"${value}"`;
                 } else {
@@ -2577,8 +2438,8 @@
                     frag.appendChild(link);
                 } else {
                     let displayValue;
-                    if (typeof value === 'string' && value.length > BIG_ARG_CHARS) {
-                        displayValue = `"${value.substring(0, BIG_ARG_CHARS - 3)}..."`;
+                    if (typeof value === 'string' && value.length > bigArgChars()) {
+                        displayValue = `"${value.substring(0, bigArgChars() - 3)}..."`;
                     } else if (typeof value === 'string') {
                         displayValue = `"${value}"`;
                     } else {
@@ -5236,6 +5097,13 @@
             showToast: (message, kind) => showToast(message, kind),
             copyTextToClipboard: (text) => copyTextToClipboard(text),
             getMessageRawStore: () => messageRawStore,
+        });
+
+        // === Tool-result rendering (components/tool-result.js) ===
+        initToolResult({
+            showToast: (message, kind) => showToast(message, kind),
+            copyTextToClipboard: (text) => copyTextToClipboard(text),
+            isReplaying: () => replayInProgress,
         });
 
         // === Settings modal + persisted preferences (components/settings.js) ===
