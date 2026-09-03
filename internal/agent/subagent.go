@@ -6,6 +6,8 @@ import (
 	"log"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
@@ -38,7 +40,103 @@ const MaxSubagentReportBytes = 64 * 1024
 // TruncateSubagentReport bounds a subagent's final report to
 // MaxSubagentReportBytes. Shared by the web and TUI spawners.
 func TruncateSubagentReport(report string) string {
-	return contextmgr.TruncateMarked(report, MaxSubagentReportBytes, "… (truncated)")
+	return contextmgr.Truncate(report, MaxSubagentReportBytes,
+		contextmgr.TruncateOptions{Marker: "… (truncated)"})
+}
+
+// FinishSubagentOutcome writes the child's final outcome onto its snapshot
+// and persists it, so the sidebar can render the true result after a
+// reload/restart (the subagent_started/finished events are not replayed to
+// connecting clients). The turn's own flush already wrote the transcript;
+// this full flush adds the outcome fields (persistMu serializes against any
+// tail of the turn's write). Status is "success" or "failed" from err; the
+// summary is the error message on failure (the report is whatever the child
+// produced before dying) or the truncated report on success. Shared by the
+// web and TUI spawners so the two hosts cannot drift.
+func (a *Agent) FinishSubagentOutcome(report string, err error) {
+	status := "success"
+	summary := TruncateSubagentReport(report)
+	if err != nil {
+		status = "failed"
+		summary = err.Error()
+	}
+	a.SetSubagentOutcome(status, summary)
+	a.FlushSession()
+}
+
+// SubagentModelSource identifies which tier of the subagent model cascade
+// won (see ResolveSubagentModel). The source drives the apply policy at the
+// spawner: the explicit tool argument is a hard requirement (a model that
+// cannot be selected fails the spawn), while the configured and parent
+// tiers fall back to the model the child's provider was seeded with
+// (fail open).
+type SubagentModelSource int
+
+const (
+	// SubagentModelInherited: no tier applies; the child keeps the model
+	// its provider was seeded with (the workspace default).
+	SubagentModelInherited SubagentModelSource = iota
+	// SubagentModelExplicit: the subagent tool's explicit model argument.
+	SubagentModelExplicit
+	// SubagentModelConfigured: the configured subagent_model setting.
+	SubagentModelConfigured
+	// SubagentModelParent: the parent's live model (only when it differs
+	// from the workspace default — the child is already seeded with that).
+	SubagentModelParent
+)
+
+// String names the tier for log messages.
+func (s SubagentModelSource) String() string {
+	switch s {
+	case SubagentModelExplicit:
+		return "explicit model"
+	case SubagentModelConfigured:
+		return "configured subagent model"
+	case SubagentModelParent:
+		return "parent model"
+	default:
+		return "inherited model"
+	}
+}
+
+// ResolveSubagentModel decides which model a subagent child runs on.
+// Cascade: the subagent tool's explicit model argument > the configured
+// subagent model (subagent_model) > the parent's live model (skipped when
+// it equals workspaceDefault, since the child's provider is already seeded
+// with that). Returns "" with SubagentModelInherited when no tier applies.
+// The spawner applies the winner with ApplySubagentModel. Shared by the web
+// and TUI spawners so the two cannot drift (like ApplySubagentThinkingLevel).
+func ResolveSubagentModel(explicit, configured, parentModel, workspaceDefault string) (string, SubagentModelSource) {
+	switch {
+	case explicit != "":
+		return explicit, SubagentModelExplicit
+	case configured != "":
+		return configured, SubagentModelConfigured
+	case parentModel != "" && parentModel != workspaceDefault:
+		return parentModel, SubagentModelParent
+	default:
+		return "", SubagentModelInherited
+	}
+}
+
+// ApplySubagentModel selects the model resolved by ResolveSubagentModel on
+// the child agent, applying the source's policy: SubagentModelExplicit is a
+// hard requirement — a model that cannot be selected returns an error (the
+// spawner fails the spawn); the other tiers log and fall back to the model
+// the child's provider was seeded with (fail open). An empty model
+// (SubagentModelInherited) selects nothing. Shared by the web and TUI
+// spawners so the two cannot drift (like ApplySubagentThinkingLevel).
+func ApplySubagentModel(ctx context.Context, child *Agent, model string, src SubagentModelSource) error {
+	if model == "" {
+		return nil
+	}
+	if err := child.SelectModel(ctx, model); err != nil {
+		if src == SubagentModelExplicit {
+			return fmt.Errorf("subagent model: %w", err)
+		}
+		log.Printf("subagent: %s %q not selectable on child (%v); using seeded default model", src, model, err)
+	}
+	return nil
 }
 
 // ApplySubagentThinkingLevel resolves and applies the child's reasoning
@@ -311,4 +409,134 @@ func handleReport(_ context.Context, a *Agent, args map[string]any) (string, err
 		return "", err
 	}
 	return "Reported to the parent session.", nil
+}
+
+// SetSubagentSpawner installs the nested-session runner (nil detaches).
+// Called once at startup by the web server and TUI runner; the subagent tool
+// stays gated on SubagentsEnabled regardless.
+func (a *Agent) SetSubagentSpawner(s SubagentSpawner) {
+	a.spawnerMu.Lock()
+	a.spawner = s
+	a.spawnerMu.Unlock()
+}
+
+// SubagentSpawner returns the installed nested-session runner (nil when
+// subagents are unavailable in this mode).
+func (a *Agent) SubagentSpawner() SubagentSpawner {
+	a.spawnerMu.RLock()
+	defer a.spawnerMu.RUnlock()
+	return a.spawner
+}
+
+// SetSubagentDepth sets this agent's nesting depth (0 = main agent). The
+// spawner sets depth+1 on children it creates.
+func (a *Agent) SetSubagentDepth(depth int) {
+	a.subagentDepth.Store(int32(depth))
+}
+
+// SubagentDepth returns this agent's nesting depth (0 = main agent).
+func (a *Agent) SubagentDepth() int {
+	return int(a.subagentDepth.Load())
+}
+
+// SetParentID marks this session as a nested (subagent) child of parentID
+// (empty clears the mark).
+func (a *Agent) SetParentID(parentID string) {
+	a.parentID.Store(parentID)
+}
+
+// ParentID returns the parent session id for nested (subagent) sessions
+// (empty for top-level sessions).
+func (a *Agent) ParentID() string {
+	v, _ := a.parentID.Load().(string)
+	return v
+}
+
+// subagentOutcome is the persisted final outcome of a nested (subagent)
+// session. Status is "" (unknown / not finished), "success", or "failed".
+type subagentOutcome struct {
+	Status  string
+	Summary string
+}
+
+// SetSubagentOutcome records the final outcome of a nested (subagent)
+// session. The spawner writes it at every terminal transition (natural
+// completion, cancellation, eviction) so the persisted snapshot carries the
+// truth across restarts; the sidebar reads it from the sessions payload
+// when the live subagent_started/finished events are gone. Empty status
+// means the child has not finished (or is not a subagent).
+func (a *Agent) SetSubagentOutcome(status, summary string) {
+	a.subagentOutcome.Store(&subagentOutcome{Status: status, Summary: summary})
+}
+
+// SubagentOutcome returns the recorded final outcome: the status ("" /
+// "success" / "failed") and the summary text.
+func (a *Agent) SubagentOutcome() (string, string) {
+	v := a.subagentOutcome.Load()
+	if v == nil {
+		return "", ""
+	}
+	o := v.(*subagentOutcome)
+	return o.Status, o.Summary
+}
+
+// SetReportHook installs the child-scoped report hook (continuable
+// subagents only): delivering a progress message to the live parent
+// session. nil detaches (the report tool is then not registered).
+func (a *Agent) SetReportHook(h func(text string) error) {
+	a.reportHookMu.Lock()
+	a.reportHook = h
+	a.reportHookMu.Unlock()
+}
+
+// ReportHook returns the installed report hook (nil when this agent is not
+// a continuable child).
+func (a *Agent) ReportHook() func(text string) error {
+	a.reportHookMu.RLock()
+	defer a.reportHookMu.RUnlock()
+	return a.reportHook
+}
+
+// reportToParent delivers a progress message to the live parent session via
+// the installed hook.
+func (a *Agent) reportToParent(text string) error {
+	a.reportHookMu.RLock()
+	h := a.reportHook
+	a.reportHookMu.RUnlock()
+	if h == nil {
+		return fmt.Errorf("report is not available in this session")
+	}
+	return h(text)
+}
+
+// subagentWiring groups the nested-session (subagent) state: the installed
+// spawner, this agent's nesting depth and parent link, the persisted
+// subagent outcome, and the child-scoped report hook.
+type subagentWiring struct {
+	// spawnerMu guards spawner (the nested-session runner installed once at
+	// startup by the server/TUI). Reads happen per turn (llmTools,
+	// executeTool), so the guard keeps the write/read race-free.
+	spawnerMu sync.RWMutex
+	spawner   SubagentSpawner
+	// subagentDepth is this agent's nesting depth (main agent = 0; the
+	// spawner sets depth+1 on children). Bounds spawning against
+	// SubagentMaxDepth (default 1 = subagents cannot spawn subagents).
+	subagentDepth atomic.Int32
+	// parentID is non-empty for nested (subagent) sessions: persisted into
+	// the session snapshot so the store can exclude them from the flat
+	// list, cascade-delete them with the parent, and cap them per parent.
+	parentID atomic.Value // string
+	// subagentOutcome records the final outcome of a nested (subagent)
+	// session (nil for top-level sessions and children that have not
+	// finished). Persisted into the snapshot so the sidebar can render the
+	// true result after a reload/restart, when the subagent_started/
+	// finished events are not replayed.
+	subagentOutcome atomic.Value // *subagentOutcome
+
+	// reportHookMu guards reportHook: the web spawner installs it on
+	// continuable children so the child-scoped report tool can deliver a
+	// progress message into the live parent session. Nil for non-children
+	// and TUI children (the report tool is gated on it).
+	reportHookMu sync.RWMutex
+	reportHook   func(text string) error
 }

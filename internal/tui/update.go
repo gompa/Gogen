@@ -83,6 +83,9 @@ func (m *Model) handleMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case streamThinkingMsg:
 		return m.handleStreamThinkingMsg(msg)
 
+	case streamStatsMsg:
+		return m.handleStreamStatsMsg(msg)
+
 	case streamToolCallMsg:
 		return m.handleStreamToolCallMsg(msg)
 
@@ -412,6 +415,23 @@ func (m *Model) handleStreamThinkingMsg(msg streamThinkingMsg) (tea.Model, tea.C
 	}
 	m.handleStreamThinking(msg.token)
 	return m, m.setProgress(progressActive, "")
+}
+
+// handleStreamStatsMsg stores the shared SpeedMeter's smoothed token rate
+// for the progress line. The message is timer-driven (a few per second
+// while the round streams) and always belongs to the focused session —
+// background sessions' adapters buffer their events instead of sending
+// them — so mirroring onto the focused liveSession keeps a focus switch
+// from showing a stale rate.
+func (m *Model) handleStreamStatsMsg(msg streamStatsMsg) (tea.Model, tea.Cmd) {
+	if !m.streaming {
+		return m, nil
+	}
+	m.streamSpeedLine = DimStyle.Render(fmt.Sprintf("%.0f tok/s", msg.toksPerSec))
+	if s := m.focusedSession(); s != nil {
+		s.streamSpeedLine = m.streamSpeedLine
+	}
+	return m, nil
 }
 
 func (m *Model) handleStreamToolCallMsg(msg streamToolCallMsg) (tea.Model, tea.Cmd) {

@@ -110,3 +110,21 @@ func (p *PinManager) ReplacePins(pins map[int]struct{}) {
 		p.pinned[idx] = struct{}{}
 	}
 }
+
+// pinLastUser pins the most recent user message so it survives compaction.
+// When no PinManager is configured the tool degrades to a no-op (this only
+// happens in tests/custom embeds) so the LLM sees a successful acknowledgement
+// rather than a confusing error.
+func (a *Agent) pinLastUser() error {
+	if a.PinManager == nil {
+		return nil
+	}
+	a.PinManager.PinLastUser(a.Messages)
+	return nil
+}
+func pinnedSet(p *PinManager) map[int]struct{} {
+	if p == nil {
+		return nil
+	}
+	return p.PinnedSet()
+}

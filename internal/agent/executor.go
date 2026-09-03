@@ -617,20 +617,23 @@ func watchCommandIdle(out *commandOutputWriter, idle time.Duration, cancel conte
 // applyToolOutputCap appends the truncation marker when the bounded writer
 // dropped output beyond the configured cap. The writer keeps the FIRST cap
 // bytes — the same prefix the context manager's tool-result cap preserves —
-// so this only reserves room for the marker, mirroring
-// contextmgr.truncateToolResult's budget discipline. The marker shares the
-// manager's standard prefix, so the later truncation pass sees it and leaves
-// the result untouched (no double-marking).
+// and the content is known to have been cut, so ForceMarker appends the
+// marker even when the content sits at exactly the cap, with its length
+// reserved inside the cap (same budget discipline as contextmgr's
+// tool-result cap). The marker shares the manager's standard prefix, so the
+// later truncation pass sees it and leaves the result untouched (no
+// double-marking).
 func (e *Executor) applyToolOutputCap(content string) string {
 	cap := e.maxToolOutputBytes()
 	if cap <= 0 {
 		return content
 	}
 	marker := fmt.Sprintf("\n… truncated (command output exceeds %d bytes)", cap)
-	if len(marker) >= cap {
-		return contextmgr.TruncateRuneSafe(content, cap)
-	}
-	return contextmgr.TruncateRuneSafe(content, cap-len(marker)) + marker
+	return contextmgr.Truncate(content, cap, contextmgr.TruncateOptions{
+		Marker:         marker,
+		MarkerInBudget: true,
+		ForceMarker:    true,
+	})
 }
 
 // outputBuffer is a mutex-guarded byte buffer shared by the command output

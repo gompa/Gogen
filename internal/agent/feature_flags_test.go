@@ -100,3 +100,87 @@ func TestSessionAgentFactorySeedsFlags(t *testing.T) {
 		t.Fatalf("session id = %q, want test-id", a.SessionID)
 	}
 }
+
+// TestSharedFeatureFlagsStore verifies the shared-reader contract: agents
+// pointed at one FeatureFlags store see every write — from the store (the
+// workspace toggle) or from any other agent — immediately, with no mirror
+// and no sweep.
+func TestSharedFeatureFlagsStore(t *testing.T) {
+	prov := llm.NewMockProvider()
+	exec := NewExecutor(t.TempDir())
+	a1 := NewAgent(prov, exec, nil)
+	a2 := NewAgent(prov, exec, nil)
+	shared := NewFeatureFlags(false, false, 0, 0)
+	a1.SetFeatureFlags(shared)
+	a2.SetFeatureFlags(shared)
+
+	// A workspace-side write is visible to every attached agent at once.
+	shared.SetBoardEnabled(true)
+	shared.SetSubagentsEnabled(true)
+	shared.SetSubagentMaxDepth(3)
+	shared.SetSubagentMaxConcurrent(2)
+	if !a1.BoardEnabled() || !a2.BoardEnabled() {
+		t.Fatalf("shared board toggle not visible: a1=%v a2=%v", a1.BoardEnabled(), a2.BoardEnabled())
+	}
+	if !a1.SubagentsEnabled() || !a2.SubagentsEnabled() {
+		t.Fatalf("shared subagent toggle not visible: a1=%v a2=%v", a1.SubagentsEnabled(), a2.SubagentsEnabled())
+	}
+	if a1.SubagentMaxDepth() != 3 || a2.SubagentMaxDepth() != 3 {
+		t.Fatalf("shared depth not visible: a1=%d a2=%d", a1.SubagentMaxDepth(), a2.SubagentMaxDepth())
+	}
+	if a1.SubagentMaxConcurrent() != 2 || a2.SubagentMaxConcurrent() != 2 {
+		t.Fatalf("shared limit not visible: a1=%d a2=%d", a1.SubagentMaxConcurrent(), a2.SubagentMaxConcurrent())
+	}
+
+	// An agent-side write through the shared store reaches the other agent.
+	a1.SetBoardEnabled(false)
+	if a2.BoardEnabled() {
+		t.Fatal("agent-side write did not reach the other agent")
+	}
+
+	// Detaching falls back to a private store: further shared writes are
+	// invisible to the detached agent.
+	a1.SetFeatureFlags(nil)
+	shared.SetBoardEnabled(true)
+	if a1.BoardEnabled() {
+		t.Fatal("detached agent still reads the shared store")
+	}
+	if !a2.BoardEnabled() {
+		t.Fatal("attached agent lost the shared store")
+	}
+}
+
+// TestSessionAgentFactorySharedFlags verifies NewSessionAgent prefers the
+// shared FeatureFlags store over the per-value fields: the created agent
+// reads the store directly, so a later store write is visible without any
+// re-seed.
+func TestSessionAgentFactorySharedFlags(t *testing.T) {
+	prov := llm.NewMockProvider()
+	exec := NewExecutor(t.TempDir())
+	shared := NewFeatureFlags(true, false, 4, 7)
+	opts := SessionAgentOptions{
+		Provider:     prov,
+		Executor:     exec,
+		WorkingDir:   exec.GetWorkingDir(),
+		FeatureFlags: shared,
+		// Value fields must be ignored when the shared store is set.
+		BoardEnabled:          false,
+		SubagentsEnabled:      true,
+		SubagentMaxDepth:      1,
+		SubagentMaxConcurrent: 1,
+	}
+	a := NewSessionAgent(opts, nil, "shared-id")
+	if a.FeatureFlags() != shared {
+		t.Fatal("factory did not attach the shared store")
+	}
+	if !a.BoardEnabled() || a.SubagentsEnabled() {
+		t.Fatalf("agent did not read the shared store: board=%v subagents=%v", a.BoardEnabled(), a.SubagentsEnabled())
+	}
+	if a.SubagentMaxDepth() != 4 || a.SubagentMaxConcurrent() != 7 {
+		t.Fatalf("agent did not read the shared store: depth=%d limit=%d", a.SubagentMaxDepth(), a.SubagentMaxConcurrent())
+	}
+	shared.SetSubagentsEnabled(true)
+	if !a.SubagentsEnabled() {
+		t.Fatal("later shared write not visible to the factory-created agent")
+	}
+}

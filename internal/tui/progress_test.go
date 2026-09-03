@@ -107,6 +107,49 @@ func TestRenderProgressInput(t *testing.T) {
 	}
 }
 
+func TestStreamStatsProgressLine(t *testing.T) {
+	m := newStreamTestModel()
+
+	// Not streaming: stats are ignored (a superseded turn's straggler).
+	m.handleStreamStatsMsg(streamStatsMsg{toksPerSec: 42})
+	if m.streamSpeedLine != "" {
+		t.Fatalf("stats applied while not streaming: %q", m.streamSpeedLine)
+	}
+
+	m.streaming = true
+	m.progressPhase = progressActive
+	m.handleStreamStatsMsg(streamStatsMsg{toksPerSec: 42})
+	if m.streamSpeedLine == "" {
+		t.Fatal("streamSpeedLine not set after stats")
+	}
+	if got := m.renderProgressInput(); !strings.Contains(got, "42 tok/s") {
+		t.Fatalf("progress line missing the rate: %q", got)
+	}
+
+	// The rate shows while a tool's arguments stream in too (the args
+	// count toward the shared meter).
+	m.activeToolName = "patch_file"
+	if got := m.renderProgressInput(); !strings.Contains(got, "42 tok/s") {
+		t.Fatalf("preparing line missing the rate: %q", got)
+	}
+
+	// The rate shows on the thinking indicator too (thinking tokens
+	// feed the shared meter).
+	m.activeToolName = ""
+	m.progressPhase = progressThinking
+	m.progressLabel = "thinking"
+	m.spinner = newProgressSpinner()
+	if got := m.renderProgressInput(); !strings.Contains(got, "42 tok/s") {
+		t.Fatalf("thinking line missing the rate: %q", got)
+	}
+
+	// Turn end / cancel clears the rate with the progress.
+	m.clearProgress()
+	if m.streamSpeedLine != "" {
+		t.Fatalf("streamSpeedLine not cleared: %q", m.streamSpeedLine)
+	}
+}
+
 func TestPadInputBand(t *testing.T) {
 	if got := padInputBand("hi", 1); got != "hi" {
 		t.Fatalf("height 1: %q", got)

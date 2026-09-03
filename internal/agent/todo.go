@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"gogen/internal/ioutil"
+	"gogen/internal/session"
 )
 
 const (
@@ -17,20 +19,13 @@ const (
 	maxTodos     = 50
 )
 
-// TodoItem represents a single task.
-type TodoItem struct {
-	ID        int       `json:"id"`
-	Text      string    `json:"text"`
-	Status    string    `json:"status"` // pending, done
-	CreatedAt time.Time `json:"created_at"`
-	DoneAt    time.Time `json:"done_at,omitempty"`
-}
-
-// TodoList manages a persistent todo list.
-type TodoList struct {
-	Items  []TodoItem `json:"items"`
-	NextID int        `json:"next_id"`
-}
+// TodoItem and TodoList are the persisted todo value types. Canonical
+// definitions live in internal/session (the storage layer owns the
+// on-disk format); these aliases keep existing references compiling.
+type (
+	TodoItem = session.TodoItem
+	TodoList = session.TodoList
+)
 
 // TodoManager handles in-memory todo operations for the current session.
 // Persistence is via SessionSnapshot (or a legacy file when sessions are disabled).
@@ -268,4 +263,42 @@ func (m *TodoManager) ClearDoneTodos() (string, error) {
 	}
 	m.todos.Items = remaining
 	return fmt.Sprintf("Cleared %d completed todos", cleared), nil
+}
+
+// todo ensures the TodoManager is initialized and returns it.
+func (a *Agent) todo() (*TodoManager, error) {
+	if a.TodoManager == nil {
+		return nil, fmt.Errorf("todo manager is not initialized")
+	}
+	return a.TodoManager, nil
+}
+func todoSnapshot(m *TodoManager) *TodoList {
+	if m == nil {
+		return nil
+	}
+	return m.Snapshot()
+}
+
+// ImportLegacyTodos adopts a project-level `.gogen/todos.json` into the current
+// session once, then persists the session so the todos become session-scoped.
+func (a *Agent) ImportLegacyTodos() bool {
+	if a.TodoManager == nil || !a.TodoManager.ImportLegacyFile() {
+		return false
+	}
+	a.persistTodos()
+	return true
+}
+
+// persistTodos writes todo changes: with the session when persistence is on,
+// otherwise to the legacy project-level todos file.
+func (a *Agent) persistTodos() {
+	if a.SessionStore != nil && a.SessionID != "" {
+		a.FlushSession()
+		return
+	}
+	if a.TodoManager != nil {
+		if err := a.TodoManager.saveLegacy(); err != nil {
+			log.Printf("todo save failed: %v", err)
+		}
+	}
 }

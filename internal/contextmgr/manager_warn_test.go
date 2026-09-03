@@ -43,7 +43,7 @@ func TestCompactPrimaryPathFitsAtDefaultTrigger(t *testing.T) {
 		msgs = append(msgs, llm.Message{Role: "user", Content: "tail message"})
 	}
 
-	out, _, err := m.CompactPinned(context.Background(), viewPrefix, msgs, nil, nil)
+	out, _, err := m.Compact(context.Background(), msgs, CompactOptions{ViewPrefix: viewPrefix})
 	if err != nil {
 		t.Fatal(err)
 	}

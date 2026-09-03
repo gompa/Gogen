@@ -19,6 +19,7 @@ import (
 	"gogen/internal/agent"
 	"gogen/internal/config"
 	"gogen/internal/llm"
+	"gogen/internal/streambuf"
 
 	"github.com/gorilla/websocket"
 )
@@ -178,7 +179,7 @@ func TestWSToolCallArgsDeltasAreCoalesced(t *testing.T) {
 // stamped buffer-length positions would break this and make the client drop
 // or duplicate a tail.
 func TestWSToolCallDeltaArgsPosIsMonotonicAndExact(t *testing.T) {
-	// Multi-byte content: positions are UTF-16 code units (liveUTF16Len),
+	// Multi-byte content: positions are UTF-16 code units (streambuf.UTF16Len),
 	// so an emoji/CJK body catches a byte-vs-code-unit mixup.
 	body := strings.Repeat("+ línea con acento y emoji 😀\n", 400)
 	stub := &argsStreamStub{
@@ -218,14 +219,14 @@ func TestWSToolCallDeltaArgsPosIsMonotonicAndExact(t *testing.T) {
 		if d.ArgsPos <= prev && i > 0 {
 			t.Fatalf("frame[%d].ArgsPos = %d, want > previous %d (positions must be monotonic)", i, d.ArgsPos, prev)
 		}
-		if start := d.ArgsPos - liveUTF16Len(d.ArgsDelta); start != prev {
+		if start := d.ArgsPos - streambuf.UTF16Len(d.ArgsDelta); start != prev {
 			t.Fatalf("frame[%d] breaks the trimToEnd invariant: ArgsPos(%d) - utf16Len(delta)(%d) = %d, want %d",
-				i, d.ArgsPos, liveUTF16Len(d.ArgsDelta), start, prev)
+				i, d.ArgsPos, streambuf.UTF16Len(d.ArgsDelta), start, prev)
 		}
 		prev = d.ArgsPos
 	}
 	// The final position must equal the full args length in UTF-16 units.
-	if want := liveUTF16Len(stub.rawArgs); prev != want {
+	if want := streambuf.UTF16Len(stub.rawArgs); prev != want {
 		t.Fatalf("final ArgsPos = %d, want %d (full args in UTF-16 code units)", prev, want)
 	}
 }

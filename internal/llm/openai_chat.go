@@ -43,9 +43,9 @@ func (p *OpenAIProvider) clientForModel(ctx context.Context) *openai.Client {
 	// cannot stall the first chat request indefinitely. The caller's context
 	// is threaded through so Ctrl+C aborts an in-flight catalog fetch instead
 	// of waiting out the timeout. OpenCode is detected from the CURRENT
-	// profile set (hasOpenCodeProfile) in addition to the legacy frozen
-	// zenClient, so discovery stays live-correct after SetProfiles.
-	if p.zenClient != nil || p.hasMultipleProfiles() || p.hasOpenCodeProfile() {
+	// profile set (hasOpenCodeProfile), so discovery stays live-correct
+	// after SetProfiles.
+	if p.hasMultipleProfiles() || p.hasOpenCodeProfile() {
 		if !p.catalogFetchOnBackoff() {
 			fetchCtx, cancel := context.WithTimeout(ctx, modelsCatalogTimeout)
 			_, _ = p.listModels(fetchCtx)
@@ -108,29 +108,16 @@ func (p *OpenAIProvider) inferOpenCodeEndpoint(model string) *openai.Client {
 	p.modelsMu.RLock()
 	profiles := p.profiles
 	p.modelsMu.RUnlock()
-	if len(profiles) > 0 {
-		for _, prof := range profiles {
-			if prof.zenStream == nil || prof.goStream == nil {
-				continue // not an OpenCode profile
-			}
-			if _, _, _, _, err := p.modelInfo.Resolve(openCodeGoBaseURL, model); err == nil {
-				return prof.goStream
-			}
-			if _, _, _, _, err := p.modelInfo.Resolve(openCodeZenBaseURL, model); err == nil {
-				return prof.zenStream
-			}
+	for _, prof := range profiles {
+		if prof.zenStream == nil || prof.goStream == nil {
+			continue // not an OpenCode profile
 		}
-		return nil
-	}
-	// Direct-constructed (test) shape: legacy frozen fields.
-	if p.goClient == nil || p.zenClient == nil {
-		return nil
-	}
-	if _, _, _, _, err := p.modelInfo.Resolve(openCodeGoBaseURL, model); err == nil {
-		return p.goClient
-	}
-	if _, _, _, _, err := p.modelInfo.Resolve(openCodeZenBaseURL, model); err == nil {
-		return p.zenClient
+		if _, _, _, _, err := p.modelInfo.Resolve(openCodeGoBaseURL, model); err == nil {
+			return prof.goStream
+		}
+		if _, _, _, _, err := p.modelInfo.Resolve(openCodeZenBaseURL, model); err == nil {
+			return prof.zenStream
+		}
 	}
 	return nil
 }

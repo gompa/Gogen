@@ -40,6 +40,7 @@
             handleBoardState,
             initBoard,
             refreshBoardStartPicker,
+            renderBoard,
             requestBoardState,
         } from '/components/board.js';
         import {
@@ -1700,6 +1701,10 @@
             if (pane.id && ws && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ type: 'session_attach', sessionId: pane.id }));
             }
+            // The click moved focus to the sidebar row (or the pane switch
+            // came from a UI action): hand it back to the composer so the
+            // user can type without re-clicking the input.
+            inputArea.focus();
         }
 
         // Create a fresh active pane: the sidebar "New" / /new / session
@@ -1783,6 +1788,9 @@
             pendingSessionResponse = false;
             ws.send(JSON.stringify({ type: 'session_attach', sessionId: id }));
             requestSessionList();
+            // Same as focusPane: the sidebar click took focus away from the
+            // composer — return it so the user can type immediately.
+            inputArea.focus();
         }
 
         // Collapse only when output is genuinely large (DOM / scroll cost).
@@ -2021,6 +2029,24 @@
             if (opts && opts.linkify) linkifyMessageRefs(node);
         }
 
+        // Returns the .message-body wrapper that holds a bubble's flow
+        // content (markdown, timestamp, model chip), creating it lazily.
+        // The hover buttons (fork/resend/edit) and the inline-edit bar are
+        // appended to .message itself, OUTSIDE this wrapper: .message-body
+        // carries content-visibility: auto, whose paint containment would
+        // otherwise clip the buttons' overhang past the bubble's edge.
+        // Non-.message elements (e.g. thought-card bodies) pass through.
+        function msgBody(el) {
+            if (!el || !el.classList || !el.classList.contains('message')) return el;
+            let body = el.querySelector('.message-body');
+            if (!body) {
+                body = document.createElement('div');
+                body.className = 'message-body';
+                el.appendChild(body);
+            }
+            return body;
+        }
+
         // Full single-shot render (stream end, history replay, edit/resend,
         // thinking finalize). The WHOLE text goes through marked at once:
         // per-block renders (renderStreamMarkdown) can split lists at blank
@@ -2036,7 +2062,7 @@
             if (!textWrap) {
                 textWrap = document.createElement('div');
                 textWrap.className = 'msg-text';
-                el.appendChild(textWrap);
+                msgBody(el).appendChild(textWrap);
             }
             delete el._gogenBlocks;
             messageRawStore.set(el, text);
@@ -2103,12 +2129,24 @@
         // partially. Any residual block-split artifacts (e.g. a list split at
         // a blank line) are corrected by the final full render when the stream
         // ends (see endStream/finalizeThinking).
+        // Splits accumulated stream text into conservative markdown blocks
+        // (blank lines outside fenced code). Returns { blocks, lastStart }:
+        // blocks[i] is the i-th block and lastStart is the offset in `text`
+        // where the LAST block began (text.length when there are no blocks).
+        // The offset lets the incremental renderer remember the in-flight
+        // block boundary and re-split only the tail on the next flush.
         function splitStreamBlocks(text) {
+            const src = String(text);
             const blocks = [];
             let cur = '';
+            let curStart = 0;   // offset where the current (in-flight) block began
+            let lastStart = 0;  // offset where the most recently pushed block began
             let fence = null; // { mark: '`'|'~', len } while inside a fenced code block
-            for (const line of String(text).split('\n')) {
+            let offset = 0;
+            for (const line of src.split('\n')) {
+                const lineLen = line.length + 1; // +1 for the '\n'
                 if (fence) {
+                    if (cur === '') curStart = offset;
                     cur += line + '\n';
                     // CommonMark closing rule: same char, length >= opener,
                     // nothing but trailing whitespace after it. This keeps a
@@ -2116,25 +2154,35 @@
                     // code blocks) and "```js" from closing a fence.
                     const c = /^\s*(`+|~+)\s*$/.exec(line);
                     if (c && c[1][0] === fence.mark && c[1].length >= fence.len) fence = null;
+                    offset += lineLen;
                     continue;
                 }
                 const m = /^\s*(```+|~~~+)/.exec(line);
                 if (m) {
+                    if (cur === '') curStart = offset;
                     cur += line + '\n';
                     fence = { mark: m[1][0], len: m[1].length };
+                    offset += lineLen;
                     continue;
                 }
                 if (line.trim() === '') {
                     if (cur !== '') {
                         blocks.push(cur);
+                        lastStart = curStart;
                         cur = '';
                     }
+                    offset += lineLen;
                     continue;
                 }
+                if (cur === '') curStart = offset;
                 cur += line + '\n';
+                offset += lineLen;
             }
-            if (cur !== '') blocks.push(cur);
-            return blocks;
+            if (cur !== '') {
+                blocks.push(cur);
+                lastStart = curStart;
+            }
+            return { blocks, lastStart: blocks.length ? lastStart : src.length };
         }
 
         // Incremental renderer for the live streaming paths (assistant stream
@@ -2147,48 +2195,66 @@
             if (!textWrap) {
                 textWrap = document.createElement('div');
                 textWrap.className = 'msg-text';
-                el.appendChild(textWrap);
+                msgBody(el).appendChild(textWrap);
             }
-            const st = el._gogenBlocks || (el._gogenBlocks = { done: [], tailNode: null });
-            const blocks = splitStreamBlocks(text);
-            // The last block is the in-flight tail; everything before it is complete.
-            const doneCount = blocks.length > 0 ? blocks.length - 1 : 0;
+            const st = el._gogenBlocks || (el._gogenBlocks = { done: [], tailNode: null, processedLen: 0, lastText: null });
 
-            // Reconciliation is index-based, not text-based: the streaming
-            // text for a given element is append-only (appendStreamToken
-            // appends; rewinds start a fresh element), so splitStreamBlocks
-            // is prefix-stable and completed blocks before the cached count
-            // can never change — only indices >= st.done.length are new
-            // (promoted tails). The guards cover the ways the cache can go
-            // stale: a rewind (doneCount shrank — old nodes are removed and
-            // everything re-renders), a full re-render that detached the
-            // nodes while the cache survived (setMessageMarkdown deletes it,
-            // but an isConnected check keeps this safe for any future
-            // caller), or a same-length content rewrite — impossible under
-            // the append-only invariant, but the stored-text comparison
-            // makes the reconciliation safe even if a future caller breaks
-            // it (the per-entry text kept in st.done is the record of what
-            // each stable node rendered).
-            const textStale = doneCount >= st.done.length
-                && st.done.some((entry, i) => entry.text !== blocks[i]);
-            if (doneCount < st.done.length || textStale
-                || (st.done.length && !st.done[0].node.isConnected)) {
+            // Incremental split: the streaming text for a given element is
+            // append-only (appendStreamToken appends; rewinds start a fresh
+            // element; setMessageMarkdown deletes this state), so
+            // splitStreamBlocks is prefix-stable — completed blocks before
+            // st.processedLen can never change. We therefore re-split only the
+            // tail (from the last in-flight block boundary to the end) instead
+            // of the whole message, keeping each flush O(tail) rather than
+            // O(n). st.processedLen is the offset where the in-flight block
+            // began; text[processedLen-1] is the blank line that ends the last
+            // completed block, which doubles as a cheap staleness probe.
+            //
+            // The guards cover the ways the cache can go stale, all O(1) in the
+            // common append path: a rewind (text shrank below processedLen), a
+            // boundary rewrite (the blank line that ends the last completed
+            // block is gone), a same-length content rewrite (text is the same
+            // length but differs — the O(n) compare only runs when the length
+            // is unchanged, i.e. no new token arrived, so it never costs on the
+            // hot path), or a full re-render that detached the nodes while the
+            // cache survived (setMessageMarkdown deletes it, but the isConnected
+            // check keeps this safe). A longer rewrite (prefix changed but the
+            // text grew) is impossible under the append-only invariant — a
+            // rewind starts a fresh element — so it is deliberately not probed
+            // (doing so would require an O(n) prefix compare every flush, which
+            // is exactly the cost this optimization removes). On staleness we
+            // drop the cached nodes and re-split from offset 0.
+            const stale = text.length < st.processedLen
+                || (st.processedLen > 0 && text[st.processedLen - 1] !== '\n')
+                || (st.lastText !== null && text.length === st.lastText.length && text !== st.lastText)
+                || (st.done.length && !st.done[0].node.isConnected);
+            if (stale) {
                 for (const entry of st.done) entry.node.remove();
                 st.done = [];
+                st.processedLen = 0;
             }
+
+            const tail = text.slice(st.processedLen);
+            const { blocks: tailBlocks, lastStart: tailLastStart } = splitStreamBlocks(tail);
+            // The last block of the tail is the in-flight block; everything
+            // before it is a newly-completed block (promoted from a prior
+            // tail). The in-flight block is re-rendered every flush; completed
+            // blocks are rendered once and cached.
+            const inFlight = tailBlocks[tailBlocks.length - 1] || '';
+            const newDone = tailBlocks.slice(0, tailBlocks.length - 1);
 
             // Completed blocks: render only the new ones, inserted before the
             // tail node so DOM order always matches document order.
-            for (let i = st.done.length; i < doneCount; i++) {
+            for (const block of newDone) {
                 const node = document.createElement('div');
                 node.className = 'md-block';
-                renderBlockNode(node, blocks[i], { linkify: false });
+                renderBlockNode(node, block, { linkify: false });
                 if (st.tailNode) {
                     textWrap.insertBefore(node, st.tailNode);
                 } else {
                     textWrap.appendChild(node);
                 }
-                st.done.push({ text: blocks[i], node });
+                st.done.push({ text: block, node });
             }
 
             // Tail: one stable node, re-rendered every flush. Markdown and
@@ -2196,13 +2262,18 @@
             // uncached code every flush (streamingTail mode: no LRU writes,
             // stale results dropped) so streaming code stays colorized as it
             // grows — the UX the pre-optimization code provided.
-            const tailText = doneCount < blocks.length ? blocks[doneCount] : '';
             if (!st.tailNode) {
                 st.tailNode = document.createElement('div');
                 st.tailNode.className = 'md-block md-tail';
                 textWrap.appendChild(st.tailNode);
             }
-            renderBlockNode(st.tailNode, tailText, { linkify: false, streamingTail: true });
+            renderBlockNode(st.tailNode, inFlight, { linkify: false, streamingTail: true });
+
+            // Advance the boundary to the start of the in-flight block; it is
+            // the only part re-split next flush. (When the tail is all blank
+            // lines there is no in-flight block, so consume the whole tail.)
+            st.processedLen += tailBlocks.length ? tailLastStart : tail.length;
+            st.lastText = text;
 
             messageRawStore.set(el, text);
         }
@@ -2272,7 +2343,7 @@
             timeEl.className = 'message-time';
             timeEl.textContent = formatRelativeTime(date);
             timeEl.title = formatExactTime(date);
-            msgDiv.appendChild(timeEl);
+            msgBody(msgDiv).appendChild(timeEl);
         }
         // === Reply-model attribution (Settings → Chat → "Show reply model") ===
         // The provider-reported model is kept in dataset.model regardless of
@@ -2296,7 +2367,7 @@
             newChip.title = 'Replied with ' + model;
             // Appended last: sits below the timestamp at the bubble's
             // bottom-right, mirroring the .message-time footer.
-            msgDiv.appendChild(newChip);
+            msgBody(msgDiv).appendChild(newChip);
         }
 
         // Syncs chips on every already-rendered assistant bubble after the
@@ -2528,6 +2599,10 @@
             if (histIdx !== undefined && histIdx >= 0) {
                 msgDiv.dataset.histIdx = histIdx;
             }
+            // Flow content goes in the .message-body wrapper (which carries
+            // content-visibility); hover buttons stay on msgDiv itself so
+            // the wrapper's paint containment can't clip their overhang.
+            const body = msgBody(msgDiv);
             if (role === 'user' && images && images.length) {
                 // Render user-attached images (vision input) above the text.
                 const imgRow = document.createElement('div');
@@ -2541,7 +2616,7 @@
                     imgEl.loading = 'lazy';
                     imgRow.appendChild(imgEl);
                 }
-                if (imgRow.childNodes.length) msgDiv.insertBefore(imgRow, msgDiv.firstChild);
+                if (imgRow.childNodes.length) body.insertBefore(imgRow, body.firstChild);
             }
             if (role === 'assistant' || role === 'user') {
                 // User messages go through markdown too, but HTML tags are escaped first
@@ -2551,7 +2626,7 @@
             } else {
                 const span = document.createElement('span');
                 span.textContent = text;
-                msgDiv.appendChild(span);
+                body.appendChild(span);
                 messageRawStore.set(msgDiv, text);
             }
             msgDiv.dataset.createdAt = date.toISOString();
@@ -2619,6 +2694,9 @@
             streamLastRender = 0;
             const msgDiv = document.createElement('div');
             msgDiv.className = 'message assistant cursor md';
+            // Content wrapper up front: the fork button appended in
+            // endStream must land on msgDiv, outside the contained body.
+            msgBody(msgDiv);
             messagesDiv.appendChild(msgDiv);
             smartScroll();
             currentStreamDiv = msgDiv;
@@ -2735,15 +2813,45 @@
         // --- Input-area progress indicator (replaces textarea during streaming) ---
         let currentProgressPhase = null;
 
+        // Smoothed token rate from the server's shared SpeedMeter
+        // (stream_stats frames; same meter, interval, and estimator as
+        // the TUI's progress line). Reset at every round start and turn
+        // end; only displayed while the phase is 'streaming'.
+        let lastStreamSpeed = 0;
+
+        function streamProgressLabel() {
+            return 'Streaming\u2026' + (lastStreamSpeed >= 1 ? ' ' + Math.round(lastStreamSpeed) + ' tok/s' : '');
+        }
+
+        // Thinking tokens feed the same meter, so the rate is meaningful
+        // in the thinking phase too; it stays blank until the first
+        // stream_stats frame (the meter is silent before the first token,
+        // so "waiting for the model" never shows a rate).
+        function thinkingProgressLabel() {
+            return 'Thinking\u2026' + (lastStreamSpeed >= 1 ? ' ' + Math.round(lastStreamSpeed) + ' tok/s' : '');
+        }
+
         // True when focus was in the chat textarea when the progress
         // indicator replaced it. Only then is focus restored on hide, so a
         // turn end/cancel can't yank the user out of the terminal/Monaco/modals.
         let progressFocusOwner = false;
 
+        // Cached progress-indicator node refs. The spinner/label structure
+        // is static (index.html #input-progress), so resolve them once when
+        // the indicator first appears instead of querySelector-ing per frame.
+        let progressSpinnerEl = null;
+        let progressLabelEl = null;
+        // Last rendered label text: the label carries a live tok/s rate that
+        // changes a few times per second, so the guard must be text-based
+        // (a phase-only guard would freeze the rate display).
+        let progressLabelText = '';
+
         /**
          * Show/update the progress indicator in the input area.
          * Phase: 'thinking' | 'streaming' | 'tool' | null
          * When phase is null, the indicator is hidden and the textarea is restored.
+         * Cheap to call repeatedly per frame: DOM writes happen only on the
+         * first show, on phase change (spinner class), or on label-text change.
          */
         function setInputProgress(phase, label) {
             if (!inputProgress) return;
@@ -2759,24 +2867,28 @@
                 }
                 progressFocusOwner = false;
                 currentProgressPhase = null;
+                progressLabelText = '';
                 return;
             }
+            const phaseChanged = currentProgressPhase !== phase;
             // Capture once, when the indicator first replaces the textarea
             // (repeated same-phase updates must not re-evaluate it: the
             // textarea is hidden by then, so activeElement is no longer it).
             if (currentProgressPhase === null) {
                 progressFocusOwner = (document.activeElement === inputArea);
+                inputArea.style.display = 'none';
+                inputProgress.classList.add('active');
+                progressSpinnerEl = inputProgress.querySelector('.progress-spinner');
+                progressLabelEl = inputProgress.querySelector('.progress-label');
             }
             currentProgressPhase = phase;
-            inputArea.style.display = 'none';
-            inputProgress.classList.add('active');
-            const spinner = inputProgress.querySelector('.progress-spinner');
-            const labelEl = inputProgress.querySelector('.progress-label');
-            if (spinner) {
-                spinner.className = 'progress-spinner ' + phase;
+            if (progressSpinnerEl && phaseChanged) {
+                progressSpinnerEl.className = 'progress-spinner ' + phase;
             }
-            if (labelEl) {
-                labelEl.textContent = label || phase;
+            const text = label || phase;
+            if (progressLabelEl && text !== progressLabelText) {
+                progressLabelEl.textContent = text;
+                progressLabelText = text;
             }
         }
 
@@ -3663,8 +3775,8 @@
             }
             // Progress phase reflects what was painted.
             if (rewind.toolCalls && rewind.toolCalls.length) setInputProgress('tool', 'Running tool\u2026');
-            else if (rewind.content) setInputProgress('streaming', 'Streaming\u2026');
-            else if (rewind.thinking) setInputProgress('thinking', 'Thinking\u2026');
+            else if (rewind.content) setInputProgress('streaming', streamProgressLabel());
+            else if (rewind.thinking) setInputProgress('thinking', thinkingProgressLabel());
             return rendered;
         }
 
@@ -3864,6 +3976,7 @@
             waiting: handleWaiting,
             thinking_token: handleThinkingToken,
             stream: handleStream,
+            stream_stats: handleStreamStats,
             stream_end: handleStreamEnd,
             model_used: handleModelUsed,
             tool_call_start: handleToolCallStart,
@@ -3960,6 +4073,7 @@
             toolsStartedThisTurn = false;
             streamingToolCards = {};
             lastStreamDiv = null; // new round: forget any prior bubble
+            lastStreamSpeed = 0; // the server re-arms its meter per round
             finalizeThinking();
             setInputProgress('thinking', 'Thinking\u2026');
 
@@ -3968,6 +4082,7 @@
         function handleWaiting(data) {
 
             setTurnActive(true);
+            updateTitle('thinking');
             setInputProgress('thinking', 'Waiting for model\u2026');
 
         }
@@ -3976,6 +4091,13 @@
 
             setTurnActive(true);
             appendThinkingToken(data.content || '', data.thinkingPos);
+            // The model is producing: the round-start "Waiting for
+            // model…" label is stale once the first thinking token
+            // lands, and the rate (when known) rides along like in the
+            // streaming phase.
+            if (currentProgressPhase === 'thinking') {
+                setInputProgress('thinking', thinkingProgressLabel());
+            }
 
         }
 
@@ -3983,10 +4105,28 @@
 
             setTurnActive(true);
             updateTitle('streaming');
-            setInputProgress('streaming', 'Streaming\u2026');
+            // The rate (when known) is carried in the label so stream
+            // frames and stream_stats frames never fight over it.
+            setInputProgress('streaming', streamProgressLabel());
             finalizeThinking();
             if (!currentStreamDiv) startStream();
             appendStreamToken(data.content, data.contentPos);
+
+        }
+
+        function handleStreamStats(data) {
+
+            // Timer-driven (a few per second) while the round streams;
+            // the server stops its meter at round end, so this always
+            // precedes stream_end. Only touch the label while the
+            // streaming or thinking indicator is up — a stats frame must
+            // not clobber the "Running tool…" label.
+            lastStreamSpeed = data.tokensPerSec || 0;
+            if (currentProgressPhase === 'streaming') {
+                setInputProgress('streaming', streamProgressLabel());
+            } else if (currentProgressPhase === 'thinking') {
+                setInputProgress('thinking', thinkingProgressLabel());
+            }
 
         }
 
@@ -4183,6 +4323,7 @@
             if (suppressTurnEnds > 0) return;
             abortInFlightUI(data.content || 'Cancelled.');
             setTurnActive(false);
+            lastStreamSpeed = 0;
             setInputProgress(null);
             refreshSidebarSessions();
 
@@ -4210,6 +4351,7 @@
             }
             setTurnActive(false);
             updateTitle('idle');
+            lastStreamSpeed = 0;
             setInputProgress(null);
             pendingSessionResponse = false;
             // A pane attached mid-turn never received the in-flight
@@ -4774,23 +4916,29 @@
             renderSessionList(getLastSessions() || []);
         }
 
-        // Append nested rows for parentId after its row. Sources: the live
-        // subagent_started/finished event records (running/summary state,
-        // children not yet saved) plus — after a page reload or a late
-        // attach, when the events are gone — the persisted children in the
-        // sessions payload (the server now includes them). Children open as
-        // panes in this tab render here TOO (buildNestedSessionRow overlays
-        // their live pane state), so opening a subagent keeps its row under
-        // the parent — renderSessionList skips those children when it
-        // builds the flat open-pane rows. Nesting is recursive (depth >= 2):
+        // Collect the nested (subagent) child RECORDS for parentId in
+        // render order — pure, no DOM: sessions.js owns placement so the
+        // keyed diff can keep a child row under its parent when the parent
+        // reorders (appending to the container end, as the old
+        // appendNestedRows did, is only correct on a wiped list).
+        // Sources: the live subagent_started/finished event records
+        // (running/summary state, children not yet saved) plus — after a
+        // page reload or a late attach, when the events are gone — the
+        // persisted children in the sessions payload (the server now
+        // includes them). Children open as panes in this tab render here
+        // TOO (buildNestedSessionRow overlays their live pane state), so
+        // opening a subagent keeps its row under the parent —
+        // renderSessionList skips those children when it builds the flat
+        // open-pane rows. Nesting is recursive (depth >= 2):
         // grandchildren render under their child rows, mirroring the
         // server's recursive cascade.
-        function appendNestedRows(parentId, depth) {
-            if (depth > 16) return; // cycle guard (subagentMaxDepth max is 10)
+        function collectNestedRows(parentId, depth) {
+            if (depth > 16) return []; // cycle guard (subagentMaxDepth max is 10)
+            const out = [];
             const rendered = new Set();
             for (const rec of nestedSessions.values()) {
                 if (rec.parentId !== parentId) continue;
-                sessionListDiv.appendChild(buildNestedSessionRow(rec));
+                out.push(rec);
                 rendered.add(rec.id);
             }
             for (const s of getLastSessions() || []) {
@@ -4803,7 +4951,7 @@
                 // never mistaken for running or failed, and a child that
                 // really failed stays failed. Status '' (not finished /
                 // legacy data) defaults to the green done state.
-                sessionListDiv.appendChild(buildNestedSessionRow({
+                out.push({
                     id: s.id,
                     parentId: s.parentId,
                     label: s.label || s.id,
@@ -4812,11 +4960,12 @@
                     success: s.subagentStatus !== 'failed',
                     active: !!s.active,
                     summary: s.subagentSummary || (s.turnActive ? '' : (s.messageCount ? s.messageCount + ' msgs' : '')),
-                }));
+                });
                 rendered.add(s.id);
             }
             // Recursion: grandchildren render under their child rows too.
-            for (const id of rendered) appendNestedRows(id, (depth || 0) + 1);
+            for (const id of rendered) out.push(...collectNestedRows(id, (depth || 0) + 1));
+            return out;
         }
 
         function buildNestedSessionRow(rec) {
@@ -4923,7 +5072,7 @@
         }
 
         // Parent id for a session that is a nested (subagent) child, or ''
-        // for a normal session. Mirrors appendNestedRows' sources: the live
+        // for a normal session. Mirrors collectNestedRows' sources: the live
         // subagent_started/finished records first, then the persisted
         // parentId in the sessions payload.
         function nestedParentIdOf(id, list) {
@@ -4935,7 +5084,7 @@
 
         // Reports whether id's row will render in this pass: as a flat row
         // (id in rowIds) or as a nested row under a parent whose own chain
-        // reaches a flat row (appendNestedRows recurses through the whole
+        // reaches a flat row (collectNestedRows recurses through the whole
         // chain). seen guards against corrupt ParentID cycles.
         function nestedRowWillRender(id, list, rowIds, seen) {
             if (rowIds.has(id)) return true;
@@ -5254,6 +5403,10 @@
             loadActivePaneState();
             pendingSessionResponse = true;
             ws.send(JSON.stringify({ type: 'session_new' }));
+            // Hand control back to the composer: the click moved focus to the
+            // button (or the palette closed), so the user would otherwise
+            // have to re-click the input before typing their first message.
+            inputArea.focus();
         }
 
         function switchMainPane(pane) {
@@ -5266,6 +5419,12 @@
             });
             if (pane === 'editor') {
                 initMonaco().then(() => refreshExplorer()).catch(() => {});
+            }
+            if (pane === 'board') {
+                // Board re-renders are gated on pane visibility
+                // (handleBoardState skips hidden panes), so paint the
+                // stored lastBoardState now that it's on screen.
+                renderBoard();
             }
         }
 
@@ -6006,25 +6165,15 @@
             } else {
                 title = baseTitle;
             }
-            // Avoid rewriting the title bar on every mutation burst.
+            // Avoid rewriting the title bar on every call.
             if (document.title !== title) document.title = title;
         }
-        // We use MutationObserver on messages div to detect streaming.
-        // Coalesce mutation bursts (innerHTML swaps, colorize attribute
-        // writes) into one rAF pass and derive state from variables instead
-        // of a subtree querySelector per mutation record.
-        let titleUpdatePending = false;
-        const titleObserver = new MutationObserver(() => {
-            if (titleUpdatePending) return;
-            titleUpdatePending = true;
-            requestAnimationFrame(() => {
-                titleUpdatePending = false;
-                if (currentProgressPhase === 'thinking') updateTitle('thinking');
-                else if (currentStreamDiv) updateTitle('streaming');
-                else updateTitle('idle');
-            });
-        });
-        titleObserver.observe(messagesDiv, { childList: true, subtree: true, attributes: true });
+        // The title is driven by the WS state transitions (thinking /
+        // stream / turn_end / cancel) rather than a MutationObserver on
+        // the transcript: observing the whole subtree generated mutation
+        // records for every token append, innerHTML swap, and class
+        // toggle during streaming, and the callback only ever derived
+        // state from the same variables the handlers already update.
 
         // === Context tooltip ===
         const contextTooltip = document.getElementById('context-tooltip');
@@ -6065,7 +6214,8 @@
             getNestedSessions: () => nestedSessions,
             nestedParentIdOf: (id, list) => nestedParentIdOf(id, list),
             nestedRowWillRender: (id, list, rowIds, seen) => nestedRowWillRender(id, list, rowIds, seen),
-            appendNestedRows: (parentId, depth) => appendNestedRows(parentId, depth),
+            collectNestedRows: (parentId, depth) => collectNestedRows(parentId, depth),
+            buildNestedRow: (rec) => buildNestedSessionRow(rec),
             relativeTime: (value, now) => relativeTime(value, now),
             focusPane: (key) => focusPane(key),
             openSessionPane: (id) => openSessionPane(id),

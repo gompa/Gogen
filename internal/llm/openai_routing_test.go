@@ -58,8 +58,11 @@ func TestFetchModelsGoTakesPrecedenceOverZen(t *testing.T) {
 	zenClient := newTestOpenAIClient(zenSrv)
 	goClient := newTestOpenAIClient(goSrv)
 	p := &OpenAIProvider{
-		zenClient:   &zenClient,
-		goClient:    &goClient,
+		profiles: []*providerProfile{{
+			name:      "default",
+			zenStream: &zenClient,
+			goStream:  &goClient,
+		}},
 		modelClient: make(map[string]*openai.Client),
 	}
 
@@ -67,10 +70,10 @@ func TestFetchModelsGoTakesPrecedenceOverZen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetchModelsWithProfiles: %v", err)
 	}
-	// Direct-construction shape: one synthesized profile whose routing is
-	// the merged zen/go result (Go precedence).
+	// One default profile whose routing is the merged zen/go result
+	// (Go precedence).
 	if len(perProfile) != 1 {
-		t.Fatalf("perProfile has %d entries, want 1 (single synthesized profile)", len(perProfile))
+		t.Fatalf("perProfile has %d entries, want 1 (single default profile)", len(perProfile))
 	}
 	routing := perProfile[0].routing
 	if len(models) != 3 {
@@ -109,12 +112,15 @@ func TestClientForModelDiscoversViaCatalogLists(t *testing.T) {
 	goClient := newTestOpenAIClient(goSrv)
 	primary := newTestOpenAIClient(zenSrv) // user-configured base URL (Zen)
 	p := &OpenAIProvider{
-		client:           primary,
-		zenClient:        &zenClient,
-		zenCatalogClient: &zenClient,
-		goClient:         &goClient,
-		goCatalogClient:  &goClient,
-		modelClient:      make(map[string]*openai.Client),
+		profiles: []*providerProfile{{
+			name:       "default",
+			stream:     &primary,
+			zenStream:  &zenClient,
+			zenCatalog: &zenClient,
+			goStream:   &goClient,
+			goCatalog:  &goClient,
+		}},
+		modelClient: make(map[string]*openai.Client),
 	}
 
 	cases := []struct {
@@ -134,7 +140,7 @@ func TestClientForModelDiscoversViaCatalogLists(t *testing.T) {
 
 	// Unknown model: no catalog entry, no models.dev info → primary client.
 	p.model = "not-a-real-model"
-	if got := p.clientForModel(t.Context()); got != &p.client {
+	if got := p.clientForModel(t.Context()); got != p.profiles[0].stream {
 		t.Fatalf("unknown model: expected primary client fallback")
 	}
 
@@ -158,12 +164,12 @@ func TestClientForModelNonOpenCodeUsesPrimaryClient(t *testing.T) {
 
 	primary := newTestOpenAIClient(srv)
 	p := &OpenAIProvider{
-		client:      primary,
+		profiles:    []*providerProfile{{name: "default", stream: &primary}},
 		modelClient: make(map[string]*openai.Client),
 		model:       "some-local-model",
 	}
 
-	if got := p.clientForModel(t.Context()); got != &p.client {
+	if got := p.clientForModel(t.Context()); got != p.profiles[0].stream {
 		t.Fatalf("non-OpenCode provider: expected the primary client")
 	}
 	if n := hits.Load(); n != 0 {
@@ -225,13 +231,16 @@ func TestClientForModelFallbackUsesModelsDevGoFirst(t *testing.T) {
 	goClient := newTestOpenAIClient(goSrv)
 	primary := newTestOpenAIClient(zenSrv)
 	p := &OpenAIProvider{
-		client:           primary,
-		zenClient:        &zenClient,
-		zenCatalogClient: &zenClient,
-		goClient:         &goClient,
-		goCatalogClient:  &goClient,
-		modelClient:      make(map[string]*openai.Client),
-		modelInfo:        modelinfo.NewResolver(cache),
+		profiles: []*providerProfile{{
+			name:       "default",
+			stream:     &primary,
+			zenStream:  &zenClient,
+			zenCatalog: &zenClient,
+			goStream:   &goClient,
+			goCatalog:  &goClient,
+		}},
+		modelClient: make(map[string]*openai.Client),
+		modelInfo:   modelinfo.NewResolver(cache),
 	}
 
 	p.model = "mimo-v2.5-pro"
@@ -243,7 +252,7 @@ func TestClientForModelFallbackUsesModelsDevGoFirst(t *testing.T) {
 		t.Fatalf("zen-only model with catalogs down: routed to the wrong endpoint (want Zen)")
 	}
 	p.model = "not-in-registry"
-	if got := p.clientForModel(t.Context()); got != &p.client {
+	if got := p.clientForModel(t.Context()); got != p.profiles[0].stream {
 		t.Fatalf("model unknown to models.dev: expected primary client fallback")
 	}
 }
@@ -271,17 +280,20 @@ func TestClientForModelBacksOffFailedCatalogFetch(t *testing.T) {
 	goClient := newTestOpenAIClient(goSrv)
 	primary := newTestOpenAIClient(zenSrv)
 	p := &OpenAIProvider{
-		client:           primary,
-		zenClient:        &zenClient,
-		zenCatalogClient: &zenClient,
-		goClient:         &goClient,
-		goCatalogClient:  &goClient,
-		modelClient:      make(map[string]*openai.Client),
+		profiles: []*providerProfile{{
+			name:       "default",
+			stream:     &primary,
+			zenStream:  &zenClient,
+			zenCatalog: &zenClient,
+			goStream:   &goClient,
+			goCatalog:  &goClient,
+		}},
+		modelClient: make(map[string]*openai.Client),
 	}
 
 	// First call: both catalog endpoints 500 → one fetch attempt per endpoint.
 	p.model = "first-unknown"
-	if got := p.clientForModel(t.Context()); got != &p.client {
+	if got := p.clientForModel(t.Context()); got != p.profiles[0].stream {
 		t.Fatalf("first call: expected primary client fallback")
 	}
 	if n := modelsHits.Load(); n != 2 {
@@ -291,7 +303,7 @@ func TestClientForModelBacksOffFailedCatalogFetch(t *testing.T) {
 	// Second call is within modelsFetchBackoff: the failed fetch must not be
 	// re-attempted (the fallback entry is cached instead).
 	p.model = "second-unknown"
-	if got := p.clientForModel(t.Context()); got != &p.client {
+	if got := p.clientForModel(t.Context()); got != p.profiles[0].stream {
 		t.Fatalf("second call: expected primary client fallback")
 	}
 	if n := modelsHits.Load(); n != 2 {
@@ -314,13 +326,16 @@ func TestClientForModelCancelledContextReturnsFast(t *testing.T) {
 	goClient := newTestOpenAIClient(srv)
 	primary := newTestOpenAIClient(srv)
 	p := &OpenAIProvider{
-		client:           primary,
-		zenClient:        &zenClient,
-		zenCatalogClient: &zenClient,
-		goClient:         &goClient,
-		goCatalogClient:  &goClient,
-		modelClient:      make(map[string]*openai.Client),
-		model:            "some-model",
+		profiles: []*providerProfile{{
+			name:       "default",
+			stream:     &primary,
+			zenStream:  &zenClient,
+			zenCatalog: &zenClient,
+			goStream:   &goClient,
+			goCatalog:  &goClient,
+		}},
+		modelClient: make(map[string]*openai.Client),
+		model:       "some-model",
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -345,11 +360,14 @@ func TestListModelsPreservesManualRoutingEntries(t *testing.T) {
 	zenClient := newTestOpenAIClient(zenSrv)
 	goClient := newTestOpenAIClient(goSrv)
 	p := &OpenAIProvider{
-		zenClient:        &zenClient,
-		zenCatalogClient: &zenClient,
-		goClient:         &goClient,
-		goCatalogClient:  &goClient,
-		modelClient:      map[string]*openai.Client{"custom-model": &goClient},
+		profiles: []*providerProfile{{
+			name:       "default",
+			zenStream:  &zenClient,
+			zenCatalog: &zenClient,
+			goStream:   &goClient,
+			goCatalog:  &goClient,
+		}},
+		modelClient: map[string]*openai.Client{"custom-model": &goClient},
 	}
 
 	models, err := p.listModels(context.Background())

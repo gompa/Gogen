@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"regexp"
 	"strings"
 
 	"gogen/internal/treesitter"
@@ -57,18 +56,12 @@ func (e *Executor) FindDefinition(ctx context.Context, symbol, subpath, glob str
 // findDefinitionText performs text-based search for symbol definitions.
 func (e *Executor) findDefinitionText(ctx context.Context, subpath, glob, symbol string) ([]string, error) {
 	// Combine all definition patterns into a single alternation to avoid
-	// spawning ripgrep (or walking the tree) 8 separate times.
-	q := regexp.QuoteMeta(symbol)
-	pattern := `(?m)(?:` +
-		`\bfunc\s+` + q + `\s*\(` + `|` +
-		`\bfunc\s*\([^)]*\)\s+` + q + `\s*\(` + `|` +
-		`\btype\s+` + q + `\s+(struct|interface|func|type)` + `|` +
-		`\bvar\s+` + q + `\b` + `|` +
-		`\bconst\s+` + q + `\b` + `|` +
-		`\blet\s+` + q + `\b` + `|` +
-		`\bclass\s+` + q + `\b` + `|` +
-		`\bdef\s+` + q + `\s*\(` +
-		`)`
+	// spawning ripgrep (or walking the tree) once per kind. The pattern is
+	// generated from the shared definition-keyword table (same source as
+	// isDefinitionLine and the list_definitions text outline) covering
+	// functions (incl. Go methods with receivers), types, classes and
+	// const/var/let bindings.
+	pattern := definitionSearchPattern(symbol, "func", "type", "class", "const", "var")
 
 	out, err := e.SearchCode(ctx, pattern, subpath, glob, 0, false)
 	if err != nil {

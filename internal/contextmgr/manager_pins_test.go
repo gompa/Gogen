@@ -23,7 +23,7 @@ func TestCompactPinnedPreservesPinnedMessage(t *testing.T) {
 		{Role: "assistant", Content: "a4"},
 	}
 	pinned := map[int]struct{}{2: {}}
-	out, newPins, err := m.CompactPinned(context.Background(), nil, msgs, nil, pinned)
+	out, newPins, err := m.Compact(context.Background(), msgs, CompactOptions{Pinned: pinned})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"gogen/internal/agent"
 	"gogen/internal/ioutil"
 	"gogen/internal/llm"
 )
@@ -53,7 +52,7 @@ type sessionIndex struct {
 
 // listCacheEntry holds a cached session list for one working directory.
 type listCacheEntry struct {
-	info []agent.SessionInfo
+	info []SessionInfo
 	time time.Time
 }
 
@@ -127,7 +126,7 @@ func (s *Store) legacySessionUpdated(workingDir string) ([]legacySession, error)
 // updated first. Uses the metadata index when available, falling back to a
 // full-file scan for legacy directories. Results are cached briefly in memory
 // to avoid repeated disk I/O on reconnects.
-func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
+func (s *Store) List(workingDir string) ([]SessionInfo, error) {
 	if !s.enabled {
 		return nil, nil
 	}
@@ -141,7 +140,7 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 	// Check in-memory cache first (1-second TTL).
 	listCacheMu.RLock()
 	if ce, ok := listCache[cacheKey]; ok && time.Since(ce.time) < time.Second {
-		out := make([]agent.SessionInfo, len(ce.info))
+		out := make([]SessionInfo, len(ce.info))
 		copy(out, ce.info)
 		listCacheMu.RUnlock()
 		return out, nil
@@ -183,9 +182,9 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 			_ = s.writeIndex(workingDir, idx)
 		}
 		slices.SortFunc(idx.Entries, func(a, b sessionIndexEntry) int { return b.Updated.Compare(a.Updated) })
-		out := make([]agent.SessionInfo, len(idx.Entries))
+		out := make([]SessionInfo, len(idx.Entries))
 		for i, e := range idx.Entries {
-			out[i] = agent.SessionInfo{
+			out[i] = SessionInfo{
 				ID:              e.ID,
 				Oneshot:         e.Oneshot,
 				UpdatedAt:       e.Updated.UTC().Format(time.RFC3339Nano),
@@ -212,7 +211,7 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 		return nil, err
 	}
 	type item struct {
-		info    agent.SessionInfo
+		info    SessionInfo
 		updated time.Time
 	}
 	var items []item
@@ -231,7 +230,7 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 		updated := s.sessionUpdatedAt(workingDir, id, f.Updated)
 		lbl := sessionLabel(f.Messages, f.Label, f.LabelRenamed)
 		items = append(items, item{
-			info: agent.SessionInfo{
+			info: SessionInfo{
 				ID:              id,
 				Oneshot:         f.Oneshot,
 				UpdatedAt:       updated.UTC().Format(time.RFC3339Nano),
@@ -254,7 +253,7 @@ func (s *Store) List(workingDir string) ([]agent.SessionInfo, error) {
 		_ = s.writeIndex(workingDir, idx)
 	}
 	slices.SortFunc(items, func(a, b item) int { return b.updated.Compare(a.updated) })
-	out := make([]agent.SessionInfo, len(items))
+	out := make([]SessionInfo, len(items))
 	for i, it := range items {
 		out[i] = it.info
 	}
@@ -344,7 +343,7 @@ func (s *Store) readIndex(workingDir string) *sessionIndex {
 // index — no session file or message payload is touched. Used by the web
 // server's delete path to discover a deleted session's parent link without
 // loading its transcript.
-func (s *Store) Info(workingDir, id string) *agent.SessionInfo {
+func (s *Store) Info(workingDir, id string) *SessionInfo {
 	if !s.enabled || id == "" {
 		return nil
 	}
@@ -359,7 +358,7 @@ func (s *Store) Info(workingDir, id string) *agent.SessionInfo {
 		if e.ID != id {
 			continue
 		}
-		return &agent.SessionInfo{
+		return &SessionInfo{
 			ID:              e.ID,
 			Oneshot:         e.Oneshot,
 			UpdatedAt:       e.Updated.UTC().Format(time.RFC3339Nano),
@@ -453,38 +452,26 @@ func (s *Store) mutateIndexWith(workingDir string, createIfMissing bool, preload
 // index instead of re-reading the session file. Existing entries keep their
 // Created when created is zero (defensive: Save always passes non-zero).
 // preloaded, when non-nil, is a caller-supplied index (see mutateIndexWith);
-// Save passes the index it already loaded for Created recovery so a full save
-// reads index.json at most once. labelRenamed mirrors the session file's
-// rename marker so List can keep deliberate renames authoritative. parentID
-// marks nested (subagent) sessions for flat-list exclusion; subagentStatus/
-// subagentSummary mirror the recorded outcome so the sessions payload can
-// render it without re-reading the session file.
-func (s *Store) updateIndex(workingDir, id string, created, updated time.Time, msgCount int, label string, oneshot, labelRenamed bool, parentID, subagentStatus, subagentSummary string, preloaded *sessionIndex) {
+// updateIndex upserts the full entry for a session in the metadata index.
+// Every field of entry is written verbatim except Created: a zero Created on
+// an existing entry means "keep the stored Created" (Save recovers it from
+// the session file only when the index has no usable value). preloaded, when
+// non-nil, is the index Save already read for Created recovery so a full save
+// reads index.json at most once; it is only valid because the caller holds
+// s.mu and no other index mutator runs between the read and this mutation.
+func (s *Store) updateIndex(workingDir string, entry sessionIndexEntry, preloaded *sessionIndex) {
 	s.mutateIndexWith(workingDir, true, preloaded, func(idx *sessionIndex) bool {
-		found := false
 		for i, e := range idx.Entries {
-			if e.ID == id {
-				if !created.IsZero() {
-					idx.Entries[i].Created = created
-				}
-				idx.Entries[i].Updated = updated
-				idx.Entries[i].Oneshot = oneshot
-				idx.Entries[i].MessageCount = msgCount
-				idx.Entries[i].Label = label
-				idx.Entries[i].LabelRenamed = labelRenamed
-				idx.Entries[i].ParentID = parentID
-				idx.Entries[i].SubagentStatus = subagentStatus
-				idx.Entries[i].SubagentSummary = subagentSummary
-				found = true
-				break
+			if e.ID != entry.ID {
+				continue
 			}
+			if entry.Created.IsZero() {
+				entry.Created = e.Created
+			}
+			idx.Entries[i] = entry
+			return true
 		}
-		if !found {
-			idx.Entries = append(idx.Entries, sessionIndexEntry{
-				ID: id, Created: created, Updated: updated, Oneshot: oneshot, MessageCount: msgCount, Label: label, LabelRenamed: labelRenamed, ParentID: parentID,
-				SubagentStatus: subagentStatus, SubagentSummary: subagentSummary,
-			})
-		}
+		idx.Entries = append(idx.Entries, entry)
 		return true
 	})
 }
@@ -508,12 +495,12 @@ func (s *Store) touchIndex(workingDir, id string, updated time.Time) error {
 // AppendMessages so listings stay accurate between full snapshots. Entries
 // missing from the index are skipped — the list fallback re-scans the
 // directory on the next miss.
-func (s *Store) updateIndexCount(workingDir, id string, updated time.Time, msgCount int) {
+func (s *Store) updateIndexCount(workingDir string, entry sessionIndexEntry) {
 	s.mutateIndex(workingDir, false, func(idx *sessionIndex) bool {
 		for i, e := range idx.Entries {
-			if e.ID == id {
-				idx.Entries[i].Updated = updated
-				idx.Entries[i].MessageCount = msgCount
+			if e.ID == entry.ID {
+				idx.Entries[i].Updated = entry.Updated
+				idx.Entries[i].MessageCount = entry.MessageCount
 				return true
 			}
 		}

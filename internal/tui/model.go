@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"gogen/internal/agent"
-	"gogen/internal/contextmgr"
 	"gogen/internal/session"
 
 	tea "charm.land/bubbletea/v2"
@@ -373,17 +372,17 @@ func (m *Model) bumpContextEstimate(delta string) {
 	if delta == "" {
 		return
 	}
-	if m.contextStreamBaseUsed <= 0 && m.contextStats.Snapshot.Limit <= 0 {
+	if m.contextEst.Base() <= 0 && m.contextStats.Snapshot.Limit <= 0 {
 		// No baseline yet (e.g. first turn before any refresh) — nothing
 		// meaningful to show until refreshContextStats() runs.
 		return
 	}
-	// contextmgr.HeuristicTokenCount is the shared bytes/4 approximation
+	// LiveEstimate uses the shared bytes/4 approximation internally
 	// (tokenizer-free, so it stays cheap mid-stream). The exact count is
 	// restored by refreshContextStats() as soon as streaming ends.
-	m.contextStreamEstAdded += contextmgr.HeuristicTokenCount(delta)
+	m.contextEst.Add(delta)
 	snap := m.contextStats.Snapshot
-	snap.Used = m.contextStreamBaseUsed + m.contextStreamEstAdded
+	snap.Used = m.contextEst.Used()
 	if snap.Limit > 0 {
 		snap.Percent = float64(snap.Used) / float64(snap.Limit)
 	}

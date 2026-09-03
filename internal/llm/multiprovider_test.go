@@ -243,8 +243,8 @@ func TestSetProfilesRefreshesCatalog(t *testing.T) {
 // TestDefaultBaseURLTracksSetProfiles verifies the live default-endpoint
 // fallbacks (/props probe target, models.dev resolution, and the
 // preserve_reasoning kwargs gate) resolve against the CURRENT default
-// profile after a runtime SetProfiles swap — the legacy p.baseURL is
-// intentionally frozen, so the fallbacks must not use it.
+// profile after a runtime SetProfiles swap — never the construction-time
+// endpoint.
 func TestDefaultBaseURLTracksSetProfiles(t *testing.T) {
 	oldSrv := catalogHandler("gpt-4o")
 	newSrv := catalogHandler("gpt-4o")
@@ -357,10 +357,10 @@ func TestProviderProfilesBuilder(t *testing.T) {
 	}
 }
 
-// TestNewOpenAIProviderSingleProfileKeepsLegacyShape pins the wrapper
-// contract: the single-endpoint constructor still routes everything through
-// the primary client (the default profile aliases it).
-func TestNewOpenAIProviderSingleProfileKeepsLegacyShape(t *testing.T) {
+// TestNewOpenAIProviderSingleProfileRoutesThroughDefaultProfile pins the
+// wrapper contract: the single-endpoint constructor routes everything
+// through the default profile's stream client.
+func TestNewOpenAIProviderSingleProfileRoutesThroughDefaultProfile(t *testing.T) {
 	srv := catalogHandler("gpt-4o")
 	t.Cleanup(srv.Close)
 
@@ -371,41 +371,38 @@ func TestNewOpenAIProviderSingleProfileKeepsLegacyShape(t *testing.T) {
 	if len(p.profiles) != 1 || p.profiles[0].name != "default" {
 		t.Fatalf("single-endpoint provider profiles = %+v, want one default", p.profiles)
 	}
-	if got := p.clientForModel(context.Background()); got != &p.client {
-		t.Fatal("single-endpoint provider should route through the primary client")
+	if got := p.clientForModel(context.Background()); got != p.profiles[0].stream {
+		t.Fatal("single-endpoint provider should route through the default profile's stream client")
 	}
 	if got := p.clientForModel(context.Background()); got != p.fallbackClient() {
-		t.Fatal("fallback client should be the primary client")
+		t.Fatal("fallback client should be the default profile's stream client")
 	}
 }
 
-// TestProfileAliasingInvariants pins the provider's dual-state contract:
-// constructor-built providers alias the default profile's stream client with
-// the legacy primary client (so the fallback path and routing always agree),
-// and SetProfiles swaps the whole client set so the fallback routing points
-// at the NEW profile clients — never the stale construction-time ones.
-func TestProfileAliasingInvariants(t *testing.T) {
+// TestFallbackTracksProfileSwaps pins the fallback contract: the fallback
+// client is always the default profile's stream client, and SetProfiles
+// swaps the whole client set so the fallback routing points at the NEW
+// profile clients — never the stale construction-time ones.
+func TestFallbackTracksProfileSwaps(t *testing.T) {
 	p := NewOpenAIProviderWithProfiles([]ProviderProfile{
 		{Name: "default", BaseURL: "https://a.example/v1", APIKey: "k1"},
 		{Name: "second", BaseURL: "https://b.example/v1", APIKey: "k2"},
 	}, "gpt-4o", t.TempDir(), nil)
 
-	// Construction: profiles[0].stream aliases the legacy primary client.
+	// Construction: the fallback is the default profile's stream client.
 	if len(p.profiles) != 2 {
 		t.Fatalf("profiles = %d, want 2", len(p.profiles))
 	}
-	if p.profiles[0].stream != &p.client {
-		t.Fatal("default profile stream must alias the legacy primary client")
-	}
-	if got := p.fallbackClient(); got != &p.client {
-		t.Fatal("fallback client must be the legacy primary client")
+	oldStream := p.profiles[0].stream
+	if got := p.fallbackClient(); got != oldStream {
+		t.Fatal("fallback client must be the default profile's stream client")
 	}
 	if got := p.defaultBaseURL(); got != "https://a.example/v1" {
 		t.Fatalf("default base URL = %q, want the default profile's", got)
 	}
 
 	// SetProfiles: the client set is rebuilt; the fallback routing must
-	// point at the new default profile's stream, and the legacy primary
+	// point at the new default profile's stream, and the construction-time
 	// client must NOT be reused (it still serves the old endpoint).
 	if err := p.SetProfiles([]ProviderProfile{
 		{Name: "default", BaseURL: "https://new.example/v1", APIKey: "k3"},
@@ -415,8 +412,8 @@ func TestProfileAliasingInvariants(t *testing.T) {
 	if len(p.profiles) != 1 {
 		t.Fatalf("profiles after SetProfiles = %d, want 1", len(p.profiles))
 	}
-	if p.profiles[0].stream == &p.client {
-		t.Fatal("SetProfiles must build fresh clients, not reuse the legacy primary client")
+	if p.profiles[0].stream == oldStream {
+		t.Fatal("SetProfiles must build fresh clients, not reuse the construction-time client")
 	}
 	if got := p.fallbackClient(); got != p.profiles[0].stream {
 		t.Fatal("fallback client must point at the new default profile's stream after SetProfiles")
@@ -428,10 +425,9 @@ func TestProfileAliasingInvariants(t *testing.T) {
 
 // TestSetProfilesDropsOpenCodeRouting pins that the OpenCode routing
 // helpers are profile-derived: after SetProfiles replaces an OpenCode
-// endpoint with a plain one, the legacy frozen zen/go clients must not be
-// used — hasOpenCodeProfile goes false and inferOpenCodeEndpoint returns
-// nil even though the legacy fields still point at the old OpenCode
-// clients. The reverse swap flips detection back on.
+// endpoint with a plain one, the construction-time zen/go clients must not
+// be used — hasOpenCodeProfile goes false and inferOpenCodeEndpoint
+// returns nil. The reverse swap flips detection back on.
 func TestSetProfilesDropsOpenCodeRouting(t *testing.T) {
 	p := NewOpenAIProviderWithProfiles([]ProviderProfile{
 		{Name: "default", BaseURL: "https://opencode.ai/zen/v1/", APIKey: "k"},
@@ -439,8 +435,8 @@ func TestSetProfilesDropsOpenCodeRouting(t *testing.T) {
 	if !p.hasOpenCodeProfile() {
 		t.Fatal("opencode default should report an opencode profile")
 	}
-	if p.zenClient == nil {
-		t.Fatal("precondition: the legacy zen client should be wired for the opencode construction")
+	if p.profiles[0].zenStream == nil {
+		t.Fatal("precondition: the zen client should be wired for the opencode construction")
 	}
 	if err := p.SetProfiles([]ProviderProfile{
 		{Name: "default", BaseURL: "https://plain.example/v1", APIKey: "k"},

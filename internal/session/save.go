@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"gogen/internal/agent"
 	"gogen/internal/ioutil"
 )
 
@@ -42,7 +41,7 @@ func (s *Store) setCreatedCache(id string, created time.Time) {
 }
 
 // Save writes a session snapshot.
-func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
+func (s *Store) Save(id string, snap SessionSnapshot) error {
 	if !s.enabled || id == "" {
 		return nil
 	}
@@ -108,7 +107,18 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 	// fresh here. This lets a cache-miss full save read index.json once
 	// instead of twice.
 	label := sessionLabel(snap.Messages, snap.Label, snap.LabelRenamed)
-	s.updateIndex(snap.WorkingDir, id, out.Created, out.Updated, len(snap.Messages), label, snap.Oneshot, snap.LabelRenamed, snap.ParentID, snap.SubagentStatus, snap.SubagentSummary, preloadedIdx)
+	s.updateIndex(snap.WorkingDir, sessionIndexEntry{
+		ID:              id,
+		Created:         out.Created,
+		Updated:         out.Updated,
+		Oneshot:         snap.Oneshot,
+		MessageCount:    len(snap.Messages),
+		Label:           label,
+		LabelRenamed:    snap.LabelRenamed,
+		ParentID:        snap.ParentID,
+		SubagentStatus:  snap.SubagentStatus,
+		SubagentSummary: snap.SubagentSummary,
+	}, preloadedIdx)
 	// Per-parent transcript cap (D2): nested sessions are exempt from the
 	// global retention counts but capped per parent (keep the most recent
 	// 10 children; oldest pruned at child save time).
@@ -138,7 +148,7 @@ func (s *Store) Save(id string, snap agent.SessionSnapshot) error {
 // single-prompt sessions are NOT an exception: their pre-prompt flush must
 // stay skipped or every `-p` run would leave an empty session entry
 // behind.) Caller must hold s.mu.
-func (s *Store) skipEmptySave(id string, snap agent.SessionSnapshot, path string) bool {
+func (s *Store) skipEmptySave(id string, snap SessionSnapshot, path string) bool {
 	if len(snap.Messages) == 0 && snap.Label == "" {
 		if _, err := os.Stat(path); os.IsNotExist(err) {
 			if _, err := os.Stat(s.deltaPath(snap.WorkingDir, id)); os.IsNotExist(err) {
@@ -265,26 +275,26 @@ func (s *Store) SetUpdatedAt(workingDir, id string, updated time.Time) error {
 }
 
 // LoadInWorkingDir loads a session from a working directory.
-func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, error) {
+func (s *Store) LoadInWorkingDir(workingDir, id string) (SessionSnapshot, error) {
 	if !s.enabled {
-		return agent.SessionSnapshot{}, fmt.Errorf("session persistence disabled")
+		return SessionSnapshot{}, fmt.Errorf("session persistence disabled")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := validateSessionID(id); err != nil {
-		return agent.SessionSnapshot{}, err
+		return SessionSnapshot{}, err
 	}
 	path := s.path(workingDir, id)
 	if err := ensureUnderSessionsDir(workingDir, path, s.globalDir); err != nil {
-		return agent.SessionSnapshot{}, err
+		return SessionSnapshot{}, err
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return agent.SessionSnapshot{}, err
+		return SessionSnapshot{}, err
 	}
 	var f file
 	if err := json.Unmarshal(data, &f); err != nil {
-		return agent.SessionSnapshot{}, err
+		return SessionSnapshot{}, err
 	}
 	if !f.Created.IsZero() {
 		s.setCreatedCache(id, f.Created)
@@ -371,7 +381,7 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 		}
 	}
 
-	return agent.SessionSnapshot{
+	return SessionSnapshot{
 		WorkingDir:      f.WorkingDir,
 		Model:           f.Model,
 		Mode:            f.Mode,
@@ -398,7 +408,7 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (agent.SessionSnapshot, 
 // delta is cumulative, it is the correct index count between full snapshots.
 // BaseCount (totalMsgCount minus the delta length) records the message count
 // of the snapshot the delta extends, letting loads detect stale deltas.
-func (s *Store) AppendMessages(id string, snap agent.SessionSnapshot, totalMsgCount int) error {
+func (s *Store) AppendMessages(id string, snap SessionSnapshot, totalMsgCount int) error {
 	if !s.enabled || id == "" {
 		return nil
 	}
@@ -440,11 +450,18 @@ func (s *Store) AppendMessages(id string, snap agent.SessionSnapshot, totalMsgCo
 	// file always holds every message since the last full snapshot, so the
 	// agent's total count is authoritative. Label and oneshot flags are
 	// preserved — appends do not change them.
-	s.updateIndexCount(snap.WorkingDir, id, time.Now().UTC(), totalMsgCount)
+	s.updateIndexCount(snap.WorkingDir, sessionIndexEntry{ID: id, Updated: time.Now().UTC(), MessageCount: totalMsgCount})
 	return nil
 }
 
-// Delete removes a saved session file.
+// Delete removes a saved session file, its delta, archive, index entry,
+// and any nested (subagent) children. A session that exists only in memory
+// — a /new pane that was never used is not persisted on quit (see Save's
+// empty-session skip) — can still be deleted (sidebar ✕ / resume del);
+// deleting it is a success, not a "session not found" error, so a missing
+// file is tolerated and any leftover delta/index/archive state is cleaned
+// up (a stale Created cache entry would otherwise be re-used by a later
+// Save of a new session with the same id).
 func (s *Store) Delete(workingDir, id string) error {
 	if !s.enabled {
 		return fmt.Errorf("session persistence disabled")
@@ -454,43 +471,9 @@ func (s *Store) Delete(workingDir, id string) error {
 	if err := validateSessionID(id); err != nil {
 		return err
 	}
-	path := s.path(workingDir, id)
-	if err := ensureUnderSessionsDir(workingDir, path, s.globalDir); err != nil {
+	if err := s.deleteSessionFile(workingDir, id); err != nil {
 		return err
 	}
-	if err := os.Remove(path); err != nil {
-		if os.IsNotExist(err) {
-			// The session may exist only in memory: a /new pane that was
-			// never used is not persisted on quit (see Save's empty-session
-			// skip), yet the user can still delete it (sidebar ✕ / resume
-			// del). Deleting it is a success — there is no persisted state
-			// to remove — so clean up any leftover delta/index entry and
-			// return nil instead of "session not found".
-			if err := s.clearDeltaFile(workingDir, id); err != nil && !os.IsNotExist(err) {
-				log.Printf("warning: failed to remove delta for session %s: %v", id, err)
-			}
-			s.removeArchiveFile(workingDir, id)
-			// Mirror the found-path cleanup: a stale Created cache entry would
-			// otherwise be re-used by a later Save of a new session with the
-			// same id (in-memory-only sessions are created and deleted without
-			// ever touching disk).
-			delete(s.createdCache, id)
-			s.removeFromIndex(workingDir, id)
-			s.invalidateListCache(workingDir)
-			s.deleteNestedChildren(workingDir, id)
-			return nil
-		}
-		return err
-	}
-	// Remove any pending delta for the session as well.
-	if err := s.clearDeltaFile(workingDir, id); err != nil && !os.IsNotExist(err) {
-		log.Printf("warning: failed to remove delta for session %s: %v", id, err)
-	}
-	s.removeArchiveFile(workingDir, id)
-	delete(s.createdCache, id)
-	// Remove from index and invalidate in-memory cache.
-	s.removeFromIndex(workingDir, id)
-	s.invalidateListCache(workingDir)
 	// Cascade: deleting a parent removes its nested (subagent) children
 	// (D2). Children are not in the flat list, so this is the only way they
 	// are ever deleted as a group.
@@ -599,8 +582,11 @@ func (s *Store) pruneNestedSiblings(workingDir, keepID, parentID string) {
 	}
 }
 
-// deleteSessionFile removes one session's file, delta, index entry, and
-// created-cache entry. Callers must hold s.mu.
+// deleteSessionFile removes one session's file, delta, archive file, index
+// entry, created-cache entry, and invalidates the list cache. A missing
+// session file is not an error (the session may exist only in memory or
+// have been deleted already); any other removal error aborts before the
+// cleanup runs. Callers must hold s.mu.
 func (s *Store) deleteSessionFile(workingDir, id string) error {
 	if err := validateSessionID(id); err != nil {
 		return err

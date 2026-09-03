@@ -12,7 +12,6 @@ import (
 	"strings"
 
 	"gogen/internal/agent"
-	"gogen/internal/llm"
 	"gogen/internal/session"
 )
 
@@ -132,10 +131,24 @@ func (s *Server) loadOrCreateRuntime(id string) (*sessionRuntime, error) {
 	// concurrent attach won the registration race above, this agent is an
 	// unregistered orphan — the winner validates its own agent.
 	if rt.agent == a && snap.Model != "" {
-		a.OnModelChanged = func() { s.pushConfigForAgent(a) }
-		go a.ValidateRestoredModel(context.Background(), snap.Model)
+		s.validateModelAsync(rt, snap.Model)
 	}
 	return rt, nil
+}
+
+// validateModelAsync confirms rt's model against the provider in the
+// background and pushes the result to the session's clients. It is the
+// single wiring point for the async ValidateRestoredModel contract shared
+// by loadOrCreateRuntime, createNewSession, and sessionFork: the hook must
+// be installed on the REGISTERED runtime's agent (the config refresh targets
+// that session's clients), and the caller decides the guard — whether the
+// model came from a restored snapshot (snap.Model != ""), was inherited
+// from the pane (modelInherited), or the agent is the registration winner
+// (rt.agent == a).
+func (s *Server) validateModelAsync(rt *sessionRuntime, model string) {
+	a := rt.agent
+	a.OnModelChanged = func() { s.pushConfigForAgent(a) }
+	go a.ValidateRestoredModel(context.Background(), model)
 }
 
 // switchPane points the connection's current pane at rt and attaches the
@@ -229,7 +242,7 @@ func (s *Server) createNewSession(ws *wsConn, pane **sessionRuntime) *sessionRun
 	var inheritModel string
 	if old := *pane; old != nil && old.agent != nil {
 		// Locked read: another connection can set the pane's thinking level
-		// concurrently (handleWSSetThinkingLevel under the session turnMu),
+		// concurrently (wsHandleSetThinkingLevel under the session turnMu),
 		// and /new must not tear the plain field read. CurrentModel is
 		// provider-internal-locked.
 		_, inheritLevel = old.agent.ModeAndThinkingLevel()
@@ -269,8 +282,7 @@ func (s *Server) createNewSession(ws *wsConn, pane **sessionRuntime) *sessionRun
 		// provider's own catalog — or cleared and replaced by sole-model
 		// auto-select when it is gone — and the clients are corrected via
 		// OnModelChanged.
-		a.OnModelChanged = func() { s.pushConfigForAgent(a) }
-		go a.ValidateRestoredModel(context.Background(), inheritModel)
+		s.validateModelAsync(rt, inheritModel)
 	}
 	return rt
 }
@@ -309,14 +321,7 @@ func (s *Server) sessionResume(ctx context.Context, ws *wsConn, pane **sessionRu
 	s.sendSessionState(ws, rt)
 
 	a := rt.agent
-	label := llm.SessionLabel(a.SnapshotMessages())
-	var out string
-	if label != "" {
-		out = fmt.Sprintf("Resumed session %s (%d messages): \"%s\"", id, a.MessageCount(), label)
-	} else {
-		out = fmt.Sprintf("Resumed session %s (%d messages).", id, a.MessageCount())
-	}
-	out = agent.AppendContextBrief(ctx, a, out)
+	out := agent.AppendContextBrief(ctx, a, agent.ResumeOutputMessage(id, a.SnapshotMessages()))
 	return agent.SessionCommandResult{
 		Output:  out,
 		Action:  agent.SessionActionClearChat,
@@ -367,8 +372,7 @@ func (s *Server) sessionFork(ctx context.Context, ws *wsConn, pane **sessionRunt
 	// itself have been restored with a model that no longer exists on the
 	// current provider.
 	if snap.Model != "" {
-		a.OnModelChanged = func() { s.pushConfigForAgent(a) }
-		go a.ValidateRestoredModel(context.Background(), snap.Model)
+		s.validateModelAsync(rt, snap.Model)
 	}
 	// Persist the forked session. The source session is deliberately NOT
 	// touched (no TouchSession): forking is an interaction with the FORK,

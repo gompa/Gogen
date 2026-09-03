@@ -7,8 +7,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"gogen/internal/agent"
 )
 
 // TestAppendArchiveJSONL pins the Phase 5 sidecar format: an append-only
@@ -16,7 +14,7 @@ import (
 func TestAppendArchiveJSONL(t *testing.T) {
 	wd := t.TempDir()
 	s := NewStore(true)
-	first := agent.ArchiveEntry{
+	first := ArchiveEntry{
 		TS:      time.Now().UTC().Truncate(time.Second),
 		Kind:    "condensed_message",
 		Index:   0,
@@ -27,7 +25,7 @@ func TestAppendArchiveJSONL(t *testing.T) {
 	if err := s.AppendArchive(wd, "sess1", first); err != nil {
 		t.Fatalf("AppendArchive: %v", err)
 	}
-	second := agent.ArchiveEntry{Kind: "condensed_message", Index: 2, Role: "tool", Content: "second"}
+	second := ArchiveEntry{Kind: "condensed_message", Index: 2, Role: "tool", Content: "second"}
 	if err := s.AppendArchive(wd, "sess1", second); err != nil {
 		t.Fatalf("AppendArchive (second): %v", err)
 	}
@@ -41,7 +39,7 @@ func TestAppendArchiveJSONL(t *testing.T) {
 	if len(lines) != 2 {
 		t.Fatalf("sidecar lines = %d, want 2", len(lines))
 	}
-	var got agent.ArchiveEntry
+	var got ArchiveEntry
 	if err := json.Unmarshal([]byte(lines[0]), &got); err != nil {
 		t.Fatalf("first line is not valid JSON: %v", err)
 	}
@@ -49,7 +47,7 @@ func TestAppendArchiveJSONL(t *testing.T) {
 		got.Tokens != 3000 || got.Content != "the original message" {
 		t.Fatalf("first entry = %+v, want the original message", got)
 	}
-	var got2 agent.ArchiveEntry
+	var got2 ArchiveEntry
 	if err := json.Unmarshal([]byte(lines[1]), &got2); err != nil {
 		t.Fatalf("second line is not valid JSON: %v", err)
 	}
@@ -63,7 +61,7 @@ func TestAppendArchiveJSONL(t *testing.T) {
 func TestDeleteRemovesArchive(t *testing.T) {
 	wd := t.TempDir()
 	s := NewStore(true)
-	if err := s.AppendArchive(wd, "sess1", agent.ArchiveEntry{Kind: "condensed_message", Content: "x"}); err != nil {
+	if err := s.AppendArchive(wd, "sess1", ArchiveEntry{Kind: "condensed_message", Content: "x"}); err != nil {
 		t.Fatalf("AppendArchive: %v", err)
 	}
 	// The session file itself does not exist (the sidecar is created
@@ -82,7 +80,7 @@ func TestDeleteRemovesArchive(t *testing.T) {
 // the in-band notice).
 func TestAppendArchiveDisabledStore(t *testing.T) {
 	s := NewStore(false)
-	if err := s.AppendArchive(t.TempDir(), "sess1", agent.ArchiveEntry{Kind: "condensed_message"}); err == nil {
+	if err := s.AppendArchive(t.TempDir(), "sess1", ArchiveEntry{Kind: "condensed_message"}); err == nil {
 		t.Fatal("AppendArchive on a disabled store: want an error")
 	}
 }

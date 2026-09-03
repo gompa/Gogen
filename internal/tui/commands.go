@@ -267,28 +267,11 @@ func cmdSession(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 		return true, false, nil
 	}
 	if result.Action == agent.SessionActionClearChat {
-		// Clear chat and show new session info
-		m.chatLines = nil
-		m.chatLines = append(m.chatLines, SystemStyle.Render(result.Output))
-		if len(result.History) > 0 {
-			m.chatLines = append(m.chatLines, renderMessages(result.History, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())...)
-		}
-		m.setViewportContent()
-		m.viewport.GotoBottom()
-		m.sessionID = m.agent.SessionID
-		// /new and /resume <id> rebind the focused agent: re-stamp the
-		// session's recency so the list does not reorder (see
-		// rebindActivity).
-		m.rebindActivity()
-		// A resumed/restored conversation has a cold token-count cache:
-		// probe off the Update thread (a synchronous probe would tokenize
-		// the whole history on the render loop).
-		cmds := []tea.Cmd{m.requestContextStats(), m.requestSavedSessions()}
 		// "resume del <current>" mutates the store on this early-return
-		// path (unlike /new and plain resume, which do not) — refresh so
-		// the deleted row does not linger in the sidebar until the next
-		// 30 s tick.
-		return true, false, tea.Batch(cmds...)
+		// path (unlike /new and plain resume, which do not); the refresh
+		// returned by applySessionSwitch keeps the deleted row from
+		// lingering in the sidebar until the next 30 s tick.
+		return true, false, m.applySessionSwitch(result)
 	} else if result.Sessions != nil {
 		// Show session list modal
 		m.sessionList = result.Sessions
@@ -307,6 +290,30 @@ func cmdSession(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 	// The store index just changed — refresh the sidebar's unified list
 	// off the Update thread.
 	return true, false, m.requestSavedSessions()
+}
+
+// applySessionSwitch applies the TUI session-switch epilogue shared by the
+// /session command path (cmdSession) and the sidebar resume path
+// (resumeSavedRow): it clears the chat, appends the notice line plus the
+// rendered history, scrolls the viewport to the bottom, re-stamps the
+// session's recency (rebindActivity), and returns the off-thread refresh
+// cmds — a cold token-count cache probe (a synchronous probe would tokenize
+// the whole history on the render loop) and a sidebar refresh. Callers own
+// their per-entry-point extras (sidebar cursor, persist-error check) and
+// return arity.
+func (m *Model) applySessionSwitch(result agent.SessionCommandResult) tea.Cmd {
+	m.chatLines = nil
+	m.chatLines = append(m.chatLines, SystemStyle.Render(result.Output))
+	if len(result.History) > 0 {
+		m.chatLines = append(m.chatLines, renderMessages(result.History, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())...)
+	}
+	m.setViewportContent()
+	m.viewport.GotoBottom()
+	m.sessionID = m.agent.SessionID
+	// /new and /resume <id> rebind the focused agent: re-stamp the
+	// session's recency so the list does not reorder (see rebindActivity).
+	m.rebindActivity()
+	return tea.Batch(m.requestContextStats(), m.requestSavedSessions())
 }
 
 func cmdSaveConfig(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
@@ -383,17 +390,26 @@ type deliveryRequestMsg struct {
 	text string
 }
 
-// submitDeliveredText renders a system-delivered message as a user line and
-// runs a turn on it — the same flow as submitUserInput minus the input
-// history bookkeeping. Callers must ensure !m.streaming.
-func (m *Model) submitDeliveredText(text string) tea.Cmd {
-	m.appendChatLine(SystemStyle.Render(noticeLabel + " " + text))
+// startTurn runs an agent turn on text, rendering chatLine as the
+// user-facing chat entry and wiring the per-session streaming state (seq,
+// cancel, adapter, delete approver) shared by every turn entry point.
+// chatLine is passed pre-rendered because the entry points style it
+// differently (UserStyle label + plain text vs a fully SystemStyle line).
+// Callers must ensure !m.streaming.
+func (m *Model) startTurn(text, chatLine string) tea.Cmd {
+	m.appendChatLine(chatLine)
 	m.streaming = true
 	m.resetStreamState(false)
 	startProgress := m.setProgress(progressThinking, "thinking")
 
+	// Create cancelable context for the LLM call (no lastActive stamp:
+	// only a COMPLETED turn produces output — the web bumps a row on
+	// output, not on submit).
 	sess := m.turnSession()
 	sess.streaming = true
+	// Bump the turn generation BEFORE the goroutine starts: every message
+	// this turn emits (and its terminal) carries the new seq, so a later
+	// cancel + resubmit supersedes it cleanly.
 	sess.turnSeq++
 	seq := sess.turnSeq
 	streamCtx, cancelFn := context.WithCancel(m.ctx)
@@ -418,6 +434,13 @@ func (m *Model) submitDeliveredText(text string) tea.Cmd {
 		return endOfStream(sess.id, seq)
 	}
 	return tea.Batch(startProgress, streamCmd)
+}
+
+// submitDeliveredText renders a system-delivered message as a user line and
+// runs a turn on it — the same flow as submitUserInput minus the input
+// history bookkeeping. Callers must ensure !m.streaming.
+func (m *Model) submitDeliveredText(text string) tea.Cmd {
+	return m.startTurn(text, SystemStyle.Render(noticeLabel+" "+text))
 }
 
 // drainDeliveries starts the next queued system delivery when the TUI is
@@ -456,46 +479,8 @@ func (m *Model) submitUserInput(input string) tea.Cmd {
 	}
 	m.historyIdx = len(m.inputHistory)
 
-	// Show user message in chat
-	m.appendChatLine(UserStyle.Render(userLabel) + " " + trimmed)
-
-	// Start streaming
-	m.streaming = true
-	m.resetStreamState(false)
-	startProgress := m.setProgress(progressThinking, "thinking")
-
-	// Create cancelable context for the LLM call (no lastActive stamp:
-	// only a COMPLETED turn produces output — the web bumps a row on
-	// output, not on submit).
-	sess := m.turnSession()
-	sess.streaming = true
-	// Bump the turn generation BEFORE the goroutine starts: every message
-	// this turn emits (and its terminal) carries the new seq, so a later
-	// cancel + resubmit supersedes it cleanly.
-	sess.turnSeq++
-	seq := sess.turnSeq
-	streamCtx, cancelFn := context.WithCancel(m.ctx)
-	sess.cancel = cancelFn
-
-	adapter := NewStreamAdapter(sess.id, seq, m.program, sess)
-	a := m.agent
-	approver := m.makeDeleteApprover(sess.id, m.program)
-
-	streamCmd := func() tea.Msg {
-		defer cancelFn()
-		_, err := a.StreamProcessInput(
-			agent.ContextWithDeleteApprover(streamCtx, approver),
-			trimmed,
-			adapter.Handlers(),
-		)
-		if err != nil {
-			return failOfStream(sess.id, seq, err)
-		}
-		// Return streamEndMsg directly so handleStreamEnd refreshes context
-		// stats synchronously after Messages are final.
-		return endOfStream(sess.id, seq)
-	}
-	return tea.Batch(startProgress, streamCmd)
+	// Show user message in chat and start the turn.
+	return m.startTurn(trimmed, UserStyle.Render(userLabel)+" "+trimmed)
 }
 
 // makeDeleteApprover creates a delete approver that shows a modal.

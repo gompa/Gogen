@@ -250,6 +250,22 @@ func (a *Agent) backgroundJob(jobID string) *BackgroundJob {
 	return a.bgJobs[jobID]
 }
 
+// exitCodeOf extracts the process exit code from err. A clean exit (nil err)
+// yields 0. An *exec.ExitError yields its real exit code (or -1 when the
+// process was killed by a signal). Any other error is an unusual failure
+// (I/O error, etc.) and yields fallback, which callers pass as -1 so it stays
+// distinct from a genuine non-zero exit such as 1.
+func exitCodeOf(err error, fallback int) int {
+	if err == nil {
+		return 0
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode()
+	}
+	return fallback
+}
+
 // BackgroundJobStatus reports the state of a background job: whether it is
 // still running, its exit code when finished, and the tail of its output.
 // Finished jobs stay registered for a bounded retention window, so the agent
@@ -263,7 +279,6 @@ func (a *Agent) BackgroundJobStatus(jobID string) (string, error) {
 	elapsed := time.Since(job.Start).Round(time.Millisecond)
 
 	running := true
-	exitCode := -1
 	var exitErr error
 	select {
 	case <-job.done:
@@ -278,16 +293,8 @@ func (a *Agent) BackgroundJobStatus(jobID string) (string, error) {
 		return fmt.Sprintf("Job %s is RUNNING (%s elapsed).\nCommand: %s\n%s", job.ID, elapsed, job.Command, formatJobOutput(job, true)), nil
 	case job.cancelled.Load():
 		return fmt.Sprintf("Job %s was CANCELLED after %s.\nCommand: %s\n%s", job.ID, elapsed, job.Command, formatJobOutput(job, false)), nil
-	case exitErr == nil:
-		exitCode = 0
-	default:
-		var ee *exec.ExitError
-		if errors.As(exitErr, &ee) {
-			exitCode = ee.ExitCode()
-		} else {
-			exitCode = 1
-		}
 	}
+	exitCode := exitCodeOf(exitErr, -1)
 	return fmt.Sprintf("Job %s FINISHED in %s with exit code %d.\nCommand: %s\n%s", job.ID, elapsed, exitCode, job.Command, formatJobOutput(job, false)), nil
 }
 
@@ -379,21 +386,11 @@ const maxJobNoticeCommandLen = 120
 // command, and exit code (-1 for unusual failures such as I/O errors).
 // Called from the job's wait goroutine after exitErr is final.
 func jobExitSummary(job *BackgroundJob) string {
-	code := 0
-	if job.exitErr != nil {
-		var exitErr *exec.ExitError
-		if errors.As(job.exitErr, &exitErr) {
-			code = exitErr.ExitCode()
-		} else {
-			code = -1
-		}
-	}
-	cmd := job.Command
-	if len(cmd) > maxJobNoticeCommandLen {
-		// Truncate on a rune boundary: the byte-slice version could split
-		// a multi-byte character and emit invalid UTF-8 into the transcript.
-		cmd = string([]rune(cmd)[:maxJobNoticeCommandLen]) + "…"
-	}
+	code := exitCodeOf(job.exitErr, -1)
+	// Truncate makes a rune-safe cut: a raw byte slice could split a
+	// multi-byte character and emit invalid UTF-8 into the transcript.
+	cmd := contextmgr.Truncate(job.Command, maxJobNoticeCommandLen,
+		contextmgr.TruncateOptions{Marker: "…"})
 	return fmt.Sprintf("[job] %s (%s) exited with code %d", job.ID, cmd, code)
 }
 
@@ -513,4 +510,51 @@ func (w *boundedOutputWriter) Write(p []byte) (int, error) {
 
 func (w *boundedOutputWriter) String() string {
 	return w.string()
+}
+
+// SetJobNoticeHook installs a callback invoked when a background job
+// (execute_command background=true) finishes naturally; it receives a
+// one-line summary. Hosts wire it to the message-delivery service so the
+// session is notified without polling. nil detaches.
+func (a *Agent) SetJobNoticeHook(h func(summary string)) {
+	a.jobNoticeHookMu.Lock()
+	a.jobNoticeHook = h
+	a.jobNoticeHookMu.Unlock()
+}
+
+// fireJobNotice invokes the installed job-notice hook, if any.
+func (a *Agent) fireJobNotice(summary string) {
+	a.jobNoticeHookMu.RLock()
+	h := a.jobNoticeHook
+	a.jobNoticeHookMu.RUnlock()
+	if h != nil {
+		h(summary)
+	}
+}
+
+// backgroundState groups the session-owned background shell jobs (bgMu) and
+// the per-session read_image byte budget (sessionImages).
+type backgroundState struct {
+	// bgMu guards bgJobs: shell commands started with execute_command
+	// background=true. Jobs outlive the turn that started them (they are
+	// owned by the session, not the turn) and are killed when the session
+	// closes (Close) or individually via background_job (action=cancel).
+	bgMu   sync.Mutex
+	bgJobs map[string]*BackgroundJob
+	// bgRetain is how long a finished background job stays registered for
+	// status polling before the reaper removes it (0 = the
+	// defaultBackgroundJobRetain window). Read only from the job's wait
+	// goroutine; tests set it before starting jobs.
+	bgRetain time.Duration
+	// bgMaxFinished caps how many finished jobs stay registered at once
+	// (0 = defaultMaxFinishedBackgroundJobs); when a job finishes over the
+	// cap, the oldest finished jobs are reaped immediately.
+	bgMaxFinished int
+
+	// sessionImages counts read_image attachments in this session. Atomic:
+	// read_image handlers run concurrently in parallel read-only batches,
+	// so the claim (reserveImageSlot) is a CAS loop. Enforces the soft
+	// per-session cap (maxSessionImages) on image bytes — the most
+	// expensive content in context, resent on every API request.
+	sessionImages atomic.Int32
 }

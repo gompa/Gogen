@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"unicode/utf8"
 
 	"gogen/internal/config"
 	"gogen/internal/debuglog"
@@ -402,60 +401,12 @@ func (m *Manager) TruncateToolResult(content string) string {
 	return truncateToolResult(content, max)
 }
 
-// TruncateRuneSafe cuts s to at most max bytes without splitting a UTF-8
-// rune: it backs off over continuation bytes until it lands on a rune
-// boundary. s is assumed valid UTF-8 (tool results that pass through JSON
-// decoding always are); for invalid input the result is never worse than a
-// raw byte cut. Shared by the context window capper and the web server's
-// per-frame tool-result cap so both produce valid UTF-8 output.
-func TruncateRuneSafe(s string, max int) string {
-	if max <= 0 || len(s) <= max {
-		return s
-	}
-	for max > 0 && !utf8.RuneStart(s[max]) {
-		max--
-	}
-	return s[:max]
-}
-
-// RuneSafeTailStart returns the byte offset at which a tail capped at max
-// bytes of data may start without splitting a UTF-8 rune: the raw cut point
-// (len(data)-max) is advanced forward over continuation bytes until it lands
-// on a rune boundary. A raw byte cut can split a multi-byte character at the
-// start of the shown tail and inject invalid UTF-8 into the tool result —
-// the tail-cut mirror of TruncateRuneSafe (which makes head cuts rune-safe).
-// data is assumed valid UTF-8 (command output usually is; for invalid input
-// the result is never worse than a raw byte cut). The []byte signature
-// exists so callers backed by bytes.Buffer can pass the offset straight to
-// Buffer.Next. Returns 0 when the data fits within max, or max <= 0 (no cap).
-func RuneSafeTailStart(data []byte, max int) int {
-	if max <= 0 || len(data) <= max {
-		return 0
-	}
-	start := len(data) - max
-	for start < len(data) && !utf8.RuneStart(data[start]) {
-		start++
-	}
-	return start
-}
-
-// TruncateMarked caps s to at most max bytes with a rune-safe head cut and
-// appends marker when a cut was made. Unlike truncateToolResult the marker
-// is NOT reserved inside the budget: the capped result may exceed max by
-// len(marker). s is assumed valid UTF-8, like TruncateRuneSafe.
-func TruncateMarked(s string, max int, marker string) string {
-	if max <= 0 || len(s) <= max {
-		return s
-	}
-	return TruncateRuneSafe(s, max) + marker
-}
-
 // truncateToolResult caps content to max bytes and appends a truncation
 // marker. The marker's length is reserved up front so the capped result fits
-// within max bytes (the previous behavior returned max + marker, exceeding
-// the budget). When max is smaller than the marker itself, the marker is
-// omitted rather than exceeding the cap; the result is then exactly max
-// bytes and will not be re-truncated on a later pass.
+// within max bytes (Truncate with MarkerInBudget; the previous behavior
+// returned max + marker, exceeding the budget). Content already carrying the
+// marker is returned unchanged (idempotency: a later pass must not
+// re-truncate an already-capped result).
 func truncateToolResult(content string, max int) string {
 	if max <= 0 || len(content) <= max {
 		return content
@@ -464,10 +415,7 @@ func truncateToolResult(content string, max int) string {
 		return content
 	}
 	marker := fmt.Sprintf("\n… truncated (%d bytes total)", len(content))
-	if len(marker) >= max {
-		return TruncateRuneSafe(content, max)
-	}
-	return TruncateRuneSafe(content, max-len(marker)) + marker
+	return Truncate(content, max, TruncateOptions{Marker: marker, MarkerInBudget: true})
 }
 
 // ContextSnapshot summarizes context window usage for display.
@@ -639,63 +587,65 @@ func (m *Manager) EnsureToolResultsCapped(messages []llm.Message) bool {
 	return changed
 }
 
-// Compact replaces the middle of canonical history with an LLM-generated summary.
-// It preserves the first user message and the most recent CompactKeepRecentMessages entries.
-func (m *Manager) Compact(ctx context.Context, messages []llm.Message) ([]llm.Message, error) {
-	out, _, err := m.CompactPinned(ctx, nil, messages, nil, nil)
-	return out, err
+// NoTailKeep is the CompactOptions.Keep value that means "no preserved tail:
+// everything after the head is summarized".
+const NoTailKeep = -1
+
+// CompactOptions configures a compaction call. Zero-value fields use defaults:
+// Keep=0 (zero) uses the configured CompactKeepRecentMessages; Forced=false
+// applies the minMiddleTokens guard; nil Pinned/Counts/ViewPrefix mean absent.
+type CompactOptions struct {
+	// Keep is the number of recent messages to preserve verbatim.
+	// Zero (the zero value) means "use the configured CompactKeepRecentMessages".
+	// NoTailKeep (-1) means no preserved tail. Positive values are literal.
+	Keep int
+
+	// Forced bypasses the minMiddleTokens guard (emergency compaction).
+	// When forced and the last message is a tool result, the trailing tool
+	// group is preserved verbatim as the tail.
+	Forced bool
+
+	// Pinned message indices to preserve in the tail.
+	Pinned map[int]struct{}
+
+	// Counts carries per-message token counts for a prefix of messages
+	// (the agent's cached counts). When it covers the region being compacted,
+	// the summarization request is sized from those counts instead of
+	// re-tokenizing the middle with the tokenizer.
+	Counts []int
+
+	// ViewPrefix carries the system/enrichment messages that precede
+	// canonical history on the wire. It is prepended to the summarization
+	// request so the conversation prefix stays byte-identical to the last
+	// turn and the provider's prompt cache covers the bulk of the request.
+	ViewPrefix []llm.Message
 }
 
-// CompactPinned is like Compact but keeps pinned message indices in the
-// preserved tail and returns remapped pin indices for the compacted history.
-// viewPrefix carries the system/enrichment messages that precede canonical
-// history on the wire (nil when none). It is prepended to the summarization
-// request so the conversation prefix stays byte-identical to the last turn
-// and the provider's prompt cache covers the bulk of the request.
+// Compact replaces the middle of canonical history with an LLM-generated
+// summary. It preserves the first user message and the most recent messages
+// (per opts.Keep or the configured default). Pinned indices are preserved in
+// the tail and remapped for the compacted history.
 //
-// counts, when non-nil, carries per-message token counts for a prefix of
-// messages (the agent's cached counts). When it covers the region being
-// compacted, the summarization request is sized from those counts instead of
-// re-tokenizing the middle with the tokenizer — the most expensive part of a
-// compaction on large histories.
-func (m *Manager) CompactPinned(ctx context.Context, viewPrefix, messages []llm.Message, counts []int, pinned map[int]struct{}) ([]llm.Message, map[int]struct{}, error) {
-	m.mu.RLock()
-	keep := m.Settings.CompactKeepRecentMessages
-	m.mu.RUnlock()
-	return m.CompactPinnedWithKeep(ctx, viewPrefix, messages, counts, pinned, keep)
+// The smaller-summary guard (ErrSummaryNotSmaller) refuses a compaction whose
+// framed summary is not strictly smaller than the region it replaces. No-op
+// paths (too few messages, no user message, empty middle) return the input
+// unchanged with a nil error; forced callers enforce the strict-shrink
+// requirement (len(result) < len(messages)) externally.
+func (m *Manager) Compact(ctx context.Context, messages []llm.Message, opts CompactOptions) ([]llm.Message, map[int]struct{}, error) {
+	keep := opts.Keep
+	switch {
+	case keep == 0:
+		m.mu.RLock()
+		keep = m.Settings.CompactKeepRecentMessages
+		m.mu.RUnlock()
+	case keep == NoTailKeep:
+		keep = 0
+	}
+	return m.compactPinned(ctx, opts.ViewPrefix, messages, opts.Counts, opts.Pinned, keep, opts.Forced)
 }
 
-// CompactPinnedWithKeep is like CompactPinned but preserves keep recent
-// messages verbatim instead of the configured CompactKeepRecentMessages.
-// keep=0 is literal (no tail: everything after the head is summarized),
-// matching the configured-keep semantics. The emergency compaction tier
-// passes a lowered keep (see ChooseCompactKeep, whose lowering floor is 1)
-// so the summarized middle can grow large enough to bring the conversation
-// under the hard window.
-func (m *Manager) CompactPinnedWithKeep(ctx context.Context, viewPrefix, messages []llm.Message, counts []int, pinned map[int]struct{}, keep int) ([]llm.Message, map[int]struct{}, error) {
-	return m.compactPinned(ctx, viewPrefix, messages, counts, pinned, keep, false)
-}
-
-// CompactPinnedForced is the emergency forced compaction used by the
-// pre-flight check (Agent.preflightForcedCompact) when the outgoing request
-// would be refused: keep=0 (no preserved tail) and the minMiddleTokens
-// guard is bypassed, because a mid-tool-loop conversation may have only a
-// handful of messages since the last compaction and the alternative is a
-// refused request. The smaller-summary guard (ErrSummaryNotSmaller) still
-// applies. Mid-tool-loop (last message a tool result) the trailing tool
-// group — the last assistant tool-call message and its results — is
-// preserved verbatim as the tail, so the model keeps the fresh results and
-// the tool-call/result protocol stays intact. No-op paths return the input
-// unchanged with a nil error; the caller enforces the strict-shrink
-// requirement (len(result) < len(messages)) and aborts when it is not met —
-// a single-message middle compacts to a conversation of the same length.
-func (m *Manager) CompactPinnedForced(ctx context.Context, viewPrefix, messages []llm.Message, counts []int, pinned map[int]struct{}) ([]llm.Message, map[int]struct{}, error) {
-	return m.compactPinned(ctx, viewPrefix, messages, counts, pinned, 0, true)
-}
-
-// compactPinned is the shared implementation of CompactPinnedWithKeep and
-// CompactPinnedForced; forced bypasses the minMiddleTokens guard (see
-// CompactPinnedForced).
+// compactPinned is the shared implementation of Compact. forced bypasses the
+// minMiddleTokens guard (emergency compaction).
 func (m *Manager) compactPinned(ctx context.Context, viewPrefix, messages []llm.Message, counts []int, pinned map[int]struct{}, keep int, forced bool) ([]llm.Message, map[int]struct{}, error) {
 	if len(messages) <= keep+1 {
 		return messages, copyIntSet(pinned), nil
@@ -1183,7 +1133,9 @@ func writeMessageForSummary(b *strings.Builder, msg llm.Message, maxToolBytes in
 	case "tool":
 		content := msg.Content
 		if maxToolBytes > 0 && len(content) > maxToolBytes {
-			content = TruncateRuneSafe(content, maxToolBytes) + fmt.Sprintf(" …(%d chars total)", len(msg.Content))
+			content = Truncate(content, maxToolBytes, TruncateOptions{
+				Marker: fmt.Sprintf(" …(%d chars total)", len(msg.Content)),
+			})
 		}
 		label := msg.ToolCallID
 		if name := toolNames[msg.ToolCallID]; name != "" {

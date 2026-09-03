@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"gogen/internal/agent"
 	"gogen/internal/config"
 	"gogen/internal/llm"
 	"gogen/internal/randhex"
@@ -35,13 +34,13 @@ type file struct {
 	// session_rename tool) rather than derived from the first user message.
 	// The store must never regenerate a renamed label — not even one that
 	// looks like a legacy 50-char truncation (see sessionLabel).
-	LabelRenamed   bool            `json:"labelRenamed,omitempty"`
-	ProjectProfile string          `json:"projectProfile,omitempty"`
-	Todos          *agent.TodoList `json:"todos,omitempty"`
-	Messages       []llm.Message   `json:"messages"`
-	Oneshot        bool            `json:"oneshot,omitempty"`
-	TokenCounts    []int           `json:"tokenCounts,omitempty"`
-	ContextLimit   int             `json:"contextLimit,omitempty"`
+	LabelRenamed   bool          `json:"labelRenamed,omitempty"`
+	ProjectProfile string        `json:"projectProfile,omitempty"`
+	Todos          *TodoList     `json:"todos,omitempty"`
+	Messages       []llm.Message `json:"messages"`
+	Oneshot        bool          `json:"oneshot,omitempty"`
+	TokenCounts    []int         `json:"tokenCounts,omitempty"`
+	ContextLimit   int           `json:"contextLimit,omitempty"`
 	// ParentID marks nested (subagent) sessions; the flat session list
 	// excludes them and deleting the parent cascades.
 	ParentID string `json:"parentID,omitempty"`
@@ -157,8 +156,6 @@ func (s *Store) path(workingDir, id string) string {
 	}
 	return filepath.Join(s.dir(workingDir), id+".json")
 }
-
-// deltaPath returns the path to the delta file for a session.
 
 func validateSessionID(id string) error {
 	if id == "" {

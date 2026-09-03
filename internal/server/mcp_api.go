@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"strings"
 	"time"
 
@@ -17,32 +16,29 @@ const mcpTestTimeout = 20 * time.Second
 // THROWAWAY stdio process (test_mcp) — never registered, never wired to the
 // shared registry. The reply is an mcp_test message carrying
 // ok/latency/tools/error.
-func wsHandleTestMCP(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
-	s.handleTestMCP(ws, msg)
-}
-
-func (s *Server) handleTestMCP(ws *wsConn, msg WSMessage) {
-	req := msg.MCPTest
-	if req == nil {
+func wsHandleTestMCP(req *wsRequest) {
+	s, ws, msg := req.server, req.conn, req.msg
+	mcpReq := msg.MCPTest
+	if mcpReq == nil {
 		writeNoticeError(ws, "mcp", "Error: missing MCP test request")
 		return
 	}
-	server := config.MCPServerConfig{Name: req.Name, Command: req.Command, Args: req.Args, Env: req.Env}
+	server := config.MCPServerConfig{Name: mcpReq.Name, Command: mcpReq.Command, Args: mcpReq.Args, Env: mcpReq.Env}
 	// Testing a registered server by name resolves its STORED command/args/
 	// env from the runtime overlay (the client only sees envSet, never the
 	// env values).
-	if req.Name != "" && req.Command == "" {
-		r := s.ws.GetRuntimeConfig()
+	if mcpReq.Name != "" && mcpReq.Command == "" {
+		rc := s.ws.GetRuntimeConfig()
 		found := false
-		for _, m := range r.MCPServers {
-			if m.Name == req.Name {
+		for _, m := range rc.MCPServers {
+			if m.Name == mcpReq.Name {
 				server = m
 				found = true
 				break
 			}
 		}
 		if !found {
-			writeNoticeError(ws, "mcp", fmt.Sprintf("Error: MCP server %q is not configured", req.Name))
+			writeNoticeError(ws, "mcp", fmt.Sprintf("Error: MCP server %q is not configured", mcpReq.Name))
 			return
 		}
 	}

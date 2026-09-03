@@ -63,21 +63,6 @@ func invalidateTrackedCache(workingDir string) {
 // trackedFilesCacheTTL is how long we cache git ls-files output before refreshing.
 const trackedFilesCacheTTL = 2 * time.Second
 
-// globRegexCache caches compiled regexes for glob patterns containing **,
-// avoiding recompilation for every file during WalkDir. The cache lives for
-// the lifetime of the process. When the cache exceeds globRegexCacheMax
-// entries, the oldest entry (by insertion order) is evicted rather than
-// dropping the entire map. This avoids cache thrashing under burst queries.
-const globRegexCacheMax = 100
-
-// globRegexCache is a package-level, mutex-guarded map of compiled regexes.
-var (
-	globRegexMu    sync.Mutex
-	globRegexCache = make(map[string]*regexp.Regexp)
-	// globRegexOrder tracks insertion order for FIFO eviction.
-	globRegexOrder []string
-)
-
 // ListFiles lists directory entries as workspace-relative paths (same convention as
 // GlobFiles / search_code), so results can be passed straight to read_file.
 // When recursive is true, walks the tree (max 500 paths).
@@ -281,7 +266,7 @@ func matchGlobPattern(pattern, relPath string) bool {
 		return ok
 	}
 	if strings.Contains(pattern, "**") {
-		return matchGlobRegex(pattern, relPath)
+		return matchGlobCached(pattern, relPath)
 	}
 	// Path-based patterns without ** use filepath.Match, unless they are
 	// simple globs (no character classes), which use the cached regex.
@@ -295,10 +280,11 @@ func matchGlobPattern(pattern, relPath string) bool {
 	return ok
 }
 
-// matchGlobCached matches a simple glob pattern (no ** and no character
-// classes) against path using a compiled regex that is memoized by pattern
-// string, so repeated matches with the same pattern skip re-translation.
-// The regex translation is equivalent to filepath.Match for such patterns.
+// matchGlobCached matches a glob pattern (no character classes) against path
+// using a compiled regex that is memoized by pattern string, so repeated
+// matches with the same pattern skip re-translation. ** is supported via
+// globToRegexString; the translation is equivalent to filepath.Match for the
+// non-** patterns that reach this function.
 func matchGlobCached(pattern, path string) bool {
 	re, err := compiledRegex(globToRegexString(pattern))
 	if err != nil {
@@ -342,37 +328,6 @@ func globToRegexString(pattern string) string {
 	}
 	reParts = append(reParts, "$")
 	return strings.Join(reParts, "")
-}
-
-// matchGlobRegex handles glob patterns that contain ** by converting
-// them to a regular expression. ** matches zero or more path segments.
-func matchGlobRegex(pattern, path string) bool {
-	// Fast path: read a compiled regex under the shared lock. The lookup is
-	// cheap and the regex (once compiled) is safe for concurrent use.
-	globRegexMu.Lock()
-	re, ok := globRegexCache[pattern]
-	globRegexMu.Unlock()
-	if ok {
-		return re.MatchString(path)
-	}
-	reStr := globToRegexString(pattern)
-	re = regexp.MustCompile(reStr)
-	// Insert under the lock. If this insert pushes us over the cap, evict
-	// the oldest entry (by insertion order) rather than clearing the entire
-	// map. This avoids cache thrashing when many distinct patterns are used
-	// in quick succession.
-	globRegexMu.Lock()
-	if _, ok := globRegexCache[pattern]; !ok {
-		if len(globRegexCache) >= globRegexCacheMax && len(globRegexOrder) > 0 {
-			victim := globRegexOrder[0]
-			globRegexOrder = globRegexOrder[1:]
-			delete(globRegexCache, victim)
-		}
-		globRegexCache[pattern] = re
-		globRegexOrder = append(globRegexOrder, pattern)
-	}
-	globRegexMu.Unlock()
-	return re.MatchString(path)
 }
 
 // ReadFiles reads multiple files and returns them with path headers.

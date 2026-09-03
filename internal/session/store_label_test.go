@@ -4,14 +4,13 @@ import (
 	"strings"
 	"testing"
 
-	"gogen/internal/agent"
 	"gogen/internal/llm"
 )
 
 func TestListIncludesLabelAndCount(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore(true)
-	snap := agent.SessionSnapshot{
+	snap := SessionSnapshot{
 		WorkingDir: dir,
 		Model:      "gpt-4o",
 		Mode:       "act",
@@ -47,7 +46,7 @@ func TestListIncludesLabelAndCount(t *testing.T) {
 func TestListKeepsRenamedLabel(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore(true)
-	snap := agent.SessionSnapshot{
+	snap := SessionSnapshot{
 		WorkingDir: dir,
 		Messages: []llm.Message{
 			{Role: "user", Content: "implement session commands with labels"},
@@ -82,7 +81,7 @@ func TestSavePersistsRenamedEmptySession(t *testing.T) {
 	store := NewStore(true)
 
 	// A renamed empty session: no messages, deliberate label.
-	if err := store.Save("sess-renamed", agent.SessionSnapshot{
+	if err := store.Save("sess-renamed", SessionSnapshot{
 		WorkingDir: dir,
 		Label:      "My Custom Title",
 	}); err != nil {
@@ -97,7 +96,7 @@ func TestSavePersistsRenamedEmptySession(t *testing.T) {
 	}
 
 	// An anonymous empty session is still skipped (no file, no index entry).
-	if err := store.Save("sess-anon", agent.SessionSnapshot{WorkingDir: dir}); err != nil {
+	if err := store.Save("sess-anon", SessionSnapshot{WorkingDir: dir}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.LoadInWorkingDir(dir, "sess-anon"); err == nil {
@@ -145,7 +144,7 @@ func TestSaveLoadKeepsRenameMarkerAcrossRestart(t *testing.T) {
 	}
 	derived := llm.SessionLabel(msgs)
 	rename := derived[:legacyLabelMaxLen]
-	if err := store.Save("sess-renamed", agent.SessionSnapshot{
+	if err := store.Save("sess-renamed", SessionSnapshot{
 		WorkingDir:   dir,
 		Messages:     msgs,
 		Label:        rename,
@@ -166,7 +165,7 @@ func TestSaveLoadKeepsRenameMarkerAcrossRestart(t *testing.T) {
 		t.Fatalf("label=%q, want the 50-char rename kept verbatim", loaded.Label)
 	}
 	// A re-save after restart must not migrate the rename either.
-	if err := store2.Save("sess-renamed", agent.SessionSnapshot{
+	if err := store2.Save("sess-renamed", SessionSnapshot{
 		WorkingDir:   dir,
 		Messages:     msgs,
 		Label:        rename,

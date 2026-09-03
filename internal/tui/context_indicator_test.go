@@ -94,7 +94,7 @@ func TestContextIndicatorNoResetAtRoundStart(t *testing.T) {
 	if !strings.Contains(m.contextLine, "(est.)") {
 		t.Fatalf("expected live estimate during round 1, got %q", m.contextLine)
 	}
-	estAfterRound1 := m.contextStreamBaseUsed + m.contextStreamEstAdded
+	estAfterRound1 := m.contextEst.Used()
 
 	// Between rounds the agent appends the assistant message and the tool
 	// result to a.Messages (and records the round's API usage).
@@ -107,13 +107,13 @@ func TestContextIndicatorNoResetAtRoundStart(t *testing.T) {
 
 	// The re-base must reflect the refreshed authoritative value, which
 	// includes round 1's growth — not the stale pre-turn mirror.
-	if m.contextStreamBaseUsed <= usedBeforeTurn {
+	if m.contextEst.Base() <= usedBeforeTurn {
 		t.Fatalf("round-start baseline did not include round 1 growth: baseline=%d before-turn=%d",
-			m.contextStreamBaseUsed, usedBeforeTurn)
+			m.contextEst.Base(), usedBeforeTurn)
 	}
-	if m.contextStreamBaseUsed < estAfterRound1 {
+	if m.contextEst.Base() < estAfterRound1 {
 		t.Fatalf("indicator reset at round start: baseline=%d is below the pre-round estimate %d",
-			m.contextStreamBaseUsed, estAfterRound1)
+			m.contextEst.Base(), estAfterRound1)
 	}
 	if strings.Contains(m.contextLine, "(est.)") {
 		t.Fatalf("refreshed round-start value should be exact, got %q", m.contextLine)

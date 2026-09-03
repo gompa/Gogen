@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -17,28 +16,8 @@ import (
 // new sessions (provider factory reads the workspace list) AND live
 // sessions (SetProfiles sweep), persists the config with secrets, and
 // broadcasts the fresh provider list to every tab.
-func wsHandleProviderSave(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
-	s.handleProviderSave(ws, msg)
-}
-
-// wsHandleProviderDelete removes a registered provider profile
-// (provider_delete). The implicit default profile (legacy config fields)
-// cannot be deleted; sessions whose selected model was served by the
-// removed profile are re-validated so they never silently route to the
-// wrong endpoint.
-func wsHandleProviderDelete(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
-	s.handleProviderDelete(ws, msg)
-}
-
-// wsHandleTestProvider runs the connectivity + catalog test against a
-// THROWAWAY provider built from the request (test_provider) — never
-// registered, never wired to a session. The reply is a provider_test
-// message carrying ok/latency/models/error.
-func wsHandleTestProvider(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
-	s.handleTestProvider(ws, msg)
-}
-
-func (s *Server) handleProviderSave(ws *wsConn, msg WSMessage) {
+func wsHandleProviderSave(req *wsRequest) {
+	s, ws, msg := req.server, req.conn, req.msg
 	op := msg.ProviderOp
 	if op == nil || strings.TrimSpace(op.Name) == "" {
 		writeNoticeError(ws, "provider", "Error: provider name is required")
@@ -56,16 +35,16 @@ func (s *Server) handleProviderSave(ws *wsConn, msg WSMessage) {
 			writeNoticeError(ws, "provider", fmt.Sprintf("Error: invalid base URL %q (want http(s))", op.BaseURL))
 			return
 		}
-		r := s.ws.GetRuntimeConfig()
-		r.OpenAIURL = strings.TrimSpace(op.BaseURL)
+		rc := s.ws.GetRuntimeConfig()
+		rc.OpenAIURL = strings.TrimSpace(op.BaseURL)
 		if op.APIKey != "" {
-			r.OpenAIKey = op.APIKey
+			rc.OpenAIKey = op.APIKey
 		}
 		if op.Model != "" {
-			r.OpenAIModel = op.Model
+			rc.OpenAIModel = op.Model
 			s.ws.SetDefaultModel(op.Model)
 		}
-		s.ws.SetRuntimeConfig(r)
+		s.ws.SetRuntimeConfig(rc)
 		// Refresh live session providers (SetProfiles rebuilds the default
 		// profile's clients), persist with secrets, broadcast.
 		s.applyProviderList(ws, s.ws.GetOpenAIProviders())
@@ -104,7 +83,13 @@ func (s *Server) handleProviderSave(ws *wsConn, msg WSMessage) {
 	s.applyProviderList(ws, providers)
 }
 
-func (s *Server) handleProviderDelete(ws *wsConn, msg WSMessage) {
+// wsHandleProviderDelete removes a registered provider profile
+// (provider_delete). The implicit default profile (legacy config fields)
+// cannot be deleted; sessions whose selected model was served by the
+// removed profile are re-validated so they never silently route to the
+// wrong endpoint.
+func wsHandleProviderDelete(req *wsRequest) {
+	s, ws, msg := req.server, req.conn, req.msg
 	op := msg.ProviderOp
 	if op == nil || strings.TrimSpace(op.Name) == "" {
 		writeNoticeError(ws, "provider", "Error: provider name is required")
@@ -133,6 +118,67 @@ func (s *Server) handleProviderDelete(ws *wsConn, msg WSMessage) {
 	// not silently route to the wrong endpoint: re-validate each session's
 	// current model against the refreshed catalog and clear it when gone.
 	go s.revalidateSessionModels()
+}
+
+// wsHandleTestProvider runs the connectivity + catalog test against a
+// THROWAWAY provider built from the request (test_provider) — never
+// registered, never wired to a session. The reply is a provider_test
+// message carrying ok/latency/models/error.
+func wsHandleTestProvider(req *wsRequest) {
+	s, ws, msg := req.server, req.conn, req.msg
+	op := msg.ProviderOp
+	if op == nil {
+		writeNoticeError(ws, "provider", "Error: missing provider test request")
+		return
+	}
+	provReq := *op
+	// Testing a registered profile by name uses its STORED credentials (the
+	// client only knows apiKeySet, never the key itself); the add-form test
+	// carries the endpoint to test directly.
+	if provReq.Name != "" {
+		for _, p := range s.ws.GetOpenAIProviders() {
+			if p.Name == provReq.Name {
+				if provReq.BaseURL == "" {
+					provReq.BaseURL = p.BaseURL
+				}
+				if provReq.APIKey == "" {
+					provReq.APIKey = p.APIKey
+				}
+				if provReq.Model == "" {
+					provReq.Model = p.Model
+				}
+				break
+			}
+		}
+	}
+	if provReq.BaseURL != "" && !validHTTPURL(provReq.BaseURL) {
+		writeNoticeError(ws, "provider", fmt.Sprintf("Error: invalid base URL %q (want http(s))", provReq.BaseURL))
+		return
+	}
+	go func() {
+		start := time.Now()
+		reply := func(res ProviderTestResult) {
+			_ = ws.writeJSON(WSMessage{Type: "provider_test", ProviderTest: &res})
+		}
+		prov, err := s.providerTestBuilder(provReq, s.ws.GetWorkingDir())
+		if err != nil {
+			reply(ProviderTestResult{Error: err.Error(), LatencyMs: time.Since(start).Milliseconds()})
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		models, err := prov.ListModels(ctx)
+		latency := time.Since(start).Milliseconds()
+		if err != nil {
+			reply(ProviderTestResult{Error: err.Error(), LatencyMs: latency})
+			return
+		}
+		reply(ProviderTestResult{
+			OK:        true,
+			LatencyMs: latency,
+			Models:    s.modelEntries(models),
+		})
+	}()
 }
 
 // applyProviderList installs the new registered provider list: the
@@ -208,62 +254,6 @@ func (s *Server) revalidateSessionModels() {
 		_, _ = rt.agent.Provider.ModelContextLimit(ctx) // sole-model auto-select
 		s.pushConfigForAgent(rt.agent)
 	}
-}
-
-func (s *Server) handleTestProvider(ws *wsConn, msg WSMessage) {
-	op := msg.ProviderOp
-	if op == nil {
-		writeNoticeError(ws, "provider", "Error: missing provider test request")
-		return
-	}
-	req := *op
-	// Testing a registered profile by name uses its STORED credentials (the
-	// client only knows apiKeySet, never the key itself); the add-form test
-	// carries the endpoint to test directly.
-	if req.Name != "" {
-		for _, p := range s.ws.GetOpenAIProviders() {
-			if p.Name == req.Name {
-				if req.BaseURL == "" {
-					req.BaseURL = p.BaseURL
-				}
-				if req.APIKey == "" {
-					req.APIKey = p.APIKey
-				}
-				if req.Model == "" {
-					req.Model = p.Model
-				}
-				break
-			}
-		}
-	}
-	if req.BaseURL != "" && !validHTTPURL(req.BaseURL) {
-		writeNoticeError(ws, "provider", fmt.Sprintf("Error: invalid base URL %q (want http(s))", req.BaseURL))
-		return
-	}
-	go func() {
-		start := time.Now()
-		reply := func(res ProviderTestResult) {
-			_ = ws.writeJSON(WSMessage{Type: "provider_test", ProviderTest: &res})
-		}
-		prov, err := s.providerTestBuilder(req, s.ws.GetWorkingDir())
-		if err != nil {
-			reply(ProviderTestResult{Error: err.Error(), LatencyMs: time.Since(start).Milliseconds()})
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-		models, err := prov.ListModels(ctx)
-		latency := time.Since(start).Milliseconds()
-		if err != nil {
-			reply(ProviderTestResult{Error: err.Error(), LatencyMs: latency})
-			return
-		}
-		reply(ProviderTestResult{
-			OK:        true,
-			LatencyMs: latency,
-			Models:    s.modelEntries(models),
-		})
-	}()
 }
 
 // validHTTPURL reports whether v parses as an http(s) URL with a host.

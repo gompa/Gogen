@@ -11,15 +11,16 @@ import (
 )
 
 // llmTools returns the tool definitions exposed to the model: the built-in
-// tools, the feature-gated board tool when enabled, plus any registered MCP
-// server tools. Feature tools are appended conditionally (MCP-style) so they
-// have zero registry trace when their feature is off.
+// tools, the feature-gated tools from the single gating policy
+// (featureTools), plus any registered MCP server tools. Feature tools are
+// appended conditionally (MCP-style) so they have zero registry trace when
+// their feature is off.
 //
 // A registered MCP tool whose name collides with a builtin or feature tool
 // SHADOWS it here (its definition is the one the model sees): executeTool
-// prefers the registry on name collisions too, so what the model sees and
-// what actually executes always agree — and the model never sees duplicate
-// definitions for one name (several APIs reject those).
+// prefers the registry on name collisions too (featureToolFor), so what the
+// model sees and what actually executes always agree — and the model never
+// sees duplicate definitions for one name (several APIs reject those).
 func (a *Agent) llmTools() []llm.Tool {
 	var mcpDefs []llm.Tool
 	mcpNames := make(map[string]struct{})
@@ -29,53 +30,17 @@ func (a *Agent) llmTools() []llm.Tool {
 			mcpNames[t.Name] = struct{}{}
 		}
 	}
-	tools := make([]llm.Tool, 0, len(BuiltinTools())+2+len(mcpDefs))
+	features := a.featureTools()
+	tools := make([]llm.Tool, 0, len(BuiltinTools())+len(features)+len(mcpDefs))
 	for _, t := range BuiltinTools() {
 		if _, shadowed := mcpNames[t.Name]; shadowed {
 			continue // the MCP definition is appended below
 		}
 		tools = append(tools, t)
 	}
-	if a.BoardEnabled() && a.BoardManager() != nil {
-		if _, shadowed := mcpNames["board"]; !shadowed {
-			tools = append(tools, boardToolDef())
-		}
-	}
-	if a.SubagentsEnabled() && a.SubagentSpawner() != nil {
-		cs := a.continuableSpawner()
-		shadowed := map[string]bool{}
-		for _, name := range []string{"subagent", "subagent_fork", "list_agents", "send_message", "interrupt_agent", "report"} {
-			if _, ok := mcpNames[name]; ok {
-				shadowed[name] = true
-			}
-		}
-		if !shadowed["subagent"] {
-			tools = append(tools, subagentToolDef(cs != nil, a.SubagentMaxConcurrent()))
-		}
-		if cs != nil {
-			if !shadowed["subagent_fork"] {
-				tools = append(tools, subagentForkToolDef())
-			}
-			if !shadowed["list_agents"] {
-				tools = append(tools, listAgentsToolDef())
-			}
-			if !shadowed["send_message"] {
-				tools = append(tools, sendMessageToolDef())
-			}
-			if !shadowed["interrupt_agent"] {
-				tools = append(tools, interruptAgentToolDef())
-			}
-			// report is child-scoped: only nested agents with an installed
-			// report hook see it (a restored subagent session reopened by a
-			// user has ParentID but no hook, so it stays hidden).
-			if a.ParentID() != "" && a.ReportHook() != nil && !shadowed["report"] {
-				tools = append(tools, reportToolDef())
-			}
-		}
-	}
-	if a.SkillsEnabled() && a.SkillsManager() != nil {
-		if _, shadowed := mcpNames["skill"]; !shadowed {
-			tools = append(tools, skillsToolDef())
+	for _, ft := range features {
+		if _, shadowed := mcpNames[ft.Name]; !shadowed {
+			tools = append(tools, ft.Definition)
 		}
 	}
 	tools = append(tools, mcpDefs...)
@@ -106,8 +71,8 @@ func (a *Agent) prepareMessages(ctx context.Context, h *llm.StreamHandlers) ([]l
 			// provider refuses the request) and bypasses the backoff, so a
 			// large message arriving during backoff still gets a
 			// compaction attempt before the request is refused. The
-			// progress guard (lastEmergencyFailCount) stops a hot loop of
-			// repeated failures at an unchanged message count.
+			// progress guard (compactionGuards.emergency) stops a hot loop
+			// of repeated failures at an unchanged message count.
 			total := a.compactionTokenTotal()
 			emergency := a.emergencyCompactDue(total)
 			if (a.shouldCompactUsingCounts() && a.compactAttemptDue()) || emergency {
@@ -141,16 +106,10 @@ func (a *Agent) prepareMessages(ctx context.Context, h *llm.StreamHandlers) ([]l
 				a.compactToFit(ctx, pinned, counts, keep, emergency)
 			}
 		}
-		// EnsureToolResultsCapped rewrites oversized tool bodies in place on
-		// the live message array; exclude concurrent ContextStats clones.
-		a.statsMu.Lock()
-		if a.Context.EnsureToolResultsCapped(a.Messages) {
-			// Tool bodies were rewritten in place, so cached counts for the
-			// affected messages are stale. Drop the cache; it is rebuilt on
-			// the next ContextStats/save.
-			a.tokenCounts = nil
-		}
-		a.statsMu.Unlock()
+		// Cap oversized tool bodies in place on the live message array (a
+		// model-free win; the cached counts are dropped when a body is
+		// rewritten) — the same stage-1 call the forced compaction makes.
+		a.capToolResultsForCompact()
 		view = a.Messages
 	}
 	// Stabilize tool args on a.Messages (not view, which may be a copy) so
@@ -242,7 +201,7 @@ func (a *Agent) rebuildView() []llm.Message {
 // request, so the check stays out of the way — that state is Phase 0e's
 // (last-resort condensation) or a misconfiguration, and the provider
 // refusal is the diagnostic; and the emergency progress guard
-// (lastEmergencyFailCount) suppresses a summarization retry at an
+// (compactionGuards.emergency) suppresses a summarization retry at an
 // unchanged message count after a failed or aborted attempt (a retry
 // would hit the same failure) — growth past that count re-arms it, as in
 // the boundary emergency tier.
@@ -283,7 +242,7 @@ func (a *Agent) preflightForcedCompact(ctx context.Context, h *llm.StreamHandler
 	// message count after a failed or aborted attempt (a retry would hit
 	// the same failure); growth past that count re-arms it.
 	a.statsMu.RLock()
-	guarded := a.lastEmergencyFailCount >= len(a.Messages)
+	guarded := a.compactionGuards.emergency >= len(a.Messages)
 	a.statsMu.RUnlock()
 	if !guarded {
 		if a.runForcedSummarization(ctx, h) {
@@ -343,17 +302,23 @@ func (a *Agent) runForcedSummarization(ctx context.Context, h *llm.StreamHandler
 	a.statsMu.RLock()
 	counts := append([]int(nil), a.tokenCounts...)
 	a.statsMu.RUnlock()
-	compacted, newPins, err := a.Context.CompactPinnedForced(ctx, a.systemPromptPrefix(), a.Messages, counts, pinned)
+	compacted, newPins, err := a.Context.Compact(ctx, a.Messages, contextmgr.CompactOptions{
+		ViewPrefix: a.systemPromptPrefix(),
+		Counts:     counts,
+		Pinned:     pinned,
+		Keep:       contextmgr.NoTailKeep,
+		Forced:     true,
+	})
 	if err != nil {
 		a.noteCompactFailure(err)
-		a.noteEmergencyCompactFailure()
+		a.noteProgressFailure(&a.compactionGuards.emergency)
 		return false
 	}
 	if len(compacted) >= len(a.Messages) {
 		// Strict-shrink requirement: abort a compaction that removed
 		// no message — it saves nothing and would not converge.
 		log.Printf("forced compaction aborted: no shrink (%d -> %d messages)", len(a.Messages), len(compacted))
-		a.noteEmergencyCompactFailure()
+		a.noteProgressFailure(&a.compactionGuards.emergency)
 		return false
 	}
 	// Publish the compacted history with the post-compaction bookkeeping
@@ -448,7 +413,7 @@ func (a *Agent) lastResortCondense(ctx context.Context, h *llm.StreamHandlers, v
 	// retried until the conversation grows past that count (a retry would
 	// hit the same failure).
 	a.statsMu.RLock()
-	guarded := a.lastLastResortFailCount >= len(a.Messages)
+	guarded := a.compactionGuards.lastResort >= len(a.Messages)
 	a.statsMu.RUnlock()
 	if guarded {
 		return false, nil
@@ -460,7 +425,7 @@ func (a *Agent) lastResortCondense(ctx context.Context, h *llm.StreamHandlers, v
 	summary, err := a.Context.CondenseMessage(ctx, msgs[idx])
 	if err != nil {
 		log.Printf("last-resort condensation failed: %v", err)
-		a.noteLastResortFailure()
+		a.noteProgressFailure(&a.compactionGuards.lastResort)
 		return false, nil
 	}
 	framed := llm.Message{
@@ -492,7 +457,7 @@ func (a *Agent) lastResortCondense(ctx context.Context, h *llm.StreamHandlers, v
 	// in-place content change is invisible to the incremental delta path.
 	a.resetSaveTracking()
 	a.FlushSession()
-	a.noteLastResortSuccess()
+	a.noteProgressSuccess(&a.compactionGuards.lastResort)
 	if h != nil && h.OnCondensed != nil {
 		suffix := " The original was archived."
 		if !archived {
@@ -564,25 +529,6 @@ func (a *Agent) condenseMessageAt(idx int, framed llm.Message) {
 	// concurrent ContextStats that computed counts for the older snapshot
 	// cannot publish stale numbers.
 	a.countsEpoch++
-	a.statsMu.Unlock()
-}
-
-// noteLastResortFailure records a failed last-resort condensation at the
-// current message count: the progress guard suppresses further attempts
-// until the conversation grows past that count (a retry at the same count
-// would hit the same failure).
-func (a *Agent) noteLastResortFailure() {
-	a.statsMu.Lock()
-	if n := len(a.Messages); n > a.lastLastResortFailCount {
-		a.lastLastResortFailCount = n
-	}
-	a.statsMu.Unlock()
-}
-
-// noteLastResortSuccess resets the last-resort progress guard.
-func (a *Agent) noteLastResortSuccess() {
-	a.statsMu.Lock()
-	a.lastLastResortFailCount = 0
 	a.statsMu.Unlock()
 }
 
@@ -702,12 +648,23 @@ func (a *Agent) compactToFit(ctx context.Context, pinned map[int]struct{}, count
 	}
 	budget := a.Context.CompactBudget()
 	for i, k := range keeps {
-		compacted, newPins, err := a.Context.CompactPinnedWithKeep(ctx, a.systemPromptPrefix(), a.Messages, counts, pinned, k)
+		// k=0 means "no tail" — map to NoTailKeep so the zero-value
+		// CompactOptions.Keep (use default) is not triggered.
+		keepOpt := k
+		if keepOpt == 0 {
+			keepOpt = contextmgr.NoTailKeep
+		}
+		compacted, newPins, err := a.Context.Compact(ctx, a.Messages, contextmgr.CompactOptions{
+			ViewPrefix: a.systemPromptPrefix(),
+			Counts:     counts,
+			Pinned:     pinned,
+			Keep:       keepOpt,
+		})
 		if err != nil {
 			// A failing summarization call must not be retried on every turn.
 			a.noteCompactFailure(err)
 			if emergency {
-				a.noteEmergencyCompactFailure()
+				a.noteProgressFailure(&a.compactionGuards.emergency)
 			}
 			return
 		}

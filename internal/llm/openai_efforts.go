@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+
+	"gogen/internal/buildinfo"
 )
 
 // errEffortsUnavailable is returned by ProbeReasoningEfforts when the
@@ -295,8 +297,9 @@ func (p *OpenAIProvider) propsRequest(ctx context.Context, method, url, body str
 	if err != nil {
 		return 0, nil, err
 	}
-	if p.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+p.apiKey)
+	req.Header.Set("User-Agent", buildinfo.UserAgent())
+	if key := p.defaultAPIKey(); key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
 	}
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")

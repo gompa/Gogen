@@ -79,6 +79,7 @@ func (m *Model) clearProgress() {
 	m.progressLabel = ""
 	// No tool is being prepared/executed any more (turn end, cancel, error).
 	m.activeToolName = ""
+	m.streamSpeedLine = ""
 	if s := m.focusedSession(); s != nil {
 		s.resetProgress()
 	}
@@ -95,7 +96,12 @@ func (m *Model) renderProgressInput() string {
 		if label == "" {
 			label = "thinking"
 		}
-		line = DimStyle.Render("  " + m.spinner.View() + " " + label)
+		// Token rate from the shared SpeedMeter (thinking tokens count
+		// toward it too); empty until the first stats message of the
+		// round, so "waiting for the model" never shows a stale rate.
+		if m.streamSpeedLine != "" {
+			line += " " + m.streamSpeedLine
+		}
 	case progressTool:
 		label := m.progressLabel
 		if label == "" {
@@ -109,6 +115,11 @@ func (m *Model) renderProgressInput() string {
 			line = DimStyle.Render("  preparing " + m.activeToolName + "…")
 		} else {
 			line = progressStreamingLine
+		}
+		// Token rate from the shared SpeedMeter (rendered once per stats
+		// message on the Update thread, not per frame).
+		if m.streamSpeedLine != "" {
+			line += " " + m.streamSpeedLine
 		}
 	default:
 		// Fallback for progressHidden (renderProgressInput is only called

@@ -29,7 +29,7 @@ func TestApplyChatCompletionExtrasUsesPropsCapability(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := &OpenAIProvider{baseURL: srv.URL + "/v1"}
+	p := &OpenAIProvider{profiles: []*providerProfile{{name: "default", baseURL: srv.URL + "/v1"}}}
 	params := openai.ChatCompletionNewParams{Model: "test-model"}
 	p.applyChatCompletionExtras(context.Background(), &params)
 
@@ -69,7 +69,7 @@ func TestApplyChatCompletionExtrasSkippedWhenCapsFalse(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := &OpenAIProvider{baseURL: srv.URL + "/v1"}
+	p := &OpenAIProvider{profiles: []*providerProfile{{name: "default", baseURL: srv.URL + "/v1"}}}
 	params := openai.ChatCompletionNewParams{Model: "test-model"}
 	p.applyChatCompletionExtras(context.Background(), &params)
 	b, err := json.Marshal(params)
@@ -93,7 +93,7 @@ func TestApplyChatCompletionExtrasSkippedWhenPropsMissing(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := &OpenAIProvider{baseURL: srv.URL + "/v1"}
+	p := &OpenAIProvider{profiles: []*providerProfile{{name: "default", baseURL: srv.URL + "/v1"}}}
 	params := openai.ChatCompletionNewParams{Model: "test-model"}
 	p.applyChatCompletionExtras(context.Background(), &params)
 	b, err := json.Marshal(params)
@@ -123,7 +123,7 @@ func TestApplyChatCompletionExtrasSkippedWithoutProps(t *testing.T) {
 		http.NotFound(w, r)
 	}))
 	defer srv.Close()
-	p2 := &OpenAIProvider{baseURL: srv.URL + "/v1"}
+	p2 := &OpenAIProvider{profiles: []*providerProfile{{name: "default", baseURL: srv.URL + "/v1"}}}
 	params2 := openai.ChatCompletionNewParams{Model: "test-model"}
 	p2.applyChatCompletionExtras(context.Background(), &params2)
 	assertNoChatTemplateKwargs(t, params2)
@@ -139,7 +139,7 @@ func TestApplyChatCompletionExtrasForcedOnSkipsProps(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := &OpenAIProvider{baseURL: srv.URL + "/v1"}
+	p := &OpenAIProvider{profiles: []*providerProfile{{name: "default", baseURL: srv.URL + "/v1"}}}
 	p.SetPreserveReasoningMode("on")
 	params := openai.ChatCompletionNewParams{Model: "test-model"}
 	p.applyChatCompletionExtras(context.Background(), &params)
@@ -175,7 +175,7 @@ func TestApplyChatCompletionExtrasForcedOff(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := &OpenAIProvider{baseURL: srv.URL + "/v1"}
+	p := &OpenAIProvider{profiles: []*providerProfile{{name: "default", baseURL: srv.URL + "/v1"}}}
 	p.SetPreserveReasoningMode("off")
 	params := openai.ChatCompletionNewParams{Model: "test-model"}
 	p.applyChatCompletionExtras(context.Background(), &params)
@@ -252,7 +252,7 @@ func TestSetModelInvalidatesPropsCaps(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := &OpenAIProvider{baseURL: srv.URL + "/v1"}
+	p := &OpenAIProvider{profiles: []*providerProfile{{name: "default", baseURL: srv.URL + "/v1"}}}
 	_ = p.templateSupportsPreserveReasoning(context.Background())
 	if err := p.SetModel("other"); err != nil {
 		t.Fatal(err)

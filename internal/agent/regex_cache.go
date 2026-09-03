@@ -13,7 +13,7 @@ var (
 	// regexMemo caches compiled regexes keyed by pattern string so repeated
 	// compiles of the same pattern (e.g. the agent re-running the same
 	// search across turns) skip regexp.Compile. Eviction is FIFO by
-	// insertion order, mirroring globRegexCache.
+	// insertion order.
 	regexMemo = make(map[string]*regexp.Regexp)
 	// regexMemoOrder tracks insertion order for FIFO eviction.
 	regexMemoOrder []string

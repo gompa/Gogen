@@ -17,6 +17,7 @@ import (
 
 	"golang.org/x/net/http2"
 
+	"gogen/internal/buildinfo"
 	"gogen/internal/onoff"
 )
 
@@ -128,9 +129,15 @@ func (c *webCfgState) isSearchOn() bool {
 	return envSearchOn()
 }
 
+// mode and allowedDomains fall back to env only when fetch itself is
+// unconfigured. fetchOn is the "fetch configured" signal: ConfigureWebFetch
+// sets fetchOn, fetchMode and fetchDomains atomically, so fetchOn != nil is
+// exactly the per-field "configured" state for these two fetch-specific
+// settings. Gating on fetchOn (not searchOn) keeps each setting's fallback
+// independent, matching isFetchOn/isSearchOn.
 func (c *webCfgState) mode() string {
 	c.mu.RLock()
-	if c.fetchOn != nil || c.searchOn != nil {
+	if c.fetchOn != nil {
 		m := c.fetchMode
 		c.mu.RUnlock()
 		return m
@@ -141,7 +148,7 @@ func (c *webCfgState) mode() string {
 
 func (c *webCfgState) allowedDomains() []string {
 	c.mu.RLock()
-	if c.fetchOn != nil || c.searchOn != nil {
+	if c.fetchOn != nil {
 		d := c.fetchDomains
 		c.mu.RUnlock()
 		return d
@@ -250,7 +257,7 @@ func newSharedFetchClient() *http.Client {
 type fetchRequest struct {
 	URL      string // target URL
 	Method   string // "GET" (default) or "POST"
-	UA       string // User-Agent (default "gogen/1.0")
+	UA       string // User-Agent (default buildinfo.UserAgent())
 	Body     string // form-encoded body for POST requests
 	MaxBytes int    // max response body bytes to read
 }
@@ -266,7 +273,7 @@ func doFetch(ctx context.Context, req fetchRequest) ([]byte, string, string, boo
 	}
 	ua := req.UA
 	if ua == "" {
-		ua = "gogen/1.0"
+		ua = buildinfo.UserAgent()
 	}
 
 	var httpReq *http.Request

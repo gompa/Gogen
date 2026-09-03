@@ -87,7 +87,12 @@ export function setBoardStartPrompt(value) {
 export function handleBoardState(data) {
     if (data.boardState) {
         lastBoardState = data.boardState;
-        renderBoard();
+        // Rebuild only while the board pane is the active view: the
+        // server broadcasts on every mutation (agent board-tool calls
+        // included), and rebuilding a display:none pane wastes work.
+        // Hidden panes pick the state up via renderBoard() on pane
+        // switch (app.js switchMainPane).
+        if (boardPaneVisible()) renderBoard();
         if (pendingBoardStartId) {
             const item = (data.boardState.items || []).find((i) => i.id === pendingBoardStartId);
             if (item && item.agentSession) {
@@ -101,6 +106,15 @@ export function handleBoardState(data) {
 export function boardTabVisible() {
     const t = document.getElementById('board-tab');
     return !!t && !t.hidden;
+}
+
+// True while the board pane is the active main pane (the server
+// re-broadcasts board_state on every mutation — including agent
+// board-tool calls — so this gates the DOM rebuild: hidden panes
+// keep lastBoardState fresh but skip the rebuild until shown).
+export function boardPaneVisible() {
+    const p = document.getElementById('board-pane');
+    return !!p && p.classList.contains('active');
 }
 
 export function requestBoardState() {

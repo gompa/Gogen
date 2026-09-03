@@ -39,10 +39,14 @@ type SessionAgentOptions struct {
 	// predate the persisted thinking-level field.
 	ThinkingLevel ThinkingLevel
 
+	// FeatureFlags is the shared flag store the agent should read (web
+	// mode: the workspace's single instance). When non-nil the agent reads
+	// the shared state directly — no per-agent mirror, no sweep — and the
+	// four value fields below are ignored.
+	FeatureFlags *FeatureFlags
 	// Live feature flags (board / subagent / nesting depth / concurrent
-	// limit). The web server passes its workspace values so sessions created
-	// after a live toggle agree with the rest; the TUI passes its startup
-	// config values.
+	// limit), used when FeatureFlags is nil. The TUI subagent spawner
+	// passes the parent's values so nested sessions agree with it.
 	BoardEnabled          bool
 	SubagentsEnabled      bool
 	SubagentMaxDepth      int
@@ -105,10 +109,16 @@ func NewSessionAgent(opts SessionAgentOptions, snap *SessionSnapshot, id string)
 	if opts.ToolHandlers != nil {
 		a.SetToolHandlers(opts.ToolHandlers)
 	}
-	a.SetBoardEnabled(opts.BoardEnabled)
-	a.SetSubagentsEnabled(opts.SubagentsEnabled)
-	a.SetSubagentMaxDepth(opts.SubagentMaxDepth)
-	a.SetSubagentMaxConcurrent(opts.SubagentMaxConcurrent)
+	if opts.FeatureFlags != nil {
+		// Shared store (web mode): the agent reads the workspace's live
+		// flags directly, so a settings toggle reaches it with no sweep.
+		a.SetFeatureFlags(opts.FeatureFlags)
+	} else {
+		a.SetBoardEnabled(opts.BoardEnabled)
+		a.SetSubagentsEnabled(opts.SubagentsEnabled)
+		a.SetSubagentMaxDepth(opts.SubagentMaxDepth)
+		a.SetSubagentMaxConcurrent(opts.SubagentMaxConcurrent)
+	}
 	a.SetBoardManager(opts.BoardManager)
 	a.SetSkillsManager(opts.SkillsManager)
 	if opts.SkillsManager != nil {

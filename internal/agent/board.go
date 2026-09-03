@@ -708,3 +708,37 @@ func normalizePriority(p string) string {
 	}
 	return ""
 }
+
+// SetBoardManager attaches the shared project board manager. The web server
+// sets the same manager on every session agent (so claims serialize);
+// TUI/CLI sets a per-agent manager. nil detaches.
+func (a *Agent) SetBoardManager(m *BoardManager) {
+	a.boardManager.Store(m)
+}
+
+// BoardManager returns the attached board manager (nil when the board
+// feature is disabled or not wired).
+func (a *Agent) BoardManager() *BoardManager {
+	return a.boardManager.Load()
+}
+
+// SetOnBoardChanged installs a callback invoked after every successful board
+// mutation made through this agent's board tool; it receives the mutation's
+// output message. The web server uses it to broadcast a fresh board_state and
+// a success notice (toast) to all clients. nil detaches.
+func (a *Agent) SetOnBoardChanged(h func(msg string)) {
+	a.boardHookMu.Lock()
+	a.boardHook = h
+	a.boardHookMu.Unlock()
+}
+
+// notifyBoardChanged fires the installed board-change hook with the
+// mutation's output message, if any hook is installed.
+func (a *Agent) notifyBoardChanged(msg string) {
+	a.boardHookMu.RLock()
+	h := a.boardHook
+	a.boardHookMu.RUnlock()
+	if h != nil {
+		h(msg)
+	}
+}

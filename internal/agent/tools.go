@@ -198,7 +198,7 @@ var builtinToolDefs = []ToolDef{
 				"dry_run": toolProp("boolean", "Preview without writing"),
 				"fuzzy":   toolProp("boolean", "Tolerate whitespace/shift drift (default true; leave on)"),
 			}, "diff")),
-		Handler:   handlePatchFile,
+		Handler:   handlePatchFileWithRetryPolicy,
 		MutatesFS: true,
 	},
 	{

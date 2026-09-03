@@ -117,14 +117,17 @@ func TestSubagentToolDescriptionConcurrentLimit(t *testing.T) {
 	}
 }
 
-// TestSubagentSpawnerNil verifies the nil-guard: enabled but no spawner
-// installed → a clear error, not a panic.
+// TestSubagentSpawnerNil verifies the degenerate state (feature enabled but
+// no spawner installed): the model never sees the subagent definition
+// (featureTools requires a spawner), so a stale call sees "unknown tool" —
+// what the model sees and what executes agree. The handler's nil-guard
+// remains as defense-in-depth against a direct call.
 func TestSubagentSpawnerNil(t *testing.T) {
 	a := newSubagentTestAgent(t)
 	a.SetSubagentsEnabled(true)
 	_, err := a.executeTool(t.Context(), llm.ToolCall{Name: "subagent", Args: map[string]any{"job": "x"}})
-	if err == nil || !strings.Contains(err.Error(), "spawner is not installed") {
-		t.Fatalf("expected spawner-not-installed error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "unknown tool: subagent") {
+		t.Fatalf("expected unknown-tool error (definition hidden without a spawner), got %v", err)
 	}
 }
 
@@ -233,5 +236,160 @@ func TestTruncateSubagentReportRuneSafe(t *testing.T) {
 				t.Fatalf("short report was modified: %q", got)
 			}
 		})
+	}
+}
+
+// TestResolveSubagentModel pins the shared subagent model cascade: the
+// explicit tool argument beats the configured subagent model, which beats
+// the parent's live model; the parent tier is skipped when it equals the
+// workspace default the child is already seeded with.
+func TestResolveSubagentModel(t *testing.T) {
+	cases := []struct {
+		name       string
+		explicit   string
+		configured string
+		parent     string
+		def        string
+		want       string
+		wantSrc    SubagentModelSource
+	}{
+		{
+			name:    "all empty inherits",
+			def:     "default",
+			wantSrc: SubagentModelInherited,
+		},
+		{
+			name:       "explicit wins over configured and parent",
+			explicit:   "explicit",
+			configured: "configured",
+			parent:     "parent",
+			def:        "default",
+			want:       "explicit",
+			wantSrc:    SubagentModelExplicit,
+		},
+		{
+			name:     "explicit wins even when parent is the default",
+			explicit: "explicit",
+			parent:   "default",
+			def:      "default",
+			want:     "explicit",
+			wantSrc:  SubagentModelExplicit,
+		},
+		{
+			name:       "configured wins over parent",
+			configured: "configured",
+			parent:     "parent",
+			def:        "default",
+			want:       "configured",
+			wantSrc:    SubagentModelConfigured,
+		},
+		{
+			name:       "configured wins when parent is the default",
+			configured: "configured",
+			parent:     "default",
+			def:        "default",
+			want:       "configured",
+			wantSrc:    SubagentModelConfigured,
+		},
+		{
+			name:    "parent inherits when it differs from the default",
+			parent:  "parent",
+			def:     "default",
+			want:    "parent",
+			wantSrc: SubagentModelParent,
+		},
+		{
+			name:    "parent equal to the default is skipped",
+			parent:  "default",
+			def:     "default",
+			wantSrc: SubagentModelInherited,
+		},
+		{
+			name:    "empty parent inherits",
+			def:     "default",
+			wantSrc: SubagentModelInherited,
+		},
+		{
+			name:    "empty default still inherits the parent",
+			parent:  "parent",
+			want:    "parent",
+			wantSrc: SubagentModelParent,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, src := ResolveSubagentModel(tc.explicit, tc.configured, tc.parent, tc.def)
+			if got != tc.want || src != tc.wantSrc {
+				t.Fatalf("ResolveSubagentModel(%q, %q, %q, %q) = (%q, %v), want (%q, %v)",
+					tc.explicit, tc.configured, tc.parent, tc.def, got, src, tc.want, tc.wantSrc)
+			}
+		})
+	}
+}
+
+// TestApplySubagentModel pins the shared apply policy for the resolved
+// subagent model: an unselectable explicit model errors (the spawner
+// fails the spawn), the other tiers fall back to the seeded default
+// (fail open), and an empty model selects nothing.
+func TestApplySubagentModel(t *testing.T) {
+	cases := []struct {
+		name    string
+		model   string
+		src     SubagentModelSource
+		catalog []string
+		wantErr bool
+		want    string
+	}{
+		{name: "empty model selects nothing", catalog: []string{"default"}, want: "default"},
+		{name: "explicit selectable succeeds", model: "explicit", src: SubagentModelExplicit,
+			catalog: []string{"default", "explicit"}, want: "explicit"},
+		{name: "explicit unselectable errors", model: "no/such-model", src: SubagentModelExplicit,
+			catalog: []string{"default"}, wantErr: true, want: "default"},
+		{name: "configured unselectable falls back", model: "vanished", src: SubagentModelConfigured,
+			catalog: []string{"default"}, want: "default"},
+		{name: "parent unselectable falls back", model: "vanished", src: SubagentModelParent,
+			catalog: []string{"default"}, want: "default"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := llm.NewMockProvider()
+			prov.Model = "default"
+			for _, id := range tc.catalog {
+				prov.Models = append(prov.Models, llm.ModelInfo{ID: id, ContextLimit: 128000})
+			}
+			ctxMgr := contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 128000})
+			child := NewAgent(prov, NewExecutor(t.TempDir()), ctxMgr)
+
+			err := ApplySubagentModel(context.Background(), child, tc.model, tc.src)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("ApplySubagentModel: expected error, got nil")
+				}
+				if !strings.Contains(err.Error(), "subagent model") {
+					t.Fatalf("error = %v, want a subagent model error", err)
+				}
+			} else if err != nil {
+				t.Fatalf("ApplySubagentModel: %v", err)
+			}
+			if got := child.CurrentModel(); got != tc.want {
+				t.Fatalf("child model = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSubagentModelSourceString pins the tier names used in spawner log
+// lines.
+func TestSubagentModelSourceString(t *testing.T) {
+	cases := map[SubagentModelSource]string{
+		SubagentModelInherited:  "inherited model",
+		SubagentModelExplicit:   "explicit model",
+		SubagentModelConfigured: "configured subagent model",
+		SubagentModelParent:     "parent model",
+	}
+	for src, want := range cases {
+		if got := src.String(); got != want {
+			t.Fatalf("SubagentModelSource(%d).String() = %q, want %q", src, got, want)
+		}
 	}
 }

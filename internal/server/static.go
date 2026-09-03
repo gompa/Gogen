@@ -10,12 +10,30 @@ import (
 	"log"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 )
 
 //go:embed all:web
 var webAssets embed.FS
+
+// vendorAssetDirs are the version-pinned third-party bundles (each dir carries
+// a VERSION file: monaco/VERSION, xterm/VERSION, vendor/VERSION). Unlike
+// app.js / index.html / components they only change on a deliberate vendor
+// bump, so they are safe to cache long in the browser — see cacheControlFor.
+var vendorAssetDirs = map[string]bool{
+	"monaco": true,
+	"xterm":  true,
+	"vendor": true,
+}
+
+// vendorMaxAge is the Cache-Control max-age (seconds) for the version-pinned
+// vendor assets above. Long enough that ordinary reloads are pure cache hits
+// instead of a conditional request per multi-MB bundle; the ETag is still
+// sent, so a hard reload or max-age expiry revalidates and picks up a bumped
+// bundle.
+const vendorMaxAge = 7 * 24 * 3600 // 7 days
 
 // staticAsset is a lazily compressed embedded asset served by HandleStatic.
 // raw and gzip are cached after first use so a page load does not re-compress
@@ -197,11 +215,14 @@ func (s *Server) HandleStatic(w http.ResponseWriter, r *http.Request) {
 	}
 	name := "web/" + rel
 	ct := contentTypeForExt(filepath.Ext(name))
-	// no-cache: the UI assets are embedded in the binary and change with every
-	// rebuild; a 24h max-age kept browsers serving stale app.js (the "rebuilt
-	// but the fix isn't showing" class of bugs). The ETag below still yields
-	// 304s when the bytes are unchanged, so reloads stay cheap.
-	s.serveEmbedded(w, r, name, ct, "no-cache", false)
+	// Per-path cache policy: version-pinned vendor bundles (monaco/xterm/vendor)
+	// are cached long, everything else is no-cache. The app assets are embedded
+	// in the binary and change with every rebuild; a 24h max-age kept browsers
+	// serving stale app.js (the "rebuilt but the fix isn't showing" class of
+	// bugs), so those stay no-cache. The ETag below still yields 304s when the
+	// bytes are unchanged, so even the cached vendor bundles revalidate on a
+	// hard reload or once max-age expires.
+	s.serveEmbedded(w, r, name, ct, cacheControlFor(rel), false)
 }
 
 // bootstrapPairing validates a pairing-code candidate from an
@@ -414,6 +435,22 @@ func hasPathTraversal(p string) bool {
 		}
 	}
 	return false
+}
+
+// cacheControlFor returns the Cache-Control value for a static asset whose URL
+// path (leading "/" stripped) is rel. The version-pinned vendor bundles under
+// monaco/, xterm/ and vendor/ are served with a long max-age so reloads become
+// pure cache hits; every other asset (index.html, app.js, editor.js, styles.css,
+// components/…) is no-cache because it changes on every rebuild.
+func cacheControlFor(rel string) string {
+	dir := rel
+	if i := strings.IndexByte(rel, '/'); i >= 0 {
+		dir = rel[:i]
+	}
+	if vendorAssetDirs[dir] {
+		return "public, max-age=" + strconv.Itoa(vendorMaxAge)
+	}
+	return "no-cache"
 }
 
 // serveEmbedded serves an embedded asset from the static asset cache, reading

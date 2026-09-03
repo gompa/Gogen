@@ -72,7 +72,16 @@ func ParseSessionCommand(input string) (cmd, args string) {
 // ResetSessionState clears all session-related state for starting fresh.
 // This is used when creating a new session or replacing a deleted current session.
 func (a *Agent) ResetSessionState() {
-	a.replaceMessages(nil)
+	a.resetSessionState(nil)
+}
+
+// resetSessionState is the shared core of ResetSessionState and ForkSession:
+// it clears all session-related state and publishes msgs as the new
+// conversation in the same sequence (nil for a fresh session, the forked
+// prefix for a fork). Keeping the reset list in one place means new state
+// added here is covered by both paths automatically.
+func (a *Agent) resetSessionState(msgs []llm.Message) {
+	a.replaceMessages(msgs)
 	a.clearTurnUsage()
 	a.statsMu.Lock()
 	a.UsageAccum = UsageAccumulator{}
@@ -181,21 +190,22 @@ func (a *Agent) resumeSessionByID(ctx context.Context, id string) (string, error
 	a.RestoreSession(snap, id)
 	// Build the context brief before background model validation so we don't
 	// race Snapshot against RefreshAfterModelChange.
-	out := AppendContextBrief(ctx, a, ResumeOutputMessage(id, snap))
+	out := AppendContextBrief(ctx, a, ResumeOutputMessage(id, snap.Messages))
 	go a.ValidateRestoredModel(context.Background(), model)
 	return out, nil
 }
 
 // ResumeOutputMessage formats the "Resumed session …" confirmation line for
-// a restored snapshot. Shared by resumeSessionByID (the rebind path) and the
-// TUI's spawn-on-open path (web openSessionPane parity) so every resume
-// entry point announces the resume identically.
-func ResumeOutputMessage(id string, snap SessionSnapshot) string {
-	label := llm.SessionLabel(snap.Messages)
+// the message list in view. Shared by every resume entry point so they
+// announce the resume identically: callers pass either a just-loaded
+// snapshot's Messages (rebind / TUI) or a live agent's SnapshotMessages (web),
+// so the count always matches the label's source.
+func ResumeOutputMessage(id string, msgs []llm.Message) string {
+	label := llm.SessionLabel(msgs)
 	if label != "" {
-		return fmt.Sprintf("Resumed session %s (%d messages): \"%s\"", id, len(snap.Messages), label)
+		return fmt.Sprintf("Resumed session %s (%d messages): \"%s\"", id, len(msgs), label)
 	}
-	return fmt.Sprintf("Resumed session %s (%d messages).", id, len(snap.Messages))
+	return fmt.Sprintf("Resumed session %s (%d messages).", id, len(msgs))
 }
 
 // ResolveResumeTarget resolves a /resume argument to a concrete session id
@@ -512,23 +522,7 @@ func (a *Agent) ForkSession(ctx context.Context, args, newSessionID string) erro
 
 	// Start new session with the truncated history
 	a.SessionID = newSessionID
-	a.replaceMessages(forkedMsgs)
-	a.clearTurnUsage()
-	a.statsMu.Lock()
-	a.UsageAccum = UsageAccumulator{}
-	a.statsMu.Unlock()
-	a.resetSaveTracking()
-	a.clearViewDriftSnapshot()
-	a.setSessionLabel("")
-	a.statsMu.Lock()
-	a.SessionOneshot = false
-	a.statsMu.Unlock()
-	if a.PinManager != nil {
-		a.PinManager.ClearPins()
-	}
-	if a.TodoManager != nil {
-		a.TodoManager.Clear()
-	}
+	a.resetSessionState(forkedMsgs)
 
 	// Persist new session
 	if a.SessionStore != nil {

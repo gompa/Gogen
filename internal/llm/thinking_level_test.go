@@ -87,11 +87,11 @@ func TestApplyThinkingLevelStrictLiteral(t *testing.T) {
 		"glm-5":   nil, // toggle-only
 	})
 	known := &OpenAIProvider{
-		baseURL:   "https://opencode.ai/zen/v1/",
+		profiles:  []*providerProfile{{name: "default", baseURL: "https://opencode.ai/zen/v1/"}},
 		modelInfo: resolver,
 	}
 	unknown := &OpenAIProvider{
-		baseURL:   "http://127.0.0.1:1/v1", // no registry match → fallback
+		profiles:  []*providerProfile{{name: "default", baseURL: "http://127.0.0.1:1/v1"}}, // no registry match → fallback
 		modelInfo: resolver,
 	}
 

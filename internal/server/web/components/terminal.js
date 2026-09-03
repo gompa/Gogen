@@ -40,6 +40,44 @@ let terminalHeight = TERM_DEFAULT_HEIGHT;
 // True when xterm.js failed to load/init; the strip then shows the
 // fallback hint instead of looking silently broken.
 let terminalLoadFailed = false;
+
+// xterm.js + addon-fit.js are loaded on demand instead of as classic
+// scripts in index.html (they blocked HTML parsing on every page load
+// even though the panel is collapsed by default). The UMD addon-fit
+// registers against the window.Terminal global, so the scripts must
+// load in order. The promise is created once and shared.
+let xtermLoad = null;
+function terminalLoadXterm() {
+    if (!xtermLoad) {
+        // The stylesheet only styles the terminal itself, so it loads
+        // with the scripts instead of blocking first paint in <head>.
+        const css = document.createElement('link');
+        css.rel = 'stylesheet';
+        css.href = '/xterm/xterm.css';
+        document.head.appendChild(css);
+        xtermLoad = new Promise((resolve, reject) => {
+            const load = (src, next) => {
+                const s = document.createElement('script');
+                s.src = src;
+                s.onload = next;
+                s.onerror = () => reject(new Error('failed to load ' + src));
+                document.head.appendChild(s);
+            };
+            load('/xterm/xterm.js', () => load('/xterm/addon-fit.js', resolve));
+        });
+    }
+    return xtermLoad;
+}
+
+// Runs fn now if xterm is ready, else once the in-flight load settles.
+// Callbacks attached to the same promise run in attach order, so WS
+// messages deferred through here keep their FIFO order. Dropped
+// silently if the load failed (the hint is already showing).
+function terminalWhenReady(fn) {
+    if (typeof window.Terminal === 'function') { fn(); return; }
+    if (terminalLoadFailed) return;
+    terminalLoadXterm().then(fn).catch(() => {});
+}
 try {
     const stored = JSON.parse(localStorage.getItem(TERM_STORE_KEY) || '{}');
     terminalExpanded = !!stored.expanded;
@@ -275,9 +313,9 @@ function terminalCreateTab(id, opts = {}) {
 export function terminalOpen(id, name, title) {
     if (terminals.has(id)) return;
     if (typeof window.Terminal !== 'function') {
-        // xterm failed to load — degrade gracefully, the chat tool
-        // cards still show the full result.
-        console.error('xterm.js not loaded; terminal tabs disabled');
+        // xterm is still loading (or failed): defer until it settles —
+        // the chat tool cards show the full result meanwhile.
+        terminalWhenReady(() => terminalOpen(id, name, title));
         return;
     }
     terminalPrune();
@@ -298,7 +336,10 @@ export function terminalOpen(id, name, title) {
 // user_term_opened/exit drive its ready/dead states.
 export function terminalEnsureUserTab() {
     if (terminals.has(USER_TERM_ID)) return;
-    if (typeof window.Terminal !== 'function') return;
+    if (typeof window.Terminal !== 'function') {
+        terminalWhenReady(() => terminalEnsureUserTab());
+        return;
+    }
     terminalCreateTab(USER_TERM_ID, {
         title: 'starting…',
         tooltip: 'User shell (interactive)',
@@ -312,6 +353,10 @@ export function terminalEnsureUserTab() {
 }
 
 export function terminalUserOpened(title, wd) {
+    if (typeof window.Terminal !== 'function') {
+        terminalWhenReady(() => terminalUserOpened(title, wd));
+        return;
+    }
     terminalEnsureUserTab();
     const t = terminals.get(USER_TERM_ID);
     if (!t) return;
@@ -328,6 +373,10 @@ export function terminalUserOpened(title, wd) {
 }
 
 export function terminalUserExited(code) {
+    if (typeof window.Terminal !== 'function') {
+        terminalWhenReady(() => terminalUserExited(code));
+        return;
+    }
     const t = terminals.get(USER_TERM_ID);
     userTermState = 'dead';
     if (!t) return;
@@ -383,12 +432,21 @@ function terminalSendResize(t) {
 }
 
 export function terminalWrite(id, chunk) {
+    if (!chunk) return;
+    if (typeof window.Terminal !== 'function') {
+        terminalWhenReady(() => terminalWrite(id, chunk));
+        return;
+    }
     const t = terminals.get(id);
-    if (!t || !chunk || t.done) return;
+    if (!t || t.done) return;
     try { t.term.write(chunk); } catch (_) {}
 }
 
 export function terminalExit(id, success) {
+    if (typeof window.Terminal !== 'function') {
+        terminalWhenReady(() => terminalExit(id, success));
+        return;
+    }
     const t = terminals.get(id);
     if (!t || t.done) return;
     t.done = true;
@@ -670,6 +728,17 @@ export function initTerminal(d) {
         terminalFitSoon();
     });
 
+    // xterm.js/addon-fit.js are no longer classic scripts in index.html:
+    // start the load now, non-blocking, so the terminal is ready by the
+    // time the panel is opened. terminal* calls that find window.Terminal
+    // missing defer onto this promise (FIFO); a failure flips
+    // terminalLoadFailed and shows the hint.
+    terminalLoadXterm().catch((err) => {
+        console.error('xterm.js failed to load:', err);
+        terminalLoadFailed = true;
+        terminalUpdateHint();
+    });
+
     try {
         terminalPanel.classList.toggle('expanded', terminalExpanded);
         if (terminalExpanded) {
@@ -679,6 +748,7 @@ export function initTerminal(d) {
         terminalChevron.innerHTML = icon(terminalExpanded ? 'chevron-down' : 'chevron-up');
         if (terminalIsMobile()) terminalCloseMobile();
         // The user shell is the default terminal: pinned tab, selected now.
+        // xterm is still loading, so this defers onto terminalLoadXterm.
         terminalEnsureUserTab();
         terminalUpdateHint();
         terminalUpdateBadge();

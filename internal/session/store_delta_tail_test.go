@@ -21,7 +21,6 @@ import (
 	"os"
 	"testing"
 
-	"gogen/internal/agent"
 	"gogen/internal/ioutil"
 	"gogen/internal/llm"
 )
@@ -56,7 +55,7 @@ func TestLoadKeepsDeltaTailWhenSnapshotExtendsBase(t *testing.T) {
 	}
 
 	// Base full save: 3 messages.
-	if err := store.Save(id, agent.SessionSnapshot{
+	if err := store.Save(id, SessionSnapshot{
 		WorkingDir: dir,
 		Messages:   []llm.Message{msg("user", "A"), msg("assistant", "B"), msg("user", "C")},
 	}); err != nil {
@@ -70,7 +69,7 @@ func TestLoadKeepsDeltaTailWhenSnapshotExtendsBase(t *testing.T) {
 	// A stale writer overwrites the snapshot with 4 messages: the base plus
 	// the FIRST delta message (D). This is the two-writer race: the snapshot
 	// now sits BETWEEN the delta's base and base+delta.
-	if err := store.Save(id, agent.SessionSnapshot{
+	if err := store.Save(id, SessionSnapshot{
 		WorkingDir: dir,
 		Messages:   []llm.Message{msg("user", "A"), msg("assistant", "B"), msg("user", "C"), msg("assistant", "D")},
 	}); err != nil {
@@ -115,7 +114,7 @@ func TestLoadDropsDivergedDeltaWhenSnapshotTailDiffers(t *testing.T) {
 	msg := func(role, content string) llm.Message {
 		return llm.Message{Role: role, Content: content}
 	}
-	if err := store.Save(id, agent.SessionSnapshot{
+	if err := store.Save(id, SessionSnapshot{
 		WorkingDir: dir,
 		Messages:   []llm.Message{msg("user", "A"), msg("assistant", "B"), msg("user", "C")},
 	}); err != nil {
@@ -125,7 +124,7 @@ func TestLoadDropsDivergedDeltaWhenSnapshotTailDiffers(t *testing.T) {
 	writeDeltaFor(t, store, dir, id, 3, msg("assistant", "D"), msg("user", "E"))
 	// A divergent writer saved a snapshot with 4 messages whose 4th message
 	// is NOT the delta's D (rollback + rewrite).
-	if err := store.Save(id, agent.SessionSnapshot{
+	if err := store.Save(id, SessionSnapshot{
 		WorkingDir: dir,
 		Messages:   []llm.Message{msg("user", "A"), msg("assistant", "B"), msg("user", "C"), msg("user", "X")},
 	}); err != nil {
@@ -165,14 +164,14 @@ func TestTailMergeIsIdempotent(t *testing.T) {
 	msg := func(role, content string) llm.Message {
 		return llm.Message{Role: role, Content: content}
 	}
-	if err := store.Save(id, agent.SessionSnapshot{
+	if err := store.Save(id, SessionSnapshot{
 		WorkingDir: dir,
 		Messages:   []llm.Message{msg("user", "A"), msg("assistant", "B"), msg("user", "C")},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	writeDeltaFor(t, store, dir, id, 3, msg("assistant", "D"), msg("user", "E"), msg("assistant", "F"))
-	if err := store.Save(id, agent.SessionSnapshot{
+	if err := store.Save(id, SessionSnapshot{
 		WorkingDir: dir,
 		Messages:   []llm.Message{msg("user", "A"), msg("assistant", "B"), msg("user", "C"), msg("assistant", "D")},
 	}); err != nil {
@@ -215,7 +214,7 @@ func TestLoadDropsDeltaWhenSnapshotShorterThanBase(t *testing.T) {
 	msg := func(role, content string) llm.Message {
 		return llm.Message{Role: role, Content: content}
 	}
-	if err := store.Save(id, agent.SessionSnapshot{
+	if err := store.Save(id, SessionSnapshot{
 		WorkingDir: dir,
 		Messages:   []llm.Message{msg("user", "A"), msg("assistant", "B"), msg("user", "C")},
 	}); err != nil {
@@ -224,7 +223,7 @@ func TestLoadDropsDeltaWhenSnapshotShorterThanBase(t *testing.T) {
 	writeDeltaFor(t, store, dir, id, 3, msg("assistant", "D"), msg("user", "E"))
 
 	// Compacted to 2 messages (fewer than the delta base).
-	if err := store.Save(id, agent.SessionSnapshot{
+	if err := store.Save(id, SessionSnapshot{
 		WorkingDir: dir,
 		Messages:   []llm.Message{msg("user", "A"), msg("assistant", "B")},
 	}); err != nil {

@@ -1047,27 +1047,15 @@ func (m *Model) resumeSavedRow(id string) tea.Cmd {
 		return nil
 	}
 	if result.Action == agent.SessionActionClearChat {
-		m.chatLines = nil
-		m.chatLines = append(m.chatLines, SystemStyle.Render(result.Output))
-		if len(result.History) > 0 {
-			m.chatLines = append(m.chatLines, renderMessages(result.History, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String())...)
-		}
-		m.setViewportContent()
-		m.viewport.GotoBottom()
-		m.sessionID = m.agent.SessionID
-		// The resumed conversation has a cold token-count cache: probe
-		// off the Update thread (a synchronous probe would tokenize the
-		// whole history on the render loop).
-		cmds := []tea.Cmd{m.requestContextStats(), m.requestSavedSessions()}
+		cmd := m.applySessionSwitch(result)
 		// The resumed session keeps its earned position (web: makePane
 		// seeds initialActivity from the saved session's updatedAt); the
 		// left-behind session keeps its in-process output stamp.
-		m.rebindActivity()
 		m.sidebarCursor = m.sidebarFocusedRow()
 		// The resume flushed the left-behind session; surface a failed
 		// save instead of losing it silently (cmdSession's old contract).
 		m.checkPersistError()
-		return tea.Batch(cmds...)
+		return cmd
 	}
 	return nil
 }
@@ -1115,7 +1103,7 @@ func (m *Model) spawnSavedSession(id string) tea.Cmd {
 	// switchToLive rebuilds the transcript from the restored Messages and
 	// rebinds every focused mirror; it is safe even mid-turn.
 	cmd := m.switchToLive(i)
-	m.appendChatLine(SystemStyle.Render(agent.ResumeOutputMessage(id, snap)))
+	m.appendChatLine(SystemStyle.Render(agent.ResumeOutputMessage(id, snap.Messages)))
 	// The resumed session keeps its earned position (web: makePane seeds
 	// initialActivity from the saved session's updatedAt); the left-behind
 	// session keeps its in-process output stamp.

@@ -71,12 +71,17 @@ func searchDuckDuckGoHTML(ctx context.Context, query string, maxResults int) (st
 	}
 
 	results := parseDDGHTMLResults(body, maxResults)
-	if len(results) == 0 {
-		return fmt.Sprintf("No results found for %q (via DuckDuckGo)", query), nil
-	}
+	return formatResults(query, "DuckDuckGo", results), nil
+}
 
+// formatResults renders search results as a numbered text list, or a
+// no-results message when results is empty.
+func formatResults(query, source string, results []searchResult) string {
+	if len(results) == 0 {
+		return fmt.Sprintf("No results found for %q (via %s)", query, source)
+	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "Web search results for %q (via DuckDuckGo):\n\n", query)
+	fmt.Fprintf(&b, "Web search results for %q (via %s):\n\n", query, source)
 	for i, r := range results {
 		fmt.Fprintf(&b, "%d. %s\n", i+1, r.title)
 		fmt.Fprintf(&b, "   URL: %s\n", r.link)
@@ -85,8 +90,8 @@ func searchDuckDuckGoHTML(ctx context.Context, query string, maxResults int) (st
 		}
 		b.WriteByte('\n')
 	}
-	fmt.Fprintf(&b, "Use web_fetch to retrieve full content from result URLs.")
-	return b.String(), nil
+	b.WriteString("Use web_fetch to retrieve full content from result URLs.")
+	return b.String()
 }
 
 type searchResult struct {
@@ -158,7 +163,7 @@ func (st *ddgResultState) handleToken(tt html.TokenType, tok html.Token) *search
 
 func (st *ddgResultState) handleStartTag(tok html.Token, selfClosing bool) {
 	// cachedClasses avoids re-parsing the class attribute on every
-	// tokenHasClass call for the same HTML token.
+	// tokenHasClassCached call for the same HTML token.
 	var cachedClasses []string
 	// <div class="result results_links ...">  → enter result
 	if tok.Data == "div" && tokenHasClassCached(tok, "result", &cachedClasses) && tokenHasClassCached(tok, "results_links", &cachedClasses) {
@@ -232,15 +237,15 @@ func (st *ddgResultState) handleText(tok html.Token) {
 	}
 }
 
-// tokenHasClassCached is like tokenHasClass but uses a cached slice of class
-// values to avoid re-parsing the class attribute on subsequent calls for the
-// same token. Pass &cachedClasses from the outer loop (nil to bypass cache).
+// tokenHasClassCached reports whether tok's class attribute contains class
+// (case-insensitive). It caches the parsed class values in *cache to avoid
+// re-parsing the attribute on repeated calls for the same token; the caller
+// must pass a non-nil *[]string that is reset to nil for each new token.
 func tokenHasClassCached(tok html.Token, class string, cache *[]string) bool {
-	if cache != nil && *cache == nil {
+	if *cache == nil {
 		for _, a := range tok.Attr {
 			if a.Key == "class" {
-				classes := strings.Fields(a.Val)
-				*cache = classes
+				*cache = strings.Fields(a.Val)
 				break
 			}
 		}
@@ -248,23 +253,9 @@ func tokenHasClassCached(tok html.Token, class string, cache *[]string) bool {
 			*cache = []string{} // non-nil sentinel: class attr absent
 		}
 	}
-	if cache != nil {
-		for _, c := range *cache {
-			if strings.EqualFold(c, class) {
-				return true
-			}
-		}
-		return false
-	}
-	// Fallback: uncached scan (for callers that don't have a cache).
-	for _, a := range tok.Attr {
-		if a.Key == "class" {
-			for _, c := range strings.Fields(a.Val) {
-				if strings.EqualFold(c, class) {
-					return true
-				}
-			}
-			return false
+	for _, c := range *cache {
+		if strings.EqualFold(c, class) {
+			return true
 		}
 	}
 	return false
@@ -339,22 +330,12 @@ func searchBrave(ctx context.Context, query string, maxResults int, apiKey strin
 		return "", fmt.Errorf("brave parse: %w", err)
 	}
 
-	var b strings.Builder
-	fmt.Fprintf(&b, "Web search results for %q (via Brave):\n\n", query)
+	results := make([]searchResult, 0, len(parsed.Web.Results))
 	for i, r := range parsed.Web.Results {
 		if i >= maxResults {
 			break
 		}
-		fmt.Fprintf(&b, "%d. %s\n", i+1, r.Title)
-		fmt.Fprintf(&b, "   URL: %s\n", r.URL)
-		if r.Description != "" {
-			fmt.Fprintf(&b, "   %s\n", r.Description)
-		}
-		b.WriteByte('\n')
+		results = append(results, searchResult{title: r.Title, link: r.URL, snippet: r.Description})
 	}
-	if len(parsed.Web.Results) == 0 {
-		b.WriteString("No results found.\n")
-	}
-	fmt.Fprintf(&b, "Use web_fetch to retrieve full content from result URLs.")
-	return b.String(), nil
+	return formatResults(query, "Brave", results), nil
 }

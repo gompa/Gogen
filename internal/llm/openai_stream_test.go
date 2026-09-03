@@ -14,13 +14,17 @@ import (
 )
 
 func newTestOpenAIProvider(srv *httptest.Server) *OpenAIProvider {
+	c := openai.NewClient(
+		option.WithBaseURL(srv.URL),
+		option.WithAPIKey("test"),
+		option.WithHTTPClient(newSSEHTTPClient()),
+	)
+	// No profile baseURL: the direct-construction shape resolved
+	// defaultBaseURL() to "", so /props probes and models.dev lookups stay
+	// off; the stream client carries the endpoint itself.
 	return &OpenAIProvider{
-		client: openai.NewClient(
-			option.WithBaseURL(srv.URL),
-			option.WithAPIKey("test"),
-			option.WithHTTPClient(newSSEHTTPClient()),
-		),
-		model: "test-model",
+		profiles: []*providerProfile{{name: "default", stream: &c}},
+		model:    "test-model",
 	}
 }
 

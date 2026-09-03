@@ -6,7 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"gogen/internal/agent"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
 )
@@ -25,49 +24,19 @@ const gitCommitMessageTimeout = 60 * time.Second
 // dropped straight into the composer's textarea.
 const gitCommitMessageInstruction = "Write a concise git commit message. Output only the message, no preamble."
 
-// gitEmptyTreeHash is the well-known SHA-1 of the empty git tree, used as
-// the diff base on an unborn HEAD (a repo with no commits yet), where
-// `git diff --cached` alone fails with "bad revision 'HEAD'".
-const gitEmptyTreeHash = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-
 // gitStagedDiff returns the staged (index vs HEAD) diff, truncated to
 // gitCommitMessageDiffMaxBytes. It returns an empty string when nothing is
 // staged. Shared by the commit-message generator; the git_staged_diff WS
 // endpoint (ticket #51) can reuse it for the composer preview.
 func (s *Server) gitStagedDiff(ctx context.Context) (string, error) {
-	exec := s.ws.Exec
-	args := []string{"diff", "--no-color", "--cached"}
-	if !gitHasHEAD(ctx, exec) {
-		args = append(args, gitEmptyTreeHash)
-	}
-	cmd, err := exec.NewGitCmd(ctx, args...)
+	diff, err := s.ws.Exec.GitStagedDiff(ctx)
 	if err != nil {
 		return "", err
 	}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		msg := strings.TrimSpace(string(out))
-		if msg == "" {
-			msg = err.Error()
-		}
-		return "", fmt.Errorf("git diff --cached failed: %s", msg)
-	}
-	diff := string(out)
-	// TruncateMarked makes a rune-safe cut: a raw byte slice here could land
+	// Truncate makes a rune-safe cut: a raw byte slice here could land
 	// mid-rune on a multi-byte diff and emit invalid UTF-8 into the prompt.
-	return contextmgr.TruncateMarked(diff, gitCommitMessageDiffMaxBytes, "\n… (diff truncated)"), nil
-}
-
-// gitHasHEAD reports whether the repository has at least one commit. A probe
-// failure (not a git repo, git missing) is reported as "no HEAD" so the
-// caller surfaces the diff-command error instead of a misleading one.
-func gitHasHEAD(ctx context.Context, exec *agent.Executor) bool {
-	cmd, err := exec.NewGitCmd(ctx, "rev-parse", "--verify", "-q", "HEAD")
-	if err != nil {
-		return false
-	}
-	_, err = cmd.Output()
-	return err == nil
+	return contextmgr.Truncate(diff, gitCommitMessageDiffMaxBytes,
+		contextmgr.TruncateOptions{Marker: "\n… (diff truncated)"}), nil
 }
 
 // openAIProviderConfigured reports whether the workspace has a usable LLM

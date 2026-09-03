@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"gogen/internal/agent"
 	"gogen/internal/llm"
 )
 
@@ -30,7 +29,7 @@ func TestStoreConcurrentSaveLoadDelete(t *testing.T) {
 		wg.Add(1)
 		go func(id string) {
 			defer wg.Done()
-			snap := agent.SessionSnapshot{
+			snap := SessionSnapshot{
 				WorkingDir: dir,
 				Messages:   []llm.Message{{Role: "user", Content: "hello " + id}},
 			}
@@ -83,7 +82,7 @@ func TestPruneProtectsMultipleActiveIDs(t *testing.T) {
 	store.SetAutoPrune(false)
 
 	for _, id := range []string{"a", "b", "c", "d", "e"} {
-		if err := store.Save(id, agent.SessionSnapshot{
+		if err := store.Save(id, SessionSnapshot{
 			WorkingDir: dir,
 			Messages:   []llm.Message{{Role: "user", Content: id}},
 		}); err != nil {

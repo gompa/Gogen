@@ -3,6 +3,7 @@ package agent
 import (
 	"path"
 	"regexp"
+	"strconv"
 	"sync"
 	"testing"
 )
@@ -16,7 +17,7 @@ func TestCompiledRegexCachesAndBounded(t *testing.T) {
 
 	patterns := make([]string, 0, regexMemoMax+50)
 	for i := 0; i < regexMemoMax+50; i++ {
-		patterns = append(patterns, "pat"+itoa(i)+".go")
+		patterns = append(patterns, "pat"+strconv.Itoa(i)+".go")
 	}
 	for _, p := range patterns {
 		if _, err := compiledRegex(p); err != nil {
@@ -54,7 +55,7 @@ func TestCompiledRegexConcurrent(t *testing.T) {
 		go func(seed int) {
 			defer wg.Done()
 			for i := 0; i < 200; i++ {
-				if _, err := compiledRegex("g" + itoa(seed) + "_[0-9]+" + itoa(i%4)); err != nil {
+				if _, err := compiledRegex("g" + strconv.Itoa(seed) + "_[0-9]+" + strconv.Itoa(i%4)); err != nil {
 					t.Errorf("compiledRegex: %v", err)
 					return
 				}

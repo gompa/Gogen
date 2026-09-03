@@ -2,7 +2,6 @@ package server
 
 import (
 	"fmt"
-	"net/http"
 )
 
 // wsHandleBoardOp handles kanban-tab operations ("board_op"): the client
@@ -14,7 +13,9 @@ import (
 // out as "response" (which renders into the chat transcript). The handler is
 // gated on the board feature flag — a stale client's op after a toggle-off
 // is rejected with an error notice.
-func wsHandleBoardOp(s *Server, ws *wsConn, r *http.Request, pane **sessionRuntime, target *sessionRuntime, msg WSMessage, holder *userTermHolder) {
+func wsHandleBoardOp(req *wsRequest) {
+	s, ws, r, msg := req.server, req.conn, req.request, req.msg
+	pane := &req.pane
 	if !s.ws.GetBoardEnabled() {
 		writeNoticeError(ws, "board", "Error: the board feature is disabled")
 		return

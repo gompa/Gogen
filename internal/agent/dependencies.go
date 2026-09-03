@@ -84,7 +84,7 @@ func (e *Executor) dependencyAnalysisWithAST(ctx context.Context, searchRoot, re
 	}
 
 	// Find indirect dependents
-	result.IndirectDependents = e.findIndirectDependents(ctx, result.DirectDependents, "")
+	result.IndirectDependents = e.findIndirectDependents(ctx, result.DirectDependents)
 
 	result.computeImpact()
 
@@ -110,21 +110,21 @@ func (e *Executor) dependencyAnalysisWithText(ctx context.Context, searchRoot, r
 	}
 
 	// Find indirect dependents
-	result.IndirectDependents = e.findIndirectDependents(ctx, result.DirectDependents, "")
+	result.IndirectDependents = e.findIndirectDependents(ctx, result.DirectDependents)
 
 	result.computeImpact()
 
 	return result, nil
 }
 
-func (e *Executor) findIndirectDependents(ctx context.Context, directDependents []string, subpath string) []string {
+func (e *Executor) findIndirectDependents(ctx context.Context, directDependents []string) []string {
 	indirect := make(map[string]bool)
 
 	for _, dep := range directDependents {
 		// Search for references to the relative path (e.g. "internal/agent/utils").
 		// This is more precise than searching for just the filename stem.
 		pattern := regexp.QuoteMeta(dep)
-		results, err := e.SearchCode(ctx, pattern, subpath, "", 0, false)
+		results, err := e.SearchCode(ctx, pattern, "", "", 0, false)
 		if err != nil {
 			continue
 		}

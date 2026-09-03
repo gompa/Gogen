@@ -288,7 +288,7 @@ func (discardProgram) Send(m tea.Msg) {}
 
 // TestJoinRoundBufferConcurrentWithTurn runs real turns whose stream
 // goroutine feeds the round buffer (via the adapter handlers) while the
-// Update thread repeatedly joins the session (roundSnapshot + render):
+// Update thread repeatedly joins the session (round.Snapshot + render):
 // the buffer must be race-free under concurrent append/snapshot (mirrors
 // the server's liveTurnState contract). Run with -race.
 func TestJoinRoundBufferConcurrentWithTurn(t *testing.T) {
@@ -345,8 +345,8 @@ func TestJoinRendersInFlightRound(t *testing.T) {
 	s2.turnSeq = 1
 	// The round buffer holds what streamed while s2 was focused (the
 	// adapter appends regardless of focus).
-	s2.roundAppendThinking("let me think")
-	s2.roundAppendContent("partial re")
+	s2.round.AppendThinking("let me think")
+	s2.round.AppendContent("partial re")
 
 	// Watch a few tokens, switch away, come back mid-round.
 	m.switchToLive(1)
@@ -399,8 +399,8 @@ func TestJoinBetweenRoundsNoDuplicate(t *testing.T) {
 	s2.turnSeq = 1
 	// The round completed: content committed to Messages, buffer cleared
 	// at round end (the adapter's OnStreamEnd does this).
-	s2.roundAppendContent("completed answer")
-	s2.roundReset()
+	s2.round.AppendContent("completed answer")
+	s2.round.Reset()
 
 	m.switchToLive(1)
 	joined := strings.Join(m.chatLines, "\n")
@@ -417,11 +417,11 @@ func TestJoinBetweenRoundsNoDuplicate(t *testing.T) {
 // turns, bounded memory (one round's output at a time).
 func TestRoundBufferResets(t *testing.T) {
 	s := &liveSession{id: "s9"}
-	s.roundAppendThinking("think")
-	s.roundAppendContent("abc")
-	s.roundToolStart(0, "call_1", "read_file")
-	s.roundToolArgsAppend(0, `{"path": "a.go"}`)
-	rw := s.roundSnapshot()
+	s.round.AppendThinking("think")
+	s.round.AppendContent("abc")
+	s.round.ToolStart(0, "call_1", "read_file")
+	s.round.AppendToolArgs(0, `{"path": "a.go"}`)
+	rw := s.round.Snapshot()
 	if rw == nil || rw.Content != "abc" || rw.Thinking != "think" || len(rw.ToolCalls) != 1 {
 		t.Fatalf("snapshot = %+v", rw)
 	}
@@ -429,13 +429,13 @@ func TestRoundBufferResets(t *testing.T) {
 		t.Fatalf("tool call = %+v", rw.ToolCalls[0])
 	}
 	// Round end (OnStreamEnd): cleared.
-	s.roundReset()
-	if rw := s.roundSnapshot(); rw != nil {
+	s.round.Reset()
+	if rw := s.round.Snapshot(); rw != nil {
 		t.Fatalf("buffer must clear on round end: %+v", rw)
 	}
 	// Turn start (OnStart) on an already-empty buffer: still empty.
-	s.roundReset()
-	if rw := s.roundSnapshot(); rw != nil {
+	s.round.Reset()
+	if rw := s.round.Snapshot(); rw != nil {
 		t.Fatalf("buffer must stay empty after turn start: %+v", rw)
 	}
 }
@@ -456,7 +456,7 @@ func TestAdapterFeedsRoundBufferRegardlessOfFocus(t *testing.T) {
 	h.OnToolCallStart(0, "call_1", "read_file")
 	h.OnToolCallArgsDelta(0, "call_1", "", `{"path": "a.go"}`)
 
-	rw := sess.roundSnapshot()
+	rw := sess.round.Snapshot()
 	if rw == nil {
 		t.Fatal("round buffer empty after adapter events")
 	}
@@ -468,7 +468,7 @@ func TestAdapterFeedsRoundBufferRegardlessOfFocus(t *testing.T) {
 	}
 	// Round end clears the buffer (the next join must not re-render it).
 	h.OnStreamEnd()
-	if rw := sess.roundSnapshot(); rw != nil {
+	if rw := sess.round.Snapshot(); rw != nil {
 		t.Fatalf("buffer must clear on round end: %+v", rw)
 	}
 }

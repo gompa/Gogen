@@ -12,7 +12,8 @@
 //   deps.getNestedSessions()           — the live subagent-records Map
 //   deps.nestedParentIdOf(id, list)    — a nested child's parent id
 //   deps.nestedRowWillRender(...)      — nested-row render check
-//   deps.appendNestedRows(parentId)    — render nested rows under a parent
+//   deps.collectNestedRows(id, depth)  — nested child records under a parent (pure, no DOM)
+//   deps.buildNestedRow(rec)           — build one nested (subagent) row element
 //   deps.relativeTime(value)           — "3m ago" formatting
 //   deps.focusPane(key)                — focus an open pane
 //   deps.openSessionPane(id)           — attach a saved session as a pane
@@ -39,6 +40,19 @@ let deps = null;
 let lastSessions = null;
 // The sidebar session list element (looked up in initSessions).
 let sessionListDiv = null;
+// Keyed row cache for the diff render: row key → { el, sig }. The
+// container is NEVER cleared — rows are created once, left untouched
+// while their signature is unchanged, moved when their order changes,
+// and removed when they leave the list. That keeps the 30s
+// relative-time refresher's in-place .session-row-time updates (and
+// scroll/hover state) alive between renders instead of rebuilding the
+// whole list on every state flip.
+// Invariant: only this module adds/removes sessionListDiv children
+// (the 30s refresher touches row textContent only) — anything else that
+// mutates the list would desync this map from the DOM.
+let rowEls = new Map();
+// The "No sessions" placeholder (created lazily, shown/hidden by the diff).
+let emptyEl = null;
 
 export function initSessions(d) {
     deps = d;
@@ -66,7 +80,6 @@ export function renderSessionList(sessions) {
     // Cache the payload so pane-state changes (focus, busy, label)
     // can re-render the list without a server round-trip.
     lastSessions = sessions || [];
-    sessionListDiv.innerHTML = '';
     const list = lastSessions;
     // ONE list of SESSIONS, not of panes. Rows come from the server's
     // saved-session payload (one row per top-level session); an open
@@ -104,7 +117,7 @@ export function renderSessionList(sessions) {
     for (const pane of idlessPanes) rows.push({ pane, entry: null });
     rows.sort((a, b) => activityOf(b) - activityOf(a));
     // A nested (subagent) child open as a pane renders under its
-    // parent via appendNestedRows below, NOT as a flat open-pane
+    // parent via the nested descriptors below, NOT as a flat open-pane
     // row — opening a subagent must not make its row jump out of
     // the parent. The child falls back to its flat open-pane row
     // only when the parent's row is missing from this render (a
@@ -121,20 +134,125 @@ export function renderSessionList(sessions) {
         // falls back to the flat open-pane row.
         return !parentId || !deps.nestedRowWillRender(parentId, list, rowIds, new Set());
     });
-    if (!flatRows.length) {
-        const empty = document.createElement('div');
-        empty.className = 'session-list-empty';
-        empty.textContent = 'No sessions';
-        sessionListDiv.appendChild(empty);
+    // Build the ORDERED row descriptors: each flat row followed by its
+    // nested (subagent) children, recursively. Nested rows join the same
+    // list the diff places — the old code appended them to the container
+    // end, which is only correct on a wiped list; a parent that reorders
+    // must carry its children with it.
+    const descriptors = [];
+    for (const r of flatRows) {
+        const id = r.pane ? r.pane.id : (r.entry ? r.entry.id : '');
+        descriptors.push({
+            key: r.pane ? (r.pane.id || 'pane:' + r.pane.key) : id,
+            sig: flatRowSig(r.pane, r.entry, act),
+            build: () => buildSessionRow(r.pane, r.entry, act),
+        });
+        if (id) {
+            for (const rec of deps.collectNestedRows(id, 0)) {
+                descriptors.push({
+                    key: rec.id,
+                    sig: nestedRowSig(rec),
+                    build: () => deps.buildNestedRow(rec),
+                });
+            }
+        }
+    }
+    if (!descriptors.length) {
+        // Empty state: drop every row, show the placeholder.
+        for (const rec of rowEls.values()) rec.el.remove();
+        rowEls.clear();
+        if (!emptyEl) {
+            emptyEl = document.createElement('div');
+            emptyEl.className = 'session-list-empty';
+            emptyEl.textContent = 'No sessions';
+        }
+        sessionListDiv.appendChild(emptyEl);
         return;
     }
-    for (const r of flatRows) {
-        sessionListDiv.appendChild(buildSessionRow(r.pane, r.entry, act));
-        // Nested (subagent) rows render directly under their parent
-        // (live events + persisted children from the payload).
-        const parentId = r.pane ? r.pane.id : (r.entry ? r.entry.id : '');
-        if (parentId) deps.appendNestedRows(parentId);
+    if (emptyEl && emptyEl.parentNode === sessionListDiv) emptyEl.remove();
+    // Diff pass 1: remove rows that left the list. Done BEFORE placement
+    // so pass 2's appendChild is a no-op for rows already in the right
+    // spot — a DOM move happens only for genuine reorders.
+    const wanted = new Set(descriptors.map((d) => d.key));
+    for (const [key, rec] of rowEls) {
+        if (!wanted.has(key)) {
+            rec.el.remove();
+            rowEls.delete(key);
+        }
     }
+    // Diff pass 2: create rows that are new or whose signature changed,
+    // then place every row in order (appendChild moves existing nodes).
+    for (const d of descriptors) {
+        let rec = rowEls.get(d.key);
+        if (!rec || rec.sig !== d.sig) {
+            if (rec) rec.el.remove(); // stale node out BEFORE the new one in
+            rec = { el: d.build(), sig: d.sig };
+            rowEls.set(d.key, rec);
+        }
+        sessionListDiv.appendChild(rec.el);
+    }
+}
+
+// Signature of everything buildSessionRow displays: pane identity, live
+// pane state, and the saved entry's fields. A row whose signature is
+// unchanged is left completely untouched — its nodes (including the 30s
+// refresher's .session-row-time updates) survive the re-render.
+// MUST cover every field buildSessionRow reads; a missed field means a
+// silently stale row.
+function flatRowSig(pane, entry, act) {
+    // Same fallback shape buildSessionRow uses for id-less/entry-less rows.
+    const s = entry || {
+        id: pane ? pane.id : '',
+        label: pane ? pane.label : '',
+        messageCount: null,
+        active: true,
+        updatedAt: '',
+    };
+    return [
+        pane ? pane.key : '',
+        pane ? (pane.id || '') : '',
+        pane ? (pane.label || '') : '',
+        pane ? (pane.turnActive ? 1 : 0) : '',
+        pane ? (pane === act ? 1 : 0) : '',
+        s.id,
+        s.label,
+        s.messageCount,
+        s.updatedAt,
+        s.active ? 1 : 0,
+    ].join('\u0000');
+}
+
+// Signature of everything buildNestedSessionRow (app.js) displays: the
+// child's open-pane overlay state plus the record's live/persisted
+// fields. Same contract as flatRowSig: cover every field the builder
+// reads (over-inclusion only costs a rare extra rebuild).
+function nestedRowSig(rec) {
+    const act = deps.getPane();
+    let paneKey = '';
+    let paneLabel = '';
+    let paneTurn = '';
+    let isCurrent = '';
+    for (const pane of deps.getPanes().values()) {
+        if (pane.id === rec.id) {
+            paneKey = pane.key;
+            paneLabel = pane.label || '';
+            paneTurn = pane.turnActive ? 1 : 0;
+            isCurrent = pane === act ? 1 : 0;
+            break;
+        }
+    }
+    return [
+        paneKey,
+        paneLabel,
+        paneTurn,
+        isCurrent,
+        rec.running ? 1 : 0,
+        rec.success ? 1 : 0,
+        rec.active ? 1 : 0,
+        rec.label,
+        (rec.summary || '').slice(0, 80),
+        rec.job || '',
+    ].join('\u0000');
 }
 
 // Build one sidebar row for an open pane (pane != null) or a saved

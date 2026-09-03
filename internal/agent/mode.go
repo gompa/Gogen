@@ -73,10 +73,8 @@ func (m Mode) AllowsTool(name string) bool {
 }
 
 // allowsTool reports whether name may run in the agent's current mode,
-// covering the static builtin set plus the dynamic feature tools. D7: the
-// board tool is plan-mode unrestricted (the coordination exception, like
-// todo) — an agent may update the board in plan mode so it can mark items
-// for review.
+// covering the static builtin set plus the dynamic feature tools (whose
+// plan-mode flags come from the single gating policy, featureTools).
 func (a *Agent) allowsTool(name string) bool {
 	if a.Mode != ModePlan {
 		return true
@@ -84,14 +82,10 @@ func (a *Agent) allowsTool(name string) bool {
 	if _, ok := planModeAllowedTools[name]; ok {
 		return true
 	}
-	if name == "board" && a.BoardEnabled() && a.BoardManager() != nil {
-		return true
-	}
-	// D-skill: skill list/read are read-only, so the skill tool is
-	// plan-mode allowed like the board (the model can consult skills while
-	// planning).
-	if name == "skill" && a.SkillsEnabled() && a.SkillsManager() != nil {
-		return true
+	for _, ft := range a.featureTools() {
+		if ft.Name == name && ft.PlanAllowed {
+			return true
+		}
 	}
 	return false
 }
@@ -130,7 +124,10 @@ func (a *Agent) isMCPTool(name string) bool {
 	return strings.HasPrefix(name, "mcp_")
 }
 
-// AllowedToolNames returns tool names available to the LLM in the current mode.
+// AllowedToolNames returns tool names available to the LLM in the current
+// mode: the builtin set filtered by mode, the feature tools from the single
+// gating policy (featureTools) filtered by their plan-mode flags, and the
+// MCP registry tools (act mode only).
 func (a *Agent) AllowedToolNames() map[string]struct{} {
 	out := make(map[string]struct{})
 	for _, name := range builtinToolNames {
@@ -138,25 +135,10 @@ func (a *Agent) AllowedToolNames() map[string]struct{} {
 			out[name] = struct{}{}
 		}
 	}
-	// Feature tools: the board tool is available in both modes (D7), the
-	// subagent tool only in act mode.
-	if a.BoardEnabled() && a.BoardManager() != nil && a.allowsTool("board") {
-		out["board"] = struct{}{}
-	}
-	if a.SubagentsEnabled() && a.SubagentSpawner() != nil && a.Mode != ModePlan {
-		out["subagent"] = struct{}{}
-		if a.continuableSpawner() != nil {
-			out["subagent_fork"] = struct{}{}
-			out["list_agents"] = struct{}{}
-			out["send_message"] = struct{}{}
-			out["interrupt_agent"] = struct{}{}
-			if a.ParentID() != "" && a.ReportHook() != nil {
-				out["report"] = struct{}{}
-			}
+	for _, ft := range a.featureTools() {
+		if a.Mode != ModePlan || ft.PlanAllowed {
+			out[ft.Name] = struct{}{}
 		}
-	}
-	if a.SkillsEnabled() && a.SkillsManager() != nil && a.allowsTool("skill") {
-		out["skill"] = struct{}{}
 	}
 	if a.Mode != ModePlan && a.MCPRegistry != nil {
 		for name := range a.MCPRegistry.ToolNames() {

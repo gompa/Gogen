@@ -374,7 +374,7 @@ func TestReasoningEffortUnsupported(t *testing.T) {
 			"glm-5.2": {"high", "max"},
 		})
 		known := &OpenAIProvider{
-			baseURL:   "https://opencode.ai/zen/v1/",
+			profiles:  []*providerProfile{{name: "default", baseURL: "https://opencode.ai/zen/v1/"}},
 			modelInfo: resolver,
 		}
 		if !known.ReasoningEffortUnsupported("glm-5") {

@@ -26,6 +26,10 @@ type subagentRecord struct {
 type tuiSubagentSpawner struct {
 	cfg *config.Config
 	m   *Model // for the /subagents list (nil in tests)
+
+	// providerFactory builds the child provider; nil = the OpenAI
+	// with-profiles default (tests inject a mock).
+	providerFactory func(cfg *config.Config, parent *agent.Agent) llm.LLMProvider
 }
 
 func (sp *tuiSubagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, job, model string, depth int) (string, error) {
@@ -41,24 +45,22 @@ func (sp *tuiSubagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, jo
 	// legacy fields form the implicit default), like the parent: a model
 	// inherited from a secondary provider must route to its owning endpoint,
 	// not fall back to the default client (D9).
-	prov := llm.NewOpenAIProviderWithProfiles(
-		llm.ProviderProfiles(cfg.OpenAIKey, cfg.OpenAIModel, cfg.OpenAIURL, cfg.OpenAIProviders),
-		cfg.OpenAIModel, parent.WorkingDir, nil)
-	// Share the parent's model→profile owner record: a child provider whose
-	// owning endpoint is down still routes inherited models to that endpoint
-	// instead of falling back to the default profile (the child's own
-	// catalog merge cannot map the model while the owner is unreachable).
-	if pp, ok := parent.Provider.(*llm.OpenAIProvider); ok {
-		prov.SetOwnerRegistry(pp.OwnerRegistry())
-	}
-	if model != "" {
-		_ = prov.SetModel(model)
-	} else if m := cfg.SubagentModel; m != "" {
-		// The configured default subagent model (config file / env) beats
-		// parent-model inheritance, mirroring the web spawner.
-		_ = prov.SetModel(m)
-	} else if m := parent.CurrentModel(); m != "" {
-		_ = prov.SetModel(m)
+	var prov llm.LLMProvider
+	if sp.providerFactory != nil {
+		prov = sp.providerFactory(cfg, parent)
+	} else {
+		openaiProv := llm.NewOpenAIProviderWithProfiles(
+			llm.ProviderProfiles(cfg.OpenAIKey, cfg.OpenAIModel, cfg.OpenAIURL, cfg.OpenAIProviders),
+			cfg.OpenAIModel, parent.WorkingDir, nil)
+		// Share the parent's model→profile owner record: a child provider
+		// whose owning endpoint is down still routes inherited models to
+		// that endpoint instead of falling back to the default profile
+		// (the child's own catalog merge cannot map the model while the
+		// owner is unreachable).
+		if pp, ok := parent.Provider.(*llm.OpenAIProvider); ok {
+			openaiProv.SetOwnerRegistry(pp.OwnerRegistry())
+		}
+		prov = openaiProv
 	}
 	child := agent.NewSessionAgent(agent.SessionAgentOptions{
 		Provider:              prov,
@@ -84,6 +86,17 @@ func (sp *tuiSubagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, jo
 	}, nil, session.NewID())
 	child.SetSubagentDepth(depth + 1)
 	child.SetParentID(parent.SessionID)
+	// Model cascade (fully shared with the web spawner — see
+	// ResolveSubagentModel/ApplySubagentModel): explicit tool argument >
+	// configured subagent model > the parent's live model (unless it is
+	// the default the child is already seeded with). The explicit
+	// argument is a hard requirement and fails the spawn when
+	// unselectable; the other tiers fall back to the seeded default
+	// (fail open).
+	m, src := agent.ResolveSubagentModel(model, cfg.SubagentModel, parent.CurrentModel(), cfg.OpenAIModel)
+	if err := agent.ApplySubagentModel(ctx, child, m, src); err != nil {
+		return "", err
+	}
 	// Reasoning effort: the same cascade as the web spawner — the
 	// configured subagent level (subagent_thinking_level) wins; empty =
 	// inherit the parent's live level. A level the child's final model
@@ -96,15 +109,10 @@ func (sp *tuiSubagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, jo
 	// list keeps the original job the parent wrote; only the child's first
 	// message carries the wrapped job.
 	report, err := child.StreamProcessInputWithImages(ctx, agent.FormatSubagentJob(job), nil, nil)
-	// Persist the final outcome on the child's snapshot (same contract as
-	// the web spawner): the sidebar reads it from the sessions payload
-	// when the live subagent events are gone.
-	status := "success"
-	if err != nil {
-		status = "failed"
-	}
-	child.SetSubagentOutcome(status, agent.TruncateSubagentReport(report))
-	child.FlushSession()
+	// Persist the final outcome on the child's snapshot (shared with the
+	// web spawner — FinishSubagentOutcome): the sidebar reads it from the
+	// sessions payload when the live subagent events are gone.
+	child.FinishSubagentOutcome(report, err)
 	if sp.m != nil {
 		sp.m.recordSubagent(subagentRecord{label: label, report: agent.TruncateSubagentReport(report), err: err})
 	}

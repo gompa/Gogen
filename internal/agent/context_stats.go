@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
@@ -294,4 +295,64 @@ func formatTokenCount(n int) string {
 		return fmt.Sprintf("%dk", whole)
 	}
 	return fmt.Sprintf("%d.%dk", whole, frac)
+}
+
+// cloneMessagesShallow copies a message slice so the result can be read after
+// statsMu is released without racing the turn goroutine's in-place
+// stabilization (stabilizeToolArgs rewrites ToolCall ArgsStr under statsMu).
+// Only unstabilized messages need their ToolCalls deep-copied: stabilization
+// is the sole writer of ToolCall fields, it skips messages already marked
+// ArgsStabilized, and the wire serializer (messagesToChat) only pins ArgsStr
+// for calls whose ArgsStr is still empty/invalid — which stabilization has
+// already made valid and trimmed. A message with ArgsStabilized=true therefore
+// has ToolCalls that are never mutated again, so sharing their slice is as
+// safe as copying it and avoids O(total tool calls) allocation on every
+// ContextStats probe / persist snapshot. Callers must hold statsMu (R or W).
+func cloneMessagesShallow(msgs []llm.Message) []llm.Message {
+	out := append([]llm.Message(nil), msgs...)
+	for i := range out {
+		if out[i].ArgsStabilized {
+			continue
+		}
+		if len(out[i].ToolCalls) > 0 {
+			out[i].ToolCalls = append([]llm.ToolCall(nil), out[i].ToolCalls...)
+		}
+	}
+	return out
+}
+
+// sessionStats groups the state ContextStats/SnapshotMessages read without
+// the session turnMu: the statsMu lock, the per-message token cache, and the
+// provider prompt_tokens baseline.
+type sessionStats struct {
+	// statsMu serializes the agent state that ContextStats/SnapshotMessages
+	// read without the session turnMu: Messages, the cached token counts
+	// (tokenCounts), the API-usage baseline (lastTurnUsage,
+	// apiBaseline*), projectProfile, UsageAccum, and SessionLabel. Every
+	// mutation of these fields from any goroutine must take statsMu. Leaf
+	// lock: while holding it, never call out to code that takes turnMu.
+	// The reverse order does occur — server paths call
+	// SessionLabelSnapshot/ContextStats while holding turnMu — so
+	// statsMu critical sections must stay short and never block on I/O or
+	// other locks.
+	statsMu sync.RWMutex
+	// apiBaselinePromptTokens and apiBaselineMsgCount let ContextStats use the
+	// API's exact prompt_tokens as the authoritative baseline for Snapshot.Used,
+	// only estimating messages added after the last API round.
+	apiBaselinePromptTokens, apiBaselineMsgCount int
+
+	// tokenCounts caches per-message token estimates aligned 1:1 with
+	// Messages[0:len(tokenCounts)] (a prefix). When len(tokenCounts) ==
+	// len(Messages) every message has a cached count and ContextStats /
+	// ShouldCompact can avoid re-tokenizing the whole conversation. The cache
+	// is filled incrementally: appendMessage extends a complete cache, and
+	// ContextStats / doPersist backfill the missing suffix on demand. It is
+	// cleared (nil) whenever the message list is replaced wholesale
+	// (compaction, restore, fork, reset, rollback).
+	//
+	// countsEpoch is bumped on every wholesale message-list change so a
+	// concurrent ContextStats that computed counts for an older snapshot can
+	// detect the list moved under it and skip publishing stale counts.
+	tokenCounts []int
+	countsEpoch uint64
 }

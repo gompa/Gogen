@@ -386,17 +386,14 @@ func (sp *subagentSpawner) SpawnBackground(ctx context.Context, parent *agent.Ag
 
 	go func() {
 		report, runErr := sp.runChildTurn(context.Background(), childRt, agent.FormatSubagentJob(rawJob))
-		// A concurrent DELETE of the parent cascades the child's file away;
-		// a write that lands after that delete (the cancelled turn's final
-		// flush, or the release path's outcome flush) resurrects the child
-		// as an invisible orphan. When the runtime was evicted as part of
-		// the cascade and the parent's file is gone, sweep the orphan on
-		// EVERY exit path — the old finish-path-only check left interrupted
+		// Sweep the orphan on EVERY exit path: a concurrent DELETE of the
+		// parent cascades the child's file away and a write that lands
+		// after that delete (the cancelled turn's final flush, or the
+		// release path's outcome flush) resurrects the child as an
+		// invisible orphan. The old finish-path-only check left interrupted
 		// and released children un-swept. (The eviction loop's own sweep
 		// covers the window before this check runs.)
-		if childRt.evicted.Load() && sp.s.ws.Store.Info(sp.s.ws.GetWorkingDir(), parent.SessionID) == nil {
-			_ = sp.s.ws.Store.Delete(sp.s.ws.GetWorkingDir(), child.id)
-		}
+		sp.sweepOrphanedChild(childRt, parent.SessionID, child.id)
 		if childRt.evicted.Load() {
 			return // released while running (parent close / retention) — nothing to notify
 		}
@@ -415,12 +412,7 @@ func (sp *subagentSpawner) SpawnBackground(ctx context.Context, parent *agent.Ag
 		// are not replayed after a reload/restart, so the saved session is
 		// what the sidebar falls back to).
 		success := runErr == nil
-		status := "success"
-		if !success {
-			status = "failed"
-		}
-		child.rt.agent.SetSubagentOutcome(status, truncateReport(report, runErr))
-		child.rt.agent.FlushSession()
+		childRt.agent.FinishSubagentOutcome(report, runErr)
 		// Enforce the per-parent finished cap NOW (spawn-time enforcement
 		// misses fast jobs that finish after their siblings spawned):
 		// release the oldest finished children beyond the cap.
@@ -591,12 +583,7 @@ func (sp *subagentSpawner) Fork(ctx context.Context, parent *agent.Agent, job st
 	childRt := newSessionRuntimeWithHold(child, sp.approvalHold())
 	childRt.parentID = parent.SessionID
 	childRt.nested = true
-	childRt.approverOverride = func(ctx context.Context, req agent.DeleteRequest) (bool, error) {
-		if childRt.clientCount() == 0 {
-			return parentRt.deleteApprover()(ctx, req)
-		}
-		return childRt.deleteApprover()(ctx, req)
-	}
+	childRt.routeApprovalsTo(parentRt)
 	s.registry.register(newID, childRt)
 	parentRt.broadcast(WSMessage{
 		Type:           "subagent_started",
@@ -608,34 +595,7 @@ func (sp *subagentSpawner) Fork(ctx context.Context, parent *agent.Agent, job st
 	})
 
 	report, err := sp.runChildTurn(ctx, childRt, job)
-	success := err == nil
-	// Persist the final outcome (same contract as Spawn/SpawnBackground):
-	// the sidebar renders the persisted status after a reload/restart, when
-	// the subagent_started/finished events are gone.
-	status := "success"
-	if !success {
-		status = "failed"
-	}
-	childRt.agent.SetSubagentOutcome(status, truncateReport(report, err))
-	childRt.agent.FlushSession()
-	// A concurrent DELETE of the parent cascades the child's file away; if
-	// that delete won the race against the flush, the write resurrected the
-	// child — remove the orphan (best-effort: the delete path's own sweep
-	// covers the window before this check runs).
-	if childRt.evicted.Load() && s.ws.Store.Info(s.ws.GetWorkingDir(), parent.SessionID) == nil {
-		_ = s.ws.Store.Delete(s.ws.GetWorkingDir(), newID)
-	}
-	s.registry.remove(newID)
-	childRt.broadcast(WSMessage{Type: "session_detached", SessionID: newID})
-	parentRt.broadcast(WSMessage{
-		Type:            "subagent_finished",
-		SessionID:       parent.SessionID,
-		SubagentID:      newID,
-		SubagentLabel:   label,
-		SubagentParent:  parent.SessionID,
-		SubagentSuccess: success,
-		SubagentSummary: truncateReport(report, err),
-	})
+	sp.finalizeForegroundChild(childRt, parentRt, label, report, err)
 	if err != nil {
 		return "", fmt.Errorf("subagent_fork %s: %w", newID, err)
 	}

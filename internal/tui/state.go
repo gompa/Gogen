@@ -8,6 +8,7 @@ import (
 
 	"gogen/internal/agent"
 	"gogen/internal/config"
+	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
 	"gogen/internal/server"
 
@@ -168,6 +169,11 @@ type Model struct {
 	spinner       spinner.Model
 	progressPhase progressPhase
 	progressLabel string
+	// streamSpeedLine is the FOCUSED session's rendered token rate
+	// ("42 tok/s") for the progress line — mirror of
+	// liveSession.streamSpeedLine, updated by handleStreamStatsMsg from
+	// the shared streamutil.SpeedMeter and cleared with the progress.
+	streamSpeedLine string
 
 	// /compact runs off the Update thread (it makes an LLM summarization
 	// call — running it inline froze the whole UI for the request's
@@ -224,16 +230,15 @@ type Model struct {
 	// Context stats
 	contextStats agent.TurnContext
 	contextLine  string
-	// contextStreamBaseUsed/contextStreamEstAdded support a live, approximate
-	// context-indicator update while a turn is streaming. We snapshot the
-	// authoritative Used count at stream start and at every round boundary
-	// (ContextStats is safe to call concurrently with a running turn — it
-	// snapshots shared state under statsMu) and add a cheap local estimate
-	// for tokens arriving via already-safe (Update-thread) stream messages.
-	// The exact count is restored via refreshContextStats() once streaming
-	// ends.
-	contextStreamBaseUsed int
-	contextStreamEstAdded int
+	// contextEst supports a live, approximate context-indicator update while
+	// a turn is streaming. We snapshot the authoritative Used count at
+	// stream start and at every round boundary (ContextStats is safe to call
+	// concurrently with a running turn — it snapshots shared state under
+	// statsMu) and add a cheap local estimate for tokens arriving via
+	// already-safe (Update-thread) stream messages. The exact count is
+	// restored via refreshContextStats() once streaming ends. Driven only
+	// from the Update thread.
+	contextEst contextmgr.LiveEstimate
 
 	// Session
 	sessionID string

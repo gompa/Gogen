@@ -37,7 +37,7 @@ func TestCompactSummaryRequestUsesConversationPrefix(t *testing.T) {
 		{Role: "assistant", Content: "a3"},
 		{Role: "user", Content: "tail"},
 	}
-	out, _, err := m.CompactPinned(context.Background(), viewPrefix, msgs, nil, nil)
+	out, _, err := m.Compact(context.Background(), msgs, CompactOptions{ViewPrefix: viewPrefix})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestCompactKeepsToolCallPairInTail(t *testing.T) {
 		{Role: "assistant", Content: "done"},
 		{Role: "user", Content: "add tests"},
 	}
-	out, err := m.Compact(context.Background(), msgs)
+	out, _, err := m.Compact(context.Background(), msgs, CompactOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestCompactPreservesMetadataFields(t *testing.T) {
 		{Role: "assistant", Content: "a2", Model: "glm-4.6", CreatedAt: created.Add(time.Hour)},
 		{Role: "user", Content: "tail"},
 	}
-	out, err := m.Compact(context.Background(), msgs)
+	out, _, err := m.Compact(context.Background(), msgs, CompactOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +204,7 @@ func TestCompactKeepZeroKeepsOnlyHead(t *testing.T) {
 		{Role: "user", Content: "b"},
 		{Role: "assistant", Content: "c"},
 	}
-	out, err := m.Compact(context.Background(), msgs)
+	out, _, err := m.Compact(context.Background(), msgs, CompactOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,7 +270,7 @@ func TestCompactRefusesTinyMiddle(t *testing.T) {
 		{Role: "assistant", Content: "a2"},
 		{Role: "user", Content: "tail"},
 	}
-	if _, _, err := m.CompactPinned(context.Background(), nil, msgs, nil, nil); err == nil {
+	if _, _, err := m.Compact(context.Background(), msgs, CompactOptions{}); err == nil {
 		t.Fatal("expected compaction of a tiny middle to be refused")
 	}
 
@@ -279,7 +279,7 @@ func TestCompactRefusesTinyMiddle(t *testing.T) {
 	// outgrow its framed summary (covered by TestCompactSmallerSummaryGuard).
 	m.minMiddleTokens = 0
 	m.requireSummaryShrink = false
-	if _, _, err := m.CompactPinned(context.Background(), nil, msgs, nil, nil); err != nil {
+	if _, _, err := m.Compact(context.Background(), msgs, CompactOptions{}); err != nil {
 		t.Fatalf("expected compaction to succeed with guard lifted: %v", err)
 	}
 
@@ -290,7 +290,7 @@ func TestCompactRefusesTinyMiddle(t *testing.T) {
 		{Role: "user", Content: strings.Repeat("substantial middle content ", 120)}, // ~1.5k tokens
 		{Role: "assistant", Content: strings.Repeat("and assistant replies ", 120)},
 	}, msgs[3:]...)
-	if _, _, err := big.CompactPinned(context.Background(), nil, bigMsgs, nil, nil); err != nil {
+	if _, _, err := big.Compact(context.Background(), bigMsgs, CompactOptions{}); err != nil {
 		t.Fatalf("expected compaction of a substantial middle to succeed: %v", err)
 	}
 }
@@ -351,7 +351,7 @@ func TestCompactSmallerSummaryGuard(t *testing.T) {
 				{Role: "assistant", Content: tc.middle},
 				{Role: "user", Content: "tail"},
 			}
-			out, _, err := m.CompactPinned(context.Background(), nil, msgs, nil, nil)
+			out, _, err := m.Compact(context.Background(), msgs, CompactOptions{})
 			if !tc.wantErr {
 				if err != nil {
 					t.Fatalf("expected compaction to succeed: %v", err)
@@ -400,7 +400,7 @@ func TestCompactSmallerSummaryGuardCoversFallbackPath(t *testing.T) {
 		{Role: "assistant", Content: strings.Repeat("word ", 10)}, // ~20 tokens
 		{Role: "user", Content: "tail"},
 	}
-	_, _, err := m.CompactPinned(context.Background(), nil, msgs, nil, nil)
+	_, _, err := m.Compact(context.Background(), msgs, CompactOptions{})
 	if err == nil {
 		t.Fatal("expected the non-shrinking fallback summary to be refused")
 	}

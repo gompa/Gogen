@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"time"
 
 	"gogen/internal/agent"
@@ -74,27 +73,16 @@ func (sp *subagentSpawner) newChildRuntime(ctx context.Context, parent *agent.Ag
 	child.SetSubagentDepth(depth + 1)
 	child.SetParentID(parent.SessionID)
 	runtimeCfg := s.ws.GetRuntimeConfig()
-	if model != "" {
-		if err := child.SelectModel(ctx, model); err != nil {
-			return nil, "", "", fmt.Errorf("subagent model: %w", err)
-		}
-	} else if m := runtimeCfg.SubagentModel; m != "" {
-		// The configured default subagent model (settings modal) beats
-		// parent-model inheritance: the user explicitly chose a model for
-		// subagents. Selection failures fall back to the workspace default
-		// rather than failing the spawn — the default is already on the
-		// provider (same fail-open pattern as the inheritance branch).
-		if err := child.SelectModel(ctx, m); err != nil {
-			log.Printf("subagent: configured subagent model %q not selectable on child (%v); using workspace default", m, err)
-		}
-	} else if m := parent.CurrentModel(); m != "" && m != s.ws.DefaultModel() {
-		// The child's provider was seeded with the workspace DEFAULT model;
-		// a parent that switched models per-session (toolbar) should pass
-		// its model on. Selection failures fall back to the default rather
-		// than failing the spawn — the default is already on the provider.
-		if err := child.SelectModel(ctx, m); err != nil {
-			log.Printf("subagent: parent model %q not selectable on child (%v); using workspace default", m, err)
-		}
+	// Model cascade (fully shared with the TUI spawner — see
+	// ResolveSubagentModel/ApplySubagentModel): explicit tool argument >
+	// configured subagent model > the parent's live model (unless it is
+	// the workspace default the child is already seeded with). The
+	// explicit argument is a hard requirement: an unselectable model
+	// fails the spawn. The other tiers fall back to the default rather
+	// than failing — it is already on the provider (fail open).
+	m, src := agent.ResolveSubagentModel(model, runtimeCfg.SubagentModel, parent.CurrentModel(), s.ws.DefaultModel())
+	if err := agent.ApplySubagentModel(ctx, child, m, src); err != nil {
+		return nil, "", "", err
 	}
 	// The reasoning effort follows the same cascade as the model: the
 	// configured subagent level (settings) wins; empty = inherit the
@@ -115,12 +103,7 @@ func (sp *subagentSpawner) newChildRuntime(ctx context.Context, parent *agent.Ag
 	// D6: delete approvals go to the child's own attached clients (the
 	// child pane shows the modal); with none attached they route to the
 	// parent's clients so a headless child can never hang an approval.
-	childRt.approverOverride = func(ctx context.Context, req agent.DeleteRequest) (bool, error) {
-		if childRt.clientCount() == 0 {
-			return parentRt.deleteApprover()(ctx, req)
-		}
-		return childRt.deleteApprover()(ctx, req)
-	}
+	childRt.routeApprovalsTo(parentRt)
 
 	// Register BEFORE the turn so attach/cancel/approvals resolve. Nested
 	// runtimes are cap-exempt, so register never evicts.
@@ -170,51 +153,68 @@ func (sp *subagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, job, 
 	parentRt, _ := s.registry.get(parent.SessionID) // still live: registered above
 
 	report, err := sp.runChildTurn(ctx, childRt, agent.FormatSubagentJob(rawJob))
-	success := err == nil
-
-	// Persist the final outcome on the child's snapshot so the sidebar can
-	// render the true result after a reload/restart (the subagent_started/
-	// finished events are not replayed to connecting clients). The turn's
-	// own flush already wrote the transcript; this full flush adds the
-	// outcome fields (persistMu serializes against any tail of the turn's
-	// write).
-	status := "success"
-	if !success {
-		status = "failed"
-	}
-	childRt.agent.SetSubagentOutcome(status, truncateReport(report, err))
-	childRt.agent.FlushSession()
-	// A concurrent DELETE of the parent cascades the child's file away;
-	// if that delete won the race against the flush above, the write
-	// resurrected the child. Detect it (runtime evicted as part of the
-	// cascade + parent's file gone) and remove the orphan so it cannot
-	// linger invisibly on disk (excluded from the flat list/prune/latest).
-	if childRt.evicted.Load() && s.ws.Store.Info(s.ws.GetWorkingDir(), parent.SessionID) == nil {
-		_ = s.ws.Store.Delete(s.ws.GetWorkingDir(), childID)
-	}
-
-	// The child is persisted by its turn (doPersist); unregistering keeps
-	// the registry clean — the saved session stays attachable via the
-	// sidebar row (ensureSessionRuntime reloads it).
-	s.registry.remove(childID)
-	// Attached child panes must close: the runtime is gone, and a message
-	// sent to it would be silently dropped (the evicted guard). Same
-	// notification as the eviction path — the session stays in the saved
-	// list and reopens from the store.
-	childRt.broadcast(WSMessage{Type: "session_detached", SessionID: childID})
-	parentRt.broadcast(WSMessage{
-		Type:            "subagent_finished",
-		SessionID:       parent.SessionID,
-		SubagentID:      childID,
-		SubagentLabel:   label,
-		SubagentParent:  parent.SessionID,
-		SubagentSuccess: success,
-		SubagentSummary: truncateReport(report, err),
-	})
+	sp.finalizeForegroundChild(childRt, parentRt, label, report, err)
 	if err != nil {
 		return "", fmt.Errorf("subagent %s: %w", childID, err)
 	}
 	return report, nil
+}
+
+// sweepOrphanedChild removes the child's saved file when a concurrent
+// DELETE of the parent won the race against a child write that landed
+// after it: the runtime was evicted as part of the delete cascade and the
+// parent's file is gone, so the write resurrected the child as an
+// invisible orphan (excluded from the flat list/prune/latest). Best
+// effort — the delete/eviction paths' own sweeps cover the window before
+// this check runs.
+func (sp *subagentSpawner) sweepOrphanedChild(rt *sessionRuntime, parentID, childID string) {
+	if rt.evicted.Load() && sp.s.ws.Store.Info(sp.s.ws.GetWorkingDir(), parentID) == nil {
+		_ = sp.s.ws.Store.Delete(sp.s.ws.GetWorkingDir(), childID)
+	}
+}
+
+// finalizeForegroundChild runs the shared post-turn epilogue for a
+// foreground child (Spawn and Fork), in a fixed order that encodes the
+// persistence/orphan contract: the outcome flush may resurrect the
+// child's file after a concurrent parent DELETE, so the orphan sweep runs
+// AFTER the flush; the registry removal, the detach notification and the
+// finished broadcast then run exactly once, here, so the contract has a
+// single definition.
+func (sp *subagentSpawner) finalizeForegroundChild(rt, parentRt *sessionRuntime, label string, report string, err error) {
+	rt.agent.FinishSubagentOutcome(report, err)
+	sp.sweepOrphanedChild(rt, parentRt.agent.SessionID, rt.agent.SessionID)
+
+	// The child is persisted by its turn (doPersist); unregistering keeps
+	// the registry clean — the saved session stays attachable via the
+	// sidebar row (ensureSessionRuntime reloads it).
+	sp.s.registry.remove(rt.agent.SessionID)
+	// Attached child panes must close: the runtime is gone, and a message
+	// sent to it would be silently dropped (the evicted guard). Same
+	// notification as the eviction path — the session stays in the saved
+	// list and reopens from the store.
+	rt.broadcast(WSMessage{Type: "session_detached", SessionID: rt.agent.SessionID})
+	parentRt.broadcast(WSMessage{
+		Type:            "subagent_finished",
+		SessionID:       parentRt.agent.SessionID,
+		SubagentID:      rt.agent.SessionID,
+		SubagentLabel:   label,
+		SubagentParent:  parentRt.agent.SessionID,
+		SubagentSuccess: err == nil,
+		SubagentSummary: truncateReport(report, err),
+	})
+}
+
+// routeApprovalsTo wires the D6 delete-approval routing for a nested
+// child: delete approvals go to the child's own attached clients (the
+// child pane shows the modal); with none attached they route to the
+// parent's clients so a headless child can never hang an approval.
+func (rt *sessionRuntime) routeApprovalsTo(parentRt *sessionRuntime) {
+	rt.approverOverride = func(ctx context.Context, req agent.DeleteRequest) (bool, error) {
+		if rt.clientCount() == 0 {
+			return parentRt.deleteApprover()(ctx, req)
+		}
+		return rt.deleteApprover()(ctx, req)
+	}
 }
 
 // approvalHold returns the configured delete-approval hold window. Reads
@@ -298,5 +298,5 @@ func (sp *subagentSpawner) runChildTurn(parentCtx context.Context, rt *sessionRu
 }
 
 func truncateJob(job string) string {
-	return contextmgr.TruncateMarked(job, 200, "…")
+	return contextmgr.Truncate(job, 200, contextmgr.TruncateOptions{Marker: "…"})
 }

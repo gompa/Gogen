@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"gogen/internal/llm"
 )
@@ -56,6 +57,80 @@ func (a *Agent) mcpRegistryHas(name string) bool {
 	return ok
 }
 
+// featureTool is one feature-gated tool: its model-facing definition, its
+// execution handler, and whether it may run in plan mode.
+type featureTool struct {
+	Name        string
+	Definition  llm.Tool
+	Handler     ToolHandler
+	PlanAllowed bool
+}
+
+// featureTools is the single gating policy for the feature tools (board,
+// the subagent cascade, skill): it is the one place that decides which
+// feature tools are currently available on the agent, and carries each
+// tool's definition, handler, and plan-mode flag. All three tool surfaces
+// derive from it — llmTools (what the model sees), executeTool (what
+// actually runs), and AllowedToolNames/allowsTool (the plan-mode
+// allowlist) — so they cannot drift apart: adding a feature tool means
+// adding one entry here.
+//
+// The result is ordered (board, subagent cascade, skill) so the
+// model-facing definition list is deterministic. MCP shadowing is applied
+// by the callers: a registry tool with the same name wins everywhere
+// (explicit user configuration), in both the definition list and
+// execution.
+func (a *Agent) featureTools() []featureTool {
+	var out []featureTool
+	if a.BoardEnabled() && a.BoardManager() != nil {
+		// D7: the board tool is plan-mode unrestricted (the coordination
+		// exception, like todo) — an agent may update the board in plan
+		// mode so it can mark items for review.
+		out = append(out, featureTool{Name: "board", Definition: boardToolDef(), Handler: handleBoard, PlanAllowed: true})
+	}
+	if a.SubagentsEnabled() && a.SubagentSpawner() != nil {
+		cs := a.continuableSpawner()
+		out = append(out, featureTool{Name: "subagent", Definition: subagentToolDef(cs != nil, a.SubagentMaxConcurrent()), Handler: handleSubagent})
+		if cs != nil {
+			out = append(out,
+				featureTool{Name: "subagent_fork", Definition: subagentForkToolDef(), Handler: handleSubagentFork},
+				featureTool{Name: "list_agents", Definition: listAgentsToolDef(), Handler: handleListAgents},
+				featureTool{Name: "send_message", Definition: sendMessageToolDef(), Handler: handleSendMessage},
+				featureTool{Name: "interrupt_agent", Definition: interruptAgentToolDef(), Handler: handleInterruptAgent},
+			)
+			// report is child-scoped: only nested agents with an installed
+			// report hook see it (a restored subagent session reopened by a
+			// user has ParentID but no hook, so it stays hidden).
+			if a.ParentID() != "" && a.ReportHook() != nil {
+				out = append(out, featureTool{Name: "report", Definition: reportToolDef(), Handler: handleReport})
+			}
+		}
+	}
+	if a.SkillsEnabled() && a.SkillsManager() != nil {
+		// D-skill: skill list/read are read-only, so the skill tool is
+		// plan-mode allowed like the board (the model can consult skills
+		// while planning).
+		out = append(out, featureTool{Name: "skill", Definition: skillsToolDef(), Handler: handleSkill, PlanAllowed: true})
+	}
+	return out
+}
+
+// featureToolFor returns the feature tool registered under name, reporting
+// false when the name is not a currently available feature tool or is
+// shadowed by an MCP registry tool (a registry tool with the same name
+// wins: explicit user configuration).
+func (a *Agent) featureToolFor(name string) (featureTool, bool) {
+	if a.mcpRegistryHas(name) {
+		return featureTool{}, false
+	}
+	for _, ft := range a.featureTools() {
+		if ft.Name == name {
+			return ft, true
+		}
+	}
+	return featureTool{}, false
+}
+
 func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error) {
 	if tc.ArgsError != "" {
 		return "", fmt.Errorf("invalid tool arguments: %s", tc.ArgsError)
@@ -67,46 +142,16 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error
 		return "", err
 	}
 	ctx = a.toolContext(ctx)
-	// Feature-gated tools are routed explicitly (MCP-style): the board tool
-	// runs when the board feature is enabled (its manager serializes all
-	// mutations), the subagent tool when the feature is enabled. When a
-	// feature is off, the name falls through to the handler map and returns
+	// Feature-gated tools are routed explicitly (MCP-style) through the
+	// single gating policy (featureTools): the same conditions that decide
+	// the model-facing definitions (llmTools) decide what runs here, so
+	// what the model sees and what executes always agree. When a feature
+	// is off, the name falls through to the handler map and returns
 	// "unknown tool" naturally — a stale mid-turn call after a live toggle
 	// sees exactly that. A registry tool with the same name wins (explicit
-	// user configuration): the model-facing definition also prefers it (see
-	// llmTools), so what the model sees and what executes always agree.
-	if a.BoardEnabled() && tc.Name == "board" && !a.mcpRegistryHas("board") {
-		return handleBoard(ctx, a, tc.Args)
-	}
-	if a.SubagentsEnabled() && tc.Name == "subagent" && !a.mcpRegistryHas("subagent") {
-		return handleSubagent(ctx, a, tc.Args)
-	}
-	if a.SubagentsEnabled() && a.continuableSpawner() != nil {
-		switch tc.Name {
-		case "subagent_fork":
-			if !a.mcpRegistryHas("subagent_fork") {
-				return handleSubagentFork(ctx, a, tc.Args)
-			}
-		case "list_agents":
-			if !a.mcpRegistryHas("list_agents") {
-				return handleListAgents(ctx, a, tc.Args)
-			}
-		case "send_message":
-			if !a.mcpRegistryHas("send_message") {
-				return handleSendMessage(ctx, a, tc.Args)
-			}
-		case "interrupt_agent":
-			if !a.mcpRegistryHas("interrupt_agent") {
-				return handleInterruptAgent(ctx, a, tc.Args)
-			}
-		case "report":
-			if a.ParentID() != "" && a.ReportHook() != nil && !a.mcpRegistryHas("report") {
-				return handleReport(ctx, a, tc.Args)
-			}
-		}
-	}
-	if a.SkillsEnabled() && tc.Name == "skill" && !a.mcpRegistryHas("skill") {
-		return handleSkill(ctx, a, tc.Args)
+	// user configuration), as it does in the definition list.
+	if ft, ok := a.featureToolFor(tc.Name); ok {
+		return ft.Handler(ctx, a, tc.Args)
 	}
 	if a.mcpRegistryHas(tc.Name) {
 		return a.MCPRegistry.CallTool(ctx, tc.Name, tc.Args)
@@ -121,59 +166,7 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (string, error
 	if !ok {
 		return "", fmt.Errorf("unknown tool: %s", tc.Name)
 	}
-	// A patch_file diff that consists solely of patch framing — end
-	// delimiters ("*** End of diff" …) and failure narration, with no
-	// headers or hunks — is a degenerate retry-loop reply: the model has
-	// dropped every hunk and is re-emitting only framing text. Do not even
-	// attempt to apply it; errPatchTurnStop makes runToolRound end the turn
-	// so the model cannot loop again.
-	if tc.Name == "patch_file" {
-		if diff, ok := tc.Args["diff"].(string); ok && detectMarkerOnlyDiff(diff) {
-			return "", fmt.Errorf("%w: patch_file received a diff containing only patch markers and no patch content — the model appears stuck in a patch retry loop; stopping the turn. Re-read the target file(s) with read_file and regenerate the diff",
-				errPatchTurnStop)
-		}
-	}
-	res, err := h(ctx, a, tc.Args)
-	if tc.Name == "patch_file" {
-		// Only stale-diff failures (ErrPatchMismatch) count toward the
-		// streak: permission, I/O, and path-safety errors mean the diff may
-		// be fine and the environment is the problem, so the "regenerate the
-		// diff" hint would be misleading. Success and non-mismatch errors
-		// both reset.
-		if err != nil && errors.Is(err, ErrPatchMismatch) {
-			// Per-turn hard stop, keyed on the failure: strikes accumulate
-			// only while the SAME diff keeps failing (same target, same
-			// mismatch). A model iterating across different files or diffs
-			// is making progress and must not be stopped — only a model
-			// re-sending the same broken diff is looping. errPatchTurnStop
-			// makes runToolRound end the turn instead of letting the model
-			// write another attempt.
-			key := res
-			if key == "" {
-				key = err.Error()
-			}
-			if prev, _ := a.patchStrikeKey.Load().(string); prev != key {
-				a.patchStrikeKey.Store(key)
-				a.patchTurnStrikes.Store(1)
-			} else if strikes := a.patchTurnStrikes.Add(1); strikes >= 3 {
-				return res, fmt.Errorf("%w: patch_file failed %d times in a row with the same diff; stopping the turn. Re-read the target file(s) with read_file (or search_code) and regenerate the diff from their current content",
-					errPatchTurnStop, strikes)
-			}
-			streak := a.patchFailStreak.Add(1)
-			if streak > 3 {
-				streak = 3 // keep the message from escalating forever
-			}
-			if streak >= 2 {
-				err = fmt.Errorf("patch_file failed %d times in a row: %w. Do not retry the same diff — it will keep failing. Re-read the target file(s) with read_file (or search_code) and regenerate the diff from their current content. If a small file keeps failing, use replace_in_file or write_file instead",
-					streak, err)
-			}
-		} else {
-			a.patchFailStreak.Store(0)
-			a.patchTurnStrikes.Store(0)
-			a.patchStrikeKey.Store("")
-		}
-	}
-	return res, err
+	return h(ctx, a, tc.Args)
 }
 
 func handleListFiles(ctx context.Context, a *Agent, args map[string]any) (string, error) {
@@ -339,6 +332,62 @@ func handlePatchFile(ctx context.Context, a *Agent, args map[string]any) (string
 		return "", err
 	}
 	return a.Executor.PatchFile(ctx, diff, dryRun, fuzzy)
+}
+
+// handlePatchFileWithRetryPolicy wraps handlePatchFile with the
+// patch_file retry-loop policy so executeTool stays a generic dispatcher.
+// It is the handler registered under "patch_file" in builtinToolDefs.
+//
+// Pre-execution: a diff that consists solely of patch framing — end
+// delimiters ("*** End of diff" …) and failure narration, with no headers
+// or hunks — is a degenerate retry-loop reply: the model has dropped every
+// hunk and is re-emitting only framing text. Do not even attempt to apply
+// it; errPatchTurnStop makes runToolRound end the turn so the model cannot
+// loop again.
+//
+// Post-execution: only stale-diff failures (ErrPatchMismatch) count toward
+// the streak — permission, I/O, and path-safety errors mean the diff may be
+// fine and the environment is the problem, so the "regenerate the diff"
+// hint would be misleading. Success and non-mismatch errors both reset.
+func handlePatchFileWithRetryPolicy(ctx context.Context, a *Agent, args map[string]any) (string, error) {
+	if diff, ok := args["diff"].(string); ok && detectMarkerOnlyDiff(diff) {
+		return "", fmt.Errorf("%w: patch_file received a diff containing only patch markers and no patch content — the model appears stuck in a patch retry loop; stopping the turn. Re-read the target file(s) with read_file and regenerate the diff",
+			errPatchTurnStop)
+	}
+	res, err := handlePatchFile(ctx, a, args)
+	if err != nil && errors.Is(err, ErrPatchMismatch) {
+		// Per-turn hard stop, keyed on the failure: strikes accumulate
+		// only while the SAME diff keeps failing (same target, same
+		// mismatch). A model iterating across different files or diffs
+		// is making progress and must not be stopped — only a model
+		// re-sending the same broken diff is looping. errPatchTurnStop
+		// makes runToolRound end the turn instead of letting the model
+		// write another attempt.
+		key := res
+		if key == "" {
+			key = err.Error()
+		}
+		if prev, _ := a.patchStrikeKey.Load().(string); prev != key {
+			a.patchStrikeKey.Store(key)
+			a.patchTurnStrikes.Store(1)
+		} else if strikes := a.patchTurnStrikes.Add(1); strikes >= 3 {
+			return res, fmt.Errorf("%w: patch_file failed %d times in a row with the same diff; stopping the turn. Re-read the target file(s) with read_file (or search_code) and regenerate the diff from their current content",
+				errPatchTurnStop, strikes)
+		}
+		streak := a.patchFailStreak.Add(1)
+		if streak > 3 {
+			streak = 3 // keep the message from escalating forever
+		}
+		if streak >= 2 {
+			err = fmt.Errorf("patch_file failed %d times in a row: %w. Do not retry the same diff — it will keep failing. Re-read the target file(s) with read_file (or search_code) and regenerate the diff from their current content. If a small file keeps failing, use replace_in_file or write_file instead",
+				streak, err)
+		}
+	} else {
+		a.patchFailStreak.Store(0)
+		a.patchTurnStrikes.Store(0)
+		a.patchStrikeKey.Store("")
+	}
+	return res, err
 }
 
 func handleDelete(ctx context.Context, a *Agent, args map[string]any) (string, error) {
@@ -631,4 +680,15 @@ func handleCallGraph(ctx context.Context, a *Agent, args map[string]any) (string
 	glob, _ := stringArgOptional(args, "glob")
 	direction, _ := stringArgOptional(args, "direction")
 	return a.Executor.CallGraph(ctx, symbol, subpath, glob, direction)
+}
+
+// toolRegistry groups the live tool-handler map. The toolMu comment carries
+// the swap-publication contract.
+type toolRegistry struct {
+	// toolMu guards toolHandlers. SetToolHandlers is called at construction
+	// (server startup / per-session agent factory) before any turn runs, but
+	// executeTool reads the map on every tool call, so the swap is published
+	// under the lock to keep the read/write race-free by construction.
+	toolMu       sync.RWMutex
+	toolHandlers map[string]ToolHandler
 }

@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"gogen/internal/agent"
 	"gogen/internal/ioutil"
 	"gogen/internal/llm"
 )
@@ -28,7 +27,7 @@ func TestLoadDropsStaleDeltaAfterCrash(t *testing.T) {
 
 	id := "sess1"
 	// Base full save with 2 messages.
-	if err := store.Save(id, agent.SessionSnapshot{
+	if err := store.Save(id, SessionSnapshot{
 		WorkingDir: dir,
 		Messages: []llm.Message{
 			{Role: "user", Content: "A"},
@@ -65,7 +64,7 @@ func TestLoadDropsStaleDeltaAfterCrash(t *testing.T) {
 	for _, base := range []int{0, 2} {
 		writeDelta(base)
 		_ = os.Chtimes(store.deltaPath(dir, id), past, past)
-		if err := store.Save(id, agent.SessionSnapshot{
+		if err := store.Save(id, SessionSnapshot{
 			WorkingDir: dir,
 			Messages: []llm.Message{
 				{Role: "user", Content: "A"},

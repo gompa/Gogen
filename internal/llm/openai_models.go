@@ -386,29 +386,13 @@ func coListedKnown(co map[string]struct{}, name string) bool {
 	return ok
 }
 
-// resolvedProfiles returns the endpoint set to query: the registered
-// profiles when set (constructor-built), else a single default profile
-// synthesized from the legacy client fields (direct-constructed providers in
-// tests).
+// resolvedProfiles returns the registered endpoint set to query (nil for
+// direct-constructed providers with no profiles; the callers treat an empty
+// set as "nothing to fetch").
 func (p *OpenAIProvider) resolvedProfiles() []*providerProfile {
 	p.modelsMu.RLock()
-	profiles := p.profiles
-	p.modelsMu.RUnlock()
-	if len(profiles) > 0 {
-		return profiles
-	}
-	return []*providerProfile{{
-		name:       "default",
-		baseURL:    p.baseURL,
-		apiKey:     p.apiKey,
-		model:      p.model,
-		stream:     &p.client,
-		catalog:    p.catalogClient,
-		zenStream:  p.zenClient,
-		zenCatalog: p.zenCatalogClient,
-		goStream:   p.goClient,
-		goCatalog:  p.goCatalogClient,
-	}}
+	defer p.modelsMu.RUnlock()
+	return p.profiles
 }
 
 func (p *OpenAIProvider) ModelContextLimit(ctx context.Context) (int, error) {

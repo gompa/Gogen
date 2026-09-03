@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"gogen/internal/agent"
 	"gogen/internal/llm"
 )
 
@@ -14,7 +13,7 @@ func TestStorePrunesOldSessions(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStoreWithOptions(true, StoreOptions{MaxCount: 2, MaxAgeDays: 365})
 	for i, id := range []string{"a", "b", "c"} {
-		snap := agent.SessionSnapshot{
+		snap := SessionSnapshot{
 			WorkingDir: dir,
 			Messages:   []llm.Message{{Role: "user", Content: id}},
 		}
@@ -28,7 +27,7 @@ func TestStorePrunesOldSessions(t *testing.T) {
 		_ = store.Save(id, snap) // refresh UpdatedAt to now; use order via sequential saves
 	}
 	// Save again with maxCount=2 so prune runs after c.
-	if err := store.Save("c", agent.SessionSnapshot{WorkingDir: dir, Messages: []llm.Message{{Role: "user", Content: "c"}}}); err != nil {
+	if err := store.Save("c", SessionSnapshot{WorkingDir: dir, Messages: []llm.Message{{Role: "user", Content: "c"}}}); err != nil {
 		t.Fatal(err)
 	}
 	list, err := store.List(dir)

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"gogen/internal/llm"
+	"gogen/internal/skills"
 )
 
 // skillsToolDef is the LLM-facing schema for the skill tool. Like the board
@@ -76,4 +77,18 @@ func handleSkill(_ context.Context, a *Agent, args map[string]any) (string, erro
 	default:
 		return "", fmt.Errorf("unknown skill action %q", action)
 	}
+}
+
+// SetSkillsManager attaches the shared skill discovery manager (nil
+// detaches). The web server sets the same manager on every session agent;
+// TUI/CLI sets a per-agent manager. The skill tool stays gated on
+// SkillsEnabled regardless.
+func (a *Agent) SetSkillsManager(m *skills.Manager) {
+	a.skillsManager.Store(m)
+}
+
+// SkillsManager returns the attached skill manager (nil when skills are
+// disabled or not wired).
+func (a *Agent) SkillsManager() *skills.Manager {
+	return a.skillsManager.Load()
 }

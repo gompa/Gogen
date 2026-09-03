@@ -83,7 +83,67 @@ func seedConversation(t *testing.T, a *Agent, total int) {
 func compactState(a *Agent) (backoff time.Time, guard int) {
 	a.statsMu.RLock()
 	defer a.statsMu.RUnlock()
-	return a.compactBackoffUntil, a.lastEmergencyFailCount
+	return a.compactBackoffUntil, a.compactionGuards.emergency
+}
+
+// guardsState snapshots both compaction progress guards under statsMu.
+func guardsState(a *Agent) (emergency, lastResort int) {
+	a.statsMu.RLock()
+	defer a.statsMu.RUnlock()
+	return a.compactionGuards.emergency, a.compactionGuards.lastResort
+}
+
+// TestProgressGuardResetAsymmetry pins the per-tier reset semantics of the
+// compaction progress guards: a successful COMPACTION (published through
+// publishCompaction → noteCompactSuccess) resets the emergency guard only,
+// and a successful last-resort CONDENSATION resets the lastResort guard
+// only. A blanket "reset all guards" success helper would break both
+// assertions.
+func TestProgressGuardResetAsymmetry(t *testing.T) {
+	// 1. A successful compaction must not clear a recorded last-resort
+	// failure.
+	a, _, _ := newEmergencyTestAgent(t, false)
+	a.appendMessage(llm.Message{Role: "user", Content: "hello"})
+	a.noteProgressFailure(&a.compactionGuards.lastResort)
+	if _, lr := guardsState(a); lr != 1 {
+		t.Fatalf("setup: lastResort guard = %d, want 1 (message count at failure)", lr)
+	}
+	// A successful compaction publishes through publishCompaction, which
+	// calls noteCompactSuccess.
+	a.publishCompaction([]llm.Message{{Role: "user", Content: "hello"}}, nil)
+	if e, lr := guardsState(a); lr != 1 {
+		t.Fatalf("successful compaction cleared the lastResort guard: %d, want 1", lr)
+	} else if e != 0 {
+		t.Fatalf("emergency guard = %d, want 0 (untouched)", e)
+	}
+
+	// 2. A successful last-resort condensation must not clear a recorded
+	// emergency failure: a fresh session whose single message is over the
+	// window (no middle to summarize, so forced compaction is a no-op)
+	// recovers via the condensation.
+	a2, mgr, _, _ := newLastResortTestAgent(t)
+	a2.appendMessage(llm.Message{Role: "user", Content: textOfTokens(t, 2200)})
+	_ = a2.ContextStats(context.Background())
+	setLimitOverBy(t, a2, mgr, 50)
+	a2.noteProgressFailure(&a2.compactionGuards.emergency)
+	if e, _ := guardsState(a2); e != 1 {
+		t.Fatalf("setup: emergency guard = %d, want 1 (message count at failure)", e)
+	}
+	view, err := a2.prepareMessages(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("prepareMessages: %v", err)
+	}
+	if len(a2.Messages) != 1 || !contextmgr.IsCondensedMessage(a2.Messages[0].Content) {
+		t.Fatalf("history = %d message(s), want the condensed message (condensation ran)", len(a2.Messages))
+	}
+	if e, lr := guardsState(a2); lr != 0 {
+		t.Fatalf("lastResort guard = %d, want 0 (reset by the successful condensation)", lr)
+	} else if e != 1 {
+		t.Fatalf("successful condensation cleared the emergency guard: %d, want 1", e)
+	}
+	if est := a2.outgoingViewEstimate(view); est >= mgr.ContextLimit() {
+		t.Fatalf("estimate after condensation = %d, want < limit %d", est, mgr.ContextLimit())
+	}
 }
 
 // cachedCounts returns a copy of the agent's per-message token count cache.

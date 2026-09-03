@@ -110,3 +110,48 @@ func topLevelLayout(workingDir string) string {
 	}
 	return "Top-level directories: " + strings.Join(dirs, ", ") + "\n"
 }
+
+func (a *Agent) SetProjectContext(path, guidelines, testCommand, lintCommand string) {
+	a.ProjectFilePath = path
+	a.ProjectGuidelines = guidelines
+	a.TestCommand = strings.TrimSpace(testCommand)
+	a.LintCommand = strings.TrimSpace(lintCommand)
+	a.statsMu.Lock()
+	a.projectProfile = ""
+	a.statsMu.Unlock()
+}
+
+// cachedProjectProfile returns the sticky project-profile string, or "" when
+// none has been detected. Thread-safe: ensureProjectProfile/SetProjectContext/
+// SetWorkingDir/RestoreSessionLocal write it under statsMu, and ContextStats
+// reads it here so a concurrent turn's profile detection cannot race readers.
+func (a *Agent) cachedProjectProfile() string {
+	a.statsMu.RLock()
+	p := a.projectProfile
+	a.statsMu.RUnlock()
+	return p
+}
+
+// ensureProjectProfile detects and caches the project profile on first use.
+// Detection (disk reads) happens outside the lock; the store is double-checked
+// so a concurrent ContextStats read never sees a torn value. Called from the
+// turn goroutine (prepareMessages) and doPersist.
+func (a *Agent) ensureProjectProfile() string {
+	if p := a.cachedProjectProfile(); p != "" {
+		return p
+	}
+	// WorkingDir is published under statsMu (SetWorkingDir), and this runs on
+	// the shutdown/eviction flush paths with no turnMu, so read it under the
+	// lock instead of racing a concurrent working-dir change.
+	a.statsMu.RLock()
+	wd := a.WorkingDir
+	a.statsMu.RUnlock()
+	profile := DetectProjectProfile(wd, a.TestCommand, a.LintCommand)
+	a.statsMu.Lock()
+	if a.projectProfile == "" {
+		a.projectProfile = profile
+	}
+	p := a.projectProfile
+	a.statsMu.Unlock()
+	return p
+}

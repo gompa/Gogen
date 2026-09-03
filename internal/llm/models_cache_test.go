@@ -37,7 +37,7 @@ func TestListModelsCachesSuccessfulFetch(t *testing.T) {
 		option.WithHTTPClient(srv.Client()),
 	)
 	p := &OpenAIProvider{
-		client:      client,
+		profiles:    []*providerProfile{{name: "default", stream: &client}},
 		modelClient: make(map[string]*openai.Client),
 	}
 
@@ -103,8 +103,11 @@ func TestFetchModelsQueriesOpenCodeEndpointsInParallel(t *testing.T) {
 		option.WithHTTPClient(goSrv.Client()),
 	)
 	p := &OpenAIProvider{
-		zenClient:   &zenClient,
-		goClient:    &goClient,
+		profiles: []*providerProfile{{
+			name:      "default",
+			zenStream: &zenClient,
+			goStream:  &goClient,
+		}},
 		modelClient: make(map[string]*openai.Client),
 	}
 
@@ -155,7 +158,7 @@ func TestListModelsHonorsCallerDeadline(t *testing.T) {
 		option.WithHTTPClient(srv.Client()),
 	)
 	p := &OpenAIProvider{
-		client:      client,
+		profiles:    []*providerProfile{{name: "default", stream: &client}},
 		modelClient: make(map[string]*openai.Client),
 	}
 

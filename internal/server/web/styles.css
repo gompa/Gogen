@@ -709,13 +709,19 @@
             word-break: break-word;
             flex-shrink: 0;
             border: 1px solid var(--border-subtle);
-            /* Skip rendering off-screen messages. Long transcripts with tool
-               cards, Monaco diff viewers and xterm make every reflow cover
-               the whole #messages box; content-visibility: auto lets the
-               browser skip layout/paint for messages outside the viewport.
-               `auto` remembers each message's last rendered height, so the
-               scrollbar and TOC scrollIntoView jumps stay stable; the 120px
-               fallback approximates a typical text bubble before first paint. */
+        }
+        /* Flow content (markdown, timestamp, model chip) lives in this
+           wrapper, created by msgBody() in app.js. The hover buttons
+           (fork/resend/edit) and the inline-edit bar are direct children
+           of .message, OUTSIDE the wrapper: content-visibility: auto
+           applies paint containment even to on-screen elements, which
+           would clip the buttons' overhang past the bubble's bottom edge.
+           Skipping off-screen content still speeds up long transcripts
+           with tool cards, Monaco diff viewers and xterm; `auto` remembers
+           each wrapper's last rendered height, so the scrollbar and TOC
+           scrollIntoView jumps stay stable; the 120px fallback approximates
+           a typical text bubble before first paint. */
+        .message-body {
             content-visibility: auto;
             contain-intrinsic-size: auto 120px;
         }

@@ -7,46 +7,22 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	"gogen/internal/session"
 )
 
 // validateModelTimeout bounds the model validation call after session restore.
 const validateModelTimeout = 12 * time.Second
 
-// SessionSnapshot is persisted conversation state.
-type SessionSnapshot struct {
-	WorkingDir    string
-	Oneshot       bool
-	Model         string
-	Mode          string
-	ThinkingLevel string // persisted thinking level; empty/absent means "off"
-	Label         string
-	// LabelRenamed is true when Label was set deliberately (RenameSession /
-	// the session_rename tool) rather than derived from the first user
-	// message. Persisted so the store never regenerates a deliberate rename
-	// (see sessionLabel's legacy-50-char migration rule).
-	LabelRenamed   bool
-	ProjectProfile string
-	Todos          *TodoList
-	Messages       []llm.Message
-	TokenCounts    []int // pre-computed token counts per message (nil if unavailable)
-	ContextLimit   int   // resolved context window size (0 = unknown)
-	// ParentID is non-empty for nested (subagent) sessions. Nested sessions
-	// are excluded from the flat saved list, cascade-deleted with their
-	// parent, and capped per parent (D2).
-	ParentID string
-	// SubagentStatus records the final outcome of a nested (subagent)
-	// session: "" (unknown / not finished), "success", or "failed".
-	// Persisted so the sidebar can render the true outcome after a
-	// reload/restart, when the subagent_started/finished events are gone.
-	SubagentStatus string
-	// SubagentSummary is the report/error summary written alongside
-	// SubagentStatus.
-	SubagentSummary string
-}
+// SessionSnapshot is the persisted conversation state. The canonical
+// definition lives in internal/session (the storage layer owns the
+// on-disk format); this alias keeps existing references compiling.
+type SessionSnapshot = session.SessionSnapshot
 
 // SessionPersister stores and loads agent sessions.
 type SessionPersister interface {
@@ -62,24 +38,9 @@ type SessionPersister interface {
 	TouchSession(workingDir, id string) error
 }
 
-// SessionInfo describes a saved session entry.
-type SessionInfo struct {
-	ID           string
-	Oneshot      bool
-	UpdatedAt    string
-	MessageCount int
-	Label        string
-	// ParentID is non-empty for nested (subagent) sessions; the sidebar
-	// renders them under their parent and the flat saved-session list
-	// excludes them.
-	ParentID string
-	// SubagentStatus is the persisted final outcome of a nested (subagent)
-	// session: "" (unknown / not finished), "success", or "failed".
-	SubagentStatus string
-	// SubagentSummary is the report/error summary written alongside
-	// SubagentStatus.
-	SubagentSummary string
-}
+// SessionInfo describes a saved session entry. Canonical definition in
+// internal/session; see SessionSnapshot above.
+type SessionInfo = session.SessionInfo
 
 // RestoreSessionLocal loads messages, mode, and model from a snapshot without
 // contacting the provider. Prefer this at process startup so the UI can come
@@ -633,17 +594,30 @@ func (a *Agent) appendMessage(m llm.Message) {
 	a.statsMu.Unlock()
 }
 
+// publishMessages is the single critical section that publishes a conversation
+// reshape under statsMu. prepare runs inside the lock and returns the new
+// Messages and token counts (nil counts clears the cache); it may also mutate
+// the messages in place (e.g. restore stabilization) and may read the current
+// state (e.g. truncate reslicing). After prepare returns, publishMessages
+// assigns the state, bumps countsEpoch, and refreshes the session image count
+// atomically, so a concurrent ContextStats never pairs new messages with stale
+// counts. Leaf lock: never acquire turnMu under it.
+func (a *Agent) publishMessages(prepare func() (msgs []llm.Message, counts []int)) {
+	a.statsMu.Lock()
+	msgs, counts := prepare()
+	a.Messages = msgs
+	a.tokenCounts = counts
+	a.countsEpoch++
+	a.sessionImages.Store(countImages(msgs))
+	a.statsMu.Unlock()
+}
+
 // replaceMessages swaps the conversation wholesale and invalidates the cached
 // token counts (compaction, session restore, fork, reset). Publishing the new
 // slice and clearing the counts in one critical section means a concurrent
 // ContextStats never pairs new messages with stale counts. Leaf lock.
 func (a *Agent) replaceMessages(msgs []llm.Message) {
-	a.statsMu.Lock()
-	a.Messages = msgs
-	a.tokenCounts = nil
-	a.countsEpoch++
-	a.sessionImages.Store(countImages(msgs))
-	a.statsMu.Unlock()
+	a.publishMessages(func() ([]llm.Message, []int) { return msgs, nil })
 }
 
 // replaceMessagesWithCounts swaps the conversation wholesale and publishes
@@ -653,12 +627,7 @@ func (a *Agent) replaceMessages(msgs []llm.Message) {
 // counts before publishing, which is cheap for a compaction because the
 // conversation just shrank. Leaf lock.
 func (a *Agent) replaceMessagesWithCounts(msgs []llm.Message, counts []int) {
-	a.statsMu.Lock()
-	a.Messages = msgs
-	a.tokenCounts = counts
-	a.countsEpoch++
-	a.sessionImages.Store(countImages(msgs))
-	a.statsMu.Unlock()
+	a.publishMessages(func() ([]llm.Message, []int) { return msgs, counts })
 }
 
 // restoreMessages publishes a restored session's messages together with their
@@ -667,40 +636,37 @@ func (a *Agent) replaceMessagesWithCounts(msgs []llm.Message, counts []int) {
 // partially-initialized messages. Takes ownership of msgs (no defensive copy).
 // Leaf lock.
 func (a *Agent) restoreMessages(msgs []llm.Message, counts []int) {
-	a.statsMu.Lock()
-	a.Messages = msgs
-	a.tokenCounts = counts
-	a.countsEpoch++
-	for i := range a.Messages {
-		m := &a.Messages[i]
-		m.ArgsStabilized = true
-		// Recompute the ArgsJSONValid memo for restored tool calls: the
-		// persisted ArgsStr is replayed byte-identically (never pinned or
-		// trimmed here), so the flag is set only when ArgsStr is already the
-		// exact trimmed valid wire bytes. A single validation per load beats
-		// re-validating every restored tool call on every request.
-		for j := range m.ToolCalls {
-			tc := &m.ToolCalls[j]
-			s := strings.TrimSpace(tc.ArgsStr)
-			tc.ArgsJSONValid = tc.ArgsStr != "" && tc.ArgsStr == s && json.Valid([]byte(s))
+	a.publishMessages(func() ([]llm.Message, []int) {
+		for i := range msgs {
+			m := &msgs[i]
+			m.ArgsStabilized = true
+			// Recompute the ArgsJSONValid memo for restored tool calls: the
+			// persisted ArgsStr is replayed byte-identically (never pinned or
+			// trimmed here), so the flag is set only when ArgsStr is already the
+			// exact trimmed valid wire bytes. A single validation per load beats
+			// re-validating every restored tool call on every request.
+			for j := range m.ToolCalls {
+				tc := &m.ToolCalls[j]
+				s := strings.TrimSpace(tc.ArgsStr)
+				tc.ArgsJSONValid = tc.ArgsStr != "" && tc.ArgsStr == s && json.Valid([]byte(s))
+			}
 		}
-	}
-	a.sessionImages.Store(countImages(msgs))
-	a.statsMu.Unlock()
+		return msgs, counts
+	})
 }
 
 // truncateMessages removes the last n messages (rollback paths) and trims the
 // cached token counts to match, keeping the fast SnapshotWithCounts path valid
 // after a rollback. Caller must guarantee n <= len(a.Messages). Leaf lock.
 func (a *Agent) truncateMessages(n int) {
-	a.statsMu.Lock()
-	a.Messages = a.Messages[:len(a.Messages)-n]
-	if a.tokenCounts != nil && len(a.tokenCounts) > len(a.Messages) {
-		a.tokenCounts = a.tokenCounts[:len(a.Messages)]
-	}
-	a.countsEpoch++
-	a.sessionImages.Store(countImages(a.Messages))
-	a.statsMu.Unlock()
+	a.publishMessages(func() ([]llm.Message, []int) {
+		msgs := a.Messages[:len(a.Messages)-n]
+		var counts []int
+		if a.tokenCounts != nil && len(a.tokenCounts) > len(msgs) {
+			counts = a.tokenCounts[:len(msgs)]
+		}
+		return msgs, counts
+	})
 }
 
 // SnapshotMessages returns a copy of the current conversation messages that
@@ -732,4 +698,121 @@ func (a *Agent) HistoryEpoch() uint64 {
 	e := a.countsEpoch
 	a.statsMu.RUnlock()
 	return e
+}
+
+// persistMinInterval is the minimum time between debounced session writes.
+// Final boundaries (turn complete, errors) bypass this via flushSession().
+const persistMinInterval = 5 * time.Second
+
+// persistMeta is the set of session fields that only the full snapshot path
+// persists (incremental deltas carry messages plus a label that loads
+// ignore). Comparing the current values against the last full save detects
+// changes that must force a full save — see lastMeta.
+type persistMeta struct {
+	label    string
+	mode     string
+	model    string
+	thinking string
+	oneshot  bool
+	profile  string
+	todos    *TodoList
+	// subagentStatus/subagentSummary mirror the recorded subagent outcome:
+	// writing it right after a turn's full save must force ANOTHER full
+	// save (deltas do not carry the outcome to the index).
+	subagentStatus  string
+	subagentSummary string
+}
+
+// extendTokenCounts extends tokenCounts to cover any messages appended since
+// the last extension. With appendMessage maintaining the counts inline this is
+// normally a no-op; it is kept as a safety net for doPersist so a full
+// snapshot can reuse the fast counts path.
+func (a *Agent) extendTokenCounts() {
+	a.statsMu.Lock()
+	defer a.statsMu.Unlock()
+	if a.tokenCounts == nil {
+		return
+	}
+	for len(a.tokenCounts) < len(a.Messages) {
+		idx := len(a.tokenCounts)
+		a.tokenCounts = append(a.tokenCounts,
+			contextmgr.ComputeMessageTokens(a.Messages[idx]))
+	}
+}
+
+// ConsumePersistError returns and clears the last session save failure, if any.
+// Serialized with doPersist via persistMu: doPersist writes lastPersistErr
+// under persistMu, and in web mode a no-turnMu flush path (ShutdownSessions,
+// sessionDelete, registry eviction) can run concurrently with the turn end
+// that consumes the error here.
+func (a *Agent) ConsumePersistError() error {
+	a.persistMu.Lock()
+	defer a.persistMu.Unlock()
+	err := a.lastPersistErr
+	a.lastPersistErr = nil
+	return err
+}
+
+// sessionPersist groups the session-persistence bookkeeping: the dirty flag,
+// the debounced-write timestamps, and the last full-snapshot metadata
+// (persistMeta). The persistMu comment carries the flush-serialization
+// contract.
+type sessionPersist struct {
+	lastPersistErr error
+	// sessionDirty tracks whether in-memory state differs from disk.
+	// TUI: single owner goroutine. Web server: the per-session turnMu
+	// serializes access across WebSocket clients (see internal/server), but the quit
+	// flush (ShutdownSessions) and a running turn's flushes can both mark and
+	// clear it concurrently — hence atomic (benign races on a plain bool were
+	// still data races under -race).
+	sessionDirty    atomic.Bool
+	lastPersistTime time.Time // timestamp of last actual disk write
+	// lastSavedMsgCount tracks how many messages were included in the last
+	// full snapshot save. Used by doPersist to decide between full and
+	// incremental delta saves, avoiding full JSON serialization every 5s.
+	lastSavedMsgCount int
+	lastFullSaveTime  time.Time // when the last full snapshot was written
+
+	// persistMu serializes doPersist executions. The turn goroutine (holding
+	// turnMu) and the shutdown/delete/eviction flush paths (no turnMu) can
+	// call FlushSession concurrently — e.g. ShutdownSessions flushes after
+	// the 2s drain times out while the turn is still running. Without this
+	// lock two doPersists would interleave their message snapshots, counter
+	// reads, and store writes, leaving a torn (snapshot, delta, index)
+	// combination on disk that LoadInWorkingDir then drops or double-merges
+	// — the "quit during a running turn loses history" bug. Serializing the
+	// whole write keeps every pair consistent: the later writer re-reads the
+	// counters the earlier one updated. Leaf lock: never held while
+	// acquiring turnMu, and no code calls FlushSession/persistSession
+	// while holding it (doPersist takes statsMu inside it, so statsMu holders
+	// must not flush — they don't).
+	persistMu sync.Mutex
+
+	// lastMeta is the session metadata written by the last full snapshot
+	// save. doPersist forces a full save (instead of an incremental delta)
+	// when any of these changed since the last full snapshot: incremental
+	// deltas only carry messages, so label/mode/model/thinking/oneshot/
+	// profile/todo changes would otherwise be silently lost if the process
+	// quit (or crashed) before the next full save.
+	lastMeta persistMeta
+}
+
+// sessionMeta groups the small session-identity flags guarded by statsMu
+// (see the statsMu comment in sessionStats).
+type sessionMeta struct {
+	// labelRenamed is true when SessionLabel was set deliberately
+	// (RenameSession / session_rename tool). Guarded by statsMu; persisted
+	// via SessionSnapshot.LabelRenamed so the store never regenerates the
+	// label from the conversation (see sessionLabel).
+	labelRenamed bool
+	// modelUnverified is true when the selected model came from a session
+	// restore or an external adoption (AdoptModel — the web /new pane-model
+	// inheritance) and has not yet been confirmed to exist at the provider.
+	// RestoreSessionLocal and AdoptModel set it; ValidateRestoredModel
+	// clears it once the model is resolved (present, absent, or
+	// auto-selected); SelectModel clears it (a selection comes from the
+	// provider's own list). requireModelSelected re-checks a
+	// still-unverified model on the first turn so a stale model from a
+	// previous provider is never sent to the endpoint. Guarded by statsMu.
+	modelUnverified bool
 }

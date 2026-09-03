@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"gogen/internal/buildinfo"
 	"gogen/internal/config"
 	"gogen/internal/modelinfo"
 
@@ -111,21 +112,15 @@ type modelProfileInfo struct {
 }
 
 type OpenAIProvider struct {
-	client           openai.Client  // primary streaming client (default profile)
-	catalogClient    *openai.Client // non-stream /v1/models (default profile, non-OpenCode)
-	zenClient        *openai.Client // OpenCode Zen streaming (default profile)
-	zenCatalogClient *openai.Client // OpenCode Zen catalog (default profile)
-	goClient         *openai.Client // OpenCode Go streaming (default profile)
-	goCatalogClient  *openai.Client // OpenCode Go catalog (default profile)
-	model            string
-	baseURL          string
-	apiKey           string
-	modelClient      map[string]*openai.Client // model ID → streaming client routing
-	// profiles is the registered endpoint set built by the constructors;
-	// profiles[0] is the default profile whose clients alias the legacy
-	// client fields above. Nil for direct-constructed providers (tests):
-	// those use the legacy fields only.
+	model string
+	// profiles is the registered endpoint set — the single source of truth
+	// for every client and endpoint. profiles[0] is the default profile
+	// (fallback client, default base URL, new-session model seed). Nil for
+	// direct-constructed providers (tests) that only exercise pure methods;
+	// the accessors below return zero values for that shape.
 	profiles []*providerProfile
+	// modelClient maps model ID → streaming client for routing.
+	modelClient map[string]*openai.Client
 	// profilesGen is bumped by SetProfiles. A catalog fetch started before
 	// the swap records the generation it began with; if the generation
 	// changed when it completes, its results came from the OLD endpoint set
@@ -284,57 +279,50 @@ func NewOpenAIProviderWithProfiles(profiles []ProviderProfile, model string, wor
 	return newOpenAIProvider(built, model, resolver)
 }
 
-// buildProfileClients constructs the stream/catalog client pair (plus the
-// zen/go twins for OpenCode URLs) for one registered provider profile.
-func buildProfileClients(prof providerProfile) *providerProfile {
+// newClientPair builds the stream + catalog client pair for one endpoint:
+// the stream client carries the SSE transport (long idle reads), the catalog
+// client the short-timeout one (see newSSEHTTPClient/newCatalogHTTPClient).
+// Empty baseURL/apiKey omit the respective option (default endpoint / no
+// auth header).
+func newClientPair(baseURL, apiKey string) (stream, catalog *openai.Client) {
 	streamOpts := []option.RequestOption{
 		option.WithHTTPClient(newSSEHTTPClient()),
+		option.WithHeader("User-Agent", buildinfo.UserAgent()),
 	}
 	catalogOpts := []option.RequestOption{
 		option.WithHTTPClient(newCatalogHTTPClient()),
+		option.WithHeader("User-Agent", buildinfo.UserAgent()),
 	}
-	if prof.apiKey != "" {
-		streamOpts = append(streamOpts, option.WithAPIKey(prof.apiKey))
-		catalogOpts = append(catalogOpts, option.WithAPIKey(prof.apiKey))
+	if apiKey != "" {
+		streamOpts = append(streamOpts, option.WithAPIKey(apiKey))
+		catalogOpts = append(catalogOpts, option.WithAPIKey(apiKey))
 	}
-	if prof.baseURL != "" {
-		streamOpts = append(streamOpts, option.WithBaseURL(prof.baseURL))
-		catalogOpts = append(catalogOpts, option.WithBaseURL(prof.baseURL))
+	if baseURL != "" {
+		streamOpts = append(streamOpts, option.WithBaseURL(baseURL))
+		catalogOpts = append(catalogOpts, option.WithBaseURL(baseURL))
 	}
-	stream := openai.NewClient(streamOpts...)
-	prof.stream = &stream
+	s := openai.NewClient(streamOpts...)
+	c := openai.NewClient(catalogOpts...)
+	return &s, &c
+}
+
+// buildProfileClients constructs the stream/catalog client pair (plus the
+// zen/go twins for OpenCode URLs) for one registered provider profile.
+// OpenCode profiles route through the zen/go twins, so their plain catalog
+// client stays nil.
+func buildProfileClients(prof providerProfile) *providerProfile {
+	prof.stream, prof.catalog = newClientPair(prof.baseURL, prof.apiKey)
 	if isOpencodeURL(prof.baseURL) {
-		newClients := func(url string) (stream, catalog *openai.Client) {
-			sopts := []option.RequestOption{
-				option.WithHTTPClient(newSSEHTTPClient()),
-				option.WithBaseURL(url),
-			}
-			copts := []option.RequestOption{
-				option.WithHTTPClient(newCatalogHTTPClient()),
-				option.WithBaseURL(url),
-			}
-			if prof.apiKey != "" {
-				sopts = append(sopts, option.WithAPIKey(prof.apiKey))
-				copts = append(copts, option.WithAPIKey(prof.apiKey))
-			}
-			s := openai.NewClient(sopts...)
-			c := openai.NewClient(copts...)
-			return &s, &c
-		}
-		prof.zenStream, prof.zenCatalog = newClients(openCodeZenBaseURL)
-		prof.goStream, prof.goCatalog = newClients(openCodeGoBaseURL)
-	} else {
-		c := openai.NewClient(catalogOpts...)
-		prof.catalog = &c
+		prof.catalog = nil
+		prof.zenStream, prof.zenCatalog = newClientPair(openCodeZenBaseURL, prof.apiKey)
+		prof.goStream, prof.goCatalog = newClientPair(openCodeGoBaseURL, prof.apiKey)
 	}
 	return &prof
 }
 
 // newOpenAIProvider assembles the provider from its profile client sets.
-// The default profile's (profiles[0]) clients alias the legacy client
-// fields so the fallback path and direct-construction tests keep working;
-// profiles[0].stream is re-pointed at the copied p.client value so the
-// fallback client and routing always agree for constructor-built providers.
+// profiles[0] is the default profile; the fallback accessors read it
+// directly, so there is no secondary client state to keep in sync.
 func newOpenAIProvider(profiles []*providerProfile, model string, resolver *modelinfo.Resolver) *OpenAIProvider {
 	p := &OpenAIProvider{
 		model:          model,
@@ -344,18 +332,6 @@ func newOpenAIProvider(profiles []*providerProfile, model string, resolver *mode
 		modelInfo:      resolver,
 		profiles:       profiles,
 		effortsDerived: make(map[string]derivedEfforts),
-	}
-	if len(profiles) > 0 {
-		def := profiles[0]
-		p.baseURL = def.baseURL
-		p.apiKey = def.apiKey
-		p.client = *def.stream
-		p.catalogClient = def.catalog
-		p.zenClient = def.zenStream
-		p.zenCatalogClient = def.zenCatalog
-		p.goClient = def.goStream
-		p.goCatalogClient = def.goCatalog
-		def.stream = &p.client
 	}
 	p.modelInfo.Warm() // non-blocking; populate cache before first limit lookup
 	return p
@@ -447,12 +423,10 @@ func (p *OpenAIProvider) SetModel(id string) error {
 // their models fall through to the default fallback and re-validation
 // surfaces the gap.
 //
-// The legacy client fields (client, catalogClient, zen/go twins) are NOT
-// rewritten: constructor-built providers route through the profile set, and
-// the legacy fields only serve the direct-construction (test) shape where
-// profiles is nil. Similarly p.baseURL/p.apiKey stay frozen at construction;
-// per-model lookups resolve through modelProfile, which the next fetch
-// repopulates.
+// The swap replaces the whole endpoint set: every fallback (default base
+// URL, API key, stream client) resolves through the NEW profiles, so no
+// construction-time client can outlive the swap. Per-model lookups resolve
+// through modelProfile, which the next fetch repopulates.
 func (p *OpenAIProvider) SetProfiles(profiles []ProviderProfile) error {
 	if p == nil {
 		return nil
@@ -519,35 +493,46 @@ func hasProfileName(profiles []*providerProfile, name string) bool {
 	return false
 }
 
-// defaultBaseURL returns the base URL of the default profile (profiles[0])
-// for constructor-built providers, or the legacy frozen p.baseURL for the
-// direct-constructed (test) shape. Live-correct after SetProfiles: the
-// legacy fields are intentionally not rewritten, but the /props probe,
-// models.dev resolution, and the preserve_reasoning kwargs gate must
-// resolve against the CURRENT default endpoint, not the construction-time
-// one. For the single-profile constructor path profiles[0].baseURL equals
-// p.baseURL, so this is a no-op there.
+// defaultBaseURL returns the base URL of the default profile (profiles[0]).
+// Live-correct after SetProfiles: the /props probe, models.dev resolution,
+// and the preserve_reasoning kwargs gate must resolve against the CURRENT
+// default endpoint, never the construction-time one. Empty for
+// direct-constructed providers with no profiles (test shape) — that is the
+// "default OpenAI API" sentinel the callers check for.
 func (p *OpenAIProvider) defaultBaseURL() string {
 	p.modelsMu.RLock()
-	profiles := p.profiles
-	p.modelsMu.RUnlock()
-	if len(profiles) > 0 {
-		return profiles[0].baseURL
+	defer p.modelsMu.RUnlock()
+	if len(p.profiles) == 0 {
+		return ""
 	}
-	return p.baseURL
+	return p.profiles[0].baseURL
+}
+
+// defaultAPIKey returns the API key of the default profile (profiles[0]).
+// Live-correct after SetProfiles, like defaultBaseURL: the /props and
+// /apply-template probes must authenticate with the CURRENT default
+// endpoint's key, not the construction-time one. Empty for
+// direct-constructed providers with no profiles (test shape).
+func (p *OpenAIProvider) defaultAPIKey() string {
+	p.modelsMu.RLock()
+	defer p.modelsMu.RUnlock()
+	if len(p.profiles) == 0 {
+		return ""
+	}
+	return p.profiles[0].apiKey
 }
 
 // fallbackClient returns the client that serves models with no known
-// routing: the default profile's stream client for constructor-built
-// providers, or the legacy primary client (direct-constructed shape).
+// routing: the default profile's stream client. Nil for direct-constructed
+// providers with no profiles (test shape); such providers never serve
+// requests.
 func (p *OpenAIProvider) fallbackClient() *openai.Client {
 	p.modelsMu.RLock()
-	profiles := p.profiles
-	p.modelsMu.RUnlock()
-	if len(profiles) > 0 {
-		return profiles[0].stream
+	defer p.modelsMu.RUnlock()
+	if len(p.profiles) == 0 {
+		return nil
 	}
-	return &p.client
+	return p.profiles[0].stream
 }
 
 // hasMultipleProfiles reports whether more than one registered provider
@@ -561,8 +546,7 @@ func (p *OpenAIProvider) hasMultipleProfiles() bool {
 }
 
 // hasOpenCodeProfile reports whether any registered profile is an OpenCode
-// endpoint (has zen/go twin clients). Profile-derived — NOT the legacy
-// frozen zenClient field — so it stays live-correct after SetProfiles: a
+// endpoint (has zen/go twin clients). Live-correct after SetProfiles: a
 // provider switched to or from OpenCode must drive catalog discovery and
 // endpoint inference from the CURRENT endpoint set, never stale
 // construction-time clients.

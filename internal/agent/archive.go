@@ -5,32 +5,16 @@ import (
 	"time"
 
 	"gogen/internal/llm"
+	"gogen/internal/session"
 )
 
 // ArchiveEntry is one line of a session's archive sidecar (Phase 5):
 // content that was shadowed out of the live history. The sidecar is an
 // append-only JSONL file written by the session store (see
-// session.Store.AppendArchive); the agent only produces entries.
-type ArchiveEntry struct {
-	// TS is when the entry was archived (UTC).
-	TS time.Time `json:"ts"`
-	// Kind identifies the kind of shadowed content. "condensed_message"
-	// is the Phase 0e last-resort condensation of a message that cannot
-	// fit the context window.
-	Kind string `json:"kind"`
-	// Index is the message's index in the live history at the moment it
-	// was shadowed.
-	Index int `json:"index"`
-	// Role is the shadowed message's role.
-	Role string `json:"role"`
-	// Tokens is the shadowed message's estimated token count.
-	Tokens int `json:"tokens"`
-	// Content is the shadowed message's full original content.
-	Content string `json:"content"`
-	// Model is the model that produced the shadowed message (assistant
-	// messages only; empty otherwise).
-	Model string `json:"model,omitempty"`
-}
+// session.Store.AppendArchive); the agent only produces entries. The
+// canonical definition lives in internal/session; this alias keeps
+// existing references compiling.
+type ArchiveEntry = session.ArchiveEntry
 
 // ArchiveAppender is optionally implemented by a SessionPersister: it
 // appends shadowed content to the session's archive sidecar (Phase 5). The

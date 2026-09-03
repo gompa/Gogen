@@ -8,14 +8,13 @@ import (
 	"testing"
 	"time"
 
-	"gogen/internal/agent"
 	"gogen/internal/llm"
 )
 
 func TestSaveLoadRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore(true)
-	snap := agent.SessionSnapshot{
+	snap := SessionSnapshot{
 		WorkingDir: dir,
 		Model:      "gpt-4o",
 		Mode:       "plan",
@@ -41,14 +40,14 @@ func TestLatestIDUsesUpdatedNotMtime(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore(true)
 
-	if err := store.Save("older", agent.SessionSnapshot{
+	if err := store.Save("older", SessionSnapshot{
 		WorkingDir: dir,
 		Messages:   []llm.Message{{Role: "user", Content: "older"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(5 * time.Millisecond)
-	if err := store.Save("newer", agent.SessionSnapshot{
+	if err := store.Save("newer", SessionSnapshot{
 		WorkingDir: dir,
 		Messages:   []llm.Message{{Role: "user", Content: "newer"}},
 	}); err != nil {
@@ -89,7 +88,7 @@ func TestGlobalModeListCacheCoherentAcrossWorkingDirs(t *testing.T) {
 	store.SetGlobalDir(globalDir)
 
 	id := "global-session"
-	if err := store.Save(id, agent.SessionSnapshot{
+	if err := store.Save(id, SessionSnapshot{
 		WorkingDir: wdA,
 		Messages:   []llm.Message{{Role: "user", Content: "hi"}},
 	}); err != nil {
@@ -116,7 +115,7 @@ func TestGlobalModeListCacheCoherentAcrossWorkingDirs(t *testing.T) {
 
 	// And a Save issued via A must be visible to a List via B.
 	id2 := "second-session"
-	if err := store.Save(id2, agent.SessionSnapshot{
+	if err := store.Save(id2, SessionSnapshot{
 		WorkingDir: wdB,
 		Messages:   []llm.Message{{Role: "user", Content: "hi2"}},
 	}); err != nil {
@@ -159,7 +158,7 @@ func TestSavePreservesCreatedOnCacheMiss(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore(true)
 	id := "created-preserve"
-	if err := store.Save(id, agent.SessionSnapshot{
+	if err := store.Save(id, SessionSnapshot{
 		WorkingDir: dir,
 		Messages:   []llm.Message{{Role: "user", Content: "hi"}},
 	}); err != nil {
@@ -182,7 +181,7 @@ func TestSavePreservesCreatedOnCacheMiss(t *testing.T) {
 	// without Load). Save must still keep the original Created.
 	time.Sleep(5 * time.Millisecond)
 	store2 := NewStore(true)
-	if err := store2.Save(id, agent.SessionSnapshot{
+	if err := store2.Save(id, SessionSnapshot{
 		WorkingDir: dir,
 		Messages:   []llm.Message{{Role: "user", Content: "hi again"}},
 	}); err != nil {
@@ -214,12 +213,12 @@ func TestAppendMessagesUpdatesIndexMessageCount(t *testing.T) {
 		{Role: "user", Content: "q1"},
 		{Role: "assistant", Content: "a1"},
 	}
-	if err := store.Save(id, agent.SessionSnapshot{WorkingDir: dir, Messages: base}); err != nil {
+	if err := store.Save(id, SessionSnapshot{WorkingDir: dir, Messages: base}); err != nil {
 		t.Fatal(err)
 	}
 
 	// First incremental save: one new message (total 3).
-	if err := store.AppendMessages(id, agent.SessionSnapshot{
+	if err := store.AppendMessages(id, SessionSnapshot{
 		WorkingDir: dir,
 		Messages:   []llm.Message{{Role: "user", Content: "q2"}},
 	}, 3); err != nil {
@@ -235,7 +234,7 @@ func TestAppendMessagesUpdatesIndexMessageCount(t *testing.T) {
 
 	// Second incremental save: the delta is cumulative (both new messages,
 	// matching how doPersist writes a.Messages[lastSavedMsgCount:]); total 4.
-	if err := store.AppendMessages(id, agent.SessionSnapshot{
+	if err := store.AppendMessages(id, SessionSnapshot{
 		WorkingDir: dir,
 		Messages: []llm.Message{
 			{Role: "user", Content: "q2"},
@@ -257,7 +256,7 @@ func TestAppendMessagesUpdatesIndexMessageCount(t *testing.T) {
 		llm.Message{Role: "user", Content: "q2"},
 		llm.Message{Role: "assistant", Content: "a2"},
 	)
-	if err := store.Save(id, agent.SessionSnapshot{WorkingDir: dir, Messages: full}); err != nil {
+	if err := store.Save(id, SessionSnapshot{WorkingDir: dir, Messages: full}); err != nil {
 		t.Fatal(err)
 	}
 	sessions, err = store.List(dir)
@@ -285,7 +284,7 @@ func TestAppendMessagesMissingIndexEntry(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"version":1,"id":"no-index-entry","messages":[{"role":"user","content":"hi"}]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.AppendMessages(id, agent.SessionSnapshot{
+	if err := store.AppendMessages(id, SessionSnapshot{
 		WorkingDir: dir,
 		Messages:   []llm.Message{{Role: "user", Content: "q2"}},
 	}, 2); err != nil {
@@ -316,10 +315,10 @@ func TestLoadInWorkingDirKeepsDeltaUntilFullSave(t *testing.T) {
 	store := NewStore(true)
 	id := "keep-delta"
 	base := []llm.Message{{Role: "user", Content: "q1"}}
-	if err := store.Save(id, agent.SessionSnapshot{WorkingDir: dir, Messages: base}); err != nil {
+	if err := store.Save(id, SessionSnapshot{WorkingDir: dir, Messages: base}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.AppendMessages(id, agent.SessionSnapshot{
+	if err := store.AppendMessages(id, SessionSnapshot{
 		WorkingDir: dir,
 		Messages:   []llm.Message{{Role: "assistant", Content: "a1"}},
 	}, 2); err != nil {
@@ -361,7 +360,7 @@ func TestLoadInWorkingDirKeepsDeltaUntilFullSave(t *testing.T) {
 	}
 	// A full save supersedes the delta and removes it.
 	full := []llm.Message{{Role: "user", Content: "q1"}, {Role: "assistant", Content: "a1"}}
-	if err := store.Save(id, agent.SessionSnapshot{WorkingDir: dir, Messages: full}); err != nil {
+	if err := store.Save(id, SessionSnapshot{WorkingDir: dir, Messages: full}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(dpath); !os.IsNotExist(err) {
@@ -388,14 +387,14 @@ func TestLoadSkipsStaleDeltaWhenSnapshotAlreadyContainsIt(t *testing.T) {
 		{Role: "user", Content: "q1"},
 		{Role: "assistant", Content: "a1"},
 	}
-	if err := store.Save(id, agent.SessionSnapshot{WorkingDir: dir, Messages: base}); err != nil {
+	if err := store.Save(id, SessionSnapshot{WorkingDir: dir, Messages: base}); err != nil {
 		t.Fatal(err)
 	}
 	delta := []llm.Message{
 		{Role: "user", Content: "q2"},
 		{Role: "assistant", Content: "a2"},
 	}
-	if err := store.AppendMessages(id, agent.SessionSnapshot{WorkingDir: dir, Messages: delta}, 4); err != nil {
+	if err := store.AppendMessages(id, SessionSnapshot{WorkingDir: dir, Messages: delta}, 4); err != nil {
 		t.Fatal(err)
 	}
 	// Full save: the snapshot now contains all 4 messages and Save removes
@@ -403,7 +402,7 @@ func TestLoadSkipsStaleDeltaWhenSnapshotAlreadyContainsIt(t *testing.T) {
 	// (snapshot write succeeded, delta unlink never happened).
 	full := append([]llm.Message{}, base...)
 	full = append(full, delta...)
-	if err := store.Save(id, agent.SessionSnapshot{WorkingDir: dir, Messages: full}); err != nil {
+	if err := store.Save(id, SessionSnapshot{WorkingDir: dir, Messages: full}); err != nil {
 		t.Fatal(err)
 	}
 	df := deltaFile{Messages: delta, BaseCount: 2}
@@ -441,10 +440,10 @@ func TestLoadDropsDeltaWhenSnapshotTruncated(t *testing.T) {
 		{Role: "user", Content: "q1"},
 		{Role: "assistant", Content: "a1"},
 	}
-	if err := store.Save(id, agent.SessionSnapshot{WorkingDir: dir, Messages: base}); err != nil {
+	if err := store.Save(id, SessionSnapshot{WorkingDir: dir, Messages: base}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.AppendMessages(id, agent.SessionSnapshot{
+	if err := store.AppendMessages(id, SessionSnapshot{
 		WorkingDir: dir,
 		Messages: []llm.Message{
 			{Role: "user", Content: "q2"},
@@ -456,7 +455,7 @@ func TestLoadDropsDeltaWhenSnapshotTruncated(t *testing.T) {
 	// Truncated re-save (1 message) — simulates a compacted/rolled-back
 	// session whose full save crashed before removing the delta.
 	truncated := []llm.Message{{Role: "user", Content: "q1"}}
-	if err := store.Save(id, agent.SessionSnapshot{WorkingDir: dir, Messages: truncated}); err != nil {
+	if err := store.Save(id, SessionSnapshot{WorkingDir: dir, Messages: truncated}); err != nil {
 		t.Fatal(err)
 	}
 	df := deltaFile{
@@ -494,7 +493,7 @@ func TestLegacyDeltaWithoutBaseCountIsMerged(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore(true)
 	id := "legacy-delta"
-	if err := store.Save(id, agent.SessionSnapshot{
+	if err := store.Save(id, SessionSnapshot{
 		WorkingDir: dir,
 		Messages:   []llm.Message{{Role: "user", Content: "q1"}},
 	}); err != nil {
@@ -519,13 +518,13 @@ func TestDeleteRemovesDelta(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore(true)
 	id := "delete-delta"
-	if err := store.Save(id, agent.SessionSnapshot{
+	if err := store.Save(id, SessionSnapshot{
 		WorkingDir: dir,
 		Messages:   []llm.Message{{Role: "user", Content: "q1"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.AppendMessages(id, agent.SessionSnapshot{
+	if err := store.AppendMessages(id, SessionSnapshot{
 		WorkingDir: dir,
 		Messages:   []llm.Message{{Role: "assistant", Content: "a1"}},
 	}, 2); err != nil {

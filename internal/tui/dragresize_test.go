@@ -2,6 +2,7 @@ package tui
 
 import (
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -104,7 +105,7 @@ func TestSidebarWheelScrollsList(t *testing.T) {
 	m.sidebarScroll = 5
 	// Enough saved rows for the list to actually overflow the panel.
 	for i := 0; i < 20; i++ {
-		m.savedCache = append(m.savedCache, agent.SessionInfo{ID: "s" + itoa(i)})
+		m.savedCache = append(m.savedCache, agent.SessionInfo{ID: "s" + strconv.Itoa(i)})
 	}
 	down := mouseEvent{x: 3, y: 5, button: tea.MouseWheelDown, kind: mouseWheelEvent}
 	if consumed, _ := m.handleSidebarMouse(down); !consumed {
@@ -133,12 +134,12 @@ func TestSidebarWheelEndToEnd(t *testing.T) {
 	m := dragModel(t)
 	m.sidebarMainLines = 30
 	for i := 0; i < 20; i++ {
-		m.savedCache = append(m.savedCache, agent.SessionInfo{ID: "s" + itoa(i)})
+		m.savedCache = append(m.savedCache, agent.SessionInfo{ID: "s" + strconv.Itoa(i)})
 	}
 	m.renderSidebar(30) // register the row count used by clamping
 	// Overflow the chat viewport so its scroll offset can move.
 	for i := 0; i < 50; i++ {
-		m.appendChatLine("line " + itoa(i))
+		m.appendChatLine("line " + strconv.Itoa(i))
 	}
 	m.setViewportContent()
 	m.viewport.GotoBottom()
@@ -177,7 +178,7 @@ func TestSidebarKeyboardFollowScroll(t *testing.T) {
 	m := dragModel(t)
 	m.sidebarMainLines = 30
 	for i := 0; i < 20; i++ {
-		m.savedCache = append(m.savedCache, agent.SessionInfo{ID: "s" + itoa(i)})
+		m.savedCache = append(m.savedCache, agent.SessionInfo{ID: "s" + strconv.Itoa(i)})
 	}
 	m.renderSidebar(30)
 	m.sidebarCursor = 15 // past the visible window (8 sessions at 30 lines)
@@ -228,5 +229,5 @@ func TestSidebarWidthClampsScaleWithTerminal(t *testing.T) {
 }
 
 func containsInt(s string, n int) bool {
-	return strings.Contains(s, itoa(n))
+	return strings.Contains(s, strconv.Itoa(n))
 }

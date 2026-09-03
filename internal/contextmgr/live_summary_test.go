@@ -61,8 +61,9 @@ func TestLiveSummaryInstructionQuality(t *testing.T) {
 	msgs := append([]llm.Message{head}, middle...)
 	msgs = append(msgs, tail...)
 
-	out, _, err := m.CompactPinned(context.Background(),
-		[]llm.Message{{Role: "system", Content: "You are a coding agent."}}, msgs, nil, nil)
+	out, _, err := m.Compact(context.Background(), msgs, CompactOptions{
+		ViewPrefix: []llm.Message{{Role: "system", Content: "You are a coding agent."}},
+	})
 	if err != nil {
 		t.Fatalf("compaction failed: %v", err)
 	}

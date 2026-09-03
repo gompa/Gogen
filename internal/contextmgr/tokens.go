@@ -186,6 +186,46 @@ func HeuristicTokenCount(s string) int {
 	return (len(s) + 3) / 4
 }
 
+// LiveEstimate is a cheap running context estimate: an authoritative
+// baseline (the Used count of the last exact ContextStats snapshot) plus a
+// tokenizer-free count of text streamed since the last Rebase. It backs the
+// live "(est.)" context indicator in UIs that must not pay tokenizer cost
+// mid-stream; the exact count is restored from ContextStats when streaming
+// ends or at the next round boundary.
+//
+// Not synchronized: drive it from a single goroutine only (the TUI's Update
+// thread, or the server's stream callback).
+type LiveEstimate struct {
+	base  int // last authoritative Used
+	added int // HeuristicTokenCount of deltas since the last Rebase
+}
+
+// Rebase sets the baseline to the given authoritative Used count and
+// discards any accumulated estimate.
+func (e *LiveEstimate) Rebase(used int) {
+	e.base = used
+	e.added = 0
+}
+
+// Add accumulates a heuristic token count for a chunk of streamed text.
+// Empty chunks are ignored.
+func (e *LiveEstimate) Add(delta string) {
+	if delta == "" {
+		return
+	}
+	e.added += HeuristicTokenCount(delta)
+}
+
+// Used returns the current estimate: baseline plus accumulated deltas.
+func (e *LiveEstimate) Used() int {
+	return e.base + e.added
+}
+
+// Base returns the authoritative baseline set by the last Rebase.
+func (e *LiveEstimate) Base() int {
+	return e.base
+}
+
 // computeMessageTokens walks the message structure once and counts every
 // string through count: content, reasoning, refusal, each tool call's
 // name/id/arguments, and the tool-call id. Both the exact and heuristic
@@ -254,5 +294,7 @@ func truncateForSummary(text string, maxTokens int) string {
 // truncateForSummary, used when the tokenizer is unavailable. The cut is
 // rune-safe so the result is always valid UTF-8.
 func truncateForSummaryHeuristic(text string, maxTokens int) string {
-	return TruncateMarked(text, maxTokens*4, fmt.Sprintf("\n… truncated for summarization (%d chars total)", len(text)))
+	return Truncate(text, maxTokens*4, TruncateOptions{
+		Marker: fmt.Sprintf("\n… truncated for summarization (%d chars total)", len(text)),
+	})
 }

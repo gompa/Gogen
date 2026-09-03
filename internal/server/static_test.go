@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 )
 
@@ -146,6 +147,47 @@ func TestHandleStaticIndexHTMLCached(t *testing.T) {
 	s.HandleStatic(rec304, req304)
 	if rec304.Code != http.StatusNotModified {
 		t.Fatalf("index revalidation status=%d, want 304", rec304.Code)
+	}
+}
+
+// TestHandleStaticCacheControlPolicy verifies the per-path cache policy:
+// version-pinned vendor bundles (monaco/xterm/vendor) are served with a long
+// max-age so reloads are pure cache hits, while the app assets that change on
+// every rebuild stay no-cache.
+func TestHandleStaticCacheControlPolicy(t *testing.T) {
+	s := &Server{}
+	tests := []struct {
+		path string
+		want string
+	}{
+		{"/monaco/editor.bundle.js", "public, max-age=" + strconv.Itoa(vendorMaxAge)},
+		{"/monaco/ts.worker.js", "public, max-age=" + strconv.Itoa(vendorMaxAge)},
+		{"/monaco/codicon.ttf", "public, max-age=" + strconv.Itoa(vendorMaxAge)},
+		{"/xterm/xterm.js", "public, max-age=" + strconv.Itoa(vendorMaxAge)},
+		{"/xterm/xterm.css", "public, max-age=" + strconv.Itoa(vendorMaxAge)},
+		{"/vendor/marked.esm.js", "public, max-age=" + strconv.Itoa(vendorMaxAge)},
+		{"/vendor/dompurify.esm.js", "public, max-age=" + strconv.Itoa(vendorMaxAge)},
+		{"/app.js", "no-cache"},
+		{"/editor.js", "no-cache"},
+		{"/styles.css", "no-cache"},
+		{"/components/popover.js", "no-cache"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.path, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			s.HandleStatic(rec, httptest.NewRequest("GET", tc.path, nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status=%d, want 200", rec.Code)
+			}
+			if got := rec.Header().Get("Cache-Control"); got != tc.want {
+				t.Fatalf("Cache-Control=%q, want %q", got, tc.want)
+			}
+			// The ETag is always present — it is the staleness safety net that
+			// lets a hard reload or max-age expiry revalidate a bumped bundle.
+			if rec.Header().Get("ETag") == "" {
+				t.Fatal("expected ETag header")
+			}
+		})
 	}
 }
 

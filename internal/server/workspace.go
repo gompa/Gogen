@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gogen/internal/agent"
@@ -54,17 +55,15 @@ type Workspace struct {
 	// sessions start with (per-session afterwards).
 	ThinkingLevel string
 
-	// Live feature flags for the board and subagent features. The web
-	// settings toggle (config WS message) writes these while
-	// NewSessionAgent reads them concurrently at session creation — a plain
-	// field access raced those readers (data race under -race). Production
-	// access must go through the Get*/Set* accessors; the fields stay
-	// exported only so existing tests can read them directly.
-	featureMu             sync.RWMutex
-	BoardEnabled          bool
-	SubagentEnabled       bool
-	SubagentMaxDepth      int
-	SubagentMaxConcurrent int
+	// featureFlags is the SINGLE live store for the board / subagent
+	// feature flags. Every session agent spawned by NewSessionAgent reads
+	// this same instance (agent.SetFeatureFlags), so a web settings toggle
+	// (config WS message) is visible to all sessions immediately — no
+	// per-agent mirror and no sweep. All values are atomic: the toggle
+	// writes them while per-turn tool derivation reads them concurrently.
+	// Lazily created for workspaces built as bare &Workspace{} literals
+	// (tests skip newWorkspaceFromAgent).
+	featureFlags atomic.Pointer[agent.FeatureFlags]
 
 	// boardManager is the single shared project board for this workspace
 	// (all session agents share one instance, so claims and moves serialize
@@ -250,66 +249,70 @@ func wrapToolHandlers(handlers map[string]agent.ToolHandler, fsMu *sync.RWMutex)
 	return out
 }
 
-// GetBoardEnabled returns the live board feature flag (see featureMu).
+// flags returns the shared feature-flag store, lazily creating it for
+// workspaces built outside newWorkspaceFromAgent (bare &Workspace{} test
+// literals).
+func (ws *Workspace) flags() *agent.FeatureFlags {
+	if f := ws.featureFlags.Load(); f != nil {
+		return f
+	}
+	f := agent.NewFeatureFlags(false, false, 0, 0)
+	if !ws.featureFlags.CompareAndSwap(nil, f) {
+		f = ws.featureFlags.Load()
+	}
+	return f
+}
+
+// FeatureFlags returns the shared flag store every session agent reads —
+// the single source of truth for the live board / subagent feature flags.
+func (ws *Workspace) FeatureFlags() *agent.FeatureFlags {
+	return ws.flags()
+}
+
+// GetBoardEnabled returns the live board feature flag.
 func (ws *Workspace) GetBoardEnabled() bool {
-	ws.featureMu.RLock()
-	defer ws.featureMu.RUnlock()
-	return ws.BoardEnabled
+	return ws.flags().BoardEnabled()
 }
 
 // SetBoardEnabled updates the live board feature flag. The web settings
-// toggle calls this for the workspace; session agents are swept separately.
+// toggle writes the shared store every session agent reads — the toggle is
+// visible to all sessions immediately, no sweep.
 func (ws *Workspace) SetBoardEnabled(on bool) {
-	ws.featureMu.Lock()
-	ws.BoardEnabled = on
-	ws.featureMu.Unlock()
+	ws.flags().SetBoardEnabled(on)
 }
 
-// GetSubagentEnabled returns the live subagent feature flag (see featureMu).
+// GetSubagentEnabled returns the live subagent feature flag.
 func (ws *Workspace) GetSubagentEnabled() bool {
-	ws.featureMu.RLock()
-	defer ws.featureMu.RUnlock()
-	return ws.SubagentEnabled
+	return ws.flags().SubagentsEnabled()
 }
 
-// SetSubagentEnabled updates the live subagent feature flag. The web
-// settings toggle calls this for the workspace; session agents are swept
-// separately.
+// SetSubagentEnabled updates the live subagent feature flag (shared store,
+// see SetBoardEnabled).
 func (ws *Workspace) SetSubagentEnabled(on bool) {
-	ws.featureMu.Lock()
-	ws.SubagentEnabled = on
-	ws.featureMu.Unlock()
+	ws.flags().SetSubagentsEnabled(on)
 }
 
 // GetSubagentMaxDepth returns the live subagent nesting-depth limit.
 func (ws *Workspace) GetSubagentMaxDepth() int {
-	ws.featureMu.RLock()
-	defer ws.featureMu.RUnlock()
-	return ws.SubagentMaxDepth
+	return ws.flags().SubagentMaxDepth()
 }
 
 // SetSubagentMaxDepth updates the live subagent nesting-depth limit.
 func (ws *Workspace) SetSubagentMaxDepth(depth int) {
-	ws.featureMu.Lock()
-	ws.SubagentMaxDepth = depth
-	ws.featureMu.Unlock()
+	ws.flags().SetSubagentMaxDepth(depth)
 }
 
 // GetSubagentMaxConcurrent returns the live per-parent concurrent-subagent
 // limit (0 = unset; readers resolve the effective value via
 // config.DefaultSubagentMaxConcurrent).
 func (ws *Workspace) GetSubagentMaxConcurrent() int {
-	ws.featureMu.RLock()
-	defer ws.featureMu.RUnlock()
-	return ws.SubagentMaxConcurrent
+	return ws.flags().SubagentMaxConcurrent()
 }
 
 // SetSubagentMaxConcurrent updates the live per-parent concurrent-subagent
 // limit.
 func (ws *Workspace) SetSubagentMaxConcurrent(n int) {
-	ws.featureMu.Lock()
-	ws.SubagentMaxConcurrent = n
-	ws.featureMu.Unlock()
+	ws.flags().SetSubagentMaxConcurrent(n)
 }
 
 // GetBoardManager returns the shared project board manager (nil when the
@@ -469,28 +472,25 @@ func (ws *Workspace) NewSessionAgent(snap *agent.SessionSnapshot, id string) *ag
 	// context change applies to sessions created afterwards too.
 	runtimeCfg := ws.GetRuntimeConfig()
 	opts := agent.SessionAgentOptions{
-		Provider:              ws.ProviderFactory(),
-		Executor:              ws.Exec,
-		Store:                 ws.Store,
-		Config:                &runtimeCfg,
-		GlobalMode:            ws.GlobalMode,
-		ProjectFilePath:       ws.ProjectFilePath,
-		ProjectGuidelines:     ws.ProjectGuidelines,
-		TestCommand:           ws.TestCommand,
-		LintCommand:           ws.LintCommand,
-		WorkingDir:            ws.GetWorkingDir(),
-		MCPRegistry:           ws.MCPRegistry,
-		ToolHandlers:          ws.buildToolHandlers(),
-		DebugCompareMessages:  ws.DebugCompareMessages,
-		ThinkingLevel:         agent.ThinkingLevel(ws.ThinkingLevel),
-		BoardEnabled:          ws.GetBoardEnabled(),
-		SubagentsEnabled:      ws.GetSubagentEnabled(),
-		SubagentMaxDepth:      ws.GetSubagentMaxDepth(),
-		SubagentMaxConcurrent: ws.GetSubagentMaxConcurrent(),
-		BoardManager:          ws.GetBoardManager(),
-		SkillsManager:         ws.skillsManager,
-		InstructionsEnabled:   runtimeCfg.AgentInstructionsEnabled(),
-		SubagentSpawner:       ws.SubagentSpawner,
+		Provider:             ws.ProviderFactory(),
+		Executor:             ws.Exec,
+		Store:                ws.Store,
+		Config:               &runtimeCfg,
+		GlobalMode:           ws.GlobalMode,
+		ProjectFilePath:      ws.ProjectFilePath,
+		ProjectGuidelines:    ws.ProjectGuidelines,
+		TestCommand:          ws.TestCommand,
+		LintCommand:          ws.LintCommand,
+		WorkingDir:           ws.GetWorkingDir(),
+		MCPRegistry:          ws.MCPRegistry,
+		ToolHandlers:         ws.buildToolHandlers(),
+		DebugCompareMessages: ws.DebugCompareMessages,
+		ThinkingLevel:        agent.ThinkingLevel(ws.ThinkingLevel),
+		FeatureFlags:         ws.flags(),
+		BoardManager:         ws.GetBoardManager(),
+		SkillsManager:        ws.skillsManager,
+		InstructionsEnabled:  runtimeCfg.AgentInstructionsEnabled(),
+		SubagentSpawner:      ws.SubagentSpawner,
 	}
 	a := agent.NewSessionAgent(opts, snap, id)
 	a.SetOnBoardChanged(ws.BoardChangedHook)
@@ -525,26 +525,30 @@ func NewWorkspaceForHost(a *agent.Agent, cfg *config.Config) *Workspace {
 // factory seeds each new provider from the agent's current model/thinking.
 func newWorkspaceFromAgent(a *agent.Agent, cfg *config.Config) *Workspace {
 	ws := &Workspace{
-		Exec:                  a.Executor,
-		Config:                cfg,
-		GlobalMode:            a.GlobalMode,
-		ProjectFilePath:       a.ProjectFilePath,
-		ProjectGuidelines:     a.ProjectGuidelines,
-		TestCommand:           a.TestCommand,
-		LintCommand:           a.LintCommand,
-		DebugCompareMessages:  a.DebugCompareMessages,
-		MCPRegistry:           a.MCPRegistry,
-		Model:                 a.CurrentModel(),
-		ThinkingLevel:         string(a.ThinkingLevel),
-		WorkingDir:            a.Executor.GetWorkingDir(),
-		BoardEnabled:          cfg != nil && cfg.BoardEnabled(),
-		SubagentEnabled:       cfg != nil && cfg.SubagentEnabled(),
-		SubagentMaxDepth:      subagentDepthFrom(cfg),
-		SubagentMaxConcurrent: subagentLimitFrom(cfg),
-		jobNotices:            cfg != nil && cfg.JobNoticesEnabled(),
-		OpenAIProviders:       providerListFromConfig(cfg),
-		runtime:               runtimeSeed(cfg),
+		Exec:                 a.Executor,
+		Config:               cfg,
+		GlobalMode:           a.GlobalMode,
+		ProjectFilePath:      a.ProjectFilePath,
+		ProjectGuidelines:    a.ProjectGuidelines,
+		TestCommand:          a.TestCommand,
+		LintCommand:          a.LintCommand,
+		DebugCompareMessages: a.DebugCompareMessages,
+		MCPRegistry:          a.MCPRegistry,
+		Model:                a.CurrentModel(),
+		ThinkingLevel:        string(a.ThinkingLevel),
+		WorkingDir:           a.Executor.GetWorkingDir(),
+		jobNotices:           cfg != nil && cfg.JobNoticesEnabled(),
+		OpenAIProviders:      providerListFromConfig(cfg),
+		runtime:              runtimeSeed(cfg),
 	}
+	// The single shared flag store: every session agent spawned by
+	// NewSessionAgent reads this instance (no per-agent mirror, no sweep).
+	ws.featureFlags.Store(agent.NewFeatureFlags(
+		cfg != nil && cfg.BoardEnabled(),
+		cfg != nil && cfg.SubagentEnabled(),
+		subagentDepthFrom(cfg),
+		subagentLimitFrom(cfg),
+	))
 	if cfg != nil && cfg.BoardEnabled() {
 		// The workspace owns the single board manager; session agents are
 		// seeded from it in NewSessionAgent.

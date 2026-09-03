@@ -5,12 +5,11 @@ import (
 	"testing"
 	"time"
 
-	"gogen/internal/agent"
 	"gogen/internal/llm"
 )
 
-func nestedSnap(workingDir, id, parent string) agent.SessionSnapshot {
-	return agent.SessionSnapshot{
+func nestedSnap(workingDir, id, parent string) SessionSnapshot {
+	return SessionSnapshot{
 		WorkingDir: workingDir,
 		ParentID:   parent,
 		Messages:   []llm.Message{{Role: "user", Content: "job " + id}},
@@ -170,14 +169,14 @@ func TestNestedParentIDRoundTrip(t *testing.T) {
 func TestNestedLatestIDExcluded(t *testing.T) {
 	dir := t.TempDir()
 	s := NewStore(true)
-	if err := s.Save("parent", agent.SessionSnapshot{
+	if err := s.Save("parent", SessionSnapshot{
 		WorkingDir: dir,
 		Messages:   []llm.Message{{Role: "user", Content: "p"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(10 * time.Millisecond) // child strictly newer
-	if err := s.Save("child", agent.SessionSnapshot{
+	if err := s.Save("child", SessionSnapshot{
 		WorkingDir: dir,
 		ParentID:   "parent",
 		Messages:   []llm.Message{{Role: "user", Content: "c"}},
@@ -202,7 +201,7 @@ func TestNestedLatestIDExcluded(t *testing.T) {
 	// Only children on disk: no flat session exists → "" (bootstrap then
 	// falls back to a fresh session).
 	dir2 := t.TempDir()
-	if err := s.Save("child-only", agent.SessionSnapshot{
+	if err := s.Save("child-only", SessionSnapshot{
 		WorkingDir: dir2,
 		ParentID:   "gone",
 		Messages:   []llm.Message{{Role: "user", Content: "c"}},
@@ -225,13 +224,13 @@ func TestNestedLatestIDExcluded(t *testing.T) {
 func TestSubagentOutcomeRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	s := NewStore(true)
-	if err := s.Save("parent", agent.SessionSnapshot{
+	if err := s.Save("parent", SessionSnapshot{
 		WorkingDir: dir,
 		Messages:   []llm.Message{{Role: "user", Content: "p"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Save("child", agent.SessionSnapshot{
+	if err := s.Save("child", SessionSnapshot{
 		WorkingDir:      dir,
 		ParentID:        "parent",
 		SubagentStatus:  "failed",

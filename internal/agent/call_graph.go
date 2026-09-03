@@ -63,72 +63,25 @@ func (e *Executor) CallGraph(ctx context.Context, symbol, subpath, glob string, 
 	return formatCallGraph(result, direction), nil
 }
 
-// definitionPattern describes how to detect a function/method definition for a
-// given symbol. The prefix is checked against the trimmed line first; when it
-// matches, verify reports whether the remainder indicates a definition of symbol.
-type definitionPattern struct {
-	prefix   string
-	verify   func(lineAfterPrefix, symbol string) bool
-	skipLen  int  // number of prefix bytes to strip; 0 = len(prefix)
-	skipRecv bool // true when Go receiver needs stripping
-	noPrefix bool // when true, prefix is not checked; all lines match
-}
-
-// isDefinitionLine checks whether a line is a definition of the symbol in any language.
+// isDefinitionLine reports whether line is a definition of symbol: a
+// function/method declaration in any supported language (Go, Python,
+// JavaScript/TypeScript, Rust), including Go methods with receivers and
+// generic methods, or a JS/TS function expression bound to a
+// const/let/var declaration. It is the shared gate (via classifyDefinitionLine)
+// that keeps the call-graph text fallback, find_symbol, and the list_definitions
+// text outline in agreement about what counts as a definition.
 func isDefinitionLine(line, symbol string) bool {
-	patterns := []definitionPattern{
-		// Go: func Symbol( or func (receiver) Symbol(
-		{prefix: "func ", skipRecv: true, verify: func(rest, sym string) bool {
-			return strings.HasPrefix(rest, sym+"(") || strings.HasPrefix(rest, sym+" ")
-		}},
-		// Python: def Symbol(
-		{prefix: "def ", verify: func(rest, sym string) bool {
-			return strings.HasPrefix(rest, sym+"(")
-		}},
-		// JavaScript/TypeScript: function Symbol(
-		{prefix: "function ", verify: func(rest, sym string) bool {
-			return strings.HasPrefix(rest, sym+"(")
-		}},
-		// JavaScript/TypeScript: const/let/var Symbol = (
-		{noPrefix: true, verify: func(rest, sym string) bool {
-			for _, kw := range []string{"const ", "let ", "var "} {
-				if strings.HasPrefix(rest, kw+sym) {
-					after := rest[len(kw)+len(sym):]
-					after = strings.TrimSpace(after)
-					if strings.HasPrefix(after, "= (") || strings.HasPrefix(after, "=(") {
-						return true
-					}
-				}
-			}
-			return false
-		}},
-	}
-
-	trimmed := strings.TrimSpace(line)
-	if trimmed == "" {
+	kind, name, rest, ok := classifyDefinitionLine(line)
+	if !ok || name != symbol {
 		return false
 	}
-
-	for _, p := range patterns {
-		if !p.noPrefix && !strings.HasPrefix(trimmed, p.prefix) {
-			continue
-		}
-		var rest string
-		if p.skipLen > 0 {
-			rest = trimmed[p.skipLen:]
-		} else if !p.noPrefix {
-			rest = trimmed[len(p.prefix):]
-		} else {
-			rest = trimmed
-		}
-		if p.skipRecv && strings.HasPrefix(rest, "(") {
-			if idx := strings.Index(rest, ")"); idx >= 0 {
-				rest = strings.TrimSpace(rest[idx+1:])
-			}
-		}
-		if p.verify(rest, symbol) {
-			return true
-		}
+	switch kind {
+	case "func":
+		return true
+	case "const", "var":
+		// JS/TS function expression: `const M = (` / `let M =(`.
+		rest = strings.TrimLeft(rest, "=")
+		return strings.HasPrefix(strings.TrimSpace(rest), "(")
 	}
 	return false
 }
@@ -218,9 +171,15 @@ func (e *Executor) callGraphWithText(ctx context.Context, searchRoot, relPrefix,
 	}
 
 	// Search for the function definition and extract callees from its body.
-	defPattern := `(?:func|def|function)\s+` + regexp.QuoteMeta(symbol) + `\s*\(`
+	// The pattern is a recall filter built from the shared keyword table
+	// (includes Go methods with receivers); the callback gates matches with
+	// isDefinitionLine so this agrees with the caller-detection path.
+	defPattern := definitionSearchPattern(symbol, "func")
 	if err := e.walkSymbolReferencesText(ctx, searchRoot, relPrefix, glob, defPattern,
 		func(filePath string, lineNum int, line string) error {
+			if !isDefinitionLine(line, symbol) {
+				return nil
+			}
 			// Found the definition at lineNum. Extract callees from the definition line
 			// and surrounding context. We use a best-effort approach here since we
 			// don't have the full file content in this callback.
@@ -305,7 +264,7 @@ func extractCallsFromLines(lines []string, start, end int, symbol string) []stri
 			}
 			name := m[1]
 			// Skip the symbol itself and common keywords.
-			if name == symbol || isBuiltinOrKeyword(name) {
+			if name == symbol || builtinOrKeywordNames[name] {
 				continue
 			}
 			if !seen[name] {
@@ -319,50 +278,30 @@ func extractCallsFromLines(lines []string, start, end int, symbol string) []stri
 
 // extractCalleesFromLine extracts function calls from a single line (best-effort for text search).
 func extractCalleesFromLine(line, symbol string) []string {
-	seen := make(map[string]bool)
-	var callees []string
-
-	callRe := callSiteRE
-	matches := callRe.FindAllStringSubmatch(line, -1)
-	for _, m := range matches {
-		if len(m) < 2 {
-			continue
-		}
-		name := m[1]
-		if name == symbol || isBuiltinOrKeyword(name) {
-			continue
-		}
-		if !seen[name] {
-			seen[name] = true
-			callees = append(callees, name)
-		}
-	}
-	return callees
+	return extractCallsFromLines([]string{line}, 1, 2, symbol)
 }
 
-// isBuiltinOrKeyword checks if a name is a common keyword, builtin, or package import.
-func isBuiltinOrKeyword(name string) bool {
-	keywords := map[string]bool{
-		// Go keywords and builtins
-		"true": true, "false": true, "nil": true,
-		"len": true, "cap": true, "make": true, "new": true, "append": true,
-		"delete": true, "copy": true, "close": true, "panic": true, "recover": true,
-		"print": true, "println": true,
-		// Control flow keywords (all languages)
-		"if": true, "else": true, "for": true, "while": true, "switch": true,
-		"case": true, "default": true, "return": true, "range": true,
-		"break": true, "continue": true, "fallthrough": true,
-		// Common package names that appear as function call targets
-		"fmt": true, "log": true, "os": true, "io": true, "strings": true,
-		"strconv": true, "filepath": true, "path": true, "context": true,
-		"time": true, "json": true, "http": true, "exec": true, "regexp": true,
-		"sort": true, "math": true, "sync": true, "errors": true,
-		// JS/Python keywords
-		"null": true, "undefined": true, "self": true, "cls": true,
-		"import": true, "from": true, "class": true, "try": true, "catch": true,
-		"finally": true, "raise": true, "yield": true, "async": true, "await": true,
-	}
-	return keywords[name]
+// builtinOrKeywordNames is a static set of common keywords, builtins, and package
+// names excluded from text-based call-graph extraction. It is only ever read.
+var builtinOrKeywordNames = map[string]bool{
+	// Go keywords and builtins
+	"true": true, "false": true, "nil": true,
+	"len": true, "cap": true, "make": true, "new": true, "append": true,
+	"delete": true, "copy": true, "close": true, "panic": true, "recover": true,
+	"print": true, "println": true,
+	// Control flow keywords (all languages)
+	"if": true, "else": true, "for": true, "while": true, "switch": true,
+	"case": true, "default": true, "return": true, "range": true,
+	"break": true, "continue": true, "fallthrough": true,
+	// Common package names that appear as function call targets
+	"fmt": true, "log": true, "os": true, "io": true, "strings": true,
+	"strconv": true, "filepath": true, "path": true, "context": true,
+	"time": true, "json": true, "http": true, "exec": true, "regexp": true,
+	"sort": true, "math": true, "sync": true, "errors": true,
+	// JS/Python keywords
+	"null": true, "undefined": true, "self": true, "cls": true,
+	"import": true, "from": true, "class": true, "try": true, "catch": true,
+	"finally": true, "raise": true, "yield": true, "async": true, "await": true,
 }
 
 func dedupeFunctionRefs(refs []FunctionRef) []FunctionRef {

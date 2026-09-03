@@ -45,7 +45,7 @@ func TestLookupModelsDevLimitFromDisk(t *testing.T) {
 	}
 
 	p := &OpenAIProvider{
-		baseURL:   "https://opencode.ai/zen/v1/",
+		profiles:  []*providerProfile{{name: "default", baseURL: "https://opencode.ai/zen/v1/"}},
 		modelInfo: modelinfo.NewResolver(cache),
 	}
 

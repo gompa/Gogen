@@ -7,8 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"gogen/internal/agent"
 )
 
 // archivePath returns the path to the archive sidecar for a session: the
@@ -28,7 +26,7 @@ func (s *Store) archivePath(workingDir, id string) string {
 // deliberately NOT part of the session snapshot: restoring a session
 // replays the LIVE history, and the archive exists only so shadowed content
 // is recoverable after the fact.
-func (s *Store) AppendArchive(workingDir, id string, entry agent.ArchiveEntry) error {
+func (s *Store) AppendArchive(workingDir, id string, entry ArchiveEntry) error {
 	if !s.enabled || id == "" {
 		return fmt.Errorf("session persistence disabled")
 	}
