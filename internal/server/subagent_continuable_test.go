@@ -38,7 +38,36 @@ func newContinuableServer(t *testing.T, childProvider func() llm.LLMProvider) (*
 	// that write would race the test's TempDir removal ("directory not
 	// empty"); wait for the delivery machinery to go quiet first.
 	t.Cleanup(func() { waitForParentDeliveriesSettled(t, s, a) })
+	// The SpawnBackground goroutine's post-turn orphan sweep (Store.Delete
+	// → index rewrite) runs AFTER the child is unregistered, so a test can
+	// return — and its TempDir start being removed — while that write is
+	// still in flight (macOS CI: "TempDir RemoveAll cleanup: ... directory
+	// not empty"). Wait for every spawn goroutine to exit first.
+	t.Cleanup(func() { waitForChildSpawnsSettled(t, s) })
 	return s, a
+}
+
+// waitForChildSpawnsSettled waits (bounded) until every SpawnBackground
+// goroutine has fully exited — including its post-turn orphan sweep, the
+// last disk write the lifecycle performs. A plain WaitGroup wait would
+// hang the whole package if a test ever leaves a child blocked in a
+// provider without cancelling it, so poll with a deadline instead.
+func waitForChildSpawnsSettled(t *testing.T, s *Server) {
+	t.Helper()
+	sp := continuableSpawner(t, s)
+	waitFor(t, 5*time.Second, func() bool {
+		done := make(chan struct{})
+		go func() {
+			sp.spawnWg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+			return true
+		case <-time.After(100 * time.Millisecond):
+			return false
+		}
+	})
 }
 
 func continuableSpawner(t *testing.T, s *Server) *subagentSpawner {

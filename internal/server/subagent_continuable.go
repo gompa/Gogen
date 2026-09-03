@@ -384,7 +384,9 @@ func (sp *subagentSpawner) SpawnBackground(ctx context.Context, parent *agent.Ag
 		return "", spawnCapError(sp.concurrentLimit(), true)
 	}
 
+	sp.spawnWg.Add(1)
 	go func() {
+		defer sp.spawnWg.Done()
 		report, runErr := sp.runChildTurn(context.Background(), childRt, agent.FormatSubagentJob(rawJob))
 		// Sweep the orphan on EVERY exit path: a concurrent DELETE of the
 		// parent cascades the child's file away and a write that lands

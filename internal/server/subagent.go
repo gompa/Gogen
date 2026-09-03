@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"gogen/internal/agent"
@@ -42,6 +43,13 @@ type subagentSpawner struct {
 	// maxLiveGuard overrides the internal per-parent cap on non-finished
 	// children (0 = defaultMaxLiveSubagents — see liveGuardLimit).
 	maxLiveGuard int
+	// spawnWg tracks in-flight SpawnBackground goroutines. The goroutine's
+	// post-turn orphan sweep (Store.Delete → index rewrite) runs AFTER the
+	// child is unregistered, so "child gone from the registry" is not a
+	// quiescence signal: test cleanups wait on this before removing their
+	// temp dir, or the sweep's write races the cleanup ("directory not
+	// empty" in the TempDir RemoveAll).
+	spawnWg sync.WaitGroup
 }
 
 // truncateReport bounds the tool result returned to the parent agent.
