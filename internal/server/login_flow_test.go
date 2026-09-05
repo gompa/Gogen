@@ -26,7 +26,7 @@ import (
 	"gogen/internal/agent"
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
-	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 )
 
 // loginFlowServer is a real server with token auth (and optionally a
@@ -41,7 +41,7 @@ type loginFlowServer struct {
 func newLoginFlowServer(t *testing.T, token, pairCode string, pairExpiry time.Time) *loginFlowServer {
 	t.Helper()
 	dir := t.TempDir()
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
 	a := agent.NewAgent(prov, exec, ctxMgr)
@@ -439,7 +439,7 @@ func TestLoginFlowRestartLifecycle(t *testing.T) {
 func TestLoginFlowBootstrapRateLimit(t *testing.T) {
 	const token = "tok-ratelimit"
 	dir := t.TempDir()
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
 	a := agent.NewAgent(prov, exec, ctxMgr)

@@ -156,63 +156,12 @@ func formatToolArgs(args map[string]any) string {
 
 // formatArgsCompact renders inline JSON tool-call args like formatToolArgs,
 // skipping the diff key; values longer than maxLen are truncated. When no
-// keys survive, returns "".
-func formatArgsCompact(rawJSON string, maxLen int) string {
+// keys survive, returns "". Takes a byte slice so streaming callers can pass
+// the append-grown args buffer without an O(N) string materialization.
+func formatArgsCompact(rawJSON []byte, maxLen int) string {
 	args, err := parseInlineJSONArgs(rawJSON)
 	if err != nil || len(args) == 0 {
 		return ""
 	}
 	return formatArgsMap(args, maxLen, func(k string) bool { return k == "diff" })
-}
-
-// extractDiffValue extracts the "diff" string value from raw (possibly incomplete)
-// JSON tool-call arguments. It handles escaped newlines and quotes.
-// Returns the unescaped diff text and true if any content was found.
-func extractDiffValue(rawJSON string) (string, bool) {
-	idx := strings.Index(rawJSON, `"diff"`)
-	if idx < 0 {
-		return "", false
-	}
-	// Skip past "diff", optional whitespace, :, optional whitespace, opening "
-	rest := rawJSON[idx+6:]
-	rest = strings.TrimLeft(rest, " \t")
-	if len(rest) == 0 || rest[0] != ':' {
-		return "", false
-	}
-	rest = rest[1:]
-	rest = strings.TrimLeft(rest, " \t")
-	if len(rest) == 0 || rest[0] != '"' {
-		return "", false
-	}
-	rest = rest[1:] // skip opening "
-
-	var buf strings.Builder
-	i := 0
-	for i < len(rest) {
-		if rest[i] == '\\' && i+1 < len(rest) {
-			switch rest[i+1] {
-			case 'n':
-				buf.WriteByte('\n')
-			case 't':
-				buf.WriteByte('\t')
-			case '"':
-				buf.WriteByte('"')
-			case '\\':
-				buf.WriteByte('\\')
-			case 'r':
-				// \r is a no-op in the diff; skip
-			default:
-				buf.WriteByte(rest[i])
-				buf.WriteByte(rest[i+1])
-			}
-			i += 2
-		} else if rest[i] == '"' {
-			// Unescaped quote — end of string
-			return buf.String(), true
-		} else {
-			buf.WriteByte(rest[i])
-			i++
-		}
-	}
-	return buf.String(), buf.Len() > 0
 }

@@ -21,8 +21,10 @@ func runTUI(ctx context.Context, a *agent.Agent, cfg *config.Config, restoredMod
 	c := tui.NewWithWorkspace(a, cfg, server.NewWorkspaceForHost(a, cfg))
 	c.SetStartupNotices(notices)
 	// tui.New installs the model-change hook (ForceRender), so a background
-	// ValidateRestoredModel that clears or auto-selects a restored model
-	// re-renders the status bar even while the terminal is idle.
-	go a.ValidateRestoredModel(context.Background(), restoredModel)
+	// validation that clears or auto-selects a restored model re-renders the
+	// status bar even while the terminal is idle — including later
+	// /resume-driven validations. The nil callback keeps that hook (the
+	// agent helper overwrites it only when given a callback).
+	a.ValidateRestoredModelAsync(restoredModel, nil)
 	c.Run(ctx)
 }

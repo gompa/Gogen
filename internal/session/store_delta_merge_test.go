@@ -22,7 +22,7 @@ import (
 
 func TestLoadDropsStaleDeltaAfterCrash(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	store.SetAutoPrune(false)
 
 	id := "sess1"

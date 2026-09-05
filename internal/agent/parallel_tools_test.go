@@ -11,6 +11,7 @@ import (
 
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 )
 
 // fakeMCPRegistry is a minimal MCPToolRegistry for eligibility tests.
@@ -63,7 +64,7 @@ func TestToolCallsParallelEligible(t *testing.T) {
 // never passes the parallel-eligibility classifier (covered separately).
 func TestExecuteToolCallsParallelStreamsToolOutput(t *testing.T) {
 	exec := NewExecutor(t.TempDir())
-	a := NewAgent(llm.NewMockProvider(), exec, nil)
+	a := NewAgent(llmtest.NewMockProvider(), exec, nil)
 
 	// Each command prints in multiple chunks; every Write from the child
 	// process is forwarded to the sink, so concatenated chunks per call
@@ -148,7 +149,7 @@ func TestExecuteToolCallsParallelRunsReadOnlyToolsConcurrently(t *testing.T) {
 		}
 	}
 
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	prov.StreamResults = []*llm.StreamResult{
 		{
 			ToolCalls: []llm.ToolCall{
@@ -236,7 +237,7 @@ func TestToolCallsParallelCancelStillClosesEveryToolCall(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	prov.StreamResults = []*llm.StreamResult{
 		{
 			ToolCalls: []llm.ToolCall{
@@ -300,7 +301,7 @@ func TestExecuteToolCallsParallelCancelKeepsCompletedResults(t *testing.T) {
 	}
 
 	exec := NewExecutor(dir)
-	a := NewAgent(llm.NewMockProvider(), exec, nil)
+	a := NewAgent(llmtest.NewMockProvider(), exec, nil)
 
 	builtin := BuiltinToolHandlers()
 	orig := builtin["read_file"]

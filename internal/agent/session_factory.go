@@ -104,7 +104,7 @@ func NewSessionAgent(opts SessionAgentOptions, snap *SessionSnapshot, id string)
 	a.PinManager = NewPinManager()
 	a.DebugCompareMessages = opts.DebugCompareMessages
 	a.SessionStore = opts.Store
-	a.SessionID = id
+	a.SetSessionID(id)
 	a.SetMCPRegistry(opts.MCPRegistry)
 	if opts.ToolHandlers != nil {
 		a.SetToolHandlers(opts.ToolHandlers)

@@ -10,15 +10,16 @@ package server
 // harness cannot create real TCP backpressure, so the write path can be
 // stalled server-side via GOGEN_WS_SENDQ_SIZE / GOGEN_WS_STALL_MS /
 // GOGEN_WS_STALL_AFTER_MS / GOGEN_WS_STALL_FOR_MS / GOGEN_WS_STALL_FIRST_CONN
-// (see wsDebugConfigLoad in server.go). GOGEN_LIVE_CALL_MS overrides the
-// stub turn length. Example — queue-full detach → headless completion →
-// re-attach recovery (tmp/live_stall_detach.js):
+// (see wsDebugConfigLoad in ws_conn_debug.go). These knobs only exist in
+// debug builds, so run the harness with -tags debug. GOGEN_LIVE_CALL_MS
+// overrides the stub turn length. Example — queue-full detach → headless
+// completion → re-attach recovery (tmp/live_stall_detach.js):
 //
 //	GOGEN_LIVE_HARNESS=1 \
 //	GOGEN_WS_SENDQ_SIZE=2 GOGEN_WS_STALL_MS=6000 \
 //	GOGEN_WS_STALL_AFTER_MS=3000 GOGEN_WS_STALL_FOR_MS=7000 \
 //	GOGEN_LIVE_CALL_MS=25000 \
-//	go test ./internal/server -run TestLiveHarnessServer -v &
+//	go test -tags debug ./internal/server -run TestLiveHarnessServer -v &
 //	sleep 3 && node tmp/live_stall_detach.js
 //
 // The stall must exceed enqueueJSON's 5s queue-full timeout: with the tiny
@@ -144,7 +145,7 @@ func TestLiveHarnessServer(t *testing.T) {
 		}
 		a.RestoreSessionLocal(agent.SessionSnapshot{Messages: msgs}, a.SessionID)
 	}
-	a.SessionStore = session.NewStore(true)
+	a.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
 	s := NewServer(a, &config.Config{})
 
 	// Bind a fixed port so the jsdom harness can connect.

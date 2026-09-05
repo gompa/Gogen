@@ -10,7 +10,7 @@ import (
 
 func TestDeleteSession(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	id := "sess-del"
 	if err := store.Save(id, SessionSnapshot{
 		WorkingDir: dir,
@@ -31,7 +31,7 @@ func TestDeleteSession(t *testing.T) {
 // skip), yet deleting it is a success — no "session not found" error.
 func TestDeleteNeverPersistedSession(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	if err := store.Delete(dir, "never-saved"); err != nil {
 		t.Fatalf("Delete of never-persisted session = %v, want nil", err)
 	}
@@ -42,7 +42,7 @@ func TestDeleteNeverPersistedSession(t *testing.T) {
 // full Save): the delete succeeds and the delta is cleaned up.
 func TestDeleteDeltaOnlySession(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	id := "delta-only"
 	if err := store.AppendMessages(id, SessionSnapshot{
 		WorkingDir: dir,
@@ -59,7 +59,7 @@ func TestDeleteDeltaOnlySession(t *testing.T) {
 }
 
 func TestDeleteSessionRejectsPathTraversal(t *testing.T) {
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	if err := store.Delete("/tmp", "../evil"); err == nil {
 		t.Fatal("expected invalid id error")
 	}
@@ -70,7 +70,7 @@ func TestDeleteSessionRejectsPathTraversal(t *testing.T) {
 // payload is loaded, and missing sessions return nil.
 func TestStoreInfo(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	if info := store.Info(dir, "missing"); info != nil {
 		t.Fatalf("Info(missing) = %+v, want nil", info)
 	}

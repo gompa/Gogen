@@ -4,11 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os"
-	"strconv"
-	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -36,70 +32,6 @@ const (
 	wsStreamDrainWait = 2 * time.Second
 )
 
-// ── Debug-only transport instruments (live harness) ─────────────────────
-// The jsdom harness (tmp/live_stall_detach.js) cannot create real TCP
-// backpressure — its WebSocket drains instantly — so these env vars inject
-// the stall server-side. Every knob is off by default; with none set the
-// write path is byte-for-byte unchanged.
-//
-//	GOGEN_WS_SENDQ_SIZE         override wsSendQueueSize (default 4096). A
-//	                            tiny queue under a stalling writer overflows
-//	                            quickly, so enqueueJSON's 5s timeout fires
-//	                            and broadcast detaches the socket — the
-//	                            "stops mid-turn" candidate (DEBUG_PLAN.md C).
-//	GOGEN_WS_STALL_MS           sleep this long before every data write once
-//	                            stalling has begun (simulated slow client).
-//	GOGEN_WS_STALL_AFTER_MS     begin stalling only once the connection has
-//	                            been alive this long, so the harness can set
-//	                            up panes and turns at normal speed first.
-//	GOGEN_WS_STALL_FOR_MS       end stalling this long after it began, so
-//	                            the writer drains the queue and a re-attach
-//	                            can recover; 0/unset = stall for the
-//	                            connection's lifetime.
-//	GOGEN_WS_STALL_FIRST_CONN=1 stall only the first connection, so a
-//	                            reconnect (e.g. a stall ≥ wsWriteTimeout that
-//	                            kills the writer) is clean.
-type wsDebugConfig struct {
-	sendQSize  int
-	stall      time.Duration
-	stallAfter time.Duration
-	stallFor   time.Duration
-	firstConn  bool
-}
-
-var (
-	wsDebugOnce  sync.Once
-	wsDebugCfg   wsDebugConfig
-	wsDebugConns atomic.Uint64 // debug-only: connection ordinal for GOGEN_WS_STALL_FIRST_CONN
-)
-
-// wsDebugConfigLoad reads the GOGEN_WS_STALL_*/GOGEN_WS_SENDQ_SIZE env vars
-// once per process (they cannot change mid-run) and returns the config.
-func wsDebugConfigLoad() wsDebugConfig {
-	wsDebugOnce.Do(func() {
-		cfg := wsDebugConfig{}
-		if v := strings.TrimSpace(os.Getenv("GOGEN_WS_SENDQ_SIZE")); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				cfg.sendQSize = n
-			}
-		}
-		ms := func(name string) time.Duration {
-			if v := strings.TrimSpace(os.Getenv(name)); v != "" {
-				if n, err := strconv.Atoi(v); err == nil && n > 0 {
-					return time.Duration(n) * time.Millisecond
-				}
-			}
-			return 0
-		}
-		cfg.stall = ms("GOGEN_WS_STALL_MS")
-		cfg.stallAfter = ms("GOGEN_WS_STALL_AFTER_MS")
-		cfg.stallFor = ms("GOGEN_WS_STALL_FOR_MS")
-		cfg.firstConn = strings.TrimSpace(os.Getenv("GOGEN_WS_STALL_FIRST_CONN")) == "1"
-		wsDebugCfg = cfg
-	})
-	return wsDebugCfg
-}
-
 // drainStreamErr waits for the stream goroutine to signal exit.
 // Returns true if the signal arrived, false on timeout (caller should keep ch).
 func drainStreamErr(ch chan error) bool {
@@ -116,10 +48,9 @@ func drainStreamErr(ch chan error) bool {
 }
 
 func newWSConn(conn *websocket.Conn) *wsConn {
-	cfg := wsDebugConfigLoad()
 	qsize := wsSendQueueSize
-	if cfg.sendQSize > 0 {
-		qsize = cfg.sendQSize // GOGEN_WS_SENDQ_SIZE: debug-only tiny queue
+	if n := wsDebugSendQueueSize(); n > 0 {
+		qsize = n // GOGEN_WS_SENDQ_SIZE (debug build only)
 	}
 	w := &wsConn{
 		conn:  conn,
@@ -140,23 +71,14 @@ func (w *wsConn) writeLoop() {
 	defer close(w.done)
 	ticker := time.NewTicker(wsPingInterval)
 	defer ticker.Stop()
-	// Debug-only backpressure (tmp/live_stall_detach.js): sleep before each
-	// data write inside the [stallStart, stallEnd] window to simulate a
-	// client that cannot drain its socket. The write deadline is set BEFORE
-	// the sleep, so a stall ≥ wsWriteTimeout trips it and the writer dies
-	// (socket drop → browser reconnects), while a smaller stall merely makes
-	// the writer lag the stream and the send queue fills (detach via
-	// enqueueJSON's 5s timeout). Zero stall = the path is untouched.
-	cfg := wsDebugConfigLoad()
-	stallStart := time.Now().Add(cfg.stallAfter)
-	stallEnd := stallStart.Add(cfg.stallFor)
-	if cfg.stallFor == 0 {
-		stallEnd = stallStart.Add(24 * time.Hour) // unset = stall for the connection's lifetime
-	}
-	stallEnabled := cfg.stall > 0
-	if cfg.firstConn && wsDebugConns.Add(1) > 1 {
-		stallEnabled = false // only the first connection stalls; reconnects are clean
-	}
+	// Debug-only backpressure (tmp/live_stall_detach.js, debug builds):
+	// stall.delay sleeps before each data write to simulate a client that
+	// cannot drain its socket. The write deadline is set BEFORE the sleep,
+	// so a stall ≥ wsWriteTimeout trips it and the writer dies (socket drop
+	// → browser reconnects), while a smaller stall merely makes the writer
+	// lag the stream and the send queue fills (detach via enqueueJSON's 5s
+	// timeout). Compiled out of production builds (ws_conn_release.go).
+	stall := newWSStallState()
 	for {
 		select {
 		case <-w.quit:
@@ -168,8 +90,8 @@ func (w *wsConn) writeLoop() {
 				log.Printf("websocket set write deadline: %v", err)
 				return
 			}
-			if stallEnabled && time.Now().After(stallStart) && time.Now().Before(stallEnd) {
-				time.Sleep(cfg.stall)
+			if d := stall.delay(time.Now()); d > 0 {
+				time.Sleep(d)
 			}
 			err := w.conn.WriteJSON(msg)
 			w.mu.Unlock()

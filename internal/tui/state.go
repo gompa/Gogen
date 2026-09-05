@@ -204,17 +204,19 @@ type Model struct {
 	streamAssistantLine int // chatLines index for the live assistant line (-1 if none)
 	streamThinkingBuf   strings.Builder
 	streamThinkingOpen  bool
-	streamThinkingLine  int               // chatLines index for the open thinking line (-1 if none)
-	streamToolCallNames map[int]string    // index -> name
-	streamToolCallArgs  map[int]string    // index -> accumulated args deltas
-	streamToolCallIDs   map[int]string    // index -> call ID (for correlating results)
-	streamToolCallLines map[int]int       // index -> chatLines index where the tool call line was added
-	toolCallDiffs       map[string]string // call ID -> diff text (for patch_file/show_diff)
-	activeToolName      string            // tool being prepared or executed; names the progress indicator
+	streamThinkingLine  int                     // chatLines index for the open thinking line (-1 if none)
+	streamThinkingCache streamThinkingCache     // incremental render cache for the open thinking block (see streaming.go)
+	streamToolCallNames map[int]string          // index -> name
+	streamToolCallArgs  map[int]*streamToolArgs // index -> accumulated args + derived display state
+	streamToolCallIDs   map[int]string          // index -> call ID (for correlating results)
+	streamToolCallLines map[int]int             // index -> chatLines index where the tool call line was added
+	toolCallDiffs       map[string]string       // call ID -> diff text (for patch_file/show_diff)
+	activeToolName      string                  // tool being prepared or executed; names the progress indicator
 
-	streamToolDiffCount map[int]int     // index -> number of diff lines already rendered progressively
-	streamToolDiffStart map[int]int     // index -> chatLines index where the first diff line is (after top border)
-	toolDiffShown       map[string]bool // call ID -> true if diff was shown progressively (skip in result)
+	streamToolDiffCount  map[int]int                   // index -> number of diff lines already rendered progressively
+	streamToolDiffStart  map[int]int                   // index -> chatLines index where the first diff line is (after top border)
+	streamToolDiffRender map[int]*streamToolDiffRender // index -> incremental extract/render state for the streaming "diff" arg
+	toolDiffShown        map[string]bool               // call ID -> true if diff was shown progressively (skip in result)
 	// Input history
 	inputHistory []string
 	historyIdx   int
@@ -351,33 +353,34 @@ func NewModel(a *agent.Agent, cfg *config.Config) *Model {
 	}
 
 	m := Model{
-		agent:               a,
-		cfg:                 cfg,
-		viewport:            vp,
-		textarea:            ta,
-		focus:               FocusInput,
-		modal:               ModalNone,
-		streaming:           false,
-		verbose:             verbose,
-		spinner:             newProgressSpinner(),
-		progressPhase:       progressHidden,
-		chatLines:           make([]string, 0, 64), // pre-allocate to reduce GC during streaming
-		streamAssistantLine: -1,
-		streamThinkingLine:  -1,
-		streamToolCallNames: make(map[int]string),
-		streamToolCallArgs:  make(map[int]string),
-		streamToolCallIDs:   make(map[int]string),
-		streamToolCallLines: make(map[int]int),
-		toolCallDiffs:       make(map[string]string),
-		streamToolDiffCount: make(map[int]int),
-		streamToolDiffStart: make(map[int]int),
-		toolDiffShown:       make(map[string]bool),
-		keys:                DefaultKeyMap,
-		sessionID:           "",
-		selectionYOff:       -1,
-		selection:           nil,
-		wrappedLines:        nil,
-		statusMsg:           "",
+		agent:                a,
+		cfg:                  cfg,
+		viewport:             vp,
+		textarea:             ta,
+		focus:                FocusInput,
+		modal:                ModalNone,
+		streaming:            false,
+		verbose:              verbose,
+		spinner:              newProgressSpinner(),
+		progressPhase:        progressHidden,
+		chatLines:            make([]string, 0, 64), // pre-allocate to reduce GC during streaming
+		streamAssistantLine:  -1,
+		streamThinkingLine:   -1,
+		streamToolCallNames:  make(map[int]string),
+		streamToolCallArgs:   make(map[int]*streamToolArgs),
+		streamToolCallIDs:    make(map[int]string),
+		streamToolCallLines:  make(map[int]int),
+		toolCallDiffs:        make(map[string]string),
+		streamToolDiffCount:  make(map[int]int),
+		streamToolDiffStart:  make(map[int]int),
+		streamToolDiffRender: make(map[int]*streamToolDiffRender),
+		toolDiffShown:        make(map[string]bool),
+		keys:                 DefaultKeyMap,
+		sessionID:            "",
+		selectionYOff:        -1,
+		selection:            nil,
+		wrappedLines:         nil,
+		statusMsg:            "",
 	}
 
 	if a != nil {

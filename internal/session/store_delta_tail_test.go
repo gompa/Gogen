@@ -46,7 +46,7 @@ func writeDeltaFor(t *testing.T, store *Store, dir, id string, base int, msgs ..
 // must keep the two messages that exist only in the delta.
 func TestLoadKeepsDeltaTailWhenSnapshotExtendsBase(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	store.SetAutoPrune(false)
 	id := "sess1"
 
@@ -107,7 +107,7 @@ func TestLoadKeepsDeltaTailWhenSnapshotExtendsBase(t *testing.T) {
 // merged, so no foreign/duplicated messages appear.
 func TestLoadDropsDivergedDeltaWhenSnapshotTailDiffers(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	store.SetAutoPrune(false)
 	id := "sess1"
 
@@ -157,7 +157,7 @@ func TestLoadDropsDivergedDeltaWhenSnapshotTailDiffers(t *testing.T) {
 // merged result without duplicating the absorbed prefix.
 func TestTailMergeIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	store.SetAutoPrune(false)
 	id := "sess1"
 
@@ -207,7 +207,7 @@ func TestTailMergeIsIdempotent(t *testing.T) {
 // must be dropped, never merged.
 func TestLoadDropsDeltaWhenSnapshotShorterThanBase(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	store.SetAutoPrune(false)
 	id := "sess1"
 

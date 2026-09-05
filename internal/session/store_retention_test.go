@@ -5,7 +5,7 @@ import "testing"
 // TestStoreSetRetention verifies the runtime retention swap and its
 // normalization (0 = default, negative maxAgeDays = keep forever).
 func TestStoreSetRetention(t *testing.T) {
-	s := NewStore(true)
+	s := NewStoreWithOptions(true, StoreOptions{})
 	s.SetRetention(3, 7)
 	if s.MaxCount() != 3 || s.MaxAgeDays() != 7 {
 		t.Fatalf("retention after set = %d/%d, want 3/7", s.MaxCount(), s.MaxAgeDays())

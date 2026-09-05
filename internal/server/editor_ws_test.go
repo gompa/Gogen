@@ -15,7 +15,7 @@ import (
 	"gogen/internal/agent"
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
-	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 )
 
 // dialEditor opens a websocket to the /ws/editor endpoint of a running test
@@ -39,7 +39,7 @@ func TestWSEditorEndpointFSRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
 	a := agent.NewAgent(prov, exec, ctxMgr)
@@ -135,7 +135,7 @@ func TestWSEditorGitStatusRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
 	a := agent.NewAgent(prov, exec, ctxMgr)

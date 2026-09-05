@@ -57,3 +57,16 @@ func TestWriteIgnoresAmbientEnvDuringTests(t *testing.T) {
 		t.Fatalf("ambient GOGEN_DEBUG_LOG should be ignored during tests, got err=%v", err)
 	}
 }
+
+// CloseLog is the test-only log-file cleanup, moved out of log.go (nothing
+// in production closes the handle; Configure reuses/replaces the open file).
+// Closing the handle lets tests on Windows rename/delete the log file.
+func CloseLog() {
+	writeMu.Lock()
+	defer writeMu.Unlock()
+	if logFile != nil {
+		_ = logFile.Close()
+		logFile = nil
+	}
+	logPathCached = ""
+}

@@ -9,6 +9,7 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 	"gogen/internal/session"
 )
 
@@ -18,21 +19,21 @@ import (
 // "parent-model"; the child provider is seeded with "default-model" (the
 // cfg.OpenAIModel analog of the web workspace default) and serves a canned
 // report.
-func spawnTUISubagent(t *testing.T, cfg *config.Config, childModels []llm.ModelInfo, job, model string) (*llm.MockProvider, string, error) {
+func spawnTUISubagent(t *testing.T, cfg *config.Config, childModels []llm.ModelInfo, job, model string) (*llmtest.MockProvider, string, error) {
 	t.Helper()
-	parentProv := llm.NewMockProvider()
+	parentProv := llmtest.NewMockProvider()
 	if err := parentProv.SetModel("parent-model"); err != nil {
 		t.Fatal(err)
 	}
 	exec := agent.NewExecutor(t.TempDir())
 	parent := agent.NewAgent(parentProv, exec, contextmgr.NewManager(parentProv, contextmgr.Settings{ContextLimit: 128000}))
-	parent.SessionStore = session.NewStore(true)
+	parent.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
 
-	var child *llm.MockProvider
+	var child *llmtest.MockProvider
 	sp := &tuiSubagentSpawner{
 		cfg: cfg,
 		providerFactory: func(_ *config.Config, _ *agent.Agent) llm.LLMProvider {
-			p := llm.NewMockProvider()
+			p := llmtest.NewMockProvider()
 			p.Model = "default-model"
 			p.Models = childModels
 			p.StreamResults = []*llm.StreamResult{{Content: "report"}}
@@ -45,7 +46,7 @@ func spawnTUISubagent(t *testing.T, cfg *config.Config, childModels []llm.ModelI
 }
 
 // assertChildModel checks the child provider's final model.
-func assertChildModel(t *testing.T, child *llm.MockProvider, want string) {
+func assertChildModel(t *testing.T, child *llmtest.MockProvider, want string) {
 	t.Helper()
 	if child == nil {
 		t.Fatal("child provider was never created")

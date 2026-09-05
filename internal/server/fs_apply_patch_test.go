@@ -15,7 +15,7 @@ import (
 	"gogen/internal/agent"
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
-	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 )
 
 // TestFSApplyPatchAppliesDiff exercises the fs_apply_patch WS handler end to
@@ -29,7 +29,7 @@ func TestFSApplyPatchAppliesDiff(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
 	a := agent.NewAgent(prov, exec, ctxMgr)
@@ -89,7 +89,7 @@ func TestFSApplyPatchRejectsStaleDiff(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
 	a := agent.NewAgent(prov, exec, ctxMgr)
@@ -144,7 +144,7 @@ func TestFSApplyPatchRejectsDeleteOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
 	a := agent.NewAgent(prov, exec, ctxMgr)
@@ -203,7 +203,7 @@ func TestFSApplyPatchWaitsForFSLock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
 	a := agent.NewAgent(prov, exec, ctxMgr)

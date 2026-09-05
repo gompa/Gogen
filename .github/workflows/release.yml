@@ -37,7 +37,7 @@ jobs:
         run: GOOS=darwin GOARCH=amd64 go build -o gogen-darwin-amd64 -ldflags="-s -w" .
       - name: Build darwin/arm64 (CGO)
         run: GOOS=darwin GOARCH=arm64 go build -o gogen-darwin-arm64 -ldflags="-s -w" .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos
           path: gogen-darwin-*
@@ -56,7 +56,7 @@ jobs:
         run: choco install mingw -y
       - name: Build windows/amd64 (CGO — full tree-sitter)
         run: GOOS=windows GOARCH=amd64 CGO_ENABLED=1 go build -o gogen-windows-amd64.exe -ldflags="-s -w" .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: gogen-windows-amd64.exe
@@ -65,7 +65,7 @@ jobs:
     needs: [linux, macos, windows]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
       - name: Collect binaries
         run: |
           mv linux/gogen-linux-* .

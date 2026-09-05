@@ -9,6 +9,7 @@ import (
 	"gogen/internal/agent"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 )
 
 // TestValidateImageInputs covers the acceptance rules for user-attached
@@ -65,7 +66,7 @@ func TestValidateImageInputs(t *testing.T) {
 // stores the user message with its images so they survive persistence,
 // rendering, and resend.
 func TestStreamProcessInputWithImagesAppendsImageMessage(t *testing.T) {
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := agent.NewExecutor(t.TempDir())
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 128000})
 	a := agent.NewAgent(prov, exec, ctxMgr)

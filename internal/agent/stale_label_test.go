@@ -4,14 +4,14 @@ import (
 	"testing"
 
 	"gogen/internal/contextmgr"
-	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 )
 
 // noModelProvider is a MockProvider whose ModelName() is always empty, so
 // requireModelSelected fails and StreamProcessInput's first-turn error path
 // (append → truncate) is exercised.
 type noModelProvider struct {
-	llm.MockProvider
+	llmtest.MockProvider
 }
 
 func (p *noModelProvider) ModelName() string { return "" }
@@ -23,7 +23,7 @@ func (p *noModelProvider) ModelName() string { return "" }
 // exists (the next turn would never re-derive it, since the label is only
 // set when empty).
 func TestFailedFirstTurnClearsStaleLabel(t *testing.T) {
-	prov := &noModelProvider{*llm.NewMockProvider()}
+	prov := &noModelProvider{*llmtest.NewMockProvider()}
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 1000})
 	a := NewAgent(prov, NewExecutor(t.TempDir()), ctxMgr)
 

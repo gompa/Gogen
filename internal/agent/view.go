@@ -303,11 +303,13 @@ func (a *Agent) runForcedSummarization(ctx context.Context, h *llm.StreamHandler
 	counts := append([]int(nil), a.tokenCounts...)
 	a.statsMu.RUnlock()
 	compacted, newPins, err := a.Context.Compact(ctx, a.Messages, contextmgr.CompactOptions{
-		ViewPrefix: a.systemPromptPrefix(),
-		Counts:     counts,
-		Pinned:     pinned,
-		Keep:       contextmgr.NoTailKeep,
-		Forced:     true,
+		ViewPrefix:   a.systemPromptPrefix(),
+		Counts:       counts,
+		Pinned:       pinned,
+		Keep:         contextmgr.NoTailKeep,
+		Forced:       true,
+		Tools:        a.llmTools(),
+		AllowedTools: a.AllowedToolNames(),
 	})
 	if err != nil {
 		a.noteCompactFailure(err)
@@ -655,10 +657,12 @@ func (a *Agent) compactToFit(ctx context.Context, pinned map[int]struct{}, count
 			keepOpt = contextmgr.NoTailKeep
 		}
 		compacted, newPins, err := a.Context.Compact(ctx, a.Messages, contextmgr.CompactOptions{
-			ViewPrefix: a.systemPromptPrefix(),
-			Counts:     counts,
-			Pinned:     pinned,
-			Keep:       keepOpt,
+			ViewPrefix:   a.systemPromptPrefix(),
+			Counts:       counts,
+			Pinned:       pinned,
+			Keep:         keepOpt,
+			Tools:        a.llmTools(),
+			AllowedTools: a.AllowedToolNames(),
 		})
 		if err != nil {
 			// A failing summarization call must not be retried on every turn.

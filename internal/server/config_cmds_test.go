@@ -9,6 +9,7 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 	"gogen/internal/session"
 )
 
@@ -98,14 +99,14 @@ func TestSetModelDoesNotDeadlock(t *testing.T) {
 func TestSetModelIsPerSession(t *testing.T) {
 	dir := t.TempDir()
 	exec := agent.NewExecutor(dir)
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	prov.Models = []llm.ModelInfo{
 		{ID: "mock-model", ContextLimit: 128000, Current: true},
 		{ID: "m2", ContextLimit: 128000},
 	}
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 1000})
 	a := agent.NewAgent(prov, exec, ctxMgr)
-	store := session.NewStore(true)
+	store := session.NewStoreWithOptions(true, session.StoreOptions{})
 	a.SessionStore = store
 	s := NewServer(a, &config.Config{})
 	srv := startWSServer(t, s)
@@ -152,7 +153,7 @@ func TestSetModelIsPerSession(t *testing.T) {
 func TestWorkspaceNewSessionAgentKeepsSavedModel(t *testing.T) {
 	dir := t.TempDir()
 	exec := agent.NewExecutor(dir)
-	store := session.NewStore(true)
+	store := session.NewStoreWithOptions(true, session.StoreOptions{})
 	ws := &Workspace{
 		Exec:       exec,
 		Store:      store,
@@ -161,7 +162,7 @@ func TestWorkspaceNewSessionAgentKeepsSavedModel(t *testing.T) {
 		GlobalMode: true,
 		Model:      "m1", // workspace default — must NOT override the saved model
 		ProviderFactory: func() llm.LLMProvider {
-			p := llm.NewMockProvider()
+			p := llmtest.NewMockProvider()
 			_ = p.SetModel("m1")
 			p.Models = []llm.ModelInfo{
 				{ID: "m1", ContextLimit: 128000, Current: true},

@@ -9,6 +9,7 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 	"gogen/internal/session"
 )
 
@@ -17,11 +18,11 @@ import (
 func newLifecycleServer(t *testing.T) (*Server, *agent.Agent, *session.Store) {
 	t.Helper()
 	dir := t.TempDir()
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 1000})
 	a := agent.NewAgent(prov, exec, ctxMgr)
-	store := session.NewStore(true)
+	store := session.NewStoreWithOptions(true, session.StoreOptions{})
 	a.SessionStore = store
 	s := NewServer(a, &config.Config{})
 	return s, a, store
@@ -320,11 +321,11 @@ func TestWorkingDirChangeSyncsAllSessions(t *testing.T) {
 // a subsequent message routes to the new default session.
 func TestTypedNewOverWS(t *testing.T) {
 	dir := t.TempDir()
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 1000})
 	a := agent.NewAgent(prov, exec, ctxMgr)
-	store := session.NewStore(true)
+	store := session.NewStoreWithOptions(true, session.StoreOptions{})
 	a.SessionStore = store
 	s := NewServer(a, &config.Config{})
 	origID := a.SessionID
@@ -486,11 +487,11 @@ func TestEnsureSessionRuntimeRegisteredSetsDefault(t *testing.T) {
 // (invisible to cancel/prune/shutdown).
 func TestDeleteFailureKeepsRuntimeRegistered(t *testing.T) {
 	dir := t.TempDir()
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 1000})
 	a := agent.NewAgent(prov, exec, ctxMgr)
-	store := session.NewStore(false) // disabled: Store.Delete will fail
+	store := session.NewStoreWithOptions(false, session.StoreOptions{}) // disabled: Store.Delete will fail
 	a.SessionStore = store
 	s := NewServer(a, &config.Config{})
 	origID := a.SessionID
@@ -518,7 +519,7 @@ func TestDeleteFailureKeepsRuntimeRegistered(t *testing.T) {
 // over-budget store pruned the evicted session's file away immediately.
 func TestPruneKeepsEvictedSession(t *testing.T) {
 	dir := t.TempDir()
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 1000})
 	a := agent.NewAgent(prov, exec, ctxMgr)

@@ -234,6 +234,39 @@ func (a *Agent) ValidateRestoredModel(ctx context.Context, model string) {
 	}
 }
 
+// ValidateRestoredModelAsync is the async form of ValidateRestoredModel and
+// the single wiring point for the host contract shared by every spawn site
+// (the web runtime wrapper Server.validateModelAsync, the TUI root and /open
+// sessions, and the CLI /resume and single-prompt paths): install the
+// OnModelChanged host hook — when onChanged is non-nil, otherwise the agent
+// keeps whatever hook a host already installed — and run the validation in a
+// background goroutine so no caller blocks on provider ListModels. The hook
+// fires from the validation goroutine after the model is confirmed, cleared,
+// or auto-selected; it must not block. The goroutine is spawned
+// unconditionally: an empty model still drives the context-limit refresh /
+// sole-model auto-select probe, so whether a model warrants validation at
+// all stays with the caller (snap.Model != "", modelInherited, the
+// registration winner).
+func (a *Agent) ValidateRestoredModelAsync(model string, onChanged func()) {
+	if onChanged != nil {
+		a.OnModelChanged = onChanged
+	}
+	go a.ValidateRestoredModel(context.Background(), model)
+}
+
+// SetSessionID makes id the agent's current session and syncs it to the
+// provider: providers that implement llm.SessionIDSetter (OpenAIProvider)
+// tag their OpenCode requests with a per-session header derived from it.
+// Every session transition — startup, restore, /new, /resume, /fork,
+// subagent spawn — goes through here so the provider's session view can
+// never drift from a.SessionID.
+func (a *Agent) SetSessionID(id string) {
+	a.SessionID = id
+	if s, ok := a.Provider.(llm.SessionIDSetter); ok {
+		s.SetSessionID(id)
+	}
+}
+
 // RestoreSession loads messages, mode, and model from a snapshot and makes id
 // the agent's current session. It is the shared restore core used by
 // main.go's startup restore, resumeSessionByID, and the session agent
@@ -241,7 +274,7 @@ func (a *Agent) ValidateRestoredModel(ctx context.Context, model string) {
 // blocked on provider ListModels).
 func (a *Agent) RestoreSession(snap SessionSnapshot, id string) {
 	a.RestoreSessionLocal(snap, id)
-	a.SessionID = id
+	a.SetSessionID(id)
 }
 
 // sameWorkingDir reports whether two working-directory paths refer to the same location.

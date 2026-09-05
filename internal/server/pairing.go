@@ -79,14 +79,6 @@ func (s *Server) SetPairingCode(code string, expiry time.Time) {
 	s.pairUses = 0
 }
 
-// PairingCode returns the current pairing code and its expiry. Callers use
-// it to print the onboarding link/QR before the server starts listening.
-func (s *Server) PairingCode() (string, time.Time) {
-	s.pairMu.Lock()
-	defer s.pairMu.Unlock()
-	return s.pairCode, s.pairExpiry
-}
-
 // consumePairingCode validates a candidate against the installed pairing
 // code and atomically consumes one use on success. The comparison is
 // constant-time (via tokenMatches) on lowercased forms — the code is random

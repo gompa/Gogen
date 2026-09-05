@@ -17,7 +17,7 @@ import (
 // index.json read-modify-write and the createdCache map. Run with -race.
 func TestStoreConcurrentSaveLoadDelete(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	store.SetAutoPrune(false) // registry owns pruning; exercise Save without it
 
 	const n = 12

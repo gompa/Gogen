@@ -88,3 +88,12 @@ func TestPairingDiagnostic(t *testing.T) {
 		t.Fatalf("invalid diagnostic should mention the expiry time, got %q", got)
 	}
 }
+
+// PairingCode is the test-only round-trip read, moved out of pairing.go:
+// production installs the code via SetPairingCode and prints the onboarding
+// link/QR from the value it generated, it never reads it back.
+func (s *Server) PairingCode() (string, time.Time) {
+	s.pairMu.Lock()
+	defer s.pairMu.Unlock()
+	return s.pairCode, s.pairExpiry
+}

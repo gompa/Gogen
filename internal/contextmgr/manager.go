@@ -536,13 +536,9 @@ func (m *Manager) compactBudgetLocked() int {
 	return budget
 }
 
-// ShouldCompact reports whether messages exceed the compaction threshold.
-// EstimateTokens computes fresh each call — safe to call every turn.
-func (m *Manager) ShouldCompact(messages []llm.Message) bool {
-	return m.ShouldCompactWithOverhead(messages, 0)
-}
-
-// ShouldCompactWithOverhead is like ShouldCompact but adds overhead — the
+// ShouldCompactWithOverhead reports whether messages exceed the compaction
+// threshold (EstimateTokens computes fresh each call — safe to call every
+// turn) after adding overhead — the
 // wire cost of the system prompt and tool definitions, which messages does
 // not include — to the estimate before comparing against the budget. Pass
 // zero when the estimate already covers the full request (e.g. a fresh
@@ -593,7 +589,8 @@ const NoTailKeep = -1
 
 // CompactOptions configures a compaction call. Zero-value fields use defaults:
 // Keep=0 (zero) uses the configured CompactKeepRecentMessages; Forced=false
-// applies the minMiddleTokens guard; nil Pinned/Counts/ViewPrefix mean absent.
+// applies the minMiddleTokens guard; nil Pinned/Counts/ViewPrefix/Tools/
+// AllowedTools mean absent.
 type CompactOptions struct {
 	// Keep is the number of recent messages to preserve verbatim.
 	// Zero (the zero value) means "use the configured CompactKeepRecentMessages".
@@ -619,6 +616,17 @@ type CompactOptions struct {
 	// request so the conversation prefix stays byte-identical to the last
 	// turn and the provider's prompt cache covers the bulk of the request.
 	ViewPrefix []llm.Message
+
+	// Tools and AllowedTools carry the tool definitions and allowlist the
+	// agent sends on real turns. The summarization request sends the same
+	// pair (the provider filters Tools through AllowedTools, exactly like a
+	// turn) so the rendered prompt prefix — system + tools + messages —
+	// stays byte-identical to the last turn. Without the tools the rendered
+	// prompt diverges right after the system message and the provider's
+	// prompt cache covers none of the middle. nil = no tools (the
+	// summarization request then cannot reuse the turn's cache).
+	Tools        []llm.Tool
+	AllowedTools map[string]struct{}
 }
 
 // Compact replaces the middle of canonical history with an LLM-generated
@@ -641,12 +649,13 @@ func (m *Manager) Compact(ctx context.Context, messages []llm.Message, opts Comp
 	case keep == NoTailKeep:
 		keep = 0
 	}
-	return m.compactPinned(ctx, opts.ViewPrefix, messages, opts.Counts, opts.Pinned, keep, opts.Forced)
+	return m.compactPinned(ctx, messages, keep, opts)
 }
 
-// compactPinned is the shared implementation of Compact. forced bypasses the
-// minMiddleTokens guard (emergency compaction).
-func (m *Manager) compactPinned(ctx context.Context, viewPrefix, messages []llm.Message, counts []int, pinned map[int]struct{}, keep int, forced bool) ([]llm.Message, map[int]struct{}, error) {
+// compactPinned is the shared implementation of Compact. opts.Forced
+// bypasses the minMiddleTokens guard (emergency compaction).
+func (m *Manager) compactPinned(ctx context.Context, messages []llm.Message, keep int, opts CompactOptions) ([]llm.Message, map[int]struct{}, error) {
+	viewPrefix, counts, pinned, forced := opts.ViewPrefix, opts.Counts, opts.Pinned, opts.Forced
 	if len(messages) <= keep+1 {
 		return messages, copyIntSet(pinned), nil
 	}
@@ -719,7 +728,7 @@ func (m *Manager) compactPinned(ctx context.Context, viewPrefix, messages []llm.
 	// message), and the middle to summarize; the instruction tells the model
 	// to summarize only the middle — head and tail are preserved verbatim by
 	// construction below.
-	summary, err := m.summarizeMiddle(ctx, viewPrefix, messages[:headIdx+1], middle, knownTokens)
+	summary, err := m.summarizeMiddle(ctx, viewPrefix, messages[:headIdx+1], middle, knownTokens, opts.Tools, opts.AllowedTools)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -850,8 +859,11 @@ func firstUserIndex(messages []llm.Message) (int, bool) {
 // knownTokens, when non-negative, is the cached token count of prefix+middle
 // (the messages-derived portion of the request); only the wire prefix and
 // the instruction are then tokenized fresh, avoiding a full re-tokenization
-// of the middle on every compaction.
-func (m *Manager) summarizeMiddle(ctx context.Context, viewPrefix, prefix, middle []llm.Message, knownTokens int) (string, error) {
+// of the middle on every compaction. tools/allowedTools are the turn's tool
+// set (see CompactOptions.Tools): they ride on the request so the rendered
+// prefix matches the last turn, and their token cost is included in the
+// budget check so the request cannot be pushed over the window.
+func (m *Manager) summarizeMiddle(ctx context.Context, viewPrefix, prefix, middle []llm.Message, knownTokens int, tools []llm.Tool, allowedTools map[string]struct{}) (string, error) {
 	if len(middle) == 0 {
 		return "", nil
 	}
@@ -865,8 +877,10 @@ func (m *Manager) summarizeMiddle(ctx context.Context, viewPrefix, prefix, middl
 	// non-portable (rejected by Anthropic and by strict Jinja chat
 	// templates such as Qwen3's "System message must be at the
 	// beginning"), so the instruction rides on the universally legal user
-	// role. The conversation prefix stays byte-identical, so the provider
-	// prompt cache still covers the bulk of the request.
+	// role. The conversation prefix stays byte-identical — INCLUDING the
+	// tool definitions, which are sent on the request (tools/allowedTools,
+	// see CompactOptions.Tools) — so the provider prompt cache covers the
+	// bulk of the request.
 	instruction := llm.Message{Role: "user", Content: summaryInstruction}
 	req := make([]llm.Message, 0, len(viewPrefix)+len(prefix)+len(middle)+1)
 	// Summarization requests must not carry user images: the summary model
@@ -890,14 +904,24 @@ func (m *Manager) summarizeMiddle(ctx context.Context, viewPrefix, prefix, middl
 		reqTokens += m.EstimateTokens(stripImages(viewPrefix))
 		reqTokens += m.EstimateTokens([]llm.Message{instruction})
 	}
+	// The tool definitions ride on the request (prompt-cache prefix) but
+	// are not in req: count them in both branches or the budget check
+	// under-reports the outgoing size. Counted once and reused by the
+	// debuglog entry (its map literal is evaluated eagerly).
+	toolTokens := 0
+	if len(tools) > 0 {
+		toolTokens = EstimateToolTokens(tools)
+	}
+	reqTokens += toolTokens
 	if reqTokens <= budget {
 		debuglog.Write("contextmgr/summarize", "continuation-summary request", "", map[string]any{
 			"path":           "primary",
 			"middleMessages": len(middle),
 			"requestTokens":  reqTokens,
+			"toolTokens":     toolTokens,
 			"budget":         budget,
 		})
-		summary, err := m.summarizeRequest(ctx, req)
+		summary, err := m.summarizeRequest(ctx, req, allowedTools, tools)
 		if err == nil {
 			return summary, nil
 		}
@@ -990,12 +1014,21 @@ func (m *Manager) summarizeMessages(ctx context.Context, messages []llm.Message,
 	return merged, nil
 }
 
+// summaryOutputAllowance is the token budget assumed for the summary output
+// when sizing the flattened single-call path: the recap is short (a few
+// hundred to ~2k tokens), and the allowance keeps input + output under the
+// window. Unlike the continuation-summary request, the flattened call
+// carries no conversation prefix, so it can safely use the full window
+// minus the reserve — the pre-fix limit/2 budget forced middles that fit
+// the window into the recursive (multi-call) path instead of one call.
+const summaryOutputAllowance = 4000
+
 func (m *Manager) maxSummaryInputTokensLocked() int {
 	limit := m.Settings.ContextLimit
 	if limit <= 0 {
 		limit = config.DefaultContextLimit
 	}
-	budget := limit/2 - m.Settings.CompactReserveTokens
+	budget := limit - m.Settings.CompactReserveTokens - summaryOutputAllowance
 	if budget < 2000 {
 		budget = 2000
 	}
@@ -1004,9 +1037,11 @@ func (m *Manager) maxSummaryInputTokensLocked() int {
 
 // summarizeRequest calls the provider with the full continuation-summary
 // request (wire prefix + middle + summaryInstruction) and extracts the
-// summary text from the response.
-func (m *Manager) summarizeRequest(ctx context.Context, request []llm.Message) (string, error) {
-	resp, err := m.Provider.GenerateResponse(ctx, request, nil, nil)
+// summary text from the response. allowedTools/tools are the turn's tool
+// set: sending them (as the turn does) keeps the rendered prompt prefix
+// byte-identical so the provider's prompt cache covers the middle.
+func (m *Manager) summarizeRequest(ctx context.Context, request []llm.Message, allowedTools map[string]struct{}, tools []llm.Tool) (string, error) {
+	resp, err := m.Provider.GenerateResponse(ctx, request, allowedTools, tools)
 	if err != nil {
 		return "", fmt.Errorf("context summarization failed: %w", err)
 	}

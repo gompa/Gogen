@@ -8,12 +8,13 @@ import (
 
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 	"gogen/internal/skills"
 )
 
 func newTestSkillAgent(t *testing.T, enabled bool) *Agent {
 	t.Helper()
-	prov := &llm.MockProvider{}
+	prov := &llmtest.MockProvider{}
 	exec := NewExecutor(t.TempDir())
 	a := NewAgent(prov, exec, contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 128000}))
 	if enabled {

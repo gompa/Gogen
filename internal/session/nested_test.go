@@ -20,7 +20,7 @@ func nestedSnap(workingDir, id, parent string) SessionSnapshot {
 // children (D2) while leaving unrelated sessions alone.
 func TestNestedCascadeDelete(t *testing.T) {
 	dir := t.TempDir()
-	s := NewStore(true)
+	s := NewStoreWithOptions(true, StoreOptions{})
 	if err := s.Save("parent", nestedSnap(dir, "parent", "")); err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestNestedCascadeDelete(t *testing.T) {
 // excluded from the flat list, so nothing else would ever delete them.
 func TestNestedCascadeDeleteGrandchild(t *testing.T) {
 	dir := t.TempDir()
-	s := NewStore(true)
+	s := NewStoreWithOptions(true, StoreOptions{})
 	if err := s.Save("parent", nestedSnap(dir, "parent", "")); err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestNestedCascadeDeleteGrandchild(t *testing.T) {
 // prune the wrong (newest) siblings.
 func TestNestedChildrenLockedFallbackOrdering(t *testing.T) {
 	dir := t.TempDir()
-	s := NewStore(true)
+	s := NewStoreWithOptions(true, StoreOptions{})
 	// Sequential saves give strictly increasing Updated stamps.
 	for _, id := range []string{"old", "mid", "new"} {
 		if err := s.Save(id, nestedSnap(dir, id, "parent")); err != nil {
@@ -107,7 +107,7 @@ func TestNestedChildrenLockedFallbackOrdering(t *testing.T) {
 // (D2), while the just-saved child is always kept.
 func TestNestedPerParentCap(t *testing.T) {
 	dir := t.TempDir()
-	s := NewStore(true)
+	s := NewStoreWithOptions(true, StoreOptions{})
 	if err := s.Save("parent", nestedSnap(dir, "parent", "")); err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestNestedPerParentCap(t *testing.T) {
 // TestNestedParentIDRoundTrip verifies ParentID survives save → load.
 func TestNestedParentIDRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	s := NewStore(true)
+	s := NewStoreWithOptions(true, StoreOptions{})
 	snap := nestedSnap(dir, "child", "parent")
 	if err := s.Save("child", snap); err != nil {
 		t.Fatal(err)
@@ -168,7 +168,7 @@ func TestNestedParentIDRoundTrip(t *testing.T) {
 // session after a restart.
 func TestNestedLatestIDExcluded(t *testing.T) {
 	dir := t.TempDir()
-	s := NewStore(true)
+	s := NewStoreWithOptions(true, StoreOptions{})
 	if err := s.Save("parent", SessionSnapshot{
 		WorkingDir: dir,
 		Messages:   []llm.Message{{Role: "user", Content: "p"}},
@@ -223,7 +223,7 @@ func TestNestedLatestIDExcluded(t *testing.T) {
 // the same directory (restart simulation).
 func TestSubagentOutcomeRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	s := NewStore(true)
+	s := NewStoreWithOptions(true, StoreOptions{})
 	if err := s.Save("parent", SessionSnapshot{
 		WorkingDir: dir,
 		Messages:   []llm.Message{{Role: "user", Content: "p"}},
@@ -269,7 +269,7 @@ func TestSubagentOutcomeRoundTrip(t *testing.T) {
 		t.Fatalf("Info outcome = %+v, want failed/boom", info)
 	}
 	// Fresh store over the same directory (restart): the index persists.
-	s2 := NewStore(true)
+	s2 := NewStoreWithOptions(true, StoreOptions{})
 	info2 := s2.Info(dir, "child")
 	if info2 == nil || info2.SubagentStatus != "failed" {
 		t.Fatalf("Info after restart = %+v, want the persisted outcome", info2)

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -65,4 +66,44 @@ func TestListPinsTruncatesRuneSafe(t *testing.T) {
 	if !utf8.ValidString(out) {
 		t.Fatalf("ListPins output is not valid UTF-8: %q", out)
 	}
+}
+
+// IsPinned, PinnedIndices, and ListPins are the PinManager's test-only read
+// surface, moved out of pins.go: production uses only PinLastUser /
+// ClearPins / ReplacePins / PinnedSet.
+
+// IsPinned reports whether the message at the given index is pinned.
+func (p *PinManager) IsPinned(index int) bool {
+	_, ok := p.pinned[index]
+	return ok
+}
+
+// PinnedIndices returns all pinned indices.
+func (p *PinManager) PinnedIndices() []int {
+	indices := make([]int, 0, len(p.pinned))
+	for idx := range p.pinned {
+		indices = append(indices, idx)
+	}
+	return indices
+}
+
+// ListPins returns a formatted list of pinned messages.
+func (p *PinManager) ListPins(messages []llm.Message) string {
+	if len(p.pinned) == 0 {
+		return "No pinned messages"
+	}
+	var b strings.Builder
+	b.WriteString("Pinned messages (survive compaction):\n")
+	for idx := range p.pinned {
+		if idx >= 0 && idx < len(messages) {
+			content := messages[idx].Content
+			// Rune-safe cut: slicing on bytes could split a multi-byte
+			// character and inject invalid UTF-8 into the tool result.
+			if r := []rune(content); len(r) > 80 {
+				content = string(r[:80]) + "…"
+			}
+			fmt.Fprintf(&b, "  #%d: %s\n", idx, content)
+		}
+	}
+	return b.String()
 }

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 )
 
 // jsonRoundTripStore mimics the session store's JSON persistence of a
@@ -56,7 +57,7 @@ func (s *jsonRoundTripStore) TouchSession(workingDir, id string) error {
 func TestRestoreRoundTripWireBytes(t *testing.T) {
 	dir := t.TempDir()
 
-	a := NewAgent(llm.NewMockProvider(), NewExecutor(dir), nil)
+	a := NewAgent(llmtest.NewMockProvider(), NewExecutor(dir), nil)
 	defer a.Close()
 	a.SetProjectContext("", "guidelines", "", "")
 
@@ -79,7 +80,7 @@ func TestRestoreRoundTripWireBytes(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 
-	b := NewAgent(llm.NewMockProvider(), NewExecutor(dir), nil)
+	b := NewAgent(llmtest.NewMockProvider(), NewExecutor(dir), nil)
 	defer b.Close()
 	b.SetProjectContext("", "guidelines", "", "")
 	b.RestoreSession(snap, "probe-session")

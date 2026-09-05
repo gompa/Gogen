@@ -11,6 +11,7 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 	"gogen/internal/session"
 )
 
@@ -25,7 +26,7 @@ func TestSubagentSpawnEndToEnd(t *testing.T) {
 	// Children get their own provider via the workspace factory: serve a
 	// canned response.
 	s.ws.ProviderFactory = func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.StreamResults = []*llm.StreamResult{{Content: "subagent report here"}}
 		return p
 	}
@@ -181,20 +182,20 @@ func TestSubagentChildPaneGetsTerminalFrames(t *testing.T) {
 // provider factory seeds the workspace default, which may differ).
 func TestSubagentChildInheritsParentModel(t *testing.T) {
 	dir := t.TempDir()
-	parentProv := llm.NewMockProvider()
+	parentProv := llmtest.NewMockProvider()
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(parentProv, contextmgr.Settings{ContextLimit: 128000})
 	a := agent.NewAgent(parentProv, exec, ctxMgr)
-	a.SessionStore = session.NewStore(true)
+	a.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
 	s := NewServer(a, &config.Config{})
 	// The workspace default was the parent's model at construction
 	// ("mock-model"); now the parent switches models per-session.
 	if err := parentProv.SetModel("parent-model"); err != nil {
 		t.Fatal(err)
 	}
-	var created []*llm.MockProvider
+	var created []*llmtest.MockProvider
 	s.ws.ProviderFactory = func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.Model = "default-model"
 		p.Models = []llm.ModelInfo{
 			{ID: "default-model", ContextLimit: 128000},
@@ -223,11 +224,11 @@ func TestSubagentChildInheritsParentModel(t *testing.T) {
 // child on the configured model.
 func TestSubagentConfiguredModelWinsOverInheritance(t *testing.T) {
 	dir := t.TempDir()
-	parentProv := llm.NewMockProvider()
+	parentProv := llmtest.NewMockProvider()
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(parentProv, contextmgr.Settings{ContextLimit: 128000})
 	a := agent.NewAgent(parentProv, exec, ctxMgr)
-	a.SessionStore = session.NewStore(true)
+	a.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
 	s := NewServer(a, &config.Config{})
 	if err := parentProv.SetModel("parent-model"); err != nil {
 		t.Fatal(err)
@@ -236,9 +237,9 @@ func TestSubagentConfiguredModelWinsOverInheritance(t *testing.T) {
 	r := s.ws.GetRuntimeConfig()
 	r.SubagentModel = "configured-model"
 	s.ws.SetRuntimeConfig(r)
-	var created []*llm.MockProvider
+	var created []*llmtest.MockProvider
 	s.ws.ProviderFactory = func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.Model = "default-model"
 		p.Models = []llm.ModelInfo{
 			{ID: "default-model", ContextLimit: 128000},
@@ -268,18 +269,18 @@ func TestSubagentConfiguredModelWinsOverInheritance(t *testing.T) {
 // the spawn — the same fail-open contract as the inheritance branch.
 func TestSubagentConfiguredModelFallbackToDefault(t *testing.T) {
 	dir := t.TempDir()
-	parentProv := llm.NewMockProvider()
+	parentProv := llmtest.NewMockProvider()
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(parentProv, contextmgr.Settings{ContextLimit: 128000})
 	a := agent.NewAgent(parentProv, exec, ctxMgr)
-	a.SessionStore = session.NewStore(true)
+	a.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
 	s := NewServer(a, &config.Config{})
 	r := s.ws.GetRuntimeConfig()
 	r.SubagentModel = "vanished-model"
 	s.ws.SetRuntimeConfig(r)
-	var created []*llm.MockProvider
+	var created []*llmtest.MockProvider
 	s.ws.ProviderFactory = func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.Model = "default-model"
 		p.Models = []llm.ModelInfo{{ID: "default-model", ContextLimit: 128000}}
 		p.StreamResults = []*llm.StreamResult{{Content: "report"}}
@@ -326,19 +327,19 @@ func TestSubagentChildThinkingLevelCascade(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			parentProv := llm.NewMockProvider()
+			parentProv := llmtest.NewMockProvider()
 			exec := agent.NewExecutor(dir)
 			ctxMgr := contextmgr.NewManager(parentProv, contextmgr.Settings{ContextLimit: 128000})
 			a := agent.NewAgent(parentProv, exec, ctxMgr)
-			a.SessionStore = session.NewStore(true)
+			a.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
 			s := NewServer(a, &config.Config{})
 			a.SetThinkingLevel(tc.parent)
 			r := s.ws.GetRuntimeConfig()
 			r.SubagentThinkingLevel = tc.configured
 			s.ws.SetRuntimeConfig(r)
-			var created []*llm.MockProvider
+			var created []*llmtest.MockProvider
 			s.ws.ProviderFactory = func() llm.LLMProvider {
-				p := llm.NewMockProvider()
+				p := llmtest.NewMockProvider()
 				p.StreamResults = []*llm.StreamResult{{Content: "report"}}
 				created = append(created, p)
 				return p
@@ -363,18 +364,18 @@ func TestSubagentChildThinkingLevelCascade(t *testing.T) {
 // back to the workspace default instead of failing.
 func TestSubagentChildModelFallbackToDefault(t *testing.T) {
 	dir := t.TempDir()
-	parentProv := llm.NewMockProvider()
+	parentProv := llmtest.NewMockProvider()
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(parentProv, contextmgr.Settings{ContextLimit: 128000})
 	a := agent.NewAgent(parentProv, exec, ctxMgr)
-	a.SessionStore = session.NewStore(true)
+	a.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
 	s := NewServer(a, &config.Config{})
 	if err := parentProv.SetModel("parent-model"); err != nil {
 		t.Fatal(err)
 	}
-	var created []*llm.MockProvider
+	var created []*llmtest.MockProvider
 	s.ws.ProviderFactory = func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.Model = "default-model"
 		p.Models = []llm.ModelInfo{{ID: "default-model", ContextLimit: 128000}}
 		p.StreamResults = []*llm.StreamResult{{Content: "report"}}
@@ -398,18 +399,18 @@ func TestSubagentChildModelFallbackToDefault(t *testing.T) {
 // argument beats both the workspace default and the parent's model.
 func TestSubagentExplicitModelArgWins(t *testing.T) {
 	dir := t.TempDir()
-	parentProv := llm.NewMockProvider()
+	parentProv := llmtest.NewMockProvider()
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(parentProv, contextmgr.Settings{ContextLimit: 128000})
 	a := agent.NewAgent(parentProv, exec, ctxMgr)
-	a.SessionStore = session.NewStore(true)
+	a.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
 	s := NewServer(a, &config.Config{})
 	if err := parentProv.SetModel("parent-model"); err != nil {
 		t.Fatal(err)
 	}
-	var created []*llm.MockProvider
+	var created []*llmtest.MockProvider
 	s.ws.ProviderFactory = func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.Model = "default-model"
 		p.Models = []llm.ModelInfo{
 			{ID: "default-model", ContextLimit: 128000},
@@ -441,7 +442,7 @@ func TestSessionsPayloadIncludesNested(t *testing.T) {
 	stub := newBlockingStub()
 	s, a, _ := newContinuationServer(t, stub, dir)
 	s.ws.ProviderFactory = func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.StreamResults = []*llm.StreamResult{{Content: "subagent report here"}}
 		return p
 	}
@@ -564,7 +565,7 @@ func sessionPayloadEntry(entries []SessionEntry, id string) *SessionEntry {
 func TestSpawnParentEvictedWhileChildRuns(t *testing.T) {
 	entered := make(chan struct{})
 	s, a := newContinuableServer(t, func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		// The child's turn blocks inside the provider until cancelled;
 		// entered fires when the child's stream actually opens (i.e. the
 		// child is registered and its turn is running).

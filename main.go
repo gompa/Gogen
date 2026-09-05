@@ -203,7 +203,9 @@ func run() error {
 
 	if opts.prompt != "" {
 		printStartupNotices(startupNotices)
-		go a.ValidateRestoredModel(context.Background(), restoredModel)
+		// Headless: no OnModelChanged hook — the background validation only
+		// refreshes the context limit / auto-selects a sole model.
+		a.ValidateRestoredModelAsync(restoredModel, nil)
 		return runSinglePrompt(ctx, a, opts.prompt, cfg)
 	}
 
@@ -244,7 +246,7 @@ func runSinglePrompt(ctx context.Context, a *agent.Agent, prompt string, cfg *co
 
 	// Start a fresh session: clear any restored conversation state.
 	a.ResetSessionState()
-	a.SessionID = session.NewID()
+	a.SetSessionID(session.NewID())
 	a.SessionOneshot = true
 	a.FlushSession()
 

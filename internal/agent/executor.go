@@ -149,15 +149,19 @@ func (e *Executor) idleTimeout() time.Duration {
 }
 
 // IdleTimeoutDuration returns the current foreground-command idle timeout
-// (0 = the built-in default). Runtime-safe read, used by the web settings
-// push and tests.
+// (0 = the built-in default). Runtime-safe read — the executor-tier
+// counterpart of Manager.SettingsSnapshot and Store.MaxCount: the
+// runtime-config tests use it to verify that live-applied settings actually
+// reached the executor.
 func (e *Executor) IdleTimeoutDuration() time.Duration {
 	return e.idleTimeout()
 }
 
 // CommandGuardMode returns the current command guard's mode ("blocklist",
-// "allowlist", "off"; "" when no guard is set). Runtime-safe read — the web
-// settings push and tests use it.
+// "allowlist", "off"; "" when no guard is set). Runtime-safe read — the
+// executor-tier counterpart of Manager.SettingsSnapshot and Store.MaxCount:
+// the runtime-config tests use it to verify that live-applied settings
+// actually reached the executor.
 func (e *Executor) CommandGuardMode() string {
 	if g := e.commandGuard(); g != nil {
 		return g.Mode
@@ -166,7 +170,9 @@ func (e *Executor) CommandGuardMode() string {
 }
 
 // SandboxMode returns the current sandbox mode ("off", "bwrap").
-// Runtime-safe read.
+// Runtime-safe read — the executor-tier counterpart of
+// Manager.SettingsSnapshot and Store.MaxCount: the runtime-config tests use
+// it to verify that live-applied settings actually reached the executor.
 func (e *Executor) SandboxMode() string {
 	return e.sandbox()
 }

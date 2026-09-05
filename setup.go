@@ -120,7 +120,7 @@ func newAgent(cfg *config.Config, isGlobalMode bool) (*agent.Agent, string, []st
 		store.SetGlobalDir(projectfile.GlobalSessionDir())
 	}
 	a.SessionStore = store
-	a.SessionID = session.NewID()
+	a.SetSessionID(session.NewID())
 	// Local-only restore: avoid blocking startup on provider ListModels.
 	var restoredModel string
 	if sessionEnabled {

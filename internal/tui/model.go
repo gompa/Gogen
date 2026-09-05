@@ -113,10 +113,23 @@ func (m *Model) wrappedContentString() string {
 
 // setViewportContent performs a full re-wrap of all chatLines and rebuilds
 // the incremental prefix.  Use this after window‑resize, session restore,
-// mode changes, or other events that touch the whole buffer.
+// mode changes, or other events that touch the whole buffer. It is not
+// resize-only: every mid-line stream write (the streaming funnels route any
+// chatLines mutation other than the last line here) and every round/turn-end
+// reset lands here too, so the work below stays single-pass: one wrap per
+// chat line, one width scan, no re-split of the joined content.
 func (m *Model) setViewportContent() {
 	if m.width <= 2 {
 		return
+	}
+	// The open thinking block's chat line holds PRE-WRAPPED output (the
+	// incremental cache, see streaming.go): re-wrapping it at a changed
+	// width would break at the old wrap seams. Rebuild the cache at the
+	// new width and rewrite the line BEFORE the re-wrap, which then
+	// re-wraps already-wrapped lines idempotently (same width).
+	if m.streamThinkingOpen {
+		m.rebuildStreamThinkingCache()
+		m.chatLines[m.streamThinkingLine] = m.streamThinkingDisplay()
 	}
 	var wrappedParts []string
 	var lastParts []string
@@ -137,24 +150,33 @@ func (m *Model) setViewportContent() {
 	m.wrappedContent = strings.Join(wrappedParts, "\n")
 	m.wrappedLinesDirty = true // lazily compute on next selection access
 	m.clearSelection()
-	// Full re-scan of all lines — acceptable because this is called rarely
-	// (resize, session restore, mode changes).
+	// Full re-scan of all wrapped lines. Not actually rare: besides resize,
+	// session restore, and mode changes this runs at every round and turn
+	// end (streaming.go resetStreamState/handleStreamEnd) and on every
+	// mid-line stream write (streaming.go routes any chatLines mutation
+	// that is not the last line here).
 	m.maxWrappedWidth = 0
 	for _, p := range wrappedParts {
 		if w := ansi.StringWidth(p); w > m.maxWrappedWidth {
 			m.maxWrappedWidth = w
 		}
 	}
-	m.viewport.SetContentMax(m.wrappedContent, m.maxWrappedWidth)
+	// Publish the already-split lines directly — SetContentMax would split
+	// wrappedContent right back after the join above.
+	m.viewport.SetContentLines(wrappedParts, m.maxWrappedWidth)
 	// styledLines is computed lazily in ensureStyledLines().
 	m.styledLinesDirty = true
 
-	// Rebuild the prefix pointing at all lines except the last.
+	// Rebuild the prefix pointing at all lines except the last. wrapLine is
+	// deterministic and the width is unchanged since the loop above, so the
+	// head of wrappedParts IS chatLines[:len-1]'s wrap — slice it instead of
+	// re-wrapping every line a second time. prefixLines aliases the
+	// viewport's line backing array (SetContentLines stores the slice
+	// as-is); the pair is rebuilt together here and buildFromPrefix copies
+	// from prefixLines before republishing, so the shared backing is never
+	// read stale.
 	if len(m.chatLines) > 1 {
-		var prefixParts []string
-		for _, line := range m.chatLines[:len(m.chatLines)-1] {
-			prefixParts = append(prefixParts, m.wrapLine(line)...)
-		}
+		prefixParts := wrappedParts[:len(wrappedParts)-len(lastParts)]
 		m.wrappedPrefix = strings.Join(prefixParts, "\n") + "\n"
 		m.prefixLines = prefixParts
 	} else {

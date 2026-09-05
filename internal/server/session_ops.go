@@ -137,18 +137,18 @@ func (s *Server) loadOrCreateRuntime(id string) (*sessionRuntime, error) {
 }
 
 // validateModelAsync confirms rt's model against the provider in the
-// background and pushes the result to the session's clients. It is the
-// single wiring point for the async ValidateRestoredModel contract shared
-// by loadOrCreateRuntime, createNewSession, and sessionFork: the hook must
-// be installed on the REGISTERED runtime's agent (the config refresh targets
-// that session's clients), and the caller decides the guard — whether the
-// model came from a restored snapshot (snap.Model != ""), was inherited
-// from the pane (modelInherited), or the agent is the registration winner
-// (rt.agent == a).
+// background and pushes the result to the session's clients. The install
+// hook + spawn mechanics are Agent.ValidateRestoredModelAsync (the single
+// wiring point for that contract across all hosts); this wrapper remains
+// the web wiring point for loadOrCreateRuntime, createNewSession, and
+// sessionFork: the hook must be installed on the REGISTERED runtime's agent
+// (the config refresh targets that session's clients), and the caller
+// decides the guard — whether the model came from a restored snapshot
+// (snap.Model != ""), was inherited from the pane (modelInherited), or the
+// agent is the registration winner (rt.agent == a).
 func (s *Server) validateModelAsync(rt *sessionRuntime, model string) {
 	a := rt.agent
-	a.OnModelChanged = func() { s.pushConfigForAgent(a) }
-	go a.ValidateRestoredModel(context.Background(), model)
+	a.ValidateRestoredModelAsync(model, func() { s.pushConfigForAgent(a) })
 }
 
 // switchPane points the connection's current pane at rt and attaches the

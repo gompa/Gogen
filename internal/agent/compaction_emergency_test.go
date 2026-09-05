@@ -146,6 +146,95 @@ func TestProgressGuardResetAsymmetry(t *testing.T) {
 	}
 }
 
+// toolRecordingProvider extends countingProvider with the (allowlist, tools)
+// pair the last summarization call received.
+type toolRecordingProvider struct {
+	countingProvider
+	lastTools   []llm.Tool
+	lastAllowed map[string]struct{}
+}
+
+func (p *toolRecordingProvider) GenerateResponse(ctx context.Context, msgs []llm.Message, allowed map[string]struct{}, tools []llm.Tool) (llm.Response, error) {
+	p.lastTools = tools
+	p.lastAllowed = allowed
+	return p.countingProvider.GenerateResponse(ctx, msgs, allowed, tools)
+}
+
+func toolNames(tools []llm.Tool) []string {
+	names := make([]string, len(tools))
+	for i, t := range tools {
+		names[i] = t.Name
+	}
+	return names
+}
+
+// assertTurnToolSetPassed verifies the summarization request carried exactly
+// the turn's (AllowedToolNames, llmTools) pair — the prompt-cache fix: with
+// the same tool set on the wire, the rendered prefix matches the last turn
+// and the provider's prompt cache covers the summarized middle.
+func assertTurnToolSetPassed(t *testing.T, a *Agent, p *toolRecordingProvider) {
+	t.Helper()
+	if len(p.lastTools) == 0 {
+		t.Fatal("summarization request carried no tool definitions")
+	}
+	want := toolNames(a.llmTools())
+	got := toolNames(p.lastTools)
+	if len(got) != len(want) {
+		t.Fatalf("summarization tools = %d, want %d (the turn's set)", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("summarization tool[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	if len(p.lastAllowed) != len(a.AllowedToolNames()) {
+		t.Fatalf("summarization allowlist = %d entries, want %d (the turn's set)", len(p.lastAllowed), len(a.AllowedToolNames()))
+	}
+}
+
+// TestCompactHistoryPassesTurnToolSet pins the agent-side half of the
+// prompt-cache fix for the manual path: /compact passes the turn's tool set
+// to the summarization request.
+func TestCompactHistoryPassesTurnToolSet(t *testing.T) {
+	provider := &toolRecordingProvider{countingProvider: countingProvider{limit: 20000}}
+	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{
+		ContextLimit:              20000,
+		CompactKeepRecentMessages: 2,
+		CompactReserveTokens:      4000,
+	})
+	a := NewAgent(provider, &Executor{WorkingDir: "."}, ctxMgr)
+	a.appendMessage(llm.Message{Role: "user", Content: "hello"})
+	a.appendMessage(llm.Message{Role: "assistant", Content: strings.Repeat("x", 4000)})
+	a.appendMessage(llm.Message{Role: "user", Content: "more"})
+	a.appendMessage(llm.Message{Role: "assistant", Content: "ok"})
+	_ = a.ContextStats(context.Background())
+	if err := a.CompactHistory(context.Background()); err != nil {
+		t.Fatalf("CompactHistory: %v", err)
+	}
+	assertTurnToolSetPassed(t, a, provider)
+}
+
+// TestPrepareMessagesCompactionPassesTurnToolSet pins the same for the
+// auto-compaction path (prepareMessages -> compactToFit).
+func TestPrepareMessagesCompactionPassesTurnToolSet(t *testing.T) {
+	provider := &toolRecordingProvider{countingProvider: countingProvider{limit: 20000}}
+	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{
+		ContextLimit:              20000,
+		CompactThreshold:          0.85,
+		CompactKeepRecentMessages: 2,
+		CompactReserveTokens:      4000,
+	})
+	a := NewAgent(provider, &Executor{WorkingDir: "."}, ctxMgr)
+	seedConversation(t, a, 14000) // budget = 0.85*20000 - 4000 = 13000: triggers
+	if _, err := a.prepareMessages(context.Background(), nil); err != nil {
+		t.Fatalf("prepareMessages: %v", err)
+	}
+	if !contextmgr.IsCompactionSummary(a.Messages[1].Content) {
+		t.Fatalf("compaction did not run: message[1] = %q", a.Messages[1].Content)
+	}
+	assertTurnToolSetPassed(t, a, provider)
+}
+
 // cachedCounts returns a copy of the agent's per-message token count cache.
 func cachedCounts(t *testing.T, a *Agent) []int {
 	t.Helper()

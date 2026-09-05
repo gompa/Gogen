@@ -9,7 +9,7 @@ import (
 
 func TestListIncludesLabelAndCount(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	snap := SessionSnapshot{
 		WorkingDir: dir,
 		Model:      "gpt-4o",
@@ -45,7 +45,7 @@ func TestListIncludesLabelAndCount(t *testing.T) {
 // pane was closed (the saved-session row reads the index entry).
 func TestListKeepsRenamedLabel(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	snap := SessionSnapshot{
 		WorkingDir: dir,
 		Messages: []llm.Message{
@@ -78,7 +78,7 @@ func TestListKeepsRenamedLabel(t *testing.T) {
 // case) must stay skipped.
 func TestSavePersistsRenamedEmptySession(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 
 	// A renamed empty session: no messages, deliberate label.
 	if err := store.Save("sess-renamed", SessionSnapshot{
@@ -137,7 +137,7 @@ func TestSessionLabelLegacyTruncationStillMigrated(t *testing.T) {
 // the legacy-label rule after a restart.
 func TestSaveLoadKeepsRenameMarkerAcrossRestart(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	msgs := []llm.Message{
 		{Role: "user", Content: "implement session commands with labels and keep going"},
 		{Role: "assistant", Content: "ok"},
@@ -153,7 +153,7 @@ func TestSaveLoadKeepsRenameMarkerAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Fresh store instance = empty createdCache (simulates a restart).
-	store2 := NewStore(true)
+	store2 := NewStoreWithOptions(true, StoreOptions{})
 	loaded, err := store2.LoadInWorkingDir(dir, "sess-renamed")
 	if err != nil {
 		t.Fatal(err)

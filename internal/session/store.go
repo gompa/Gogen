@@ -69,15 +69,6 @@ type StoreOptions struct {
 	MaxAgeDays int // drop sessions older than this many days (0 = config.DefaultSessionMaxAgeDays, negative = keep forever)
 }
 
-// NewStore creates a session store with default retention.
-//
-// Exported convenience constructor: other packages' tests (e.g.
-// internal/server) build stores with it; production code uses
-// NewStoreWithOptions with config-driven retention.
-func NewStore(enabled bool) *Store {
-	return NewStoreWithOptions(enabled, StoreOptions{})
-}
-
 // SetGlobalDir configures the store to use a fixed directory for session
 // storage instead of the per-project .gogen/sessions/. Used in global mode.
 func (s *Store) SetGlobalDir(dir string) {

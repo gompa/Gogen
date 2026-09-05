@@ -37,9 +37,9 @@ update:
 test:
 	go test -race ./...
 
-# Packages with //go:build debug code (view-drift, profiling).
+# Packages with //go:build debug code (view-drift, profiling, WS stall knobs).
 test-debug:
-	go test -race -tags debug ./internal/agent/ ./internal/profiling/
+	go test -race -tags debug ./internal/agent/ ./internal/profiling/ ./internal/server/
 
 vet:
 	go vet ./...

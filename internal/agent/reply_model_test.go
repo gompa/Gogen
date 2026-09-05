@@ -7,6 +7,7 @@ import (
 
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 )
 
 // lastAssistantMsg returns the most recent assistant message in msgs.
@@ -25,7 +26,7 @@ func lastAssistantMsg(msgs []llm.Message) (llm.Message, bool) {
 // assistant message, and that a turn without a reported model leaves the
 // field empty.
 func TestStreamResultModelStampedOnAssistantMessage(t *testing.T) {
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	prov.StreamResults = []*llm.StreamResult{
 		{Content: "answer", Model: "glm-4.6"},
 	}
@@ -65,7 +66,7 @@ func TestStreamResultModelStampedOnAssistantMessage(t *testing.T) {
 // even when the turn's final round carries tool calls (the second StreamResult
 // in a tool-call turn is the final assistant message).
 func TestStreamResultModelStampedOnToolCallRound(t *testing.T) {
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	prov.StreamResults = []*llm.StreamResult{
 		{ToolCalls: []llm.ToolCall{{ID: "c1", Name: "read_file", Args: map[string]any{"path": "x"}}}, Model: "glm-4.6"},
 		{Content: "done", Model: "glm-4.6"},
@@ -93,7 +94,7 @@ func TestStreamResultModelStampedOnToolCallRound(t *testing.T) {
 // (History replay attributes older rounds via the assistant message Model
 // field, but the live bubble must not have to wait for that sync.)
 func TestOnReplyModelFiredPerRoundBeforeStreamEnd(t *testing.T) {
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	calls := 0
 	prov.OnStream = func(_ context.Context, _ []llm.Message, h *llm.StreamHandlers) (*llm.StreamResult, error) {
 		calls++

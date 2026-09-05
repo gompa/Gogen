@@ -45,8 +45,8 @@ func TestCondenseMessageProviderPath(t *testing.T) {
 // sent to the provider — a message that big cannot be sent anyway.
 func TestCondenseMessageTruncatedFallback(t *testing.T) {
 	prov := &countingStubProvider{stubProvider: stubProvider{summary: "the recap"}}
-	// limit 10000: maxIn = 10000/2 - 4000 -> clamped to 2000. A
-	// ~3000-token message exceeds the budget.
+	// limit 10000: maxIn = 10000 - 4000 (reserve) - 4000 (summary output
+	// allowance) = 2000. A ~3000-token message exceeds the budget.
 	m := NewManager(prov, Settings{ContextLimit: 10000, CompactReserveTokens: 4000})
 	big := strings.Repeat("x", 8*3000)
 	out, err := m.CondenseMessage(context.Background(), llm.Message{Role: "user", Content: big})

@@ -55,6 +55,8 @@ type Agent struct {
 	// may have been cleared or replaced by sole-model auto-select). Set at
 	// construction by the TUI/web hosts before the validation goroutine is
 	// spawned; called from that goroutine. Must not block.
+	// ValidateRestoredModelAsync is the shared install-and-spawn wiring;
+	// a nil callback there preserves a hook installed here.
 	OnModelChanged func()
 
 	// lastTurnUsage is the provider-reported usage of the last API round

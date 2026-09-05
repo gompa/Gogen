@@ -20,6 +20,7 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 )
 
 // newGitTestRepo creates a temp git repository with a committer identity.
@@ -105,7 +106,7 @@ func TestGitCommitMessageOneShot(t *testing.T) {
 	}
 	gitIn(t, dir, "add", "a.txt")
 
-	mock := llm.NewMockProvider()
+	mock := llmtest.NewMockProvider()
 	mock.Responses = []llm.Response{{Content: "feat: update a.txt"}}
 	s, a := newEditorAIServer(t, dir, mock)
 	editor := dialEditor(t, startEditorTestServer(t, s))
@@ -157,7 +158,7 @@ func TestGitCommitMessageErrors(t *testing.T) {
 		}
 		gitIn(t, dir, "add", "a.txt")
 
-		mock := llm.NewMockProvider()
+		mock := llmtest.NewMockProvider()
 		mock.GenerateErr = errors.New("boom")
 		s, _ := newEditorAIServer(t, dir, mock)
 		editor := dialEditor(t, startEditorTestServer(t, s))
@@ -170,7 +171,7 @@ func TestGitCommitMessageErrors(t *testing.T) {
 
 	t.Run("nothing_staged", func(t *testing.T) {
 		dir := newGitTestRepo(t)
-		mock := llm.NewMockProvider()
+		mock := llmtest.NewMockProvider()
 		s, _ := newEditorAIServer(t, dir, mock)
 		editor := dialEditor(t, startEditorTestServer(t, s))
 
@@ -190,7 +191,7 @@ func TestGitCommitMessageErrors(t *testing.T) {
 		}
 		gitIn(t, dir, "add", "a.txt")
 
-		mock := llm.NewMockProvider()
+		mock := llmtest.NewMockProvider()
 		s, _ := newEditorAIServer(t, dir, mock)
 		// A real OpenAIProvider with no key/URL anywhere in the config.
 		s.ws.ProviderFactory = func() llm.LLMProvider {
@@ -211,7 +212,7 @@ func TestGitCommitMessageErrors(t *testing.T) {
 		}
 		gitIn(t, dir, "add", "a.txt")
 
-		mock := llm.NewMockProvider()
+		mock := llmtest.NewMockProvider()
 		s, _ := newEditorAIServer(t, dir, mock)
 		s.ws.ProviderFactory = nil
 		editor := dialEditor(t, startEditorTestServer(t, s))
@@ -234,7 +235,7 @@ func TestGitCommitMessageTruncatesLargeDiff(t *testing.T) {
 	}
 	gitIn(t, dir, "add", "big.txt")
 
-	mock := llm.NewMockProvider()
+	mock := llmtest.NewMockProvider()
 	s, _ := newEditorAIServer(t, dir, mock)
 	editor := dialEditor(t, startEditorTestServer(t, s))
 
@@ -268,7 +269,7 @@ func TestGitCommitMessageDoesNotBlockReadLoop(t *testing.T) {
 	gitIn(t, dir, "add", "a.txt")
 
 	release := make(chan struct{})
-	mock := llm.NewMockProvider()
+	mock := llmtest.NewMockProvider()
 	mock.OnGenerate = func(ctx context.Context, _ []llm.Message) (llm.Response, error) {
 		select {
 		case <-release:
@@ -359,7 +360,7 @@ func TestGitStagedDiffTruncationIsRuneSafe(t *testing.T) {
 	}
 	gitIn(t, dir, "add", "f.txt")
 
-	s, _ := newEditorAIServer(t, dir, llm.NewMockProvider())
+	s, _ := newEditorAIServer(t, dir, llmtest.NewMockProvider())
 	diff, err := s.gitStagedDiff(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -395,7 +396,7 @@ func TestGitCommitViaWSEditor(t *testing.T) {
 	}
 	gitIn(t, dir, "add", "a.txt")
 
-	mock := llm.NewMockProvider()
+	mock := llmtest.NewMockProvider()
 	s, _ := newEditorAIServer(t, dir, mock)
 	editor := dialEditor(t, startEditorTestServer(t, s))
 

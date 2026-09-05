@@ -21,7 +21,7 @@ import (
 func newSidebarFullModel(t *testing.T) *Model {
 	t.Helper()
 	a := newSwitchTestAgent(t)
-	a.SessionStore = session.NewStore(true)
+	a.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
 	a.SessionID = "cur"
 	vp := NewViewport(80, 20)
 	vp.Style = ViewportStyle

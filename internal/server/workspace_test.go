@@ -21,7 +21,7 @@ func TestWorkspaceDefaultModelAccessors(t *testing.T) {
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(stub, contextmgr.Settings{ContextLimit: 1000})
 	a := agent.NewAgent(stub, exec, ctxMgr)
-	a.SessionStore = session.NewStore(true)
+	a.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
 	s := NewServer(a, &config.Config{})
 
 	// Initial value is the agent's model at construction.
@@ -52,7 +52,7 @@ func TestProviderFactorySeedsResolvedDefaultModel(t *testing.T) {
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 1000})
 	a := agent.NewAgent(prov, exec, ctxMgr)
-	a.SessionStore = session.NewStore(true)
+	a.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
 	s := NewServer(a, &config.Config{OpenAIModel: "cfg-model"})
 
 	// Workspace starts with no model (the agent provider has none selected).

@@ -1,31 +1,34 @@
-package llm
+package llmtest
 
 import (
 	"context"
 	"sync"
+
+	"gogen/internal/llm"
 )
 
-// MockProvider is a configurable LLMProvider for tests.
+// MockProvider is a configurable llm.LLMProvider for tests.
 type MockProvider struct {
 	mu sync.Mutex
 
 	Model         string
 	ContextLimit  int
-	Models        []ModelInfo
-	Responses     []Response // consumed in order by GenerateResponse
-	StreamResults []*StreamResult
+	Models        []llm.ModelInfo
+	Responses     []llm.Response // consumed in order by GenerateResponse
+	StreamResults []*llm.StreamResult
 	GenerateErr   error
 	StreamErr     error
 	SetModelErr   error
 	CallCount     int
-	LastMessages  []Message
+	LastMessages  []llm.Message
 	LastAllowed   map[string]struct{}
+	LastTools     []llm.Tool
 	// ThinkingLevel records the last SetThinkingLevel call ("" = never
 	// set) so spawn-time wiring tests can assert the level reached the
 	// child provider.
 	ThinkingLevel string
-	OnGenerate    func(ctx context.Context, messages []Message) (Response, error)
-	OnStream      func(ctx context.Context, messages []Message, h *StreamHandlers) (*StreamResult, error)
+	OnGenerate    func(ctx context.Context, messages []llm.Message) (llm.Response, error)
+	OnStream      func(ctx context.Context, messages []llm.Message, h *llm.StreamHandlers) (*llm.StreamResult, error)
 }
 
 // NewMockProvider returns a mock with sensible defaults.
@@ -33,25 +36,26 @@ func NewMockProvider() *MockProvider {
 	return &MockProvider{
 		Model:        "mock-model",
 		ContextLimit: 128000,
-		Models:       []ModelInfo{{ID: "mock-model", ContextLimit: 128000, Current: true}},
-		Responses:    []Response{{Content: "ok"}},
+		Models:       []llm.ModelInfo{{ID: "mock-model", ContextLimit: 128000, Current: true}},
+		Responses:    []llm.Response{{Content: "ok"}},
 	}
 }
 
-func (m *MockProvider) GenerateResponse(ctx context.Context, messages []Message, allowedTools map[string]struct{}, _ []Tool) (Response, error) {
+func (m *MockProvider) GenerateResponse(ctx context.Context, messages []llm.Message, allowedTools map[string]struct{}, tools []llm.Tool) (llm.Response, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.CallCount++
-	m.LastMessages = append([]Message(nil), messages...)
+	m.LastMessages = append([]llm.Message(nil), messages...)
 	m.LastAllowed = allowedTools
+	m.LastTools = append([]llm.Tool(nil), tools...)
 	if m.OnGenerate != nil {
 		return m.OnGenerate(ctx, messages)
 	}
 	if m.GenerateErr != nil {
-		return Response{}, m.GenerateErr
+		return llm.Response{}, m.GenerateErr
 	}
 	if len(m.Responses) == 0 {
-		return Response{Content: "ok"}, nil
+		return llm.Response{Content: "ok"}, nil
 	}
 	resp := m.Responses[0]
 	if len(m.Responses) > 1 {
@@ -60,11 +64,11 @@ func (m *MockProvider) GenerateResponse(ctx context.Context, messages []Message,
 	return resp, nil
 }
 
-func (m *MockProvider) GenerateResponseStream(ctx context.Context, messages []Message, allowedTools map[string]struct{}, extraTools []Tool, h *StreamHandlers) (*StreamResult, error) {
+func (m *MockProvider) GenerateResponseStream(ctx context.Context, messages []llm.Message, allowedTools map[string]struct{}, extraTools []llm.Tool, h *llm.StreamHandlers) (*llm.StreamResult, error) {
 	m.mu.Lock()
 	onStream := m.OnStream
 	streamErr := m.StreamErr
-	var result *StreamResult
+	var result *llm.StreamResult
 	if len(m.StreamResults) > 0 {
 		result = m.StreamResults[0]
 		if len(m.StreamResults) > 1 {
@@ -90,14 +94,14 @@ func (m *MockProvider) GenerateResponseStream(ctx context.Context, messages []Me
 		}
 		return result, nil
 	}
-	out := &StreamResult{Content: resp.Content, Reasoning: resp.Reasoning, Refusal: resp.Refusal, ToolCalls: resp.ToolCalls, Usage: resp.Usage}
+	out := &llm.StreamResult{Content: resp.Content, Reasoning: resp.Reasoning, Refusal: resp.Refusal, ToolCalls: resp.ToolCalls, Usage: resp.Usage}
 	if h != nil {
 		emitStreamResult(h, out)
 	}
 	return out, nil
 }
 
-func emitStreamResult(h *StreamHandlers, result *StreamResult) {
+func emitStreamResult(h *llm.StreamHandlers, result *llm.StreamResult) {
 	if h.OnStart != nil {
 		h.OnStart()
 	}
@@ -134,13 +138,13 @@ func (m *MockProvider) ModelContextLimit(context.Context) (int, error) {
 	return 128000, nil
 }
 
-func (m *MockProvider) ListModels(context.Context) ([]ModelInfo, error) {
+func (m *MockProvider) ListModels(context.Context) ([]llm.ModelInfo, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.Models != nil {
-		return append([]ModelInfo(nil), m.Models...), nil
+		return append([]llm.ModelInfo(nil), m.Models...), nil
 	}
-	return []ModelInfo{{ID: m.ModelName(), Current: true}}, nil
+	return []llm.ModelInfo{{ID: m.ModelName(), Current: true}}, nil
 }
 
 func (m *MockProvider) SetModel(id string) error {
@@ -168,5 +172,5 @@ func (m *MockProvider) SetThinkingLevel(level string) {
 	m.ThinkingLevel = level
 }
 
-// Ensure MockProvider implements LLMProvider.
-var _ LLMProvider = (*MockProvider)(nil)
+// Ensure MockProvider implements llm.LLMProvider.
+var _ llm.LLMProvider = (*MockProvider)(nil)

@@ -46,6 +46,47 @@ func TestSummarizeMessagesChunksLargeHistory(t *testing.T) {
 	}
 }
 
+// segmentProvider records the flattened segment each single-message
+// summarization call carries, so tests can assert on truncation.
+type segmentProvider struct {
+	stubProvider
+	calls    int
+	segments []string
+}
+
+func (p *segmentProvider) GenerateResponse(_ context.Context, msgs []llm.Message, _ map[string]struct{}, _ []llm.Tool) (llm.Response, error) {
+	p.calls++
+	if len(msgs) == 1 {
+		p.segments = append(p.segments, msgs[0].Content)
+	}
+	return llm.Response{Content: "the recap"}, nil
+}
+
+// TestSummarizeFlattenedSingleCallFitsFullWindow pins the raised single-call
+// budget (limit - reserve - summaryOutputAllowance): a flattened middle that
+// fits that budget is summarized in ONE call carrying the FULL segment. The
+// pre-fix limit/2 budget would have truncated the same middle (the sentinel
+// would be cut off) or split it into a recursive multi-call fan-out.
+func TestSummarizeFlattenedSingleCallFitsFullWindow(t *testing.T) {
+	provider := &segmentProvider{stubProvider: stubProvider{summary: "the recap"}}
+	m := NewManager(provider, Settings{ContextLimit: 100000, CompactReserveTokens: 4000})
+	// New maxIn = 100000 - 4000 - 4000 = 92000; pre-fix = 100000/2 - 4000 =
+	// 46000. The middle is sized to sit between the two.
+	middle := []llm.Message{{Role: "assistant", Content: strings.Repeat("word ", 50000) + "SENTINEL_END"}}
+	if tok := m.EstimateTokens(middle); tok < 46000 || tok >= 92000 {
+		t.Fatalf("test setup: middle = %d tokens, want between 46000 (pre-fix budget) and 92000 (new budget)", tok)
+	}
+	if _, err := m.summarizeMessagesDepth(context.Background(), middle, 0); err != nil {
+		t.Fatalf("summarizeMessagesDepth: %v", err)
+	}
+	if provider.calls != 1 {
+		t.Fatalf("provider calls = %d, want 1 (a single flattened call)", provider.calls)
+	}
+	if len(provider.segments) != 1 || !strings.Contains(provider.segments[0], "SENTINEL_END") {
+		t.Fatalf("segment truncated: the full middle must fit one call (calls = %d)", provider.calls)
+	}
+}
+
 // TestSummarizeMessagesDepthGuardsRecursion verifies the depth cap in
 // summarizeMessagesDepth actually engages: at depth >= maxSummarizeDepth the
 // summarizer must stop recursing into the provider and instead return a

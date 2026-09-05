@@ -26,6 +26,7 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 	"gogen/internal/session"
 )
 
@@ -219,11 +220,11 @@ func TestConsecutiveTurnsSecondTurnCancellable(t *testing.T) {
 // eviction TryLock + sticky flag close.
 func TestMessageToEvictedPaneDropped(t *testing.T) {
 	dir := t.TempDir()
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 1000})
 	a := agent.NewAgent(prov, exec, ctxMgr)
-	a.SessionStore = session.NewStore(true)
+	a.SessionStore = session.NewStoreWithOptions(true, session.StoreOptions{})
 	s := NewServer(a, &config.Config{WebMaxActiveSessions: 2})
 	srv := startWSServer(t, s)
 	defer srv.Close()

@@ -10,6 +10,7 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 	"gogen/internal/session"
 )
 
@@ -43,7 +44,7 @@ func TestDeliverToSessionIdle(t *testing.T) {
 	dir := t.TempDir()
 	stub := newBlockingStub()
 	s, a, store := newContinuationServer(t, stub, dir)
-	p := llm.NewMockProvider()
+	p := llmtest.NewMockProvider()
 	p.StreamResults = []*llm.StreamResult{{Content: "ack"}}
 	a.Provider = p
 
@@ -144,7 +145,7 @@ func TestDeliverQueueOverflow(t *testing.T) {
 	dir := t.TempDir()
 	stub := newBlockingStub()
 	s, a, _ := newContinuationServer(t, stub, dir)
-	p := llm.NewMockProvider()
+	p := llmtest.NewMockProvider()
 	// The FIRST stream call (the "block me" turn started below) blocks
 	// until cancelled, so the delivery worker's tryAcquireTurn fails while
 	// it runs and the burst below cannot be popped mid-append. Later calls
@@ -258,11 +259,11 @@ func TestJobNoticeDeliveredToSession(t *testing.T) {
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(stub, contextmgr.Settings{ContextLimit: 1000})
 	a := agent.NewAgent(stub, exec, ctxMgr)
-	store := session.NewStore(true)
+	store := session.NewStoreWithOptions(true, session.StoreOptions{})
 	a.SessionStore = store
 	_ = NewServer(a, &config.Config{JobNotices: "on"})
 	// The notice's delivery turn needs a provider that answers.
-	p := llm.NewMockProvider()
+	p := llmtest.NewMockProvider()
 	p.StreamResults = []*llm.StreamResult{{Content: "ack"}}
 	a.Provider = p
 
@@ -305,7 +306,7 @@ func TestDeliverToParentQueuesUntilRegistered(t *testing.T) {
 	dir := t.TempDir()
 	stub := newBlockingStub()
 	s, a, _ := newContinuationServer(t, stub, dir)
-	p := llm.NewMockProvider()
+	p := llmtest.NewMockProvider()
 	p.StreamResults = []*llm.StreamResult{{Content: "ack"}}
 	a.Provider = p
 

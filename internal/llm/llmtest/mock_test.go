@@ -1,4 +1,4 @@
-package llm_test
+package llmtest
 
 import (
 	"context"
@@ -8,7 +8,7 @@ import (
 )
 
 func TestMockProviderBasic(t *testing.T) {
-	m := llm.NewMockProvider()
+	m := NewMockProvider()
 	m.Responses = []llm.Response{
 		{Content: "first"},
 		{Content: "second"},

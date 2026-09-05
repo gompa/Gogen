@@ -17,6 +17,7 @@ import (
 
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 )
 
 type blockingPersistStore struct {
@@ -83,7 +84,7 @@ func (b *blockingPersistStore) TouchSession(string, string) error  { return nil 
 // plus the sweep using FlushPending) must keep B writing m2.
 func TestDirtyFlagLostUpdateOnFinalFlush(t *testing.T) {
 	store := newBlockingPersistStore()
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := NewExecutor(t.TempDir())
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 1000})
 	a := NewAgent(prov, exec, ctxMgr)

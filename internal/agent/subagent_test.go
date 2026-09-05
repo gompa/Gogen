@@ -10,6 +10,7 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 )
 
 // fakeSpawner records spawn requests and returns a canned report.
@@ -36,7 +37,7 @@ func (f *fakeSpawner) Spawn(ctx context.Context, parent *Agent, job, model strin
 
 func newSubagentTestAgent(t *testing.T) *Agent {
 	t.Helper()
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := NewExecutor(t.TempDir())
 	return NewAgent(prov, exec, contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 128000}))
 }
@@ -352,7 +353,7 @@ func TestApplySubagentModel(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			prov := llm.NewMockProvider()
+			prov := llmtest.NewMockProvider()
 			prov.Model = "default"
 			for _, id := range tc.catalog {
 				prov.Models = append(prov.Models, llm.ModelInfo{ID: id, ContextLimit: 128000})

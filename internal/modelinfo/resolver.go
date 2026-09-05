@@ -320,20 +320,11 @@ func (r *Resolver) providerFor(baseURL string) (providerEntry, error) {
 	return provider, nil
 }
 
-// ResolveContextLimit returns the context window size (in tokens) for the
-// given model. It never blocks on the network. Returns an error if the
-// registry is not loaded yet or the provider/model is missing — callers fall
-// back to GOGEN_CONTEXT_LIMIT / heuristics.
-func (r *Resolver) ResolveContextLimit(baseURL, modelID string) (Limit, error) {
-	lim, _, _, _, err := r.Resolve(baseURL, modelID)
-	return lim, err
-}
-
 // Resolve returns context limit, pricing, accepted reasoning-effort values,
-// and the model description in a single registry lookup. Use this instead of
-// a separate ResolveContextLimit call to avoid redundant map lookups. The
-// efforts slice is a fresh copy; like the returned *Cost, it must not be
-// mutated by callers.
+// and the model description in a single registry lookup — callers that need
+// several of these must resolve once here instead of probing the registry
+// separately (redundant map lookups). The efforts slice is a fresh copy;
+// like the returned *Cost, it must not be mutated by callers.
 func (r *Resolver) Resolve(baseURL, modelID string) (Limit, *Cost, []string, string, error) {
 	provider, err := r.providerFor(baseURL)
 	if err != nil {
@@ -343,14 +334,4 @@ func (r *Resolver) Resolve(baseURL, modelID string) (Limit, *Cost, []string, str
 		return m.Limit, &m.Cost, m.ReasoningEfforts(), m.Description, nil
 	}
 	return Limit{}, nil, nil, "", fmt.Errorf("provider %q found, but no entry for model %q", provider.ID, modelID)
-}
-
-// ProviderID returns the models.dev provider ID matching a base URL, if any.
-// Useful for logging/debugging, not required for ResolveContextLimit.
-func (r *Resolver) ProviderID(baseURL string) (string, bool) {
-	provider, err := r.providerFor(baseURL)
-	if err != nil {
-		return "", false
-	}
-	return provider.ID, true
 }

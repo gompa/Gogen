@@ -12,6 +12,7 @@ import (
 
 	"gogen/internal/agent"
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 )
 
 // enableBoardAndAddCard turns the board feature on over the WS and adds a
@@ -45,7 +46,7 @@ func TestBoardStartViaWS(t *testing.T) {
 	stub := newBlockingStub()
 	s, _, store := newContinuationServer(t, stub, dir)
 	s.ws.ProviderFactory = func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.Model = "default-model"
 		p.StreamResults = []*llm.StreamResult{{Content: "ticket done reply"}}
 		return p
@@ -138,7 +139,7 @@ func TestBoardStartModelAndPrompt(t *testing.T) {
 	stub := newBlockingStub()
 	s, _, store := newContinuationServer(t, stub, dir)
 	s.ws.ProviderFactory = func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.Model = "default-model"
 		p.Models = []llm.ModelInfo{
 			{ID: "default-model", ContextLimit: 128000, Current: true},
@@ -234,7 +235,7 @@ func TestBoardStartErrors(t *testing.T) {
 	dir := t.TempDir()
 	stub := newBlockingStub()
 	s, _, store := newContinuationServer(t, stub, dir)
-	s.ws.ProviderFactory = func() llm.LLMProvider { return llm.NewMockProvider() }
+	s.ws.ProviderFactory = func() llm.LLMProvider { return llmtest.NewMockProvider() }
 	srv := startWSServer(t, s)
 	defer srv.Close()
 
@@ -305,7 +306,7 @@ func TestBoardStartThinkingLevel(t *testing.T) {
 	stub := newBlockingStub()
 	s, _, store := newContinuationServer(t, stub, dir)
 	s.ws.ProviderFactory = func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.Model = "default-model"
 		p.StreamResults = []*llm.StreamResult{{Content: "ticket done reply"}}
 		return p
@@ -605,7 +606,7 @@ func TestBoardStartStaleAgentLink(t *testing.T) {
 	stub := newBlockingStub()
 	s, _, store := newContinuationServer(t, stub, dir)
 	s.ws.ProviderFactory = func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.Model = "default-model"
 		p.StreamResults = []*llm.StreamResult{{Content: "done"}}
 		return p
@@ -685,7 +686,7 @@ func TestBoardStartTurnErrorCommentsTicket(t *testing.T) {
 	stub := newBlockingStub()
 	s, _, _ := newContinuationServer(t, stub, dir)
 	s.ws.ProviderFactory = func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.StreamErr = errors.New("boom")
 		return p
 	}
@@ -730,7 +731,7 @@ func TestBoardStartCompletedSessionNotActive(t *testing.T) {
 	stub := newBlockingStub()
 	s, _, store := newContinuationServer(t, stub, dir)
 	s.ws.ProviderFactory = func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.Model = "default-model"
 		p.StreamResults = []*llm.StreamResult{{Content: "ticket done reply"}}
 		return p

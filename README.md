@@ -303,7 +303,7 @@ After each agent turn, GoGen shows context usage in the CLI (dim line) and web U
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GOGEN_COMMAND_SANDBOX` | `off` | Sandbox mode: `off` or `bwrap` (bubblewrap when available) |
-| `GOGEN_COMMAND_IDLE_TIMEOUT_SECS` | `120` | Foreground `execute_command` is killed after this many seconds without output (any output resets the window; background jobs are unaffected); also `command_idle_timeout_secs` in `.gogen/gogen.conf` |
+| `GOGEN_COMMAND_IDLE_TIMEOUT_SECS` | `300` | Foreground `execute_command` is killed after this many seconds without output (any output resets the window; background jobs are unaffected); also `command_idle_timeout_secs` in `.gogen/gogen.conf` |
 
 The timeout is an **idle (no-output) timeout**, not a wall-clock cap: the
 window is reset by any output the command produces, so a long-running command

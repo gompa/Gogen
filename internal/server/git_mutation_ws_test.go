@@ -10,7 +10,7 @@ import (
 	"gogen/internal/agent"
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
-	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 )
 
 // newGitTestRepoWithOrigin creates a temp git repo (with committer identity)
@@ -46,7 +46,7 @@ func TestWSEditorGitStageCommitPushRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
 	a := agent.NewAgent(prov, exec, ctxMgr)
@@ -116,7 +116,7 @@ func TestWSEditorGitUnstage(t *testing.T) {
 	gitIn(t, dir, "add", "x.txt")
 	gitIn(t, dir, "add", "y.txt")
 
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
 	a := agent.NewAgent(prov, exec, ctxMgr)
@@ -164,7 +164,7 @@ func TestWSEditorGitIndexLockError(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Remove(lock) })
 
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.DefaultSettings())
 	a := agent.NewAgent(prov, exec, ctxMgr)

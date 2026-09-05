@@ -17,6 +17,7 @@ import (
 
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 )
 
 type fakeDeltaState struct {
@@ -101,7 +102,7 @@ func (f *fakePersistStore) TouchSession(string, string) error  { return nil }
 // no duplicates. Run with -race to also prove the counters are synchronized.
 func TestConcurrentFlushKeepsStoreConsistent(t *testing.T) {
 	store := newFakePersistStore()
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := NewExecutor(t.TempDir())
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 1000})
 	a := NewAgent(prov, exec, ctxMgr)

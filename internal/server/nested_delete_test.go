@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 )
 
 // TestSubagentCloseChildNotifiesParent drives the ✕ close on an open child
@@ -114,7 +115,7 @@ func TestSubagentDeleteFinishedChildSilent(t *testing.T) {
 	stub := newBlockingStub()
 	s, a, store := newContinuationServer(t, stub, dir)
 	s.ws.ProviderFactory = func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.StreamResults = []*llm.StreamResult{{Content: "child report"}}
 		return p
 	}
@@ -178,7 +179,7 @@ func TestSubagentDeleteFinishedRegisteredChildSilent(t *testing.T) {
 	stub := newBlockingStub()
 	s, a, store := newContinuationServer(t, stub, dir)
 	s.ws.ProviderFactory = func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.StreamResults = []*llm.StreamResult{{Content: "bg report"}}
 		return p
 	}

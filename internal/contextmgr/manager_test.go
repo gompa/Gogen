@@ -157,7 +157,7 @@ func TestShouldCompactRequiresEnoughMessages(t *testing.T) {
 		{Role: "user", Content: "hello"},
 		{Role: "assistant", Content: "hi"},
 	}
-	if m.ShouldCompact(msgs) {
+	if m.ShouldCompactWithOverhead(msgs, 0) {
 		t.Fatal("should not compact with too few messages")
 	}
 }
@@ -177,7 +177,7 @@ func TestShouldCompactWhenOverBudget(t *testing.T) {
 		{Role: "user", Content: "more"},
 		{Role: "assistant", Content: "recent"},
 	}
-	if !m.ShouldCompact(msgs) {
+	if !m.ShouldCompactWithOverhead(msgs, 0) {
 		t.Fatal("expected compaction threshold to be exceeded")
 	}
 }
@@ -197,11 +197,11 @@ func TestShouldCompactSeesGrowthAcrossCalls(t *testing.T) {
 		msgs = append(msgs, llm.Message{Role: "user", Content: "u"})
 		msgs = append(msgs, llm.Message{Role: "assistant", Content: "a"})
 	}
-	if m.ShouldCompact(msgs) {
+	if m.ShouldCompactWithOverhead(msgs, 0) {
 		t.Fatal("expected under budget initially")
 	}
 	msgs = append(msgs, llm.Message{Role: "user", Content: strings.Repeat("word ", 20000)})
-	if !m.ShouldCompact(msgs) {
+	if !m.ShouldCompactWithOverhead(msgs, 0) {
 		t.Fatal("expected ShouldCompact to see growth after appending a large message")
 	}
 }
@@ -338,7 +338,7 @@ func TestAutoCompactDisabledAtZeroThreshold(t *testing.T) {
 	if m.AutoCompactEnabled() {
 		t.Fatal("expected auto-compaction disabled at threshold 0")
 	}
-	if m.ShouldCompact([]llm.Message{{Role: "user", Content: strings.Repeat("word ", 20000)}}) {
+	if m.ShouldCompactWithOverhead([]llm.Message{{Role: "user", Content: strings.Repeat("word ", 20000)}}, 0) {
 		t.Fatal("expected no auto-compaction at threshold 0")
 	}
 	if got := m.CompactBudget(); got != 0 {

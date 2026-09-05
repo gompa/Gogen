@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"context"
 	"fmt"
 	"slices"
 	"strings"
@@ -1080,23 +1079,22 @@ func (m *Model) spawnSavedSession(id string) tea.Cmd {
 		return nil
 	}
 	a := m.workspace.NewSessionAgent(&snap, id)
-	// Background validation (ValidateRestoredModel) may clear or
+	// Background validation (ValidateRestoredModelAsync) may clear or
 	// auto-select the restored model after the UI opened; re-render when it
 	// lands (the TUI runner hooks the same event for the root agent).
 	if snap.Model != "" {
 		// Capture the sender HERE (Update thread): the hook fires from
-		// ValidateRestoredModel's goroutine, and m.program is written once
-		// in TUI.Run without synchronization — reading it inside the
-		// closure would race that write (the same hazard spawnLiveSession
+		// the validation goroutine, and m.program is written once in
+		// TUI.Run without synchronization — reading it inside the closure
+		// would race that write (the same hazard spawnLiveSession
 		// documents for its job-notice sender). Run assigns m.program
 		// before the event loop starts, so the captured value is final.
 		sender := m.program
-		a.OnModelChanged = func() {
+		a.ValidateRestoredModelAsync(snap.Model, func() {
 			if sender != nil {
 				sender.Send(modelChangedMsg{})
 			}
-		}
-		go a.ValidateRestoredModel(context.Background(), snap.Model)
+		})
 	}
 	m.spawnLiveSession(a)
 	i := len(m.lives.sessions) - 1

@@ -8,6 +8,7 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 	"gogen/internal/session"
 )
 
@@ -18,7 +19,7 @@ import (
 // instances so tests can assert per-session isolation.
 func perSessionModelFactory(s *Server, created *[]llm.LLMProvider) func() llm.LLMProvider {
 	return func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.Models = []llm.ModelInfo{
 			{ID: "m0", ContextLimit: 128000, Current: true},
 			{ID: "m1", ContextLimit: 128000},
@@ -33,11 +34,11 @@ func perSessionModelFactory(s *Server, created *[]llm.LLMProvider) func() llm.LL
 
 // newModelServer builds a server whose default session runs mock model m0
 // (the workspace default) and whose sessions get per-session mock providers.
-func newModelServer(t *testing.T) (*Server, *llm.MockProvider, *[]llm.LLMProvider) {
+func newModelServer(t *testing.T) (*Server, *llmtest.MockProvider, *[]llm.LLMProvider) {
 	t.Helper()
 	dir := t.TempDir()
 	exec := agent.NewExecutor(dir)
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	prov.Model = "m0"
 	prov.Models = []llm.ModelInfo{
 		{ID: "m0", ContextLimit: 128000, Current: true},
@@ -45,7 +46,7 @@ func newModelServer(t *testing.T) (*Server, *llm.MockProvider, *[]llm.LLMProvide
 	}
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 1000})
 	a := agent.NewAgent(prov, exec, ctxMgr)
-	store := session.NewStore(true)
+	store := session.NewStoreWithOptions(true, session.StoreOptions{})
 	a.SessionStore = store
 	s := NewServer(a, &config.Config{})
 	var created []llm.LLMProvider

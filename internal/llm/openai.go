@@ -195,6 +195,12 @@ type OpenAIProvider struct {
 
 	// thinkingLevel controls reasoning_effort. Empty means omit (no thinking).
 	thinkingLevel string
+
+	// sessionHdr carries the current session ID (and its derived UUIDv5) for
+	// the X-Opencode-Session header. Shared with the OpenCode clients' header
+	// round-trippers and the /props probe; nil for direct-constructed
+	// providers (tests) that only exercise pure methods.
+	sessionHdr *sessionHeaderState
 }
 
 // ProviderProfiles builds the registered OpenAI-compatible endpoint list for
@@ -264,6 +270,7 @@ func NewOpenAIProviderWithProfiles(profiles []ProviderProfile, model string, wor
 	if resolver == nil {
 		resolver = modelinfo.NewResolver(modelinfo.CachePath(workingDir))
 	}
+	st := newSessionHeaderState()
 	built := make([]*providerProfile, 0, len(profiles))
 	for _, pr := range profiles {
 		name := strings.TrimSpace(pr.Name)
@@ -275,23 +282,34 @@ func NewOpenAIProviderWithProfiles(profiles []ProviderProfile, model string, wor
 			baseURL: strings.TrimSpace(pr.BaseURL),
 			apiKey:  pr.APIKey,
 			model:   pr.Model,
-		}))
+		}, st))
 	}
-	return newOpenAIProvider(built, model, resolver)
+	return newOpenAIProvider(built, model, resolver, st)
 }
 
 // newClientPair builds the stream + catalog client pair for one endpoint:
 // the stream client carries the SSE transport (long idle reads), the catalog
 // client the short-timeout one (see newSSEHTTPClient/newCatalogHTTPClient).
 // Empty baseURL/apiKey omit the respective option (default endpoint / no
-// auth header).
-func newClientPair(baseURL, apiKey string) (stream, catalog *openai.Client) {
+// auth header). A non-nil st wraps both transports so every request carries
+// the current X-Opencode-Session header (OpenCode endpoints only — see
+// buildProfileClients); nil leaves the clients untagged.
+func newClientPair(baseURL, apiKey string, st *sessionHeaderState) (stream, catalog *openai.Client) {
+	streamHTTP := newSSEHTTPClient()
+	catalogHTTP := newCatalogHTTPClient()
+	if st != nil {
+		// The clients are freshly built per call, so re-wrapping the
+		// Transport touches no shared state; openai-go reads both Client and
+		// Transport from it.
+		streamHTTP.Transport = &sessionHeaderRoundTripper{base: streamHTTP.Transport, st: st}
+		catalogHTTP.Transport = &sessionHeaderRoundTripper{base: catalogHTTP.Transport, st: st}
+	}
 	streamOpts := []option.RequestOption{
-		option.WithHTTPClient(newSSEHTTPClient()),
+		option.WithHTTPClient(streamHTTP),
 		option.WithHeader("User-Agent", buildinfo.UserAgent()),
 	}
 	catalogOpts := []option.RequestOption{
-		option.WithHTTPClient(newCatalogHTTPClient()),
+		option.WithHTTPClient(catalogHTTP),
 		option.WithHeader("User-Agent", buildinfo.UserAgent()),
 	}
 	if apiKey != "" {
@@ -310,21 +328,27 @@ func newClientPair(baseURL, apiKey string) (stream, catalog *openai.Client) {
 // buildProfileClients constructs the stream/catalog client pair (plus the
 // zen/go twins for OpenCode URLs) for one registered provider profile.
 // OpenCode profiles route through the zen/go twins, so their plain catalog
-// client stays nil.
-func buildProfileClients(prof providerProfile) *providerProfile {
-	prof.stream, prof.catalog = newClientPair(prof.baseURL, prof.apiKey)
+// client stays nil. OpenCode clients are tagged with the per-session
+// X-Opencode-Session header (st); third-party endpoints never see it. A nil
+// st (direct-constructed providers) leaves every client untagged.
+func buildProfileClients(prof providerProfile, st *sessionHeaderState) *providerProfile {
 	if isOpencodeURL(prof.baseURL) {
+		prof.stream, prof.catalog = newClientPair(prof.baseURL, prof.apiKey, st)
 		prof.catalog = nil
-		prof.zenStream, prof.zenCatalog = newClientPair(openCodeZenBaseURL, prof.apiKey)
-		prof.goStream, prof.goCatalog = newClientPair(openCodeGoBaseURL, prof.apiKey)
+		prof.zenStream, prof.zenCatalog = newClientPair(openCodeZenBaseURL, prof.apiKey, st)
+		prof.goStream, prof.goCatalog = newClientPair(openCodeGoBaseURL, prof.apiKey, st)
+		return &prof
 	}
+	prof.stream, prof.catalog = newClientPair(prof.baseURL, prof.apiKey, nil)
 	return &prof
 }
 
 // newOpenAIProvider assembles the provider from its profile client sets.
 // profiles[0] is the default profile; the fallback accessors read it
-// directly, so there is no secondary client state to keep in sync.
-func newOpenAIProvider(profiles []*providerProfile, model string, resolver *modelinfo.Resolver) *OpenAIProvider {
+// directly, so there is no secondary client state to keep in sync. st is the
+// shared session-header state the profile clients were built with (may be
+// nil for direct-constructed providers).
+func newOpenAIProvider(profiles []*providerProfile, model string, resolver *modelinfo.Resolver, st *sessionHeaderState) *OpenAIProvider {
 	p := &OpenAIProvider{
 		model:          model,
 		modelClient:    make(map[string]*openai.Client),
@@ -333,6 +357,7 @@ func newOpenAIProvider(profiles []*providerProfile, model string, resolver *mode
 		modelInfo:      resolver,
 		profiles:       profiles,
 		effortsDerived: make(map[string]derivedEfforts),
+		sessionHdr:     st,
 	}
 	p.modelInfo.Warm() // non-blocking; populate cache before first limit lookup
 	return p
@@ -358,6 +383,19 @@ func (p *OpenAIProvider) SetPromptCacheKey(key string) {
 		return
 	}
 	p.promptCacheKey = param.NewOpt(key)
+}
+
+// SetSessionID sets the session whose ID tags this provider's OpenCode
+// requests: the X-Opencode-Session header carries a UUIDv5 derived from id
+// (see SessionUUID), so the value is stable across restarts of a resumed
+// session. An empty id clears the header. The value is resolved per request,
+// so the call is safe from any goroutine at any time — including after
+// SetProfiles rebuilds the clients (they share the same state).
+func (p *OpenAIProvider) SetSessionID(id string) {
+	if p == nil || p.sessionHdr == nil {
+		return
+	}
+	p.sessionHdr.SetSessionID(id)
 }
 
 // ProjectPromptCacheKey returns a stable, short hash of the working directory
@@ -443,7 +481,7 @@ func (p *OpenAIProvider) SetProfiles(profiles []ProviderProfile) error {
 			baseURL: strings.TrimSpace(pr.BaseURL),
 			apiKey:  pr.APIKey,
 			model:   pr.Model,
-		}))
+		}, p.sessionHdr))
 	}
 	p.invalidatePropsCaps()
 	p.invalidateReasoningEfforts()

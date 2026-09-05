@@ -9,6 +9,7 @@ import (
 
 	"gogen/internal/config"
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 	"gogen/internal/projectfile"
 
 	"github.com/gorilla/websocket"
@@ -199,7 +200,7 @@ func TestTestProviderViaWS(t *testing.T) {
 		if op.BaseURL == "http://broken" {
 			return nil, fmt.Errorf("connection refused")
 		}
-		m := llm.NewMockProvider()
+		m := llmtest.NewMockProvider()
 		m.Models = []llm.ModelInfo{{ID: "mock-model", ContextLimit: 128000}}
 		return m, nil
 	}
@@ -254,7 +255,7 @@ func TestTestProviderByNameUsesStoredCredentials(t *testing.T) {
 	var gotOp ProviderOpRequest
 	s.providerTestBuilder = func(op ProviderOpRequest, _ string) (llm.LLMProvider, error) {
 		gotOp = op
-		return llm.NewMockProvider(), nil
+		return llmtest.NewMockProvider(), nil
 	}
 	srv := startWSServer(t, s)
 	defer srv.Close()

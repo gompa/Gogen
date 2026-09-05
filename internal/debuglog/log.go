@@ -114,14 +114,3 @@ func Write(location, message, hypothesisID string, data map[string]any) {
 	}
 	_, _ = logFile.Write(line)
 }
-
-// CloseLog closes the debug log file (cross-platform test cleanup).
-func CloseLog() {
-	writeMu.Lock()
-	defer writeMu.Unlock()
-	if logFile != nil {
-		_ = logFile.Close()
-		logFile = nil
-	}
-	logPathCached = ""
-}

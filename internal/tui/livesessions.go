@@ -510,6 +510,9 @@ func (m *Model) renderRoundBuffer(rw *streambuf.Snapshot) {
 			m.chatLines = append(m.chatLines, renderStyledBlock(ThinkingStyle, "<thinking>"+displayBuf))
 			m.streamThinkingOpen = true
 			m.streamThinkingBuf.WriteString(rw.Thinking)
+			// Seed the incremental render cache from the snapshot so the
+			// next live token advances it instead of starting from empty.
+			m.rebuildStreamThinkingCache()
 		} else {
 			// Content or tool calls followed: the live path already
 			// closed the block — render it closed.
@@ -526,9 +529,9 @@ func (m *Model) renderRoundBuffer(rw *streambuf.Snapshot) {
 	for _, tc := range rw.ToolCalls {
 		m.streamToolCallNames[tc.Index] = tc.Name
 		m.streamToolCallIDs[tc.Index] = tc.ID
-		m.streamToolCallArgs[tc.Index] = tc.Args
+		m.streamToolCallArgs[tc.Index] = &streamToolArgs{buf: []byte(tc.Args)}
 		line := prefix + " " + tc.Name
-		if args, err := parseInlineJSONArgs(tc.Args); err == nil && len(args) > 0 {
+		if args, err := parseInlineJSONArgs([]byte(tc.Args)); err == nil && len(args) > 0 {
 			line += " " + ToolCallArgsStyle.Render(formatToolArgs(args))
 		}
 		m.streamToolCallLines[tc.Index] = len(m.chatLines)

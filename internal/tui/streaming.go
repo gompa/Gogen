@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -431,6 +432,30 @@ func renderStyledBlock(style lipgloss.Style, text string) string {
 	return strings.Join(lines, "\n")
 }
 
+// streamThinkingCache is the incremental render state of the open thinking
+// block. styledPrefix holds the styled+wrapped output of every FINALIZED raw
+// line — each a pure function of (line, style, width): ansi.Wrap resets its
+// wrap state at every newline, so per-line style+wrap is byte-identical to
+// the old whole-block rebuild. current is the raw in-progress last line; it
+// is re-styled and re-wrapped FROM RAW TEXT on every batch (never extended
+// in wrapped form — appending to a wrapped line would break the greedy wrap
+// at the seam), so no stale SGR state can ever leak into the wrap (the
+// failure mode the old rebuild-from-buffer comment describes).
+//
+// The tag lives inside the first raw line ("<thinking>..."), exactly as the
+// old renderStyledBlock(ThinkingStyle, "<thinking>"+displayBuf) produced it.
+// When the buffer ends with a newline, current is "" (the display trims
+// trailing newlines, so the last visible line is the one before it).
+//
+// The chat line holds the PRE-WRAPPED display (see streamThinkingDisplay);
+// re-wrapping it at the SAME width is idempotent, but at a CHANGED width it
+// would break at the old wrap seams — setViewportContent rebuilds the cache
+// and rewrites the line before its full re-wrap for exactly that reason.
+type streamThinkingCache struct {
+	styledPrefix string
+	current      string
+}
+
 func (m *Model) handleStreamThinking(token string) {
 	// Guard: if tool calls are already in progress, thinking tokens belong
 	// before them (OpenAI protocol ensures this ordering).  Silently ignore
@@ -445,20 +470,97 @@ func (m *Model) handleStreamThinking(token string) {
 		m.streamThinkingOpen = true
 		m.streamThinkingLine = len(m.chatLines)
 		m.appendChatLine(ThinkingTagStyle.Render("<thinking>"))
+		// Seed the cache: the tag opens the first raw line, which the
+		// advance below extends with this token.
+		m.streamThinkingCache = streamThinkingCache{current: "<thinking>"}
 	}
+	// Advance the cache incrementally (O(token) + O(in-progress line))
+	// instead of re-copying, re-styling, and re-wrapping the whole block
+	// every batch — the old rebuild was O(total thinking so far) per
+	// 32ms flush, i.e. O(n²) over a long reasoning stream. The output is
+	// byte-identical to that rebuild (see streamThinkingCache).
+	m.advanceStreamThinkingCache(token)
+	m.renderStreamThinkingLine()
+}
 
-	// Rebuild the thinking line cleanly from the accumulated buffer.  This
-	// avoids two problems with per-delta append+style: (1) interleaved
-	// \x1b[0m codes destabilise word-wrap (line height jumps when the block
-	// closes and normalises the styling), and (2) whitespace-only tokens
-	// that the batcher splits into standalone segments are silently dropped
-	// from the display by TrimSpace, only to re-appear after close.
-	// When the buffer ends with a newline, wrapLine splits it into an extra
-	// blank visual line that will flash away when the next token fills it in
-	// or when </thinking> replaces it on close.  Trim trailing newlines so
-	// the streaming display stays stable.
-	displayBuf := strings.TrimRight(m.streamThinkingBuf.String(), "\n")
-	m.replaceStreamLine(m.streamThinkingLine, renderStyledBlock(ThinkingStyle, "<thinking>"+displayBuf))
+// rebuildStreamThinkingCache rebuilds the thinking render cache from the
+// full buffer. Called when the block is seeded from a round-buffer snapshot
+// (mid-turn join) or after a width change (resize / sidebar drag), where
+// the cached per-line output no longer matches the current wrap width.
+func (m *Model) rebuildStreamThinkingCache() {
+	m.streamThinkingCache = streamThinkingCache{}
+	// Mirror the display rule: trailing newlines are trimmed so a buffer
+	// ending in "\n" shows no blank trailing line.
+	buf := strings.TrimRight(m.streamThinkingBuf.String(), "\n")
+	if buf == "" {
+		return
+	}
+	lines := strings.Split(buf, "\n")
+	lines[0] = "<thinking>" + lines[0]
+	c := &m.streamThinkingCache
+	c.current = lines[len(lines)-1]
+	if len(lines) > 1 {
+		parts := make([]string, 0, len(lines)-1)
+		for _, l := range lines[:len(lines)-1] {
+			parts = append(parts, m.wrapLine(ThinkingStyle.Render(l))...)
+		}
+		c.styledPrefix = strings.Join(parts, "\n")
+	}
+}
+
+// styleWrapLine styles one raw line and wraps it for the current width.
+func (m *Model) styleWrapLine(raw string) string {
+	return strings.Join(m.wrapLine(ThinkingStyle.Render(raw)), "\n")
+}
+
+// advanceStreamThinkingCache folds a fresh token batch into the thinking
+// render cache: every newline finalizes the in-progress line into
+// styledPrefix (styled+wrapped once), leaving only the new tail to re-render.
+func (m *Model) advanceStreamThinkingCache(token string) {
+	c := &m.streamThinkingCache
+	for len(token) > 0 {
+		i := strings.IndexByte(token, '\n')
+		if i < 0 {
+			c.current += token
+			return
+		}
+		c.current += token[:i]
+		wrapped := m.styleWrapLine(c.current)
+		if c.styledPrefix == "" {
+			c.styledPrefix = wrapped
+		} else {
+			c.styledPrefix += "\n" + wrapped
+		}
+		c.current = ""
+		token = token[i+1:]
+	}
+}
+
+// streamThinkingDisplay assembles the pre-wrapped thinking block from the
+// cache. The in-progress line is the only part styled+wrapped, so each
+// batch costs O(in-progress line) instead of O(total thinking so far).
+func (m *Model) streamThinkingDisplay() string {
+	c := &m.streamThinkingCache
+	switch {
+	case c.current != "":
+		last := m.styleWrapLine(c.current)
+		if c.styledPrefix == "" {
+			return last
+		}
+		return c.styledPrefix + "\n" + last
+	case c.styledPrefix != "":
+		return c.styledPrefix
+	default:
+		// Buffer holds only newlines so far: show the bare tag, exactly
+		// as the old renderStyledBlock(ThinkingStyle, "<thinking>") did.
+		return ThinkingStyle.Render("<thinking>")
+	}
+}
+
+// renderStreamThinkingLine writes the cached thinking block into its chat
+// line.
+func (m *Model) renderStreamThinkingLine() {
+	m.replaceStreamLine(m.streamThinkingLine, m.streamThinkingDisplay())
 }
 
 // closeThinkingBlock finalizes an open thinking line in place (not necessarily
@@ -476,6 +578,7 @@ func (m *Model) closeThinkingBlock() {
 	}
 	m.replaceStreamLine(m.streamThinkingLine, line)
 	m.streamThinkingBuf.Reset()
+	m.streamThinkingCache = streamThinkingCache{}
 	m.streamThinkingLine = -1
 	// Reset assistant state so content tokens arriving after this thinking
 	// block create a new line below it, preserving temporal order.
@@ -483,11 +586,33 @@ func (m *Model) closeThinkingBlock() {
 	m.streamAssistantLine = -1
 }
 
-// appendToStreamLine appends text to a tracked streaming line. When that line
-// is last, uses the cheap prefix rebuild; otherwise full rewrap.
-// If the recorded lineIdx is no longer valid (e.g. the chat was modified
-// concurrently), fall back to appending to the last line so the token is
-// not silently dropped. The mismatch is logged at debug level.
+// commitChatLineWrite applies one write to chat line idx — appending text
+// when append is true, replacing the line otherwise — and settles the
+// viewport. This is the streaming prefix-cache invalidation rule in one
+// place: wrappedPrefix caches the wrap of everything before the last line,
+// so only a write to the LAST chat line keeps it valid (cheap suffix
+// rebuild via buildFromPrefix); a write to any earlier line stales the
+// prefix and needs the full re-wrap (setViewportContent). The viewport is
+// always re-pinned to the bottom, matching streaming behavior.
+func (m *Model) commitChatLineWrite(idx int, append bool, text string) {
+	if append {
+		m.chatLines[idx] += text
+	} else {
+		m.chatLines[idx] = text
+	}
+	if idx == len(m.chatLines)-1 {
+		m.buildFromPrefix()
+	} else {
+		m.setViewportContent()
+	}
+	m.viewport.GotoBottom()
+}
+
+// appendToStreamLine appends text to a tracked streaming line (refresh rule
+// in commitChatLineWrite). If the recorded lineIdx is no longer valid (e.g.
+// the chat was modified concurrently), fall back to appending to the last
+// line so the token is not silently dropped. The mismatch is logged at
+// debug level.
 func (m *Model) appendToStreamLine(lineIdx int, text string) {
 	if lineIdx < 0 || lineIdx >= len(m.chatLines) {
 		debuglog.Write("tui/stream", "appendToStreamLine: slot invalid", "stream-slot-lost", map[string]any{
@@ -498,18 +623,12 @@ func (m *Model) appendToStreamLine(lineIdx int, text string) {
 		m.appendToLastLine(text)
 		return
 	}
-	m.chatLines[lineIdx] += text
-	if lineIdx == len(m.chatLines)-1 {
-		m.buildFromPrefix()
-	} else {
-		m.setViewportContent()
-	}
-	m.viewport.GotoBottom()
+	m.commitChatLineWrite(lineIdx, true, text)
 }
 
-// replaceStreamLine replaces text in a tracked streaming line. When that line
-// is last, uses the cheap prefix rebuild; otherwise full rewrap. If the
-// recorded lineIdx is no longer valid, fall back to the last line and log.
+// replaceStreamLine replaces text in a tracked streaming line (refresh rule
+// in commitChatLineWrite). If the recorded lineIdx is no longer valid, fall
+// back to the last line and log.
 func (m *Model) replaceStreamLine(lineIdx int, text string) {
 	if lineIdx < 0 || lineIdx >= len(m.chatLines) {
 		debuglog.Write("tui/stream", "replaceStreamLine: slot invalid", "stream-slot-lost", map[string]any{
@@ -520,13 +639,7 @@ func (m *Model) replaceStreamLine(lineIdx int, text string) {
 		m.replaceLastLine(text)
 		return
 	}
-	m.chatLines[lineIdx] = text
-	if lineIdx == len(m.chatLines)-1 {
-		m.buildFromPrefix()
-	} else {
-		m.setViewportContent()
-	}
-	m.viewport.GotoBottom()
+	m.commitChatLineWrite(lineIdx, false, text)
 }
 
 func (m *Model) handleStreamToolCall(index int, id string, name string) {
@@ -537,11 +650,227 @@ func (m *Model) handleStreamToolCall(index int, id string, name string) {
 	m.streamAssistantLine = -1
 	m.streamToolCallNames[index] = name
 	m.setActiveTool(name)
-	m.streamToolCallArgs[index] = ""
+	m.streamToolCallArgs[index] = &streamToolArgs{}
 	m.streamToolCallIDs[index] = id
 	m.streamToolCallLines[index] = len(m.chatLines) // appendChatLine will add at this index
 	prefix := ToolCallStyle.Render("  →")
 	m.appendChatLine(prefix + " " + name)
+}
+
+// streamToolDiffRender is the incremental render state of one patch_file
+// call's "diff" argument while it streams. Raw args are append-only, so
+// every batch extends the value at its tail: valueStart/consumed track how
+// much of the value is already unescaped into diff (a trailing backslash is
+// held back until its escape pair completes in a later batch), and
+// renderedLines/lastRaw hold the rendered finalized lines plus the raw
+// in-progress last line — the same finalize-on-newline pattern as
+// streamThinkingCache. Per-batch work is O(delta) instead of O(diff).
+type streamToolDiffRender struct {
+	valueStart    int      // raw offset of the first value byte; -1 = key not found yet
+	valueEnd      int      // raw offset just past the closing quote; -1 = value still open
+	consumed      int      // raw bytes of the value already unescaped into diff
+	diff          []byte   // accumulated unescaped diff text (append-grown: a string accumulator would copy O(diff) per batch)
+	rawRendered   int      // bytes of diff already folded into renderedLines/lastRaw
+	renderedLines []string // rendered finalized lines
+	lastRaw       string   // in-progress last raw line (the caller renders it for display)
+}
+
+// diffKeyRaw is the needle advanceToolDiffRender uses to locate the "diff"
+// member; a package-level slice avoids converting per batch.
+var diffKeyRaw = []byte(`"diff"`)
+
+// advanceToolDiffRender folds the current raw args buffer into the
+// per-index incremental diff state, processing only bytes not seen before:
+// it locates the "diff" value once, scans for the closing quote from where
+// the previous batch stopped, unescapes only the new tail, and finalizes
+// newly completed lines into renderedLines. The state is always returned
+// (created on first use); while no diff content has arrived, diff is empty.
+//
+// The locator keeps the legacy whole-buffer extractor's semantics (first
+// `"diff"` occurrence; wait for more bytes while the colon/opening quote
+// has not arrived) so display behaviour is unchanged. raw is the caller's
+// append-grown args buffer, passed by reference so batches never re-copy it.
+func (m *Model) advanceToolDiffRender(index int, raw []byte) *streamToolDiffRender {
+	st := m.streamToolDiffRender[index]
+	if st == nil {
+		st = &streamToolDiffRender{valueStart: -1, valueEnd: -1}
+		m.streamToolDiffRender[index] = st
+	}
+	// Locate the start of the "diff" value once.
+	if st.valueStart < 0 {
+		keyIdx := bytes.Index(raw, diffKeyRaw)
+		if keyIdx < 0 {
+			return st
+		}
+		i := keyIdx + len(`"diff"`)
+		for i < len(raw) && (raw[i] == ' ' || raw[i] == '\t') {
+			i++
+		}
+		if i >= len(raw) || raw[i] != ':' {
+			return st
+		}
+		i++
+		for i < len(raw) && (raw[i] == ' ' || raw[i] == '\t') {
+			i++
+		}
+		if i >= len(raw) || raw[i] != '"' {
+			return st
+		}
+		st.valueStart = i + 1
+	}
+	// Scan for the closing quote from where the unescape left off (only new
+	// bytes are scanned; escaped quotes are skipped as pairs).
+	if st.valueEnd < 0 {
+		i := st.valueStart + st.consumed
+		for i < len(raw) {
+			switch raw[i] {
+			case '\\':
+				i += 2
+			case '"':
+				st.valueEnd = i + 1
+				i = len(raw)
+			default:
+				i++
+			}
+		}
+	}
+	// Unescape the new tail of the value.
+	pos := st.valueStart + st.consumed
+	chunkEnd := pos
+	if st.valueEnd < 0 {
+		chunkEnd = len(raw)
+	} else if st.valueEnd-1 > chunkEnd {
+		chunkEnd = st.valueEnd - 1
+	}
+	if chunkEnd > pos {
+		chunk := raw[pos:chunkEnd]
+		i := 0
+		for i < len(chunk) {
+			if chunk[i] == '\\' {
+				if i+1 >= len(chunk) {
+					// Trailing backslash: its escape may complete in the
+					// next batch — hold it back rather than freezing a
+					// literal backslash into the diff.
+					break
+				}
+				switch chunk[i+1] {
+				case 'n':
+					st.diff = append(st.diff, '\n')
+				case 't':
+					st.diff = append(st.diff, '\t')
+				case '"':
+					st.diff = append(st.diff, '"')
+				case '\\':
+					st.diff = append(st.diff, '\\')
+				case 'r':
+					// \r is a no-op in the diff; skip
+				default:
+					st.diff = append(st.diff, chunk[i], chunk[i+1])
+				}
+				i += 2
+				continue
+			}
+			st.diff = append(st.diff, chunk[i])
+			i++
+		}
+		st.consumed += i
+	}
+	// Render the new tail: each newline finalizes the in-progress line into
+	// renderedLines; the remainder stays raw in lastRaw. tail is a window
+	// into st.diff used only within this call, after the appends above — it
+	// never observes a later reallocation — and the string conversions copy,
+	// so nothing retained aliases the buffer.
+	for tail := st.diff[st.rawRendered:]; len(tail) > 0; {
+		i := bytes.IndexByte(tail, '\n')
+		if i < 0 {
+			st.lastRaw += string(tail)
+			break
+		}
+		st.renderedLines = append(st.renderedLines, renderDiffLine(st.lastRaw+string(tail[:i])))
+		st.lastRaw = ""
+		tail = tail[i+1:]
+	}
+	st.rawRendered = len(st.diff)
+	return st
+}
+
+// streamJSONScan incrementally tracks whether the top-level JSON value in
+// an append-only args buffer has closed, scanning only bytes not seen
+// before. It understands just enough of the grammar — string state,
+// backslash escapes, bracket depth — to find the closing brace of the root
+// object, so callers can skip whole-buffer json.Unmarshal attempts that
+// could not succeed yet (encoding/json pre-scans the entire input for
+// validity before failing, O(N) per batch). The scan is monotonic: raw only
+// grows, so once closed the buffer stays closed — and bytes after the
+// closing brace cannot repair an unparseable prefix — which lets callers
+// cache the once-computed parse result for good.
+type streamJSONScan struct {
+	consumed int  // bytes already scanned
+	depth    int  // bracket nesting inside the root value
+	inString bool // inside a JSON string
+	escaped  bool // previous byte in the current string was an unescaped '\'
+	closed   bool // root object's closing brace seen
+}
+
+// advance scans the newly arrived tail of buf, updating string and bracket
+// state; per batch it is O(new bytes). The first '{' opens the root object
+// and the matching '}' closes it — after that the scan is a no-op. Malformed
+// input (a stray closing brace at root, a trailing escape) cannot make a
+// later batch parseable either, so the worst case is the legacy one: the
+// line simply never gains args.
+func (s *streamJSONScan) advance(buf []byte) {
+	if s.closed {
+		return
+	}
+	for i := s.consumed; i < len(buf); i++ {
+		c := buf[i]
+		if s.inString {
+			switch {
+			case s.escaped:
+				s.escaped = false
+			case c == '\\':
+				s.escaped = true
+			case c == '"':
+				s.inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			s.inString = true
+		case '{', '[':
+			s.depth++
+		case '}', ']':
+			s.depth--
+			if s.depth == 0 {
+				// End of the root object: later bytes cannot change
+				// parseability, so stop scanning for good.
+				s.closed = true
+				s.consumed = i + 1
+				return
+			}
+			if s.depth < 0 {
+				s.depth = 0
+			}
+		}
+	}
+	s.consumed = len(buf)
+}
+
+// streamToolArgs accumulates one tool call's streamed args plus the derived
+// streaming display state, so no batch re-parses the whole buffer. buf is
+// append-grown (a string accumulator would copy O(total) per batch); scan
+// advances over only the new tail; and the compact (patch_file) and
+// formatted (generic) args lines are computed exactly once, when the scan
+// sees the top-level object close — while it is open, json.Unmarshal could
+// not succeed anyway, so the per-batch re-parse was pure overhead.
+type streamToolArgs struct {
+	buf         []byte         // accumulated raw args, append-only
+	scan        streamJSONScan // incremental completeness scan over buf
+	compact     string         // patch_file: formatArgsCompact output ("" = none)
+	compactDone bool           // patch_file: compact line finalized (object closed)
+	argStr      string         // generic: formatToolArgs output ("" = none)
+	genDone     bool           // generic: args line finalized (object closed)
 }
 
 func (m *Model) handleStreamToolArgs(index int, id string, delta string) {
@@ -549,74 +878,140 @@ func (m *Model) handleStreamToolArgs(index int, id string, delta string) {
 	if !ok || lineIdx < 0 || lineIdx >= len(m.chatLines) {
 		return
 	}
-	m.streamToolCallArgs[index] += delta
-	raw := m.streamToolCallArgs[index]
+	ab := m.streamToolCallArgs[index]
+	if ab == nil {
+		ab = &streamToolArgs{}
+		m.streamToolCallArgs[index] = ab
+	}
+	// O(delta) append: the accumulated args are never re-copied per batch
+	// (a string += would copy the whole buffer every ~32 ms).
+	ab.buf = append(ab.buf, delta...)
+	ab.scan.advance(ab.buf)
+	raw := ab.buf
 	m.bumpContextEstimate(delta)
 
 	// For patch_file: progressively render diff content as it streams in.
 	// This avoids a jarring "pop-up" of the entire diff block in the result.
+	//
+	// The raw args buffer is append-only, so the extracted diff (and its
+	// rendered form) only grows at its tail: per batch, at most the previous
+	// LAST diff line changes in place and everything after it is new. The
+	// extract+render is incremental (advanceToolDiffRender, O(delta)) and
+	// the chatLines updates go through the append funnels (appendChatLine(s)
+	// + buildFromPrefix, O(new lines)) — the old path re-scanned the whole
+	// raw buffer, re-rendered the entire diff, and fell back to
+	// setViewportContent (a full re-wrap of the whole conversation) on
+	// every 32 ms args batch.
 	if m.streamToolCallNames[index] == "patch_file" {
-		if diff, ok := extractDiffValue(raw); ok && diff != "" {
-			rendered := renderDiff(diff)
-			renderedLines := strings.Split(rendered, "\n")
+		if st := m.advanceToolDiffRender(index, raw); len(st.renderedLines) > 0 || st.lastRaw != "" {
+			// Displayed lines: the finalized rendered lines plus the
+			// in-progress last line, if any.
+			renderedLines := make([]string, 0, len(st.renderedLines)+1)
+			renderedLines = append(renderedLines, st.renderedLines...)
+			if st.lastRaw != "" {
+				renderedLines = append(renderedLines, renderDiffLine(st.lastRaw))
+			}
 			prevCount := m.streamToolDiffCount[index]
 			newCount := len(renderedLines)
-
-			// First time we're showing diff lines: add the top border
-			if prevCount == 0 {
-				m.chatLines = append(m.chatLines, DiffMetaStyle.Render("  ╭─ diff ─"))
-				m.streamToolDiffStart[index] = len(m.chatLines)
+			switch {
+			case newCount > prevCount:
+				// First time we're showing diff lines: add the top border
+				// through the funnel so the prefix cache stays valid.
+				if prevCount == 0 {
+					m.appendChatLine(DiffMetaStyle.Render("  ╭─ diff ─"))
+					m.streamToolDiffStart[index] = len(m.chatLines)
+				}
+				// At most the previous last diff line grew within the batch;
+				// earlier lines are byte-identical and stay untouched.
+				if prevCount > 0 {
+					lastIdx := m.streamToolDiffStart[index] + prevCount - 1
+					if updated := "  " + renderedLines[prevCount-1]; m.chatLines[lastIdx] != updated {
+						m.chatLines[lastIdx] = updated
+						if lastIdx != len(m.chatLines)-1 {
+							// Another stream appended after our last diff
+							// line, so this is a middle-line write and the
+							// prefix cache is stale: full rebuild.
+							m.setViewportContent()
+						}
+					}
+				}
+				newLines := make([]string, 0, newCount-prevCount)
+				for i := prevCount; i < newCount; i++ {
+					newLines = append(newLines, "  "+renderedLines[i])
+				}
+				m.appendChatLines(newLines)
+				m.streamToolDiffCount[index] = newCount
+			case newCount == prevCount && prevCount > 0:
+				// No new lines: only the last diff line may have grown.
+				lastIdx := m.streamToolDiffStart[index] + prevCount - 1
+				if updated := "  " + renderedLines[prevCount-1]; m.chatLines[lastIdx] != updated {
+					m.commitChatLineWrite(lastIdx, false, updated)
+				}
 			}
-
-			diffStart := m.streamToolDiffStart[index]
-			// Update existing diff lines (content may have grown within a line)
-			for i := 0; i < prevCount && i < newCount; i++ {
-				m.chatLines[diffStart+i] = "  " + renderedLines[i]
-			}
-			// Append new diff lines
-			for i := prevCount; i < newCount; i++ {
-				m.chatLines = append(m.chatLines, "  "+renderedLines[i])
-			}
-			m.streamToolDiffCount[index] = newCount
-
-			// Diff lines were appended directly to chatLines (not via
-			// appendChatLine), so the incremental prefix is stale: full rebuild.
-			m.setViewportContent()
-			m.viewport.GotoBottom()
+			// newCount < prevCount is unreachable: raw only grows, so the
+			// extracted diff and its rendered line count are monotonic.
 		}
 		// Don't try to parse JSON for the args line; diff values are huge and
 		// formatToolArgs would just truncate them. Show a clean compact line.
+		//
+		// While the top-level object is open the JSON is incomplete, so
+		// formatArgsCompact could only return "" anyway (the legacy path
+		// proved that by re-unmarshaling the whole diff every batch); the
+		// unmarshal therefore runs exactly once, when the scan first sees
+		// the object close.
+		if ab.scan.closed && !ab.compactDone {
+			ab.compact = formatArgsCompact(raw, 120)
+			ab.compactDone = true
+		}
 		prefix := ToolCallStyle.Render("  →")
-		shortArgs := formatArgsCompact(raw, 120)
 		toolName := m.streamToolCallNames[index]
-		if shortArgs == "" {
-			m.chatLines[lineIdx] = prefix + " " + toolName
+		var lineText string
+		if ab.compact == "" {
+			lineText = prefix + " " + toolName
 		} else {
-			m.chatLines[lineIdx] = prefix + " " + toolName + " " + ToolCallArgsStyle.Render(shortArgs)
+			lineText = prefix + " " + toolName + " " + ToolCallArgsStyle.Render(ab.compact)
 		}
-		if lineIdx == len(m.chatLines)-1 {
-			m.buildFromPrefix()
+		if m.chatLines[lineIdx] != lineText {
+			// Rare — the compact line only changes when a non-diff key
+			// appears in the JSON. Diff lines sit below the tool-call line,
+			// so this is a middle-line write and commitChatLineWrite takes
+			// the full-rebuild path.
+			m.commitChatLineWrite(lineIdx, false, lineText)
+		} else {
+			m.viewport.GotoBottom()
 		}
-		m.viewport.GotoBottom()
 		return
 	}
 
 	// Only show args once JSON is fully parseable.  Raw / truncated JSON
 	// varies in length enough to cause the line to re-wrap and make
 	// content below jump when handleStreamToolCallFinal normalises it.
-	args, parseErr := parseInlineJSONArgs(raw)
-	if parseErr != nil {
+	//
+	// Parseability is decided incrementally by the per-index scan (O(delta)
+	// per batch): the whole-buffer unmarshal — whose validity pre-scan walks
+	// every byte — runs exactly once, when the object first closes, and the
+	// formatted args are cached from then on.
+	if !ab.scan.closed {
 		return
 	}
-
-	// Format the same way handleStreamToolCallFinal does, so the line is
-	// already in its final form when that fires.  This eliminates the jump
-	// entirely for multi-key args and only leaves the minimal name→name+args
-	// transition for tools whose last arg key completes the JSON.
-	if len(args) == 0 {
+	if !ab.genDone {
+		ab.genDone = true
+		args, parseErr := parseInlineJSONArgs(raw)
+		if parseErr != nil || len(args) == 0 {
+			return
+		}
+		// Format the same way handleStreamToolCallFinal does, so the line is
+		// already in its final form when that fires.  This eliminates the
+		// jump entirely for multi-key args and only leaves the minimal
+		// name→name+args transition for tools whose last arg key completes
+		// the JSON.
+		ab.argStr = formatToolArgs(args)
+	} else if ab.argStr == "" {
+		// Finalized as unparseable (or empty): a closed buffer can never
+		// become parseable again, so no later batch can change the line.
 		return
 	}
-	argStr := formatToolArgs(args)
+	argStr := ab.argStr
 
 	// Rebuild the line cleanly from the accumulated buffer so there is a
 	// single contiguous SGR wrapper.  Per-delta styling produces interleaved
@@ -624,14 +1019,14 @@ func (m *Model) handleStreamToolArgs(index int, id string, delta string) {
 	// to jump when handleStreamToolCallFinal normalises the styling.
 	name := m.streamToolCallNames[index]
 	prefix := ToolCallStyle.Render("  →")
-	m.chatLines[lineIdx] = prefix + " " + name + " " + ToolCallArgsStyle.Render(argStr)
-
-	if lineIdx == len(m.chatLines)-1 {
-		m.buildFromPrefix()
+	line := prefix + " " + name + " " + ToolCallArgsStyle.Render(argStr)
+	if m.chatLines[lineIdx] != line {
+		m.commitChatLineWrite(lineIdx, false, line)
 	} else {
-		m.setViewportContent()
+		// argStr is cached, so the line is already final; just keep the
+		// viewport pinned like the unchanged-line branch above.
+		m.viewport.GotoBottom()
 	}
-	m.viewport.GotoBottom()
 }
 
 // handleStreamToolCallFinal replaces the streaming tool call line with the final
@@ -647,17 +1042,11 @@ func (m *Model) handleStreamToolCallFinal(index int, tc llm.ToolCall) {
 	}
 	prefix := ToolCallStyle.Render("  →")
 	argStr := formatToolArgs(tc.Args)
-	if argStr == "" {
-		m.chatLines[lineIdx] = prefix + " " + name
-	} else {
-		m.chatLines[lineIdx] = prefix + " " + name + " " + ToolCallArgsStyle.Render(argStr)
+	line := prefix + " " + name
+	if argStr != "" {
+		line += " " + ToolCallArgsStyle.Render(argStr)
 	}
-	if lineIdx == len(m.chatLines)-1 {
-		m.buildFromPrefix()
-	} else {
-		m.setViewportContent()
-	}
-	m.viewport.GotoBottom()
+	m.commitChatLineWrite(lineIdx, false, line)
 
 	// Capture diff content for patch_file calls so we can render it in the result
 	// (fallback if progressive rendering didn't cover the full diff).
@@ -676,13 +1065,15 @@ func (m *Model) handleStreamToolCallFinal(index int, tc llm.ToolCall) {
 
 // parseInlineJSONArgs attempts to parse incomplete streaming JSON args.
 // Returns the parsed map on success; nil+error when JSON is not yet complete.
-func parseInlineJSONArgs(raw string) (map[string]any, error) {
-	s := strings.TrimSpace(raw)
-	if s == "" || !strings.HasPrefix(s, "{") {
+// Takes a byte slice so streaming callers can pass the append-grown args
+// buffer without an O(N) string materialization per batch.
+func parseInlineJSONArgs(raw []byte) (map[string]any, error) {
+	s := bytes.TrimSpace(raw)
+	if len(s) == 0 || s[0] != '{' {
 		return nil, fmt.Errorf("incomplete")
 	}
 	var args map[string]any
-	err := json.Unmarshal([]byte(s), &args)
+	err := json.Unmarshal(s, &args)
 	return args, err
 }
 
@@ -767,16 +1158,18 @@ func (m *Model) resetStreamState(keepToolDiffShown bool) {
 	m.streamAssistantBuf.Reset()
 	m.streamAssistantLine = -1
 	m.streamThinkingBuf.Reset()
+	m.streamThinkingCache = streamThinkingCache{}
 	m.streamThinkingOpen = false
 	m.streamThinkingLine = -1
 	m.streamToolCallNames = make(map[int]string)
-	m.streamToolCallArgs = make(map[int]string)
+	m.streamToolCallArgs = make(map[int]*streamToolArgs)
 	m.streamToolCallIDs = make(map[int]string)
 	m.streamToolCallLines = make(map[int]int)
 	m.setActiveTool("")
 	m.toolCallDiffs = make(map[string]string)
 	m.streamToolDiffCount = make(map[int]int)
 	m.streamToolDiffStart = make(map[int]int)
+	m.streamToolDiffRender = make(map[int]*streamToolDiffRender)
 	if !keepToolDiffShown {
 		m.toolDiffShown = make(map[string]bool)
 	}

@@ -366,3 +366,25 @@ func TestSetCachePathClearsMemory(t *testing.T) {
 		t.Fatal("expected in-memory registry cleared for new project path")
 	}
 }
+
+// ResolveContextLimit and ProviderID are the test-only read surface, moved
+// out of resolver.go: production resolves everything it needs through the
+// single-lookup Resolve (and uses providerFor internally).
+
+// ResolveContextLimit returns the context window size (in tokens) for the
+// given model. It never blocks on the network. Returns an error if the
+// registry is not loaded yet or the provider/model is missing — callers fall
+// back to GOGEN_CONTEXT_LIMIT / heuristics.
+func (r *Resolver) ResolveContextLimit(baseURL, modelID string) (Limit, error) {
+	lim, _, _, _, err := r.Resolve(baseURL, modelID)
+	return lim, err
+}
+
+// ProviderID returns the models.dev provider ID matching a base URL, if any.
+func (r *Resolver) ProviderID(baseURL string) (string, bool) {
+	provider, err := r.providerFor(baseURL)
+	if err != nil {
+		return "", false
+	}
+	return provider.ID, true
+}

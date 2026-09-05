@@ -135,7 +135,7 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 	}
 	reg := newSessionRegistry(maxActive)
 	if a.SessionID == "" {
-		a.SessionID = sesspkg.NewID()
+		a.SetSessionID(sesspkg.NewID())
 	}
 	rt := newSessionRuntimeWithHold(a, ws.ApprovalHold())
 	reg.register(a.SessionID, rt)

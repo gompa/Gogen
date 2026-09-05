@@ -13,7 +13,7 @@ import (
 // JSONL file next to the session file, one self-contained entry per line.
 func TestAppendArchiveJSONL(t *testing.T) {
 	wd := t.TempDir()
-	s := NewStore(true)
+	s := NewStoreWithOptions(true, StoreOptions{})
 	first := ArchiveEntry{
 		TS:      time.Now().UTC().Truncate(time.Second),
 		Kind:    "condensed_message",
@@ -60,7 +60,7 @@ func TestAppendArchiveJSONL(t *testing.T) {
 // archive sidecar too (the shadowed content belongs to the session).
 func TestDeleteRemovesArchive(t *testing.T) {
 	wd := t.TempDir()
-	s := NewStore(true)
+	s := NewStoreWithOptions(true, StoreOptions{})
 	if err := s.AppendArchive(wd, "sess1", ArchiveEntry{Kind: "condensed_message", Content: "x"}); err != nil {
 		t.Fatalf("AppendArchive: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestDeleteRemovesArchive(t *testing.T) {
 // off means no sidecar is written (the agent reports the archive failure in
 // the in-band notice).
 func TestAppendArchiveDisabledStore(t *testing.T) {
-	s := NewStore(false)
+	s := NewStoreWithOptions(false, StoreOptions{})
 	if err := s.AppendArchive(t.TempDir(), "sess1", ArchiveEntry{Kind: "condensed_message"}); err == nil {
 		t.Fatal("AppendArchive on a disabled store: want an error")
 	}

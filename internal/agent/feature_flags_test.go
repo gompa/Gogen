@@ -5,13 +5,13 @@ import (
 
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
-	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 )
 
 // TestFeatureFlagsDefaultOff verifies the live feature flags default to off
 // with the default nesting depth, exactly like the config layer.
 func TestFeatureFlagsDefaultOff(t *testing.T) {
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := NewExecutor(t.TempDir())
 	a := NewAgent(prov, exec, contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 128000}))
 	if a.BoardEnabled() {
@@ -31,7 +31,7 @@ func TestFeatureFlagsDefaultOff(t *testing.T) {
 // TestFeatureFlagSetters verifies the setters publish atomically (run under
 // -race to check concurrent readers).
 func TestFeatureFlagSetters(t *testing.T) {
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := NewExecutor(t.TempDir())
 	a := NewAgent(prov, exec, contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 128000}))
 	a.SetBoardEnabled(true)
@@ -74,7 +74,7 @@ func TestFeatureFlagSetters(t *testing.T) {
 // TestSessionAgentFactorySeedsFlags verifies NewSessionAgent propagates the
 // live feature flags onto the created agent.
 func TestSessionAgentFactorySeedsFlags(t *testing.T) {
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := NewExecutor(t.TempDir())
 	opts := SessionAgentOptions{
 		Provider:              prov,
@@ -106,7 +106,7 @@ func TestSessionAgentFactorySeedsFlags(t *testing.T) {
 // workspace toggle) or from any other agent — immediately, with no mirror
 // and no sweep.
 func TestSharedFeatureFlagsStore(t *testing.T) {
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := NewExecutor(t.TempDir())
 	a1 := NewAgent(prov, exec, nil)
 	a2 := NewAgent(prov, exec, nil)
@@ -155,7 +155,7 @@ func TestSharedFeatureFlagsStore(t *testing.T) {
 // reads the store directly, so a later store write is visible without any
 // re-seed.
 func TestSessionAgentFactorySharedFlags(t *testing.T) {
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := NewExecutor(t.TempDir())
 	shared := NewFeatureFlags(true, false, 4, 7)
 	opts := SessionAgentOptions{

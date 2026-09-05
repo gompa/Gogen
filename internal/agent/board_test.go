@@ -12,6 +12,7 @@ import (
 
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 )
 
 func newTestBoard(t *testing.T) *BoardManager {
@@ -314,7 +315,7 @@ func TestBoardGlobalDir(t *testing.T) {
 // output message (the web server broadcasts board_state + a success toast
 // from it) and does NOT fire for read-only actions or failed mutations.
 func TestBoardChangedHook(t *testing.T) {
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := NewExecutor(t.TempDir())
 	a := NewAgent(prov, exec, contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 128000}))
 	a.SetBoardEnabled(true)
@@ -408,7 +409,7 @@ func TestBoardDelete(t *testing.T) {
 // executeTool returns "unknown tool"; with it on (and a manager attached) it
 // is exposed and runs; in plan mode it stays available (D7).
 func TestBoardToolGating(t *testing.T) {
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := NewExecutor(t.TempDir())
 	a := NewAgent(prov, exec, contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 128000}))
 
@@ -537,7 +538,7 @@ func TestSetStartOptions(t *testing.T) {
 // and absent ids are rejected.
 func TestBoardIDSurvivesToolCall(t *testing.T) {
 	newAgent := func() (*Agent, *BoardManager) {
-		prov := llm.NewMockProvider()
+		prov := llmtest.NewMockProvider()
 		exec := NewExecutor(t.TempDir())
 		a := NewAgent(prov, exec, contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 128000}))
 		a.SetBoardEnabled(true)

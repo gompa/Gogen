@@ -154,7 +154,7 @@ func (a *Agent) startNewSession(newID string) (string, error) {
 	if a.SessionStore != nil {
 		a.FlushSession()
 	}
-	a.SessionID = newID
+	a.SetSessionID(newID)
 	a.ResetSessionState()
 	if a.SessionStore != nil {
 		a.FlushSession()
@@ -191,7 +191,9 @@ func (a *Agent) resumeSessionByID(ctx context.Context, id string) (string, error
 	// Build the context brief before background model validation so we don't
 	// race Snapshot against RefreshAfterModelChange.
 	out := AppendContextBrief(ctx, a, ResumeOutputMessage(id, snap.Messages))
-	go a.ValidateRestoredModel(context.Background(), model)
+	// No OnModelChanged callback: headless hosts have no UI to refresh, and
+	// a host that installed its own hook (the TUI root agent) keeps it.
+	a.ValidateRestoredModelAsync(model, nil)
 	return out, nil
 }
 
@@ -269,7 +271,7 @@ func (a *Agent) deleteSessionByID(ctx context.Context, id, newSessionID string) 
 		if strings.TrimSpace(newSessionID) == "" {
 			return "", SessionActionNone, fmt.Errorf("session id is required")
 		}
-		a.SessionID = newSessionID
+		a.SetSessionID(newSessionID)
 		a.ResetSessionState()
 		a.FlushSession()
 		out := fmt.Sprintf("Deleted session %s (was current — started new session %s).", id, newSessionID)
@@ -521,7 +523,7 @@ func (a *Agent) ForkSession(ctx context.Context, args, newSessionID string) erro
 	oldSessionID := a.SessionID
 
 	// Start new session with the truncated history
-	a.SessionID = newSessionID
+	a.SetSessionID(newSessionID)
 	a.resetSessionState(forkedMsgs)
 
 	// Persist new session

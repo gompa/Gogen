@@ -217,8 +217,8 @@ func TestConfigDefaults(t *testing.T) {
 	if d.MaxToolResultBytes != 262144 {
 		t.Errorf("default max tool result bytes = %d, want 262144", d.MaxToolResultBytes)
 	}
-	if d.CommandIdleTimeoutSecs != 120 {
-		t.Errorf("default command idle timeout = %d, want 120", d.CommandIdleTimeoutSecs)
+	if d.CommandIdleTimeoutSecs != 300 {
+		t.Errorf("default command idle timeout = %d, want 300", d.CommandIdleTimeoutSecs)
 	}
 	if d.SessionMaxCount != 50 {
 		t.Errorf("default session max count = %d, want 50", d.SessionMaxCount)
@@ -235,4 +235,13 @@ func TestConfigDefaults(t *testing.T) {
 	if strings.TrimSpace(d.OpenAIModel) != "" {
 		t.Errorf("default openai model should be empty, got %q", d.OpenAIModel)
 	}
+}
+
+// WebToolsEnabled is test-only surface, moved out of config.go: production
+// branches on WebFetchEnabled / WebSearchEnabled individually (network gating
+// per tool), nothing reads the combined predicate.
+
+// WebToolsEnabled reports whether either web tool may use the network.
+func (c *Config) WebToolsEnabled() bool {
+	return c.WebFetchEnabled() || c.WebSearchEnabled()
 }

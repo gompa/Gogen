@@ -22,6 +22,7 @@ import (
 
 	"gogen/internal/agent"
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 	"gogen/internal/session"
 )
 
@@ -98,7 +99,7 @@ func TestSubagentOutcomePersistedInPayload(t *testing.T) {
 	stub := newBlockingStub()
 	s, a, store := newContinuationServer(t, stub, dir)
 	s.ws.ProviderFactory = func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.StreamResults = []*llm.StreamResult{{Content: "good report"}}
 		return p
 	}
@@ -168,7 +169,7 @@ func TestReattachedChildRestoresRuntimePrivileges(t *testing.T) {
 	stub := newBlockingStub()
 	s, a, store := newContinuationServer(t, stub, dir)
 	s.ws.ProviderFactory = func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.StreamResults = []*llm.StreamResult{{Content: "child report"}}
 		return p
 	}

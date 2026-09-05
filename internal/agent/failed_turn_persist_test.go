@@ -24,6 +24,7 @@ import (
 
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 )
 
 // recordingPersistStore records every Save/AppendMessages call so tests can
@@ -110,7 +111,7 @@ func newPersistTestAgent(t *testing.T, prov llm.LLMProvider, store SessionPersis
 // target on the next startup).
 func TestFailedModelCheckWritesNothing(t *testing.T) {
 	store := &recordingPersistStore{}
-	a := newPersistTestAgent(t, &noModelProvider{*llm.NewMockProvider()}, store)
+	a := newPersistTestAgent(t, &noModelProvider{*llmtest.NewMockProvider()}, store)
 
 	_, err := a.StreamProcessInput(context.Background(), "hello", nil)
 	if err == nil {
@@ -137,7 +138,7 @@ func TestFailedModelCheckWritesNothing(t *testing.T) {
 // title with the first-message text on the next save.
 func TestFailedModelCheckKeepsRenamedLabel(t *testing.T) {
 	store := &recordingPersistStore{}
-	a := newPersistTestAgent(t, &noModelProvider{*llm.NewMockProvider()}, store)
+	a := newPersistTestAgent(t, &noModelProvider{*llmtest.NewMockProvider()}, store)
 
 	if _, err := a.RenameSession("My Custom Title"); err != nil {
 		t.Fatalf("rename: %v", err)

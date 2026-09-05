@@ -12,15 +12,134 @@ import (
 )
 
 // recordingProvider captures the summarization request so tests can verify
-// its shape (view prefix + head + middle + instruction).
+// its shape (view prefix + head + middle + instruction) and the tool set it
+// carried.
 type recordingProvider struct {
 	stubProvider
-	requests [][]llm.Message
+	requests    [][]llm.Message
+	lastAllowed map[string]struct{}
+	lastTools   []llm.Tool
 }
 
-func (p *recordingProvider) GenerateResponse(_ context.Context, msgs []llm.Message, _ map[string]struct{}, _ []llm.Tool) (llm.Response, error) {
+func (p *recordingProvider) GenerateResponse(_ context.Context, msgs []llm.Message, allowed map[string]struct{}, tools []llm.Tool) (llm.Response, error) {
 	p.requests = append(p.requests, msgs)
+	p.lastAllowed = allowed
+	p.lastTools = tools
 	return llm.Response{Content: "middle summary"}, nil
+}
+
+// TestCompactSummaryRequestCarriesToolDefinitions pins the prompt-cache fix:
+// the summarization request sends the same (allowlist, tools) pair the agent
+// sends on real turns, so the rendered prompt prefix (system + tools +
+// messages) stays byte-identical to the last turn and the provider's prompt
+// cache covers the middle. Zero-value options send no tools (back-compat).
+func TestCompactSummaryRequestCarriesToolDefinitions(t *testing.T) {
+	tools := []llm.Tool{
+		{Type: "function", Name: "read_file", Description: "Read a file"},
+		{Type: "function", Name: "search_code", Description: "Search code"},
+	}
+	allowed := map[string]struct{}{"read_file": {}, "search_code": {}}
+	provider := &recordingProvider{}
+	m := NewManager(provider, Settings{CompactKeepRecentMessages: 1, ContextLimit: 100000, CompactThreshold: 0.5})
+	m.minMiddleTokens = 0
+	msgs := []llm.Message{
+		{Role: "user", Content: "first"},
+		{Role: "assistant", Content: strings.Repeat("middle content ", 100)},
+		{Role: "user", Content: "tail"},
+	}
+	if _, _, err := m.Compact(context.Background(), msgs, CompactOptions{Tools: tools, AllowedTools: allowed}); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if len(provider.lastTools) != len(tools) {
+		t.Fatalf("summarization request tools = %d, want %d", len(provider.lastTools), len(tools))
+	}
+	for i, want := range tools {
+		if provider.lastTools[i].Name != want.Name {
+			t.Fatalf("summarization tool[%d] = %q, want %q", i, provider.lastTools[i].Name, want.Name)
+		}
+	}
+	if len(provider.lastAllowed) != len(allowed) {
+		t.Fatalf("summarization request allowlist = %v, want %v", provider.lastAllowed, allowed)
+	}
+
+	provider2 := &recordingProvider{}
+	m2 := NewManager(provider2, Settings{CompactKeepRecentMessages: 1, ContextLimit: 100000, CompactThreshold: 0.5})
+	m2.minMiddleTokens = 0
+	if _, _, err := m2.Compact(context.Background(), msgs, CompactOptions{}); err != nil {
+		t.Fatalf("Compact (zero-value options): %v", err)
+	}
+	if provider2.lastTools != nil {
+		t.Fatalf("zero-value options must send no tools, got %d", len(provider2.lastTools))
+	}
+	if provider2.lastAllowed != nil {
+		t.Fatalf("zero-value options must send no allowlist, got %v", provider2.lastAllowed)
+	}
+}
+
+// TestCompactSummaryRequestBudgetIncludesToolTokens pins the budget
+// accounting: the tool definitions ride on the summarization request, so
+// their token cost must count against the summary request budget — a middle
+// that fits WITHOUT tools but not WITH them takes the flattened-text
+// fallback instead of an over-window primary request.
+func TestCompactSummaryRequestBudgetIncludesToolTokens(t *testing.T) {
+	const limit, reserve = 20000, 4000
+	budget := limit - reserve // summaryRequestBudget
+
+	viewPrefix := []llm.Message{{Role: "system", Content: "You are a coding agent."}}
+	tools := []llm.Tool{{Type: "function", Name: "read_file", Description: strings.Repeat("read a file from the working directory ", 100)}}
+	toolTokens := EstimateToolTokens(tools)
+	if toolTokens <= 200 {
+		t.Fatalf("test setup: toolTokens = %d, want a meaningful overhead", toolTokens)
+	}
+
+	newMgr := func(p *recordingProvider) *Manager {
+		m := NewManager(p, Settings{CompactKeepRecentMessages: 1, ContextLimit: limit, CompactReserveTokens: reserve})
+		m.minMiddleTokens = 0
+		return m
+	}
+	// Size the cached prefix+middle count so the request lands 100 tokens
+	// UNDER the budget without tools and OVER it with them.
+	probe := NewManager(&stubProvider{}, Settings{ContextLimit: limit, CompactReserveTokens: reserve})
+	base := probe.EstimateTokens(viewPrefix) + probe.EstimateTokens([]llm.Message{{Role: "user", Content: summaryInstruction}})
+	known := budget - base - 100
+	if known < 100 {
+		t.Fatalf("test setup: known = %d, want >= 100", known)
+	}
+	counts := []int{10, known - 10, 10}
+	msgs := []llm.Message{
+		{Role: "user", Content: "first"},
+		{Role: "assistant", Content: "middle"},
+		{Role: "user", Content: "tail"},
+	}
+
+	// Without tools: under budget -> the primary continuation request
+	// (view prefix + head + middle + instruction).
+	provider := &recordingProvider{}
+	if _, _, err := newMgr(provider).Compact(context.Background(), msgs, CompactOptions{ViewPrefix: viewPrefix, Counts: counts}); err != nil {
+		t.Fatalf("Compact (no tools): %v", err)
+	}
+	if len(provider.requests) != 1 {
+		t.Fatalf("no-tools path: %d summarization request(s), want 1", len(provider.requests))
+	}
+	req := provider.requests[0]
+	if len(req) != len(viewPrefix)+3 {
+		t.Fatalf("no-tools path: request has %d messages, want %d (view prefix + head + middle + instruction)",
+			len(req), len(viewPrefix)+3)
+	}
+	if req[len(req)-1].Role != "user" {
+		t.Fatalf("no-tools path: last request message role = %q, want the user instruction (primary path)", req[len(req)-1].Role)
+	}
+
+	// With tools: over budget -> the flattened-text fallback (one
+	// system-message request).
+	provider2 := &recordingProvider{}
+	if _, _, err := newMgr(provider2).Compact(context.Background(), msgs, CompactOptions{ViewPrefix: viewPrefix, Counts: counts, Tools: tools, AllowedTools: map[string]struct{}{"read_file": {}}}); err != nil {
+		t.Fatalf("Compact (with tools): %v", err)
+	}
+	if len(provider2.requests) != 1 || len(provider2.requests[0]) != 1 || provider2.requests[0][0].Role != "system" {
+		t.Fatalf("with-tools path: want the flattened-text fallback (one system-message request), got %d request(s), first = %d message(s)",
+			len(provider2.requests), len(provider2.requests[0]))
+	}
 }
 
 func TestCompactSummaryRequestUsesConversationPrefix(t *testing.T) {
@@ -228,11 +347,11 @@ func TestShouldCompactWithKeepZero(t *testing.T) {
 	msgs := []llm.Message{
 		{Role: "user", Content: strings.Repeat("word ", 20000)},
 	}
-	if m.ShouldCompact(msgs) {
+	if m.ShouldCompactWithOverhead(msgs, 0) {
 		t.Fatal("expected no compaction for a head-only conversation (len <= keep+1)")
 	}
 	msgs = append(msgs, llm.Message{Role: "assistant", Content: strings.Repeat("word ", 20000)})
-	if !m.ShouldCompact(msgs) {
+	if !m.ShouldCompactWithOverhead(msgs, 0) {
 		t.Fatal("expected compaction once there is something beyond the head")
 	}
 }

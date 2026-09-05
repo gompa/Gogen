@@ -311,6 +311,13 @@ func (p *OpenAIProvider) propsRequest(ctx context.Context, method, url, body str
 	if key := p.defaultAPIKey(); key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
+	// Probes can target an OpenCode base URL (router hosts): tag it like the
+	// client pair does so the request carries the session header too.
+	if p.sessionHdr != nil {
+		if uuid := p.sessionHdr.uuid(); uuid != "" {
+			req.Header.Set(SessionHeaderName, uuid)
+		}
+	}
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}

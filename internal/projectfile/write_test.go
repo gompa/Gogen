@@ -154,7 +154,7 @@ func TestSaveConfigWritesNonDefaults(t *testing.T) {
 	cfg.SubagentMaxDepth = 3
 	cfg.SubagentMaxConcurrent = 5
 	cfg.CommandSandbox = "bwrap"
-	cfg.CommandIdleTimeoutSecs = 300
+	cfg.CommandIdleTimeoutSecs = 900
 	cfg.SessionMaxCount = 60
 	cfg.SessionMaxAgeDays = -1
 	cfg.WebMaxActiveSessions = 4
@@ -170,7 +170,7 @@ func TestSaveConfigWritesNonDefaults(t *testing.T) {
 	for _, want := range []string{
 		`board: "on"`, `subagent: "on"`, "subagent_max_depth: 3",
 		"subagent_max_concurrent: 5",
-		"command_sandbox: bwrap", "command_idle_timeout_secs: 300",
+		"command_sandbox: bwrap", "command_idle_timeout_secs: 900",
 		"session_max_count: 60", "session_max_age_days: -1",
 		"web_max_active_sessions: 4", "web_approval_hold_secs: 5",
 		"web_bind: 0.0.0.0:9090",
@@ -186,7 +186,7 @@ func TestSaveConfigWritesNonDefaults(t *testing.T) {
 	merged := Merge(pf, FlagOverrides{})
 	if merged.Board != "on" || merged.Subagent != "on" || merged.SubagentDepth() != 3 ||
 		merged.SubagentLimit() != 5 ||
-		merged.CommandSandbox != "bwrap" || merged.CommandIdleTimeoutSecs != 300 ||
+		merged.CommandSandbox != "bwrap" || merged.CommandIdleTimeoutSecs != 900 ||
 		merged.SessionMaxCount != 60 || merged.SessionMaxAgeDays != -1 ||
 		merged.WebMaxActiveSessions != 4 || merged.WebApprovalHoldSecs != 5 ||
 		merged.WebBind != "0.0.0.0:9090" {
@@ -205,7 +205,7 @@ func TestSaveConfigNeverWritesLegacyCommandTimeoutKey(t *testing.T) {
 
 	// Start from a legacy-spelled file, round-trip it through the effective
 	// config, and re-save.
-	legacy := "command_timeout_secs: 300\n"
+	legacy := "command_timeout_secs: 900\n"
 	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -213,8 +213,8 @@ func TestSaveConfigNeverWritesLegacyCommandTimeoutKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pf.Config.CommandIdleTimeoutSecs != 300 {
-		t.Fatalf("legacy key not aliased before save: %d, want 300", pf.Config.CommandIdleTimeoutSecs)
+	if pf.Config.CommandIdleTimeoutSecs != 900 {
+		t.Fatalf("legacy key not aliased before save: %d, want 900", pf.Config.CommandIdleTimeoutSecs)
 	}
 	cfg := Merge(pf, FlagOverrides{})
 	if err := SaveConfig(path, "", cfg, "", WriteOptions{}); err != nil {
@@ -225,7 +225,7 @@ func TestSaveConfigNeverWritesLegacyCommandTimeoutKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := string(data)
-	if !strings.Contains(body, "command_idle_timeout_secs: 300") {
+	if !strings.Contains(body, "command_idle_timeout_secs: 900") {
 		t.Fatalf("saved config missing renamed key:\n%s", body)
 	}
 	if strings.Contains(body, "command_timeout_secs:") {

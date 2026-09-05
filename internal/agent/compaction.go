@@ -271,9 +271,11 @@ func (a *Agent) CompactHistory(ctx context.Context) error {
 	cachedCounts := append([]int(nil), a.tokenCounts...)
 	a.statsMu.RUnlock()
 	compacted, newPins, err := a.Context.Compact(ctx, a.Messages, contextmgr.CompactOptions{
-		ViewPrefix: a.systemPromptPrefix(),
-		Counts:     cachedCounts,
-		Pinned:     pinnedSet(a.PinManager),
+		ViewPrefix:   a.systemPromptPrefix(),
+		Counts:       cachedCounts,
+		Pinned:       pinnedSet(a.PinManager),
+		Tools:        a.llmTools(),
+		AllowedTools: a.AllowedToolNames(),
 	})
 	if err != nil {
 		return err

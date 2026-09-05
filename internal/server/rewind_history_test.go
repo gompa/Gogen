@@ -158,7 +158,7 @@ func newRewindServer(t *testing.T, stub *rewindStreamStub, dir string) (*Server,
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(stub, contextmgr.Settings{ContextLimit: 1000})
 	a := agent.NewAgent(stub, exec, ctxMgr)
-	store := session.NewStore(true)
+	store := session.NewStoreWithOptions(true, session.StoreOptions{})
 	a.SessionStore = store
 	s := NewServer(a, &config.Config{})
 	return s, a, store

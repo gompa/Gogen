@@ -51,16 +51,16 @@ func TestExecuteCommandIdleTimeoutAllowsActiveCommand(t *testing.T) {
 
 // TestExecuteCommandIdleTimeoutDefaultApplies pins the config semantic:
 // when the setter is never called (config 0 = "use default"), the
-// built-in 120s window applies — a 2s silent command must survive it.
+// built-in 300s window applies — a 2s silent command must survive it.
 func TestExecuteCommandIdleTimeoutDefaultApplies(t *testing.T) {
 	exec := NewExecutor(t.TempDir())
 	// Never call SetIdleTimeout: the built-in default must apply. The
-	// default is 120s, so a 2s silent command must SURVIVE (the default
+	// default is 300s, so a 2s silent command must SURVIVE (the default
 	// window is not yet reached) — proving the default is the long one,
 	// and a separately configured short window is what kills.
 	out, err := exec.ExecuteCommand(context.Background(), "sleep 2; echo ok")
 	if err != nil {
-		t.Fatalf("2s silent command must survive the 120s default idle window: %v", err)
+		t.Fatalf("2s silent command must survive the 300s default idle window: %v", err)
 	}
 	if !strings.Contains(out, "ok") {
 		t.Fatalf("output = %q, want ok", out)

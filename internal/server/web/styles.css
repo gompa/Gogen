@@ -76,6 +76,13 @@
             --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
         }
         * { box-sizing: border-box; }
+        /* The hidden attribute only hides via the UA stylesheet's
+           [hidden] { display: none }, which any author display declaration
+           overrides (e.g. .main-tab { display: inline-flex } kept the board
+           tab visible while disabled). !important beats every non-important
+           author display rule regardless of specificity, so the attribute
+           works on every element without per-element patches. */
+        [hidden] { display: none !important; }
         body {
             font-family: var(--sans);
             margin: 0;
@@ -647,7 +654,6 @@
             border-top: 1px solid var(--border);
             flex-shrink: 0;
         }
-        #near-compact-banner[hidden] { display: none; }
         #near-compact-banner #ncb-text {
             flex: 1;
             min-width: 0;
@@ -684,7 +690,6 @@
             border-top: 1px solid var(--border);
             flex-shrink: 0;
         }
-        #condensed-banner[hidden] { display: none; }
         #condensed-banner #condensed-banner-text {
             flex: 1;
             min-width: 0;
@@ -755,7 +760,6 @@
             gap: 6px;
             padding: 4px 0;
         }
-        #attachment-preview[hidden] { display: none; }
         .attachment-chip {
             position: relative;
             display: inline-flex;
@@ -1736,7 +1740,6 @@
             border-top: 1px solid var(--border); padding-top: 6px;
             display: flex; flex-direction: column; gap: 6px;
         }
-        .board-start-prompt-section[hidden] { display: none; }
         .board-start-prompt-head {
             display: flex; justify-content: space-between; align-items: center; gap: 6px;
         }

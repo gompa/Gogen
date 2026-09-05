@@ -33,7 +33,7 @@ const (
 	// DefaultCommandIdleTimeoutSecs is the maximum time a foreground
 	// execute_command may run without producing any output before it is
 	// killed; 0 in the config falls back to this default.
-	DefaultCommandIdleTimeoutSecs = 120
+	DefaultCommandIdleTimeoutSecs = 300
 	// DefaultSessionMaxCount is the maximum saved sessions per working dir.
 	DefaultSessionMaxCount = 50
 	// DefaultSessionMaxAgeDays is the retention window for saved sessions.
@@ -168,7 +168,7 @@ type Config struct {
 	WebFetchMode      string // https, all
 
 	CommandSandbox         string // off, bwrap (bubblewrap when available)
-	CommandIdleTimeoutSecs int    // execute_command idle (no-output) timeout; 0 = default 120s
+	CommandIdleTimeoutSecs int    // execute_command idle (no-output) timeout; 0 = default 300s
 
 	// PreserveReasoning controls chat_template_kwargs.preserve_reasoning for
 	// self-hosted OpenAI-compatible servers: auto (probe /props), on, off.
@@ -389,9 +389,4 @@ func (c *Config) WebSearchEnabled() bool {
 		return false
 	}
 	return configOn(c.WebSearch)
-}
-
-// WebToolsEnabled reports whether either web tool may use the network.
-func (c *Config) WebToolsEnabled() bool {
-	return c.WebFetchEnabled() || c.WebSearchEnabled()
 }

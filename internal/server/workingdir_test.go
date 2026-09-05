@@ -8,7 +8,7 @@ import (
 	"gogen/internal/agent"
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
-	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 	"gogen/internal/session"
 )
 
@@ -48,12 +48,12 @@ func TestWorkingDirChangeRequiresGlobalMode(t *testing.T) {
 
 	t.Run("global mode allowed", func(t *testing.T) {
 		dir := t.TempDir()
-		prov := llm.NewMockProvider()
+		prov := llmtest.NewMockProvider()
 		exec := agent.NewExecutor(dir)
 		ctxMgr := contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 1000})
 		a := agent.NewAgent(prov, exec, ctxMgr)
 		a.GlobalMode = true
-		store := session.NewStore(true)
+		store := session.NewStoreWithOptions(true, session.StoreOptions{})
 		a.SessionStore = store
 		s := NewServer(a, &config.Config{})
 		srv := startWSServer(t, s)

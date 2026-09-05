@@ -13,7 +13,7 @@ import (
 
 func TestSaveLoadRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	snap := SessionSnapshot{
 		WorkingDir: dir,
 		Model:      "gpt-4o",
@@ -38,7 +38,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 
 func TestLatestIDUsesUpdatedNotMtime(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 
 	if err := store.Save("older", SessionSnapshot{
 		WorkingDir: dir,
@@ -84,7 +84,7 @@ func TestGlobalModeListCacheCoherentAcrossWorkingDirs(t *testing.T) {
 	if err := os.MkdirAll(wdB, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	store.SetGlobalDir(globalDir)
 
 	id := "global-session"
@@ -138,7 +138,7 @@ func TestGlobalModeListCacheCoherentAcrossWorkingDirs(t *testing.T) {
 }
 
 func TestSetCreatedCacheEvictsOldest(t *testing.T) {
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	base := time.Now().UTC()
 	for i := 0; i < maxCreatedCacheEntries+10; i++ {
 		store.setCreatedCache("id"+fmt.Sprintf("%d", i), base.Add(time.Duration(i)*time.Second))
@@ -156,7 +156,7 @@ func TestSetCreatedCacheEvictsOldest(t *testing.T) {
 
 func TestSavePreservesCreatedOnCacheMiss(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	id := "created-preserve"
 	if err := store.Save(id, SessionSnapshot{
 		WorkingDir: dir,
@@ -180,7 +180,7 @@ func TestSavePreservesCreatedOnCacheMiss(t *testing.T) {
 	// New store instance = empty createdCache (simulates process restart
 	// without Load). Save must still keep the original Created.
 	time.Sleep(5 * time.Millisecond)
-	store2 := NewStore(true)
+	store2 := NewStoreWithOptions(true, StoreOptions{})
 	if err := store2.Save(id, SessionSnapshot{
 		WorkingDir: dir,
 		Messages:   []llm.Message{{Role: "user", Content: "hi again"}},
@@ -207,7 +207,7 @@ func TestSavePreservesCreatedOnCacheMiss(t *testing.T) {
 // the agent's total message count.
 func TestAppendMessagesUpdatesIndexMessageCount(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	id := "delta-count"
 	base := []llm.Message{
 		{Role: "user", Content: "q1"},
@@ -273,7 +273,7 @@ func TestAppendMessagesUpdatesIndexMessageCount(t *testing.T) {
 // the legacy fallback scan as the source of truth.
 func TestAppendMessagesMissingIndexEntry(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	id := "no-index-entry"
 	// Write a session file without touching the index (simulates a legacy
 	// directory before the first full save indexed it).
@@ -312,7 +312,7 @@ func TestAppendMessagesMissingIndexEntry(t *testing.T) {
 // next persist.
 func TestLoadInWorkingDirKeepsDeltaUntilFullSave(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	id := "keep-delta"
 	base := []llm.Message{{Role: "user", Content: "q1"}}
 	if err := store.Save(id, SessionSnapshot{WorkingDir: dir, Messages: base}); err != nil {
@@ -381,7 +381,7 @@ func TestLoadInWorkingDirKeepsDeltaUntilFullSave(t *testing.T) {
 // again (which would duplicate history).
 func TestLoadSkipsStaleDeltaWhenSnapshotAlreadyContainsIt(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	id := "stale-delta"
 	base := []llm.Message{
 		{Role: "user", Content: "q1"},
@@ -434,7 +434,7 @@ func TestLoadSkipsStaleDeltaWhenSnapshotAlreadyContainsIt(t *testing.T) {
 // than merged back into the history.
 func TestLoadDropsDeltaWhenSnapshotTruncated(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	id := "truncated-delta"
 	base := []llm.Message{
 		{Role: "user", Content: "q1"},
@@ -491,7 +491,7 @@ func TestLoadDropsDeltaWhenSnapshotTruncated(t *testing.T) {
 // unconditionally, matching the historic behavior.
 func TestLegacyDeltaWithoutBaseCountIsMerged(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	id := "legacy-delta"
 	if err := store.Save(id, SessionSnapshot{
 		WorkingDir: dir,
@@ -516,7 +516,7 @@ func TestLegacyDeltaWithoutBaseCountIsMerged(t *testing.T) {
 // any pending delta for the session.
 func TestDeleteRemovesDelta(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(true)
+	store := NewStoreWithOptions(true, StoreOptions{})
 	id := "delete-delta"
 	if err := store.Save(id, SessionSnapshot{
 		WorkingDir: dir,

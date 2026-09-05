@@ -33,7 +33,7 @@ jobs:
       - name: Test
         run: go test -race ./...
       - name: Test debug tags
-        run: go test -race -tags debug ./internal/agent/ ./internal/profiling/
+        run: go test -race -tags debug ./internal/agent/ ./internal/profiling/ ./internal/server/
       - name: Vet
         run: go vet ./...
       - name: Staticcheck

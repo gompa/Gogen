@@ -10,6 +10,7 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 	"gogen/internal/session"
 )
 
@@ -22,11 +23,11 @@ func newContinuableServer(t *testing.T, childProvider func() llm.LLMProvider) (*
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(stub, contextmgr.Settings{ContextLimit: 1000})
 	a := agent.NewAgent(stub, exec, ctxMgr)
-	store := session.NewStore(true)
+	store := session.NewStoreWithOptions(true, session.StoreOptions{})
 	a.SessionStore = store
 	// The parent's delivery turns (completion notices, replies) need a
 	// provider that answers.
-	p := llm.NewMockProvider()
+	p := llmtest.NewMockProvider()
 	p.StreamResults = []*llm.StreamResult{{Content: "ack"}, {Content: "ack2"}}
 	a.Provider = p
 	s := NewServer(a, &config.Config{})
@@ -109,7 +110,7 @@ func waitForParentDeliveriesSettled(t *testing.T, s *Server, a *agent.Agent) {
 // user message, and the child stays registered (held) until release.
 func TestBackgroundSpawnCompletionNotice(t *testing.T) {
 	s, a := newContinuableServer(t, func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.StreamResults = []*llm.StreamResult{{Content: "background report"}}
 		return p
 	})
@@ -155,7 +156,7 @@ func TestBackgroundSpawnCompletionNotice(t *testing.T) {
 // is not orphan-evicted between the notice and the reply.
 func TestSendMessageReplyCapture(t *testing.T) {
 	s, a := newContinuableServer(t, func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		// First call: the main job. Second call: the send_message turn.
 		p.StreamResults = []*llm.StreamResult{
 			{Content: "main job report"},
@@ -231,7 +232,7 @@ func TestInterruptAgent(t *testing.T) {
 // untouched.
 func TestSubagentForkCopiesMessages(t *testing.T) {
 	s, a := newContinuableServer(t, func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.StreamResults = []*llm.StreamResult{{Content: "fork reply"}}
 		return p
 	})
@@ -329,7 +330,7 @@ func TestForkPersistsFailedOutcome(t *testing.T) {
 // saved session stays.
 func TestChildRetentionRelease(t *testing.T) {
 	s, a := newContinuableServer(t, func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.StreamResults = []*llm.StreamResult{{Content: "done"}}
 		return p
 	})
@@ -389,7 +390,7 @@ func TestParentEvictionCancelsChildren(t *testing.T) {
 // progress message lands in the parent conversation.
 func TestChildReportDeliversToParent(t *testing.T) {
 	s, a := newContinuableServer(t, func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.StreamResults = []*llm.StreamResult{
 			{ToolCalls: []llm.ToolCall{{
 				ID: "c1", Name: "report", Args: map[string]any{"message": "progress from child"},
@@ -422,7 +423,7 @@ func TestChildReportDeliversToParent(t *testing.T) {
 // beyond the cap releases the oldest finished children.
 func TestChildCapReleasesOldest(t *testing.T) {
 	s, a := newContinuableServer(t, func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.StreamResults = []*llm.StreamResult{{Content: "done"}}
 		return p
 	})
@@ -549,7 +550,7 @@ func TestConcurrentLimitFromConfig(t *testing.T) {
 // is allowed once the first child has finished.
 func TestConcurrentLimitCountsOnlyLiveChildren(t *testing.T) {
 	s, a := newContinuableServer(t, func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.StreamResults = []*llm.StreamResult{{Content: "done"}}
 		return p
 	})
@@ -601,7 +602,7 @@ func TestInterruptFreesConcurrentSlot(t *testing.T) {
 	s, a := newContinuableServer(t, func() llm.LLMProvider {
 		n++
 		if n == 2 {
-			p := llm.NewMockProvider()
+			p := llmtest.NewMockProvider()
 			p.StreamResults = []*llm.StreamResult{{Content: "done"}}
 			return p
 		}
@@ -758,7 +759,7 @@ func TestForegroundCountsTowardConcurrentLimit(t *testing.T) {
 // limit for nothing.
 func TestForegroundSlotReleasedOnFailure(t *testing.T) {
 	s, a := newContinuableServer(t, func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.StreamResults = []*llm.StreamResult{{Content: "done"}}
 		return p
 	})
@@ -832,7 +833,7 @@ func TestLiveGuardBoundsIdleChildren(t *testing.T) {
 // re-delivered to the parent as the reply to an interrupted send_message.
 func TestOnTurnEndReplyBaseline(t *testing.T) {
 	s, a := newContinuableServer(t, func() llm.LLMProvider {
-		p := llm.NewMockProvider()
+		p := llmtest.NewMockProvider()
 		p.StreamResults = []*llm.StreamResult{{Content: "ack"}}
 		return p
 	})

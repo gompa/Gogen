@@ -16,6 +16,7 @@ import (
 	"gogen/internal/agent"
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 )
 
 func TestQuitRestartDoesNotBloatHistory(t *testing.T) {
@@ -60,7 +61,7 @@ func TestQuitRestartDoesNotBloatHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restart load: %v", err)
 	}
-	prov := llm.NewMockProvider()
+	prov := llmtest.NewMockProvider()
 	exec := agent.NewExecutor(dir)
 	ctxMgr := contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 1000})
 	a2 := agent.NewAgent(prov, exec, ctxMgr)

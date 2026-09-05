@@ -10,12 +10,13 @@ import (
 	"gogen/internal/agent"
 	"gogen/internal/config"
 	"gogen/internal/llm"
+	llmtest "gogen/internal/llm/llmtest"
 	"gogen/internal/session"
 )
 
 func newTestRuntime(t *testing.T) *sessionRuntime {
 	t.Helper()
-	return newSessionRuntime(agent.NewAgent(llm.NewMockProvider(), agent.NewExecutor(t.TempDir()), nil))
+	return newSessionRuntime(agent.NewAgent(llmtest.NewMockProvider(), agent.NewExecutor(t.TempDir()), nil))
 }
 
 // newFakeWSConn returns a wsConn whose writeJSON succeeds (buffered send
@@ -122,7 +123,7 @@ func TestRegistryEvictionSkipsAcquiringTurn(t *testing.T) {
 func TestRegistryRegisterGetRemove(t *testing.T) {
 	r := newSessionRegistry(0)
 	newRT := func() *sessionRuntime {
-		return &sessionRuntime{agent: agent.NewAgent(llm.NewMockProvider(), agent.NewExecutor(t.TempDir()), nil)}
+		return &sessionRuntime{agent: agent.NewAgent(llmtest.NewMockProvider(), agent.NewExecutor(t.TempDir()), nil)}
 	}
 	rt1 := newRT()
 	rt2 := newRT()
@@ -154,8 +155,8 @@ func TestRegistryRegisterGetRemove(t *testing.T) {
 // lock: holding one session's turnMu does not block another session's turn
 // (the old global turnMu serialized all sessions).
 func TestSessionTurnLocksArePerSession(t *testing.T) {
-	a1 := agent.NewAgent(llm.NewMockProvider(), agent.NewExecutor(t.TempDir()), nil)
-	a2 := agent.NewAgent(llm.NewMockProvider(), agent.NewExecutor(t.TempDir()), nil)
+	a1 := agent.NewAgent(llmtest.NewMockProvider(), agent.NewExecutor(t.TempDir()), nil)
+	a2 := agent.NewAgent(llmtest.NewMockProvider(), agent.NewExecutor(t.TempDir()), nil)
 	rt1 := &sessionRuntime{agent: a1}
 	rt2 := &sessionRuntime{agent: a2}
 
@@ -185,7 +186,7 @@ func TestSessionTurnLocksArePerSession(t *testing.T) {
 func TestWorkspaceNewSessionAgentFactory(t *testing.T) {
 	dir := t.TempDir()
 	exec := agent.NewExecutor(dir)
-	store := session.NewStore(true)
+	store := session.NewStoreWithOptions(true, session.StoreOptions{})
 	cfg := &config.Config{WorkingDir: dir}
 	ws := &Workspace{
 		Exec:          exec,
@@ -198,7 +199,7 @@ func TestWorkspaceNewSessionAgentFactory(t *testing.T) {
 		// The provider factory seeds the workspace default model + thinking
 		// level, mirroring newWorkspaceFromAgent.
 		ProviderFactory: func() llm.LLMProvider {
-			p := llm.NewMockProvider()
+			p := llmtest.NewMockProvider()
 			_ = p.SetModel("m1")
 			p.SetThinkingLevel("high")
 			return p
