@@ -1105,17 +1105,31 @@ func findHunkMatch(lines, oldLines []string, hint int, fuzzy bool) (matched int,
 }
 
 func formatHunkMismatch(hunkNum, hunkTotal, line int, actual, expected []string, fuzzy bool) error {
-	firstDiff := 0
+	// firstDiff is -1 when the compared prefix contains no difference. That
+	// happens when actual (the file's remaining lines) is a STRICT PREFIX of
+	// the expected context — the file ran out before any line disagreed.
+	// Quoting actual[0]/expected[0] there would print two IDENTICAL lines as
+	// "the mismatch", so the diagnostic reports the shortfall instead.
+	firstDiff := -1
 	for i := 0; i < len(actual) && i < len(expected); i++ {
 		if actual[i] != expected[i] {
 			firstDiff = i
 			break
 		}
 	}
-	msg := fmt.Sprintf("hunk %d/%d context mismatch at line %d", hunkNum, hunkTotal, line+firstDiff)
-	if firstDiff < len(actual) && firstDiff < len(expected) {
+	atLine := line
+	if firstDiff >= 0 {
+		atLine = line + firstDiff
+	}
+	msg := fmt.Sprintf("hunk %d/%d context mismatch at line %d", hunkNum, hunkTotal, atLine)
+	switch {
+	case firstDiff >= 0:
 		msg += fmt.Sprintf(": file has %q, patch expects %q", actual[firstDiff], expected[firstDiff])
-	} else if len(actual) == 0 {
+	case len(actual) == 0:
+		msg += ": hunk context not found in file"
+	case len(actual) < len(expected):
+		msg += fmt.Sprintf(": file has %d line(s) here but the hunk expects %d context lines", len(actual), len(expected))
+	default:
 		msg += ": hunk context not found in file"
 	}
 	if !fuzzy {

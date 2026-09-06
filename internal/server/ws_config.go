@@ -40,6 +40,7 @@ func agentConfigMsgBasic(a *agent.Agent) WSMessage {
 	// Live feature flags: the settings modal renders and toggles these.
 	msg.Board = onOff(a.BoardEnabled())
 	msg.Subagent = onOff(a.SubagentsEnabled())
+	msg.ReviewAgent = onOff(a.ReviewAgentEnabled())
 	msg.SubagentMaxDepth = a.SubagentMaxDepth()
 	return msg
 }
@@ -173,7 +174,7 @@ func (s *Server) handleWSConfig(ws *wsConn, ctx context.Context, pane **sessionR
 	if msg.WorkingDir != "" {
 		s.handleWSWorkingDir(ws, ctx, pane, msg)
 	}
-	if msg.Board != "" || msg.Subagent != "" || msg.SubagentMaxDepth != 0 || msg.SubagentMaxConcurrent != 0 {
+	if msg.Board != "" || msg.Subagent != "" || msg.ReviewAgent != "" || msg.SubagentMaxDepth != 0 || msg.SubagentMaxConcurrent != 0 {
 		s.handleWSFeatureFlags(ws, msg)
 	}
 	if len(msg.ConfigFields) > 0 {
@@ -210,6 +211,17 @@ func (s *Server) handleWSFeatureFlags(ws *wsConn, msg WSMessage) {
 		}
 		subagentSet = true
 	}
+	var reviewAgent bool
+	var reviewAgentSet bool
+	if msg.ReviewAgent != "" {
+		var ok bool
+		reviewAgent, ok = onoff.Parse(msg.ReviewAgent)
+		if !ok {
+			writeNoticeError(ws, "settings", fmt.Sprintf("Error: invalid reviewAgent value %q (want on or off)", msg.ReviewAgent))
+			return
+		}
+		reviewAgentSet = true
+	}
 	if msg.SubagentMaxDepth < 0 {
 		writeNoticeError(ws, "settings", "Error: subagentMaxDepth must be >= 0")
 		return
@@ -223,6 +235,9 @@ func (s *Server) handleWSFeatureFlags(ws *wsConn, msg WSMessage) {
 	}
 	if subagentSet {
 		s.ws.SetSubagentEnabled(subagent)
+	}
+	if reviewAgentSet {
+		s.ws.SetReviewAgentEnabled(reviewAgent)
 	}
 	if msg.SubagentMaxDepth > 0 {
 		s.ws.SetSubagentMaxDepth(msg.SubagentMaxDepth)
@@ -264,6 +279,7 @@ func (s *Server) effectiveConfig() *config.Config {
 	// Feature flags + provider list live in their own workspace stores.
 	out.Board = onOff(s.ws.GetBoardEnabled())
 	out.Subagent = onOff(s.ws.GetSubagentEnabled())
+	out.ReviewAgent = onOff(s.ws.GetReviewAgentEnabled())
 	out.SubagentMaxDepth = s.ws.GetSubagentMaxDepth()
 	out.SubagentMaxConcurrent = s.ws.GetSubagentMaxConcurrent()
 	out.OpenAIProviders = s.ws.GetOpenAIProviders()
@@ -282,6 +298,8 @@ func (s *Server) applyBoardManagerToAll() {
 	if s.ws.GetBoardEnabled() {
 		bm = s.ws.ensureBoardManager()
 	}
+	// The review hook rides on the (possibly just-created) manager.
+	s.installReviewAgent()
 	for _, id := range s.registry.activeIDs() {
 		if rt, ok := s.registry.get(id); ok {
 			rt.agent.SetBoardManager(bm)

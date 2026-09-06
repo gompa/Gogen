@@ -98,3 +98,73 @@ func TestUpdateSettingsPreservesManualPin(t *testing.T) {
 		t.Fatalf("manual limit after model change = %d, want 200000 kept", got)
 	}
 }
+
+// TestUpdateSettingsFuncMergesAgainstStoredSettings pins the atomic
+// read-modify-write contract: fn is handed the CURRENTLY STORED settings
+// (not a caller-side copy) and the merged result is stored under the same
+// lock. This is what makes the server's per-field push safe against
+// interleaving — with the old separate SettingsSnapshot + UpdateSettings
+// pair, a push whose snapshot predated another push's store silently
+// reverted that push's field.
+func TestUpdateSettingsFuncMergesAgainstStoredSettings(t *testing.T) {
+	m := NewManager(&stubProvider{}, Settings{ContextLimit: 5000})
+
+	// Push 1 (field A) lands first.
+	m.UpdateSettingsFunc(func(cur Settings) Settings {
+		cur.CompactReserveTokens = 2222
+		return cur
+	})
+	// Push 2 carries a settings copy snapshotted BEFORE push 1 stored (the
+	// concurrent-interleave shape): its copy fn sets only its own field and
+	// must observe push 1's value in the cur it is handed.
+	m.UpdateSettingsFunc(func(cur Settings) Settings {
+		if cur.CompactReserveTokens != 2222 {
+			t.Errorf("fn saw CompactReserveTokens = %d, want 2222 (must merge against stored settings, not a stale copy)", cur.CompactReserveTokens)
+		}
+		cur.MaxToolResultBytes = 1111
+		return cur
+	})
+	snap := m.SettingsSnapshot()
+	if snap.CompactReserveTokens != 2222 || snap.MaxToolResultBytes != 1111 {
+		t.Fatalf("after two single-field pushes: reserve=%d max=%d, want 2222/1111 (a field was reverted)", snap.CompactReserveTokens, snap.MaxToolResultBytes)
+	}
+	if snap.ContextLimit != 5000 {
+		t.Fatalf("ContextLimit = %d, want 5000 untouched", snap.ContextLimit)
+	}
+}
+
+// TestUpdateSettingsFuncLimitSemantics verifies UpdateSettingsFunc applies
+// the same ContextLimit manual/resolved rules as UpdateSettings: an
+// unchanged limit preserves the resolved state (a model change re-resolves
+// it), an explicitly changed value pins it as manual, and normalizeSettings
+// clamps the merged result.
+func TestUpdateSettingsFuncLimitSemantics(t *testing.T) {
+	m := NewManager(&stubProvider{}, Settings{})
+	m.SetContextLimit(10000) // provider-resolved, NOT manual
+
+	m.UpdateSettingsFunc(func(cur Settings) Settings {
+		cur.CompactThreshold = 0.4
+		return cur
+	})
+	m.RefreshAfterModelChange(t.Context())
+	if got := m.ContextLimit(); got != 128000 {
+		t.Fatalf("limit after model change = %d, want re-resolved 128000 (not pinned)", got)
+	}
+
+	m.UpdateSettingsFunc(func(cur Settings) Settings {
+		cur.ContextLimit = 7777
+		return cur
+	})
+	m.RefreshAfterModelChange(t.Context())
+	if got := m.ContextLimit(); got != 7777 {
+		t.Fatalf("limit after model change = %d, want manual 7777 kept", got)
+	}
+
+	m.UpdateSettingsFunc(func(cur Settings) Settings {
+		cur.CompactThreshold = -1
+		return cur
+	})
+	if got := m.SettingsSnapshot().CompactThreshold; got != DefaultSettings().CompactThreshold {
+		t.Fatalf("threshold after invalid value = %v, want default", got)
+	}
+}

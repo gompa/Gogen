@@ -1,8 +1,18 @@
 // Standalone verification of splitStreamBlocks + the incremental render state
-// machine used by renderStreamMarkdown (copied verbatim from app.js).
+// machine used by renderStreamMarkdown (copied verbatim from
+// web/components/markdown.js).
 'use strict';
 
-// Copied verbatim from app.js (returns { blocks, lastStart }).
+// Copied verbatim from web/components/markdown.js.
+function listMarkerOf(line) {
+  const m = /^ {0,3}([-*+]|\d{1,9}[.)])(\s|$)/.exec(line);
+  if (!m) return null;
+  const tok = m[1];
+  if (tok === '-' || tok === '*' || tok === '+') return { kind: 'bullet', ch: tok };
+  return { kind: 'ordered', delim: tok[tok.length - 1] };
+}
+
+// Copied verbatim from web/components/markdown.js (returns { blocks, lastStart }).
 function splitStreamBlocks(text) {
   const src = String(text);
   const blocks = [];
@@ -11,7 +21,10 @@ function splitStreamBlocks(text) {
   let lastStart = 0;  // offset where the most recently pushed block began
   let fence = null; // { mark: '`'|'~', len } while inside a fenced code block
   let offset = 0;
-  for (const line of src.split('\n')) {
+  let list = null;
+  const lines = src.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     const lineLen = line.length + 1; // +1 for the '\n'
     if (fence) {
       if (cur === '') curStart = offset;
@@ -27,20 +40,37 @@ function splitStreamBlocks(text) {
     if (m) {
       if (cur === '') curStart = offset;
       cur += line + '\n';
+      list = null;
       fence = { mark: m[1][0], len: m[1].length };
       offset += lineLen;
       continue;
     }
     if (line.trim() === '') {
       if (cur !== '') {
+        let j = i + 1;
+        while (j < lines.length && lines[j].trim() === '') j++;
+        const next = j < lines.length ? lines[j] : null;
+        const nextMarker = next ? listMarkerOf(next) : null;
+        if (list && nextMarker && nextMarker.kind === list.kind
+          && (list.kind === 'bullet'
+            ? nextMarker.ch === list.ch
+            : nextMarker.delim === list.delim)) {
+          cur += line + '\n';
+          offset += lineLen;
+          continue;
+        }
         blocks.push(cur);
         lastStart = curStart;
         cur = '';
+        list = null;
       }
       offset += lineLen;
       continue;
     }
-    if (cur === '') curStart = offset;
+    if (cur === '') {
+      curStart = offset;
+      list = listMarkerOf(line);
+    }
     cur += line + '\n';
     offset += lineLen;
   }
@@ -106,6 +136,56 @@ check('unclosed fence is tail', JSON.stringify(blocks('a\n\n```js\nx')) ===
 check('~~~ fence', JSON.stringify(blocks('~~~\na\n~~~')) === '["~~~\\na\\n~~~\\n"]');
 check('list no blank', JSON.stringify(blocks('- a\n- b')) === '["- a\\n- b\\n"]');
 check('blank-only', JSON.stringify(blocks('\n\n')) === '[]');
+
+// --- List continuation across blank lines (the loose-list lookahead) ---
+// A same-type item after a blank line keeps the block OPEN (blank lines
+// inside), because the one-shot parse renders one loose list there.
+check('loose bullet list stays one block',
+  JSON.stringify(blocks('- a\n\n- b\n\n- c')) === '["- a\\n\\n- b\\n\\n- c\\n"]',
+  JSON.stringify(blocks('- a\n\n- b\n\n- c')));
+check('loose ordered list stays one block',
+  JSON.stringify(blocks('1. a\n\n2. b')) === '["1. a\\n\\n2. b\\n"]',
+  JSON.stringify(blocks('1. a\n\n2. b')));
+check('multiple blank lines inside continued list',
+  JSON.stringify(blocks('- a\n\n\n\n- b')) === '["- a\\n\\n\\n\\n- b\\n"]',
+  JSON.stringify(blocks('- a\n\n\n\n- b')));
+check('indented sub-list continues the item block',
+  JSON.stringify(blocks('- a\n\n  - b')) === '["- a\\n\\n  - b\\n"]',
+  JSON.stringify(blocks('- a\n\n  - b')));
+check('lazy continuation keeps list terms',
+  JSON.stringify(blocks('- a\nlazy\n\n- b')) === '["- a\\nlazy\\n\\n- b\\n"]',
+  JSON.stringify(blocks('- a\nlazy\n\n- b')));
+// Marker type changes split (CommonMark starts a NEW list).
+check('bullet char change splits',
+  JSON.stringify(blocks('- a\n\n* b')) === '["- a\\n","* b\\n"]',
+  JSON.stringify(blocks('- a\n\n* b')));
+check('ordered then bullet splits',
+  JSON.stringify(blocks('1. a\n\n- b')) === '["1. a\\n","- b\\n"]',
+  JSON.stringify(blocks('1. a\n\n- b')));
+check('ordered delimiter change splits',
+  JSON.stringify(blocks('1. a\n\n2) b')) === '["1. a\\n","2) b\\n"]',
+  JSON.stringify(blocks('1. a\n\n2) b')));
+// A paragraph or blockquote after the blank line still splits.
+check('paragraph ends list block',
+  JSON.stringify(blocks('- a\n\ntext')) === '["- a\\n","text\\n"]',
+  JSON.stringify(blocks('- a\n\ntext')));
+check('blockquote groups still split',
+  JSON.stringify(blocks('> a\n\n> b')) === '["> a\\n","> b\\n"]',
+  JSON.stringify(blocks('> a\n\n> b')));
+check('list does not continue across non-list start block',
+  JSON.stringify(blocks('text\n- a\n\n- b')) === '["text\\n- a\\n","- b\\n"]',
+  JSON.stringify(blocks('text\n- a\n\n- b')));
+// A fence between list groups ends continuation terms: the fence is at
+// column 0, so the one-shot parse also renders separate lists there.
+check('fence between list groups splits',
+  JSON.stringify(blocks('- a\n\n```\nx\n```\n\n- b')) ===
+  '["- a\\n","```\\nx\\n```\\n","- b\\n"]',
+  JSON.stringify(blocks('- a\n\n```\nx\n```\n\n- b')));
+// lastStart still points at the start of the in-flight block.
+check('lastStart: loose list in flight', splitStreamBlocks('- a\n\n- b').lastStart === 0,
+  String(splitStreamBlocks('- a\n\n- b').lastStart));
+check('lastStart: list then paragraph', splitStreamBlocks('- a\n\ntext').lastStart === 5,
+  String(splitStreamBlocks('- a\n\ntext').lastStart));
 
 // --- Nested / tricky fence cases (CommonMark closing rules) ---
 check('4-tick outer holds 3-tick inner',
@@ -211,6 +291,25 @@ ftext += '```\n\noutro';
 fence.render(ftext);
 check('fence: incremental == full-split (open then closed)', fenceOk
   && JSON.stringify(fence.frames[fence.frames.length - 1]) === JSON.stringify(fullSplitFrame(ftext)));
+
+// --- Loose list stays IN-FLIGHT until a non-list block completes ---
+// The lookahead keeps the list block open across blank lines, so the
+// renderer must not freeze (and thus paint) tight list fragments: done
+// stays empty while the loose list grows, and the list is only promoted
+// when a non-list block completes after it.
+const loose = makeRenderer();
+loose.render('- a');
+loose.render('- a\n\n- b');
+loose.render('- a\n\n- b\n\n- c');
+check('loose list: still in-flight while items stream in',
+  JSON.stringify(loose.frames[loose.frames.length - 1]) === JSON.stringify({ done: [], tail: '- a\n\n- b\n\n- c\n' }),
+  JSON.stringify(loose.frames[loose.frames.length - 1]));
+loose.render('- a\n\n- b\n\n- c\n\nsummary text');
+check('loose list: promoted as ONE block when a paragraph follows',
+  JSON.stringify(loose.frames[loose.frames.length - 1]) === JSON.stringify({
+    done: ['- a\n\n- b\n\n- c\n'],
+    tail: 'summary text\n',
+  }), JSON.stringify(loose.frames[loose.frames.length - 1]));
 
 // --- Staleness: a same-length rewrite of an early block triggers a reset ---
 const rw = makeRenderer();

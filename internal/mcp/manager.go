@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"regexp"
@@ -129,13 +130,7 @@ func NewManager(servers []config.MCPServerConfig) (*Manager, error) {
 			continue
 		}
 		for _, tool := range tools {
-			extName := ExternalToolName(s.Name, tool.Name)
-			reg.tools[extName] = toolEntry{
-				server: s.Name,
-				tool:   tool.Name,
-				schema: tool,
-				client: c,
-			}
+			reg.add(s.Name, tool.Name, tool, c)
 		}
 		m.clients = append(m.clients, c)
 	}
@@ -413,6 +408,29 @@ func (m *Manager) Registry() *Registry {
 // ExternalToolName builds the LLM-visible MCP tool name.
 func ExternalToolName(server, tool string) string {
 	return toolPrefix + sanitize(server) + "_" + sanitize(tool)
+}
+
+// add registers one MCP tool under its LLM-visible external name. Two
+// different (server, tool) pairs can sanitize to the same name — server
+// "my-server" + tool "list_files" vs server "my" + tool "server_list_files",
+// or "get-url" vs "get_url" on one server — and a bare map write would
+// silently overwrite the earlier entry, making that tool vanish from the
+// model's toolset with no trace. The FIRST registration wins (the same
+// duplicate-ID precedence the provider profiles use) and the loser is logged
+// so the config mistake is diagnosable.
+func (r *Registry) add(server, tool string, schema llm.Tool, client *Client) {
+	extName := ExternalToolName(server, tool)
+	if prev, ok := r.tools[extName]; ok {
+		log.Printf("mcp: duplicate tool name %q (server %q, tool %q) collides with server %q, tool %q; keeping the first registration — rename one of them",
+			extName, server, tool, prev.server, prev.tool)
+		return
+	}
+	r.tools[extName] = toolEntry{
+		server: server,
+		tool:   tool,
+		schema: schema,
+		client: client,
+	}
 }
 
 func sanitize(s string) string {

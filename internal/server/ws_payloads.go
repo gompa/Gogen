@@ -81,6 +81,12 @@ func (r *sessionRegistry) turnActiveSet() map[string]bool {
 func historyEntries(msgs []llm.Message) []HistoryEntry {
 	out := make([]HistoryEntry, 0, len(msgs))
 	for idx, m := range msgs {
+		// Empty placeholder messages are not shipped (shared with
+		// agent.HistoryFingerprint so the conditional attach's skip decision
+		// always agrees with what this builder would have sent).
+		if !agent.HistoryShips(m) {
+			continue
+		}
 		createdAt := ""
 		if !m.CreatedAt.IsZero() {
 			createdAt = m.CreatedAt.UTC().Format(time.RFC3339Nano)
@@ -88,18 +94,8 @@ func historyEntries(msgs []llm.Message) []HistoryEntry {
 
 		switch m.Role {
 		case "user":
-			if m.Content == "" {
-				// Pure-image messages (no text) are still valid history: they
-				// carry their images. Only skip when there is nothing at all.
-				if len(m.Images) == 0 {
-					continue
-				}
-			}
 			out = append(out, HistoryEntry{Role: m.Role, Content: m.Content, Images: m.Images, Index: idx, CreatedAt: createdAt})
 		case "assistant":
-			if m.Content == "" && len(m.ToolCalls) == 0 && m.Reasoning == "" && m.Refusal == "" {
-				continue
-			}
 			entry := HistoryEntry{
 				Role:      m.Role,
 				Content:   m.Content,
@@ -122,9 +118,6 @@ func historyEntries(msgs []llm.Message) []HistoryEntry {
 			out = append(out, entry)
 
 		case "tool":
-			if m.Content == "" && m.ToolCallID == "" {
-				continue
-			}
 			out = append(out, HistoryEntry{
 				Role:       m.Role,
 				Content:    m.Content,

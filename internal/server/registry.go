@@ -63,6 +63,15 @@ type sessionRuntime struct {
 	// viewer attach upgrades a passive socket (delete from passive).
 	passive map[*wsConn]struct{}
 
+	// closing latches an explicit session_close that has claimed this
+	// runtime (claimClose): no client was attached at the claim and the
+	// runtime is about to be cancelled and evicted, so attach must refuse —
+	// a viewer racing the close would otherwise attach to a runtime the
+	// eviction removes from under it. Guarded by clientsMu (both the claim
+	// and the attach check hold it); sticky: never cleared, the claimed
+	// runtime is leaving memory.
+	closing bool
+
 	// turnActive backs the session_state reply on attach so a reconnecting
 	// client can distinguish "turn running headless" from "idle"; startedAt
 	// records when the turn began (retained bookkeeping, not sent to the
@@ -260,8 +269,15 @@ func (rt *sessionRuntime) liveToolArgsSegmentEnd(index int, text string) int {
 // socket previously attached passively (approval delivery only) is upgraded
 // to a viewer: the session is now genuinely open in this tab, so it counts
 // for the live-session signal again.
-func (rt *sessionRuntime) attach(ws *wsConn) {
-	rt.attachWithRole(ws, false)
+//
+// It returns false when the attach is refused: the runtime is closing (a
+// claimed session_close, claimClose) or already evicted, so no socket may
+// attach to a runtime that is leaving memory. The caller reports
+// session_detached instead — the session stays saved and reopens from the
+// store, the same self-heal an eviction's own broadcast produces, minus the
+// eviction-under-attach.
+func (rt *sessionRuntime) attach(ws *wsConn) bool {
+	return rt.attachWithRole(ws, false)
 }
 
 // attachPassive registers a socket for approval delivery WITHOUT making it a
@@ -271,16 +287,29 @@ func (rt *sessionRuntime) attach(ws *wsConn) {
 // the orphan eviction, so the session can read as a plain saved session (no
 // stale "resume to continue" row) while only passively attached sockets
 // remain. The board start uses it: the initiating tab must receive the
-// headless turn's delete approvals without "viewing" the session.
-func (rt *sessionRuntime) attachPassive(ws *wsConn) {
-	rt.attachWithRole(ws, true)
+// headless turn's delete approvals without "viewing" the session. Refusal
+// semantics mirror attach (closing or evicted runtime — attach returns
+// false, the caller reports session_detached).
+func (rt *sessionRuntime) attachPassive(ws *wsConn) bool {
+	return rt.attachWithRole(ws, true)
 }
 
-func (rt *sessionRuntime) attachWithRole(ws *wsConn, passive bool) {
+// attachWithRole adds ws to the runtime's clients — atomically with
+// claimClose's clientless check (both hold clientsMu), so an attach either
+// lands before a close claim, keeping the session open, or is refused by
+// the closing latch. It returns false when the attach is refused: the
+// runtime is closing (a claimed session_close) or already evicted, i.e.
+// leaving memory; nothing is mutated, not even the pending-approval
+// re-notify below.
+func (rt *sessionRuntime) attachWithRole(ws *wsConn, passive bool) bool {
 	if ws == nil {
-		return
+		return true
 	}
 	rt.clientsMu.Lock()
+	if rt.closing || rt.evicted.Load() {
+		rt.clientsMu.Unlock()
+		return false
+	}
 	rt.clients[ws] = struct{}{}
 	if passive {
 		rt.passive[ws] = struct{}{}
@@ -315,6 +344,7 @@ func (rt *sessionRuntime) attachWithRole(ws *wsConn, passive bool) {
 			SessionID:  rt.agent.SessionID,
 		})
 	}
+	return true
 }
 
 // detach removes a socket from the session. It never cancels the turn: the
@@ -387,6 +417,38 @@ func (rt *sessionRuntime) viewerCount() int {
 	rt.clientsMu.Lock()
 	defer rt.clientsMu.Unlock()
 	return len(rt.clients) - len(rt.passive)
+}
+
+// claimClose atomically decides whether an explicit session_close may
+// proceed: it returns true only when the runtime has no attached clients,
+// and latches closing so a viewer attach that races the close is refused
+// (its handler reports session_detached — the session stays saved) instead
+// of attaching to a runtime the imminent eviction removes from under it.
+// The claim and a racing attach are serialized by clientsMu, so exactly one
+// of the two wins: either the attach lands first and the claim fails (the
+// session stays open for the new viewer), or the claim wins and the attach
+// is refused.
+//
+// This closes the check-then-close window the session_close handler used to
+// have: a plain clientCount()==0 followed — after the parent-notification
+// detour — by closeRuntime let a concurrent session_attach resolve the
+// still-registered runtime in between and attach, and the close then evicted
+// the racing viewer's runtime from under it (cancelling a turn started in
+// that window), violating the handler's own multi-tab guarantee.
+//
+// Once claimed, the close is unconditional: the caller must run
+// closeRuntime, and the latch is never cleared — the runtime is leaving
+// memory. A claim on an already-evicted runtime still returns true
+// (clientless); closeRuntime then no-ops on its evicted flag, matching the
+// handler's pre-claim behavior for that case.
+func (rt *sessionRuntime) claimClose() bool {
+	rt.clientsMu.Lock()
+	defer rt.clientsMu.Unlock()
+	if rt.closing || len(rt.clients) > 0 {
+		return false
+	}
+	rt.closing = true
+	return true
 }
 
 // broadcast writes a message to every attached socket. A socket whose write
@@ -547,6 +609,39 @@ func (rt *sessionRuntime) deleteApprover() agent.DeleteApprover {
 	}
 }
 
+// nestedDeleteApprover returns the D6 delete-approval override for a nested
+// (subagent) child runtime: approvals go to the child's own attached clients
+// (the child pane shows the modal); with none attached they route to the
+// parent's clients so a headless child can never hang an approval.
+//
+// The parent is resolved by id AT APPROVAL TIME, never via a runtime pointer
+// captured at spawn/reopen: the parent can be orphan-evicted while its
+// background child keeps running and later reopened as a FRESH runtime under
+// the same id. An override closing over the spawn-time pointer would
+// broadcast the approval to the dead runtime's swept clients set and wait
+// forever — reports and completion notices survive that eviction via
+// deliverToParent queueing, but approvals have no queue: the waiter holds
+// the child's turn hostage, with no auto-deny armed (that machinery fires on
+// client detach, and a headless child has no client). Recovery would only be
+// interrupt_agent.
+//
+// When neither the child nor the live parent has any attached client, the
+// request is DENIED fail-closed (false, nil): parking the approval would
+// broadcast to nobody and hang the child's turn. This matches the board
+// start's deny-when-unattended override and the last-detach auto-deny: an
+// unattended turn must not block on a destructive prompt.
+func (r *sessionRegistry) nestedDeleteApprover(child *sessionRuntime, parentID string) agent.DeleteApprover {
+	return func(ctx context.Context, req agent.DeleteRequest) (bool, error) {
+		if child.clientCount() > 0 {
+			return child.deleteApprover()(ctx, req)
+		}
+		if parentRt, ok := r.get(parentID); ok && parentRt != child && parentRt.clientCount() > 0 {
+			return parentRt.deleteApprover()(ctx, req)
+		}
+		return false, nil
+	}
+}
+
 // sessionRegistry owns the live sessions of the web server. The map itself
 // is guarded by mu (short critical sections only); per-session state is
 // serialized by the session's own turnMu.
@@ -587,9 +682,10 @@ func newSessionRegistry(maxActive int) *sessionRegistry {
 
 // register adds a runtime under id and returns the ids of any sessions it
 // evicted to make room (empty when none). Registering an already-active id is
-// a no-op (dedupe, E9) returning nil. Evicted sessions were flushed before
-// eviction; their ids are returned so callers that prune the store right
-// after (session create/fork) can protect the fresh files (E2/E11).
+// a no-op (dedupe, E9) returning nil. Evicted sessions were flushed and their
+// background jobs killed before eviction; their ids are returned so callers
+// that prune the store right after (session create/fork) can protect the
+// fresh files (E2/E11).
 func (r *sessionRegistry) register(id string, rt *sessionRuntime) []string {
 	var victims []*sessionRuntime
 	var victimIDs []string
@@ -673,6 +769,18 @@ func (r *sessionRegistry) register(id string, rt *sessionRuntime) []string {
 		// saved-session list and distort the recency ordering that
 		// Store.List/LatestID/Prune rely on.
 		victim.agent.FlushPending()
+		// The runtime is leaving memory: its background jobs (execute_command
+		// background=true) have no owner left to poll them, so kill them
+		// rather than leak orphan processes — the documented evictRuntime
+		// contract every other eviction path goes through. Close is
+		// idempotent, non-blocking (context cancels + retention-timer stops
+		// under bgMu), and nils the job registry: a finishing job can
+		// neither rearm a reaper on the closing Agent nor fire a completion
+		// notice the registry-backed deliverer would silently drop (the
+		// victim is already unregistered here). Under turnMu, mirroring
+		// evictRuntime; the sticky evicted flag set above already blocks
+		// any new turn once the lock is released.
+		victim.agent.Close()
 		victim.turnMu.Unlock()
 		victim.broadcast(WSMessage{Type: "session_detached", SessionID: victimIDs[i]})
 		// Detach every attached socket AFTER the notification (the client
@@ -735,6 +843,17 @@ func (r *sessionRegistry) evictRuntime(rt *sessionRuntime) {
 	// set — teardown's detachAll only sweeps REGISTERED sessions and would
 	// never reach it. detach is idempotent and never cancels a turn.
 	rt.detachAllClients()
+	// Deny whatever approvals are still parked on this runtime: it is
+	// leaving memory, so nothing can ever answer them, and the normal
+	// auto-deny arming (the last client's detach) may not have fired when
+	// the runtime was already clientless — e.g. an orphan-evicted parent
+	// holding an approval a background child routed to it before the
+	// eviction. Without this the child's waiter hangs forever on the dead
+	// runtime (no auto-deny is armed for it — that machinery is armed by
+	// client detach, and the runtime has none left). Normally a no-op:
+	// detach's auto-deny already released everything parked while a client
+	// was attached.
+	rt.autoDenyPendingApprovals()
 }
 
 // fireEvictHook invokes the registry's eviction hook for id (the web server
@@ -754,6 +873,12 @@ func (r *sessionRegistry) fireEvictHook(id string) {
 // then evicts the runtime. Used by the explicit session_close message: the
 // user pressed ✕ on the pane — stop the session and put it back in the saved
 // list. The session stays saved on disk.
+//
+// closeRuntime itself does not look at the clients set (tests call it
+// directly on known-idle runtimes). A caller that must honor the multi-tab
+// guarantee — close only when no other socket is attached — claims the close
+// first (sessionRuntime.claimClose), which atomically checks clientlessness
+// against attach; see wsHandleClose.
 func (r *sessionRegistry) closeRuntime(rt *sessionRuntime) {
 	if rt == nil || rt.evicted.Load() {
 		return

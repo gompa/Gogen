@@ -316,8 +316,28 @@ func wsHandleAttach(req *wsRequest) {
 		// restarted with pruning): tell the client to drop the pane.
 		_ = ws.writeJSON(WSMessage{Type: "session_removed", SessionID: msg.SessionID, Content: err.Error()})
 	} else {
-		s.switchPane(ws, pane, rt2)
-		s.attachSession(ws, r, rt2, !msg.NoHistory)
+		if !s.switchPane(ws, pane, rt2) {
+			// The attach raced an eviction: the resolved runtime is
+			// closing (a claimed session_close) or already evicted —
+			// report the detach so the client drops the pane instead of
+			// sending messages to a runtime that is leaving memory.
+			s.notifySessionDetached(ws, rt2)
+			return
+		}
+		// Conditional attach: a pane re-focusing with an unchanged
+		// transcript (session id + history epoch + newest rendered index)
+		// lets the server skip the history snapshot entirely.
+		var known *attachKnown
+		if msg.KnownHistoryEpoch != nil && msg.KnownHistoryIndex != nil {
+			known = &attachKnown{epoch: *msg.KnownHistoryEpoch, index: *msg.KnownHistoryIndex}
+		}
+		if !s.attachSession(ws, r, rt2, !msg.NoHistory, known) {
+			// The same race, landing between the pane switch and the
+			// payload (cap eviction ignores attachments). The eviction's
+			// own session_detached broadcast may also arrive; duplicates
+			// are idempotent client-side.
+			s.notifySessionDetached(ws, rt2)
+		}
 	}
 }
 
@@ -345,21 +365,32 @@ func wsHandleClose(req *wsRequest) {
 		return
 	}
 	target.detach(ws)
-	if target.clientCount() == 0 {
-		// Closing a nested (subagent) child reports back to its parent
-		// session: the main agent must learn the child was stopped by the
-		// user (delivered as a system message once the parent is idle /
-		// its turn ends). Skipped when the runtime was already evicted —
-		// closeRuntime would be a no-op, so there is nothing to report.
-		if parentID := target.agent.ParentID(); parentID != "" && !target.evicted.Load() {
-			label := target.agent.SessionLabelSnapshot()
-			if label == "" {
-				label = target.agent.SessionID
-			}
-			s.registry.deliverToParent(parentID, fmt.Sprintf("[subagent %s] closed by the user — its session stays saved and can be reopened.", label))
-		}
-		s.registry.closeRuntime(target)
+	// The clientless decision must be atomic against attach: a plain
+	// clientCount()==0 check here raced a concurrent session_attach, which
+	// could resolve this (still-registered) runtime in the window before
+	// closeRuntime and attach — the close then evicted the racing viewer's
+	// runtime from under it (and cancelled a turn started in that window),
+	// violating the multi-tab guarantee in the comment above. claimClose
+	// latches the runtime closing under clientsMu only when it is
+	// clientless, so the racing attach is refused instead and its handler
+	// reports session_detached (the session stays saved; the client reopens
+	// it from the saved list).
+	if !target.claimClose() {
+		return
 	}
+	// Closing a nested (subagent) child reports back to its parent
+	// session: the main agent must learn the child was stopped by the
+	// user (delivered as a system message once the parent is idle /
+	// its turn ends). Skipped when the runtime was already evicted —
+	// closeRuntime would be a no-op, so there is nothing to report.
+	if parentID := target.agent.ParentID(); parentID != "" && !target.evicted.Load() {
+		label := target.agent.SessionLabelSnapshot()
+		if label == "" {
+			label = target.agent.SessionID
+		}
+		s.registry.deliverToParent(parentID, fmt.Sprintf("[subagent %s] closed by the user — its session stays saved and can be reopened.", label))
+	}
+	s.registry.closeRuntime(target)
 }
 
 func wsHandleUserTermInput(req *wsRequest) {

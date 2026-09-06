@@ -122,9 +122,14 @@ func (s *Server) applyContextField(r *config.Config, copy func(next *contextmgr.
 		if rt.agent.Context == nil {
 			continue
 		}
-		next := rt.agent.Context.SettingsSnapshot()
-		copy(&next, r)
-		rt.agent.Context.UpdateSettings(next)
+		// UpdateSettingsFunc merges against the CURRENT settings under one
+		// lock, so two concurrent single-field pushes for the same session
+		// cannot interleave and silently revert each other (the old
+		// snapshot-then-update pair was not atomic).
+		rt.agent.Context.UpdateSettingsFunc(func(cur contextmgr.Settings) contextmgr.Settings {
+			copy(&cur, r)
+			return cur
+		})
 	}
 }
 

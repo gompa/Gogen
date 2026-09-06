@@ -106,11 +106,17 @@ settingsOverlay.addEventListener('click', (e) => {
 // (applyFeatureSettings), so multiple tabs stay in sync.
 const boardEnabledSelect = document.getElementById('board-enabled-select');
 const subagentEnabledSelect = document.getElementById('subagent-enabled-select');
+const reviewAgentEnabledSelect = document.getElementById('review-agent-enabled-select');
 const subagentDepthInput = document.getElementById('subagent-depth-input');
 const subagentLimitInput = document.getElementById('subagent-limit-input');
 if (boardEnabledSelect) {
     boardEnabledSelect.addEventListener('change', () => {
         sendFeatureConfig({ board: boardEnabledSelect.value });
+    });
+}
+if (reviewAgentEnabledSelect) {
+    reviewAgentEnabledSelect.addEventListener('change', () => {
+        sendFeatureConfig({ reviewAgent: reviewAgentEnabledSelect.value });
     });
 }
 if (subagentEnabledSelect) {
@@ -152,6 +158,7 @@ if (subagentLimitInput) {
 export function applyFeatureSettings(data) {
     const boardOn = data.board === 'on';
     const subagentOn = data.subagent === 'on';
+    const reviewAgentOn = data.reviewAgent === 'on';
     const boardTab = document.getElementById('board-tab');
     const wasVisible = boardTab && !boardTab.hidden;
     if (boardTab && boardTab.hidden === boardOn) boardTab.hidden = !boardOn;
@@ -182,13 +189,29 @@ export function applyFeatureSettings(data) {
     if (subModelPicker) subModelPicker.hidden = !subagentOn;
     const subThinkingPicker = document.getElementById('subagent-thinking-picker');
     if (subThinkingPicker) subThinkingPicker.hidden = !subagentOn;
+    // The review-agent controls are meaningful only while the review
+    // agent is on AND the board is on (the reviewer works on board
+    // tickets; the trigger rides on the board manager).
+    const reviewAgentRowsVisible = reviewAgentOn && boardOn;
+    const reviewSel = document.getElementById('review-agent-enabled-select');
+    if (reviewSel && reviewSel.value !== (reviewAgentOn ? 'on' : 'off')) reviewSel.value = reviewAgentOn ? 'on' : 'off';
+    const reviewModelPicker = document.getElementById('review-agent-model-row');
+    if (reviewModelPicker) reviewModelPicker.hidden = !reviewAgentRowsVisible;
+    const reviewThinkingPicker = document.getElementById('review-agent-thinking-row');
+    if (reviewThinkingPicker) reviewThinkingPicker.hidden = !reviewAgentRowsVisible;
+    const reviewPromptRow = document.getElementById('board-review-prompt-row');
+    if (reviewPromptRow) reviewPromptRow.hidden = !reviewAgentRowsVisible;
     const ws = deps.getWs();
     const models = deps.getModels();
-    if (subagentOn && !subModelPicker.hidden && isSettingsOpen()
-        && (!models || models.length === 0)
-        && ws && ws.readyState === WebSocket.OPEN) {
+    const needsModels = isSettingsOpen() && (!models || models.length === 0)
+        && ws && ws.readyState === WebSocket.OPEN;
+    if (needsModels && subagentOn && !subModelPicker.hidden) {
         // Just enabled while the modal is open: fetch the catalog so
-        // the picker is not stuck on "No models loaded".
+        // the subagent picker is not stuck on "No models loaded".
+        ws.send(JSON.stringify({ type: 'list_models' }));
+    }
+    if (needsModels && reviewAgentRowsVisible) {
+        // Same for the review-agent model picker.
         ws.send(JSON.stringify({ type: 'list_models' }));
     }
 }
@@ -247,6 +270,7 @@ const RUNTIME_CONTROLS = [
     { id: 'mcp-select', field: 'mcp' },
     // Prompts (configurable templates; settings Agent group)
     { id: 'board-start-prompt-input', field: 'boardStartPrompt' },
+    { id: 'board-review-prompt-input', field: 'boardReviewPrompt' },
     { id: 'system-prompt-input', field: 'systemPrompt' },
     { id: 'subagent-prompt-input', field: 'subagentPrompt' },
 ];
@@ -289,6 +313,7 @@ RUNTIME_CONTROLS.forEach(wireRuntimeControl);
 // and the next push re-populates the textarea with it.
 const PROMPT_RESET_BUTTONS = [
     { id: 'board-prompt-reset-btn', field: 'boardStartPrompt' },
+    { id: 'board-review-prompt-reset-btn', field: 'boardReviewPrompt' },
     { id: 'system-prompt-reset-btn', field: 'systemPrompt' },
     { id: 'subagent-prompt-reset-btn', field: 'subagentPrompt' },
 ];
@@ -355,6 +380,18 @@ export function applyRuntimeSettings(data) {
     // editor pre-fills from it.
     if (data.boardStartPrompt !== undefined) {
         setBoardStartPrompt(data.boardStartPrompt || '');
+    }
+    // Review agent default model + reasoning effort: the server
+    // pushes the current values ("" = cascade / inherit, pointer-carried
+    // so a clear by another tab syncs here too), like the subagent
+    // picker above.
+    if (data.reviewAgentModel !== undefined) {
+        deps.setReviewAgentModel(data.reviewAgentModel || '');
+        if (isSettingsOpen()) deps.renderReviewAgentPicker();
+    }
+    if (data.reviewAgentThinkingLevel !== undefined) {
+        deps.setReviewAgentThinkingLevel(data.reviewAgentThinkingLevel || '');
+        if (isSettingsOpen()) deps.renderReviewAgentPicker();
     }
 }
 

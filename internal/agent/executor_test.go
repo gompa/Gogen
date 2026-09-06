@@ -2,8 +2,10 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -338,6 +340,84 @@ func TestLargeFileSearchSkipsTotalDrain(t *testing.T) {
 	}
 	if !strings.Contains(out, "needle-here") {
 		t.Fatalf("expected match content in output, got: %q", out)
+	}
+}
+
+// TestReadFileRangeSearchWindowFillsLimit verifies that the search-mode
+// window fills out to the requested limit: when the first regex match sits
+// near the start of the file, the before-context ring holds fewer lines
+// than the ctxBefore budget, and the unused before-budget must flow into
+// the after-context instead of leaving the window under-filled.
+func TestReadFileRangeSearchWindowFillsLimit(t *testing.T) {
+	const totalFiller = 200
+	writeNeedleFile := func(t *testing.T, dir string, matchLine int) string {
+		t.Helper()
+		path := filepath.Join(dir, "log.txt")
+		var sb strings.Builder
+		for i := 1; i <= totalFiller; i++ {
+			if i == matchLine {
+				sb.WriteString("needle\n")
+				continue
+			}
+			fmt.Fprintf(&sb, "filler %d\n", i)
+		}
+		if err := os.WriteFile(path, []byte(sb.String()), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	tests := []struct {
+		name       string
+		matchLine  int
+		offset     int
+		limit      int
+		wantStart  int
+		wantWindow int
+	}{
+		// Regression: with the match on line 2, 4 of the 5 before-budget
+		// lines go unused; the window must still span the full limit of 11.
+		{"near-start match fills unused before-budget into after", 2, 0, 11, 1, 11},
+		// Match on the very first line: no before-context at all.
+		{"first-line match grants entire budget to after", 1, 0, 11, 1, 11},
+		// Ring fully filled: the budgeted 5/5 split of the 11-line window.
+		{"full before-context keeps budgeted split", 50, 0, 11, 45, 11},
+		// Explicit offset pins the before-context; after takes the remainder.
+		{"offset-pinned before leaves remainder to after", 50, 3, 11, 47, 11},
+		// No limit: the fixed default of 10 lines per side still applies.
+		{"no limit keeps default 10-line sides", 2, 0, 0, 1, 12},
+	}
+	headerRe := regexp.MustCompile(`^Lines (\d+)-(\d+) of \d+\+? \(matched "needle" at line (\d+)\)$`)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := writeNeedleFile(t, dir, tt.matchLine)
+			exec := NewExecutor(dir)
+			out, err := exec.ReadFileRange(path, tt.offset, tt.limit, "needle", true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			header, body, _ := strings.Cut(out, "\n")
+			m := headerRe.FindStringSubmatch(header)
+			if m == nil {
+				t.Fatalf("unexpected header: %q", header)
+			}
+			var start, end, gotMatch int
+			fmt.Sscanf(m[1]+" "+m[2]+" "+m[3], "%d %d %d", &start, &end, &gotMatch)
+			if gotMatch != tt.matchLine {
+				t.Fatalf("matched line = %d, want %d (header %q)", gotMatch, tt.matchLine, header)
+			}
+			if start != tt.wantStart || end-start+1 != tt.wantWindow {
+				t.Fatalf("window = lines %d-%d (%d lines), want start %d with %d lines (header %q)",
+					start, end, end-start+1, tt.wantStart, tt.wantWindow, header)
+			}
+			if got := strings.Count(body, "\n") + 1; got != tt.wantWindow {
+				t.Fatalf("body has %d lines, want %d", got, tt.wantWindow)
+			}
+			if !strings.Contains(body, "needle") {
+				t.Fatalf("expected match content in body, got: %q", body)
+			}
+		})
 	}
 }
 

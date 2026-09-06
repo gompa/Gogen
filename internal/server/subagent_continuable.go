@@ -240,6 +240,29 @@ func (c *backgroundChild) isRunning() bool {
 	return c.status == "running"
 }
 
+// busy reports whether the child has lifecycle work a release would cut
+// short: an active turn, a send_message delivery queued for the delivery
+// worker but not yet turned into one, or a captured reply not yet delivered
+// to the parent. The last two cover the delivery handoffs the turn state
+// alone reads as idle: the worker holds the queued item until it has
+// ACQUIRED the turn lock (deliverLoop's peek-not-pop contract), and
+// deliverStartHook arms pendingReply before startTurn sets the turn active
+// — with the mirror-image window at turn end, where setTurnActive(false)
+// runs before the turn-end hook consumes the reply. Takes no locks on
+// entry; c.mu, rt.stateMu and rt.deliverMu are leaf locks (the documented
+// children.mu → c.mu order, never the reverse).
+func (c *backgroundChild) busy() bool {
+	if active, _ := c.rt.turnState(); active {
+		return true
+	}
+	if c.rt.hasPendingDeliveries() {
+		return true
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pendingReply
+}
+
 // onTurnEnd is installed as the child runtime's turn-end hook: when a
 // send_message delivery's turn has ended, the child's last assistant reply
 // is injected into the parent conversation (delivery service; dropped when
@@ -375,13 +398,32 @@ func (sp *subagentSpawner) SpawnBackground(ctx context.Context, parent *agent.Ag
 	//     + foreground) so interrupted children cannot accumulate
 	//     unbounded runtimes.
 	activeOver, guardOver := sp.children.spawnCapExceeded(parent.SessionID, sp.concurrentLimit(), sp.liveGuardLimit())
-	if activeOver {
-		sp.releaseChild(child)
-		return "", spawnCapError(sp.concurrentLimit(), false)
+	if activeOver || guardOver {
+		// The child is DISCARDED, not released: it never started — no turn,
+		// nothing persisted — so it must leave no artifact. releaseChild
+		// would stamp the outcome "failed"/"cancelled" and force a flush,
+		// writing an empty session file + index entry per refused spawn: a
+		// phantom failed child row in the sidebar for a child that never
+		// existed (discardUnstartedChild's flush-free eviction writes
+		// nothing). The refusal error below — the tool result the parent
+		// model sees — is the refused child's only trace.
+		sp.discardUnstartedChild(child)
+		return "", spawnCapError(sp.concurrentLimit(), guardOver)
 	}
-	if guardOver {
-		sp.releaseChild(child)
-		return "", spawnCapError(sp.concurrentLimit(), true)
+
+	// Announce the ADMITTED child (the sidebar row's attach target) — only
+	// now, after the caps passed: a refused child is discarded without ever
+	// being announced, so no client ever learns of it (an announced-but-
+	// refused child would leave a "running" row no event ever resolves).
+	if parentRt, ok := s.registry.get(parent.SessionID); ok {
+		parentRt.broadcast(WSMessage{
+			Type:           "subagent_started",
+			SessionID:      parent.SessionID,
+			SubagentID:     child.id,
+			SubagentLabel:  label,
+			SubagentJob:    truncateJob(rawJob),
+			SubagentParent: parent.SessionID,
+		})
 	}
 
 	sp.spawnWg.Add(1)
@@ -462,7 +504,22 @@ func (sp *subagentSpawner) enforceChildCap(parentID string) {
 	overflow := len(finished) - sp.maxFinishedLimit()
 	var victims []*backgroundChild
 	if overflow > 0 {
-		victims = append(victims, finished[:overflow]...)
+		// Oldest-first, but never a child whose reply work is still in
+		// flight (an active send_message turn, a delivery queued for the
+		// worker, or a captured reply): releaseChild would cancel the
+		// turn and drop the reply silently — the same trap the retention
+		// timer's busy check guards. A spared child is released by its own
+		// retention timer once it goes quiet (armed at finish), and the
+		// next spawn/finish re-runs this cap, so sparing cannot strand it.
+		for _, c := range finished {
+			if len(victims) >= overflow {
+				break
+			}
+			if c.busy() {
+				continue
+			}
+			victims = append(victims, c)
+		}
 	}
 	sp.children.mu.Unlock()
 	for _, c := range victims {
@@ -471,11 +528,21 @@ func (sp *subagentSpawner) enforceChildCap(parentID string) {
 }
 
 // maybeReleaseChild runs when a child's retention window elapses. A child
-// with a turn currently running (e.g. a send_message reply) is NOT released
-// mid-turn — the timer re-arms so the reply completes and the child is
-// released after the next quiet window. Idle children are released.
+// with lifecycle work in flight is NOT released — the timer re-arms so the
+// work completes and the child is released after the next quiet window:
+//   - an active turn (e.g. a send_message reply): releasing mid-turn would
+//     cancel the reply;
+//   - a send_message delivery queued but not yet past the acquire step:
+//     the delivery worker has not acquired the turn lock, so the turn state
+//     reads idle — checking only the turn state released the child here and
+//     silently dropped the queued message (the parent got no reply and no
+//     error);
+//   - a reply captured but not yet delivered to the parent (the delivery
+//     turn's acquire→start handoff and the end→hook window).
+//
+// Quiet children are released.
 func (sp *subagentSpawner) maybeReleaseChild(c *backgroundChild) {
-	if active, _ := c.rt.turnState(); active {
+	if c.busy() {
 		time.AfterFunc(sp.retainWindow(), func() { sp.maybeReleaseChild(c) })
 		return
 	}
@@ -485,7 +552,10 @@ func (sp *subagentSpawner) maybeReleaseChild(c *backgroundChild) {
 // releaseChild unregisters and evicts a child's runtime. Idempotent. The
 // saved session stays on disk and reopens via the sidebar. An in-flight
 // turn (e.g. a send_message reply) is cancelled first so it cannot keep
-// running on an evicted runtime.
+// running on an evicted runtime. Only for children whose lifecycle started
+// (running, interrupted-idle, or finished) — a spawn refused before its
+// turn must go through discardUnstartedChild instead, or it would leave a
+// phantom empty "failed" session file behind.
 func (sp *subagentSpawner) releaseChild(c *backgroundChild) {
 	sp.children.mu.Lock()
 	if c.released {
@@ -515,6 +585,37 @@ func (sp *subagentSpawner) releaseChild(c *backgroundChild) {
 	sp.s.registry.evictRuntime(c.rt)
 	// Releasing a child is an explicit teardown of its session: its own
 	// children (grandchildren) are cancelled and released in turn.
+	sp.s.registry.fireEvictHook(c.id)
+}
+
+// discardUnstartedChild tears down a child refused BEFORE its turn ever
+// started (the spawn-cap refusals in SpawnBackground). Unlike releaseChild
+// it stamps no outcome and forces no flush: the child never ran, and a
+// turn's persist is the only thing that ever writes its session file — so
+// the flush-free eviction's FlushPending finds a clean session and writes
+// NOTHING. That is the point: a refused spawn must not leave an empty
+// "failed" session file + index entry behind, or the sidebar grows one
+// phantom failed child row per refused spawn, for children that never
+// existed (the pre-fix behavior — releaseChild's mid-run flush). The
+// refusal error returned to the parent model is the refused child's only
+// trace. Idempotent with releaseChild via the same released flag. Runs
+// before any turn goroutine exists: there is no in-flight turn to cancel,
+// and the same synchronous call that evicts the runtime is the only one
+// that could have started a turn on it.
+func (sp *subagentSpawner) discardUnstartedChild(c *backgroundChild) {
+	sp.children.mu.Lock()
+	if c.released {
+		sp.children.mu.Unlock()
+		return
+	}
+	c.released = true
+	delete(sp.children.children, c.id)
+	sp.children.mu.Unlock()
+	c.rt.held.Store(false)
+	sp.s.registry.evictRuntime(c.rt)
+	// Same teardown symmetry as releaseChild: the refused child cannot have
+	// children of its own, but the hook keeps the "every child teardown
+	// fires the evict hook" invariant future-proof.
 	sp.s.registry.fireEvictHook(c.id)
 }
 
@@ -585,7 +686,9 @@ func (sp *subagentSpawner) Fork(ctx context.Context, parent *agent.Agent, job st
 	childRt := newSessionRuntimeWithHold(child, sp.approvalHold())
 	childRt.parentID = parent.SessionID
 	childRt.nested = true
-	childRt.routeApprovalsTo(parentRt)
+	// Resolved by id at approval time: the parent pointer captured here goes
+	// stale when the parent is orphan-evicted and reopened (routeApprovalsTo).
+	childRt.routeApprovalsTo(s.registry, parent.SessionID)
 	s.registry.register(newID, childRt)
 	parentRt.broadcast(WSMessage{
 		Type:           "subagent_started",
@@ -648,7 +751,13 @@ func (sp *subagentSpawner) SendMessage(caller *agent.Agent, agentID, text string
 	// The message itself is delivered through the child's delivery service
 	// (queued when the child is mid-turn); reply capture is armed by the
 	// delivery-start hook when the delivered turn actually begins.
-	child.rt.deliverToSession(text)
+	if !child.rt.deliverToSession(text) {
+		// The child's runtime was evicted between the registry lookup and
+		// the queue append (e.g. the retention release racing this send):
+		// report the loss instead of dropping the message silently — the
+		// model can re-send or re-spawn.
+		return fmt.Errorf("send_message: subagent %s is no longer live", agentID)
+	}
 	return nil
 }
 

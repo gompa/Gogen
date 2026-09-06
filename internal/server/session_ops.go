@@ -96,22 +96,17 @@ func (s *Server) loadOrCreateRuntime(id string) (*sessionRuntime, error) {
 	// A re-attached nested (subagent) child restores its runtime-level
 	// parent link and privileges: the nested flag re-arms the
 	// active-session cap exemption, and the D6 delete-approval override
-	// routes to the parent's clients when the child has none attached
-	// (the parent is resolved lazily at approval time — it may not be
-	// live when the child is reopened). Without this, a child reopened
-	// after eviction/restart could be cap-evicted mid-task and headless
-	// delete approvals would hang instead of reaching the parent.
+	// routes to the parent's clients when the child has none attached.
+	// The parent is resolved by id at approval time (it may not be live,
+	// or may be a fresh runtime, when the child is reopened) and an
+	// approval nobody can answer is denied instead of parked forever —
+	// see nestedDeleteApprover. Without this, a child reopened after
+	// eviction/restart could be cap-evicted mid-task and headless delete
+	// approvals would hang instead of reaching the parent.
 	if p := a.ParentID(); p != "" {
 		rt.parentID = p
 		rt.nested = true
-		rt.approverOverride = func(ctx context.Context, req agent.DeleteRequest) (bool, error) {
-			if rt.clientCount() == 0 {
-				if parentRt, ok := s.registry.get(p); ok {
-					return parentRt.deleteApprover()(ctx, req)
-				}
-			}
-			return rt.deleteApprover()(ctx, req)
-		}
+		rt.approverOverride = s.registry.nestedDeleteApprover(rt, p)
 	}
 	s.registry.register(id, rt)
 	// A concurrent attach (or resume) of the same session may have
@@ -160,9 +155,26 @@ func (s *Server) validateModelAsync(rt *sessionRuntime, model string) {
 // closes a pane (✕ — the server cancels the turn and unregisters the
 // runtime); a killed tab self-heals via lazy detach-on-write-failure
 // (E26/E32).
-func (s *Server) switchPane(ws *wsConn, pane **sessionRuntime, rt *sessionRuntime) {
+//
+// It returns false when the attach was refused — rt is closing (a claimed
+// session_close) or already evicted — in which case the pane pointer is NOT
+// moved to a runtime that is leaving memory; the caller reports
+// session_detached (notifySessionDetached).
+func (s *Server) switchPane(ws *wsConn, pane **sessionRuntime, rt *sessionRuntime) bool {
+	if !rt.attach(ws) {
+		return false
+	}
 	*pane = rt
-	rt.attach(ws)
+	return true
+}
+
+// notifySessionDetached reports a refused attach: the runtime the client
+// tried to attach to left the registry (a claimed session_close the attach
+// raced, or a cap/orphan eviction). The session is saved, not deleted — the
+// client closes the pane like a removal (handleSessionDetached in app.js)
+// and can reopen it from the saved list, which reloads it from the store.
+func (s *Server) notifySessionDetached(ws *wsConn, rt *sessionRuntime) {
+	_ = ws.writeJSON(WSMessage{Type: "session_detached", SessionID: rt.agent.SessionID})
 }
 
 // pruneSessions invokes the store's explicit prune with the full active set

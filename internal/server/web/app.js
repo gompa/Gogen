@@ -55,6 +55,7 @@
         // machinery and smartScroll. Owns the stickToBottom /
         // ignoreScrollEvent state; app.js reaches it through the exports.
         import {
+            disableFollow,
             distanceFromBottom,
             enableFollow,
             initScroll,
@@ -426,6 +427,34 @@
             onThinkingChange: (value) => sendRuntimeConfig({ subagentThinkingLevel: { prop: 'subagentThinkingLevel', value } }),
         });
         subagentModelFilter?.addEventListener('input', () => subagentPicker.render());
+
+        // ── Review agent model + reasoning-effort picker (Agent settings
+        // tab) ── The shared ModelThinkingPicker, configured for the
+        // board auto-review agent: the model list's default row is the
+        // CASCADE value ("" = the ticket's own review model override,
+        // else the workspace default model); the effort chips are
+        // model-aware (the selected review model's accepted values, the
+        // pane's model values while the cascade row is selected, the
+        // default set as a last resort — the server re-validates against
+        // the reviewer's final model at review start). Selections
+        // round-trip through the runtime-config channel (configFields:
+        // ["reviewAgentModel", "reviewAgentThinkingLevel"]).
+        const reviewAgentPickerState = { model: '', thinkingLevel: '' }; // server-pushed current values ('' = cascade/inherit)
+        const reviewAgentModelFilter = document.getElementById('review-agent-model-filter');
+        const reviewAgentPicker = createModelThinkingPicker({
+            listEl: document.getElementById('review-agent-model-list'),
+            filterEl: reviewAgentModelFilter,
+            chipsEl: document.getElementById('review-agent-thinking-options'),
+            getState: () => reviewAgentPickerState,
+            getModels: () => availableModels,
+            getPane: () => activePane(),
+            defaultRow: { label: 'Cascade (ticket override → workspace default)', title: 'Use the ticket override, else the workspace default model' },
+            inheritChipTitle: 'Inherit the workspace level',
+            stripPaneCurrent: true,
+            onModelChange: (id) => sendRuntimeConfig({ reviewAgentModel: { prop: 'reviewAgentModel', value: id } }),
+            onThinkingChange: (value) => sendRuntimeConfig({ reviewAgentThinkingLevel: { prop: 'reviewAgentThinkingLevel', value } }),
+        });
+        reviewAgentModelFilter?.addEventListener('input', () => reviewAgentPicker.render());
 
         // ── Toolbar: thinking level chips ──
         // The chip rendering (Off chip + the model's accepted values,
@@ -825,9 +854,12 @@
             }
         }
 
-        function clearChat() {
-            disposeChatEditors();
-            messagesDiv.innerHTML = '';
+        // Reset the module-level chat state that belongs to the ACTIVE pane
+        // (stream references, pending acks/cancels, follow). clearChat runs
+        // it after wiping the DOM; the pane-switch cache path runs it after
+        // moving the outgoing pane's transcript into its offscreen cache —
+        // the state is the outgoing pane's either way.
+        function resetChatTranscriptState() {
             hideTocTooltip();
             rebuildToc();
             enableFollow();
@@ -855,19 +887,103 @@
             streamContentPos = 0;
             thinkingContentPos = 0;
             lastFinalizedThinking = null;
-            // noMirror: clearChat is also used mid-pane-switch (clear → load),
+            // noMirror: this also runs mid-pane-switch (cache → load),
             // where the new pane's turnActive must survive the reset.
             setTurnActive(false, { silent: true, noMirror: true });
             setInputProgress(null);
             // Transcript is empty: pinned and at the bottom, so this hides
             // the jump button (same as the old direct classList.remove).
             updateScrollBottomBtn();
-            // Show the empty-state placeholder only while the transcript is
-            // truly empty.
+        }
+
+        // Show the empty-state placeholder only while the transcript is
+        // truly empty.
+        function ensureEmptyState() {
             if (!messagesDiv.querySelector('.message, .thought-card, .tool-card')
                 && !messagesDiv.querySelector('.empty-state')) {
                 messagesDiv.appendChild(buildEmptyState());
             }
+        }
+
+        function clearChat() {
+            disposeChatEditors();
+            messagesDiv.innerHTML = '';
+            resetChatTranscriptState();
+            ensureEmptyState();
+        }
+
+        // ── Per-pane transcript cache ──
+        // Switching panes used to clear the transcript and re-derive it from
+        // a full server history snapshot on every focus (re-clone, re-marshal,
+        // re-ship, re-parse, re-render — seconds on a long session). A SETTLED
+        // pane instead moves its rendered transcript into an offscreen
+        // container here, and focusPane moves it back before re-attaching:
+        // nothing is re-rendered, and the attach tells the server the pane's
+        // history fingerprint so it can skip the snapshot entirely (and even
+        // the wire cost) when the session is unchanged. Panes that were live
+        // mid-turn at switch time are NOT cached — background stream events
+        // never reach the DOM, so their transcript would be stale by the
+        // in-flight content; those keep the clear-and-rederive path.
+        function paneSettledForCache() {
+            return !turnActive
+                && !hasLiveInFlight()
+                // Live agent terminal cards stream tool output by node
+                // reference; a pane holding any would miss updates while
+                // cached. Same conservative rule as the live-render check.
+                && Object.keys(bgTermCards).length === 0
+                && pendingAcks.length === 0
+                && pendingCancels.length === 0
+                && cancelTarget.size === 0
+                && !pendingSessionResponse
+                && !resendAwaitingHistory
+                && !compacting;
+        }
+
+        // Capture the ACTIVE pane's rendered transcript into an offscreen
+        // cache so a later focus can restore it without a server round-trip.
+        // Returns true when cached; the caller then runs
+        // resetChatTranscriptState() instead of clearChat().
+        function cachePaneTranscript(pane) {
+            if (!pane || !pane.id) return false;
+            if (!paneSettledForCache()) return false;
+            const cache = {
+                container: document.createElement('div'),
+                sessionId: pane.id,
+                scrollTop: messagesDiv.scrollTop,
+                pinned: isPinned(),
+                msgIdxCounter,
+                historyToolCallArgs,
+            };
+            while (messagesDiv.firstChild) cache.container.appendChild(messagesDiv.firstChild);
+            pane.domCache = cache;
+            return true;
+        }
+
+        // Move a pane's cached transcript back into the live container and
+        // restore the per-pane state captured with it. The cache is consumed.
+        // Returns true when a cache was restored (the caller then re-attaches
+        // with the pane's known history fingerprint); false leaves the
+        // container empty for the caller's empty-state.
+        function restorePaneTranscript(pane) {
+            const cache = pane && pane.domCache;
+            pane.domCache = null;
+            if (!cache || cache.sessionId !== pane.id) return false;
+            // Stray content (should not happen — the outgoing pane was moved
+            // out or wiped) is dropped, not merged into the restored cache.
+            messagesDiv.replaceChildren(...cache.container.childNodes);
+            msgIdxCounter = cache.msgIdxCounter;
+            historyToolCallArgs = cache.historyToolCallArgs;
+            // resetChatTranscriptState emptied the TOC rail after the cache
+            // was captured; rebuild it from the restored DOM (same nodes, so
+            // the dot ↔ message wiring is preserved).
+            rebuildToc();
+            if (cache.pinned) {
+                pinToBottom();
+            } else {
+                disableFollow();
+                messagesDiv.scrollTop = cache.scrollTop;
+            }
+            return true;
         }
 
         // ── Empty chat state (fresh session) ──
@@ -1221,6 +1337,22 @@
                 // snapshot lacks the in-flight reply, so on turn_end we
                 // re-attach once to converge the transcript.
                 needsFreshHistory: false,
+                // historyEpoch of the last history payload applied to this
+                // pane's transcript (0 = the session was never reshaped;
+                // undefined = no payload applied yet). Compared against an
+                // attach snapshot's historyEpoch to tell a stale snapshot
+                // from a reshaped history, and sent back on session_attach
+                // (with the DOM's newest rendered index) so the server can
+                // skip the history snapshot entirely when the pane is
+                // already current (conditional attach).
+                histEpoch: undefined,
+                // Offscreen transcript cache captured when this pane was
+                // switched away from while settled: { container, sessionId,
+                // scrollTop, pinned, msgIdxCounter, historyToolCallArgs }.
+                // Focusing the pane restores the DOM directly (no server
+                // round-trip, no replay) and the attach re-verifies the
+                // fingerprint server-side; null = no cache.
+                domCache: null,
                 // Session id whose turn_end must be ignored: set when the
                 // user resumes another session while this pane's session has
                 // a running turn. The old session keeps running headless
@@ -1536,6 +1668,10 @@
                         if (!other || other === pane) {
                             const oldId = pane.id;
                             pane.id = data.sessionId;
+                            // The pane now belongs to a different session: its
+                            // transcript cache / epoch describe the old one.
+                            pane.domCache = null;
+                            pane.histEpoch = undefined;
                             sendSessionDetach(oldId);
                         }
                     }
@@ -1567,18 +1703,38 @@
             }
         }
 
-        // Make a pane the active/visible one. The transcript is cleared and
-        // re-attached so the server resends the pane's state.
+        // Make a pane the active/visible one. The transcript is restored
+        // from the pane's offscreen cache when one was captured (settled
+        // pane) and re-attached so the server resends the pane's state —
+        // with the pane's history fingerprint, so an unchanged session
+        // skips the history snapshot entirely (conditional attach).
         function focusPane(key) {
             if (key === activePaneKey) return;
             const pane = panes.get(key);
             if (!pane) return;
+            const outgoing = activePane();
             saveActivePaneState();
+            // Cache the outgoing pane's transcript when it is settled; only
+            // non-cacheable panes (mid-turn, pending acks/change) and the
+            // already-deleted outgoing pane (closePane) pay the old
+            // clear-and-rederive cost. The cache path still resets the
+            // module-level state (it belongs to the outgoing pane) — the
+            // DOM itself moves into the cache instead of being wiped.
+            if (!outgoing || !cachePaneTranscript(outgoing)) {
+                clearChat();
+            } else {
+                resetChatTranscriptState();
+            }
             activePaneKey = key;
-            // clearChat resets module-level DOM state; load the pane's state
-            // AFTER it so the restored flags survive.
-            clearChat();
+            // load the pane's state AFTER the outgoing state was saved/reset
+            // so the restored flags survive.
             loadActivePaneState();
+            let restored = false;
+            if (!restorePaneTranscript(pane)) {
+                ensureEmptyState();
+            } else {
+                restored = true;
+            }
             // Mode/thinking/model are per-session; restore the toolbar to
             // this pane's last-known values.
             if (pane.mode) updateModeInfo(pane.mode);
@@ -1589,7 +1745,20 @@
             if (sessionInfoDiv) sessionInfoDiv.textContent = pane.id || '';
             refreshSidebarSessions();
             if (pane.id && ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'session_attach', sessionId: pane.id }));
+                const attachMsg = { type: 'session_attach', sessionId: pane.id };
+                if (restored && pane.histEpoch !== undefined) {
+                    // Conditional attach: tell the server what this pane has
+                    // already rendered (last payload's epoch + the newest
+                    // rendered index). The server skips the history snapshot
+                    // while the session is unchanged and ships a rewind-only
+                    // frame when just an in-flight round is missing.
+                    const newestIdx = newestDomHistIdx();
+                    if (newestIdx >= 0) {
+                        attachMsg.knownHistoryEpoch = pane.histEpoch;
+                        attachMsg.knownHistoryIndex = newestIdx;
+                    }
+                }
+                ws.send(JSON.stringify(attachMsg));
             }
             // The click moved focus to the sidebar row (or the pane switch
             // came from a UI action): hand it back to the composer so the
@@ -1602,10 +1771,20 @@
         // next session_new reply. `pendingSessionResponse` gates the reply
         // so the config handler re-keys the pane.
         function replaceActivePane() {
+            const outgoing = activePane();
             const p = makePane();
+            // Same transcript-cache decision as focusPane: a settled pane
+            // (e.g. /new typed into an idle session) keeps its transcript
+            // cacheable; makePane already refreshed the sidebar with the
+            // new pane first, which does not touch the transcript DOM.
+            if (!outgoing || !cachePaneTranscript(outgoing)) {
+                clearChat();
+            } else {
+                resetChatTranscriptState();
+            }
             activePaneKey = p.key;
-            clearChat();
             loadActivePaneState();
+            ensureEmptyState();
             if (ws && ws.readyState === WebSocket.OPEN) {
                 pendingSessionResponse = true;
                 ws.send(JSON.stringify({ type: 'session_new' }));
@@ -1665,6 +1844,14 @@
             const seeded = savedEntry && savedEntry.updatedAt ? Date.parse(savedEntry.updatedAt) : NaN;
             const pane = makePane(Number.isNaN(seeded) ? undefined : seeded);
             pane.id = id;
+            // Same outgoing-pane transcript handling as focusPane: cache the
+            // pane we are leaving (if settled) instead of wiping it.
+            const outgoing = activePane();
+            if (!outgoing || !cachePaneTranscript(outgoing)) {
+                clearChat();
+            } else {
+                resetChatTranscriptState();
+            }
             activePaneKey = pane.key;
             // makePane refreshed the sidebar while the id was still unknown.
             // Refresh again so the new active row is marked "current": the
@@ -1672,8 +1859,8 @@
             // handler would not re-render (id unchanged) and the row would
             // stay stale until the next pane switch.
             refreshSidebarSessions();
-            clearChat();
             loadActivePaneState();
+            ensureEmptyState();
             if (sessionInfoDiv) sessionInfoDiv.textContent = id;
             pendingSessionResponse = false;
             ws.send(JSON.stringify({ type: 'session_attach', sessionId: id }));
@@ -1825,10 +2012,18 @@
             const srcId = activePane().id;
             // Open a new pane; the source pane stays open in the background.
             saveActivePaneState();
+            const outgoing = activePane();
             const pane = makePane();
+            // Same outgoing-pane transcript handling as focusPane: cache the
+            // source pane (if settled) instead of wiping it.
+            if (!outgoing || !cachePaneTranscript(outgoing)) {
+                clearChat();
+            } else {
+                resetChatTranscriptState();
+            }
             activePaneKey = pane.key;
-            clearChat();
             loadActivePaneState();
+            ensureEmptyState();
             pendingSessionResponse = true;
             ws.send(JSON.stringify({ type: 'session_fork', messageIndex: msgIdx, sessionId: srcId }));
         }
@@ -3140,6 +3335,16 @@
             return max;
         }
 
+        // Live in-flight render state: stream/thinking nodes or streaming /
+        // pending tool cards. Used by the stale-snapshot skip (converge at
+        // turn_end) and by the pane-switch cache decision (a live pane's
+        // transcript must not be cached — background events never reach it).
+        function hasLiveInFlight() {
+            return !!(currentStreamDiv || currentThinkingDiv
+                || Object.keys(streamingToolCards).length > 0
+                || Object.keys(pendingToolCards).length > 0);
+        }
+
         // Snapshot the live stream state so the rewind merge can splice the
         // already-rendered tail exactly (positions are server-stamped).
         function captureLiveStreamState() {
@@ -4149,9 +4354,40 @@
             // Full snapshot — replace the pane so reconnect / session
             // restore never stacks duplicate transcripts.
             const histPane = activePane();
-            const hasLiveInFlight = !!(currentStreamDiv || currentThinkingDiv
-                || Object.keys(streamingToolCards).length > 0
-                || Object.keys(pendingToolCards).length > 0);
+
+            // Conditional attach, rewind-only frame: the server proved this
+            // pane's transcript is already current (the knownHistoryEpoch /
+            // Index sent with the attach matched the session's fingerprint)
+            // and carries ONLY the in-flight round's partial output. Keep
+            // the restored transcript — no clear, no replay — and merge the
+            // rewind onto it: the cache path restored a clean live state
+            // (settled panes only), so this is exactly the fresh-attach
+            // rewind render. needsFreshHistory stays latched (session_state
+            // preceded this frame), so the turn_end convergence refetch
+            // still stamps the round's messages with their server indexes.
+            // (A rewind-only frame without a rewind payload — an idle race
+            // on the server's snapshot decision — still keeps the DOM: the
+            // frame's whole contract is "your transcript is current".)
+            if (data.rewindOnly) {
+                histPane.histEpoch = data.historyEpoch || 0;
+                const rendered = data.rewind
+                    ? renderRewindAndMerge(data.rewind, {
+                        streamRaw: '',
+                        streamPos: 0,
+                        thinkingRaw: '',
+                        thinkingPos: 0,
+                        thinkingFinalized: null,
+                        toolCards: {},
+                    })
+                    : false;
+                if (histPane.turnActive && !rendered) {
+                    setTurnActive(true, { silent: true });
+                    setInputProgress('thinking', 'Resuming\u2026');
+                }
+                updateTocActive();
+                flushReplayEventBuffer();
+                return;
+            }
             // A stale snapshot — the attach's deep clone finished
             // after the turn completed, landing after the turn_end
             // convergence refetch — must not wipe the rendered
@@ -4161,9 +4397,9 @@
             // rendered (epoch match — compaction/rollback reset
             // indexes, making the comparison meaningless), and
             // nothing is still streaming (converge at turn_end).
-            if (!histPane.needsFreshHistory && !hasLiveInFlight
+            if (!histPane.needsFreshHistory && !hasLiveInFlight()
                 && histPane.histEpoch !== undefined
-                && data.historyEpoch === histPane.histEpoch
+                && (data.historyEpoch || 0) === histPane.histEpoch
                 && lastHistoryIndex(data.history) >= 0
                 && newestDomHistIdx() >= 0
                 && lastHistoryIndex(data.history) <= newestDomHistIdx()) {
@@ -4173,7 +4409,7 @@
             // no rewind in the snapshot (older server): keep the live
             // content — the turn_end convergence refetch paints the
             // full transcript.
-            if (histPane.needsFreshHistory && hasLiveInFlight && !data.rewind) {
+            if (histPane.needsFreshHistory && hasLiveInFlight() && !data.rewind) {
                 return;
             }
             // Capture the live stream state BEFORE clearing so the
@@ -4183,7 +4419,10 @@
             const captured = captureLiveStreamState();
             let rewindRendered = false;
             clearChat();
-            histPane.histEpoch = data.historyEpoch;
+            // 0 (never reshaped) is omitted by the wire's omitempty: store a
+            // NUMBER so the stale-skip epoch comparison works for sessions
+            // that were never compacted/rolled back either.
+            histPane.histEpoch = data.historyEpoch || 0;
             const afterHistory = () => {
                 // Render the in-flight partial (the server's live-turn
                 // buffer) through the normal stream machinery, then
@@ -4266,6 +4505,11 @@
                 if (pane.id === null || pendingSessionResponse) {
                     pane.id = data.sessionId;
                     pane.needsFreshHistory = false; // new session: no mid-turn gap from the old one
+                    // The pane now shows a DIFFERENT session: any transcript
+                    // cache / epoch describes the old session's history and
+                    // must not survive the re-key.
+                    pane.domCache = null;
+                    pane.histEpoch = undefined;
                     refreshSidebarSessions();
                     // The pane's session changed (typed /new, /resume,
                     // fork, resend): release the old session's
@@ -4699,10 +4943,18 @@
             // pane stays open in the background. The new pane's session id
             // arrives in the config reply (re-key via the config handler).
             saveActivePaneState();
+            const outgoing = activePane();
             const pane = makePane();
+            // Same outgoing-pane transcript handling as focusPane: cache the
+            // previous pane (if settled) instead of wiping it.
+            if (!outgoing || !cachePaneTranscript(outgoing)) {
+                clearChat();
+            } else {
+                resetChatTranscriptState();
+            }
             activePaneKey = pane.key;
-            clearChat();
             loadActivePaneState();
+            ensureEmptyState();
             pendingSessionResponse = true;
             ws.send(JSON.stringify({ type: 'session_new' }));
             // Hand control back to the composer: the click moved focus to the
@@ -5127,6 +5379,9 @@
             setSubagentModel: (v) => { subagentPickerState.model = v; },
             setSubagentThinkingLevel: (v) => { subagentPickerState.thinkingLevel = v; },
             renderSubagentPicker: () => subagentPicker.render(),
+            setReviewAgentModel: (v) => { reviewAgentPickerState.model = v; },
+            setReviewAgentThinkingLevel: (v) => { reviewAgentPickerState.thinkingLevel = v; },
+            renderReviewAgentPicker: () => reviewAgentPicker.render(),
         });
 
         // === Sidebar session list (components/sessions.js) ===

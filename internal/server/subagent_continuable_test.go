@@ -189,6 +189,141 @@ func TestSendMessageReplyCapture(t *testing.T) {
 	})
 }
 
+// TestBackgroundChildBusy pins the release-safety predicate: a quiet child
+// is not busy; a send_message delivery queued for the delivery worker (not
+// yet past the turn acquire — the turn state reads idle) is busy; a
+// captured reply not yet delivered to the parent is busy. The last two are
+// the handoff windows where maybeReleaseChild used to read the child as
+// idle and release it mid-delivery.
+func TestBackgroundChildBusy(t *testing.T) {
+	s, a := newContinuableServer(t, func() llm.LLMProvider {
+		p := llmtest.NewMockProvider()
+		p.StreamResults = []*llm.StreamResult{
+			{Content: "main job report"}, // the main job
+			{Content: "reply"},           // the queued delivery's turn
+		}
+		return p
+	})
+	sp := continuableSpawner(t, s)
+	sp.retain = time.Hour
+
+	id, err := sp.SpawnBackground(context.Background(), a, "main job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := sp.children.get(id)
+	waitFor(t, 5*time.Second, func() bool { return child.statusOf() == "finished" })
+	if child.busy() {
+		t.Fatal("a quiet finished child must not be busy")
+	}
+
+	// Queued delivery: hold the child's turn lock so the delivery worker
+	// cannot get past the acquire step — the message stays queued and no
+	// turn has started.
+	child.rt.turnMu.Lock()
+	unlocked := false
+	unlockOnce := func() {
+		if !unlocked {
+			unlocked = true
+			child.rt.turnMu.Unlock()
+		}
+	}
+	t.Cleanup(unlockOnce)
+	if err := sp.SendMessage(a, id, "queued question"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return child.rt.hasPendingDeliveries() })
+	if !child.busy() {
+		t.Fatal("a send_message delivery queued for the worker must read busy")
+	}
+
+	// Captured reply: the delivery turn acquired the lock and started
+	// (deliverStartHook armed pendingReply) but setTurnActive(true) has not
+	// run yet — the acquire→start handoff. Simulated by arming the flag
+	// directly.
+	child.mu.Lock()
+	child.pendingReply = true
+	child.mu.Unlock()
+	if !child.busy() {
+		t.Fatal("a captured reply not yet delivered to the parent must read busy")
+	}
+	child.mu.Lock()
+	child.pendingReply = false
+	child.mu.Unlock()
+}
+
+// TestRetentionReleasesAfterQueuedDelivery pins the retention/queue
+// interaction end to end: a send_message delivery queued for the child's
+// delivery worker (not yet past the turn acquire, so the turn state reads
+// idle) must DEFER the retention release. The pre-fix maybeReleaseChild
+// checked only the turn state, read the child as idle mid-window, released
+// it, and the queued message was silently dropped — the parent got no reply
+// and no error. After the delivery completes and the child goes quiet, the
+// next timer fire releases it as designed.
+func TestRetentionReleasesAfterQueuedDelivery(t *testing.T) {
+	s, a := newContinuableServer(t, func() llm.LLMProvider {
+		p := llmtest.NewMockProvider()
+		p.StreamResults = []*llm.StreamResult{
+			{Content: "main job report"}, // the main job
+			{Content: "queued reply"},    // the queued delivery's turn
+		}
+		return p
+	})
+	sp := continuableSpawner(t, s)
+	sp.retain = 500 * time.Millisecond
+
+	// The parent pane stays attached (a real user watching the parent), so
+	// the parent runtime is not orphan-evicted between the notice and the
+	// reply — the reply must land in the parent transcript for the
+	// assertion.
+	srv := startWSServer(t, s)
+	defer srv.Close()
+	conn := dialWS(t, srv, "/ws")
+	defer conn.Close()
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+
+	id, err := sp.SpawnBackground(context.Background(), a, "main job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := sp.children.get(id)
+	waitFor(t, 5*time.Second, func() bool { return child.statusOf() == "finished" })
+
+	// Hold the child's turn lock so the delivery worker cannot get past
+	// the acquire step: the message stays queued and the turn state reads
+	// idle — exactly the state the timer must not misread.
+	child.rt.turnMu.Lock()
+	unlocked := false
+	unlockOnce := func() {
+		if !unlocked {
+			unlocked = true
+			child.rt.turnMu.Unlock()
+		}
+	}
+	t.Cleanup(unlockOnce)
+	if err := sp.SendMessage(a, id, "queued question"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return child.rt.hasPendingDeliveries() })
+
+	// Outlive the retention window: the timer fires (and re-fires) while
+	// the message is still queued and must re-arm instead of releasing.
+	time.Sleep(3 * sp.retainWindow())
+	if sp.children.get(id) == nil {
+		t.Fatal("a queued send_message delivery must defer the retention release")
+	}
+
+	// Deliver: the worker acquires the turn, the reply runs, and the
+	// parent receives it.
+	unlockOnce()
+	waitFor(t, 5*time.Second, func() bool {
+		return deliveredMessages(a, "queued reply")
+	})
+
+	// Back to quiet: the next timer fire releases the child as designed.
+	waitFor(t, 5*time.Second, func() bool { return sp.children.get(id) == nil })
+}
+
 // TestInterruptAgent cancels the in-flight turn only: the child stays
 // registered and continuable, and no completion notice is delivered.
 func TestInterruptAgent(t *testing.T) {
@@ -488,10 +623,113 @@ func TestLiveChildCapRefuses(t *testing.T) {
 	if _, err := sp.SpawnBackground(context.Background(), a, "second job", "", 0); err == nil {
 		t.Fatal("spawning beyond the live cap must be refused")
 	}
-	// The refused child was released; the first stays registered.
+	// The refused child was discarded (never announced, nothing
+	// persisted); the first stays registered.
 	if sp.children.get(id1) == nil {
 		t.Fatal("the first child must stay registered")
 	}
+	// Cleanup: cancel the running child so its turn goroutine exits.
+	sp.cancelAll(a.SessionID)
+	waitFor(t, 5*time.Second, func() bool { return sp.children.get(id1) == nil })
+}
+
+// TestRefusedSpawnLeavesNoSessionFile pins the cap-refusal hygiene: a
+// background spawn refused by either cap must leave NO artifact. The child
+// never started, so stamping its outcome "failed" and forcing a flush (the
+// pre-fix releaseChild path) wrote an empty session file + index entry per
+// refused spawn — a phantom failed child row in the sidebar for a session
+// that never existed, stacked one per refusal. The refusal error (the tool
+// result the parent model sees) is the only trace a refused spawn may
+// leave.
+func TestRefusedSpawnLeavesNoSessionFile(t *testing.T) {
+	s, a := newContinuableServer(t, func() llm.LLMProvider {
+		return &blockingProvider{} // keeps the accepted child running
+	})
+	sp := continuableSpawner(t, s)
+	sp.retain = time.Hour
+	s.ws.SetSubagentMaxConcurrent(1)
+
+	// A live client observes the announcements: the admitted child is
+	// announced exactly once; the refused children are never announced (an
+	// announced-but-refused child would leave a "running" sidebar row no
+	// event ever resolves).
+	srv := startWSServer(t, s)
+	defer srv.Close()
+	conn := dialWS(t, srv, "/ws")
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+
+	// drainStarted reads frames for d and fails if a subagent_started
+	// arrives — a refused child must never be announced.
+	drainStarted := func(d time.Duration) {
+		t.Helper()
+		deadline := time.Now().Add(d)
+		for {
+			_ = conn.SetReadDeadline(deadline)
+			var msg WSMessage
+			if err := conn.ReadJSON(&msg); err != nil {
+				return // quiet window elapsed: nothing announced
+			}
+			if msg.Type == "subagent_started" {
+				t.Fatalf("refused spawn must not be announced, got subagent_started for %s", msg.SubagentID)
+			}
+		}
+	}
+
+	// failedChildIDs lists the persisted children of the parent stamped
+	// failed — the phantom rows at stake.
+	failedChildIDs := func() []string {
+		t.Helper()
+		list, err := s.ws.Store.List(s.ws.GetWorkingDir())
+		if err != nil {
+			t.Fatalf("store list: %v", err)
+		}
+		var out []string
+		for _, e := range list {
+			if e.ParentID == a.SessionID && e.SubagentStatus == "failed" {
+				out = append(out, e.ID)
+			}
+		}
+		return out
+	}
+
+	id1, err := sp.SpawnBackground(context.Background(), a, "long job", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "subagent_started" })
+	if started.SubagentID != id1 {
+		t.Fatalf("announced child = %q, want the admitted %q", started.SubagentID, id1)
+	}
+	waitFor(t, 5*time.Second, func() bool { return sp.children.get(id1) != nil })
+
+	// Refused by the user-facing concurrent limit.
+	if id, err := sp.SpawnBackground(context.Background(), a, "refused job", "", 0); err == nil ||
+		id != "" || !strings.Contains(err.Error(), "limit reached") {
+		t.Fatalf("spawn beyond the cap must be refused with a limit error and no id, got id %q err %v", id, err)
+	}
+	drainStarted(400 * time.Millisecond)
+	if got := failedChildIDs(); len(got) != 0 {
+		t.Fatalf("refused spawn must not persist a failed child session, got %v", got)
+	}
+
+	// Refused by the internal live guard (raise the user-facing limit so
+	// the guard is the only cap in play).
+	s.ws.SetSubagentMaxConcurrent(4)
+	sp.maxLiveGuard = 1
+	if id, err := sp.SpawnBackground(context.Background(), a, "guard-refused job", "", 0); err == nil ||
+		id != "" || !strings.Contains(err.Error(), "too many live subagents") {
+		t.Fatalf("spawn at the live guard must be refused with a guard error and no id, got id %q err %v", id, err)
+	}
+	drainStarted(400 * time.Millisecond)
+	if got := failedChildIDs(); len(got) != 0 {
+		t.Fatalf("guard-refused spawn must not persist a failed child session, got %v", got)
+	}
+
+	// The accepted child is untouched by both refusals.
+	if sp.children.get(id1) == nil {
+		t.Fatal("the accepted child must stay registered")
+	}
+
 	// Cleanup: cancel the running child so its turn goroutine exits.
 	sp.cancelAll(a.SessionID)
 	waitFor(t, 5*time.Second, func() bool { return sp.children.get(id1) == nil })

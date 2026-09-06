@@ -107,6 +107,11 @@ type Server struct {
 	// anything). Defaults to mcp.TestServer; tests inject a stub so no real
 	// process is spawned.
 	mcpTestFn func(ctx context.Context, server config.MCPServerConfig) ([]llm.Tool, error)
+
+	// reviewTrigger owns the auto-review state (the per-start mutex). nil
+	// until installReviewAgent first runs; the trigger itself re-checks
+	// the review-agent feature flag on every fire.
+	reviewTrigger *boardReviewTrigger
 }
 
 func NewServer(a *agent.Agent, cfg *config.Config) *Server {
@@ -182,6 +187,11 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 		s.broadcastBoardNotice(msg)
 	}
 	a.SetOnBoardChanged(ws.BoardChangedHook)
+	// Auto review agent: a ticket moved into in_review spawns a headless
+	// review session (web host only — the TUI has no session spawner and
+	// never installs the trigger). The trigger re-checks the review-agent
+	// feature flag on every fire, so the settings toggle is live.
+	s.installReviewAgent()
 	// The initial agent must read the WORKSPACE's single shared flag store
 	// (not the per-process values setup.go seeded from cfg) and use the
 	// WORKSPACE's single shared board manager — not the per-process manager
@@ -303,6 +313,19 @@ func (s *Server) resolveRuntime(id string) *sessionRuntime {
 	return rt
 }
 
+// attachKnown is the client's conditional-attach claim: the history epoch
+// and newest shipped message index its pane has already rendered (from the
+// last history payload it applied). Both fields must be present to count.
+//
+// When they still match the session's HistoryFingerprint at attach time, the
+// transcript part of the payload is skipped entirely (or reduced to a
+// rewind-only frame) — a pane switch back to a cached, unchanged session
+// re-renders nothing and ships nothing.
+type attachKnown struct {
+	epoch uint64
+	index int
+}
+
 // attachSession registers a socket as a viewer of the session and sends the
 // attach payload: session_state first (turnActive for "resuming…" rendering,
 // E28), then — asynchronously, because a running turn holds the session turn
@@ -319,32 +342,24 @@ func (s *Server) resolveRuntime(id string) *sessionRuntime {
 // on reconnect, whose transcript re-derives from a full attach when focused —
 // the (potentially multi-MB) snapshot would be discarded client-side, so it
 // is neither built nor sent.
-func (s *Server) attachSession(ws *wsConn, r *http.Request, rt *sessionRuntime, sendHistory bool) {
-	rt.attach(ws)
+//
+// known carries the conditional-attach claim (nil = absent → always send
+// the full snapshot). The history part itself is written by
+// sendAttachHistory below.
+//
+// It returns false when the attach was refused — the runtime is closing (a
+// claimed session_close) or already evicted, i.e. leaving memory — and
+// NOTHING is sent for it (no state, history, or config): the caller reports
+// session_detached instead, so the client drops the pane instead of
+// building it on a runtime the imminent eviction removes from under it.
+func (s *Server) attachSession(ws *wsConn, r *http.Request, rt *sessionRuntime, sendHistory bool, known *attachKnown) bool {
+	if !rt.attach(ws) {
+		return false
+	}
 	s.sendSessionState(ws, rt)
 	go func() {
 		if sendHistory {
-			// Snapshot and send history FIRST, without the turn lock. A running
-			// turn holds turnMu for its ENTIRE duration (startTurn defers the
-			// unlock), so taking turnMu.RLock here would leave a mid-turn page
-			// open / reconnect with an empty transcript until the turn finishes
-			// — minutes for a long agent run, or indefinitely for a stuck turn.
-			// SnapshotMessages deep-clones under its own statsMu (its documented
-			// contract: web history snapshots never hold turnMu), so the
-			// transcript is consistent with the live stream and paints at once.
-			msgs := rt.agent.SnapshotMessages()
-			if len(msgs) > 0 {
-				_ = ws.writeJSON(WSMessage{
-					Type:         "history",
-					History:      historyEntries(msgs),
-					HistoryEpoch: rt.agent.HistoryEpoch(),
-					// The in-flight turn's partial output, so a mid-turn attach
-					// shows the current reply instead of "Resuming…" with no
-					// context until the turn ends (nil between rounds).
-					Rewind:    rt.live.Snapshot(),
-					SessionID: rt.agent.SessionID,
-				})
-			}
+			s.sendAttachHistory(ws, rt, known)
 		}
 		// Config echo: no turnMu — every field is internally synchronized
 		// (agentConfigMsgBasic), so a mid-turn attach gets the session's
@@ -365,6 +380,75 @@ func (s *Server) attachSession(ws *wsConn, r *http.Request, rt *sessionRuntime, 
 		// fallback set the configs above carried.
 		s.maybeProbeReasoningEfforts(r.Context(), rt.agent)
 	}()
+	return true
+}
+
+// sendAttachHistory writes the history part of an attach payload: the full
+// snapshot, a rewind-only frame, or nothing at all.
+//
+// The conditional path (known != nil) compares the client's fingerprint
+// claim against agent.HistoryFingerprint() — one consistent (epoch, last
+// shipped index) read. Equality proves the client's rendered transcript is
+// still current: the epoch covers wholesale reshapes (compaction/restore/
+// rollback/fork) and the shipped index covers appends, which never bump the
+// epoch. A matched idle session then needs NO history frame at all; with an
+// in-flight round's partial output, only the rewind ships (rewind-only) so
+// the client merges it onto its cached transcript. Everything else takes the
+// full-snapshot path unchanged.
+func (s *Server) sendAttachHistory(ws *wsConn, rt *sessionRuntime, known *attachKnown) {
+	epoch, lastShipped := rt.agent.HistoryFingerprint()
+	current := known != nil && known.epoch == epoch && known.index == lastShipped && lastShipped >= 0
+	if current {
+		// The client's transcript is current. With no in-flight round output
+		// and no turn, neither build (SnapshotMessages deep clone) nor ship
+		// the snapshot at all; with round output, ship ONLY the rewind so
+		// the client merges it onto its cached transcript instead of
+		// clearing and replaying everything.
+		rewind := rt.live.Snapshot()
+		if rewind != nil {
+			_ = ws.writeJSON(WSMessage{
+				Type:         "history",
+				RewindOnly:   true,
+				HistoryEpoch: epoch,
+				Rewind:       rewind,
+				SessionID:    rt.agent.SessionID,
+			})
+			return
+		}
+		if active, _ := rt.turnState(); !active {
+			return
+		}
+		// Mid-turn with an empty round buffer: either between rounds or
+		// before the round's first token. Re-read the fingerprint: appends
+		// that landed behind the first read (the same window the plain
+		// attach has between its session_state write and the
+		// SnapshotMessages clone) must fall back to the full snapshot, not
+		// a skip that would strand the client without them.
+		if epoch2, lastShipped2 := rt.agent.HistoryFingerprint(); epoch2 == epoch && lastShipped2 == lastShipped {
+			return
+		}
+	}
+	// Snapshot and send history FIRST, without the turn lock. A running
+	// turn holds turnMu for its ENTIRE duration (startTurn defers the
+	// unlock), so taking turnMu.RLock here would leave a mid-turn page
+	// open / reconnect with an empty transcript until the turn finishes
+	// — minutes for a long agent run, or indefinitely for a stuck turn.
+	// SnapshotMessages deep-clones under its own statsMu (its documented
+	// contract: web history snapshots never hold turnMu), so the
+	// transcript is consistent with the live stream and paints at once.
+	msgs := rt.agent.SnapshotMessages()
+	if len(msgs) > 0 {
+		_ = ws.writeJSON(WSMessage{
+			Type:         "history",
+			History:      historyEntries(msgs),
+			HistoryEpoch: rt.agent.HistoryEpoch(),
+			// The in-flight turn's partial output, so a mid-turn attach
+			// shows the current reply instead of "Resuming…" with no
+			// context until the turn ends (nil between rounds).
+			Rewind:    rt.live.Snapshot(),
+			SessionID: rt.agent.SessionID,
+		})
+	}
 }
 
 func (s *Server) handleWSSessionAction(ws *wsConn, ctx context.Context, pane **sessionRuntime, msg WSMessage) {

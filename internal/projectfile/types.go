@@ -75,7 +75,11 @@ type FileConfig struct {
 	SubagentMaxConcurrent     int                   `yaml:"subagent_max_concurrent"`
 	SubagentModel             string                `yaml:"subagent_model"`
 	SubagentThinkingLevel     string                `yaml:"subagent_thinking_level"`
+	ReviewAgent               string                `yaml:"review_agent"`
+	ReviewAgentModel          string                `yaml:"review_agent_model"`
+	ReviewAgentThinkingLevel  string                `yaml:"review_agent_thinking_level"`
 	BoardStartPrompt          string                `yaml:"board_start_prompt"`
+	BoardReviewPrompt         string                `yaml:"board_review_prompt"`
 	SystemPrompt              string                `yaml:"system_prompt"`
 	SubagentPrompt            string                `yaml:"subagent_prompt"`
 	AgentInstructions         string                `yaml:"agent_instructions"`

@@ -166,12 +166,16 @@ subagent_max_depth: 2  # max nesting; 1 (default) = subagents cannot spawn subag
 subagent_max_concurrent: 4  # max subagents running at once per session (web); 4 (default)
 subagent_model: gpt-4o-mini    # default subagent model (empty = inherit the parent's model)
 subagent_thinking_level: high  # subagent reasoning effort (empty = inherit the parent's level)
+review_agent: off  # auto-review: a ticket moved into in_review spawns a review session (web)
+review_agent_model: gpt-4o-mini  # default review model (empty = ticket override, else workspace default)
+review_agent_thinking_level: high  # review agent reasoning effort (empty = inherit the workspace level)
 job_notices: off   # notify the session when a background command finishes
 skills: off        # skill tool (list/read over .gogen/skills + ~/.config/gogen/skills)
 agent_instructions: off  # load AGENTS.md / CLAUDE.md workspace instruction files
 web_bind: 0.0.0.0:8080  # web listen address (applies on next start; also GOGEN_WEB_BIND / --host)
 # Configurable prompt templates ("" = the built-in default):
 board_start_prompt: "You have been assigned board ticket #{id}: {title}..."  # board "Start agent" prompt
+board_review_prompt: "You are the review agent for board ticket #{id}..."   # auto review agent prompt
 system_prompt: "You are a coding agent in {working_dir}..."                  # replaces the base system prompt
 subagent_prompt: "You are a subagent...\n\nJob:\n{job}"                      # wraps subagent jobs
 ```
@@ -355,6 +359,10 @@ These can be set in `.gogen/gogen.conf` only — there is no CLI flag or environ
 | `GOGEN_SUBAGENT_MODEL` | *(empty)* | Default model for spawned subagents (empty = inherit the parent's model; the tool's explicit `model` argument always wins) |
 | `GOGEN_SUBAGENT_THINKING_LEVEL` | *(empty)* | Reasoning-effort level for spawned subagents (empty = inherit the parent session's live level; `off` = never send `reasoning_effort`). A level the subagent's final model does not accept is omitted at spawn time |
 | `GOGEN_BOARD_START_PROMPT` | *(empty)* | Template for the agent started from a board ticket (`{id}` `{title}` `{description}` `{priority}` `{context}`; empty = built-in default) |
+| `GOGEN_REVIEW_AGENT` | off | Set to `on` to enable the board auto-review agent (web mode): a ticket moved into in_review — by an agent's board tool or by the user — automatically starts a headless review session that marks the ticket done or comments findings and moves it back to in_progress. Max 5 review rounds per ticket |
+| `GOGEN_REVIEW_AGENT_MODEL` | *(empty)* | Default model for auto review sessions (empty = the ticket's own review model override, else the workspace default model) |
+| `GOGEN_REVIEW_AGENT_THINKING_LEVEL` | *(empty)* | Reasoning-effort level for auto review sessions (empty = inherit the workspace level; a ticket's own review level override wins; a level the reviewer's final model does not accept is omitted) |
+| `GOGEN_BOARD_REVIEW_PROMPT` | *(empty)* | Template for the auto review agent (`{id}` `{title}` `{description}` `{priority}` `{context}` `{assignee}`; empty = built-in default) |
 | `GOGEN_SYSTEM_PROMPT` | *(empty)* | Custom system prompt template (`{working_dir}`; replaces the built-in base prompt; project rules and plan mode still apply; empty = built-in default) |
 | `GOGEN_SUBAGENT_PROMPT` | *(empty)* | Template wrapping subagent jobs (`{job}`; empty = built-in default) |
 | `GOGEN_JOB_NOTICES` | off | Set to `on` to notify the session when a background command finishes (injects a summary + runs a turn) |
@@ -461,7 +469,21 @@ mode it is fixed to the project directory and the input is hidden.
   (if the initiating tab is closed, approvals are denied until the session
   is reopened). The choices are stored on the ticket so the popover
   pre-fills on the next start; the start prompt template is editable in
-  the settings modal (`board_start_prompt`).
+  the settings modal (`board_start_prompt`). The popover's collapsible
+  **Review agent** section sets per-ticket review options (model +
+  reasoning effort) used by the auto-review agent on this ticket.
+- With `review_agent: on` (web mode; the **Board review agent** toggle in
+  the settings Agent group), a ticket moved into **in_review** — by an
+  agent's board tool or by drag-drop — automatically starts a headless
+  review session (`review #N: title` in the sidebar). It verifies the
+  work (diff, tests, ticket criteria) and marks the ticket done, or
+  comments findings and moves it back to in_progress. One reviewer runs
+  per ticket at a time; auto-review stops after 5 review rounds per
+  ticket (commented on the card). The reviewer's default model and
+  reasoning effort are set in the settings modal
+  (`review_agent_model`, `review_agent_thinking_level`), its prompt via
+  `board_review_prompt`; a ticket's own **Review agent** popover section
+  overrides them.
 - With `subagent: on`, subagents appear as **nested rows** under their parent
   session in the sidebar. A colored dot marks a live child — amber
   **responding** while running, red **failed** on error, green **done** on

@@ -1416,6 +1416,59 @@ func TestSidebarReorderKeepsCursorInWindow(t *testing.T) {
 	}
 }
 
+// Regression: typed /new rebinds the focused agent to a fresh session, but
+// the panel cursor kept its identity on the LEFT-BEHIND session's row (which
+// stays in the list — /new saves it), so the selection indicator never moved
+// to the new session. The rebind epilogue (applySessionSwitch) must move the
+// cursor to the focused session's row — the same sync switchToLive does for
+// the focus-switch paths.
+func TestSidebarCursorFollowsTypedNew(t *testing.T) {
+	m := newSidebarFullModel(t)
+	m.sidebarMainLines = 30
+	// An older saved session so the list has more than the focused row.
+	if err := m.agent.SessionStore.Save("old1", agent.SessionSnapshot{
+		WorkingDir: m.agent.WorkingDir,
+		Messages:   []llm.Message{{Role: "user", Content: "hello"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.refreshSavedSessions()
+	oldID := m.agent.SessionID // "cur"
+
+	// Park the cursor on the current session's row (as a click would).
+	rows := m.buildSidebarRows()
+	for i, r := range rows {
+		if r.id == oldID {
+			m.setSidebarCursor(rows, i)
+		}
+	}
+	if m.sidebarCursorID != oldID {
+		t.Fatalf("setup: cursor identity = %q, want %q", m.sidebarCursorID, oldID)
+	}
+
+	// Type /new through the command dispatcher (the full typed path).
+	handled, quit, cmd := m.dispatchCommand("/new")
+	if !handled || quit {
+		t.Fatalf("dispatchCommand(/new) = (handled=%v, quit=%v)", handled, quit)
+	}
+	if cmd == nil {
+		t.Fatal("/new must return the off-thread refresh cmds")
+	}
+	if m.agent.SessionID == oldID {
+		t.Fatal("setup: /new did not rebind the agent to a fresh session")
+	}
+	if m.sidebarCursorID != m.agent.SessionID {
+		t.Fatalf("cursor identity = %q, want the new session %q (the old row must not keep the selection)",
+			m.sidebarCursorID, m.agent.SessionID)
+	}
+	// The resolved cursor must land on the new session's row.
+	rows = m.buildSidebarRows()
+	cursor := m.resolveSidebarCursor(rows)
+	if cursor < 0 || cursor >= len(rows) || rows[cursor].id != m.agent.SessionID {
+		t.Fatalf("resolved cursor row %d is not the new session (rows: %v)", cursor, rows)
+	}
+}
+
 // Footer buttons hit EXACT columns: the two-column gaps between them (and
 // the "│ " prefix) must be inert — the old ±2 tolerance let a gap click
 // trigger the nearest button (e.g. "new session").

@@ -320,15 +320,25 @@ func (e *Executor) readWithRegexSearch(secure string, offset, limit int, search 
 			} else if ringPos > 0 {
 				before = ring[:ringPos]
 			}
+			// The after-context gets whatever of the limit budget remains
+			// after the before-context actually collected. When the match
+			// sits near the start of the file the ring holds fewer than
+			// ctxBefore lines, so the unused before-budget must flow into
+			// the after-context — otherwise the window under-fills short of
+			// the requested limit.
+			maxAfter := ctxAfter
+			if limit > 0 {
+				maxAfter = limit - len(before) - 1
+				if maxAfter < 0 {
+					maxAfter = 0
+				}
+			}
 			after := []string{line}
 			for sc.Scan() {
-				// Stop once the total window (before + match + after) reaches
-				// the limit, or once the after-context budget is filled when
-				// no limit is set.
-				if limit > 0 && len(before)+len(after) >= limit {
-					break
-				}
-				if len(after) >= ctxAfter+1 {
+				// Stop once the after-context budget is filled: with a limit
+				// this is the remainder of the total window (before + match +
+				// after), without one the fixed default of 10 lines.
+				if len(after) >= maxAfter+1 {
 					break
 				}
 				lineNum++
@@ -427,6 +437,18 @@ func (e *Executor) readWithLineRange(secure string, offset, limit int, lineNumbe
 
 	var selected []string
 	lineNum := 0
+	// Once the requested window is collected, draining the rest of the file
+	// only counts lines for the "Lines X-Y of Z" header. On a large file
+	// that would read the entire remainder — defeating the offset/limit
+	// design — so it is skipped and the header reports a lower bound (the
+	// same trade-off the regex-search path makes via searchMaxFileBytes).
+	// A stat error keeps the old drain-to-EOF behavior: the count stays
+	// exact, and correctness is unaffected either way.
+	countRemaining := true
+	if info, err := f.Stat(); err == nil && info.Size() > searchMaxFileBytes {
+		countRemaining = false
+	}
+	countTruncated := false
 	for scanner.Scan() {
 		lineNum++
 		if lineNum < start {
@@ -434,6 +456,10 @@ func (e *Executor) readWithLineRange(secure string, offset, limit int, lineNumbe
 		}
 		if effectiveLimit > 0 {
 			if len(selected) >= effectiveLimit {
+				if !countRemaining {
+					countTruncated = true
+					break
+				}
 				continue
 			}
 		} else if len(selected) >= readFileMaxLines {
@@ -442,6 +468,10 @@ func (e *Executor) readWithLineRange(secure string, offset, limit int, lineNumbe
 			// unbounded (multi-MB) result — the "Lines X-Y of Z" header below
 			// tells the caller the read was truncated. The old `offset == 0`
 			// guard let offset reads run to EOF.
+			if !countRemaining {
+				countTruncated = true
+				break
+			}
 			continue
 		}
 		selected = append(selected, scanner.Text())
@@ -467,7 +497,12 @@ func (e *Executor) readWithLineRange(secure string, offset, limit int, lineNumbe
 		hdr.WriteString(header)
 	}
 	if offset == 0 && limit == 0 && totalLines > readFileMaxLines {
-		hdr.WriteString(fmt.Sprintf("Warning: file has %d lines; showing first %d. Use offset/limit for more.\n", totalLines, readFileMaxLines))
+		warnLines := fmt.Sprintf("%d", totalLines)
+		if countTruncated {
+			// The drain was skipped (large file): the count is a lower bound.
+			warnLines += "+"
+		}
+		hdr.WriteString(fmt.Sprintf("Warning: file has %s lines; showing first %d. Use offset/limit for more.\n", warnLines, readFileMaxLines))
 	}
 
 	body := strings.Join(selected, "\n")
@@ -475,7 +510,12 @@ func (e *Executor) readWithLineRange(secure string, offset, limit int, lineNumbe
 		body = formatWithLineNumbers(selected, start)
 	}
 	if len(selected) > 0 && (end < totalLines || start > 1) {
-		hdr.WriteString(fmt.Sprintf("Lines %d-%d of %d\n", start, end, totalLines))
+		if countTruncated {
+			hdr.WriteString(fmt.Sprintf("Lines %d-%d of %d+ (file larger than %s, total line count omitted)\n",
+				start, end, totalLines, formatByteSize(searchMaxFileBytes)))
+		} else {
+			hdr.WriteString(fmt.Sprintf("Lines %d-%d of %d\n", start, end, totalLines))
+		}
 	}
 	if hdr.Len() > 0 {
 		return hdr.String() + body, nil
@@ -579,10 +619,10 @@ func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, 
 		if idleKilled.Load() {
 			return outStr, fmt.Errorf("command idle for %s with no output: %s", idle.Round(time.Second), command)
 		}
-		if ctx.Err() == context.DeadlineExceeded {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return outStr, fmt.Errorf("command timed out: %s", command)
 		}
-		if ctx.Err() == context.Canceled {
+		if errors.Is(ctx.Err(), context.Canceled) {
 			return outStr, fmt.Errorf("command cancelled: %s", command)
 		}
 		return outStr, err

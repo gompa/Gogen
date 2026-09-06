@@ -33,6 +33,12 @@ const (
 	boardMaxActivity = 50  // D4: activity entries per ticket (oldest dropped)
 )
 
+// MaxReviewRounds caps auto-review starts per ticket: past it a move into
+// in_review no longer spawns a reviewer (a worker/reviewer ping-pong would
+// otherwise loop forever). The cap is surfaced as a comment on the ticket
+// so the stopped auto-review is visible.
+const MaxReviewRounds = 5
+
 // BoardColumns is the fixed column set (D10 — column configuration is a
 // follow-up).
 var BoardColumns = []string{"backlog", "ready", "in_progress", "in_review", "blocked", "done"}
@@ -68,11 +74,29 @@ type BoardItem struct {
 	// live level, the pre-existing behavior; "off" = never send
 	// reasoning_effort). The popover pre-fills from it; the start op is
 	// authoritative.
-	ThinkingLevel string          `json:"thinkingLevel,omitempty"`
-	CreatedAt     time.Time       `json:"created_at"`
-	UpdatedAt     time.Time       `json:"updated_at"`
-	DoneAt        time.Time       `json:"done_at,omitempty"`
-	Activity      []BoardActivity `json:"activity,omitempty"`
+	ThinkingLevel string `json:"thinkingLevel,omitempty"`
+	// ReviewModel / ReviewThinkingLevel are the per-ticket review-agent
+	// options chosen in the card popover's review section ("" = inherit:
+	// the configured review_agent_model, then the workspace default model;
+	// the workspace thinking level). SetReviewOptions persists them; the
+	// auto-review trigger resolves the cascade and validates the level
+	// against the FINAL model at review-start time.
+	ReviewModel         string `json:"reviewModel,omitempty"`
+	ReviewThinkingLevel string `json:"reviewThinkingLevel,omitempty"`
+	// ReviewSessionID is the review session currently or last started for
+	// this ticket by the auto-review trigger ("" = none). It doubles as
+	// the one-reviewer-per-ticket guard: while the linked session is live,
+	// a new move into in_review does not spawn a second reviewer. Cleared
+	// by moveLocked whenever the ticket leaves in_review.
+	ReviewSessionID string `json:"reviewSession,omitempty"`
+	// ReviewRounds counts started review sessions for this ticket. The
+	// trigger stops auto-reviewing past MaxReviewRounds.
+	ReviewRounds int `json:"reviewRounds,omitempty"`
+
+	CreatedAt time.Time       `json:"created_at"`
+	UpdatedAt time.Time       `json:"updated_at"`
+	DoneAt    time.Time       `json:"done_at,omitempty"`
+	Activity  []BoardActivity `json:"activity,omitempty"`
 }
 
 // BoardSnapshot is the full board state for rendering (web UI / list).
@@ -107,6 +131,15 @@ type BoardManager struct {
 	dir        string
 	globalMode bool
 	idx        *boardIndex
+
+	// reviewHookMu guards reviewNeeded (its own mutex, NOT m.mu: the
+	// callback fires after m.mu is released, and its handler calls back
+	// into the manager and spawns sessions — holding m.mu would deadlock).
+	// The web workspace installs it once at startup (nil = no auto-review;
+	// TUI/CLI). reviewNeeded receives a SNAPSHOT of the ticket and the
+	// actor label of the move that entered in_review.
+	reviewHookMu sync.RWMutex
+	reviewNeeded func(item BoardItem, by string)
 }
 
 // NewBoardManager creates a board manager rooted at the board directory for
@@ -455,6 +488,79 @@ func (m *BoardManager) SetStartOptions(id, model, prompt, thinkingLevel string) 
 	return m.saveItemLocked(item)
 }
 
+// SetOnReviewNeeded installs the auto-review trigger, fired after a
+// successful Move into in_review — the single choke point both the agent
+// board tool and the web UI (move op / drag-drop) go through. The callback
+// runs OUTSIDE the manager lock with a snapshot of the ticket plus the
+// actor label of the move; moves can race, so the callback must be safe to
+// run concurrently. nil detaches (TUI/CLI: no auto-review).
+func (m *BoardManager) SetOnReviewNeeded(fn func(item BoardItem, by string)) {
+	m.reviewHookMu.Lock()
+	m.reviewNeeded = fn
+	m.reviewHookMu.Unlock()
+}
+
+// onReviewNeeded returns the installed auto-review trigger (nil when the
+// feature is not wired).
+func (m *BoardManager) onReviewNeeded() func(item BoardItem, by string) {
+	m.reviewHookMu.RLock()
+	defer m.reviewHookMu.RUnlock()
+	return m.reviewNeeded
+}
+
+// SetReviewOptions persists the per-ticket review-agent model and
+// reasoning-effort level chosen in the card popover's review section (""
+// clears back to the inherited defaults: the configured review_agent_model,
+// then the workspace default model; the workspace thinking level). The
+// level is canonicalized via NormalizeThinkingLevel so the stored value
+// matches what the auto-review trigger applies and what the popover
+// pre-fills.
+func (m *BoardManager) SetReviewOptions(id, model, thinkingLevel, by string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.loadIndexLocked(); err != nil {
+		return "", err
+	}
+	item, err := m.loadItemLocked(id)
+	if err != nil {
+		return "", err
+	}
+	item.ReviewModel = strings.TrimSpace(model)
+	item.ReviewThinkingLevel = string(NormalizeThinkingLevel(thinkingLevel))
+	m.appendActivityLocked(item, by, "review options updated")
+	if err := m.saveItemLocked(item); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("Review options set on board item #%s", item.ID), nil
+}
+
+// AttachReviewAgent records the auto-started review session on the ticket:
+// the link (ReviewSessionID) doubles as the one-reviewer guard, and the
+// rounds counter feeds the MaxReviewRounds cap. Called by the review
+// trigger after the session is registered, before its first turn.
+func (m *BoardManager) AttachReviewAgent(id, sessionID, by string) (string, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return "", fmt.Errorf("review session id is required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.loadIndexLocked(); err != nil {
+		return "", err
+	}
+	item, err := m.loadItemLocked(id)
+	if err != nil {
+		return "", err
+	}
+	item.ReviewSessionID = sessionID
+	item.ReviewRounds++
+	m.appendActivityLocked(item, by, "review started (round "+strconv.Itoa(item.ReviewRounds)+", session "+sessionID+")")
+	if err := m.saveItemLocked(item); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("Review session %s started for board item #%s (round %d)", sessionID, item.ID, item.ReviewRounds), nil
+}
+
 // Add creates a new ticket in the backlog column.
 func (m *BoardManager) Add(title, description, priority, by string) (string, error) {
 	title = strings.TrimSpace(title)
@@ -532,12 +638,23 @@ func (m *BoardManager) Claim(id, by string) (string, error) {
 	return fmt.Sprintf("Claimed board item #%s: %s", item.ID, item.Title), nil
 }
 
-// Move changes a ticket's column.
+// Move changes a ticket's column. Moving into in_review additionally fires
+// the auto-review hook (SetOnReviewNeeded) after the mutation is persisted
+// and the manager lock released: the hook's handler calls back into the
+// manager and spawns a review session, so it must never run under m.mu.
+// Defers run LIFO — the hook defer is registered BEFORE the unlock defer,
+// so the unlock executes first.
 func (m *BoardManager) Move(id, column, by string) (string, error) {
 	column = strings.TrimSpace(strings.ToLower(column))
 	if !slices.Contains(BoardColumns, column) {
 		return "", fmt.Errorf("unknown board column %q (want one of: %s)", column, strings.Join(BoardColumns, ", "))
 	}
+	var fireReviewHook func()
+	defer func() {
+		if fireReviewHook != nil {
+			fireReviewHook()
+		}
+	}()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err := m.loadIndexLocked(); err != nil {
@@ -559,6 +676,14 @@ func (m *BoardManager) Move(id, column, by string) (string, error) {
 	}
 	if err := m.saveIndexLocked(); err != nil {
 		return "", err
+	}
+	if column == "in_review" {
+		// Snapshot for the hook: the ticket may keep mutating after the
+		// unlock, and the callback must not observe live state.
+		snapshot := *item
+		if hook := m.onReviewNeeded(); hook != nil {
+			fireReviewHook = func() { hook(snapshot, by) }
+		}
 	}
 	return fmt.Sprintf("Moved board item #%s to %s: %s", item.ID, column, item.Title), nil
 }
@@ -669,7 +794,9 @@ func (m *BoardManager) Delete(id string) (string, error) {
 }
 
 // moveLocked updates item.Status, the index order, and the done marker.
-// Callers must hold m.mu and save both files afterwards.
+// Callers must hold m.mu and save both files afterwards. Any move OUT of
+// in_review clears the review link: the ticket no longer awaits review, so
+// the next move into in_review may start a fresh reviewer.
 func (m *BoardManager) moveLocked(item *BoardItem, column string) error {
 	if item.Status != "" {
 		m.idx.Order[item.Status] = removeFromOrder(m.idx.Order[item.Status], item.ID)
@@ -679,6 +806,9 @@ func (m *BoardManager) moveLocked(item *BoardItem, column string) error {
 		item.DoneAt = time.Now().UTC()
 	} else {
 		item.DoneAt = time.Time{}
+	}
+	if column != "in_review" {
+		item.ReviewSessionID = ""
 	}
 	m.idx.Order[column] = append(m.idx.Order[column], item.ID)
 	return nil

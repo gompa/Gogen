@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -463,5 +466,80 @@ func TestFSMutatingToolsConsistency(t *testing.T) {
 		if !want[name] {
 			t.Errorf("fsMutatingTools wraps tool %q that the registry does not flag MutatesFS", name)
 		}
+	}
+}
+
+// TestCapEvictionKillsBackgroundJobs pins the background-job half of the
+// cap-eviction teardown contract. Every eviction path except register's cap
+// tail goes through evictRuntime, which kills the session's execute_command
+// background=true jobs ("kill them rather than leak orphan processes");
+// pre-fix the cap tail flushed and detached the victim but skipped
+// agent.Close, so the job's process kept running with no owner left to poll
+// it, and its eventual completion notice was silently dropped (the
+// registry-backed deliverer resolves the live runtime and finds none).
+func TestCapEvictionKillsBackgroundJobs(t *testing.T) {
+	dir := t.TempDir()
+	r := newSessionRegistry(2)
+	rtA := newSessionRuntime(agent.NewAgent(llmtest.NewMockProvider(), agent.NewExecutor(dir), nil))
+	rtB := newTestRuntime(t)
+	r.register("a", rtA)
+	r.register("b", rtB)
+	r.setDefault("b") // b is the default (front of order): a is the LRU victim
+
+	// A long-running background job on the soon-to-be-evicted session:
+	// sleep 30, then write the marker. If the eviction fails to kill the
+	// job, the process outlives the runtime and completes its work. (The
+	// BackgroundJob handle is agent-internal; the test observes the job
+	// through the exported status/hook API only.)
+	marker := filepath.Join(dir, "marker")
+	id, err := rtA.agent.StartBackgroundCommand(context.Background(), "sleep 30; echo done > "+marker)
+	if err != nil {
+		t.Fatalf("start background job: %v", err)
+	}
+	if st, err := rtA.agent.BackgroundJobStatus(id); err != nil || !strings.Contains(st, "RUNNING") {
+		t.Fatalf("status before eviction: %q, %v; want RUNNING", st, err)
+	}
+	// Record any completion notice: after the fix the eviction CANCELS the
+	// job, so onJobFinished never fires the hook — and a notice from a
+	// legitimately finished job would be dropped anyway, because the
+	// deliverer resolves the runtime through the registry the victim just
+	// left.
+	notices := make(chan string, 1)
+	rtA.agent.SetJobNoticeHook(func(summary string) { notices <- summary })
+
+	// The third registration exceeds the cap → a is cap-evicted.
+	r.register("c", newTestRuntime(t))
+
+	if _, ok := r.get("a"); ok {
+		t.Fatal("cap eviction did not unregister the victim")
+	}
+	if !rtA.evicted.Load() {
+		t.Fatal("evicted runtime not marked")
+	}
+	// The eviction tail must have run agent.Close: the job registry is
+	// cleared, so a later poll reports the job unknown. Pre-fix the job
+	// stayed registered — RUNNING, then FINISHED for the whole retention
+	// window, and never unknown.
+	waitFor(t, 5*time.Second, func() bool {
+		_, err := rtA.agent.BackgroundJobStatus(id)
+		return err != nil && strings.Contains(err.Error(), "unknown background job")
+	})
+	// The kill must have cut the sleep short: the marker is never written.
+	requireNever(t, 750*time.Millisecond, "background job survived cap eviction and completed its work", func() bool {
+		_, err := os.Stat(marker)
+		return err == nil
+	})
+	// No completion notice fires for the cancelled job.
+	requireNever(t, 250*time.Millisecond, "completion notice fired for a cap-evicted session's killed job", func() bool {
+		select {
+		case <-notices:
+			return true
+		default:
+			return false
+		}
+	})
+	// No pollable residue: the evicted session's job registry is empty.
+	if _, err := rtA.agent.BackgroundJobStatus(id); err == nil || !strings.Contains(err.Error(), "unknown background job") {
+		t.Fatalf("status after cap eviction: %v, want unknown background job", err)
 	}
 }

@@ -94,6 +94,13 @@ type BoardOpRequest struct {
 	// the stored ticket override is cleared). Validated against the
 	// ticket's final model at start time. start only.
 	ThinkingLevel string `json:"thinkingLevel,omitempty"`
+	// ReviewModel / ReviewThinkingLevel are the per-ticket review-agent
+	// options chosen in the card popover's review section. review_options
+	// only ("" clears back to the inherited defaults); the review trigger
+	// resolves the cascade and validates the level against the final
+	// model at review-start time.
+	ReviewModel         string `json:"reviewModel,omitempty"`
+	ReviewThinkingLevel string `json:"reviewThinkingLevel,omitempty"`
 }
 
 // ProviderEntry is one registered OpenAI-compatible provider in the config
@@ -291,9 +298,23 @@ type WSMessage struct {
 	// so the fields are pre-populated with what will actually be used;
 	// client→server carries the user's edits ("" = reset to the built-in
 	// default).
-	BoardStartPrompt string `json:"boardStartPrompt,omitempty"`
-	SystemPrompt     string `json:"systemPrompt,omitempty"`
-	SubagentPrompt   string `json:"subagentPrompt,omitempty"`
+	BoardStartPrompt  string `json:"boardStartPrompt,omitempty"`
+	BoardReviewPrompt string `json:"boardReviewPrompt,omitempty"`
+	SystemPrompt      string `json:"systemPrompt,omitempty"`
+	SubagentPrompt    string `json:"subagentPrompt,omitempty"`
+	// ReviewAgent is the live board auto-review flag state ("on"/"off"),
+	// same contract as Board/Subagent.
+	ReviewAgent string `json:"reviewAgent,omitempty"`
+	// ReviewAgentModel is the live default model for auto review sessions
+	// (client→server value inside ConfigFields; server→client current
+	// value in config pushes). A POINTER like SubagentModel so config
+	// pushes always carry it — including the empty "inherit" state —
+	// while non-config messages omit it entirely.
+	ReviewAgentModel *string `json:"reviewAgentModel,omitempty"`
+	// ReviewAgentThinkingLevel is the live reasoning-effort level for auto
+	// review sessions (pointer, same contract as SubagentThinkingLevel;
+	// empty = inherit the workspace level).
+	ReviewAgentThinkingLevel *string `json:"reviewAgentThinkingLevel,omitempty"`
 	// BoardOp carries a kanban-tab operation (client→server "board_op").
 	BoardOp *BoardOpRequest `json:"boardOp,omitempty"`
 	// BoardState carries the full board snapshot (server→client
@@ -412,6 +433,26 @@ type WSMessage struct {
 	// is replaced wholesale (compaction/restore/rollback/fork), letting
 	// clients distinguish a stale snapshot from a reshaped history.
 	HistoryEpoch uint64 `json:"historyEpoch,omitempty"`
+	// KnownHistoryEpoch / KnownHistoryIndex carry a client's rendered
+	// transcript state on a session_attach (request direction): the history
+	// epoch of the last history payload it applied and the newest message
+	// index rendered in the pane. When both still match the session's
+	// HistoryFingerprint (same epoch, and the client has rendered through
+	// the newest shipped entry) and no turn is in flight, the attach skips
+	// building and sending the history snapshot entirely — the pane keeps
+	// its cached transcript; when only an in-flight round's partial output
+	// is missing, a rewind-only frame (RewindOnly) ships just that rewind.
+	// Pointers so "provided epoch 0" is distinguishable from "absent"
+	// (absent = full attach, unchanged).
+	KnownHistoryEpoch *uint64 `json:"knownHistoryEpoch,omitempty"`
+	KnownHistoryIndex *int    `json:"knownHistoryIndex,omitempty"`
+	// RewindOnly marks a history frame whose transcript portion was
+	// suppressed by a conditional attach: the client's knownHistoryEpoch /
+	// knownHistoryIndex proved its transcript is already current, so it
+	// must keep the rendered transcript and merge ONLY the carried rewind
+	// (the in-flight round's partial output) instead of clearing and
+	// replaying. Never set on a full history frame.
+	RewindOnly bool `json:"rewindOnly,omitempty"`
 	// Rewind carries the in-flight turn's partial output on a mid-turn
 	// attach/resume history payload (nil when nothing has streamed yet).
 	// It is the shared streambuf.Snapshot — the same struct the TUI renders

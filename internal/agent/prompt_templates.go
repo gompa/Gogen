@@ -138,6 +138,62 @@ func activityContextBlock(activity []BoardActivity) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+// DefaultReviewAgentPrompt is the built-in template for review agents
+// auto-started on tickets moved into in_review. Placeholders: {id} {title}
+// {description} {priority} {context} {assignee}.
+const DefaultReviewAgentPrompt = `You are the review agent for board ticket #{id}: {title}.
+
+The ticket was moved to in_review by {assignee}, who believes the work
+is complete. Verify it: inspect the actual changes (git diff/status),
+check the work against the ticket description below, and run the
+project's tests/lint commands when they exist.
+
+{description}
+
+Priority: {priority}
+
+{context}
+
+Then finish the review using the board tool:
+- If the work is complete and correct, mark it done (done {id}).
+- If it needs changes, comment your findings as concrete, actionable
+  review notes, then move the ticket back to in_progress
+  (move {id} in_progress).
+
+Rules:
+- Never claim the ticket: it stays assigned to {assignee}.
+- Never move the ticket to in_review yourself (that would restart the
+  review loop).
+- Judge what the ticket asked for. Style nits go in a comment, not in a
+  rejection.
+- If the ticket left in_review while you were working, comment your
+  findings instead of moving or closing anything.`
+
+// ReviewPrompt renders the seed prompt for an auto-started review session.
+// template is the user-configured template; empty (or equal to the built-in
+// default) uses DefaultReviewAgentPrompt. Substitution is single-pass over
+// the template, so placeholder-like text inside the ticket's own fields is
+// never re-substituted (same contract as TicketPrompt).
+func ReviewPrompt(item *BoardItem, template string) string {
+	template = ResolvePromptTemplate(template, DefaultReviewAgentPrompt)
+	assignee := item.Assignee
+	if assignee == "" {
+		assignee = "the assignee"
+	}
+	priority := item.Priority
+	if priority == "" {
+		priority = "none"
+	}
+	return strings.NewReplacer(
+		"{id}", item.ID,
+		"{title}", item.Title,
+		"{description}", item.Description,
+		"{priority}", priority,
+		"{assignee}", assignee,
+		"{context}", activityContextBlock(item.Activity),
+	).Replace(template)
+}
+
 // DefaultSubagentPrompt is the built-in template wrapping subagent jobs.
 // Placeholder: {job}.
 const DefaultSubagentPrompt = `You are a subagent working on a task delegated by the parent agent.

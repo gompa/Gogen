@@ -21,6 +21,7 @@ type FeatureFlags struct {
 	subagentsEnabled      atomic.Bool
 	subagentMaxDepth      atomic.Int32
 	subagentMaxConcurrent atomic.Int32
+	reviewAgentEnabled    atomic.Bool
 }
 
 // NewFeatureFlags creates a FeatureFlags store seeded with the given
@@ -75,6 +76,18 @@ func (f *FeatureFlags) SubagentMaxConcurrent() int {
 // (0 = unset).
 func (f *FeatureFlags) SetSubagentMaxConcurrent(n int) {
 	f.subagentMaxConcurrent.Store(int32(n))
+}
+
+// ReviewAgentEnabled reports whether the board auto-review agent is
+// active. Opt-in: the shared store is seeded off; the config seed and the
+// settings toggle write it.
+func (f *FeatureFlags) ReviewAgentEnabled() bool {
+	return f.reviewAgentEnabled.Load()
+}
+
+// SetReviewAgentEnabled toggles the board auto-review agent.
+func (f *FeatureFlags) SetReviewAgentEnabled(on bool) {
+	f.reviewAgentEnabled.Store(on)
 }
 
 // flags returns this agent's feature-flag store, lazily creating a private
@@ -163,6 +176,20 @@ func (a *Agent) SubagentMaxDepth() int {
 // default.
 func (a *Agent) SetSubagentMaxConcurrent(n int) {
 	a.flags().SetSubagentMaxConcurrent(n)
+}
+
+// SetReviewAgentEnabled toggles the board auto-review agent for this agent
+// (see SetBoardEnabled for the live-toggle contract). The flag gates the
+// host-side trigger: with it on, a ticket moved into in_review spawns a
+// headless review session (web host only — the TUI has no session spawner
+// and never installs the trigger).
+func (a *Agent) SetReviewAgentEnabled(on bool) {
+	a.flags().SetReviewAgentEnabled(on)
+}
+
+// ReviewAgentEnabled reports whether the board auto-review agent is active.
+func (a *Agent) ReviewAgentEnabled() bool {
+	return a.flags().ReviewAgentEnabled()
 }
 
 // SubagentMaxConcurrent returns the effective per-parent concurrent-subagent

@@ -205,17 +205,42 @@ func (m *Manager) UpdateSettings(settings Settings) {
 	settings = normalizeSettings(settings)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	limitChanged := settings.ContextLimit != m.Settings.ContextLimit
-	m.Settings = settings
+	m.applySettingsLocked(settings)
+}
+
+// UpdateSettingsFunc applies fn to the current settings and stores the merged
+// result atomically: the read (previous values) and the write (merged result)
+// happen under one m.mu critical section. With separate SettingsSnapshot +
+// UpdateSettings calls, two concurrent single-field updates (the web settings
+// modal's per-field push from several tabs) can interleave so the second
+// caller's snapshot predates the first caller's write, silently reverting the
+// first field. fn must mutate only the settings it owns; the merged result
+// gets the same ContextLimit semantics as UpdateSettings (an unchanged limit
+// preserves the manual/resolved distinction, an explicitly changed value
+// re-derives it).
+func (m *Manager) UpdateSettingsFunc(fn func(Settings) Settings) {
+	if fn == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.applySettingsLocked(normalizeSettings(fn(m.Settings)))
+}
+
+// applySettingsLocked stores next and re-derives the ContextLimit
+// manual/resolved state when the value changed. Caller holds m.mu.
+func (m *Manager) applySettingsLocked(next Settings) {
+	limitChanged := next.ContextLimit != m.Settings.ContextLimit
+	m.Settings = next
 	if !limitChanged {
 		return
 	}
 	m.manualContextLimit = 0
 	// A manual limit is resolved by construction; 0 returns to provider
 	// resolution (EnsureContextLimit re-probes on the next turn).
-	m.limitResolved = settings.ContextLimit > 0
-	if settings.ContextLimit > 0 {
-		m.manualContextLimit = settings.ContextLimit
+	m.limitResolved = next.ContextLimit > 0
+	if next.ContextLimit > 0 {
+		m.manualContextLimit = next.ContextLimit
 	}
 }
 

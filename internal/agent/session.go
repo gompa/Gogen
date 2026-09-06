@@ -733,6 +733,45 @@ func (a *Agent) HistoryEpoch() uint64 {
 	return e
 }
 
+// HistoryShips reports whether a history snapshot includes m: snapshots skip
+// empty placeholder messages so clients render only meaningful entries. The
+// server's historyEntries wire builder and HistoryFingerprint share this
+// predicate, so the skip decision can never disagree with what the builder
+// would have shipped.
+func HistoryShips(m llm.Message) bool {
+	switch m.Role {
+	case "user":
+		// Pure-image messages (no text) are still valid history: they carry
+		// their images. Only skip when there is nothing at all.
+		return m.Content != "" || len(m.Images) > 0
+	case "assistant":
+		return m.Content != "" || len(m.ToolCalls) > 0 || m.Reasoning != "" || m.Refusal != ""
+	case "tool":
+		return m.Content != "" || m.ToolCallID != ""
+	}
+	return false
+}
+
+// HistoryFingerprint returns the history epoch together with the highest
+// message index a history snapshot would ship (-1 when no message is
+// shippable), read under one statsMu lock so callers compare a client's
+// rendered transcript against ONE consistent conversation state. Snapshots
+// skip placeholder messages (HistoryShips), so the last shipped index can
+// trail len(Messages)-1. The web server's conditional session_attach uses
+// the pair to decide whether a client's transcript is already current —
+// without paying for the SnapshotMessages deep clone. Thread-safe.
+func (a *Agent) HistoryFingerprint() (epoch uint64, lastShipped int) {
+	a.statsMu.RLock()
+	defer a.statsMu.RUnlock()
+	epoch = a.countsEpoch
+	for i := len(a.Messages) - 1; i >= 0; i-- {
+		if HistoryShips(a.Messages[i]) {
+			return epoch, i
+		}
+	}
+	return epoch, -1
+}
+
 // persistMinInterval is the minimum time between debounced session writes.
 // Final boundaries (turn complete, errors) bypass this via flushSession().
 const persistMinInterval = 5 * time.Second

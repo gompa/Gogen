@@ -188,7 +188,10 @@ func (a *Agent) runToolRound(ctx context.Context, h *llm.StreamHandlers, toolCal
 			return toolRoundStopped, res
 		}
 		if ctx.Err() != nil {
-			if errTool != nil && errTool != context.Canceled {
+			// errors.Is, not ==: a tool that wraps the cancellation
+			// (fmt.Errorf("...: %w", ctx.Err())) must still read as
+			// cancelled, not as a real error.
+			if errTool != nil && !errors.Is(errTool, context.Canceled) {
 				res = formatToolError(res, errTool)
 			} else {
 				res = toolCanceledMsg
@@ -543,9 +546,11 @@ func (a *Agent) executeToolCallsParallel(ctx context.Context, h *llm.StreamHandl
 		res, errTool := results[i].res, results[i].err
 		// Mirror runToolRound's per-call semantics: a tool that completed
 		// before the cancellation keeps its real result; only a call that
-		// was interrupted (returned context.Canceled) or never ran (still
-		// waiting to start when the batch finished) reads as cancelled.
-		if errTool == context.Canceled || (cancelled && !results[i].done) {
+		// was interrupted (returned — or returned an error wrapping —
+		// context.Canceled; errors.Is covers the wrapped form) or never
+		// ran (still waiting to start when the batch finished) reads as
+		// cancelled.
+		if errors.Is(errTool, context.Canceled) || (cancelled && !results[i].done) {
 			a.deliverToolResult(h, tc, toolCanceledMsg, false, sinks[i])
 			continue
 		}

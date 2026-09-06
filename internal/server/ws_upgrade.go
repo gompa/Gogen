@@ -111,23 +111,43 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	// (session_new/resume/fork) switch the pane; teardown detaches from
 	// whatever the current pane is — WITHOUT cancelling any turn (the turn is
 	// owned by the runtime, so disconnecting never kills it, §4).
-	pane := s.registry.first()
-	if pane == nil {
-		// The registry can be empty: every runtime was evicted — the last
-		// pane was explicitly closed (session_close) or the last client
-		// detached from an idle session (orphan eviction). Bootstrap a
-		// default session (latest saved, or a fresh one) so the connection
-		// and any legacy id-less message have a target.
-		pane = s.createBootstrapSession()
+	//
+	// The resolution loops because it can race an explicit close
+	// (session_close): first() returns a runtime the close has claimed
+	// (clientless, latched closing) or already removed, and the attach is
+	// REFUSED — no client may attach to a runtime that is leaving memory.
+	// The handshake must land somewhere, so retry: the claimed runtime is
+	// unregistered within its drain window (≤ wsStreamDrainWait plus the
+	// flush) and the next first() returns another session, or nil → the
+	// bootstrap loads the latest saved session from the store (the
+	// just-closed one, flushed by its close) or creates a fresh default.
+	// The registry can also be empty outright: every runtime was evicted —
+	// the last pane was explicitly closed (session_close) or the last client
+	// detached from an idle session (orphan eviction) — and bootstrapping
+	// gives the connection and any legacy id-less message a target.
+	deadline := time.Now().Add(5 * time.Second)
+	var pane *sessionRuntime
+	for {
+		pane = s.registry.first()
+		if pane == nil {
+			pane = s.createBootstrapSession()
+		}
+		if pane == nil {
+			_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: no session available"})
+			return
+		}
+		if s.attachSession(ws, r, pane, true, nil) {
+			break
+		}
+		if time.Now().After(deadline) {
+			// Pathological: every candidate stayed claimed for the whole
+			// deadline. Fail the handshake the same way a missing session
+			// does — the client's reconnect logic retries.
+			_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: no session available"})
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
-	if pane == nil {
-		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: no session available"})
-		return
-	}
-
-	// Attach this connection as a viewer of the session.
-	s.attachSession(ws, r, pane, true)
-	// Teardown detaches the connection from EVERY session it is attached to
 	// (the current pane plus any background panes) — WITHOUT cancelling any
 	// turn (the turn is owned by the runtime, so disconnecting never kills
 	// it, §4). A killed tab cannot send session_detach per pane, and a stale

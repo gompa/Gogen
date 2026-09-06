@@ -1,6 +1,9 @@
 package server
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -45,13 +48,36 @@ func TestParsePorcelainV2(t *testing.T) {
 			},
 		},
 		{
-			name: "rename_with_companion_N_line",
-			in: "1 R  .R... 100644 100644 100644 " +
-				"83070db83f0737e87c5545b4b1a6e8b19fda3147 4b825dc642cb6eb9a060e54bf8d69288fbee4904 old.go\n" +
-				"N  .R... 100644 100644 100644 " +
-				"83070db83f0737e87c5545b4b1a6e8b19fda3147 4b825dc642cb6eb9a060e54bf8d69288fbee4904 old.go -> new.go\n",
+			// Real v2 rename record: "2 ... R100 <newPath>\t<origPath>".
+			// A plain staged rename is not a conflict.
+			name: "staged_rename_uses_new_path_not_conflict",
+			in: "2 R. N... 100644 100644 100644 " +
+				"df967b96a579e45a18b8251732d16804b2e56a55 df967b96a579e45a18b8251732d16804b2e56a55 " +
+				"R100 renamed.go\ta.go\n",
 			want: GitStatus{
-				Staged: []GitStatusEntry{{Path: "new.go", Status: "R"}},
+				Staged: []GitStatusEntry{{Path: "renamed.go", Status: "R"}},
+			},
+		},
+		{
+			// v2 renames carry newPath\torigPath; spaces in either path are
+			// emitted raw (unquoted), so the tab is the only separator.
+			name: "staged_rename_with_worktree_mod_and_spaces",
+			in: "2 RM N... 100644 100644 100644 " +
+				"587be6b4c3f93f93c489c0111bba5596147a26cb b77b4eb1d946f923f61785536da9ca5af6909f06 " +
+				"R50 new name.txt\tmy file.txt\n",
+			want: GitStatus{
+				Staged:   []GitStatusEntry{{Path: "new name.txt", Status: "R"}},
+				Unstaged: []GitStatusEntry{{Path: "new name.txt", Status: "M"}},
+			},
+		},
+		{
+			// git does not quote plain spaces in paths; the path must not
+			// be truncated at the first space.
+			name: "path_with_raw_spaces_not_truncated",
+			in: "1  M .M... 100644 100644 100644 " +
+				"83070db83f0737e87c5545b4b1a6e8b19fda3147 4b825dc642cb6eb9a060e54bf8d69288fbee4904 my file.go\n",
+			want: GitStatus{
+				Unstaged: []GitStatusEntry{{Path: "my file.go", Status: "M"}},
 			},
 		},
 		{
@@ -76,13 +102,27 @@ func TestParsePorcelainV2(t *testing.T) {
 			},
 		},
 		{
-			name: "unmerged",
-			in: "2 UU .U... 100644 100644 100644 " +
-				"83070db83f0737e87c5545b4b1a6e8b19fda3147 4b825dc642cb6eb9a060e54bf8d69288fbee4904 conflict.go\n",
+			// Unmerged paths are "u" records in v2 (8 fixed fields before
+			// the path), not "2" records.
+			name: "unmerged_u_record",
+			in: "u UU N... 100644 100644 100644 100644 " +
+				"a7453f07505c42ea8d6fdda75fa91710c81c53d6 ba2906d0666cf726c7eaadd2cd3db615dedfdf3a " +
+				"83070db83f0737e87c5545b4b1a6e8b19fda3147 conflict.go\n",
 			want: GitStatus{
 				Staged:   []GitStatusEntry{{Path: "conflict.go", Status: "U"}},
 				Unstaged: []GitStatusEntry{{Path: "conflict.go", Status: "U"}},
 				Unmerged: []GitStatusEntry{{Path: "conflict.go", Status: "U"}},
+			},
+		},
+		{
+			name: "unmerged_both_added",
+			in: "u AA N... 000000 100644 100644 100644 " +
+				"0000000000000000000000000000000000000000 a7453f07505c42ea8d6fdda75fa91710c81c53d6 " +
+				"ba2906d0666cf726c7eaadd2cd3db615dedfdf3a c.txt\n",
+			want: GitStatus{
+				Staged:   []GitStatusEntry{{Path: "c.txt", Status: "A"}},
+				Unstaged: []GitStatusEntry{{Path: "c.txt", Status: "A"}},
+				Unmerged: []GitStatusEntry{{Path: "c.txt", Status: "U"}},
 			},
 		},
 		{
@@ -112,7 +152,7 @@ func TestParsePorcelainV2(t *testing.T) {
 				"1 M  .M... 100644 100644 100644 0000000000000000000000000000000000000000 83070db83f0737e87c5545b4b1a6e8b19fda3147 staged.go\n" +
 				"1  M .M... 100644 100644 100644 83070db83f0737e87c5545b4b1a6e8b19fda3147 4b825dc642cb6eb9a060e54bf8d69288fbee4904 work.go\n" +
 				"1 MM .MM.. 100644 100644 100644 83070db83f0737e87c5545b4b1a6e8b19fda3147 4b825dc642cb6eb9a060e54bf8d69288fbee4904 both.go\n" +
-				"2 UU .U... 100644 100644 100644 83070db83f0737e87c5545b4b1a6e8b19fda3147 4b825dc642cb6eb9a060e54bf8d69288fbee4904 conflict.go\n" +
+				"u UU N... 100644 100644 100644 100644 83070db83f0737e87c5545b4b1a6e8b19fda3147 4b825dc642cb6eb9a060e54bf8d69288fbee4904 a7453f07505c42ea8d6fdda75fa91710c81c53d6 conflict.go\n" +
 				"? new.txt\n",
 			want: GitStatus{
 				Branch: "main",
@@ -159,5 +199,64 @@ func TestUnquoteGitPath(t *testing.T) {
 		if got := unquoteGitPath(tt.in); got != tt.want {
 			t.Errorf("unquoteGitPath(%q) = %q, want %q", tt.in, got, tt.want)
 		}
+	}
+}
+
+// TestParsePorcelainV2Live pins parsePorcelainV2 to real git output for
+// the record kinds most easily fabricated wrong: "2" (rename/copy, not a
+// conflict) and "u" (the only unmerged record in porcelain v2).
+func TestParsePorcelainV2Live(t *testing.T) {
+	dir := newGitTestRepo(t)
+	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", "a.go")
+	gitIn(t, dir, "commit", "-m", "init")
+
+	// Staged rename: a "2 ... newPath\torigPath" record.
+	gitIn(t, dir, "mv", "a.go", "renamed.go")
+	st := parsePorcelainV2(gitIn(t, dir, "status", "--porcelain=v2"))
+	if len(st.Unmerged) != 0 {
+		t.Fatalf("staged rename unmerged = %#v, want empty", st.Unmerged)
+	}
+	if !reflect.DeepEqual(st.Staged, []GitStatusEntry{{Path: "renamed.go", Status: "R"}}) {
+		t.Fatalf("staged rename staged = %#v, want renamed.go/R", st.Staged)
+	}
+
+	// Real conflict: a "u" record (both sides edit a file that exists in
+	// the merge base, so git reports XY=UU rather than AA).
+	gitIn(t, dir, "reset", "--hard")
+	if err := os.WriteFile(filepath.Join(dir, "c.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", "c.txt")
+	gitIn(t, dir, "commit", "-m", "base-c")
+	head := gitIn(t, dir, "rev-parse", "--abbrev-ref", "HEAD")
+	if err := os.WriteFile(filepath.Join(dir, "c.txt"), []byte("main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", "c.txt")
+	gitIn(t, dir, "commit", "-m", "c-main")
+	gitIn(t, dir, "checkout", "-q", "HEAD~1", "-b", "feature2")
+	if err := os.WriteFile(filepath.Join(dir, "c.txt"), []byte("feature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", "c.txt")
+	gitIn(t, dir, "commit", "-m", "c-feature")
+	merge := exec.Command("git", "merge", head)
+	merge.Dir = dir
+	if out, err := merge.CombinedOutput(); err == nil {
+		t.Fatalf("merge unexpectedly succeeded: %s", out)
+	}
+	st = parsePorcelainV2(gitIn(t, dir, "status", "--porcelain=v2"))
+	if !reflect.DeepEqual(st.Unmerged, []GitStatusEntry{{Path: "c.txt", Status: "U"}}) {
+		t.Fatalf("conflict unmerged = %#v, want c.txt/U", st.Unmerged)
+	}
+	// Conflicts also surface in Staged/Unstaged so they stay actionable.
+	if !reflect.DeepEqual(st.Staged, []GitStatusEntry{{Path: "c.txt", Status: "U"}}) {
+		t.Fatalf("conflict staged = %#v, want c.txt/U", st.Staged)
+	}
+	if !reflect.DeepEqual(st.Unstaged, []GitStatusEntry{{Path: "c.txt", Status: "U"}}) {
+		t.Fatalf("conflict unstaged = %#v, want c.txt/U", st.Unstaged)
 	}
 }

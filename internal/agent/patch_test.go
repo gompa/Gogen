@@ -1958,3 +1958,41 @@ func parseDiffLineCount(part string) (int, error) {
 	start, _, err := parseDiffLineRange(part)
 	return start, err
 }
+
+// TestPatchMismatchDiagnosticFileShorterThanContext pins the mismatch
+// diagnostic when the file runs out before any expected line disagrees: the
+// file's remaining lines are a strict prefix of the hunk context, so there
+// is no differing line to quote — the diagnostic must report the shortfall
+// instead of presenting two IDENTICAL lines as "the mismatch". A real
+// differing line keeps the classic quote-the-difference shape.
+func TestPatchMismatchDiagnosticFileShorterThanContext(t *testing.T) {
+	dir := t.TempDir()
+	exec := NewExecutor(dir)
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("a\nb\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The hunk starts at line 2 and expects two context lines ("b", "c"),
+	// but the file ends after "b". The per-file diagnostic rides on the
+	// RESULT (formatPatchReport); the error is the aggregate.
+	res, err := exec.PatchFile(context.Background(), "--- a/f.txt\n+++ b/f.txt\n@@ -2,2 +2,2 @@\n b\n-c\n+d\n", false, true)
+	if err == nil {
+		t.Fatal("expected the mismatch to fail")
+	}
+	if !strings.Contains(res, "file has 1 line(s) here but the hunk expects 2 context lines") {
+		t.Fatalf("diagnostic = %q, want the shortfall explanation", res)
+	}
+	if strings.Contains(res, `file has "b", patch expects "b"`) {
+		t.Fatalf("diagnostic quotes identical lines as the mismatch: %q", res)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "g.txt"), []byte("a\nX\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err = exec.PatchFile(context.Background(), "--- a/g.txt\n+++ b/g.txt\n@@ -1,2 +1,2 @@\n a\n-b\n+c\n", false, false)
+	if err == nil {
+		t.Fatal("expected the mismatch to fail")
+	}
+	if !strings.Contains(res, `file has "X", patch expects "b"`) {
+		t.Fatalf("diagnostic = %q, want the differing-line quote", res)
+	}
+}

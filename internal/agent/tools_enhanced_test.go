@@ -418,3 +418,58 @@ func TestReadFileRangeOffsetPastEnd(t *testing.T) {
 		t.Fatalf("expected past-end message for empty file, got %q", out)
 	}
 }
+
+// TestReadFileRangeLargeFileSkipsRemainderDrain pins the offset/limit
+// efficiency contract: once the requested window is collected from a file
+// larger than searchMaxFileBytes, the scanner stops instead of draining the
+// rest of the file just to report a total in the "Lines X-Y of Z" header —
+// the header reports a lower bound ("of N+") instead, mirroring the
+// regex-search path. Small files keep the exact total.
+func TestReadFileRangeLargeFileSkipsRemainderDrain(t *testing.T) {
+	dir := t.TempDir()
+	exec := NewExecutor(dir)
+	var b strings.Builder
+	for i := 1; i <= 120000; i++ {
+		fmt.Fprintf(&b, "line %d\n", i)
+	}
+	if len(b.String()) <= searchMaxFileBytes {
+		t.Fatalf("test setup: generated file is only %d bytes, must exceed searchMaxFileBytes (%d)", len(b.String()), searchMaxFileBytes)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "huge.txt"), []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := exec.ReadFileRange("huge.txt", 119990, 5, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "Lines 119990-119994 of 119995+ (file larger than") {
+		t.Fatalf("header = %q, want a lower-bound total with the omitted-count note", strings.SplitN(out, "\n", 2)[0])
+	}
+	if !strings.Contains(out, "line 119990") || !strings.Contains(out, "line 119994") || strings.Contains(out, "line 119995") {
+		t.Fatalf("window content wrong:\n%s", out)
+	}
+
+	// No explicit limit on a large file: the readFileMaxLines cap stops the
+	// scan the same way, and the truncation warning reports a lower bound.
+	out, err = exec.ReadFileRange("huge.txt", 0, 0, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "file has 10001+ lines; showing first 10000") {
+		t.Fatalf("warning = %q, want a lower-bound line count", strings.SplitN(out, "\n", 2)[0])
+	}
+
+	// Small files keep the exact total (no "+" suffix, unchanged shape).
+	small := filepath.Join(dir, "small.txt")
+	if err := os.WriteFile(small, []byte("a\nb\nc\nd\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err = exec.ReadFileRange("small.txt", 2, 2, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "Lines 2-3 of 4\n") {
+		t.Fatalf("small-file header = %q, want the exact total", out)
+	}
+}

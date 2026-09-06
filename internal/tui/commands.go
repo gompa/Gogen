@@ -296,11 +296,13 @@ func cmdSession(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 // /session command path (cmdSession) and the sidebar resume path
 // (resumeSavedRow): it clears the chat, appends the notice line plus the
 // rendered history, scrolls the viewport to the bottom, re-stamps the
-// session's recency (rebindActivity), and returns the off-thread refresh
-// cmds — a cold token-count cache probe (a synchronous probe would tokenize
-// the whole history on the render loop) and a sidebar refresh. Callers own
-// their per-entry-point extras (sidebar cursor, persist-error check) and
-// return arity.
+// session's recency (rebindActivity), moves the panel cursor to the focused
+// session's row (the rebind changed which session is current — without this
+// the selection stayed on the saved-and-left-behind session after /new),
+// and returns the off-thread refresh cmds — a cold token-count cache probe
+// (a synchronous probe would tokenize the whole history on the render loop)
+// and a sidebar refresh. Callers own their per-entry-point extras
+// (persist-error check) and return arity.
 func (m *Model) applySessionSwitch(result agent.SessionCommandResult) tea.Cmd {
 	m.chatLines = nil
 	m.chatLines = append(m.chatLines, SystemStyle.Render(result.Output))
@@ -313,6 +315,11 @@ func (m *Model) applySessionSwitch(result agent.SessionCommandResult) tea.Cmd {
 	// /new and /resume <id> rebind the focused agent: re-stamp the
 	// session's recency so the list does not reorder (see rebindActivity).
 	m.rebindActivity()
+	// The rebind changed the focused session: move the panel cursor to its
+	// row (identity recorded), so /new selects the fresh session instead of
+	// leaving the highlight on the saved-and-left-behind one — the same
+	// sync switchToLive does for the focus-switch paths.
+	m.sidebarCursor = m.sidebarFocusedRow()
 	return tea.Batch(m.requestContextStats(), m.requestSavedSessions())
 }
 

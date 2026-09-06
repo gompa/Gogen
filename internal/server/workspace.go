@@ -292,6 +292,18 @@ func (ws *Workspace) SetSubagentEnabled(on bool) {
 	ws.flags().SetSubagentsEnabled(on)
 }
 
+// GetReviewAgentEnabled returns the live board auto-review flag.
+func (ws *Workspace) GetReviewAgentEnabled() bool {
+	return ws.flags().ReviewAgentEnabled()
+}
+
+// SetReviewAgentEnabled updates the live board auto-review flag (shared
+// store, see SetBoardEnabled). The trigger re-checks it on every fire, so
+// the settings toggle is live.
+func (ws *Workspace) SetReviewAgentEnabled(on bool) {
+	ws.flags().SetReviewAgentEnabled(on)
+}
+
 // GetSubagentMaxDepth returns the live subagent nesting-depth limit.
 func (ws *Workspace) GetSubagentMaxDepth() int {
 	return ws.flags().SubagentMaxDepth()
@@ -549,6 +561,9 @@ func newWorkspaceFromAgent(a *agent.Agent, cfg *config.Config) *Workspace {
 		subagentDepthFrom(cfg),
 		subagentLimitFrom(cfg),
 	))
+	if cfg != nil {
+		ws.flags().SetReviewAgentEnabled(cfg.ReviewAgentEnabled())
+	}
 	if cfg != nil && cfg.BoardEnabled() {
 		// The workspace owns the single board manager; session agents are
 		// seeded from it in NewSessionAgent.

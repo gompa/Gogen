@@ -218,20 +218,17 @@ func (s *Server) gitStatusEntries(ctx context.Context) (GitStatus, error) {
 //   - "1 XY ... path": X not ' '/'.' → Staged (status X); Y not ' '/'.'
 //     → Unstaged (status Y). A file may appear in BOTH lists (partially
 //     staged). '.' means "no change" (worktree column for new index entries).
-//   - "2 XY ... path": Unmerged (status U), also into Staged/Unstaged per
-//     column so conflicts stay actionable there.
+//   - "2 XY ... <newPath>\t<origPath>": renamed/copied in the index —
+//     NOT a conflict. Bucketed like "1" per column (X is typically R or
+//     C); the entry path is newPath, origPath is ignored.
+//   - "u XY ... path": unmerged (XY is one of DD AU UD UA DU AA UU) →
+//     Unmerged (status U), also into Staged/Unstaged per column so
+//     conflicts stay actionable there.
 //   - "? path": Untracked (status U).
-//   - "N ... old -> new": rename/copy companion of the previous record —
-//     the entry's path is replaced with the new path.
 //   - "# branch.head/upstream/ab" headers fill the branch fields; other
-//     "#" lines (and T/u records) are ignored.
+//     "#" lines are ignored.
 func parsePorcelainV2(text string) GitStatus {
 	var st GitStatus
-	// Rename/copy companion lines ("N") arrive AFTER their "1"/"2" record;
-	// remember the last record's path and the slice positions of the entries
-	// appended for it so the N line can swap in the new path.
-	lastFrom := ""
-	lastStaged, lastUnstaged := -1, -1
 	for _, line := range strings.Split(text, "\n") {
 		if line == "" {
 			continue
@@ -243,48 +240,41 @@ func parsePorcelainV2(text string) GitStatus {
 			if len(line) < 5 {
 				continue
 			}
-			// "1 <XY> <sub> <hM> <m1> <m2> <m3> <o> <X> <Y> <path>": the
-			// path is the LAST field (quoted paths contain no raw spaces,
-			// so Fields is safe).
-			xy := line[2:4]
-			fields := strings.Fields(line[5:])
-			if len(fields) == 0 {
-				continue
-			}
-			path := unquoteGitPath(fields[len(fields)-1])
-			lastFrom, lastStaged, lastUnstaged = path, -1, -1
+			rest := line[5:]
+			// sub + mH/mI/mW/hH/hI precede the path in "1" records.
+			fixed := 6
 			if line[0] == '2' {
-				st.Unmerged = append(st.Unmerged, GitStatusEntry{Path: path, Status: "U"})
+				// "2 ... <newPath>\t<origPath>": tabs inside a quoted path
+				// are escaped as \t, so the last raw tab separates newPath
+				// from the rename/copy source; keep the new path.
+				if i := strings.LastIndexByte(rest, '\t'); i >= 0 {
+					rest = rest[:i]
+				}
+				// "2" also carries the X+score column before newPath.
+				fixed = 7
 			}
-			// ' ' or '.' means no change in that column ('.' is used for
-			// the worktree column when the index entry is new and matches).
-			if x := xy[0]; x != ' ' && x != '.' {
-				lastStaged = len(st.Staged)
-				st.Staged = append(st.Staged, GitStatusEntry{Path: path, Status: string(x)})
-			}
-			if y := xy[1]; y != ' ' && y != '.' {
-				lastUnstaged = len(st.Unstaged)
-				st.Unstaged = append(st.Unstaged, GitStatusEntry{Path: path, Status: string(y)})
-			}
-		case 'N':
-			if len(line) < 3 || lastFrom == "" {
+			// The path is the tail after the fixed header fields. Plain
+			// spaces in a path are NOT quoted by git, so the last
+			// whitespace token of strings.Fields would truncate it.
+			path := pathAfterFields(rest, fixed)
+			if path == "" {
 				continue
 			}
-			arrow := strings.Index(line, " -> ")
-			if arrow < 0 {
+			st.addXY(line[2:4], unquoteGitPath(path))
+		case 'u':
+			if len(line) < 5 {
 				continue
 			}
-			fromFields := strings.Fields(line[:arrow])
-			if len(fromFields) == 0 || unquoteGitPath(fromFields[len(fromFields)-1]) != lastFrom {
+			// "u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>":
+			// unmerged paths get their own record in v2 — one more fixed
+			// field than "1"/"2" before the path.
+			path := pathAfterFields(line[5:], 8)
+			if path == "" {
 				continue
 			}
-			to := unquoteGitPath(strings.TrimSpace(line[arrow+4:]))
-			if lastStaged >= 0 {
-				st.Staged[lastStaged].Path = to
-			}
-			if lastUnstaged >= 0 {
-				st.Unstaged[lastUnstaged].Path = to
-			}
+			path = unquoteGitPath(path)
+			st.Unmerged = append(st.Unmerged, GitStatusEntry{Path: path, Status: "U"})
+			st.addXY(line[2:4], path)
 		case '?':
 			if len(line) < 3 {
 				continue
@@ -297,6 +287,33 @@ func parsePorcelainV2(text string) GitStatus {
 		}
 	}
 	return st
+}
+
+// addXY buckets path into Staged/Unstaged per XY column; ' ' and '.' mean
+// no change in that column ('.' is used for the worktree column when the
+// index entry is new and matches). Shared by the "1", "2" and "u" records.
+func (st *GitStatus) addXY(xy, path string) {
+	if x := xy[0]; x != ' ' && x != '.' {
+		st.Staged = append(st.Staged, GitStatusEntry{Path: path, Status: string(x)})
+	}
+	if y := xy[1]; y != ' ' && y != '.' {
+		st.Unstaged = append(st.Unstaged, GitStatusEntry{Path: path, Status: string(y)})
+	}
+}
+
+// pathAfterFields returns rest with the first skip space-separated fields
+// removed, or "" if there are fewer. Porcelain paths are the record tail
+// after the fixed header fields; they are not split on whitespace because
+// paths containing plain spaces are emitted unquoted.
+func pathAfterFields(rest string, skip int) string {
+	for i := 0; i < skip; i++ {
+		j := strings.IndexByte(rest, ' ')
+		if j < 0 {
+			return ""
+		}
+		rest = rest[j+1:]
+	}
+	return rest
 }
 
 // parseBranchHeader fills the branch fields from "# branch.head <name>",

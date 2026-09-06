@@ -62,17 +62,25 @@ func truncateReport(report string, err error) string {
 
 // newChildRuntime creates and registers a nested child runtime for parent:
 // fresh session agent (model selection, label, depth, parent link), D6
-// approval forwarding, registry registration, and the subagent_started
-// broadcast. Returns the child runtime, its label, and the RAW (unwrapped)
-// job. Shared by the foreground Spawn and the background SpawnBackground so
-// the two cannot drift.
+// approval forwarding, registry registration. Returns the child runtime,
+// its label, and the RAW (unwrapped) job. Shared by the foreground Spawn
+// and the background SpawnBackground so the two cannot drift.
+//
+// The factory does NOT announce the child: the subagent_started broadcast
+// belongs to the caller, AFTER admission. Spawn and Fork have already
+// cleared their caps when the child is created, so they announce
+// immediately; SpawnBackground checks its caps after registration and must
+// discard a refused child WITHOUT announcing it — an announced child that
+// is then refused would leave a phantom "running" row in the parent's
+// sidebar that no event ever resolves.
 func (sp *subagentSpawner) newChildRuntime(ctx context.Context, parent *agent.Agent, job, model string, depth int) (*sessionRuntime, string, string, error) {
 	s := sp.s
 	if parent == nil {
 		return nil, "", "", fmt.Errorf("subagent: parent agent is nil")
 	}
-	parentRt, ok := s.registry.get(parent.SessionID)
-	if !ok {
+	// Liveness guard only (the D6 approver re-resolves the parent by id at
+	// approval time): the spawn must fail when the parent's runtime is gone.
+	if _, ok := s.registry.get(parent.SessionID); !ok {
 		return nil, "", "", fmt.Errorf("subagent: parent session is not live")
 	}
 
@@ -110,8 +118,11 @@ func (sp *subagentSpawner) newChildRuntime(ctx context.Context, parent *agent.Ag
 	childRt.nested = true
 	// D6: delete approvals go to the child's own attached clients (the
 	// child pane shows the modal); with none attached they route to the
-	// parent's clients so a headless child can never hang an approval.
-	childRt.routeApprovalsTo(parentRt)
+	// parent's clients so a headless child can never hang an approval. The
+	// parent is resolved by id at approval time (routeApprovalsTo) — the
+	// runtime pointer captured here goes stale when the parent is
+	// orphan-evicted and reopened while the child keeps running.
+	childRt.routeApprovalsTo(s.registry, parent.SessionID)
 
 	// Register BEFORE the turn so attach/cancel/approvals resolve. Nested
 	// runtimes are cap-exempt, so register never evicts.
@@ -130,14 +141,6 @@ func (sp *subagentSpawner) newChildRuntime(ctx context.Context, parent *agent.Ag
 		return nil
 	})
 
-	parentRt.broadcast(WSMessage{
-		Type:           "subagent_started",
-		SessionID:      parent.SessionID,
-		SubagentID:     childID,
-		SubagentLabel:  label,
-		SubagentJob:    truncateJob(rawJob),
-		SubagentParent: parent.SessionID,
-	})
 	return childRt, label, rawJob, nil
 }
 
@@ -159,6 +162,18 @@ func (sp *subagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, job, 
 	}
 	childID := childRt.agent.SessionID
 	parentRt, _ := s.registry.get(parent.SessionID) // still live: registered above
+
+	// Announce the admitted child (the sidebar row's attach target). The
+	// caps were checked before the child existed, so every Spawn that gets
+	// here is admitted — announce unconditionally, like Fork does below.
+	parentRt.broadcast(WSMessage{
+		Type:           "subagent_started",
+		SessionID:      parent.SessionID,
+		SubagentID:     childID,
+		SubagentLabel:  label,
+		SubagentJob:    truncateJob(rawJob),
+		SubagentParent: parent.SessionID,
+	})
 
 	report, err := sp.runChildTurn(ctx, childRt, agent.FormatSubagentJob(rawJob))
 	sp.finalizeForegroundChild(childRt, parentRt, label, report, err)
@@ -215,14 +230,15 @@ func (sp *subagentSpawner) finalizeForegroundChild(rt, parentRt *sessionRuntime,
 // routeApprovalsTo wires the D6 delete-approval routing for a nested
 // child: delete approvals go to the child's own attached clients (the
 // child pane shows the modal); with none attached they route to the
-// parent's clients so a headless child can never hang an approval.
-func (rt *sessionRuntime) routeApprovalsTo(parentRt *sessionRuntime) {
-	rt.approverOverride = func(ctx context.Context, req agent.DeleteRequest) (bool, error) {
-		if rt.clientCount() == 0 {
-			return parentRt.deleteApprover()(ctx, req)
-		}
-		return rt.deleteApprover()(ctx, req)
-	}
+// parent's clients so a headless child can never hang an approval. The
+// parent is resolved by id AT APPROVAL TIME (nestedDeleteApprover), never
+// via the runtime pointer captured at spawn: the parent can be
+// orphan-evicted while its background child keeps running and later
+// reopened as a fresh runtime under the same id, and an approval routed to
+// the dead pointer would wait forever. An approval nobody can answer is
+// denied fail-closed instead of being parked.
+func (rt *sessionRuntime) routeApprovalsTo(reg *sessionRegistry, parentID string) {
+	rt.approverOverride = reg.nestedDeleteApprover(rt, parentID)
 }
 
 // approvalHold returns the configured delete-approval hold window. Reads

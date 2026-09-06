@@ -44,6 +44,16 @@ export function enableFollow() {
     messagesDiv.classList.add('no-anchor');
 }
 
+// Restore the follow state to "not following" without the unpin machinery
+// (grace timer / recovery probe) — that is for live user gestures, while
+// this is the pane-switch cache restore: the restored pane was reading at
+// a scroll offset, so follow must simply stay off.
+export function disableFollow() {
+    stickToBottom = false;
+    messagesDiv.classList.remove('no-anchor');
+    updateScrollBottomBtn();
+}
+
 export function isPinned() {
     return stickToBottom;
 }

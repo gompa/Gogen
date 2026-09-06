@@ -440,6 +440,49 @@
                         <button type="button" class="settings-btn-secondary" id="board-prompt-reset-btn">Reset to default</button>
                     </div>
                 </div>
+                <!-- Board review agent: spawns a headless review session
+                     when a ticket moves into in_review (agent board tool or
+                     user drag-drop). Server-backed toggle + model/effort
+                     pickers (same ModelThinkingPicker as the subagent
+                     settings); the review prompt is a configurable
+                     template like the board agent prompt above. -->
+                <div class="setting-row">
+                    <div>
+                        <label>Board review agent</label>
+                        <select id="review-agent-enabled-select" aria-label="Board review agent">
+                            <option value="off">Off</option>
+                            <option value="on">On</option>
+                        </select>
+                        <p class="settings-note">When on, a ticket moved into in_review automatically starts a review session that verifies the work, then marks the ticket done or comments findings and moves it back to in_progress. Max 5 review rounds per ticket. Web mode only.</p>
+                    </div>
+                </div>
+                <div class="setting-row" id="review-agent-model-row">
+                    <div>
+                        <label>Default review model</label>
+                        <div id="review-agent-model-picker">
+                            <input type="text" id="review-agent-model-filter" class="tb-model-filter" placeholder="Filter models…" autocomplete="off" aria-label="Filter review agent models">
+                            <div id="review-agent-model-list" class="tb-model-list"></div>
+                            <p class="settings-note">Empty = the ticket's own review model override, else the workspace default model. A card's review section (Start-agent popover) can set a per-ticket model.</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting-row" id="review-agent-thinking-row">
+                    <div>
+                        <label>Review agent reasoning effort</label>
+                        <div id="review-agent-thinking-picker">
+                            <div id="review-agent-thinking-options" class="tb-thinking-grid"></div>
+                            <p class="settings-note">Empty = inherit the workspace level. Options follow the review model's accepted values; a level the model does not accept is never sent.</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting-row" id="board-review-prompt-row">
+                    <div>
+                        <label>Board review prompt</label>
+                        <textarea id="board-review-prompt-input" rows="6" spellcheck="false" aria-label="Board review prompt template"></textarea>
+                        <p class="settings-note">Template for the auto review agent started when a ticket enters in_review. Placeholders: {id} {title} {description} {priority} {context} {assignee}. Empty = built-in default.</p>
+                        <button type="button" class="settings-btn-secondary" id="board-review-prompt-reset-btn">Reset to default</button>
+                    </div>
+                </div>
                 <div class="setting-row">
                     <div>
                         <label>System prompt</label>

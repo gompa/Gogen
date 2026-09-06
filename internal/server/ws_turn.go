@@ -20,9 +20,26 @@ import (
 // cancels any in-flight turn, acquires the session turn lock, emits a
 // "compacting" event so the client can show a persistent progress indicator,
 // runs CompactHistory (which may take a while — it summarizes the middle via
-// the provider), then reports the result and refreshed context stats. Runs in
-// a goroutine so the slow summarization does not block the WS read loop.
-func (s *Server) handleWSCompact(ws *wsConn, r *http.Request, rt *sessionRuntime) {
+// the provider), then reports the result and refreshed context stats, and
+// broadcasts turn_end. Runs in a goroutine so the slow summarization does not
+// block the WS read loop.
+//
+// The goroutine mirrors startTurn's turn lifecycle: it registers a
+// Background-derived cancel handle with rt.stream (begin) and clears it on
+// exit (end), so closeRuntime/sessionDelete/shutdown can cancel AND drain the
+// compact like any in-flight turn. Without that registration their
+// cancelInFlight is a no-op and their turnMu.TryLock fails for the whole
+// multi-second summarization — the teardown proceeds while the compact still
+// runs, and its success-path FlushSession re-creates the session file the
+// close/delete just removed (delete resurrection). Like runTurnBody, the
+// compact broadcasts turn_end while still holding the lock and clears the
+// turn-active state before unlocking: a client that attaches mid-compact
+// latches "busy" plus a pending history refetch on session_state, and only
+// turn_end converges it. The compact context derives from
+// context.Background(), not the HTTP request: like a turn, the compaction
+// belongs to the session and survives a disconnect (§4); only an explicit
+// teardown cancels it.
+func (s *Server) handleWSCompact(ws *wsConn, _ *http.Request, rt *sessionRuntime) {
 	if !rt.acquireTurnForHandler(ws) {
 		// /compact is a typed chat command: the busy rejection is its
 		// reply on the conversation channel.
@@ -37,20 +54,40 @@ func (s *Server) handleWSCompact(ws *wsConn, r *http.Request, rt *sessionRuntime
 	// is running), but the state must be cleared BEFORE the lock is released
 	// so the next turn never sees a stale turnActive/turnOwner.
 	rt.setTurnActive(true, time.Now(), ws)
+	// Register with the runtime's stream handles exactly like startTurn.
+	// Holding turnMu proves any prior stream has fully ended (end()
+	// precedes the turn unlock), so begin() cannot clobber live handles.
+	compactCtx, compactCancel := context.WithCancel(context.Background())
+	errCh := rt.stream.begin(compactCancel)
 	go func() {
-		// Orphan check runs LAST (after turnMu.Unlock): if the only client
-		// left mid-compact, the idle runtime goes back to the saved list.
+		// Defers run LIFO, mirroring startTurn's goroutine: turn_end
+		// broadcast + setTurnActive(false) (both while the lock is still
+		// held — turn_end must never interleave after a new turn's first
+		// events, and a new turn must never see a stale turnActive/
+		// turnOwner) → errCh signal → stream.end() → turnMu.Unlock() →
+		// orphan check. The orphan check runs LAST (after turnMu.Unlock):
+		// if the only client left mid-compact, the idle runtime goes back
+		// to the saved list.
 		defer rt.evictOrphanedIfPossible()
-		defer rt.setTurnActive(false, time.Time{}, nil)
 		defer rt.turnMu.Unlock()
+		defer rt.stream.end()
+		defer func() { errCh <- nil }()
+		defer func() {
+			rt.broadcast(WSMessage{Type: "turn_end", SessionID: rt.agent.SessionID})
+			rt.setTurnActive(false, time.Time{}, nil)
+		}()
 		_ = ws.writeJSON(WSMessage{Type: "compacting", SessionID: rt.agent.SessionID})
-		if err := rt.agent.CompactHistory(r.Context()); err != nil {
+		if err := rt.agent.CompactHistory(compactCtx); err != nil {
 			_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: " + err.Error(), SessionID: rt.agent.SessionID})
 		} else {
 			rt.agent.FlushSession()
 			_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf("History compacted (%d messages remaining).", rt.agent.MessageCount()), SessionID: rt.agent.SessionID})
 		}
-		_ = ws.writeJSON(contextMsg(r.Context(), rt.agent))
+		// context.Background() rather than the (dead) request context or
+		// the (teardown-cancellable) compact context: the stats echo must
+		// still reach the client after the compact result (mirrors
+		// runTurnBody's persist path).
+		_ = ws.writeJSON(contextMsg(context.Background(), rt.agent))
 	}()
 }
 

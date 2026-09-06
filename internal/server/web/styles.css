@@ -1740,6 +1740,19 @@
             border-top: 1px solid var(--border); padding-top: 6px;
             display: flex; flex-direction: column; gap: 6px;
         }
+        .board-start-review-section {
+            border-top: 1px solid var(--border); padding-top: 6px;
+            display: flex; flex-direction: column; gap: 6px;
+        }
+        .board-start-review-head { display: flex; justify-content: flex-end; }
+        .board-start-review-body { display: flex; flex-direction: column; gap: 6px; }
+        .board-start-review-model-list {
+            max-height: 220px; overflow-y: auto;
+            display: flex; flex-direction: column; gap: 2px;
+        }
+        .board-start-review-note {
+            margin: 0; font-size: 0.75em; color: var(--fg-muted);
+        }
         .board-start-prompt-head {
             display: flex; justify-content: space-between; align-items: center; gap: 6px;
         }

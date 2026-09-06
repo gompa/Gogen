@@ -61,11 +61,18 @@ function boardMoveCancel() {
 let pendingBoardStartId = null;
 // Per-ticket "Start agent" popover state: the open popover's
 // selections (model, edited prompt template, whether the prompt
-// editor is expanded). The popover element is a singleton appended
+// editor is expanded, the review-agent section's per-ticket review
+// options). The popover element is a singleton appended
 // to <body>, so a board re-render while the user is mid-choice
 // closes it without losing anything — nothing is sent until Start.
-let boardStartState = null; // { item, model, prompt, promptOpen, thinkingLevel }
+let boardStartState = null; // { item, model, prompt, promptOpen, thinkingLevel, reviewOpen, reviewModel, reviewThinkingLevel }
 let boardStartPicker = null; // shared ModelThinkingPicker for the popover
+// Second picker for the popover's review-agent section (per-ticket
+// review options for the session auto-started on in_review). Like the
+// worker picker it is state-only: the selections ride the start op
+// (an immediate review op would re-render the board and close this
+// popover mid-choice).
+let reviewPicker = null;
 // Shared popover shell (components/popover.js) for the singleton
 // popover element: outside-click/Escape dismissal, fixed
 // positioning under the anchor (flipped above when there is no
@@ -437,6 +444,12 @@ export function openBoardStartPopover(item, anchor) {
         // '' = Inherit the active pane's live level (the pre-existing
         // behavior); the ticket's stored override pre-fills here.
         thinkingLevel: item.thinkingLevel || '',
+        // Review-agent section: the ticket's stored per-ticket review
+        // options pre-fill here (the review session auto-started when
+        // the ticket enters in_review runs with them).
+        reviewOpen: false,
+        reviewModel: item.reviewModel || '',
+        reviewThinkingLevel: item.reviewThinkingLevel || '',
         promptOpen: false,
     };
     boardStartAnchor = anchor;
@@ -454,6 +467,8 @@ export function openBoardStartPopover(item, anchor) {
     // outside-click/Escape dismissal and scroll/resize re-anchor.
     boardStartPopoverCtl.open();
     boardStartPicker.render();
+    reviewPicker.render();
+    syncBoardStartReviewSection();
     syncBoardStartPromptEditor();
 }
 
@@ -466,7 +481,10 @@ export function closeBoardStartPopover() {
 // unknown model's accepted values knowable, at which point a stale
 // effort must reset (the server re-validates at start).
 export function refreshBoardStartPicker() {
-    if (boardStartPopoverCtl && boardStartPopoverCtl.isOpen()) boardStartPicker.refresh();
+    if (boardStartPopoverCtl && boardStartPopoverCtl.isOpen()) {
+        boardStartPicker.refresh();
+        reviewPicker.refresh();
+    }
 }
 
 function buildBoardStartPopover() {
@@ -536,6 +554,69 @@ function buildBoardStartPopover() {
         paneCurrentRow: true,
     });
 
+    // Review-agent section: the ticket's per-ticket review options for
+    // the review session auto-started when this ticket moves into
+    // in_review (feature flag "Board review agent" must be on; without
+    // it the section is inert). Collapsed by default; its selections
+    // ride the start op and are persisted on the ticket by the server
+    // (an immediate review-options op would re-render the board and
+    // close this popover mid-choice).
+    const reviewSection = document.createElement('div');
+    reviewSection.className = 'board-start-review-section';
+    const reviewHead = document.createElement('div');
+    reviewHead.className = 'board-start-review-head';
+    const reviewToggle = document.createElement('button');
+    reviewToggle.type = 'button';
+    reviewToggle.className = 'board-start-pen board-start-review-toggle';
+    reviewToggle.textContent = 'Review agent';
+    reviewToggle.title = 'Per-ticket model and reasoning effort for the review session started when the ticket enters in_review';
+    reviewToggle.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (!boardStartState) return;
+        boardStartState.reviewOpen = !boardStartState.reviewOpen;
+        syncBoardStartReviewSection();
+    });
+    reviewHead.append(reviewToggle);
+    const reviewBody = document.createElement('div');
+    reviewBody.className = 'board-start-review-body';
+    reviewBody.hidden = true;
+    const reviewFilter = document.createElement('input');
+    reviewFilter.type = 'text';
+    reviewFilter.className = 'board-start-filter board-start-review-filter';
+    reviewFilter.placeholder = 'Filter models…';
+    reviewFilter.autocomplete = 'off';
+    reviewFilter.addEventListener('input', () => reviewPicker.render());
+    // Dedicated classes (NOT the worker grid's): the review list and
+    // chips live in the same popover, and selectors like
+    // `.board-start-thinking-grid .tb-thinking-chip` must keep matching
+    // the worker picker only (the web-harness regression tests query
+    // them).
+    const reviewList = document.createElement('div');
+    reviewList.className = 'board-start-review-model-list';
+    const reviewChips = document.createElement('div');
+    reviewChips.className = 'tb-thinking-grid board-start-review-thinking-grid';
+    const reviewNote = document.createElement('p');
+    reviewNote.className = 'board-start-review-note';
+    reviewNote.textContent = 'For the review session auto-started when the ticket enters in_review (needs the "Board review agent" setting). Empty model = the workspace default review model.';
+    reviewBody.append(reviewFilter, reviewList, reviewChips, reviewNote);
+    reviewSection.append(reviewHead, reviewBody);
+    pop.appendChild(reviewSection);
+
+    // The review picker: same shared factory, no pane-current row (the
+    // cascade resolves ticket override → workspace default), no
+    // change callbacks — the selections stay local until Start.
+    reviewPicker = createModelThinkingPicker({
+        listEl: reviewList,
+        filterEl: reviewFilter,
+        chipsEl: reviewChips,
+        getState: () => boardStartState,
+        getModels: () => deps.getModels(),
+        getPane: () => deps.getPane(),
+        defaultRow: { label: 'Workspace default review model', title: 'Use the workspace default review model' },
+        inheritChipTitle: 'Inherit the workspace reasoning effort',
+        stripPaneCurrent: true,
+    });
+
     // Prompt editor: hidden until the pen icon is clicked.
     const promptSection = document.createElement('div');
     promptSection.className = 'board-start-prompt-section';
@@ -600,6 +681,8 @@ function buildBoardStartPopover() {
             model: boardStartState.model,
             prompt: boardStartState.prompt,
             thinkingLevel: boardStartState.thinkingLevel,
+            reviewModel: boardStartState.reviewModel,
+            reviewThinkingLevel: boardStartState.reviewThinkingLevel,
         });
         closeBoardStartPopover();
     });
@@ -608,6 +691,21 @@ function buildBoardStartPopover() {
 
     document.body.appendChild(pop);
     return pop;
+}
+
+// Syncs the review section with the current state: collapsed until the
+// toggle is used; the toggle stays highlighted while a per-ticket review
+// option is armed (chosen and kept after collapsing).
+function syncBoardStartReviewSection() {
+    if (!boardStartState) return;
+    const pop = document.getElementById('board-start-popover');
+    const body = pop.querySelector('.board-start-review-body');
+    const toggle = pop.querySelector('.board-start-review-toggle');
+    if (!body || !toggle) return;
+    body.hidden = !boardStartState.reviewOpen;
+    toggle.classList.toggle('active', boardStartState.reviewOpen
+        || boardStartState.reviewModel !== ''
+        || boardStartState.reviewThinkingLevel !== '');
 }
 
 // Syncs the popover's prompt editor with the current state: the

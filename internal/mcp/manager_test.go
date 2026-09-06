@@ -138,3 +138,36 @@ func TestNewManagerWithNoServers(t *testing.T) {
 		t.Fatalf("expected no tools for nil servers, got %v", defs)
 	}
 }
+
+// TestRegistryAddCollisionKeepsFirst pins the duplicate-name policy: two
+// different (server, tool) pairs can sanitize to the same LLM-visible name
+// (server "my-server" + tool "list_files" vs server "my" +
+// tool "server_list_files"), and a bare map write would silently overwrite
+// the earlier entry — the tool would vanish from the model's toolset with no
+// trace. The FIRST registration must win; the loser is logged and skipped,
+// and later non-colliding tools still register normally.
+func TestRegistryAddCollisionKeepsFirst(t *testing.T) {
+	if ExternalToolName("my-server", "list_files") != ExternalToolName("my", "server_list_files") {
+		t.Fatal("test setup: expected the two (server, tool) pairs to collide")
+	}
+	r := &Registry{tools: make(map[string]toolEntry)}
+	r.add("my-server", "list_files", llm.Tool{Name: "mcp_my_server_list_files", Description: "first"}, nil)
+	r.add("my", "server_list_files", llm.Tool{Name: "mcp_my_server_list_files", Description: "second"}, nil)
+
+	got, ok := r.tools["mcp_my_server_list_files"]
+	if !ok {
+		t.Fatal("colliding tool missing from the registry")
+	}
+	if got.server != "my-server" || got.tool != "list_files" {
+		t.Fatalf("kept entry = server %q tool %q, want the FIRST registration (my-server/list_files)", got.server, got.tool)
+	}
+	if got.schema.Description != "first" {
+		t.Fatalf("schema description = %q, want the first tool's schema", got.schema.Description)
+	}
+
+	// A non-colliding tool on the same registry still registers.
+	r.add("other", "ping", llm.Tool{Name: "mcp_other_ping"}, nil)
+	if entry, ok := r.tools["mcp_other_ping"]; !ok || entry.tool != "ping" {
+		t.Fatalf("non-colliding tool missing or wrong: %+v", entry)
+	}
+}

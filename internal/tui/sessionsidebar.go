@@ -1047,10 +1047,6 @@ func (m *Model) resumeSavedRow(id string) tea.Cmd {
 	}
 	if result.Action == agent.SessionActionClearChat {
 		cmd := m.applySessionSwitch(result)
-		// The resumed session keeps its earned position (web: makePane
-		// seeds initialActivity from the saved session's updatedAt); the
-		// left-behind session keeps its in-process output stamp.
-		m.sidebarCursor = m.sidebarFocusedRow()
 		// The resume flushed the left-behind session; surface a failed
 		// save instead of losing it silently (cmdSession's old contract).
 		m.checkPersistError()

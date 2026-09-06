@@ -587,6 +587,77 @@ func buildConfigFields() map[string]fieldSpec {
 	}
 	add(f)
 
+	// --- board auto-review agent --------------------------------------------
+	f = fieldSpec{
+		name: "reviewAgentModel",
+		get:  func(r *config.Config) any { return r.ReviewAgentModel },
+		set:  func(r *config.Config, v any) { r.ReviewAgentModel = v.(string) },
+		fromMsg: func(m *WSMessage) any {
+			if m.ReviewAgentModel == nil {
+				return ""
+			}
+			return *m.ReviewAgentModel
+		},
+		// The default model for auto review sessions; empty clears back
+		// to the cascade (the ticket's own override, then the workspace
+		// default). Any model id string is accepted — catalog validation
+		// is fail-open at review-start time (the cascade falls through to
+		// the workspace default when unselectable).
+		normalize: func(v any) (any, string) {
+			raw := v.(string)
+			val := strings.TrimSpace(raw)
+			if raw != "" && val == "" {
+				return nil, "Error: reviewAgentModel must be a model id or empty (cascade)"
+			}
+			return val, ""
+		},
+		// Pointer so config pushes always carry it — including the empty
+		// "cascade" state a clear by one tab must broadcast to every tab.
+		project: func(r *config.Config, m *WSMessage) { m.ReviewAgentModel = &r.ReviewAgentModel },
+		msgGet: func(m *WSMessage) any {
+			if m.ReviewAgentModel == nil {
+				return nil
+			}
+			return *m.ReviewAgentModel
+		},
+		sample: "gpt-4o-mini",
+	}
+	add(f)
+
+	f = fieldSpec{
+		name: "reviewAgentThinkingLevel",
+		get:  func(r *config.Config) any { return r.ReviewAgentThinkingLevel },
+		set:  func(r *config.Config, v any) { r.ReviewAgentThinkingLevel = v.(string) },
+		fromMsg: func(m *WSMessage) any {
+			if m.ReviewAgentThinkingLevel == nil {
+				return ""
+			}
+			return *m.ReviewAgentThinkingLevel
+		},
+		// The reasoning-effort level for auto review sessions; empty
+		// clears back to "inherit the workspace level". Normalized to a
+		// literal reasoning_effort value; validity against the reviewer's
+		// final model is resolved at review start (the per-ticket
+		// override wins, so the server cannot validate it here).
+		normalize: func(v any) (any, string) {
+			raw := v.(string)
+			val := string(agent.NormalizeThinkingLevel(raw))
+			if raw != "" && val == "" {
+				return nil, "Error: reviewAgentThinkingLevel must be a reasoning-effort value or empty (inherit)"
+			}
+			return val, ""
+		},
+		project: func(r *config.Config, m *WSMessage) { m.ReviewAgentThinkingLevel = &r.ReviewAgentThinkingLevel },
+		msgGet: func(m *WSMessage) any {
+			if m.ReviewAgentThinkingLevel == nil {
+				return nil
+			}
+			return *m.ReviewAgentThinkingLevel
+		},
+		sample: "high",
+	}
+	add(f)
+
 	f = fieldSpec{
 		name: "subagentThinkingLevel",
 		get:  func(r *config.Config) any { return r.SubagentThinkingLevel },
@@ -635,6 +706,20 @@ func buildConfigFields() map[string]fieldSpec {
 		m.BoardStartPrompt = agent.ResolvePromptTemplate(r.BoardStartPrompt, agent.DefaultBoardStartPrompt)
 	}
 	f.sample = "board tmpl {title}"
+	add(f)
+
+	f = strSpec("boardReviewPrompt",
+		func(r *config.Config) string { return r.BoardReviewPrompt },
+		func(r *config.Config, v string) { r.BoardReviewPrompt = v },
+		func(m *WSMessage) string { return m.BoardReviewPrompt },
+		func(m *WSMessage, v string) { m.BoardReviewPrompt = v })
+	f.normalize = promptNormalize("boardReviewPrompt", func() string { return agent.DefaultReviewAgentPrompt })
+	// Pushed as the RESOLVED effective template (empty config → built-in
+	// default), so the modal is pre-populated with what will be used.
+	f.project = func(r *config.Config, m *WSMessage) {
+		m.BoardReviewPrompt = agent.ResolvePromptTemplate(r.BoardReviewPrompt, agent.DefaultReviewAgentPrompt)
+	}
+	f.sample = "review tmpl {title}"
 	add(f)
 
 	f = strSpec("systemPrompt",

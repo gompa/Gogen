@@ -238,3 +238,137 @@ func TestSessionCloseUnknownIDIgnored(t *testing.T) {
 	stub.releaseN(1)
 	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "turn_end" && m.SessionID == sid })
 }
+
+// TestSessionCloseClaimRefusesRacingAttach pins the TOCTOU fix in
+// wsHandleClose: the clientless check and the close are one atomic claim, so
+// a viewer that resolved the runtime before the close and attaches after the
+// claim is refused — it never sits attached to a runtime the close evicts
+// from under it (nor has a turn started in the window cancelled). Pre-fix,
+// a plain clientCount()==0 followed by closeRuntime let the racing attach
+// land in between and inherit the doomed runtime.
+//
+// The runtime is marked held so detach's orphan eviction cannot remove it
+// first (that path refuses attaches via the evicted flag); the test must
+// exercise the closing latch specifically.
+func TestSessionCloseClaimRefusesRacingAttach(t *testing.T) {
+	r := newSessionRegistry(0)
+	rt := newTestRuntime(t)
+	rt.agent.SessionID = "a"
+	r.register("a", rt)
+	rt.held.Store(true) // detach must not orphan-evict before the claim
+
+	wsA := newFakeWSConn()
+	if !rt.attach(wsA) {
+		t.Fatal("setup: viewer attach refused")
+	}
+	wsB := newFakeWSConn()
+	// wsB is the racing viewer: it resolved this runtime (registry.get)
+	// BEFORE the close began — its handler holds this doomed *sessionRuntime
+	// from here on. The interleaving below starts after that resolution.
+
+	// The close begins: detach, then claim.
+	rt.detach(wsA)
+	if !rt.claimClose() {
+		t.Fatal("claimClose refused a clientless runtime")
+	}
+
+	// The racing attach lands AFTER the claim: refused, and the runtime
+	// carries no client the eviction could sweep.
+	if rt.attach(wsB) {
+		t.Fatal("attach succeeded on a closing runtime (TOCTOU is back)")
+	}
+	if rt.clientCount() != 0 {
+		t.Fatalf("clients after refused attach = %d, want 0", rt.clientCount())
+	}
+
+	// The claimed close proceeds unconditionally (held runtimes are exempt
+	// from ORPHAN eviction only — an explicit close still evicts).
+	r.closeRuntime(rt)
+	if _, ok := r.get("a"); ok {
+		t.Fatal("claimed runtime not evicted by closeRuntime")
+	}
+
+	// Counterfactual: a viewer that attaches BEFORE the claim keeps the
+	// session open — the claim fails and the close handler returns without
+	// closing (another tab is watching).
+	rt2 := newTestRuntime(t)
+	rt2.agent.SessionID = "b"
+	rt2.held.Store(true)
+	r.register("b", rt2)
+	if !rt2.attach(wsB) {
+		t.Fatal("setup: viewer attach refused")
+	}
+	rt2.detach(wsA) // foreign socket: a no-op detach
+	if rt2.claimClose() {
+		t.Fatal("claimClose succeeded while a viewer was attached")
+	}
+	if _, ok := r.get("b"); !ok {
+		t.Fatal("runtime evicted though a viewer attached before the claim")
+	}
+
+	// The failed claim must not latch: the session is still normally
+	// closable once its viewer leaves.
+	rt2.detach(wsB)
+	if !rt2.claimClose() {
+		t.Fatal("claimClose refused a clientless runtime after the viewer left")
+	}
+	r.closeRuntime(rt2)
+	if _, ok := r.get("b"); ok {
+		t.Fatal("runtime not evicted after its viewer left and the close was claimed")
+	}
+}
+
+// TestSessionCloseAttachRaceInvariant hammers the attach-vs-close race the
+// claim fixes: a viewer attach concurrent with the close's detach+claim must
+// resolve to exactly one winner, serialized by clientsMu — either the attach
+// lands first and the runtime stays open (registered, not closing), or the
+// claim wins and the attach is refused (the runtime is evicted with zero
+// clients). The pre-fix code allowed the poisonous middle: attach true AND
+// evicted.
+func TestSessionCloseAttachRaceInvariant(t *testing.T) {
+	const iterations = 100
+	for i := 0; i < iterations; i++ {
+		r := newSessionRegistry(0)
+		rt := newTestRuntime(t)
+		rt.agent.SessionID = "a"
+		r.register("a", rt)
+		rt.held.Store(true) // detach must not orphan-evict before the claim
+
+		wsA := newFakeWSConn()
+		if !rt.attach(wsA) {
+			t.Fatal("setup: viewer attach refused")
+		}
+		wsB := newFakeWSConn()
+
+		// wsB resolved rt before the close and attaches concurrently with
+		// the close's detach + claim.
+		attachOK := make(chan bool, 1)
+		go func() { attachOK <- rt.attach(wsB) }()
+		rt.detach(wsA)
+		claimed := rt.claimClose()
+		if claimed {
+			r.closeRuntime(rt)
+		}
+		bOK := <-attachOK
+
+		switch {
+		case bOK && claimed:
+			t.Fatalf("iteration %d: attach and claim both won (clientsMu did not serialize them)", i)
+		case !bOK && !claimed:
+			t.Fatalf("iteration %d: attach and claim both lost", i)
+		case bOK:
+			// The attach won: the session must stay open for the new viewer.
+			if _, ok := r.get("a"); !ok {
+				t.Fatalf("iteration %d: attach succeeded but the runtime was still evicted", i)
+			}
+		default:
+			// The claim won: the refused viewer is not swept by the eviction.
+			if _, ok := r.get("a"); ok {
+				t.Fatalf("iteration %d: claimed runtime not evicted", i)
+			}
+			if n := rt.clientCount(); n != 0 {
+				t.Fatalf("iteration %d: evicted runtime holds %d clients", i, n)
+			}
+		}
+	}
+}

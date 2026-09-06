@@ -132,7 +132,11 @@ type configYAML struct {
 	SubagentMaxConcurrent     int                           `yaml:"subagent_max_concurrent,omitempty"`
 	SubagentModel             string                        `yaml:"subagent_model,omitempty"`
 	SubagentThinkingLevel     string                        `yaml:"subagent_thinking_level,omitempty"`
+	ReviewAgent               string                        `yaml:"review_agent,omitempty"`
+	ReviewAgentModel          string                        `yaml:"review_agent_model,omitempty"`
+	ReviewAgentThinkingLevel  string                        `yaml:"review_agent_thinking_level,omitempty"`
 	BoardStartPrompt          string                        `yaml:"board_start_prompt,omitempty"`
+	BoardReviewPrompt         string                        `yaml:"board_review_prompt,omitempty"`
 	SystemPrompt              string                        `yaml:"system_prompt,omitempty"`
 	SubagentPrompt            string                        `yaml:"subagent_prompt,omitempty"`
 	AgentInstructions         string                        `yaml:"agent_instructions,omitempty"`
@@ -213,7 +217,11 @@ func buildConfigYAML(cfg *config.Config, opts WriteOptions) (string, error) {
 		SubagentMaxConcurrent:     omitDefaultInt(cfg.SubagentMaxConcurrent, def.SubagentMaxConcurrent),
 		SubagentModel:             cfg.SubagentModel,
 		SubagentThinkingLevel:     cfg.SubagentThinkingLevel,
+		ReviewAgent:               omitDefaultString(cfg.ReviewAgent, def.ReviewAgent),
+		ReviewAgentModel:          cfg.ReviewAgentModel,
+		ReviewAgentThinkingLevel:  cfg.ReviewAgentThinkingLevel,
 		BoardStartPrompt:          cfg.BoardStartPrompt,
+		BoardReviewPrompt:         cfg.BoardReviewPrompt,
 		SystemPrompt:              cfg.SystemPrompt,
 		SubagentPrompt:            cfg.SubagentPrompt,
 		AgentInstructions:         omitDefaultString(cfg.AgentInstructions, def.AgentInstructions),

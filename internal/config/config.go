@@ -207,10 +207,33 @@ type Config struct {
 	// save time).
 	SubagentThinkingLevel string
 
+	// ReviewAgent enables the board auto-review agent ("on"/"off"; default
+	// off; web mode only): when on, a ticket moved into in_review — by an
+	// agent's board tool or by the user — automatically spawns a headless
+	// review session that marks the ticket done or comments findings and
+	// moves it back to in_progress.
+	ReviewAgent string
+	// ReviewAgentModel is the default model for auto review sessions.
+	// Empty (the default) resolves the cascade per ticket: the ticket's
+	// own review model override, then the workspace default model.
+	ReviewAgentModel string
+	// ReviewAgentThinkingLevel is the reasoning-effort level for auto
+	// review sessions. Empty (the default) inherits the workspace
+	// thinking level; "off" never sends reasoning_effort; any other value
+	// is a literal reasoning_effort value, sent only when the reviewer's
+	// final model accepts it (a per-ticket override wins over this
+	// setting; validity is resolved against the final model at review
+	// start, never at save time).
+	ReviewAgentThinkingLevel string
+
 	// BoardStartPrompt is the template for prompts given to agents started
 	// from a board ticket ("" = the built-in default). Placeholders:
 	// {id} {title} {description} {priority} {context}.
 	BoardStartPrompt string
+	// BoardReviewPrompt is the template for prompts given to auto review
+	// agents ("" = the built-in default). Placeholders: {id} {title}
+	// {description} {priority} {context} {assignee}.
+	BoardReviewPrompt string
 	// SystemPrompt is a custom system prompt template ("" = the built-in
 	// default). The {working_dir} placeholder is substituted with the
 	// working directory; the project profile, project rules, and plan-mode
@@ -325,6 +348,13 @@ func (c *Config) BoardEnabled() bool {
 // Opt-in: the tool is not registered unless subagent is explicitly enabled.
 func (c *Config) SubagentEnabled() bool {
 	return c != nil && configOn(c.Subagent)
+}
+
+// ReviewAgentEnabled reports whether the board auto-review agent is active.
+// Opt-in: a ticket moved into in_review spawns no review session unless
+// review_agent is explicitly enabled (web mode only).
+func (c *Config) ReviewAgentEnabled() bool {
+	return c != nil && configOn(c.ReviewAgent)
 }
 
 // AgentInstructionsEnabled reports whether AGENTS.md/CLAUDE.md workspace
