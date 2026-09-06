@@ -19,6 +19,7 @@ import (
 type FeatureFlags struct {
 	boardEnabled          atomic.Bool
 	subagentsEnabled      atomic.Bool
+	automationsEnabled    atomic.Bool
 	subagentMaxDepth      atomic.Int32
 	subagentMaxConcurrent atomic.Int32
 	reviewAgentEnabled    atomic.Bool
@@ -49,6 +50,18 @@ func (f *FeatureFlags) SetBoardEnabled(on bool) {
 // SubagentsEnabled reports whether the subagent feature is active.
 func (f *FeatureFlags) SubagentsEnabled() bool {
 	return f.subagentsEnabled.Load()
+}
+
+// AutomationsEnabled reports whether the automation scheduler may fire
+// (host-level flag: the scheduler sweeps and fires due automations while a
+// TUI/web host with this flag on is running, see internal/automation).
+func (f *FeatureFlags) AutomationsEnabled() bool {
+	return f.automationsEnabled.Load()
+}
+
+// SetAutomationsEnabled toggles the automation scheduler flag (live).
+func (f *FeatureFlags) SetAutomationsEnabled(on bool) {
+	f.automationsEnabled.Store(on)
 }
 
 // SetSubagentsEnabled toggles the subagent feature.
@@ -190,6 +203,19 @@ func (a *Agent) SetReviewAgentEnabled(on bool) {
 // ReviewAgentEnabled reports whether the board auto-review agent is active.
 func (a *Agent) ReviewAgentEnabled() bool {
 	return a.flags().ReviewAgentEnabled()
+}
+
+// SetAutomationsEnabled toggles the automation scheduler flag for this
+// agent (see SetReviewAgentEnabled for the live-toggle contract). The flag
+// gates the HOST-side scheduler: with it on, a running TUI/web host fires
+// due automations as headless runs.
+func (a *Agent) SetAutomationsEnabled(on bool) {
+	a.flags().SetAutomationsEnabled(on)
+}
+
+// AutomationsEnabled reports whether the automation scheduler may fire.
+func (a *Agent) AutomationsEnabled() bool {
+	return a.flags().AutomationsEnabled()
 }
 
 // SubagentMaxConcurrent returns the effective per-parent concurrent-subagent

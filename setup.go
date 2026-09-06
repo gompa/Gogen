@@ -83,6 +83,7 @@ func newAgent(cfg *config.Config, isGlobalMode bool) (*agent.Agent, string, []st
 	// supports live toggles via the config WS message).
 	a.SetBoardEnabled(cfg.BoardEnabled())
 	a.SetSubagentsEnabled(cfg.SubagentEnabled())
+	a.SetAutomationsEnabled(cfg.AutomationsEnabled())
 	a.SetSubagentMaxDepth(cfg.SubagentDepth())
 	a.SetSubagentMaxConcurrent(cfg.SubagentLimit())
 	if cfg.BoardEnabled() {

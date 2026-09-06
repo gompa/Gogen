@@ -51,6 +51,9 @@ const COMPONENT_MODULES = [
   'internal/server/web/components/tool-result.js',
   'internal/server/web/components/model-picker.js',
   'internal/server/web/components/board.js',
+  // Automations tab; imports icons.js only. Eval'd before settings.js,
+  // whose applyFeatureSettings toggles the automations tab.
+  'internal/server/web/components/automations.js',
   'internal/server/web/components/toc.js',
   // Imports toc.js (updateTocActive / syncTocRailBox / hideTocTooltip) and
   // editor.js (chatDiffWheelEdge, stubbed above).

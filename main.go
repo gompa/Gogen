@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"gogen/internal/agent"
+	"gogen/internal/automation"
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/debuglog"
@@ -118,6 +119,14 @@ func main() {
 // on both the success and error paths; main only translates a returned error
 // into a non-zero exit code.
 func run() error {
+	// The `gogen automation` subcommand tree (internal/automation) talks
+	// straight to the file store: no agent, no API key, no mode setup.
+	// Dispatched before everything else so its own flags (-json, --daily,
+	// ...) never reach the main flag parser.
+	if len(os.Args) > 1 && os.Args[1] == "automation" {
+		return automation.RunCLI(os.Args[2:])
+	}
+
 	opts, workingDir := parseCLIOptions()
 
 	profiling.Start()
@@ -249,6 +258,14 @@ func runSinglePrompt(ctx context.Context, a *agent.Agent, prompt string, cfg *co
 	a.SetSessionID(session.NewID())
 	a.SessionOneshot = true
 	a.FlushSession()
+
+	// Automation runs report their session id through this file so the
+	// scheduler can link the fired session into the run history (the
+	// SessionIDFileEnv contract, see internal/automation/fire.go).
+	// Best-effort: a failed write never breaks the headless run.
+	if p := os.Getenv(automation.SessionIDFileEnv); p != "" {
+		_ = os.WriteFile(p, []byte(a.SessionID), 0o644)
+	}
 
 	var final strings.Builder
 	handlers := &llm.StreamHandlers{

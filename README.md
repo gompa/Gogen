@@ -170,6 +170,7 @@ review_agent: off  # auto-review: a ticket moved into in_review spawns a review 
 review_agent_model: gpt-4o-mini  # default review model (empty = ticket override, else workspace default)
 review_agent_thinking_level: high  # review agent reasoning effort (empty = inherit the workspace level)
 job_notices: off   # notify the session when a background command finishes
+automations: off   # file-based cron scheduler: fire saved prompts as headless runs on a schedule
 skills: off        # skill tool (list/read over .gogen/skills + ~/.config/gogen/skills)
 agent_instructions: off  # load AGENTS.md / CLAUDE.md workspace instruction files
 web_bind: 0.0.0.0:8080  # web listen address (applies on next start; also GOGEN_WEB_BIND / --host)
@@ -557,12 +558,87 @@ export GOGEN_PRESERVE_REASONING=on
 ./gogen
 ```
 
+## Automations
+
+Automations are saved **prompt + working dir + schedule** records that a
+running GoGen fires as headless runs at the scheduled time — the "fleet runs
+itself" loop on top of the board and subagents.
+
+```bash
+# Create: pass exactly one schedule selector.
+gogen automation create "Nightly triage" \
+  --prompt "Triage new GitHub issues and update the board" \
+  --dir /path/to/repo --daily --time 22:00 --timezone America/New_York
+
+gogen automation create "Hourly build check" \
+  --prompt "Run the build and report failures" --hourly --minute 15
+
+gogen automation create "Monday standup notes" \
+  --prompt "Summarize last week's board activity" --weekly 1
+
+# Inspect / manage
+gogen automation ls [--json]
+gogen automation get <id> [--json]
+gogen automation runs <id> [--json]     # run history (status + session id)
+gogen automation update <id> [--title T] [--prompt P] [--dir PATH]
+    [--at|--daily|--hourly|--weekdays|--weekly DAYS] [--time HH:MM]
+    [--minute M] [--timezone IANA] [--enable|--disable] [--json]
+gogen automation enable <id> | disable <id>
+gogen automation delete <id> --yes
+```
+
+`update` is a PATCH: pass at least one field, omitted fields keep their
+stored values. A schedule selector (or `--time`/`--minute`/`--timezone`)
+re-times the next run; editing only the prompt/direction leaves an imminent
+run where it was.
+
+How it works:
+
+- **Storage**: records live in the global config dir as JSON —
+  `~/.config/gogen/automations.json` plus a bounded run-history file
+  (`automation_runs.json`, newest-first, 25 runs per automation). Every
+  write is atomic; a corrupted store file surfaces as an error message
+  (never a panic, and never overwritten).
+- **Schedules**: `once` (RFC 3339 `--at`, or `2006-01-02 15:04` interpreted
+  in `--timezone`), `hourly` (`--minute`), `daily` / `weekdays` /
+  `weekly <0=Sun…6=Sat>` at `--time`, all evaluated in an IANA `--timezone`
+  (empty = the machine's local zone). Wall-clock times stay pinned across
+  DST shifts: a nonexistent time in a spring-forward gap fires just after
+  the gap (02:30 → 03:30), the fall-back duplicate takes the earlier
+  occurrence.
+- **Firing**: while the `automations` feature flag (below) is on, a running
+  TUI or web host sweeps the store every 30 s. Each due automation starts a
+  detached `gogen -p <prompt> --dir <working_dir>` subprocess — the same
+  headless path as a manual run, in its own process, so a failing run is
+  recorded as a failed run and never crashes the host. Every run gets a
+  history entry (`running` → `completed`/`failed`) linking the fired
+  session's id; a run capped at 60 minutes is killed and recorded as
+  failed.
+- **Catch-up policy**: a due automation fires if it is less than one hour
+  overdue (e.g. GoGen opened shortly after the scheduled time); anything
+  older — missed while no host was running — is recorded as a `missed` run
+  and the schedule advances without firing. `once` schedules disarm
+  themselves after their fire (or miss); runs left `running` by a previous
+  host session are marked `interrupted` at startup.
+- **The flag**: `automations: on` (config file, `GOGEN_AUTOMATIONS`, or the
+  web Settings → Agent toggle) gates firing only — the CLI manages records
+  whether or not the flag is on. Automations fire only while a GoGen host
+  is running; running two hosts (e.g. TUI and web server) with the flag on
+  fires each schedule in both — keep one host with the flag on.
+- **Web tab**: with the flag on, an **Automations** tab appears in the web
+  UI next to Board — the saved jobs with their schedule, next run and last
+  status, per-job Edit / Pause / Enable / Delete, an expandable run history
+  (status + session id per run), and a create form (title, prompt, working
+  dir, schedule selectors, timezone). The CLI and the tab edit the same
+  store, so both stay in sync.
+
 ## Architecture
 
 ```
 main.go
 └── internal/
     ├── agent/       — Core agent logic, tool execution, safety guards
+    ├── automation/  — File-based cron scheduler (saved prompts on a schedule)
     ├── projectfile/ — .gogen/gogen.conf and .md file loading/merging/writing
     ├── mcp/         — MCP stdio client and tool registry
     ├── session/     — Conversation persistence (JSON snapshots on disk)

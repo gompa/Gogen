@@ -290,6 +290,26 @@ func TestMergeJobNoticesFlag(t *testing.T) {
 	}
 }
 
+// TestMergeAutomationsFlag pins the automations feature flag merge: default
+// off, file value applies, env overrides file.
+func TestMergeAutomationsFlag(t *testing.T) {
+	os.Unsetenv("GOGEN_AUTOMATIONS")
+	if Merge(nil, FlagOverrides{}).AutomationsEnabled() {
+		t.Fatal("automations should default off")
+	}
+	pf, err := ParseContent("GOGEN.md", "---\nautomations: on\n---\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !Merge(pf, FlagOverrides{}).AutomationsEnabled() {
+		t.Fatal("file automations: on should enable")
+	}
+	t.Setenv("GOGEN_AUTOMATIONS", "off")
+	if Merge(pf, FlagOverrides{}).AutomationsEnabled() {
+		t.Fatal("env off should override file on")
+	}
+}
+
 func TestMergeBoardSubagentFlags(t *testing.T) {
 	for _, env := range []string{"GOGEN_BOARD", "GOGEN_SUBAGENT", "GOGEN_SUBAGENT_MAX_DEPTH", "GOGEN_SUBAGENT_MAX_CONCURRENT"} {
 		os.Unsetenv(env)

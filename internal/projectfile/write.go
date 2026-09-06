@@ -142,6 +142,7 @@ type configYAML struct {
 	AgentInstructions         string                        `yaml:"agent_instructions,omitempty"`
 	Skills                    string                        `yaml:"skills,omitempty"`
 	JobNotices                string                        `yaml:"job_notices,omitempty"`
+	Automations               string                        `yaml:"automations,omitempty"`
 	SessionMaxCount           int                           `yaml:"session_max_count,omitempty"`
 	SessionMaxAgeDays         int                           `yaml:"session_max_age_days,omitempty"`
 	WebMaxActiveSessions      int                           `yaml:"web_max_active_sessions,omitempty"`
@@ -227,6 +228,7 @@ func buildConfigYAML(cfg *config.Config, opts WriteOptions) (string, error) {
 		AgentInstructions:         omitDefaultString(cfg.AgentInstructions, def.AgentInstructions),
 		Skills:                    omitDefaultString(cfg.Skills, def.Skills),
 		JobNotices:                omitDefaultString(cfg.JobNotices, def.JobNotices),
+		Automations:               omitDefaultString(cfg.Automations, def.Automations),
 		SessionMaxCount:           omitDefaultInt(cfg.SessionMaxCount, def.SessionMaxCount),
 		SessionMaxAgeDays:         omitDefaultInt(cfg.SessionMaxAgeDays, def.SessionMaxAgeDays),
 		WebMaxActiveSessions:      omitDefaultInt(cfg.WebMaxActiveSessions, def.WebMaxActiveSessions),

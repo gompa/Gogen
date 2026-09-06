@@ -281,6 +281,18 @@ func (ws *Workspace) SetBoardEnabled(on bool) {
 	ws.flags().SetBoardEnabled(on)
 }
 
+// GetAutomationsEnabled returns the live automations feature flag (host
+// scheduler gate; the scheduler start/stop rides on the server).
+func (ws *Workspace) GetAutomationsEnabled() bool {
+	return ws.flags().AutomationsEnabled()
+}
+
+// SetAutomationsEnabled updates the live automations feature flag (shared
+// store, see SetBoardEnabled).
+func (ws *Workspace) SetAutomationsEnabled(on bool) {
+	ws.flags().SetAutomationsEnabled(on)
+}
+
 // GetSubagentEnabled returns the live subagent feature flag.
 func (ws *Workspace) GetSubagentEnabled() bool {
 	return ws.flags().SubagentsEnabled()
@@ -563,6 +575,7 @@ func newWorkspaceFromAgent(a *agent.Agent, cfg *config.Config) *Workspace {
 	))
 	if cfg != nil {
 		ws.flags().SetReviewAgentEnabled(cfg.ReviewAgentEnabled())
+		ws.flags().SetAutomationsEnabled(cfg.AutomationsEnabled())
 	}
 	if cfg != nil && cfg.BoardEnabled() {
 		// The workspace owns the single board manager; session agents are

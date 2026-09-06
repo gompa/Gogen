@@ -44,6 +44,14 @@
             requestBoardState,
         } from '/components/board.js';
         import {
+            automationsPaneVisible,
+            handleAutomationsRuns,
+            handleAutomationsState,
+            initAutomations,
+            renderAutomations,
+            requestAutomationsState,
+        } from '/components/automations.js';
+        import {
             appendTocDot,
             hideTocTooltip,
             initToc,
@@ -335,6 +343,9 @@
                 }
                 if (btn.dataset.pane === 'board') {
                     requestBoardState();
+                }
+                if (btn.dataset.pane === 'automations') {
+                    requestAutomationsState();
                 }
             });
         });
@@ -3638,6 +3649,8 @@
             context: handleContext,
             delete_approval: handleDeleteApproval,
             board_state: handleBoardState,
+            automations_state: handleAutomationsState,
+            automations_runs: handleAutomationsRuns,
             notice: handleNotice,
             provider_test: handleProviderTest,
             mcp_test: handleMCPTest,
@@ -4782,10 +4795,11 @@
                 return;
             }
             showToast(data.content || 'Operation failed', 'error');
-            // Failed board ops resync the board — but only while the tab
-            // is visible: a rejected op when the feature is disabled must
-            // not re-trigger another op (toast/resync loop).
+            // Failed board/automation ops resync their tab — but only while
+            // the tab is visible: a rejected op when the feature is
+            // disabled must not re-trigger another op (toast/resync loop).
             if (data.kind === 'board' && boardTabVisible()) requestBoardState();
+            if (data.kind === 'automations' && automationsPaneVisible()) requestAutomationsState();
         }
 
         function sendMessage() {
@@ -4979,6 +4993,10 @@
                 // (handleBoardState skips hidden panes), so paint the
                 // stored lastBoardState now that it's on screen.
                 renderBoard();
+            }
+            if (pane === 'automations') {
+                // Same visibility-gated render contract as the board.
+                renderAutomations();
             }
         }
 
@@ -5423,6 +5441,13 @@
             },
             getModels: () => availableModels,
             getPane: () => activePane(),
+        });
+
+        // === Automations tab (scheduled jobs) ===
+        initAutomations({
+            getWs: () => ws,
+            showToast: (message, kind) => showToast(message, kind),
+            switchMainPane: (pane) => switchMainPane(pane),
         });
 
         // Create the initial pane (the server's default session). Its session

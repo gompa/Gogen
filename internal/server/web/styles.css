@@ -1586,6 +1586,67 @@
         #board-view { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 12px; }
         #board-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
         #board-header h3 { margin: 0; }
+
+        /* Automations pane: the scheduled-jobs table + create form. */
+        #automations-pane { flex-direction: column; background: var(--bg); overflow-y: auto; }
+        #automations-view { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 12px; gap: 12px; }
+        #automations-header { display: flex; align-items: center; justify-content: space-between; }
+        #automations-header h3 { margin: 0; }
+        .automations-header-actions { display: flex; gap: 8px; }
+        .automations-row {
+            display: grid;
+            grid-template-columns: 1fr auto auto;
+            gap: 12px; align-items: center;
+            padding: 10px 12px;
+            background: var(--bg-elevated, var(--bg));
+            border: 1px solid var(--border); border-radius: var(--radius-lg, 8px);
+        }
+        .automations-row.paused { opacity: 0.65; }
+        .automations-row-main { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+        .automations-row-title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .automations-row-meta, .automations-row-status {
+            font-size: 0.85em; color: var(--fg-muted);
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .automations-row-next { font-size: 0.85em; color: var(--accent); white-space: nowrap; }
+        .automations-row.paused .automations-row-next { color: var(--fg-muted); }
+        .automations-row-actions { display: flex; gap: 6px; }
+        .automations-row-actions button {
+            display: inline-flex; align-items: center; gap: 4px;
+            padding: 4px 8px; font-size: 0.85em;
+        }
+        .automations-row-actions .icon { width: 14px; height: 14px; }
+        .automations-runs { padding: 4px 12px 10px 12px; border-left: 2px solid var(--border); margin-left: 12px; }
+        .automations-runs-table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+        .automations-runs-table th, .automations-runs-table td {
+            text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border);
+        }
+        .automations-runs-table th { color: var(--fg-muted); font-weight: 600; }
+        .automations-runs-table td.run-detail {
+            max-width: 420px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+            color: var(--fg-muted);
+        }
+        .run-status.run-completed { color: var(--success); }
+        .run-status.run-failed { color: var(--warn, #f87171); }
+        .run-status.run-missed, .run-status.run-interrupted { color: var(--fg-muted); }
+        .run-status.run-running { color: var(--accent); }
+        .automations-note { color: var(--fg-muted); font-size: 0.9em; padding: 4px 2px; }
+        .automations-note.error { color: var(--warn, #f87171); }
+        #automations-list { display: flex; flex-direction: column; gap: 8px; }
+        #automations-form {
+            background: var(--bg-elevated, var(--bg));
+            border: 1px solid var(--border); border-radius: var(--radius-lg, 8px);
+            padding: 12px; display: flex; flex-direction: column; gap: 10px;
+        }
+        .automations-form-grid { display: flex; flex-direction: column; gap: 8px; }
+        .automations-form-row { display: grid; grid-template-columns: 220px 1fr; gap: 8px; align-items: center; }
+        .automations-form-row label { font-size: 0.9em; color: var(--fg-muted); }
+        .automations-form-row textarea { font-family: inherit; resize: vertical; }
+        .automations-form-check { display: flex; align-items: center; gap: 8px; }
+        .automations-form-check label { color: var(--fg, inherit); }
+        .automations-form-actions { display: flex; justify-content: flex-end; gap: 8px; }
+        #automations-form[hidden] { display: none; }
+        .automations-row-actions button, #automations-form button { cursor: pointer; }
         .board-columns { flex: 1; min-height: 0; display: flex; gap: 12px; overflow-x: auto; }
         #board-add-form { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
         #board-add-form input[type="text"] { flex: 1; min-width: 180px; }

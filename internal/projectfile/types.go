@@ -85,6 +85,7 @@ type FileConfig struct {
 	AgentInstructions         string                `yaml:"agent_instructions"`
 	Skills                    string                `yaml:"skills"`
 	JobNotices                string                `yaml:"job_notices"`
+	Automations               string                `yaml:"automations"`
 	// KeepRecentMessages is the pre-rename spelling of
 	// compact_keep_recent_messages, accepted for back-compat with a
 	// deprecation warning and cleared by parseYAMLFrontMatter after aliasing.

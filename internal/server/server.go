@@ -112,6 +112,11 @@ type Server struct {
 	// until installReviewAgent first runs; the trigger itself re-checks
 	// the review-agent feature flag on every fire.
 	reviewTrigger *boardReviewTrigger
+
+	// automations owns the automation scheduler lifecycle (see
+	// automation_sched.go): started with Start / the settings toggle,
+	// stopped on toggle-off and shutdown.
+	automations automationHost
 }
 
 func NewServer(a *agent.Agent, cfg *config.Config) *Server {
@@ -514,6 +519,14 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 
 	s.trackHTTPServer(srv)
 	defer s.untrackHTTPServer()
+
+	// Automation scheduler: sweep the global store while the server runs
+	// (only when the automations feature flag is on; the settings toggle
+	// can start/stop it live). Nil-safe for bare-Server tests.
+	if s.ws != nil && s.ws.GetAutomationsEnabled() {
+		s.startAutomations()
+	}
+	defer s.stopAutomations()
 
 	select {
 	case <-ctx.Done():

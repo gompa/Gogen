@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"gogen/internal/agent"
+	"gogen/internal/automation"
 	"gogen/internal/llm"
 	"gogen/internal/streambuf"
 )
@@ -101,6 +102,45 @@ type BoardOpRequest struct {
 	// model at review-start time.
 	ReviewModel         string `json:"reviewModel,omitempty"`
 	ReviewThinkingLevel string `json:"reviewThinkingLevel,omitempty"`
+}
+
+// AutomationsOpRequest is one automations-tab operation sent client→server
+// as an "automations_op" message: list/runs (reads) or create/enable/
+// disable/delete (mutations — each broadcast a fresh automations_state).
+// The create fields mirror the `gogen automation create` flags; exactly one
+// schedule kind is required and the server validates via the same
+// Automation.Validate as the CLI.
+type AutomationsOpRequest struct {
+	Action string `json:"action,omitempty"`
+	ID     string `json:"id,omitempty"`
+	// Create fields.
+	Title      string `json:"title,omitempty"`
+	Prompt     string `json:"prompt,omitempty"`
+	WorkingDir string `json:"workingDir,omitempty"`
+	Kind       string `json:"kind,omitempty"`
+	At         string `json:"at,omitempty"`
+	Time       string `json:"time,omitempty"`
+	Minute     int    `json:"minute,omitempty"`
+	Weekdays   []int  `json:"weekdays,omitempty"`
+	Timezone   string `json:"timezone,omitempty"`
+	// StartDisabled creates the automation paused.
+	StartDisabled bool `json:"startDisabled,omitempty"`
+}
+
+// AutomationsState is the automations-tab snapshot (server→client): the
+// feature-flag state, the store health, and all saved automations.
+type AutomationsState struct {
+	Enabled     bool                    `json:"enabled"`
+	StoreOK     bool                    `json:"storeOk"`
+	StoreError  string                  `json:"storeError,omitempty"`
+	Automations []automation.Automation `json:"automations"`
+}
+
+// AutomationsRunsPayload is the run history of one automation
+// (server→client reply to the "runs" op).
+type AutomationsRunsPayload struct {
+	AutomationID string           `json:"automationId"`
+	Runs         []automation.Run `json:"runs"`
 }
 
 // ProviderEntry is one registered OpenAI-compatible provider in the config
@@ -305,6 +345,19 @@ type WSMessage struct {
 	// ReviewAgent is the live board auto-review flag state ("on"/"off"),
 	// same contract as Board/Subagent.
 	ReviewAgent string `json:"reviewAgent,omitempty"`
+	// Automations is the live automation-scheduler flag state ("on"/"off"),
+	// same contract as Board/Subagent. Toggling it starts/stops the
+	// host-side automation scheduler live (see internal/automation).
+	Automations string `json:"automations,omitempty"`
+	// AutomationsOp carries an automations-tab operation (client→server
+	// "automations_op").
+	AutomationsOp *AutomationsOpRequest `json:"automationsOp,omitempty"`
+	// AutomationsState carries the full automations-tab snapshot
+	// (server→client, after every mutation and on request).
+	AutomationsState *AutomationsState `json:"automationsState,omitempty"`
+	// AutomationsRuns carries the run history of one automation
+	// (server→client reply to the "runs" op).
+	AutomationsRuns *AutomationsRunsPayload `json:"automationsRuns,omitempty"`
 	// ReviewAgentModel is the live default model for auto review sessions
 	// (client→server value inside ConfigFields; server→client current
 	// value in config pushes). A POINTER like SubagentModel so config

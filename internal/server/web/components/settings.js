@@ -28,6 +28,7 @@
 
 import { openModal, closeModal, setMonacoTheme, applyEditorPrefs } from '/editor.js';
 import { requestBoardState, setBoardStartPrompt } from '/components/board.js';
+import { requestAutomationsState, automationsPaneVisible } from '/components/automations.js';
 import { icon } from '/components/icons.js';
 
 let deps = null;
@@ -124,6 +125,12 @@ if (subagentEnabledSelect) {
         sendFeatureConfig({ subagent: subagentEnabledSelect.value });
     });
 }
+const automationsEnabledSelect = document.getElementById('automations-enabled-select');
+if (automationsEnabledSelect) {
+    automationsEnabledSelect.addEventListener('change', () => {
+        sendFeatureConfig({ automations: automationsEnabledSelect.value });
+    });
+}
 if (subagentDepthInput) {
     subagentDepthInput.addEventListener('change', () => {
         const n = parseInt(subagentDepthInput.value, 10);
@@ -170,6 +177,19 @@ export function applyFeatureSettings(data) {
     if (boardPromptRow) boardPromptRow.hidden = !boardOn;
     const subSel = document.getElementById('subagent-enabled-select');
     if (subSel && subSel.value !== (subagentOn ? 'on' : 'off')) subSel.value = subagentOn ? 'on' : 'off';
+    const automationsOn = data.automations === 'on';
+    const autoSel = document.getElementById('automations-enabled-select');
+    if (autoSel && autoSel.value !== (automationsOn ? 'on' : 'off')) autoSel.value = automationsOn ? 'on' : 'off';
+    // The automations TAB follows the flag exactly like the board tab:
+    // shown only while the scheduler may fire. Turning it on requests the
+    // snapshot; turning it off falls back to chat when the pane was active.
+    const automationsTab = document.getElementById('automations-tab');
+    if (automationsTab && automationsTab.hidden === automationsOn) automationsTab.hidden = !automationsOn;
+    if (automationsOn && automationsPaneVisible()) requestAutomationsState();
+    if (!automationsOn) {
+        const automationsPane = document.getElementById('automations-pane');
+        if (automationsPane && automationsPane.classList.contains('active')) deps.switchMainPane('chat');
+    }
     const depthInput = document.getElementById('subagent-depth-input');
     if (depthInput && data.subagentMaxDepth > 0 && String(depthInput.value) !== String(data.subagentMaxDepth)) {
         depthInput.value = String(data.subagentMaxDepth);

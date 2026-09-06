@@ -257,6 +257,13 @@ type Config struct {
 	// summary is injected into the session as a user message and a turn
 	// runs on it. Config-only in v1 (env/file — no web settings toggle).
 	JobNotices string
+
+	// Automations enables the file-based cron scheduler ("on"/"off";
+	// default off): when on, a running TUI or web host sweeps the global
+	// automation store every 30 s and fires due automations as headless
+	// `-p` runs (see internal/automation). The `gogen automation` CLI
+	// manages the records; the flag only gates firing.
+	Automations string
 }
 
 // Defaults returns built-in default configuration values.
@@ -306,6 +313,7 @@ func Defaults() Config {
 		AgentInstructions:         "off",
 		Skills:                    "off",
 		JobNotices:                "off",
+		Automations:               "off",
 	}
 }
 
@@ -375,6 +383,14 @@ func (c *Config) SkillsEnabled() bool {
 // explicitly enabled.
 func (c *Config) JobNoticesEnabled() bool {
 	return c != nil && configOn(c.JobNotices)
+}
+
+// AutomationsEnabled reports whether the automation scheduler may fire.
+// Opt-in: the store can be inspected and edited via the `gogen automation`
+// CLI regardless, but no host sweeps/fires unless automations is explicitly
+// enabled.
+func (c *Config) AutomationsEnabled() bool {
+	return c != nil && configOn(c.Automations)
 }
 
 // SubagentDepth returns the effective maximum subagent nesting depth

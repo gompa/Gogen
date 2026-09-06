@@ -151,6 +151,7 @@ func TestSaveConfigWritesNonDefaults(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.Board = "on"
 	cfg.Subagent = "on"
+	cfg.Automations = "on"
 	cfg.SubagentMaxDepth = 3
 	cfg.SubagentMaxConcurrent = 5
 	cfg.CommandSandbox = "bwrap"
@@ -168,7 +169,7 @@ func TestSaveConfigWritesNonDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		`board: "on"`, `subagent: "on"`, "subagent_max_depth: 3",
+		`board: "on"`, `subagent: "on"`, `automations: "on"`, "subagent_max_depth: 3",
 		"subagent_max_concurrent: 5",
 		"command_sandbox: bwrap", "command_idle_timeout_secs: 900",
 		"session_max_count: 60", "session_max_age_days: -1",
@@ -184,7 +185,7 @@ func TestSaveConfigWritesNonDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	merged := Merge(pf, FlagOverrides{})
-	if merged.Board != "on" || merged.Subagent != "on" || merged.SubagentDepth() != 3 ||
+	if merged.Board != "on" || merged.Subagent != "on" || !merged.AutomationsEnabled() || merged.SubagentDepth() != 3 ||
 		merged.SubagentLimit() != 5 ||
 		merged.CommandSandbox != "bwrap" || merged.CommandIdleTimeoutSecs != 900 ||
 		merged.SessionMaxCount != 60 || merged.SessionMaxAgeDays != -1 ||

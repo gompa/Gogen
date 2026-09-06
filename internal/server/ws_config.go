@@ -41,6 +41,7 @@ func agentConfigMsgBasic(a *agent.Agent) WSMessage {
 	msg.Board = onOff(a.BoardEnabled())
 	msg.Subagent = onOff(a.SubagentsEnabled())
 	msg.ReviewAgent = onOff(a.ReviewAgentEnabled())
+	msg.Automations = onOff(a.AutomationsEnabled())
 	msg.SubagentMaxDepth = a.SubagentMaxDepth()
 	return msg
 }
@@ -174,7 +175,7 @@ func (s *Server) handleWSConfig(ws *wsConn, ctx context.Context, pane **sessionR
 	if msg.WorkingDir != "" {
 		s.handleWSWorkingDir(ws, ctx, pane, msg)
 	}
-	if msg.Board != "" || msg.Subagent != "" || msg.ReviewAgent != "" || msg.SubagentMaxDepth != 0 || msg.SubagentMaxConcurrent != 0 {
+	if msg.Board != "" || msg.Subagent != "" || msg.ReviewAgent != "" || msg.Automations != "" || msg.SubagentMaxDepth != 0 || msg.SubagentMaxConcurrent != 0 {
 		s.handleWSFeatureFlags(ws, msg)
 	}
 	if len(msg.ConfigFields) > 0 {
@@ -222,6 +223,17 @@ func (s *Server) handleWSFeatureFlags(ws *wsConn, msg WSMessage) {
 		}
 		reviewAgentSet = true
 	}
+	var automations bool
+	var automationsSet bool
+	if msg.Automations != "" {
+		var ok bool
+		automations, ok = onoff.Parse(msg.Automations)
+		if !ok {
+			writeNoticeError(ws, "settings", fmt.Sprintf("Error: invalid automations value %q (want on or off)", msg.Automations))
+			return
+		}
+		automationsSet = true
+	}
 	if msg.SubagentMaxDepth < 0 {
 		writeNoticeError(ws, "settings", "Error: subagentMaxDepth must be >= 0")
 		return
@@ -238,6 +250,17 @@ func (s *Server) handleWSFeatureFlags(ws *wsConn, msg WSMessage) {
 	}
 	if reviewAgentSet {
 		s.ws.SetReviewAgentEnabled(reviewAgent)
+	}
+	if automationsSet {
+		s.ws.SetAutomationsEnabled(automations)
+		// The scheduler follows the flag live: on = sweep the global store
+		// (or restart it), off = stop sweeping. The in-flight headless
+		// children are unaffected (they are independent processes).
+		if automations {
+			s.startAutomations()
+		} else {
+			s.stopAutomations()
+		}
 	}
 	if msg.SubagentMaxDepth > 0 {
 		s.ws.SetSubagentMaxDepth(msg.SubagentMaxDepth)
@@ -280,6 +303,7 @@ func (s *Server) effectiveConfig() *config.Config {
 	out.Board = onOff(s.ws.GetBoardEnabled())
 	out.Subagent = onOff(s.ws.GetSubagentEnabled())
 	out.ReviewAgent = onOff(s.ws.GetReviewAgentEnabled())
+	out.Automations = onOff(s.ws.GetAutomationsEnabled())
 	out.SubagentMaxDepth = s.ws.GetSubagentMaxDepth()
 	out.SubagentMaxConcurrent = s.ws.GetSubagentMaxConcurrent()
 	out.OpenAIProviders = s.ws.GetOpenAIProviders()
