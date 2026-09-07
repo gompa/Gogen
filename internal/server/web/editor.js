@@ -679,6 +679,19 @@ export function colorizeNode(node, opts) {
   }
 }
 
+// Class of a unified-diff line (meta/hunk/add/del), or null. Shared by the
+// full and append-only decoration passes and the fallback renderer's
+// applyDiffLineClass twin.
+function diffLineClass(text) {
+  if (text.startsWith('+++') || text.startsWith('---') || text.startsWith('diff ') || text.startsWith('index ')) {
+    return 'gogen-diff-meta';
+  }
+  if (text.startsWith('@@')) return 'gogen-diff-hunk';
+  if (text.startsWith('+')) return 'gogen-diff-add';
+  if (text.startsWith('-')) return 'gogen-diff-del';
+  return null;
+}
+
 /** Colorize unified-diff lines via decorations (works even if language tokens are missing). */
 export function applyUnifiedDiffDecorations(ed) {
   if (!ed) return;
@@ -686,18 +699,9 @@ export function applyUnifiedDiffDecorations(ed) {
   if (!model) return;
   const lineCount = model.getLineCount();
   const decorations = [];
+  const decoLines = [];
   for (let i = 1; i <= lineCount; i++) {
-    const text = model.getLineContent(i);
-    let cls = null;
-    if (text.startsWith('+++') || text.startsWith('---') || text.startsWith('diff ') || text.startsWith('index ')) {
-      cls = 'gogen-diff-meta';
-    } else if (text.startsWith('@@')) {
-      cls = 'gogen-diff-hunk';
-    } else if (text.startsWith('+')) {
-      cls = 'gogen-diff-add';
-    } else if (text.startsWith('-')) {
-      cls = 'gogen-diff-del';
-    }
+    const cls = diffLineClass(model.getLineContent(i));
     if (!cls) continue;
     decorations.push({
       range: new monaco.Range(i, 1, i, model.getLineMaxColumn(i)),
@@ -707,9 +711,57 @@ export function applyUnifiedDiffDecorations(ed) {
         marginClassName: cls + '-margin',
       },
     });
+    decoLines.push(i);
   }
   const prev = ed.__gogenDiffDecorations || [];
   ed.__gogenDiffDecorations = ed.deltaDecorations(prev, decorations);
+  // Line each tracked decoration covers, same order as the ids — lets the
+  // append-only pass find (and replace) the grown last line's decoration.
+  ed.__gogenDiffDecoLines = decoLines;
+}
+
+// Append-only decoration pass for a streaming diff: classify and decorate
+// only lines from `fromLine` to the end, keeping the decorations already
+// tracked in ed.__gogenDiffDecorations (ids) / ed.__gogenDiffDecoLines
+// (parallel line numbers). Valid because on an append-only delta the content
+// above the edit point is byte-identical. (Rescanning every line per delta
+// was O(n²) over the stream.)
+//
+// `regrowLine` is the model line the tail's first segment landed on when
+// that line previously had content (a still-streaming incomplete line). Its
+// class can change as it grows — classes are prefix matches, so a line can
+// cross a threshold ('@a' → '@@ …', 'index' → 'index …', '--' → '---' del→
+// meta) though it can never lose one. When it was decorated, it is the
+// highest tracked line: drop that decoration and re-classify the line with
+// the tail below.
+function appendUnifiedDiffDecorations(ed, fromLine, regrowLine) {
+  const model = ed.getModel();
+  if (!model) return;
+  const ids = ed.__gogenDiffDecorations || (ed.__gogenDiffDecorations = []);
+  const lines = ed.__gogenDiffDecoLines || (ed.__gogenDiffDecoLines = []);
+  const removed = [];
+  if (regrowLine != null && lines.length > 0 && lines[lines.length - 1] === regrowLine) {
+    removed.push(ids.pop());
+    lines.pop();
+  }
+  const decorations = [];
+  const newLines = [];
+  for (let i = fromLine; i <= model.getLineCount(); i++) {
+    const cls = diffLineClass(model.getLineContent(i));
+    if (!cls) continue;
+    decorations.push({
+      range: new monaco.Range(i, 1, i, model.getLineMaxColumn(i)),
+      options: {
+        isWholeLine: true,
+        className: cls,
+        marginClassName: cls + '-margin',
+      },
+    });
+    newLines.push(i);
+  }
+  if (!removed.length && !decorations.length) return;
+  ids.push(...ed.deltaDecorations(removed, decorations));
+  lines.push(...newLines);
 }
 
 // ── Editor preferences (settings modal ↔ Monaco options) ──
@@ -2264,11 +2316,12 @@ export async function mountDiffEditor(container, value, opts = {}) {
     container.appendChild(host);
 
     // File-line numbers for the diff, derived from the @@ hunks (old numbers
-    // for '-' lines, new numbers for '+'/context lines). Parsed once per text
-    // change and served from the cache.
+    // for '-' lines, new numbers for '+'/context lines). Served from the
+    // incremental cache hanging off the editor (ed.__gogenDiffNums), which
+    // mountDiffEditor seeds below and updateDiffEditor keeps in sync as the
+    // diff streams in. The old cache keyed on model.getValue() rebuilt the
+    // entire diff string per rendered line — O(full diff) while streaming.
     let edRef = null;
-    let diffNumsCacheText = null;
-    let diffNumsCache = [];
     const ed = monaco.editor.create(host, {
       value: value || '',
       language: 'diff',
@@ -2295,14 +2348,15 @@ export async function mountDiffEditor(container, value, opts = {}) {
       // lines, new numbers for '+'/context), matching the @@ hunks — not the
       // sequential index of the patch text.
       lineNumbers: (line) => {
-        const model = edRef && edRef.getModel();
-        if (!model) return '';
-        const text = model.getValue();
-        if (text !== diffNumsCacheText) {
-          diffNumsCacheText = text;
-          diffNumsCache = diffLineNumbers(text);
+        if (!edRef) return '';
+        let cache = edRef.__gogenDiffNums;
+        if (!cache) {
+          // Not seeded yet (never happens after the seed below — mount
+          // assigns edRef and the cache back to back); rebuild lazily.
+          const model = edRef.getModel();
+          cache = edRef.__gogenDiffNums = makeDiffNumsCache(model ? model.getValue() : '');
         }
-        const n = diffNumsCache[line - 1];
+        const n = cache.nums[line - 1];
         return n || '';
       },
       folding: false,
@@ -2310,6 +2364,12 @@ export async function mountDiffEditor(container, value, opts = {}) {
       ...opts,
     });
     edRef = ed;
+    // Seed the streaming state updateDiffEditor maintains: a mirror of the
+    // model text (so per-frame no-op checks and append detection never call
+    // model.getValue(), which materializes the whole diff string) and the
+    // incremental file-line-number cache (see makeDiffNumsCache).
+    ed.__gogenDiffValue = value || '';
+    ed.__gogenDiffNums = makeDiffNumsCache(value || '');
     chatEditors.add(ed);
     applyUnifiedDiffDecorations(ed);
 
@@ -2336,19 +2396,80 @@ export function updateDiffEditor(ed, value) {
   if (!ed) return;
   const model = ed.getModel();
   if (!model) return;
-  if (model.getValue() === value) return;
-  // Preserve the user's reading position while the diff streams in:
-  // model.setValue resets the scroll to top, so re-reveal after every
-  // update — follow the new last line only if the user was at the bottom,
-  // otherwise keep the line that was at the top of the view in place.
-  const topLine = diffTopVisibleLine(ed);
+  // ed.__gogenDiffValue mirrors the model text (mountDiffEditor seeds it and
+  // every update below keeps it in sync). Checking the mirror keeps the
+  // unchanged short-circuit off model.getValue(), which materializes the
+  // whole diff string on every streaming frame.
+  const prev = ed.__gogenDiffValue;
+  if (prev === value) return;
+  const appendOnly = typeof prev === 'string' && value.startsWith(prev) &&
+    // Models EOL-normalize on setValue/create; appending raw text next to a
+    // previously normalized value would render CRLF inconsistently. Rare —
+    // take the slow safe path instead.
+    value.indexOf('\r') === -1;
+  if (!appendOnly && typeof prev !== 'string' && model.getValue() === value) {
+    // Untracked editor (did not come from mountDiffEditor) that already
+    // holds this text: adopt tracking and stop, like the old no-op check.
+    ed.__gogenDiffValue = value;
+    ed.__gogenDiffNums = makeDiffNumsCache(value);
+    return;
+  }
   const atBottom = diffAtBottom(ed);
-  model.setValue(value);
-  applyUnifiedDiffDecorations(ed);
-  if (atBottom) {
-    ed.revealLine(model.getLineCount());
-  } else if (topLine > 1) {
-    ed.revealLine(topLine);
+  if (appendOnly) {
+    // Streaming append (the normal tool_call_delta case): the diff only ever
+    // grows at the end, so splice the new tail into the model. The previous
+    // model.setValue per delta was the worst CPU path in the UI during a
+    // large patch: whole-buffer replace + re-tokenize + scroll reset for
+    // every tool_call_delta — O(n²) over the stream (the fallback <pre>
+    // already got this fix; the Monaco path had not). applyEdits, not
+    // pushEditOperations: this model is a read-only viewer, and applyEdits
+    // never records undo elements, so hundreds of deltas cannot accumulate
+    // undo-stack state.
+    const lastLine = model.getLineCount();
+    const lastCol = model.getLineMaxColumn(lastLine);
+    model.applyEdits([{
+      // Plain IRange object — structurally what monaco.Range wraps; the edit
+      // needs no monaco symbol beyond the model itself.
+      range: {
+        startLineNumber: lastLine,
+        startColumn: lastCol,
+        endLineNumber: lastLine,
+        endColumn: lastCol,
+      },
+      text: value.slice(prev.length),
+    }]);
+    ed.__gogenDiffValue = value;
+    // Line numbers: extend the incremental cache with just the tail (see
+    // extendDiffNumsCache); a full diffLineNumbers rescan per delta was O(n²).
+    if (ed.__gogenDiffNums) extendDiffNumsCache(ed.__gogenDiffNums, value);
+    else ed.__gogenDiffNums = makeDiffNumsCache(value);
+    // Decorations: only the appended tail can introduce classifiable lines —
+    // content above the edit point is byte-identical. The line the tail's
+    // first segment lands on (the empty line after the previous final
+    // newline, the single empty line of an empty model, or the grown
+    // incomplete last line) is rescanned: prefix classes can be crossed as a
+    // line grows (see appendUnifiedDiffDecorations).
+    appendUnifiedDiffDecorations(ed, lastLine, lastCol === 1 ? null : lastLine);
+    // The edit sits at the end of the model: the viewport above it is
+    // untouched, so a reader scrolled up stays put without any re-reveal.
+    // Only a pinned-to-bottom reader needs to follow the new tail.
+    if (atBottom) ed.revealLine(model.getLineCount());
+  } else {
+    // First tracked update, or the rare non-append rewrite (server re-sent a
+    // corrected diff): full replace. Preserve the user's reading position —
+    // model.setValue resets the scroll to top, so re-reveal: follow the new
+    // last line only if the user was at the bottom, otherwise keep the line
+    // that was at the top of the view in place.
+    const topLine = diffTopVisibleLine(ed);
+    model.setValue(value);
+    ed.__gogenDiffValue = value;
+    ed.__gogenDiffNums = makeDiffNumsCache(value);
+    applyUnifiedDiffDecorations(ed);
+    if (atBottom) {
+      ed.revealLine(model.getLineCount());
+    } else if (topLine > 1) {
+      ed.revealLine(topLine);
+    }
   }
   requestAnimationFrame(() => {
     try {
@@ -2520,16 +2641,80 @@ function applyDiffLineClass(code, line) {
 // number; '+' and context lines show the new-file line number — matching how
 // standard diff viewers number unified diffs.
 export function diffLineNumbers(text) {
+  return makeDiffNumsCache(text).nums;
+}
+
+// Build the incremental file-line-number cache for a diff editor
+// (ed.__gogenDiffNums): the exact nums array diffLineNumbers would produce,
+// plus the scan state and the trailing incomplete line so
+// extendDiffNumsCache can grow the array per streaming delta without
+// rescanning the whole diff.
+//
+// Scan invariant (same one appendDiffRows holds for the fallback renderer):
+// the state advances only past COMPLETE lines. While a patch streams in, the
+// trailing line may still grow — advancing past a half-received '@@ ...'
+// hunk header would number every following line wrong. The incomplete line
+// gets a preview number computed on a state copy; the real state advances
+// past it only once its terminating newline arrives.
+function makeDiffNumsCache(text) {
   const lines = String(text || '').split('\n');
   const state = { oldN: 0, newN: 0, inHunk: false };
-  const out = new Array(lines.length);
-  for (let i = 0; i < lines.length; i++) out[i] = diffLineNumbersStep(state, lines[i]);
-  return out;
+  const nums = new Array(lines.length);
+  const last = lines.length - 1;
+  for (let i = 0; i < last; i++) nums[i] = diffLineNumbersStep(state, lines[i]);
+  const incomplete = text !== '' && !text.endsWith('\n');
+  nums[last] = diffLineNumbersStep(incomplete ? { ...state } : state, lines[last]);
+  return { text, nums, state, lastLine: incomplete ? lines[last] : null };
+}
+
+// Extend an incremental line-number cache with an append-only text change
+// (text.startsWith(cache.text) — enforced by updateDiffEditor's append-only
+// test). Only the new tail is scanned: a full diffLineNumbers rescan per
+// tool_call_delta was O(n²) over a streaming patch. Maintains the
+// makeDiffNumsCache invariant: state advances past complete lines only; the
+// trailing incomplete line keeps a preview number from a state copy.
+function extendDiffNumsCache(cache, text) {
+  const tail = text.slice(cache.text.length);
+  if (tail === '') return;
+  const parts = tail.split('\n'); // final part is '' iff text ends with '\n'
+  const nums = cache.nums;
+  const state = cache.state;
+  // The tail's first segment lands on the model's current last line: it
+  // either grows the still-streaming line (cache.lastLine) or fills the
+  // empty line after the previous final newline. That entry already exists
+  // in nums — rewrite it in place, never append.
+  const line = (cache.lastLine != null ? cache.lastLine : '') + parts[0];
+  if (parts.length === 1) {
+    // No newline in the tail: the last line is still streaming. Preview on
+    // a state copy (its number cannot actually change — same first
+    // character, same state before it).
+    nums[nums.length - 1] = diffLineNumbersStep({ ...state }, line);
+    cache.lastLine = line;
+  } else {
+    // The line just completed (its '\n' arrived): scan it with the real state.
+    nums[nums.length - 1] = diffLineNumbersStep(state, line);
+    for (let i = 1; i < parts.length - 1; i++) {
+      nums.push(diffLineNumbersStep(state, parts[i]));
+    }
+    const last = parts[parts.length - 1];
+    if (last === '') {
+      // Text ends with '\n': the '' split-entry after the final newline is
+      // complete (and a no-op for the scan).
+      nums.push(diffLineNumbersStep(state, ''));
+      cache.lastLine = null;
+    } else {
+      // Trailing line still streaming: preview only.
+      nums.push(diffLineNumbersStep({ ...state }, last));
+      cache.lastLine = last;
+    }
+  }
+  cache.text = text;
 }
 
 // One step of the diffLineNumbers scan: returns the displayed number for
-// `line` and advances `state` ({ oldN, newN, inHunk }). updateDiffFallback
-// drives this incrementally so appended lines don't re-scan the whole diff.
+// `line` and advances `state` ({ oldN, newN, inHunk }). Both diff renderers
+// drive it incrementally (updateDiffFallback's rows and the Monaco path's
+// ed.__gogenDiffNums cache) so appended lines don't re-scan the whole diff.
 function diffLineNumbersStep(state, line) {
   const h = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
   if (h) {
