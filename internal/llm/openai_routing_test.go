@@ -347,6 +347,53 @@ func TestClientForModelCancelledContextReturnsFast(t *testing.T) {
 	}
 }
 
+// TestFetchModelsOpenCodeKeepsSurvivingTwinWhenPeerHangs verifies that when an
+// OpenCode profile's Go twin hangs, the completed Zen catalog is not
+// discarded: queryProfile joins both queries and merges whatever the
+// surviving endpoint listed, instead of returning an empty error result that
+// emptied the whole OpenCode profile's models.
+func TestFetchModelsOpenCodeKeepsSurvivingTwinWhenPeerHangs(t *testing.T) {
+	zenSrv := httptest.NewServer(openCodeCatalogHandler([]string{"zen-only"}, nil))
+	defer zenSrv.Close()
+	// The Go twin never answers: it blocks until the query context is
+	// cancelled (the per-profile budget), like an offline host that does not
+	// refuse the connection.
+	hungSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer hungSrv.Close()
+
+	zenClient := newTestOpenAIClient(zenSrv)
+	goClient := newTestOpenAIClient(hungSrv)
+
+	old := profileCatalogTimeout
+	profileCatalogTimeout = 300 * time.Millisecond
+	defer func() { profileCatalogTimeout = old }()
+
+	p := &OpenAIProvider{
+		profiles: []*providerProfile{{
+			name:       "default",
+			zenStream:  &zenClient,
+			zenCatalog: &zenClient,
+			goStream:   &goClient,
+			goCatalog:  &goClient,
+		}},
+		modelClient: make(map[string]*openai.Client),
+	}
+
+	start := time.Now()
+	models, _, _, err := p.fetchModelsWithProfiles(context.Background())
+	if err != nil {
+		t.Fatalf("fetchModelsWithProfiles: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("fetch took %s; the hanging twin must be bounded by profileCatalogTimeout", elapsed)
+	}
+	if len(models) != 1 || models[0].ID != "zen-only" {
+		t.Fatalf("models = %+v, want the surviving zen catalog", models)
+	}
+}
+
 // TestListModelsPreservesManualRoutingEntries verifies a successful catalog
 // refresh merges routing into modelClient instead of replacing it, so
 // fallback entries clientForModel cached for models absent from the catalog

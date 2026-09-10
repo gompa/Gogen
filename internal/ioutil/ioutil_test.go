@@ -77,6 +77,103 @@ func TestWriteFileAtomicPreservesPermissions(t *testing.T) {
 	}
 }
 
+func TestAtomicWriterCommit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "out.bin")
+	w, err := NewAtomicWriter(path, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var total int
+	for _, chunk := range []string{"hello ", "streaming ", "world"} {
+		n, err := w.Write([]byte(chunk))
+		if err != nil {
+			t.Fatalf("Write(%q): %v", chunk, err)
+		}
+		total += n
+	}
+	if err := w.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	// A second Commit must be a harmless no-op.
+	if err := w.Commit(); err != nil {
+		t.Fatalf("second Commit: %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "hello streaming world" {
+		t.Fatalf("content mismatch: got %q", got)
+	}
+	if len(got) != total {
+		t.Fatalf("size mismatch: got %d, want %d", len(got), total)
+	}
+}
+
+func TestAtomicWriterAbortLeavesTargetUntouched(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "out.bin")
+	if err := os.WriteFile(path, []byte("original"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewAtomicWriter(path, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("partial")); err != nil {
+		t.Fatal(err)
+	}
+	w.Abort()
+	w.Abort() // idempotent
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "original" {
+		t.Fatalf("Abort modified the target: got %q", got)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".gogen-write-") {
+			t.Fatalf("temp file left behind: %s", e.Name())
+		}
+	}
+}
+
+func TestAtomicWriterPreservesPermissions(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("chmod not reliable on Windows")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "script.sh")
+	if err := os.WriteFile(path, []byte("#!/bin/sh"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewAtomicWriter(path, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("#!/bin/sh\necho hi")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0755 {
+		t.Fatalf("permissions not preserved: got %o, want 0755", got)
+	}
+}
+
 func TestWriteFileAtomicNoSync(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nosync.txt")

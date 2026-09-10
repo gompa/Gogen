@@ -111,6 +111,11 @@ func NewAgent(provider llm.LLMProvider, executor *Executor, ctxMgr *contextmgr.M
 	}
 }
 
+// SetMCPRegistry attaches the MCP tool registry (nil detaches). It bumps the
+// tool generation so the wire-overhead cache recomputes against the changed
+// model-facing tool set; assign this field directly only if the cached
+// overhead does not matter (tests).
 func (a *Agent) SetMCPRegistry(reg MCPToolRegistry) {
 	a.MCPRegistry = reg
+	a.noteToolsChanged()
 }

@@ -316,7 +316,7 @@ func formatJobOutput(job *BackgroundJob, running bool) string {
 		// invalid UTF-8 into the tool result — the same bug class the head
 		// cuts fix. Back off to a rune boundary; the reported byte count is
 		// the actually-shown length, which can be a few bytes smaller.
-		tail := out[contextmgr.RuneSafeTailStart([]byte(out), maxShowBytes):]
+		tail := out[contextmgr.RuneSafeTailStartString(out, maxShowBytes):]
 		return fmt.Sprintf("Output (last %d bytes of %d):\n%s", len(tail), len(out), tail)
 	}
 	return "Output:\n" + out

@@ -228,7 +228,7 @@ func wsHandleSetModel(req *wsRequest) {
 	cfg := agentConfigMsgBasic(a)
 	fillModelPricing(a, &cfg)
 	s.decorateConfig(&cfg)
-	rt.turnMu.Unlock()
+	rt.releaseTurn()
 	if err != nil {
 		writeNoticeError(ws, "model", fmt.Sprintf("Error: %v", err))
 		return
@@ -271,7 +271,7 @@ func wsHandleSetMode(req *wsRequest) {
 		cfg = agentConfigMsgBasic(a)
 		s.decorateConfig(&cfg)
 	}
-	rt.turnMu.Unlock()
+	rt.releaseTurn()
 	if modeSet {
 		// Echo off the read loop (tokenization can take seconds on a large
 		// uncached session; the read loop serializes every message).
@@ -297,7 +297,7 @@ func wsHandleSetThinkingLevel(req *wsRequest) {
 		a.SetThinkingLevel(agent.ThinkingLevel(msg.ThinkingLevel))
 	}
 	cfg := agentConfigMsgBasic(a)
-	rt.turnMu.Unlock()
+	rt.releaseTurn()
 	fillModelPricing(a, &cfg)
 	s.decorateConfig(&cfg)
 	// Echo off the read loop (tokenization can take seconds on a large

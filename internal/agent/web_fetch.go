@@ -245,7 +245,7 @@ func newSharedFetchClient() *http.Client {
 					return fmt.Errorf("redirect loop detected: %s", nextURL)
 				}
 			}
-			if isPrivateHost(req.URL.Host) {
+			if isPrivateHost(req.URL.Hostname()) {
 				return fmt.Errorf("redirect to private host blocked: %s", req.URL.Host)
 			}
 			return nil
@@ -268,6 +268,63 @@ type fetchRequest struct {
 // It returns the response body, its Content-Type header, the final URL after
 // redirects, and whether the body was cut short by req.MaxBytes.
 func doFetch(ctx context.Context, req fetchRequest) ([]byte, string, string, bool, error) {
+	resp, err := doFetchRequest(ctx, req)
+	if err != nil {
+		return nil, "", req.URL, false, err
+	}
+	defer resp.Body.Close()
+
+	maxBytes := req.MaxBytes
+	if maxBytes <= 0 {
+		maxBytes = webFetchDefaultMax
+	}
+	// Read one byte past the cap so truncation is detectable instead of
+	// silently looking like the complete document (which previously made
+	// mid-file cuts indistinguishable from full files).
+	limited := io.LimitReader(resp.Body, int64(maxBytes)+1)
+	body, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, "", resp.Request.URL.String(), false, fmt.Errorf("read body: %w", err)
+	}
+	truncated := len(body) > maxBytes
+	if truncated {
+		body = body[:maxBytes]
+	}
+	return body, resp.Header.Get("Content-Type"), resp.Request.URL.String(), truncated, nil
+}
+
+// doFetchStream is doFetch's streaming counterpart: it performs the same
+// SSRF-checked request but copies the response body into w instead of
+// buffering it on the heap, so large downloads never materialize in memory.
+// It returns the body's Content-Type, the final URL after redirects, the
+// number of bytes copied, and whether the body exceeded req.MaxBytes. At most
+// maxBytes+1 bytes are copied (the +1 is the same truncation probe doFetch
+// uses); when truncated is true the caller must discard whatever it sent to w.
+func doFetchStream(ctx context.Context, req fetchRequest, w io.Writer) (string, string, int64, bool, error) {
+	resp, err := doFetchRequest(ctx, req)
+	if err != nil {
+		return "", req.URL, 0, false, err
+	}
+	defer resp.Body.Close()
+
+	maxBytes := req.MaxBytes
+	if maxBytes <= 0 {
+		maxBytes = webFetchDefaultMax
+	}
+	limited := io.LimitReader(resp.Body, int64(maxBytes)+1)
+	n, err := io.Copy(w, limited)
+	if err != nil {
+		return "", resp.Request.URL.String(), n, false, fmt.Errorf("read body: %w", err)
+	}
+	return resp.Header.Get("Content-Type"), resp.Request.URL.String(), n, n > int64(maxBytes), nil
+}
+
+// doFetchRequest builds and executes the HTTP request described by req with
+// the shared SSRF-guarded client (dialContextPublicOnly + CheckRedirect), so
+// private/internal hosts are blocked at both the dial and redirect level. The
+// caller owns the returned response body and must close it. 4xx/5xx statuses
+// are reported as errors so callers never treat an error page as content.
+func doFetchRequest(ctx context.Context, req fetchRequest) (*http.Response, error) {
 	if req.Method == "" {
 		req.Method = http.MethodGet
 	}
@@ -286,7 +343,7 @@ func doFetch(ctx context.Context, req fetchRequest) ([]byte, string, string, boo
 		httpReq, err = http.NewRequestWithContext(ctx, http.MethodGet, req.URL, nil)
 	}
 	if err != nil {
-		return nil, "", req.URL, false, fmt.Errorf("request: %w", err)
+		return nil, fmt.Errorf("request: %w", err)
 	}
 
 	httpReq.Header.Set("User-Agent", ua)
@@ -297,38 +354,19 @@ func doFetch(ctx context.Context, req fetchRequest) ([]byte, string, string, boo
 
 	resp, err := sharedFetchClient.Do(httpReq)
 	if err != nil {
-		return nil, "", req.URL, false, fmt.Errorf("fetch: %w", err)
+		return nil, fmt.Errorf("fetch: %w", err)
 	}
-	defer resp.Body.Close()
-
 	if resp.StatusCode >= 400 {
-		return nil, "", resp.Request.URL.String(), false, fmt.Errorf("http %d", resp.StatusCode)
+		resp.Body.Close()
+		return nil, fmt.Errorf("http %d", resp.StatusCode)
 	}
-
-	contentType := resp.Header.Get("Content-Type")
-	maxBytes := req.MaxBytes
-	if maxBytes <= 0 {
-		maxBytes = webFetchDefaultMax
-	}
-	// Read one byte past the cap so truncation is detectable instead of
-	// silently looking like the complete document (which previously made
-	// mid-file cuts indistinguishable from full files).
-	limited := io.LimitReader(resp.Body, int64(maxBytes)+1)
-	body, err := io.ReadAll(limited)
-	if err != nil {
-		return nil, "", resp.Request.URL.String(), false, fmt.Errorf("read body: %w", err)
-	}
-	truncated := len(body) > maxBytes
-	if truncated {
-		body = body[:maxBytes]
-	}
-	return body, contentType, resp.Request.URL.String(), truncated, nil
+	return resp, nil
 }
 
 // isInternalIP reports whether ip is a private/internal address that the
-// fetch/dial layers must never connect to. Shared by dialContextPublicOnly
-// (skip internal addresses, dial only verified public ones) and isPrivateHost
-// (a host is internal when ALL of its addresses are).
+// fetch/dial layers must never connect to. dialContextPublicOnly uses it to
+// skip internal addresses and dial only verified public ones; a host is
+// blocked entirely when ALL of its resolved addresses are internal.
 func isInternalIP(ip net.IP) bool {
 	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() || ip.IsMulticast()
 }
@@ -381,30 +419,48 @@ func dialContextPublicOnly(ctx context.Context, network, addr string) (net.Conn,
 	return nil, errors.Join(dialErrs...)
 }
 
+// isPrivateHost reports whether host is a private/internal host that must not
+// be fetched. It is a purely syntactic check: localhost names, the private
+// literal ranges matched by fetchPrivateRE, and IP literals (v4 and v6) that
+// are loopback/private/link-local/unspecified/multicast.
+//
+// It deliberately does NOT resolve hostnames. Name resolution happens once,
+// with the caller's context, in dialContextPublicOnly: that layer blocks a
+// host whose addresses are all internal and pins the connection to the
+// verified public addresses (defeating DNS rebinding). Resolving here as well
+// would duplicate that lookup with a blocking, context-less net.LookupIP call
+// that can outlive the tool call's own deadline — and it previously mangled
+// IPv6 literals (strings.LastIndex(host, ":") then resolving the bracket), so
+// every IPv6-literal URL was wrongly rejected as private/internal.
 func isPrivateHost(host string) bool {
 	host = strings.TrimSpace(strings.ToLower(host))
 	if host == "" || host == "localhost" || host == "localhost.localdomain" {
 		return true
 	}
+	// Strip an optional port. URL.Host carries "host:port" (bracketing an IPv6
+	// literal), while URL.Hostname() does not. net.SplitHostPort handles
+	// "[::1]:443"; a bare literal ("::1") or a bracketed literal with no port
+	// ("[::1]") errors and is handled by the bracket trim below.
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	} else if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+	if host == "" {
+		return true
+	}
 	if fetchPrivateRE.MatchString(host) {
 		return true
 	}
-	if colon := strings.LastIndex(host, ":"); colon > 0 {
-		host = host[:colon]
+	// A literal IP (v4 or v6) resolves to itself, so classify it directly
+	// instead of sending a bracketed/mangled literal to the resolver.
+	if ip := net.ParseIP(host); ip != nil {
+		return isInternalIP(ip)
 	}
-	ips, err := net.LookupIP(host)
-	if err != nil {
-		return true // can't resolve, be safe
-	}
-	for _, ip := range ips {
-		// Any public address makes the host reachable publicly; the dial
-		// layer then only connects to the verified public addresses. A host
-		// whose addresses are ALL internal (or unresolvable) is blocked.
-		if !isInternalIP(ip) {
-			return false
-		}
-	}
-	return true
+	// A hostname: not known to be private from syntax alone. dialContextPublicOnly
+	// resolves it with the caller's context and blocks it if every resolved
+	// address is internal.
+	return false
 }
 
 // WebFetchOptions configures a web_fetch call. Selector and Query are the
@@ -550,7 +606,9 @@ func validateFetchURL(rawURL string) (*url.URL, error) {
 		return nil, fmt.Errorf("invalid URL: %w", err)
 	}
 	// Block private/internal hosts on the initial URL (redirects are also checked).
-	if isPrivateHost(u.Host) {
+	// Hostname() strips the port and IPv6 brackets; hostname resolution is
+	// enforced at dial time by dialContextPublicOnly.
+	if isPrivateHost(u.Hostname()) {
 		return nil, fmt.Errorf("requests to private/internal hosts are blocked: %s", u.Hostname())
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {

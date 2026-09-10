@@ -117,10 +117,16 @@ function renderBlockNode(node, blockText, opts) {
 // Returns the .message-body wrapper that holds a bubble's flow
 // content (markdown, timestamp, model chip), creating it lazily.
 // The hover buttons (fork/resend/edit) and the inline-edit bar are
-// appended to .message itself, OUTSIDE this wrapper: .message-body
-// carries content-visibility: auto, whose paint containment would
-// otherwise clip the buttons' overhang past the bubble's edge.
-// Non-.message elements (e.g. thought-card bodies) pass through.
+// appended to .message itself, OUTSIDE this wrapper, so any future
+// containment on the wrapper can't clip the buttons' overhang past
+// the bubble's edge. Non-.message elements (e.g. thought-card bodies)
+// pass through.
+//
+// The wrapper is paint-skipped off-screen via .paint-skip once its
+// content is final (see styles.css and components/paint-skip.js),
+// never with a bare content-visibility: auto: an unconditional skip
+// makes the transcript's scrollHeight fall short of the real height,
+// which breaks the scrollbar, the jump button and every scroll-up.
 export function msgBody(el) {
     if (!el || !el.classList || !el.classList.contains('message')) return el;
     let body = el.querySelector('.message-body');

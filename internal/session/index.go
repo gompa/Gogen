@@ -412,24 +412,14 @@ func (s *Store) writeIndex(workingDir string, idx *sessionIndex) error {
 // index file exists, the mutation is a no-op; when true, a fresh empty index
 // is passed in so callers can seed the first entry. Write errors are returned
 // so callers that care (touchIndex) can propagate them; the other index
-// mutators swallow them, matching their historical behavior.
+// mutators swallow them, matching their historical behavior. Callers must hold
+// s.mu so the read-modify-write of index.json cannot interleave with another
+// mutator.
 func (s *Store) mutateIndex(workingDir string, createIfMissing bool, mutate func(idx *sessionIndex) bool) error {
-	return s.mutateIndexWith(workingDir, createIfMissing, nil, mutate)
-}
-
-// mutateIndexWith is mutateIndex with a caller-supplied preloaded index: when
-// preloaded is non-nil it is used instead of re-reading the index file (Save
-// reuses the index it already loaded for Created recovery). The preloaded
-// snapshot is only valid because the caller holds s.mu and no other index
-// mutator runs between the read and this mutation.
-func (s *Store) mutateIndexWith(workingDir string, createIfMissing bool, preloaded *sessionIndex, mutate func(idx *sessionIndex) bool) error {
 	if !s.enabled {
 		return nil
 	}
-	idx := preloaded
-	if idx == nil {
-		idx = s.readIndex(workingDir)
-	}
+	idx := s.readIndex(workingDir)
 	if idx == nil {
 		if !createIfMissing {
 			return nil
@@ -451,16 +441,12 @@ func (s *Store) mutateIndexWith(workingDir string, createIfMissing bool, preload
 // a process restart) can recover the immutable Created timestamp from the
 // index instead of re-reading the session file. Existing entries keep their
 // Created when created is zero (defensive: Save always passes non-zero).
-// preloaded, when non-nil, is a caller-supplied index (see mutateIndexWith);
 // updateIndex upserts the full entry for a session in the metadata index.
 // Every field of entry is written verbatim except Created: a zero Created on
 // an existing entry means "keep the stored Created" (Save recovers it from
-// the session file only when the index has no usable value). preloaded, when
-// non-nil, is the index Save already read for Created recovery so a full save
-// reads index.json at most once; it is only valid because the caller holds
-// s.mu and no other index mutator runs between the read and this mutation.
-func (s *Store) updateIndex(workingDir string, entry sessionIndexEntry, preloaded *sessionIndex) {
-	s.mutateIndexWith(workingDir, true, preloaded, func(idx *sessionIndex) bool {
+// the session file only when the index has no usable value).
+func (s *Store) updateIndex(workingDir string, entry sessionIndexEntry) {
+	s.mutateIndex(workingDir, true, func(idx *sessionIndex) bool {
 		for i, e := range idx.Entries {
 			if e.ID != entry.ID {
 				continue

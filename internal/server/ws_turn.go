@@ -69,7 +69,7 @@ func (s *Server) handleWSCompact(ws *wsConn, _ *http.Request, rt *sessionRuntime
 		// if the only client left mid-compact, the idle runtime goes back
 		// to the saved list.
 		defer rt.evictOrphanedIfPossible()
-		defer rt.turnMu.Unlock()
+		defer rt.releaseTurn()
 		defer rt.stream.end()
 		defer func() { errCh <- nil }()
 		defer func() {
@@ -150,7 +150,7 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 	if modeHandled {
 		modeCfg := agentConfigMsgBasic(a)
 		s.decorateConfig(&modeCfg)
-		rt.turnMu.Unlock()
+		rt.releaseTurn()
 		// Tokenization + echo off the read loop (large uncached sessions
 		// take seconds; the read loop serializes every message).
 		go func(cfg WSMessage, out string) {
@@ -164,7 +164,7 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 
 	thinkOut, thinkHandled := a.HandleThinkingCommand(msg.Content)
 	if thinkHandled {
-		rt.turnMu.Unlock()
+		rt.releaseTurn()
 		go func(out string) {
 			cfg := agentConfigMsg(r.Context(), rt)
 			_, thinking := a.ModeAndThinkingLevel()
@@ -178,7 +178,7 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 
 	ctxOut, ctxHandled := a.HandleContextCommand(r.Context(), msg.Content)
 	if ctxHandled {
-		rt.turnMu.Unlock()
+		rt.releaseTurn()
 		go func(out string) {
 			ctxMsg := contextMsg(r.Context(), a)
 			_ = ws.writeJSON(ctxMsg)
@@ -191,7 +191,7 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 	// route through the registry instead of mutating the agent.
 	sessResult, sessHandled, sessErr := s.runSessionCommand(r.Context(), ws, pane, msg.Content)
 	if sessHandled {
-		rt.turnMu.Unlock()
+		rt.releaseTurn()
 		s.writeSessionCommandResult(ws, r.Context(), *pane, sessResult, sessErr)
 		return
 	}
@@ -200,7 +200,7 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 		out, _, modelErr := a.HandleModelsCommand(r.Context(), msg.Content)
 		cfg := agentConfigMsgBasic(a)
 		s.decorateConfig(&cfg)
-		rt.turnMu.Unlock()
+		rt.releaseTurn()
 		// Echo off the read loop (tokenization can take seconds on a large
 		// uncached session; the read loop serializes every message). Both
 		// cfg (success only) and resp are written from the goroutine so
@@ -328,7 +328,7 @@ func (rt *sessionRuntime) startTurn(owner *wsConn, content string, images []llm.
 		// that finishes with zero attached clients leaves an idle runtime
 		// nobody is viewing — evict it so it reads as a plain saved session.
 		defer rt.evictOrphanedIfPossible()
-		defer rt.turnMu.Unlock()
+		defer rt.releaseTurn()
 		defer rt.stream.end()
 		defer func() { done <- nil }()
 		// runTurnBody owns the evicted check (an evicted runtime is a clean

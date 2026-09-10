@@ -11,9 +11,6 @@ import (
 // overwriting files. Readable and writable by owner, readable by others.
 const defaultFilePerm os.FileMode = 0o644
 
-// defaultDirPerm is the default directory permission for created parent dirs.
-const defaultDirPerm os.FileMode = 0o755
-
 // evalPath resolves symlinks for an existing path, or for the nearest existing
 // parent when creating a new file.
 func evalPath(path string) (string, error) {

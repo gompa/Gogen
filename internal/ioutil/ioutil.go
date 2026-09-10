@@ -36,9 +36,48 @@ func WriteFileAtomicNoSync(path string, content []byte, perm os.FileMode) error 
 // the temp file nor the containing directory is fsynced before/after rename
 // (trades durability for less SSD wear).
 func writeFileSync(path string, content []byte, perm os.FileMode, skipFSync bool) error {
+	w, err := newAtomicWriter(path, perm, skipFSync)
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write(content); err != nil {
+		w.Abort()
+		return err
+	}
+	return w.Commit()
+}
+
+// AtomicWriter writes content to a temporary file and atomically moves it into
+// place on Commit. It is the streaming counterpart of WriteFileAtomic: a
+// caller whose content is too large to buffer in memory writes straight to the
+// writer (it implements io.Writer) instead of materializing the whole body as
+// a []byte, so the file never has to exist on the heap.
+//
+// Parent directories are created when the writer is constructed and an
+// existing target file's mode is preserved. Commit fsyncs the temp file before
+// the rename and the containing directory after it (the durability contract
+// documented on WriteFileAtomic). Abort — or letting the writer go without
+// Commit — closes and removes the temp file, leaving any existing target
+// untouched.
+type AtomicWriter struct {
+	path      string
+	tmp       *os.File
+	tmpName   string
+	skipFSync bool
+	done      bool
+}
+
+// NewAtomicWriter creates a temp file in path's directory (creating parent
+// directories as needed) ready to receive the atomic write. Call Commit to
+// publish it or Abort to discard it.
+func NewAtomicWriter(path string, perm os.FileMode) (*AtomicWriter, error) {
+	return newAtomicWriter(path, perm, false)
+}
+
+func newAtomicWriter(path string, perm os.FileMode, skipFSync bool) (*AtomicWriter, error) {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
+		return nil, err
 	}
 	// Preserve the existing file mode when overwriting, so execute bits
 	// on scripts are not destroyed.
@@ -47,15 +86,9 @@ func writeFileSync(path string, content []byte, perm os.FileMode, skipFSync bool
 	}
 	tmp, err := os.CreateTemp(dir, ".gogen-write-*")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	tmpName := tmp.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpName)
-		}
-	}()
+	w := &AtomicWriter{path: path, tmp: tmp, tmpName: tmp.Name(), skipFSync: skipFSync}
 
 	// Chmod may be unsupported on some filesystems (Windows, FUSE, 9p, some
 	// network mounts). When that happens, don't fail the whole write — log
@@ -65,40 +98,66 @@ func writeFileSync(path string, content []byte, perm os.FileMode, skipFSync bool
 	if err := tmp.Chmod(perm); err != nil {
 		if !isChmodUnsupported(err) {
 			_ = tmp.Close()
-			return err
+			_ = os.Remove(w.tmpName)
+			return nil, err
 		}
 		debuglog.Write("ioutil/write", "Chmod unsupported; file written with default mode", "fs-chmod-unsupported", map[string]any{
 			"path": path,
 			"err":  err.Error(),
 		})
 	}
-	if _, err := tmp.Write(content); err != nil {
-		_ = tmp.Close()
-		return err
+	return w, nil
+}
+
+// Write implements io.Writer, appending to the temp file.
+func (w *AtomicWriter) Write(p []byte) (int, error) {
+	return w.tmp.Write(p)
+}
+
+// Commit fsyncs (unless disabled), closes the temp file, renames it into place,
+// and fsyncs the containing directory. It is a no-op after the writer has
+// already been committed or aborted.
+func (w *AtomicWriter) Commit() error {
+	if w.done {
+		return nil
 	}
-	if !skipFSync {
-		if err := tmp.Sync(); err != nil {
-			_ = tmp.Close()
+	w.done = true
+	if !w.skipFSync {
+		if err := w.tmp.Sync(); err != nil {
+			_ = w.tmp.Close()
+			_ = os.Remove(w.tmpName)
 			return err
 		}
 	}
-	if err := tmp.Close(); err != nil {
+	if err := w.tmp.Close(); err != nil {
+		_ = os.Remove(w.tmpName)
 		return err
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := os.Rename(w.tmpName, w.path); err != nil {
+		_ = os.Remove(w.tmpName)
 		return err
 	}
-	cleanup = false
-	if !skipFSync {
+	if !w.skipFSync {
 		// Fsyncing the temp file guarantees its content is durable, but the
 		// directory entry that makes path point at it is not. Fsync the
 		// containing directory so a power loss cannot revert path to the
 		// previous file.
-		if err := syncDir(dir); err != nil {
+		if err := syncDir(filepath.Dir(w.path)); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// Abort closes and removes the temp file, leaving the target untouched. It is a
+// no-op after Commit and safe to call more than once.
+func (w *AtomicWriter) Abort() {
+	if w.done {
+		return
+	}
+	w.done = true
+	_ = w.tmp.Close()
+	_ = os.Remove(w.tmpName)
 }
 
 // syncDir fsyncs a directory so that a preceding rename or create within it

@@ -49,7 +49,7 @@ func TestToolCallsParallelEligible(t *testing.T) {
 		t.Fatal("a batch with a mutating tool must run sequentially")
 	}
 	// MCP-shadowed names are excluded even when every name is a builtin.
-	a.MCPRegistry = &fakeMCPRegistry{names: map[string]struct{}{"read_file": {}}}
+	a.SetMCPRegistry(&fakeMCPRegistry{names: map[string]struct{}{"read_file": {}}})
 	if a.toolCallsParallelEligible(readOnly) {
 		t.Fatal("an MCP-shadowed name must force the sequential path")
 	}

@@ -794,17 +794,34 @@
         /* Flow content (markdown, timestamp, model chip) lives in this
            wrapper, created by msgBody() in app.js. The hover buttons
            (fork/resend/edit) and the inline-edit bar are direct children
-           of .message, OUTSIDE the wrapper: content-visibility: auto
-           applies paint containment even to on-screen elements, which
-           would clip the buttons' overhang past the bubble's bottom edge.
-           Skipping off-screen content still speeds up long transcripts
-           with tool cards, Monaco diff viewers and xterm; `auto` remembers
-           each wrapper's last rendered height, so the scrollbar and TOC
-           scrollIntoView jumps stay stable; the 120px fallback approximates
-           a typical text bubble before first paint. */
+           of .message, OUTSIDE the wrapper.
+
+           The wrapper is paint-skipped off-screen via .paint-skip (see
+           below), never with a bare `content-visibility: auto`: an
+           unconditional skip sizes never-rendered items with its fallback
+           instead of their real height and corrupts #messages.scrollHeight,
+           which lurched the scrollbar, the scroll-to-bottom button
+           (distanceFromBottom) and every scroll-up.
+
+           flow-root contains the flow content's block margins inside the
+           wrapper. Without it the first/last child's margin collapses out of
+           the wrapper, so the wrapper's measured height (and therefore a
+           paint-skipped item's contain-intrinsic-size) came up ~7px short of
+           the box it occupies in normal layout. */
         .message-body {
+            display: flow-root;
+        }
+        /* Paint skip for off-screen transcript items (components/paint-skip.js):
+           content-visibility: auto, applied by JS only AFTER the item's real
+           height has been measured into --ps-h, so a skipped item still
+           reports its true height and #messages.scrollHeight stays exact.
+           `auto` keeps it correct for items that grow while on screen (the
+           streaming tail, async Monaco mounts). */
+        .message-body.paint-skip,
+        .tool-card.paint-skip,
+        .thought-card.paint-skip {
             content-visibility: auto;
-            contain-intrinsic-size: auto 120px;
+            contain-intrinsic-size: auto var(--ps-h, 120px);
         }
         .user {
             background: var(--user-bg);
@@ -1085,11 +1102,10 @@
             overflow: hidden;
             font-size: 0.9em;
             flex-shrink: 0;
-            /* Off-screen tool cards (often holding Monaco/xterm output) are the
-               most expensive to reflow; skip them until near the viewport.
-               Taller than a plain message, so a larger fallback. */
-            content-visibility: auto;
-            contain-intrinsic-size: auto 200px;
+            /* Paint-skipped off-screen via .paint-skip (measured height), not
+               a bare content-visibility: auto — a skipped card must still
+               report its real (often Monaco/xterm-tall) height or the
+               transcript's scroll geometry drifts. */
         }
         .tool-call-header {
             display: flex;
@@ -2191,9 +2207,9 @@
             align-self: flex-start;
             color: var(--fg-muted);
             box-sizing: border-box;
-            /* Off-screen thinking blocks: skip layout/paint until in view. */
-            content-visibility: auto;
-            contain-intrinsic-size: auto 100px;
+            /* Paint-skipped off-screen via .paint-skip (measured content-box
+               height); the vertical padding is why paint-skip.js records the
+               content-box, not the border-box, height. */
         }
         .btn-link {
             margin: 4px 12px 8px;

@@ -353,14 +353,16 @@ func (r *sessionRegistry) clearParentDeliveries(id string) {
 // startTurn (whose goroutine defers the unlock), and repeats until the
 // queue is empty.
 //
-// The wake-up signal comes from setTurnActive(false), which every turn
-// runner (startTurn, runChildTurn, compact) calls on exit — so the worker
-// wakes exactly when a turn ends, without polling. A failed acquire does
-// not mean a turn is running (brief config handlers also take turnMu), so
-// the worker keeps the item at the HEAD (FIFO, peek-not-pop) and waits for
-// the signal with a short timeout fallback to cover holders that never
-// signal. The item is popped only once the turn lock is acquired, so
-// orphan eviction (hasPendingDeliveries) never races the handoff.
+// The worker wakes without polling when either a turn-lock holder releases
+// the lock (releaseTurn's broadcast — covering both a turn end and a brief
+// config handler) or a new item is enqueued (deliverNotify). A failed
+// TryLock does not mean a turn is running (brief config handlers also take
+// turnMu), so the worker keeps the item at the HEAD (FIFO, peek-not-pop) and
+// parks on those signals; the item is popped only once the turn lock is
+// acquired, so orphan eviction (hasPendingDeliveries) never races the
+// handoff. An eviction that cannot win the turn lock (a stuck turn holds it)
+// still wakes the worker via remove's notifyTurnReleased, so the queue is
+// dropped rather than waiting for that turn to unlock.
 func (rt *sessionRuntime) deliverLoop() {
 	for {
 		rt.deliverMu.Lock()
@@ -383,12 +385,18 @@ func (rt *sessionRuntime) deliverLoop() {
 			rt.deliverMu.Unlock()
 			continue // dropped: the runtime left the registry mid-queue
 		}
-		if !rt.tryAcquireTurn(wsTurnAcquireWait) {
-			// Keep the item at the head (FIFO) and wait for the turn-end
-			// signal with a short timeout fallback.
+		// Capture the release signal BEFORE probing the lock
+		// (capture-then-check): a holder that frees the lock between this
+		// failed TryLock and the wait below closes the captured channel, so
+		// the wake-up is never missed. No polling: the worker sleeps until
+		// the holder (a running turn, or a brief config handler) releases
+		// the lock, or a fresh enqueue signals deliverNotify, and keeps the
+		// item at the head (FIFO) in the meantime.
+		release := rt.turnReleaseChan()
+		if !rt.turnMu.TryLock() {
 			select {
+			case <-release:
 			case <-rt.deliverNotify:
-			case <-time.After(wsTurnAcquireWait):
 			}
 			continue
 		}
@@ -401,7 +409,7 @@ func (rt *sessionRuntime) deliverLoop() {
 			rt.deliverMu.Lock()
 			rt.pendingDeliver = rt.pendingDeliver[1:]
 			rt.deliverMu.Unlock()
-			rt.turnMu.Unlock()
+			rt.releaseTurn()
 			continue
 		}
 		// The turn lock is ours and the runtime is live: pop and hand the
@@ -421,7 +429,7 @@ func (rt *sessionRuntime) deliverLoop() {
 		rt.deliverMu.Lock()
 		if len(rt.pendingDeliver) == 0 || rt.pendingDeliver[0].ID != item.ID {
 			rt.deliverMu.Unlock()
-			rt.turnMu.Unlock()
+			rt.releaseTurn()
 			continue
 		}
 		item = rt.pendingDeliver[0]

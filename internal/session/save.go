@@ -17,6 +17,13 @@ import (
 // cannot grow unboundedly on long-running processes with many sessions.
 const maxCreatedCacheEntries = 200
 
+// savePayloadHook, when non-nil, runs inside Save at the boundary between its
+// first critical section (path/Created resolution) and the unlocked payload
+// serialization+write. It is a test-only seam for Save's lock contract: the
+// store mutex must be free when it runs, so the hook may re-enter the store.
+// Production leaves it nil.
+var savePayloadHook func()
+
 // setCreatedCache adds an entry to the created-timestamp cache, evicting the
 // entry with the oldest Created timestamp if the cache exceeds
 // maxCreatedCacheEntries to prevent unbounded memory growth on long-running
@@ -42,27 +49,53 @@ func (s *Store) setCreatedCache(id string, created time.Time) {
 }
 
 // Save writes a session snapshot.
+//
+// Save deliberately does NOT hold the store-wide mutex while it serializes and
+// writes the (potentially large) message payload. Holding it across
+// json.Marshal of the whole history plus the atomic write meant a turn-end full
+// save of a big session blocked every other store operation — List/Info/
+// LatestID, i.e. the web sidebar, which is served synchronously on the WS read
+// loop — for the whole marshal+write. The payload write is per-session and made
+// visible atomically by the temp-file rename, so it needs no shared lock; only
+// the shared metadata (createdCache, saveCount, index.json) is mutated, in two
+// short critical sections that bracket the unlocked write.
 func (s *Store) Save(id string, snap SessionSnapshot) error {
 	if !s.enabled || id == "" {
 		return nil
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err := validateSessionID(id); err != nil {
 		return err
 	}
+
+	// First critical section: resolve the paths and the immutable Created
+	// timestamp from shared state (createdCache, else the index, else a
+	// legacy file decode). Cheap in steady state and free of payload
+	// serialization. The dir/globalDir reads also belong here — globalDir is
+	// guarded by s.mu.
+	s.mu.Lock()
 	dir := s.dir(snap.WorkingDir)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
 	path := s.path(snap.WorkingDir, id)
 	if err := ensureUnderSessionsDir(snap.WorkingDir, path, s.globalDir); err != nil {
+		s.mu.Unlock()
 		return err
 	}
 	if s.skipEmptySave(id, snap, path) {
+		s.mu.Unlock()
 		return nil
 	}
-	created, preloadedIdx := s.recoverCreated(id, path, snap.WorkingDir)
+	created := s.recoverCreated(id, path, snap.WorkingDir)
+	s.mu.Unlock()
+
+	// Unlocked: serialize and atomically write the snapshot. The rename means
+	// readers never observe a torn file; LoadInWorkingDir's delta baseCount
+	// check tolerates the (now wider) gap between this write and the delta
+	// unlink below — it is the same crash window the store already handles.
+	if savePayloadHook != nil {
+		savePayloadHook()
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
 	out := file{
 		Version:         version,
 		ID:              id,
@@ -91,11 +124,15 @@ func (s *Store) Save(id string, snap SessionSnapshot) error {
 	if err := ioutil.WriteFileAtomicNoSync(path, data, 0o600); err != nil {
 		return err
 	}
+
+	// Second critical section: publish the write to the shared metadata.
 	// The full snapshot now supersedes the delta. Remove it only after the
 	// snapshot write succeeded: clearing it first meant a crash or a write
 	// failure between the two operations permanently lost the messages that
 	// existed only in the delta. A stale delta that survives into a later
 	// load is detected and dropped by LoadInWorkingDir's baseCount check.
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.clearDeltaFile(snap.WorkingDir, id); err != nil && !os.IsNotExist(err) {
 		log.Printf("warning: failed to remove delta for session %s: %v", id, err)
 	}
@@ -103,10 +140,12 @@ func (s *Store) Save(id string, snap SessionSnapshot) error {
 	s.saveCount++
 	// Update index and invalidate in-memory cache. Runs before prune (order
 	// swap): prune always keeps the current session id, so its later index
-	// rewrite cannot clobber this entry, and the preloaded index — read
-	// during Created recovery and untouched since, under s.mu — is still
-	// fresh here. This lets a cache-miss full save read index.json once
-	// instead of twice.
+	// rewrite cannot clobber this entry. The index is re-read here — the
+	// preload recoverCreated may have taken is NOT reused, because the lock
+	// was released across the payload write and another Save may have
+	// updated index.json in the meantime; reusing the stale snapshot would
+	// drop that concurrent entry. The extra read is a small index.json
+	// decode, dwarfed by the payload work the split moved out of the lock.
 	label := sessionLabel(snap.Messages, snap.Label, snap.LabelRenamed)
 	s.updateIndex(snap.WorkingDir, sessionIndexEntry{
 		ID:              id,
@@ -119,7 +158,7 @@ func (s *Store) Save(id string, snap SessionSnapshot) error {
 		ParentID:        snap.ParentID,
 		SubagentStatus:  snap.SubagentStatus,
 		SubagentSummary: snap.SubagentSummary,
-	}, preloadedIdx)
+	})
 	// Per-parent transcript cap (D2): nested sessions are exempt from the
 	// global retention counts but capped per parent (keep the most recent
 	// 10 children; oldest pruned at child save time).
@@ -166,20 +205,16 @@ func (s *Store) skipEmptySave(id string, snap SessionSnapshot, path string) bool
 // restart case avoids re-reading the potentially large session file), else a
 // minimal field-only decode of the session file for legacy indexes that
 // predate the created field (index-loss recovery; the minimal target skips
-// allocating the previous session's messages just to recover one
-// timestamp). The index read during recovery is returned as preloadedIdx so
-// updateIndex can reuse it — a cache-miss full save then reads index.json
-// at most once. Caller must hold s.mu.
-func (s *Store) recoverCreated(id, path, workingDir string) (time.Time, *sessionIndex) {
+// allocating the previous session's messages just to recover one timestamp).
+// Caller must hold s.mu.
+func (s *Store) recoverCreated(id, path, workingDir string) time.Time {
 	created := time.Now().UTC()
-	var preloadedIdx *sessionIndex
 	if cached, ok := s.createdCache[id]; ok {
-		return cached, nil
+		return cached
 	}
 	found := false
-	preloadedIdx = s.readIndex(workingDir)
-	if preloadedIdx != nil {
-		for _, e := range preloadedIdx.Entries {
+	if idx := s.readIndex(workingDir); idx != nil {
+		for _, e := range idx.Entries {
 			if e.ID == id && !e.Created.IsZero() {
 				created = e.Created
 				found = true
@@ -197,7 +232,7 @@ func (s *Store) recoverCreated(id, path, workingDir string) (time.Time, *session
 			}
 		}
 	}
-	return created, preloadedIdx
+	return created
 }
 
 // TouchSession updates only the session's timestamp metadata without

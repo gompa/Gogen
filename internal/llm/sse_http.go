@@ -124,23 +124,29 @@ func newSSEHTTPClient() *http.Client {
 	// provider host was unreachable (blackhole / wrong LAN IP). Caller contexts
 	// still win when they are shorter.
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	// Clone DefaultTransport so HTTPS_PROXY/HTTP_PROXY (ProxyFromEnvironment)
+	// and its TLS handshake timeout still apply: a bare &http.Transport{} has
+	// no Proxy function (so the environment proxy is ignored, and a probe that
+	// succeeds through the proxy is followed by chat requests that cannot) and
+	// leaves TLSHandshakeTimeout at 0, bounding a stalled handshake only by the
+	// SSE idle read deadline. Only compression and dialing are overridden.
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DisableCompression = true
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		if idle > 0 {
+			return &idleTimeoutConn{Conn: conn, timeout: idle}, nil
+		}
+		return conn, nil
+	}
 	return &http.Client{
 		// sseFilterTransport drops the SSE keep-alive frames that
 		// openai-go's stream decoder cannot digest (unexpected end of
 		// JSON input — see sse_filter.go for the per-version gap analysis).
-		Transport: &sseFilterTransport{base: &http.Transport{
-			DisableCompression: true,
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				conn, err := dialer.DialContext(ctx, network, addr)
-				if err != nil {
-					return nil, err
-				}
-				if idle > 0 {
-					return &idleTimeoutConn{Conn: conn, timeout: idle}, nil
-				}
-				return conn, nil
-			},
-		}},
+		Transport: &sseFilterTransport{base: tr},
 	}
 }
 
@@ -149,11 +155,14 @@ func newSSEHTTPClient() *http.Client {
 // idle read deadline (default 30m) when a provider stalls after headers.
 func newCatalogHTTPClient() *http.Client {
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	// Clone DefaultTransport (as propsHTTPClient does) so HTTPS_PROXY and
+	// TLSHandshakeTimeout apply; a bare &http.Transport{} bypasses the
+	// environment proxy and leaves the handshake unbounded.
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DisableCompression = true
+	tr.DialContext = dialer.DialContext
 	return &http.Client{
-		Timeout: modelsCatalogTimeout,
-		Transport: &http.Transport{
-			DisableCompression: true,
-			DialContext:        dialer.DialContext,
-		},
+		Timeout:   modelsCatalogTimeout,
+		Transport: tr,
 	}
 }

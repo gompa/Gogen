@@ -106,6 +106,14 @@ func (a *Agent) prepareMessages(ctx context.Context, h *llm.StreamHandlers) ([]l
 				a.compactToFit(ctx, pinned, counts, keep, emergency)
 			}
 		}
+		// Backfill a cold per-message count cache (restored session, or a
+		// cache dropped by capToolResultsForCompact) once, after the
+		// boundary decision but before the pre-flight measurement, so the
+		// pre-flight does not re-tokenize the whole view on every round
+		// while the cache stays incomplete. The boundary decision above
+		// deliberately runs first: the emergency tier is documented to skip
+		// an incomplete cache (total -1) and fall back to the normal tier.
+		a.ensureTokenCounts()
 		// Cap oversized tool bodies in place on the live message array (a
 		// model-free win; the cached counts are dropped when a body is
 		// rewritten) — the same stage-1 call the forced compaction makes.
@@ -336,10 +344,7 @@ func (a *Agent) runForcedSummarization(ctx context.Context, h *llm.StreamHandler
 // compaction), and reset save tracking. It returns the new counts so a
 // retrying caller (compactToFit) can pass them to the next compaction pass.
 func (a *Agent) publishCompaction(compacted []llm.Message, newPins map[int]struct{}) []int {
-	counts := make([]int, len(compacted))
-	for j, m := range compacted {
-		counts[j] = contextmgr.ComputeMessageTokens(m)
-	}
+	counts := contextmgr.CountTokens(compacted)
 	a.replaceMessagesWithCounts(compacted, counts)
 	if a.PinManager != nil {
 		a.PinManager.ReplacePins(newPins)
@@ -480,10 +485,7 @@ func (a *Agent) messageCounts() ([]llm.Message, []int) {
 	if a.tokenCounts != nil && len(a.tokenCounts) == len(msgs) {
 		return msgs, append([]int(nil), a.tokenCounts...)
 	}
-	counts := make([]int, len(msgs))
-	for i := range msgs {
-		counts[i] = contextmgr.ComputeMessageTokens(msgs[i])
-	}
+	counts := contextmgr.CountTokens(msgs)
 	return msgs, counts
 }
 

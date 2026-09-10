@@ -307,6 +307,7 @@ func (s *Store) SetEnabled(id string, enabled bool) error {
 	if !ok {
 		return fmt.Errorf("no automation with id %s", id)
 	}
+	prev := a.clone()
 	a.Enabled = enabled
 	a.UpdatedAt = s.now()
 	if enabled {
@@ -318,6 +319,10 @@ func (s *Store) SetEnabled(id string, enabled bool) error {
 		}
 	}
 	if err := s.saveAutomations(); err != nil {
+		// Roll the in-memory row back: with the mutation left in place a
+		// later successful save would silently persist a toggle that never
+		// hit the disk (the same phantom-write discipline as Create).
+		*a = prev
 		return err
 	}
 	return nil
@@ -327,11 +332,14 @@ func (s *Store) SetEnabled(id string, enabled bool) error {
 func (s *Store) Delete(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.autos[id]; !ok {
+	a, ok := s.autos[id]
+	if !ok {
 		return fmt.Errorf("no automation with id %s", id)
 	}
+	prev := a.clone()
+	prevRuns := s.runs // the filter below builds a NEW slice, so this stays intact
 	delete(s.autos, id)
-	runs := s.runs[:0]
+	var runs []Run
 	for _, r := range s.runs {
 		if r.AutomationID != id {
 			runs = append(runs, r)
@@ -339,8 +347,19 @@ func (s *Store) Delete(id string) error {
 	}
 	s.runs = runs
 	if err := s.saveAutomations(); err != nil {
+		// The automations file is the commit point and nothing was written:
+		// restore the row and its history together so memory and disk keep
+		// agreeing. Returning with the deletion still applied to memory
+		// would let the next successful save silently persist it (the
+		// phantom-write discipline of Create applied to both halves).
+		stored := prev
+		s.autos[id] = &stored
+		s.runs = prevRuns
 		return err
 	}
+	// Past the commit point the row is durably gone; the history cleanup is
+	// best-effort from here — a failed runs write is retried by the next
+	// saveRuns and can never resurrect the automation.
 	return s.saveRuns()
 }
 
@@ -372,6 +391,7 @@ func (s *Store) Update(updated *Automation) error {
 	if !ok {
 		return fmt.Errorf("no automation with id %s", updated.ID)
 	}
+	prev := stored.clone()
 	scheduleChanged := !schedulesEqual(stored.Schedule, updated.Schedule)
 	wasEnabled := stored.Enabled
 
@@ -398,6 +418,11 @@ func (s *Store) Update(updated *Automation) error {
 		// next_run_at: a prompt edit must not delay an imminent run.
 	}
 	if err := s.saveAutomations(); err != nil {
+		// Roll the stored row back to its pre-update value: otherwise the
+		// new fields stay in memory only and the next successful save
+		// silently persists an update that reported failure (Create's
+		// phantom-write discipline).
+		*stored = prev
 		return err
 	}
 	return nil

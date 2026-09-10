@@ -853,6 +853,7 @@ func normalizePriority(p string) string {
 // TUI/CLI sets a per-agent manager. nil detaches.
 func (a *Agent) SetBoardManager(m *BoardManager) {
 	a.boardManager.Store(m)
+	a.noteToolsChanged()
 }
 
 // BoardManager returns the attached board manager (nil when the board

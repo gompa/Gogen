@@ -85,6 +85,7 @@ func handleSkill(_ context.Context, a *Agent, args map[string]any) (string, erro
 // SkillsEnabled regardless.
 func (a *Agent) SetSkillsManager(m *skills.Manager) {
 	a.skillsManager.Store(m)
+	a.noteToolsChanged()
 }
 
 // SkillsManager returns the attached skill manager (nil when skills are

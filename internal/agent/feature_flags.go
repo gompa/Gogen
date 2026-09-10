@@ -23,6 +23,21 @@ type FeatureFlags struct {
 	subagentMaxDepth      atomic.Int32
 	subagentMaxConcurrent atomic.Int32
 	reviewAgentEnabled    atomic.Bool
+
+	// gen is the store's monotonic change counter, bumped by every setter.
+	// It is a component of the wire-overhead cache key (see overheadKey): a
+	// live toggle through the SHARED store must invalidate every session
+	// agent's cached tool set even though the agent's own setters were not
+	// called, so the counter lives with the shared state. See
+	// FeatureFlags.generation.
+	gen atomic.Uint64
+}
+
+// generation returns the store's monotonic change counter. The wire-overhead
+// cache keys on it (via overheadKey) so a live board/subagent toggle
+// recomputes the tool set only when a flag actually changed.
+func (f *FeatureFlags) generation() uint64 {
+	return f.gen.Load()
 }
 
 // NewFeatureFlags creates a FeatureFlags store seeded with the given
@@ -45,6 +60,7 @@ func (f *FeatureFlags) BoardEnabled() bool {
 // SetBoardEnabled toggles the board feature.
 func (f *FeatureFlags) SetBoardEnabled(on bool) {
 	f.boardEnabled.Store(on)
+	f.gen.Add(1)
 }
 
 // SubagentsEnabled reports whether the subagent feature is active.
@@ -62,11 +78,13 @@ func (f *FeatureFlags) AutomationsEnabled() bool {
 // SetAutomationsEnabled toggles the automation scheduler flag (live).
 func (f *FeatureFlags) SetAutomationsEnabled(on bool) {
 	f.automationsEnabled.Store(on)
+	f.gen.Add(1)
 }
 
 // SetSubagentsEnabled toggles the subagent feature.
 func (f *FeatureFlags) SetSubagentsEnabled(on bool) {
 	f.subagentsEnabled.Store(on)
+	f.gen.Add(1)
 }
 
 // SubagentMaxDepth returns the stored nesting-depth limit (0 = unset).
@@ -77,6 +95,7 @@ func (f *FeatureFlags) SubagentMaxDepth() int {
 // SetSubagentMaxDepth stores the nesting-depth limit (0 = unset).
 func (f *FeatureFlags) SetSubagentMaxDepth(depth int) {
 	f.subagentMaxDepth.Store(int32(depth))
+	f.gen.Add(1)
 }
 
 // SubagentMaxConcurrent returns the stored per-parent concurrent-subagent
@@ -89,6 +108,7 @@ func (f *FeatureFlags) SubagentMaxConcurrent() int {
 // (0 = unset).
 func (f *FeatureFlags) SetSubagentMaxConcurrent(n int) {
 	f.subagentMaxConcurrent.Store(int32(n))
+	f.gen.Add(1)
 }
 
 // ReviewAgentEnabled reports whether the board auto-review agent is
@@ -101,6 +121,7 @@ func (f *FeatureFlags) ReviewAgentEnabled() bool {
 // SetReviewAgentEnabled toggles the board auto-review agent.
 func (f *FeatureFlags) SetReviewAgentEnabled(on bool) {
 	f.reviewAgentEnabled.Store(on)
+	f.gen.Add(1)
 }
 
 // flags returns this agent's feature-flag store, lazily creating a private
@@ -163,6 +184,7 @@ func (a *Agent) SubagentsEnabled() bool {
 // v1, so this is set at construction).
 func (a *Agent) SetSkillsEnabled(on bool) {
 	a.skillsEnabled.Store(on)
+	a.noteToolsChanged()
 }
 
 // SkillsEnabled reports whether the skill tool is registered for this agent.
@@ -285,4 +307,25 @@ type featureWiring struct {
 	// feature is off.
 	jobNoticeHookMu sync.RWMutex
 	jobNoticeHook   func(summary string)
+
+	// toolGen counts model-facing tool-set reconfigurations that the SHARED
+	// FeatureFlags generation does not capture: the MCP registry, the board/
+	// skills managers, the subagent spawner, and the child report hook.
+	// wireOverheadTokens keys its cache on toolGen + the flag store's
+	// generation + the store identity (see overheadKey), so a stable tool
+	// set costs one integer compare per turn instead of re-serializing every
+	// tool schema; every setter that can change llmTools() must call
+	// noteToolsChanged.
+	toolGen atomic.Uint64
+}
+
+// noteToolsChanged marks the model-facing tool set as reconfigured so the
+// wire-overhead cache (wireOverheadTokens) recomputes its estimate. Call it
+// from any setter that can change the result of llmTools() — the MCP
+// registry, the board/skills managers, the subagent spawner, the report
+// hook — or the cached wire overhead could be reused against a changed
+// tool set. Feature-flag changes are covered separately by the shared
+// FeatureFlags generation.
+func (a *Agent) noteToolsChanged() {
+	a.toolGen.Add(1)
 }

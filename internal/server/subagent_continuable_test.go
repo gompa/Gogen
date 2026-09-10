@@ -225,7 +225,10 @@ func TestBackgroundChildBusy(t *testing.T) {
 	unlockOnce := func() {
 		if !unlocked {
 			unlocked = true
-			child.rt.turnMu.Unlock()
+			// Release through the production helper so the parked delivery
+			// worker wakes on the release broadcast (the test simulates a
+			// held turn lock).
+			child.rt.releaseTurn()
 		}
 	}
 	t.Cleanup(unlockOnce)
@@ -307,7 +310,10 @@ func TestRetentionReleasesAfterQueuedDelivery(t *testing.T) {
 	unlockOnce := func() {
 		if !unlocked {
 			unlocked = true
-			child.rt.turnMu.Unlock()
+			// Release through the production helper so the parked delivery
+			// worker wakes on the release broadcast (the test simulates a
+			// held turn lock).
+			child.rt.releaseTurn()
 		}
 	}
 	t.Cleanup(unlockOnce)

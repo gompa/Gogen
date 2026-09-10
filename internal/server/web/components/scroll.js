@@ -456,9 +456,9 @@ export function restoreChatAnchor(anchor) {
     // not a live gesture. disableFollow also refreshes the jump button.
     disableFollow();
     positionChatAnchor(el, anchor.subPx);
-    // Late layout (Monaco colorization, image loads, content-visibility
-    // placeholders resolving) shifts the anchor after the first pass;
-    // re-check one frame later, mirroring the double-pass settle cadence.
+    // Late layout (Monaco colorization, image loads, async rendering)
+    // shifts the anchor after the first pass; re-check one frame later,
+    // mirroring the double-pass settle cadence.
     requestAnimationFrame(() => positionChatAnchor(el, anchor.subPx));
     return true;
 }

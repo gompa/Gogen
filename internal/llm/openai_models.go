@@ -14,6 +14,27 @@ import (
 )
 
 func (p *OpenAIProvider) listModels(ctx context.Context) ([]openai.Model, error) {
+	return p.listModelsInternal(ctx, true)
+}
+
+// listModelsProbe is listModels for the brief, best-effort catalog lookup in
+// ModelContextLimit: a failed fetch does NOT arm the shared
+// modelsFetchFailedAt backoff. That lookup runs under
+// modelsLimitLookupTimeout (1.5s), which routinely cuts off a slow-but-alive
+// remote catalog; treating the timeout as a dead-endpoint signal would make
+// clientForModel skip catalog discovery for modelsFetchBackoff and route
+// every model through the fallback/owner inference. Only full-budget catalog
+// fetches (ListModels, clientForModel's discovery) arm the backoff.
+func (p *OpenAIProvider) listModelsProbe(ctx context.Context) ([]openai.Model, error) {
+	return p.listModelsInternal(ctx, false)
+}
+
+// listModelsInternal fetches the merged catalog with a single-flight guard
+// and a modelsCatalogTimeout bound. armBackoff selects whether a failed fetch
+// arms the shared failure backoff (modelsFetchFailedAt): callers whose budget
+// is shorter than a full catalog fetch (the ModelContextLimit probe) pass
+// false so their brief timeout cannot degrade routing.
+func (p *OpenAIProvider) listModelsInternal(ctx context.Context, armBackoff bool) ([]openai.Model, error) {
 	ctx, cancel := context.WithTimeout(ctx, modelsCatalogTimeout)
 	defer cancel()
 
@@ -75,9 +96,11 @@ func (p *OpenAIProvider) listModels(ctx context.Context) ([]openai.Model, error)
 		// endpoints and is NOT cached — concurrent waiters get the snapshot
 		// once, and the next call re-fetches the new endpoint set.
 		p.modelsFetchFailedAt = time.Time{}
-	} else {
+	} else if armBackoff {
 		// Record the failure so clientForModel's backoff gate skips re-probing
-		// a dead catalog on every chat request.
+		// a dead catalog on every chat request. A brief probe
+		// (listModelsProbe) leaves the marker untouched: its short budget is
+		// not evidence the endpoint is dead.
 		p.modelsFetchFailedAt = time.Now()
 	}
 	p.modelsFetch = nil
@@ -180,16 +203,13 @@ func (p *OpenAIProvider) fetchModelsWithProfiles(ctx context.Context) ([]openai.
 			defer wg.Done()
 			goRes = query(qctx, prof.goCatalog, prof.goStream)
 		}()
-		done := make(chan struct{})
-		go func() {
-			wg.Wait()
-			close(done)
-		}()
-		select {
-		case <-qctx.Done():
-			return result{err: qctx.Err()}
-		case <-done:
-		}
+		// Join both queries before reading their results. Each query observes
+		// qctx cancellation and its catalog client carries its own timeout,
+		// so this wait is bounded even when one endpoint hangs. Waiting (rather
+		// than returning early on qctx.Done) also keeps whatever the surviving
+		// twin already listed: a hung Zen or Go endpoint must not discard the
+		// other's completed catalog, matching the per-profile merge rule.
+		wg.Wait()
 
 		routing := make(map[string]*openai.Client, len(zenRes.routing)+len(goRes.routing))
 		models := make([]openai.Model, 0, len(zenRes.models)+len(goRes.models))
@@ -425,8 +445,11 @@ func (p *OpenAIProvider) ModelContextLimit(ctx context.Context) (int, error) {
 
 	// 3. Brief /v1/models probe (fallback when models.dev has no entry).
 	//    Local LLMs typically answer in << 1s; a hung remote host is bounded
-	//    by the outer modelsLimitLookupTimeout context.
-	models, _ := p.listModels(ctx)
+	//    by the outer modelsLimitLookupTimeout context. The probe uses
+	//    listModelsProbe so a timeout from that brief budget never arms the
+	//    shared catalog backoff (which would degrade clientForModel routing
+	//    for a slow-but-alive remote catalog).
+	models, _ := p.listModelsProbe(ctx)
 	if lim, ok := p.contextLimitFromModels(models); ok {
 		return lim, nil
 	}

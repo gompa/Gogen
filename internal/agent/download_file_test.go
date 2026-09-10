@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -148,9 +149,51 @@ func TestDownloadFileSizeCapRejected(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "exceeds max_bytes") {
 		t.Fatalf("expected size-cap error, got %v", err)
 	}
-	// A partial file must not be left behind.
+	// A partial file must not be left behind, nor a stray temp file.
 	if _, statErr := os.Stat(filepath.Join(wd, "big.bin")); !os.IsNotExist(statErr) {
 		t.Fatalf("truncated download was written to disk (stat err = %v)", statErr)
+	}
+	entries, readErr := os.ReadDir(wd)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".gogen-write-") {
+			t.Fatalf("temp file left behind after rejected download: %s", e.Name())
+		}
+	}
+}
+
+func TestDoFetchStreamReportsTruncation(t *testing.T) {
+	payload := strings.Repeat("z", 8192)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(payload))
+	}))
+	defer srv.Close()
+	useLocalFetchClient(t, srv)
+
+	// Under the cap: not truncated, full body streamed.
+	var buf bytes.Buffer
+	_, _, n, truncated, err := doFetchStream(context.Background(), fetchRequest{URL: srv.URL, MaxBytes: len(payload) + 1}, &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if truncated || n != int64(len(payload)) || buf.Len() != len(payload) {
+		t.Fatalf("under cap: truncated=%v n=%d buf=%d, want false/%d/%d", truncated, n, buf.Len(), len(payload), len(payload))
+	}
+
+	// Over the cap: truncated=true and at most MaxBytes+1 bytes copied (the
+	// +1 is the truncation probe).
+	buf.Reset()
+	_, _, n, truncated, err = doFetchStream(context.Background(), fetchRequest{URL: srv.URL, MaxBytes: 4096}, &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !truncated {
+		t.Fatal("expected truncation")
+	}
+	if n != 4097 || buf.Len() != 4097 {
+		t.Fatalf("over cap: n=%d buf=%d, want 4097", n, buf.Len())
 	}
 }
 

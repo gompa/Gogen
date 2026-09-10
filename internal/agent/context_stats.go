@@ -141,13 +141,12 @@ func (a *Agent) contextSnapshot(msgs, view []llm.Message, counts []int, countsEp
 		// No cached counts (fresh session, or a compaction/restore just
 		// cleared them): compute them once for this snapshot, then publish
 		// the result so subsequent probes skip re-tokenization entirely.
-		// The computed counts stay valid for the cloned snapshot even if
-		// the live list changes before the store; the epoch guard keeps
-		// stale counts from ever being published.
-		counts = make([]int, len(msgs))
-		for i := range msgs {
-			counts[i] = contextmgr.ComputeMessageTokens(msgs[i])
-		}
+		// CountTokens shares one memo across all messages (repeated
+		// tool-call names/IDs encode once), which matters most on a large
+		// restored session. The computed counts stay valid for the cloned
+		// snapshot even if the live list changes before the store; the
+		// epoch guard keeps stale counts from ever being published.
+		counts = contextmgr.CountTokens(msgs)
 		snap := a.Context.SnapshotWithCounts(msgs, view, counts)
 		a.publishTokenCounts(counts, len(msgs), countsEpoch)
 		return snap, counts
@@ -155,13 +154,12 @@ func (a *Agent) contextSnapshot(msgs, view []llm.Message, counts []int, countsEp
 	if len(counts) < len(msgs) {
 		// The cache is a valid prefix but messages were appended since it
 		// was last extended (ContextStats can race a burst of appends).
-		// Compute counts for only the missing suffix locally and publish
-		// the extension under the epoch guard.
+		// Compute counts for only the missing suffix locally (one batched
+		// pass with a shared memo) and publish the extension under the
+		// epoch guard.
 		extended := make([]int, len(msgs))
 		copy(extended, counts)
-		for i := len(counts); i < len(msgs); i++ {
-			extended[i] = contextmgr.ComputeMessageTokens(msgs[i])
-		}
+		copy(extended[len(counts):], contextmgr.CountTokens(msgs[len(counts):]))
 		snap := a.Context.SnapshotWithCounts(msgs, view, extended)
 		a.publishTokenCounts(extended, len(msgs), countsEpoch)
 		return snap, extended
@@ -179,6 +177,36 @@ func (a *Agent) publishTokenCounts(counts []int, msgCount int, countsEpoch uint6
 		a.tokenCounts = append(a.tokenCounts, counts[len(a.tokenCounts):]...)
 	}
 	a.statsMu.Unlock()
+}
+
+// ensureTokenCounts backfills the per-message token-count cache when it does
+// not cover every message, using one batched pass with a shared memo. A cold
+// cache — a restored session whose snapshot carried no counts, or a cache
+// dropped by capToolResultsForCompact — would otherwise make every round
+// re-tokenize the whole view in outgoingViewEstimate and
+// shouldCompactUsingCounts; backfilling once restores the cached fast paths.
+//
+// It runs on the turn goroutine (the only writer of Messages) after the
+// boundary compaction decision but before the pre-flight measurement; the
+// boundary decision deliberately sees the incomplete cache so the emergency
+// tier keeps its documented "total -1 → skip" behavior. The epoch guard still
+// drops the result if a concurrent reshape (restore/fork/rollback) moved the
+// list underneath us.
+func (a *Agent) ensureTokenCounts() {
+	if a.Context == nil {
+		return
+	}
+	a.statsMu.RLock()
+	n := len(a.Messages)
+	complete := n == 0 || (a.tokenCounts != nil && len(a.tokenCounts) == n)
+	if complete {
+		a.statsMu.RUnlock()
+		return
+	}
+	msgs := append([]llm.Message(nil), a.Messages...)
+	countsEpoch := a.countsEpoch
+	a.statsMu.RUnlock()
+	a.publishTokenCounts(contextmgr.CountTokens(msgs), len(msgs), countsEpoch)
 }
 
 // applyAPIBaseline uses the last request's exact prompt_tokens as the

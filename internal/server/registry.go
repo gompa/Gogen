@@ -22,6 +22,15 @@ type sessionRuntime struct {
 	agent  *agent.Agent
 	turnMu sync.RWMutex // turns take Lock; config/history reads take RLock
 
+	// turnRelease is the turn-lock release broadcast: every write unlock
+	// goes through releaseTurn, which closes the current channel and
+	// installs a fresh one (notifyTurnReleased), so tryAcquireTurn and the
+	// delivery worker's idle wait wake exactly when a holder frees the lock
+	// instead of polling. turnReleaseMu guards the swap; it is a leaf lock —
+	// never held while acquiring turnMu, r.mu, or deliverMu.
+	turnReleaseMu sync.Mutex
+	turnRelease   chan struct{}
+
 	// stream owns the in-flight stream cancel handles for this session
 	// (moved from per-connection).
 	stream *wsConnStream
@@ -168,6 +177,7 @@ func newSessionRuntime(a *agent.Agent) *sessionRuntime {
 		clients:       make(map[*wsConn]struct{}),
 		passive:       make(map[*wsConn]struct{}),
 		deliverNotify: make(chan struct{}, 1),
+		turnRelease:   make(chan struct{}),
 	}
 }
 
@@ -785,7 +795,7 @@ func (r *sessionRegistry) register(id string, rt *sessionRuntime) []string {
 		// evictRuntime; the sticky evicted flag set above already blocks
 		// any new turn once the lock is released.
 		victim.agent.Close()
-		victim.turnMu.Unlock()
+		victim.releaseTurn()
 		victim.broadcast(WSMessage{Type: "session_detached", SessionID: victimIDs[i]})
 		// Detach every attached socket AFTER the notification (the client
 		// closes its pane on session_detached): the victim left the
@@ -892,7 +902,7 @@ func (r *sessionRegistry) closeRuntime(rt *sessionRuntime) {
 	// still alive, e.g. stuck in a tool), that turn itself holds the lock —
 	// proceed without it; the evicted flag prevents new turns regardless.
 	if held := rt.turnMu.TryLock(); held {
-		defer rt.turnMu.Unlock()
+		defer rt.releaseTurn()
 	}
 	r.evictRuntime(rt)
 	// Explicit close: the session is gone for good (until reopened) — its
@@ -943,7 +953,7 @@ func (r *sessionRegistry) evictOrphaned(rt *sessionRuntime) {
 	if !rt.turnMu.TryLock() {
 		return
 	}
-	defer rt.turnMu.Unlock()
+	defer rt.releaseTurn()
 	r.evictRuntime(rt)
 }
 
@@ -962,7 +972,8 @@ func (r *sessionRegistry) remove(id string) {
 	if _, ok := r.agents[id]; !ok {
 		return
 	}
-	r.agents[id].evicted.Store(true)
+	rt := r.agents[id]
+	rt.evicted.Store(true)
 	delete(r.agents, id)
 	for i, oid := range r.order {
 		if oid == id {
@@ -970,6 +981,13 @@ func (r *sessionRegistry) remove(id string) {
 			break
 		}
 	}
+	// Wake any waiter parked on the runtime's turn-release broadcast so an
+	// eviction that could not win the turn lock (a stuck turn holds it) still
+	// lets the delivery worker re-check evicted and drop the queue instead of
+	// blocking until that turn finally unlocks. The completed-eviction paths
+	// release the lock themselves (releaseTurn), so this is redundant there —
+	// harmless, since notifyTurnReleased always installs a fresh channel.
+	rt.notifyTurnReleased()
 }
 
 // setDefault makes id the default session (first in registration order), so
@@ -1166,24 +1184,81 @@ func (rt *sessionRuntime) acquireTurnForHandler(ws *wsConn) bool {
 	// or the eviction completed first (the flag is set). Drop silently: the
 	// client already received session_detached and closed the pane.
 	if rt.evicted.Load() {
-		rt.turnMu.Unlock()
+		rt.releaseTurn()
 		return false
 	}
 	return true
 }
 
-// tryAcquireTurn waits briefly for the session's turnMu (e.g. after
-// cancelling our own stream). Returns false if another client still holds the
-// session's turn lock.
+// releaseTurn releases the session turn (write) lock and wakes every waiter
+// parked in tryAcquireTurn or the delivery worker's idle wait. Use it in
+// place of rt.turnMu.Unlock() so a waiter learns of the release the instant
+// it happens instead of re-probing on a timer.
+//
+// The unlock MUST happen before the signal: a waiter woken by the broadcast
+// re-probes with TryLock, so signalling first would let it observe the lock
+// still held, re-arm on the freshly installed channel, and miss the (later)
+// release. Unlock-then-notify closes that window.
+func (rt *sessionRuntime) releaseTurn() {
+	rt.turnMu.Unlock()
+	rt.notifyTurnReleased()
+}
+
+// notifyTurnReleased broadcasts a turn-lock release by closing the current
+// release channel and installing a fresh one, so every current waiter wakes
+// while a waiter that arrives later parks on the new channel. A plain
+// buffered-channel send would wake only one of several waiters.
+func (rt *sessionRuntime) notifyTurnReleased() {
+	rt.turnReleaseMu.Lock()
+	// nil-safe: runtimes built as bare struct literals (tests) skip
+	// newSessionRuntime, so install the channel on first use.
+	if rt.turnRelease != nil {
+		close(rt.turnRelease)
+	}
+	rt.turnRelease = make(chan struct{})
+	rt.turnReleaseMu.Unlock()
+}
+
+// turnReleaseChan returns the current release-broadcast channel. A waiter
+// captures it BEFORE re-probing the lock: a release that lands between the
+// failed TryLock and the wait closes the captured channel, so the wake-up is
+// never missed.
+func (rt *sessionRuntime) turnReleaseChan() chan struct{} {
+	rt.turnReleaseMu.Lock()
+	defer rt.turnReleaseMu.Unlock()
+	if rt.turnRelease == nil {
+		rt.turnRelease = make(chan struct{})
+	}
+	return rt.turnRelease
+}
+
+// tryAcquireTurn waits up to wait for the session's turnMu (e.g. after
+// cancelling our own stream), waking on the turn-release broadcast rather
+// than polling. Returns false if another client still holds the session's
+// turn lock when the deadline expires. A non-positive wait is a single
+// non-blocking probe.
 func (rt *sessionRuntime) tryAcquireTurn(wait time.Duration) bool {
-	deadline := time.Now().Add(wait)
+	if rt.turnMu.TryLock() {
+		return true
+	}
+	if wait <= 0 {
+		return false
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
 	for {
+		// Capture the release signal before re-probing so a release landing
+		// now is not missed (capture-then-check).
+		release := rt.turnReleaseChan()
 		if rt.turnMu.TryLock() {
 			return true
 		}
-		if time.Now().After(deadline) {
-			return false
+		select {
+		case <-release:
+			// A holder released: retry the lock.
+		case <-timer.C:
+			// Last chance: a release may have landed in the same instant.
+			return rt.turnMu.TryLock()
 		}
-		time.Sleep(5 * time.Millisecond)
 	}
 }

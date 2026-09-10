@@ -386,15 +386,23 @@ func (p *OpenAIProvider) GenerateResponse(ctx context.Context, messages []Messag
 
 	var toolCalls []ToolCall
 	for _, tc := range resp.Choices[0].Message.ToolCalls {
-		var args map[string]any
-		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-			return Response{}, fmt.Errorf("failed to unmarshal tool call arguments: %w", err)
+		// A malformed arguments blob must not kill the whole round: record it
+		// per call (ArgsError) and keep the other tool calls, matching the
+		// streaming accumulator (buildResult) so recovery does not depend on
+		// which transport served the turn. parseToolCallArgs also carries the
+		// duplicated-object recovery the stream path relies on.
+		args, argsErr := parseToolCallArgs(tc.Function.Arguments)
+		errStr := ""
+		if argsErr != nil {
+			args = map[string]any{}
+			errStr = argsErr.Error()
 		}
 		toolCalls = append(toolCalls, ToolCall{
-			ID:      tc.ID,
-			Name:    tc.Function.Name,
-			Args:    args,
-			ArgsStr: tc.Function.Arguments,
+			ID:        tc.ID,
+			Name:      tc.Function.Name,
+			Args:      args,
+			ArgsStr:   tc.Function.Arguments,
+			ArgsError: errStr,
 		})
 	}
 
@@ -732,6 +740,19 @@ func (p *OpenAIProvider) streamChatAttempt(ctx context.Context, messages []Messa
 	drainGrace := streamDrainGrace()
 	var drainTimer *time.Timer
 
+	// Disarm the grace timers on every exit path, including the in-loop
+	// ctx-cancel return below: an armed AfterFunc would otherwise stay
+	// scheduled for up to a full grace window, retaining the accumulator and
+	// re-closing an already-closed stream.
+	defer func() {
+		if stopGrace != nil {
+			stopGrace.Stop()
+		}
+		if drainTimer != nil {
+			drainTimer.Stop()
+		}
+	}()
+
 	for stream.Next() {
 		// Every surfaced chunk (even a no-op delta) proves the pipe is
 		// moving: reset the stall clock.
@@ -765,12 +786,6 @@ func (p *OpenAIProvider) streamChatAttempt(ctx context.Context, messages []Messa
 				_ = stream.Close()
 			})
 		}
-	}
-	if stopGrace != nil {
-		stopGrace.Stop()
-	}
-	if drainTimer != nil {
-		drainTimer.Stop()
 	}
 
 	if err := ctx.Err(); err != nil {

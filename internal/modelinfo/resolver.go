@@ -239,8 +239,9 @@ func (r *Resolver) refreshAsync() {
 			return
 		}
 		r.setDataLocked(data)
+		cachePath := r.cachePath
 		r.mu.Unlock()
-		r.writeDiskCache(data)
+		r.writeDiskCache(cachePath, data)
 	}()
 }
 
@@ -286,15 +287,18 @@ func (r *Resolver) readDiskCache() (registry, error) {
 	return reg, nil
 }
 
-func (r *Resolver) writeDiskCache(data registry) {
-	if r.cachePath == "" {
+// writeDiskCache persists data to cachePath. The path is passed explicitly
+// rather than read from r.cachePath so callers outside the lock cannot race
+// with SetCachePath.
+func (r *Resolver) writeDiskCache(cachePath string, data registry) {
+	if cachePath == "" {
 		return
 	}
 	b, err := json.Marshal(data)
 	if err != nil {
 		return
 	}
-	_ = ioutil.WriteFileAtomicNoSync(r.cachePath, b, 0o644)
+	_ = ioutil.WriteFileAtomicNoSync(cachePath, b, 0o644)
 }
 
 // normalizeURL strips a trailing slash so "https://x/v1" and "https://x/v1/"

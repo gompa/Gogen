@@ -529,3 +529,66 @@ func TestReasoningEffortsInvalidatedOnSetProfiles(t *testing.T) {
 		t.Fatalf("props hits = %d, want 2 (one per probe generation)", propsHits.Load())
 	}
 }
+
+// TestPropsProbeUsesOwningProfileAPIKey pins that the llama.cpp capability
+// probes (/props and /apply-template, shared by the reasoning-effort and
+// preserve-reasoning paths) authenticate with the API key of the endpoint
+// they actually dial. With two registered profiles, a non-default model's
+// /props request must carry the owning (secondary) profile's Bearer token,
+// not the default profile's.
+func TestPropsProbeUsesOwningProfileAPIKey(t *testing.T) {
+	t.Parallel()
+
+	newAuthServer := func(t *testing.T, wantKey string, hits *atomic.Int32) *httptest.Server {
+		t.Helper()
+		mux := http.NewServeMux()
+		mux.HandleFunc("/props", func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			if got := r.Header.Get("Authorization"); got != "Bearer "+wantKey {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"chat_template_caps": map[string]bool{"supports_reasoning_effort": true},
+				"chat_template":      unslothQwen38Template,
+			})
+		})
+		srv := httptest.NewServer(mux)
+		t.Cleanup(srv.Close)
+		return srv
+	}
+
+	defHits := new(atomic.Int32)
+	secHits := new(atomic.Int32)
+	defSrv := newAuthServer(t, "default-key", defHits)
+	secSrv := newAuthServer(t, "secondary-key", secHits)
+
+	p := NewOpenAIProviderWithProfiles([]ProviderProfile{
+		{Name: "default", BaseURL: defSrv.URL + "/v1", APIKey: "default-key"},
+		{Name: "secondary", BaseURL: secSrv.URL + "/v1", APIKey: "secondary-key"},
+	}, "sec-model", t.TempDir(), nil)
+	// The catalog associates sec-model with the secondary profile; emulate
+	// the post-fetch routing state directly.
+	p.modelsMu.Lock()
+	p.modelProfile = map[string]modelProfileInfo{
+		"sec-model": {name: "secondary", baseURL: secSrv.URL + "/v1"},
+	}
+	p.modelsMu.Unlock()
+
+	changed, err := p.ProbeReasoningEfforts(context.Background(), "sec-model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("want changed=true (default → derived)")
+	}
+	if got := p.ModelReasoningEfforts("sec-model"); !slices.Equal(got, []string{"xhigh", "medium", "low"}) {
+		t.Fatalf("ModelReasoningEfforts = %v, want [xhigh medium low]", got)
+	}
+	if secHits.Load() != 1 {
+		t.Fatalf("secondary /props hits = %d, want 1", secHits.Load())
+	}
+	if defHits.Load() != 0 {
+		t.Fatalf("default /props hits = %d, want 0 (probe must target the owning profile)", defHits.Load())
+	}
+}

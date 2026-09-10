@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log"
-	"strconv"
 	"sync"
 	"time"
 
@@ -51,8 +50,8 @@ func (a *Agent) snapshotBaselineState() baselineState {
 // summing the cached per-message token counts when they are complete to avoid
 // re-tokenizing the whole conversation on every turn. Falls back to
 // Manager.ShouldCompactWithOverhead (a full EstimateTokens pass) when the
-// cache is empty or incomplete (e.g. right after a compaction or session
-// restore).
+// cache is empty or incomplete (e.g. after capToolResultsForCompact drops it;
+// compaction and session restore publish fresh counts).
 //
 // Wire overhead accounting: the per-message counts cover the canonical
 // messages only — the system prompt and tool definitions (10-30k tokens)
@@ -88,8 +87,8 @@ func (a *Agent) shouldCompactUsingCounts() bool {
 // using the same accounting as shouldCompactUsingCounts: the provider's
 // exact prompt_tokens baseline when fresh, otherwise the cached per-message
 // counts plus the wire overhead. Returns -1 when the per-message count
-// cache is incomplete (e.g. right after a session restore) so callers can
-// fall back to the full-estimate path.
+// cache is incomplete (e.g. after capToolResultsForCompact drops it) so
+// callers can fall back to the full-estimate path.
 func (a *Agent) compactionTokenTotal() int {
 	snap := a.snapshotBaselineState()
 	if !snap.complete {
@@ -119,13 +118,34 @@ func (a *Agent) compactionTokenTotal() int {
 	return total
 }
 
+// overheadKey identifies a wire-overhead computation: the hash of the system
+// prompt content plus a generation of the model-facing tool set. Two calls
+// with an equal key must see the same (system prompt, tool definitions)
+// content, so the cached token estimate can be reused without re-deriving
+// it.
+//
+// The tool side is deliberately a generation rather than a content
+// fingerprint: hashing the tool definitions (contextmgr.ToolDefinitionString
+// json.Marshals every parameter schema) on each turn was the dominant cost of
+// this cache even on a hit. Every mutation that can change llmTools() bumps
+// the generation instead — noteToolsChanged for the agent's own
+// reconfigurations, FeatureFlags.generation for a live shared-board/subagent
+// toggle — so a stable tool set costs one integer compare per turn.
+type overheadKey struct {
+	sysHash      uint64
+	toolGen      uint64
+	flagsVersion uint64
+	flags        *FeatureFlags
+}
+
 // wireOverheadTokens returns the estimated wire token cost of everything a
 // provider request carries besides the canonical messages: the system prompt
 // (or only its enrichment suffix when the history already carries a system
 // message, whose base content is in the per-message counts) plus all tool
-// definitions. The result is cached and recomputed only when the content
-// fingerprint of (system prompt, tool definitions) changes, so the
-// per-round prepareMessages call does not re-tokenize the tool set.
+// definitions. The result is cached and recomputed only when the system
+// prompt or the model-facing tool set changes (see overheadKey), so the
+// per-round prepareMessages call does not re-tokenize or re-serialize the
+// tool set.
 func (a *Agent) wireOverheadTokens() int {
 	var sysContent string
 	if prefix := a.systemPromptPrefix(); prefix != nil {
@@ -135,37 +155,28 @@ func (a *Agent) wireOverheadTokens() int {
 		// wire overhead (the base content is counted in the messages).
 		sysContent = buildSystemSuffix(a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode)
 	}
-	tools := a.llmTools()
-	fp := overheadFingerprint(sysContent, tools)
+	h := fnv.New64a()
+	h.Write([]byte(sysContent))
+	flags := a.flags()
+	key := overheadKey{
+		sysHash:      h.Sum64(),
+		toolGen:      a.toolGen.Load(),
+		flagsVersion: flags.generation(),
+		flags:        flags,
+	}
 	a.overheadMu.Lock()
-	if fp != a.overheadFingerprint {
+	if key != a.overheadCacheKey {
+		tools := a.llmTools()
 		tokens := contextmgr.EstimateToolTokens(tools)
 		if sysContent != "" && a.Context != nil {
 			tokens += a.Context.EstimateTokens([]llm.Message{{Role: "system", Content: sysContent}})
 		}
-		a.overheadFingerprint = fp
+		a.overheadCacheKey = key
 		a.overheadTokens = tokens
 	}
 	t := a.overheadTokens
 	a.overheadMu.Unlock()
 	return t
-}
-
-// overheadFingerprint builds a content fingerprint of (system prompt, tool
-// definitions) for the wire-overhead cache: any change to the system prompt
-// text or any tool definition produces a different fingerprint, invalidating
-// the cached token estimate. Length-prefixed segments make the hash
-// collision-resistant against concatenation ambiguity.
-func overheadFingerprint(sysContent string, tools []llm.Tool) string {
-	h := fnv.New64a()
-	fmt.Fprintf(h, "%d\x00", len(sysContent))
-	h.Write([]byte(sysContent))
-	for _, t := range tools {
-		s := contextmgr.ToolDefinitionString(t)
-		fmt.Fprintf(h, "%d\x00", len(s))
-		h.Write([]byte(s))
-	}
-	return strconv.FormatUint(h.Sum64(), 16)
 }
 
 // compactAttemptDue reports whether the auto-compaction failure backoff has expired.
@@ -283,10 +294,7 @@ func (a *Agent) CompactHistory(ctx context.Context) error {
 	// Publish the compacted history together with its freshly computed token
 	// counts (cheap — compaction shrank the conversation) so the cached
 	// shouldCompactUsingCounts path stays valid on the next turn.
-	counts := make([]int, len(compacted))
-	for i, m := range compacted {
-		counts[i] = contextmgr.ComputeMessageTokens(m)
-	}
+	counts := contextmgr.CountTokens(compacted)
 	a.replaceMessagesWithCounts(compacted, counts)
 	if a.PinManager != nil {
 		a.PinManager.ReplacePins(newPins)
@@ -319,14 +327,14 @@ type compactionState struct {
 		lastResort int
 	}
 
-	// overheadMu guards overheadFingerprint/overheadTokens: the cached wire
+	// overheadMu guards overheadCacheKey/overheadTokens: the cached wire
 	// overhead (system prompt + tool definitions) in tokens. Recomputed only
-	// when the content fingerprint of (system prompt, tool definitions)
-	// changes, so the per-round prepareMessages call never re-tokenizes the
-	// tool set. Deliberately not statsMu: tokenizing is CPU-heavy and the
-	// cache is consulted only on the turn goroutine (shouldCompactUsingCounts),
-	// not by lock-free readers.
-	overheadMu          sync.Mutex
-	overheadFingerprint string
-	overheadTokens      int
+	// when the system prompt or the model-facing tool set generation changes
+	// (see overheadKey), so the per-round prepareMessages call never
+	// re-tokenizes or re-serializes the tool set. Deliberately not statsMu:
+	// tokenizing is CPU-heavy and the cache is consulted only on the turn
+	// goroutine (shouldCompactUsingCounts), not by lock-free readers.
+	overheadMu       sync.Mutex
+	overheadCacheKey overheadKey
+	overheadTokens   int
 }

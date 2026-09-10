@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -365,6 +366,59 @@ func TestSetCachePathClearsMemory(t *testing.T) {
 	if r.data != nil || r.byAPI != nil || !r.fetchedAt.IsZero() {
 		t.Fatal("expected in-memory registry cleared for new project path")
 	}
+}
+
+// TestSetCachePathConcurrentWithRefresh is a regression guard for a data race
+// on Resolver.cachePath: the background refresh goroutine read cachePath
+// unlocked in writeDiskCache while SetCachePath wrote it under r.mu. A project
+// switch (SetModelInfoCacheDir) overlapping a registry refresh hit this. Run
+// under -race; the old code tripped the detector on the unlock-then-write path.
+func TestSetCachePathConcurrentWithRefresh(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(sampleRegistry())
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	paths := []string{
+		filepath.Join(dir, "a", "models.json"),
+		filepath.Join(dir, "b", "models.json"),
+	}
+	for _, p := range paths {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	r := NewResolver(paths[0])
+	r.url = srv.URL
+	r.client = &http.Client{Timeout: 2 * time.Second}
+
+	// Hammer SetCachePath while refreshes persist to the (changing) path.
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+				r.SetCachePath(paths[i%len(paths)])
+			}
+		}
+	}()
+
+	// SetCachePath clears in-memory data, so each call lets refreshAsync start
+	// a new fetch whose writeDiskCache overlaps the writes above.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		r.refreshAsync()
+		time.Sleep(time.Millisecond)
+	}
+	close(stop)
+	wg.Wait()
 }
 
 // ResolveContextLimit and ProviderID are the test-only read surface, moved

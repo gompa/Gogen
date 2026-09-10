@@ -305,6 +305,59 @@ func TestTokenCountsCacheIncremental(t *testing.T) {
 	}
 }
 
+// TestRestoreBackfillsMissingTokenCounts verifies that a session restored
+// from a snapshot without per-message counts (a FlushSession-written
+// snapshot carries none) has its count cache backfilled once at restore, so
+// compactionTokenTotal / shouldCompactUsingCounts take the cached fast path
+// immediately instead of re-tokenizing the whole view every round.
+func TestRestoreBackfillsMissingTokenCounts(t *testing.T) {
+	provider := &statsStubProvider{limit: 100000}
+	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{ContextLimit: 100000})
+	a := NewAgent(provider, &Executor{WorkingDir: "."}, ctxMgr)
+
+	msgs := []llm.Message{
+		{Role: "user", Content: "hello world"},
+		{Role: "assistant", Content: "hi"},
+		{Role: "user", Content: "do the thing"},
+	}
+	a.RestoreSessionLocal(SessionSnapshot{Messages: msgs}, "restore-sess")
+
+	a.statsMu.RLock()
+	got := append([]int(nil), a.tokenCounts...)
+	a.statsMu.RUnlock()
+	if len(got) != len(msgs) {
+		t.Fatalf("tokenCounts len=%d, want %d (restore must backfill)", len(got), len(msgs))
+	}
+	for i, m := range msgs {
+		if want := contextmgr.ComputeMessageTokens(m); got[i] != want {
+			t.Fatalf("counts[%d]=%d, want %d", i, got[i], want)
+		}
+	}
+	if total := a.compactionTokenTotal(); total < 0 {
+		t.Fatalf("compactionTokenTotal = %d, want >= 0 after restore backfill", total)
+	}
+}
+
+// TestRestoreReusesProvidedTokenCounts pins that a snapshot carrying a
+// complete count slice is trusted verbatim — the restore must not spend a
+// tokenization pass rewriting counts it already has.
+func TestRestoreReusesProvidedTokenCounts(t *testing.T) {
+	provider := &statsStubProvider{limit: 100000}
+	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{ContextLimit: 100000})
+	a := NewAgent(provider, &Executor{WorkingDir: "."}, ctxMgr)
+
+	msgs := []llm.Message{{Role: "user", Content: "a"}, {Role: "assistant", Content: "b"}}
+	saved := []int{11, 22}
+	a.RestoreSessionLocal(SessionSnapshot{Messages: msgs, TokenCounts: saved}, "restore-sess")
+
+	a.statsMu.RLock()
+	got := append([]int(nil), a.tokenCounts...)
+	a.statsMu.RUnlock()
+	if len(got) != len(saved) || got[0] != saved[0] || got[1] != saved[1] {
+		t.Fatalf("tokenCounts = %v, want the provided %v", got, saved)
+	}
+}
+
 // TestShouldCompactUsingCountsMatchesDirect verifies the cached-count
 // compaction decision agrees with the full EstimateTokens pass. No API
 // baseline is recorded here, so both sides add the wire overhead

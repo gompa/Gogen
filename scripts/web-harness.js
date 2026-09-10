@@ -43,6 +43,9 @@ const COMPONENT_MODULES = [
   // and app.js call icon() — its top-level declaration must land in the
   // global scope before any of them eval.
   'internal/server/web/components/icons.js',
+  // Leaf module (no imports): off-screen paint skip that measures real
+  // heights; app.js calls enablePaintSkip at each item's finalization.
+  'internal/server/web/components/paint-skip.js',
   'internal/server/web/components/popover.js',
   // Shared decision-dialog plumbing (openDialog); imports editor.js
   // (openModal / closeModal, stubbed above). sessions.js and

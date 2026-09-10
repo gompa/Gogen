@@ -549,6 +549,169 @@ func TestDeleteRemovesAutomationAndHistory(t *testing.T) {
 	}
 }
 
+// blockStoreFile replaces one of the store files with a directory so the
+// atomic write for it fails (the temp-file rename hits EISDIR) while the
+// other file stays writable. The returned func removes the blocker and
+// restores the original bytes; it is idempotent.
+func blockStoreFile(t *testing.T, st *Store, name string) func() {
+	t.Helper()
+	path := filepath.Join(st.dir, name)
+	orig, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove %s: %v", path, err)
+	}
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", path, err)
+	}
+	restored := false
+	return func() {
+		if restored {
+			return
+		}
+		restored = true
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("remove blocker %s: %v", path, err)
+		}
+		if err := os.WriteFile(path, orig, 0o600); err != nil {
+			t.Fatalf("restore %s: %v", path, err)
+		}
+	}
+}
+
+// marshalAutomation serializes a record so two snapshots can be compared
+// without relying on time.Time's internal representation.
+func marshalAutomation(t *testing.T, a Automation) string {
+	t.Helper()
+	data, err := json.Marshal(a)
+	if err != nil {
+		t.Fatalf("marshal automation: %v", err)
+	}
+	return string(data)
+}
+
+// TestFailedWritesRollBackMemory pins the phantom-write discipline for the
+// mutation paths that do NOT recreate the row from scratch: a failed
+// automations write must leave both memory and disk at the pre-operation
+// state. Create already compensates by deleting its just-added row;
+// SetEnabled, Update, and Delete must roll back too, or the next successful
+// save would silently persist an operation the caller was told had failed.
+func TestFailedWritesRollBackMemory(t *testing.T) {
+	cases := []struct {
+		name  string
+		apply func(st *Store, a Automation) error
+	}{
+		{
+			name: "SetEnabled",
+			apply: func(st *Store, a Automation) error {
+				return st.SetEnabled(a.ID, false)
+			},
+		},
+		{
+			name: "Update",
+			apply: func(st *Store, a Automation) error {
+				updated := a
+				updated.Title = "Renamed by a failed write"
+				updated.Enabled = false
+				return st.Update(&updated)
+			},
+		},
+		{
+			name: "Delete",
+			apply: func(st *Store, a Automation) error {
+				return st.Delete(a.ID)
+			},
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			st, _ := newTestStore(t)
+			a := updateBase(t, st)
+			if _, err := st.RecordFire(a.ID, st.now()); err != nil {
+				t.Fatalf("RecordFire: %v", err)
+			}
+			before, ok := st.Get(a.ID)
+			if !ok {
+				t.Fatal("setup lost the automation")
+			}
+			beforeRuns := len(st.Runs(a.ID))
+
+			restore := blockStoreFile(t, st, AutomationsFile)
+			if err := tc.apply(st, a); err == nil {
+				t.Fatal("operation succeeded despite a blocked automations write")
+			}
+			// In-memory state is untouched: no phantom mutation is left
+			// waiting for the next successful save to persist it.
+			after, ok := st.Get(a.ID)
+			if !ok {
+				t.Fatal("failed write dropped the row from memory")
+			}
+			if marshalAutomation(t, before) != marshalAutomation(t, after) {
+				t.Fatalf("failed write mutated memory:\n before %s\n  after %s",
+					marshalAutomation(t, before), marshalAutomation(t, after))
+			}
+			if got := len(st.Runs(a.ID)); got != beforeRuns {
+				t.Fatalf("failed write changed the in-memory history: %d -> %d", beforeRuns, got)
+			}
+
+			// The disk still holds the pre-operation record, so the next
+			// successful write cannot smuggle the aborted mutation through.
+			restore()
+			if err := st.SetEnabled(a.ID, true); err != nil {
+				t.Fatalf("post-failure write: %v", err)
+			}
+			st2, err := OpenStore(st.dir)
+			if err != nil {
+				t.Fatalf("reopen: %v", err)
+			}
+			onDisk, ok := st2.Get(a.ID)
+			if !ok {
+				t.Fatal("aborted operation was persisted by a later successful write")
+			}
+			if marshalAutomation(t, before) != marshalAutomation(t, onDisk) {
+				t.Fatalf("disk record drifted after an aborted write:\n before %s\n   disk %s",
+					marshalAutomation(t, before), marshalAutomation(t, onDisk))
+			}
+		})
+	}
+}
+
+// TestDeleteRunsWriteFailureKeepsCommitPoint pins the two-file commit
+// point: once the automations write succeeds the row is durably gone, so a
+// failed history write must NOT resurrect it in memory (that would let the
+// next automations save restore a row the user deleted). The history
+// cleanup is retried by the next runs write instead.
+func TestDeleteRunsWriteFailureKeepsCommitPoint(t *testing.T) {
+	st, _ := newTestStore(t)
+	a := updateBase(t, st)
+	if _, err := st.RecordFire(a.ID, st.now()); err != nil {
+		t.Fatal(err)
+	}
+	restore := blockStoreFile(t, st, RunsFile)
+	if err := st.Delete(a.ID); err == nil {
+		t.Fatal("Delete should report the failed history write")
+	}
+	if _, ok := st.Get(a.ID); ok {
+		t.Fatal("row resurrected in memory after the automations commit point")
+	}
+	if runs := st.Runs(a.ID); len(runs) != 0 {
+		t.Fatalf("history removal not applied in memory: %d rows", len(runs))
+	}
+	// The automations file lost the row; the failed history write is only
+	// an eventual cleanup.
+	restore()
+	st2, err := OpenStore(st.dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if _, ok := st2.Get(a.ID); ok {
+		t.Fatal("deleted row still on disk after the automations commit")
+	}
+}
+
 // TestStoreFileShapes pins the on-disk formats (machine-readable, versioned
 // JSON under the global config dir).
 func TestStoreFileShapes(t *testing.T) {

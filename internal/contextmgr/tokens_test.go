@@ -27,6 +27,40 @@ func TestEstimateTokensUsesTokenizer(t *testing.T) {
 	}
 }
 
+// TestCountTokensMatchesPerMessage verifies the batched CountTokens (one
+// tokenizer resolution, one shared memo) returns exactly the same per-message
+// counts as the per-message ComputeMessageTokens it replaces, including
+// repeated tool-call names/IDs and tool args that exercise the memo path. The
+// empty slice returns nil, not an empty non-nil slice.
+func TestCountTokensMatchesPerMessage(t *testing.T) {
+	if got := CountTokens(nil); got != nil {
+		t.Fatalf("CountTokens(nil) = %v, want nil", got)
+	}
+	if got := CountTokens([]llm.Message{}); got != nil {
+		t.Fatalf("CountTokens(empty) = %v, want nil", got)
+	}
+	msgs := []llm.Message{
+		{Role: "system", Content: "you are a helpful agent"},
+		{Role: "user", Content: "read the file"},
+		{Role: "assistant", ToolCalls: []llm.ToolCall{
+			{Name: "read_file", ID: "call_1", Args: map[string]any{"path": "a.go"}},
+			{Name: "read_file", ID: "call_2", Args: map[string]any{"path": "a.go"}},
+		}},
+		{Role: "tool", ToolCallID: "call_1", Content: strings.Repeat("func main() {}\n", 40)},
+		{Role: "tool", ToolCallID: "call_2", Content: strings.Repeat("func main() {}\n", 40)},
+		{Role: "assistant", Reasoning: "thinking about it", Content: "done"},
+	}
+	got := CountTokens(msgs)
+	if len(got) != len(msgs) {
+		t.Fatalf("len=%d, want %d", len(got), len(msgs))
+	}
+	for i, m := range msgs {
+		if want := ComputeMessageTokens(m); got[i] != want {
+			t.Fatalf("CountTokens[%d] = %d, ComputeMessageTokens = %d", i, got[i], want)
+		}
+	}
+}
+
 func TestEstimateTokensRejectsStaleCacheAfterMutation(t *testing.T) {
 	m := NewManager(nil, Settings{})
 	msgs := []llm.Message{{Role: "user", Content: "short"}}

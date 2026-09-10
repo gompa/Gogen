@@ -215,7 +215,7 @@ func (p *OpenAIProvider) probeEffortsOnce(ctx context.Context, baseURL, modelID 
 	if propsURL == "" {
 		return nil, errEffortsUnavailable
 	}
-	status, body, err := p.propsRequest(ctx, http.MethodGet, propsURL, "")
+	status, body, err := p.propsRequest(ctx, http.MethodGet, propsURL, p.apiKeyForBaseURL(baseURL), "")
 	if err != nil || status != http.StatusOK {
 		return nil, errEffortsUnavailable
 	}
@@ -270,7 +270,7 @@ func (p *OpenAIProvider) probeEffortValuesViaApplyTemplate(ctx context.Context, 
 	if err != nil {
 		return nil, errEffortsUnavailable
 	}
-	status, respBody, err := p.propsRequest(ctx, http.MethodPost, applyURL, string(probeBody))
+	status, respBody, err := p.propsRequest(ctx, http.MethodPost, applyURL, p.apiKeyForBaseURL(baseURL), string(probeBody))
 	if err != nil {
 		return nil, errEffortsUnavailable
 	}
@@ -294,9 +294,9 @@ func (p *OpenAIProvider) probeEffortValuesViaApplyTemplate(ctx context.Context, 
 }
 
 // propsRequest performs one bounded HTTP call to a llama.cpp capability
-// endpoint (/props, /apply-template) with the provider's default-profile API
+// endpoint (/props, /apply-template) with the endpoint's owning-profile API
 // key. The response body is capped at 1 MiB.
-func (p *OpenAIProvider) propsRequest(ctx context.Context, method, url, body string) (int, []byte, error) {
+func (p *OpenAIProvider) propsRequest(ctx context.Context, method, url, apiKey, body string) (int, []byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, propsProbeTimeout)
 	defer cancel()
 	var rd io.Reader
@@ -308,8 +308,8 @@ func (p *OpenAIProvider) propsRequest(ctx context.Context, method, url, body str
 		return 0, nil, err
 	}
 	req.Header.Set("User-Agent", buildinfo.UserAgent())
-	if key := p.defaultAPIKey(); key != "" {
-		req.Header.Set("Authorization", "Bearer "+key)
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	// Probes can target an OpenCode base URL (router hosts): tag it like the
 	// client pair does so the request carries the session header too.

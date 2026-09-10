@@ -22,6 +22,10 @@ import (
 )
 
 const (
+	// mcpCallTimeout is the default bound for one MCP JSON-RPC call when the
+	// caller has not supplied its own deadline. A caller with a longer
+	// deadline (a legitimately long-running tools/call) is honored as-is
+	// rather than being capped here.
 	mcpCallTimeout = 30 * time.Second
 	// mcpInitTimeout bounds initialize + tools/list during NewManager so a
 	// hung MCP stdio server cannot stall process startup for a full
@@ -29,6 +33,14 @@ const (
 	mcpInitTimeout         = 5 * time.Second
 	mcpMaxSkippedResponses = 100
 )
+
+// mcpMaxLineBytes bounds one MCP stdio message line read by readLoop. A broken
+// or hostile server that streams data with no newline (or one giant frame)
+// would otherwise make an unbounded ReadBytes allocate without limit; the
+// reader fails the connection instead. Matched to the openai-go decoder / SSE
+// filter cap (bufio.MaxScanTokenSize << 9 = 32 MiB), far above any real
+// JSON-RPC message. A var so tests can shrink it.
+var mcpMaxLineBytes = bufio.MaxScanTokenSize << 9
 
 // toolPrefix is prepended to every LLM-visible MCP tool name.
 const toolPrefix = "mcp_"
@@ -114,6 +126,10 @@ func NewManager(servers []config.MCPServerConfig) (*Manager, error) {
 	for _, s := range ValidServers(servers) {
 		c, err := startClient(s)
 		if err != nil {
+			// Keep starting the remaining servers, but surface the failure:
+			// a server that fails to spawn otherwise vanishes silently from
+			// the model's toolset with no trace.
+			log.Printf("mcp: server %q failed to start: %v", s.Name, err)
 			continue
 		}
 		initCtx, cancel := context.WithTimeout(context.Background(), mcpInitTimeout)
@@ -149,11 +165,18 @@ func startClient(s config.MCPServerConfig) (*Client, error) {
 	}
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
+		_ = stdin.Close()
 		return nil, err
 	}
 	// Discard stderr so MCP noise does not pollute the TUI/CLI.
 	cmd.Stderr = io.Discard
 	if err := cmd.Start(); err != nil {
+		// cmd.Start failed, so the process never took ownership of the pipe
+		// ends and Cmd.Wait (which normally closes them) is never called.
+		// Close both parent ends here so the descriptors are released
+		// promptly instead of waiting for the os.File finalizer at GC.
+		_ = stdin.Close()
+		_ = stdoutPipe.Close()
 		return nil, err
 	}
 	c := &Client{
@@ -170,15 +193,15 @@ func startClient(s config.MCPServerConfig) (*Client, error) {
 
 func (c *Client) readLoop() {
 	defer close(c.readerDone)
-	reader := bufio.NewReader(c.stdout)
+	sc := bufio.NewScanner(c.stdout)
+	// Bound the size of one JSON-RPC line (see mcpMaxLineBytes): a server that
+	// never sends a newline must not make the reader allocate unboundedly. The
+	// initial slice is capped at the limit too, so the bound is exact even
+	// when a test shrinks mcpMaxLineBytes below the default read size.
+	sc.Buffer(make([]byte, 0, min(64*1024, mcpMaxLineBytes)), mcpMaxLineBytes)
 	skipped := 0
-	for {
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			c.failPending(err)
-			return
-		}
-		line = bytes.TrimSpace(line)
+	for sc.Scan() {
+		line := bytes.TrimSpace(sc.Bytes())
 		if len(line) == 0 {
 			continue
 		}
@@ -214,6 +237,14 @@ func (c *Client) readLoop() {
 		default:
 		}
 	}
+	// A clean EOF still means the server is gone: fail every in-flight call
+	// promptly with io.EOF instead of leaving it to time out. Scanner errors
+	// (e.g. bufio.ErrTooLong from mcpMaxLineBytes) are surfaced verbatim.
+	if err := sc.Err(); err != nil {
+		c.failPending(err)
+		return
+	}
+	c.failPending(io.EOF)
 }
 
 func (c *Client) failPending(err error) {
@@ -322,8 +353,21 @@ func (c *Client) notify(method string, params any) error {
 	return err
 }
 
+// withCallTimeout bounds an MCP request with the default mcpCallTimeout only
+// when the caller has not imposed its own deadline. A caller-provided
+// deadline is honored as-is — even when it is longer than mcpCallTimeout —
+// so a legitimately long-running tools/call is not reported as failed after
+// 30s. initialize/listTools always pass their own init deadline, so they stay
+// bounded. The returned CancelFunc is never nil; callers may defer it.
+func withCallTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, mcpCallTimeout)
+}
+
 func (c *Client) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
-	ctx, cancel := context.WithTimeout(ctx, mcpCallTimeout)
+	ctx, cancel := withCallTimeout(ctx)
 	defer cancel()
 
 	select {

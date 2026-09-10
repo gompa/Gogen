@@ -278,7 +278,7 @@ func (sp *subagentSpawner) runChildTurn(parentCtx context.Context, rt *sessionRu
 	}
 	resCh := make(chan turnResult, 1)
 	go func() {
-		defer rt.turnMu.Unlock()
+		defer rt.releaseTurn()
 		defer rt.stream.end()
 		defer func() { errCh <- nil }()
 		rt.turnMu.Lock()

@@ -543,3 +543,63 @@ func TestCapEvictionKillsBackgroundJobs(t *testing.T) {
 		t.Fatalf("status after cap eviction: %v, want unknown background job", err)
 	}
 }
+
+// TestTryAcquireTurnWakesOnRelease pins the release-broadcast handoff: a
+// waiter parked in tryAcquireTurn acquires the instant releaseTurn fires,
+// rather than after the next polling interval (the old loop slept 5 ms).
+func TestTryAcquireTurnWakesOnRelease(t *testing.T) {
+	rt := &sessionRuntime{}
+	rt.turnMu.Lock()
+
+	acquired := make(chan bool, 1)
+	go func() {
+		acquired <- rt.tryAcquireTurn(2 * time.Second)
+	}()
+	// Give the waiter time to park on the release broadcast before releasing.
+	time.Sleep(50 * time.Millisecond)
+
+	start := time.Now()
+	rt.releaseTurn()
+	select {
+	case ok := <-acquired:
+		if !ok {
+			t.Fatal("tryAcquireTurn returned false after a release")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("tryAcquireTurn did not wake on the release broadcast")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("woke %v after release; want an immediate handoff", elapsed)
+	}
+	rt.turnMu.Unlock()
+}
+
+// TestTryAcquireTurnTimesOut pins the bounded wait: with no release the waiter
+// returns false at the deadline instead of blocking forever.
+func TestTryAcquireTurnTimesOut(t *testing.T) {
+	rt := &sessionRuntime{}
+	rt.turnMu.Lock()
+	defer rt.turnMu.Unlock()
+	start := time.Now()
+	if rt.tryAcquireTurn(80 * time.Millisecond) {
+		t.Fatal("tryAcquireTurn acquired a held lock")
+	}
+	if elapsed := time.Since(start); elapsed < 60*time.Millisecond {
+		t.Fatalf("returned after %v; the deadline was 80ms", elapsed)
+	}
+}
+
+// TestTryAcquireTurnNonPositiveIsProbe pins the wait<=0 fast path: a single
+// non-blocking probe with no timer.
+func TestTryAcquireTurnNonPositiveIsProbe(t *testing.T) {
+	rt := &sessionRuntime{}
+	rt.turnMu.Lock()
+	if rt.tryAcquireTurn(0) {
+		t.Fatal("tryAcquireTurn(0) acquired a held lock")
+	}
+	rt.turnMu.Unlock()
+	if !rt.tryAcquireTurn(0) {
+		t.Fatal("tryAcquireTurn(0) must acquire a free lock")
+	}
+	rt.turnMu.Unlock()
+}

@@ -418,6 +418,7 @@ func (a *Agent) SetSubagentSpawner(s SubagentSpawner) {
 	a.spawnerMu.Lock()
 	a.spawner = s
 	a.spawnerMu.Unlock()
+	a.noteToolsChanged()
 }
 
 // SubagentSpawner returns the installed nested-session runner (nil when
@@ -443,6 +444,9 @@ func (a *Agent) SubagentDepth() int {
 // (empty clears the mark).
 func (a *Agent) SetParentID(parentID string) {
 	a.parentID.Store(parentID)
+	// ParentID gates the child-scoped report tool (llmTools), so a change
+	// invalidates the cached wire overhead.
+	a.noteToolsChanged()
 }
 
 // ParentID returns the parent session id for nested (subagent) sessions
@@ -487,6 +491,7 @@ func (a *Agent) SetReportHook(h func(text string) error) {
 	a.reportHookMu.Lock()
 	a.reportHook = h
 	a.reportHookMu.Unlock()
+	a.noteToolsChanged()
 }
 
 // ReportHook returns the installed report hook (nil when this agent is not

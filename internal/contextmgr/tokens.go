@@ -31,22 +31,36 @@ func WarmTokenizer() {
 	_, _ = getCodec()
 }
 
-// TokenCounts returns per-message token counts for the given messages.
+// CountTokens returns per-message token counts for the given messages.
 // Token counts are computed fresh each time; the cl100k_base tokenizer
 // is fast enough that a global cache added more complexity than value.
-func (m *Manager) TokenCounts(messages []llm.Message) []int {
+//
+// It resolves the counting strategy once and shares a single memo across the
+// whole slice: repeated strings (system prompt, tool-call names and IDs,
+// repeated argument values) encode once instead of once per message. This is
+// the batched form of ComputeMessageTokens and is what cold paths (restore,
+// first probe, compaction republish, session save) should use — looping
+// ComputeMessageTokens per message would resolve the tokenizer and walk the
+// structure once per message with zero cross-message dedup.
+func CountTokens(messages []llm.Message) []int {
 	if len(messages) == 0 {
 		return nil
 	}
 	count := messageCounterFor()
-	// One memo per pass: repeated strings (system prompt, tool-call names and
-	// IDs, repeated argument values) encode once instead of once per message.
+	// One memo per pass: repeated strings encode once instead of once per
+	// message.
 	memo := make(map[string]int)
 	counts := make([]int, len(messages))
 	for i := range messages {
 		counts[i] = computeMessageTokens(messages[i], count, memo) + imageTokenEstimate(messages[i])
 	}
 	return counts
+}
+
+// TokenCounts is the Manager-scoped alias of CountTokens, kept for callers
+// that already hold a Manager. The counting itself does not use the Manager.
+func (m *Manager) TokenCounts(messages []llm.Message) []int {
+	return CountTokens(messages)
 }
 
 // ComputeMessageTokens returns the estimated token count for a single message
@@ -84,9 +98,9 @@ func (m *Manager) EstimateTokens(messages []llm.Message) int {
 // ToolDefinitionString serializes a single tool definition in a stable,
 // wire-like form: type, name, description, and JSON parameters
 // (encoding/json sorts map keys, so the output is deterministic regardless
-// of map construction order). Shared by EstimateToolTokens (token counting)
-// and the agent's wire-overhead cache fingerprint, so the two can never
-// disagree about what a tool definition "is".
+// of map construction order). EstimateToolTokens defines a tool definition's
+// token cost through it, so this string is the canonical "what a definition
+// is" for token accounting.
 func ToolDefinitionString(t llm.Tool) string {
 	var b strings.Builder
 	b.WriteString(t.Type)

@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -117,5 +119,45 @@ func TestPruneProtectsMultipleActiveIDs(t *testing.T) {
 		if _, err := os.Stat(path); err == nil {
 			t.Errorf("over-capacity session %s should have been pruned", id)
 		}
+	}
+}
+
+// TestSaveReleasesStoreMutexDuringPayloadWrite pins Save's lock contract: the
+// store-wide mutex is released before the (potentially large) payload is
+// serialized and written, so a turn-end full save of a big session cannot block
+// List/Info/LatestID — the web sidebar, served synchronously on the WS read
+// loop. The seam re-enters the store (Info takes s.mu unconditionally); a
+// regression that holds s.mu across the marshal+write deadlocks here and is
+// caught by the timeout.
+func TestSaveReleasesStoreMutexDuringPayloadWrite(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStoreWithOptions(true, StoreOptions{})
+	store.SetAutoPrune(false)
+
+	var fired atomic.Bool
+	savePayloadHook = func() {
+		fired.Store(true)
+		// If Save still held s.mu here, this re-entrant call blocks forever.
+		store.Info(dir, "big")
+	}
+	t.Cleanup(func() { savePayloadHook = nil })
+
+	done := make(chan error, 1)
+	go func() {
+		done <- store.Save("big", SessionSnapshot{
+			WorkingDir: dir,
+			Messages:   []llm.Message{{Role: "user", Content: strings.Repeat("x", 1<<20)}},
+		})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Save: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Save hung — store mutex held across the payload write?")
+	}
+	if !fired.Load() {
+		t.Fatal("savePayloadHook did not run; test seam wired wrong")
 	}
 }

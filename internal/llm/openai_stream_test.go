@@ -457,6 +457,48 @@ data: {"choices":[{"index":0,"delta":{}}]}
 	}
 }
 
+// TestGenerateResponseStreamNamelessToolCallInfersStop pins the finish-reason
+// inference against the built tool-call list rather than the raw accumulator
+// count. An arguments-only delta that never carries a tool name accumulates a
+// tcAccum (so the old `len(a.tcAccums) > 0` check fired "tool_calls"), but
+// buildResult drops nameless accumulators from ToolCalls — reporting a tool
+// round with zero calls, which the caller cannot execute. The inferred reason
+// must be "stop".
+func TestGenerateResponseStreamNamelessToolCallInfersStop(t *testing.T) {
+	t.Parallel()
+	const sse = `data: {"choices":[{"delta":{"content":"answer"}}]}
+
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"a.go\"}"}}]}}]}
+
+`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(sse))
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(srv)
+	result, err := p.GenerateResponseStream(
+		t.Context(),
+		[]Message{{Role: "user", Content: "hi"}},
+		nil,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.ToolCalls) != 0 {
+		t.Fatalf("toolCalls = %#v, want none (nameless accumulator must be dropped)", result.ToolCalls)
+	}
+	if result.FinishReason != "stop" {
+		t.Fatalf("FinishReason = %q, want %q (no usable tool calls)", result.FinishReason, "stop")
+	}
+	if result.Content != "answer" {
+		t.Fatalf("Content = %q, want %q", result.Content, "answer")
+	}
+}
+
 // TestGenerateResponseStreamIgnoresSpuriousStopOnReasoningChunk is the
 // regression test for the real-world failure: llama.cpp emits a spurious
 // finish_reason:"stop" on a chunk that ALSO carries a reasoning_content

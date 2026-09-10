@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"net/http"
 	"testing"
 	"time"
 )
@@ -15,6 +16,45 @@ func TestNewSSEHTTPClientDisablesCompression(t *testing.T) {
 	}
 	if !tr.DisableCompression {
 		t.Fatal("DisableCompression = false, want true")
+	}
+}
+
+// TestSSEHTTPClientInheritsDefaultTransport pins that the SSE client clones
+// http.DefaultTransport instead of building a bare &http.Transport{} that
+// silently ignores HTTPS_PROXY and leaves TLSHandshakeTimeout at 0.
+func TestSSEHTTPClientInheritsDefaultTransport(t *testing.T) {
+	t.Parallel()
+	tr, ok := baseHTTPTransport(newSSEHTTPClient())
+	if !ok {
+		t.Fatal("expected *http.Transport under the SSE filter transport")
+	}
+	assertDefaultTransportInherited(t, tr)
+}
+
+// TestCatalogHTTPClientInheritsDefaultTransport pins the same proxy/TLS
+// inheritance for the non-streaming catalog client.
+func TestCatalogHTTPClientInheritsDefaultTransport(t *testing.T) {
+	t.Parallel()
+	tr, ok := newCatalogHTTPClient().Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport type = %T, want *http.Transport", newCatalogHTTPClient().Transport)
+	}
+	assertDefaultTransportInherited(t, tr)
+}
+
+// assertDefaultTransportInherited checks the proxy/TLS knobs a bare
+// &http.Transport{} would leave unset while still disabling compression.
+func assertDefaultTransportInherited(t *testing.T, tr *http.Transport) {
+	t.Helper()
+	if tr.Proxy == nil {
+		t.Error("Proxy = nil, want ProxyFromEnvironment (HTTPS_PROXY/HTTP_PROXY)")
+	}
+	def := http.DefaultTransport.(*http.Transport)
+	if tr.TLSHandshakeTimeout != def.TLSHandshakeTimeout {
+		t.Errorf("TLSHandshakeTimeout = %v, want %v", tr.TLSHandshakeTimeout, def.TLSHandshakeTimeout)
+	}
+	if !tr.DisableCompression {
+		t.Error("DisableCompression = false, want true")
 	}
 }
 

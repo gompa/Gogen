@@ -53,8 +53,17 @@ func (a *Agent) RestoreSessionLocal(snap SessionSnapshot, newSessionID string) {
 	prevSessionID := a.SessionID
 
 	// Publish messages, their pre-computed token counts, and the stabilized
-	// flag atomically (no defensive copy of the message slice).
-	a.restoreMessages(snap.Messages, snap.TokenCounts)
+	// flag atomically (no defensive copy of the message slice). A snapshot
+	// written by FlushSession (skipTokenCounts=true) carries no counts, and a
+	// delta merge can leave them short; compute the missing counts once here
+	// with one batched pass so the restored session takes the cached fast
+	// paths instead of re-tokenizing the whole view every round until a
+	// ContextStats / full doPersist backfills it.
+	counts := snap.TokenCounts
+	if a.Context != nil && len(counts) != len(snap.Messages) {
+		counts = contextmgr.CountTokens(snap.Messages)
+	}
+	a.restoreMessages(snap.Messages, counts)
 	// Token counts are keyed by content fingerprint, so entries from the
 	// previous session remain valid as long as the content hasn't changed.
 	// Keep the sticky project profile when resuming in the same working
@@ -586,10 +595,7 @@ func (a *Agent) persistDeltaSnapshot(st persistState, count int, skipTokenCounts
 			// the same content a second time.
 			newCounts = append([]int(nil), st.tokenCounts[a.lastSavedMsgCount:count]...)
 		} else {
-			newCounts = make([]int, len(newMsgs))
-			for i := range newMsgs {
-				newCounts[i] = contextmgr.ComputeMessageTokens(newMsgs[i])
-			}
+			newCounts = contextmgr.CountTokens(newMsgs)
 		}
 	}
 	deltaSnap := SessionSnapshot{
@@ -816,10 +822,10 @@ func (a *Agent) extendTokenCounts() {
 	if a.tokenCounts == nil {
 		return
 	}
-	for len(a.tokenCounts) < len(a.Messages) {
-		idx := len(a.tokenCounts)
+	if len(a.tokenCounts) < len(a.Messages) {
+		// One batched pass with a shared memo for the missing suffix.
 		a.tokenCounts = append(a.tokenCounts,
-			contextmgr.ComputeMessageTokens(a.Messages[idx]))
+			contextmgr.CountTokens(a.Messages[len(a.tokenCounts):])...)
 	}
 }
 

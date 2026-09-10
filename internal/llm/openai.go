@@ -43,6 +43,14 @@ const (
 // modelsCacheTTL governs cache staleness.
 var modelsFetchBackoff = 30 * time.Second
 
+// propsProbeRetryTTL bounds negative caching of a failed capability probe: an
+// endpoint that does not answer GET /props (404 on a plain OpenAI-compatible
+// server, timeout, unparseable body) is not re-probed on every agent-loop
+// round — the failed attempt is remembered for this window and skipped, then
+// re-probed so a cold-start endpoint that comes up later is still discovered.
+// A var (not const) so tests can shrink it, mirroring modelsFetchBackoff.
+var propsProbeRetryTTL = 30 * time.Second
+
 // profileCatalogTimeout bounds ONE provider's catalog query inside the
 // overall fetch budget: profile queries run in parallel, so a hung endpoint
 // (offline host that never refuses the connection) costs only this window
@@ -174,12 +182,18 @@ type OpenAIProvider struct {
 	// on SetModel because router/multi-model hosts may change the template.
 	// The cache is keyed by endpoint (propsBaseURL): with multiple
 	// registered profiles, the probe must hit the CURRENT model's owning
-	// endpoint. Only completed probes (200 + parseable JSON) are cached;
-	// failures are not, so a later request re-probes.
+	// endpoint. Only completed probes (200 + parseable JSON) are cached as a
+	// value (propsChecked/propsPreserveReasoning); a failed attempt is
+	// remembered only for propsProbeRetryTTL (propsNegBaseURL/propsNegAt) so
+	// the agent loop does not re-dial an endpoint without /props on every
+	// round, while a cold-start endpoint that later comes up is still
+	// re-probed once the window elapses.
 	propsMu                sync.Mutex
 	propsChecked           bool
 	propsBaseURL           string
 	propsPreserveReasoning bool
+	propsNegBaseURL        string
+	propsNegAt             time.Time
 
 	// effortsDerived caches per-model reasoning-effort options derived from
 	// llama.cpp /props (+ /apply-template) capability probes (see
@@ -191,9 +205,11 @@ type OpenAIProvider struct {
 	effortsDerived map[string]derivedEfforts
 
 	// preserveReasoningMode: auto (default, probe /props), on, off.
+	// Guarded by modelsMu.
 	preserveReasoningMode string
 
 	// thinkingLevel controls reasoning_effort. Empty means omit (no thinking).
+	// Guarded by modelsMu.
 	thinkingLevel string
 
 	// sessionHdr carries the current session ID (and its derived UUIDv5) for
@@ -547,14 +563,26 @@ func (p *OpenAIProvider) defaultBaseURL() string {
 	return p.profiles[0].baseURL
 }
 
-// defaultAPIKey returns the API key of the default profile (profiles[0]).
-// Live-correct after SetProfiles, like defaultBaseURL: the /props and
-// /apply-template probes must authenticate with the CURRENT default
-// endpoint's key, not the construction-time one. Empty for
-// direct-constructed providers with no profiles (test shape).
-func (p *OpenAIProvider) defaultAPIKey() string {
+// apiKeyForBaseURL returns the API key of the registered profile whose base
+// URL matches baseURL, falling back to the default profile's key when the
+// endpoint is unknown (removed/renamed provider, or a direct-constructed
+// test provider with no profiles) or when baseURL is empty.
+//
+// The llama.cpp capability probes (/props, /apply-template) must authenticate
+// with the key of the endpoint they actually dial: with multiple registered
+// providers the probe target is the CURRENT model's owning endpoint, not the
+// default one. Live-correct after SetProfiles, like defaultBaseURL.
+func (p *OpenAIProvider) apiKeyForBaseURL(baseURL string) string {
+	baseURL = strings.TrimSpace(baseURL)
 	p.modelsMu.RLock()
 	defer p.modelsMu.RUnlock()
+	if baseURL != "" {
+		for _, prof := range p.profiles {
+			if prof.baseURL == baseURL {
+				return prof.apiKey
+			}
+		}
+	}
 	if len(p.profiles) == 0 {
 		return ""
 	}

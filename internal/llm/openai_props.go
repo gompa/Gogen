@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/shared"
@@ -20,7 +21,10 @@ func (p *OpenAIProvider) SetPreserveReasoningMode(mode string) {
 	if p == nil {
 		return
 	}
-	p.preserveReasoningMode = normalizePreserveReasoningMode(mode)
+	mode = normalizePreserveReasoningMode(mode)
+	p.modelsMu.Lock()
+	p.preserveReasoningMode = mode
+	p.modelsMu.Unlock()
 }
 
 func normalizePreserveReasoningMode(mode string) string {
@@ -46,7 +50,10 @@ func (p *OpenAIProvider) applyChatCompletionExtras(ctx context.Context, params *
 	if p == nil || params == nil {
 		return
 	}
-	switch normalizePreserveReasoningMode(p.preserveReasoningMode) {
+	p.modelsMu.RLock()
+	mode := p.preserveReasoningMode
+	p.modelsMu.RUnlock()
+	switch normalizePreserveReasoningMode(mode) {
 	case "off":
 		return
 	case "on":
@@ -117,12 +124,13 @@ func (p *OpenAIProvider) acceptedReasoningEfforts() []string {
 // providers, /props must be asked of the endpoint that actually serves the
 // request). Failures / missing caps → false.
 //
-// Only a completed exchange (200 with parseable JSON) is cached; transport
-// errors, timeouts, non-200 responses, and unparseable bodies return false
-// for this call WITHOUT caching, so the next request re-probes (same
-// convention as the efforts probe: failures are not cached). This keeps a
-// cold-start probe — fired before the router has loaded the model — from
-// pinning "off" for the process lifetime.
+// A completed exchange (200 with parseable JSON) is cached for the endpoint's
+// lifetime as a value. A failed probe (transport error, timeout, non-200, or
+// unparseable body) is NOT cached as a value — a cold-start probe fired
+// before the router has loaded the model must not pin "off" for the process
+// lifetime — but it IS remembered for propsProbeRetryTTL, so an endpoint
+// without /props costs one bounded attempt per window instead of one full
+// handshake per agent-loop round (F1).
 func (p *OpenAIProvider) templateSupportsPreserveReasoning(ctx context.Context) bool {
 	baseURL := p.propsBaseURLForCurrentModel()
 	p.propsMu.Lock()
@@ -131,11 +139,22 @@ func (p *OpenAIProvider) templateSupportsPreserveReasoning(ctx context.Context) 
 		p.propsMu.Unlock()
 		return v
 	}
+	if p.propsNegBaseURL == baseURL && time.Since(p.propsNegAt) < propsProbeRetryTTL {
+		// A recent attempt for this endpoint failed: reuse the negative
+		// result instead of re-dialing it every round.
+		p.propsMu.Unlock()
+		return false
+	}
 	p.propsMu.Unlock()
 
 	supported, ok := p.probePreserveReasoning(ctx, baseURL, p.currentModel())
 	if !ok {
-		// Incomplete probe: don't pin the negative result.
+		// Incomplete probe: don't pin the negative as a value, but remember
+		// the attempt so rounds within propsProbeRetryTTL skip re-probing.
+		p.propsMu.Lock()
+		p.propsNegBaseURL = baseURL
+		p.propsNegAt = time.Now()
+		p.propsMu.Unlock()
 		return false
 	}
 
@@ -145,6 +164,11 @@ func (p *OpenAIProvider) templateSupportsPreserveReasoning(ctx context.Context) 
 		p.propsChecked = true
 		p.propsBaseURL = baseURL
 		p.propsPreserveReasoning = supported
+	}
+	// A completed probe supersedes any recorded failure for this endpoint.
+	if p.propsNegBaseURL == baseURL {
+		p.propsNegBaseURL = ""
+		p.propsNegAt = time.Time{}
 	}
 	v := p.propsPreserveReasoning
 	p.propsMu.Unlock()
@@ -175,6 +199,8 @@ func (p *OpenAIProvider) invalidatePropsCaps() {
 	p.propsChecked = false
 	p.propsBaseURL = ""
 	p.propsPreserveReasoning = false
+	p.propsNegBaseURL = ""
+	p.propsNegAt = time.Time{}
 	p.propsMu.Unlock()
 }
 
@@ -188,7 +214,7 @@ func (p *OpenAIProvider) probePreserveReasoning(ctx context.Context, baseURL, mo
 	if propsURL == "" {
 		return false, false
 	}
-	status, body, err := p.propsRequest(ctx, http.MethodGet, propsURL, "")
+	status, body, err := p.propsRequest(ctx, http.MethodGet, propsURL, p.apiKeyForBaseURL(baseURL), "")
 	if err != nil || status != http.StatusOK {
 		return false, false
 	}

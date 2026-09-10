@@ -31,13 +31,33 @@ func TruncateRuneSafe(s string, max int) string {
 // data is assumed valid UTF-8 (command output usually is; for invalid input
 // the result is never worse than a raw byte cut). The []byte signature
 // exists so callers backed by bytes.Buffer can pass the offset straight to
-// Buffer.Next. Returns 0 when the data fits within max, or max <= 0 (no cap).
+// Buffer.Next; callers holding a string should use RuneSafeTailStartString
+// instead, which avoids the []byte(s) allocation-and-copy. Returns 0 when
+// the data fits within max, or max <= 0 (no cap).
 func RuneSafeTailStart(data []byte, max int) int {
 	if max <= 0 || len(data) <= max {
 		return 0
 	}
 	start := len(data) - max
 	for start < len(data) && !utf8.RuneStart(data[start]) {
+		start++
+	}
+	return start
+}
+
+// RuneSafeTailStartString is the string form of RuneSafeTailStart: it returns
+// the byte offset at which a tail capped at max bytes of s may start without
+// splitting a UTF-8 rune, with the same rune-boundary contract and the same
+// 0 return when s fits within max (or max <= 0). Callers that already hold a
+// string — the common case, since tool results are strings — use this to
+// avoid the O(len) allocation-and-copy of []byte(s) that the []byte form
+// would force; the returned offset is directly indexable as s[offset:].
+func RuneSafeTailStartString(s string, max int) int {
+	if max <= 0 || len(s) <= max {
+		return 0
+	}
+	start := len(s) - max
+	for start < len(s) && !utf8.RuneStart(s[start]) {
 		start++
 	}
 	return start
@@ -157,7 +177,7 @@ func TruncateHeadTail(s string, opts TruncateHeadTailOptions) string {
 		head = TruncateRuneSafe(s, opts.HeadBytes)
 	}
 	if opts.TailBytes > 0 {
-		tail = s[RuneSafeTailStart([]byte(s), opts.TailBytes):]
+		tail = s[RuneSafeTailStartString(s, opts.TailBytes):]
 	}
 	return head + formatDroppedMarker(opts.Marker, len(s)-len(head)-len(tail), opts.FormatDropped) + tail
 }

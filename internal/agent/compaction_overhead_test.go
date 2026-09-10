@@ -140,24 +140,68 @@ func TestWireOverheadCacheInvalidation(t *testing.T) {
 		t.Fatalf("guidelines change did not grow overhead: %d -> %d", base, withGuidelines)
 	}
 
-	// Tool definition change (MCP tool added) invalidates the cache.
-	a.MCPRegistry = &fakeMCPRegistry{
+	// Tool set change (MCP tool added) invalidates the cache.
+	a.SetMCPRegistry(&fakeMCPRegistry{
 		names: map[string]struct{}{"mcp_extra": {}},
 		defs: []llm.Tool{{
 			Type:        "function",
 			Name:        "mcp_extra",
 			Description: strings.Repeat("mcp ", 200),
 		}},
-	}
+	})
 	withTool := a.wireOverheadTokens()
 	if withTool <= withGuidelines {
 		t.Fatalf("tool change did not grow overhead: %d -> %d", withGuidelines, withTool)
 	}
 
 	// Restoring the tool set recomputes back to the guidelines-only value.
-	a.MCPRegistry = nil
+	a.SetMCPRegistry(nil)
 	if got := a.wireOverheadTokens(); got != withGuidelines {
 		t.Fatalf("restoring tools: overhead = %d, want %d", got, withGuidelines)
+	}
+}
+
+// TestWireOverheadCacheTracksToolGeneration pins the generation-keyed cache
+// invalidation on the two paths the content fingerprint did not need but the
+// generation does: a live feature-flag toggle through the shared store
+// (FeatureFlags.generation) and a manager/spawner reconfiguration
+// (noteToolsChanged). Both must recompute the cached estimate when the
+// model-facing tool set actually changes, and leave it unchanged when it does
+// not.
+func TestWireOverheadCacheTracksToolGeneration(t *testing.T) {
+	a, _ := newOverheadTestAgent(t)
+	a.appendMessage(llm.Message{Role: "user", Content: "hi"})
+
+	base := a.wireOverheadTokens()
+
+	// Enabling the board flag with no manager attached leaves the tool set
+	// unchanged (the tool needs both), so the recompute yields the same
+	// estimate.
+	a.SetBoardEnabled(true)
+	if got := a.wireOverheadTokens(); got != base {
+		t.Fatalf("board flag without manager changed overhead: %d -> %d", base, got)
+	}
+
+	// Attaching the manager makes the board tool visible: tokens grow.
+	a.SetBoardManager(NewBoardManager(t.TempDir(), false))
+	withBoard := a.wireOverheadTokens()
+	if withBoard <= base {
+		t.Fatalf("board tool visibility did not grow overhead: %d -> %d", base, withBoard)
+	}
+
+	// Toggling the flag back off hides the tool again and recomputes to the
+	// pre-board value.
+	a.SetBoardEnabled(false)
+	if got := a.wireOverheadTokens(); got != base {
+		t.Fatalf("board flag off: overhead = %d, want %d", got, base)
+	}
+
+	// Enabling subagents and installing a spawner exposes the subagent
+	// tools: tokens grow again.
+	a.SetSubagentsEnabled(true)
+	a.SetSubagentSpawner(&fakeSpawner{})
+	if got := a.wireOverheadTokens(); got <= base {
+		t.Fatalf("subagent tools did not grow overhead: want > %d, got %d", base, got)
 	}
 }
 

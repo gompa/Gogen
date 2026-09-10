@@ -79,6 +79,10 @@
             unpinFromBottom,
             updateScrollBottomBtn,
         } from '/components/scroll.js';
+        // Off-screen paint skip that preserves the real scroll geometry
+        // (components/paint-skip.js): measures a finalized transcript item's
+        // real height once, then lets content-visibility: auto skip it.
+        import { enablePaintSkip } from '/components/paint-skip.js';
         import {
             USER_TERM_ID,
             initTerminal,
@@ -2446,9 +2450,9 @@
             if (histIdx !== undefined && histIdx >= 0) {
                 msgDiv.dataset.histIdx = histIdx;
             }
-            // Flow content goes in the .message-body wrapper (which carries
-            // content-visibility); hover buttons stay on msgDiv itself so
-            // the wrapper's paint containment can't clip their overhang.
+            // Flow content goes in the .message-body wrapper; hover buttons
+            // stay on msgDiv itself, outside the wrapper, so containment on
+            // the wrapper (if ever added) can't clip their overhang.
             const body = msgBody(msgDiv);
             if (role === 'user' && images && images.length) {
                 // Render user-attached images (vision input) above the text.
@@ -2507,6 +2511,9 @@
             // replay, attach fallback), so this single hook keeps the TOC
             // rail in sync with the transcript.
             if (role === 'user') appendTocDot(msgDiv);
+            // Content is final here; let the item be paint-skipped off-screen
+            // once paint-skip.js has measured its real height.
+            enablePaintSkip(body);
             smartScroll();
             return msgDiv;
         }
@@ -2822,6 +2829,8 @@
                 // the incremental live stream (e.g. a list split at a blank
                 // line) so the collapsed card matches a single-shot render.
                 setMessageMarkdown(currentThinkingSpan, currentThinkingRaw);
+                // The card is complete; allow the paint skip.
+                enablePaintSkip(div);
             }
             currentThinkingDiv = null;
             currentThinkingSpan = null;
@@ -2862,6 +2871,8 @@
                     forkSession(-1);
                 });
                 currentStreamDiv.appendChild(forkBtn);
+                // The bubble is complete; allow the paint skip off-screen.
+                enablePaintSkip(msgBody(currentStreamDiv));
             }
             currentStreamDiv = null;
             currentStreamRaw = '';
@@ -3367,6 +3378,10 @@
                 // Always re-sync the scroll position after the card update,
                 // even if a viewer mount failed or rejected.
                 smartScroll();
+                // The card is complete (Monaco xterm mounts grow it while it
+                // is on screen, where the remembered size tracks them); allow
+                // the paint skip off-screen.
+                enablePaintSkip(card);
             }
         }
 
@@ -3493,6 +3508,8 @@
                             div.dataset.createdAt = h.createdAt;
                         }
                         messagesDiv.appendChild(div);
+                        // Replayed reasoning is final; allow the paint skip.
+                        enablePaintSkip(div);
                         smartScroll();
                     }
                     // Render refusal text through the normal assistant bubble

@@ -105,6 +105,33 @@ func TestRuneSafeTailStart(t *testing.T) {
 	}
 }
 
+// TestRuneSafeTailStartString pins the string form of the tail cut to the
+// []byte form it replaces: for every byte cap the returned offsets are equal
+// (so switching a string caller off []byte(s) changes nothing), the tail is
+// rune-safe, and the no-op cases return 0.
+func TestRuneSafeTailStartString(t *testing.T) {
+	const s = "日本語テキスト" // 7 runes × 3 bytes = 21 bytes
+	data := []byte(s)
+	for max := -1; max <= len(s)+1; max++ {
+		got := RuneSafeTailStartString(s, max)
+		if want := RuneSafeTailStart(data, max); got != want {
+			t.Fatalf("max %d: string form %d != []byte form %d", max, got, want)
+		}
+		if tail := s[got:]; len(tail) > max && max > 0 {
+			t.Fatalf("max %d: tail length %d exceeds max", max, len(tail))
+		}
+		if got < len(s) && !utf8.RuneStart(s[got]) {
+			t.Fatalf("max %d: tail %q starts mid-rune", max, s[got:])
+		}
+	}
+	// No-op cases mirror RuneSafeTailStart.
+	for _, max := range []int{0, -1, len(s), len(s) + 1} {
+		if got := RuneSafeTailStartString(s, max); got != 0 {
+			t.Errorf("max %d: got %d, want 0", max, got)
+		}
+	}
+}
+
 // TestTruncateVariants verifies the Truncate option matrix: the marker is
 // appended OUTSIDE the budget by default (result may exceed max by
 // len(marker)); MarkerInBudget reserves room for the marker (result is at

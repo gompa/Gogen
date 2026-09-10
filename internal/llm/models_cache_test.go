@@ -179,3 +179,91 @@ func TestListModelsHonorsCallerDeadline(t *testing.T) {
 		t.Fatal("server never saw /models request")
 	}
 }
+
+// TestCatalogProbeFailureDoesNotArmBackoff verifies the brief catalog lookup
+// used by ModelContextLimit (listModelsProbe) does not arm the shared
+// modelsFetchFailedAt backoff when its short budget cuts the fetch off, while
+// a full catalog fetch (listModels) still does. A slow-but-alive remote
+// catalog that misses the 1.5s probe budget must not make clientForModel skip
+// discovery for modelsFetchBackoff and route every model through the
+// fallback/owner inference.
+func TestCatalogProbeFailureDoesNotArmBackoff(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			http.NotFound(w, r)
+			return
+		}
+		// Hang until the caller's budget aborts the request.
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	client := openai.NewClient(
+		option.WithBaseURL(srv.URL+"/"),
+		option.WithAPIKey("test"),
+		option.WithHTTPClient(srv.Client()),
+	)
+	p := &OpenAIProvider{
+		profiles:    []*providerProfile{{name: "default", stream: &client}},
+		modelClient: make(map[string]*openai.Client),
+	}
+
+	probeCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := p.listModelsProbe(probeCtx); err == nil {
+		t.Fatal("expected probe fetch to fail on a hung /models")
+	}
+	if p.catalogFetchOnBackoff() {
+		t.Fatal("brief probe failure must not arm the shared catalog backoff")
+	}
+
+	fullCtx, fullCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer fullCancel()
+	if _, err := p.listModels(fullCtx); err == nil {
+		t.Fatal("expected full fetch to fail on a hung /models")
+	}
+	if !p.catalogFetchOnBackoff() {
+		t.Fatal("full-budget catalog fetch failure must arm the shared backoff")
+	}
+}
+
+// TestModelContextLimitProbeDoesNotArmBackoff verifies the ModelContextLimit
+// probe path leaves modelsFetchFailedAt unset when its /v1/models lookup
+// fails, so a following clientForModel discovery attempt is not suppressed by
+// the shared backoff.
+func TestModelContextLimitProbeDoesNotArmBackoff(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			http.NotFound(w, r)
+			return
+		}
+		hits.Add(1)
+		// Fail fast: openai-go retries 5xx with exponential backoff, which
+		// would stall the test for no coverage benefit.
+		w.Header().Set("x-should-retry", "false")
+		http.Error(w, "down", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	client := openai.NewClient(
+		option.WithBaseURL(srv.URL+"/"),
+		option.WithAPIKey("test"),
+		option.WithHTTPClient(srv.Client()),
+	)
+	p := &OpenAIProvider{
+		profiles:    []*providerProfile{{name: "default", stream: &client}},
+		modelClient: make(map[string]*openai.Client),
+		model:       "unknown-model",
+	}
+
+	if _, err := p.ModelContextLimit(context.Background()); err != nil {
+		t.Fatalf("ModelContextLimit: %v", err)
+	}
+	if n := hits.Load(); n == 0 {
+		t.Fatal("ModelContextLimit did not probe /v1/models")
+	}
+	if p.catalogFetchOnBackoff() {
+		t.Fatal("ModelContextLimit's brief probe must not arm the shared catalog backoff")
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/openai/openai-go/v3"
 )
@@ -327,11 +328,13 @@ func TestParsePreserveReasoningCap(t *testing.T) {
 	}
 }
 
-// TestApplyChatCompletionExtrasFailedProbeNotCached verifies the cold-start
-// fix: a probe that does not complete (404 here) must not pin "off" for the
-// endpoint's lifetime — the next request re-probes and picks up the
-// capability once the endpoint recovers.
-func TestApplyChatCompletionExtrasFailedProbeNotCached(t *testing.T) {
+// TestApplyChatCompletionExtrasFailedProbeNegativelyCached verifies the F1
+// fix: a probe that does not complete (404 here) is remembered for
+// propsProbeRetryTTL so the agent loop does not re-dial the endpoint every
+// round — but the negative result is NOT pinned forever, so a cold-start
+// endpoint that later recovers is discovered on the next probe after the
+// window.
+func TestApplyChatCompletionExtrasFailedProbeNegativelyCached(t *testing.T) {
 	t.Parallel()
 
 	var status atomic.Int32
@@ -351,7 +354,7 @@ func TestApplyChatCompletionExtrasFailedProbeNotCached(t *testing.T) {
 
 	p := &OpenAIProvider{profiles: []*providerProfile{{name: "default", baseURL: srv.URL + "/v1"}}}
 
-	// First probe fails: no kwargs, and the negative result is NOT cached.
+	// First probe fails: no kwargs, one hit, negative result recorded.
 	params := openai.ChatCompletionNewParams{Model: "test-model"}
 	p.applyChatCompletionExtras(context.Background(), &params)
 	assertNoChatTemplateKwargs(t, params)
@@ -359,11 +362,24 @@ func TestApplyChatCompletionExtrasFailedProbeNotCached(t *testing.T) {
 		t.Fatalf("/props hits = %d, want 1", got)
 	}
 
-	// Endpoint recovers: the next request re-probes and sends the kwargs.
-	status.Store(http.StatusOK)
+	// A second request within the window reuses the cached failure: no new
+	// dial (the F1 fix — no per-round probe).
 	params2 := openai.ChatCompletionNewParams{Model: "test-model"}
 	p.applyChatCompletionExtras(context.Background(), &params2)
-	b, err := json.Marshal(params2)
+	assertNoChatTemplateKwargs(t, params2)
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("/props hits = %d, want 1 (negative cached within window)", got)
+	}
+
+	// The window elapses and the endpoint recovers: the next probe runs and
+	// picks up the capability (the cold-start negative is not pinned).
+	p.propsMu.Lock()
+	p.propsNegAt = time.Now().Add(-2 * propsProbeRetryTTL)
+	p.propsMu.Unlock()
+	status.Store(http.StatusOK)
+	params3 := openai.ChatCompletionNewParams{Model: "test-model"}
+	p.applyChatCompletionExtras(context.Background(), &params3)
+	b, err := json.Marshal(params3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,14 +392,54 @@ func TestApplyChatCompletionExtrasFailedProbeNotCached(t *testing.T) {
 		t.Fatalf("expected preserve_reasoning=true after recovery, got %s", b)
 	}
 	if got := hits.Load(); got != 2 {
-		t.Fatalf("/props hits = %d, want 2 (failed probe not cached)", got)
+		t.Fatalf("/props hits = %d, want 2 (re-probed after window)", got)
 	}
 
 	// The successful probe IS cached: no further hits.
-	params3 := openai.ChatCompletionNewParams{Model: "test-model"}
-	p.applyChatCompletionExtras(context.Background(), &params3)
+	params4 := openai.ChatCompletionNewParams{Model: "test-model"}
+	p.applyChatCompletionExtras(context.Background(), &params4)
 	if got := hits.Load(); got != 2 {
 		t.Fatalf("/props hits = %d, want 2 (success cached)", got)
+	}
+}
+
+// TestTemplateSupportsPreserveReasoningNegativeWindow pins the negative-cache
+// window at the probe level: repeated calls after a failed probe skip the
+// network entirely, and invalidatePropsCaps (SetModel/SetProfiles) clears the
+// window so a model switch re-probes immediately.
+func TestTemplateSupportsPreserveReasoningNegativeWindow(t *testing.T) {
+	t.Parallel()
+
+	var status atomic.Int32
+	status.Store(http.StatusNotFound)
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.Error(w, "nope", int(status.Load()))
+	}))
+	defer srv.Close()
+
+	p := &OpenAIProvider{profiles: []*providerProfile{{name: "default", baseURL: srv.URL + "/v1"}}}
+
+	if p.templateSupportsPreserveReasoning(context.Background()) {
+		t.Fatal("expected false for a /props-less endpoint")
+	}
+	for i := 0; i < 5; i++ {
+		if p.templateSupportsPreserveReasoning(context.Background()) {
+			t.Fatal("expected false while negative-cached")
+		}
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("/props hits = %d, want 1 (subsequent calls served from negative cache)", got)
+	}
+
+	// Model switch invalidates both caches: the next call probes again.
+	p.invalidatePropsCaps()
+	if p.templateSupportsPreserveReasoning(context.Background()) {
+		t.Fatal("expected false for a /props-less endpoint")
+	}
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("/props hits = %d, want 2 (invalidated window re-probes)", got)
 	}
 }
 

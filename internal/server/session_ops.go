@@ -451,7 +451,7 @@ func (s *Server) sessionDelete(ctx context.Context, ws *wsConn, pane **sessionRu
 		// from the delete path).
 		heldTurnMu := rt.turnMu.TryLock()
 		if heldTurnMu {
-			defer rt.turnMu.Unlock()
+			defer rt.releaseTurn()
 		}
 		rt.agent.FlushSession()
 	}
@@ -480,7 +480,7 @@ func (s *Server) sessionDelete(ctx context.Context, ws *wsConn, pane **sessionRu
 		// timed out (the cancelled turn's goroutine is still alive), that
 		// turn itself holds the lock, so no new turn can start anyway.
 		if held := d.turnMu.TryLock(); held {
-			defer d.turnMu.Unlock()
+			defer d.releaseTurn()
 		}
 		d.agent.FlushSession()
 	}

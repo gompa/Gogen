@@ -315,7 +315,13 @@ func (a *streamAccumulator) buildResult() (*StreamResult, error) {
 	content := a.fullContent.String()
 
 	if a.lastFinishReason == "" && (content != "" || a.fullRefusal.Len() > 0 || a.fullReasoning.Len() > 0 || len(a.tcAccums) > 0) {
-		if len(a.tcAccums) > 0 {
+		// Base the tool-call verdict on the built toolCalls list, not the
+		// raw accumulator count: buildResult drops accumulators with an
+		// empty Name (an arguments-only delta that never carried a tool
+		// name), so a non-empty tcAccums can still yield zero usable calls —
+		// inferring "tool_calls" there would report a tool round the caller
+		// cannot execute.
+		if len(toolCalls) > 0 {
 			a.lastFinishReason = "tool_calls"
 		} else {
 			a.lastFinishReason = "stop"

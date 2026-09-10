@@ -69,6 +69,10 @@ func (s *Server) handleWSWorkingDir(ws *wsConn, ctx context.Context, pane **sess
 		}
 		cfg := agentConfigMsgBasic(a)
 		paneRT.turnMu.RUnlock()
+		// This reader briefly held the turn lock; a handler parked in
+		// tryAcquireTurn waits on the release broadcast, so nudge it. The
+		// reader is not the write holder, so there is no releaseTurn here.
+		paneRT.notifyTurnReleased()
 		accum := a.SnapshotUsageAccum()
 		applyContextStats(&cfg, a.ContextStats(ctx), &accum)
 		echo := WSMessage{Type: "config", WorkingDir: absDir, Model: cfg.Model, ContextLimit: cfg.ContextLimit, UsedTokens: cfg.UsedTokens, UsedSource: cfg.UsedSource, UsedPercent: cfg.UsedPercent, CompactAt: cfg.CompactAt, MessageCount: cfg.MessageCount, NearCompact: cfg.NearCompact, WarnNearCompact: cfg.WarnNearCompact, ToolTruncated: cfg.ToolTruncated, Mode: cfg.Mode, GlobalMode: cfg.GlobalMode, Board: cfg.Board, Subagent: cfg.Subagent, SubagentMaxDepth: cfg.SubagentMaxDepth}
@@ -127,7 +131,7 @@ func (s *Server) applyWorkingDirToAll(absDir string) (skipped []string) {
 		if s.ws.Store != nil && !prevUpdated.IsZero() {
 			_ = s.ws.Store.SetUpdatedAt(absDir, id, prevUpdated)
 		}
-		rt.turnMu.Unlock()
+		rt.releaseTurn()
 	}
 	return skipped
 }

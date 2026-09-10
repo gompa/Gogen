@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -85,23 +84,28 @@ func (e *Executor) DownloadFile(ctx context.Context, rawURL, targetPath string, 
 	ctx, cancel := context.WithTimeout(ctx, downloadTimeout)
 	defer cancel()
 
-	body, _, finalURL, truncated, err := doFetch(ctx, fetchRequest{
-		URL:      parsed.String(),
-		MaxBytes: maxBytes,
-	})
+	// Stream the response body straight into a temp file so a large download
+	// never has to sit on the heap: the buffered doFetch path would hold the
+	// entire body in memory and then copy it into the temp file, roughly
+	// tripling the peak footprint.
+	writer, err := ioutil.NewAtomicWriter(secure, defaultFilePerm)
 	if err != nil {
 		return "", err
 	}
+	_, finalURL, written, truncated, err := doFetchStream(ctx, fetchRequest{
+		URL:      parsed.String(),
+		MaxBytes: maxBytes,
+	}, writer)
+	if err != nil {
+		writer.Abort()
+		return "", err
+	}
 	if truncated {
+		writer.Abort()
 		return "", fmt.Errorf("download exceeds max_bytes (%d); body is larger than %d bytes — raise max_bytes (up to %d) or use execute_command with curl for larger files",
 			maxBytes, maxBytes, downloadHardMaxBytes)
 	}
-
-	dir := filepath.Dir(secure)
-	if err := os.MkdirAll(dir, defaultDirPerm); err != nil {
-		return "", fmt.Errorf("create parent dir: %w", err)
-	}
-	if err := ioutil.WriteFileAtomic(secure, body, defaultFilePerm); err != nil {
+	if err := writer.Commit(); err != nil {
 		return "", err
 	}
 
@@ -109,5 +113,5 @@ func (e *Executor) DownloadFile(ctx context.Context, rawURL, targetPath string, 
 	if finalURL != from {
 		from = fmt.Sprintf("%s (final URL %s)", from, finalURL)
 	}
-	return fmt.Sprintf("Downloaded %d bytes to %s (from %s)", len(body), targetPath, from), nil
+	return fmt.Sprintf("Downloaded %d bytes to %s (from %s)", written, targetPath, from), nil
 }

@@ -3,12 +3,98 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"io"
+	"strings"
 	"testing"
+	"time"
 
 	"gogen/internal/llm"
 
 	"gogen/internal/config"
 )
+
+// TestReadLoopRejectsOverlongLine pins the bounded line read: a server that
+// emits an unterminated line longer than mcpMaxLineBytes must fail the
+// connection's pending calls (instead of the reader allocating without
+// bound). The cap is shrunk so the test stays fast.
+func TestReadLoopRejectsOverlongLine(t *testing.T) {
+	old := mcpMaxLineBytes
+	mcpMaxLineBytes = 64
+	defer func() { mcpMaxLineBytes = old }()
+
+	ch := make(chan jsonRPCResponse, 1)
+	c := &Client{
+		stdout:     io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("a"), 4096))),
+		pending:    map[int64]chan jsonRPCResponse{1: ch},
+		readerDone: make(chan struct{}),
+	}
+	go c.readLoop()
+
+	select {
+	case resp := <-ch:
+		if resp.Error == nil {
+			t.Fatalf("resp = %+v, want an error", resp)
+		}
+		if !strings.Contains(resp.Error.Message, "token too long") {
+			t.Fatalf("error = %q, want an overlong-line error", resp.Error.Message)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("readLoop did not fail pending on an overlong line")
+	}
+	select {
+	case <-c.readerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("readLoop did not exit after an overlong line")
+	}
+}
+
+// TestWithCallTimeoutHonorsCallerDeadline pins the fix for the fixed 30s cap
+// on every tools/call: a caller that supplies its own (possibly longer)
+// deadline must keep it, so a legitimately long-running MCP tool is not
+// reported as failed after mcpCallTimeout. A caller with no deadline still
+// gets the default bound.
+func TestWithCallTimeoutHonorsCallerDeadline(t *testing.T) {
+	t.Run("no caller deadline applies default", func(t *testing.T) {
+		ctx, cancel := withCallTimeout(context.Background())
+		defer cancel()
+		dl, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("expected a default deadline")
+		}
+		if remaining := time.Until(dl); remaining <= 0 || remaining > mcpCallTimeout {
+			t.Fatalf("default deadline %s out of range (want <= %s)", remaining, mcpCallTimeout)
+		}
+	})
+
+	t.Run("longer caller deadline is honored", func(t *testing.T) {
+		want := time.Now().Add(10 * time.Minute)
+		caller, callerCancel := context.WithDeadline(context.Background(), want)
+		defer callerCancel()
+
+		ctx, cancel := withCallTimeout(caller)
+		defer cancel()
+		got, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("expected a deadline")
+		}
+		if !got.Equal(want) {
+			t.Fatalf("deadline = %s, want the caller's %s (not capped at %s)", got, want, mcpCallTimeout)
+		}
+	})
+
+	t.Run("shorter caller deadline is preserved", func(t *testing.T) {
+		want := time.Now().Add(time.Second)
+		caller, callerCancel := context.WithDeadline(context.Background(), want)
+		defer callerCancel()
+
+		ctx, cancel := withCallTimeout(caller)
+		defer cancel()
+		got, _ := ctx.Deadline()
+		if !got.Equal(want) {
+			t.Fatalf("deadline = %s, want %s", got, want)
+		}
+	})
+}
 
 func TestBytesTrimSpace(t *testing.T) {
 	got := string(bytes.TrimSpace([]byte("  hello  \n")))
