@@ -106,18 +106,21 @@ func (a *Agent) prepareMessages(ctx context.Context, h *llm.StreamHandlers) ([]l
 				a.compactToFit(ctx, pinned, counts, keep, emergency)
 			}
 		}
-		// Backfill a cold per-message count cache (restored session, or a
-		// cache dropped by capToolResultsForCompact) once, after the
+		// Cap oversized tool bodies in place on the live message array (a
+		// model-free win; the cached counts are dropped when a body is
+		// rewritten) — the same stage-1 call the forced compaction makes.
+		// Runs BEFORE the count backfill below: capping drops the cached
+		// counts, so backfilling first would be discarded and the pre-flight
+		// would re-tokenize the whole view anyway.
+		a.capToolResultsForCompact()
+		// Backfill a cold per-message count cache (a restored session, or the
+		// cache capToolResultsForCompact just dropped) once, after the
 		// boundary decision but before the pre-flight measurement, so the
 		// pre-flight does not re-tokenize the whole view on every round
 		// while the cache stays incomplete. The boundary decision above
 		// deliberately runs first: the emergency tier is documented to skip
 		// an incomplete cache (total -1) and fall back to the normal tier.
 		a.ensureTokenCounts()
-		// Cap oversized tool bodies in place on the live message array (a
-		// model-free win; the cached counts are dropped when a body is
-		// rewritten) — the same stage-1 call the forced compaction makes.
-		a.capToolResultsForCompact()
 		view = a.Messages
 	}
 	// Stabilize tool args on a.Messages (not view, which may be a copy) so

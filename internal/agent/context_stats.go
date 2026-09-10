@@ -203,7 +203,11 @@ func (a *Agent) ensureTokenCounts() {
 		a.statsMu.RUnlock()
 		return
 	}
-	msgs := append([]llm.Message(nil), a.Messages...)
+	// cloneMessagesShallow, not a bare slice copy: the counting below runs
+	// after statsMu is released, and this is the documented way to read the
+	// messages outside the lock (unstabilized ToolCalls are deep-copied so
+	// the count cannot race an in-place stabilization).
+	msgs := cloneMessagesShallow(a.Messages)
 	countsEpoch := a.countsEpoch
 	a.statsMu.RUnlock()
 	a.publishTokenCounts(contextmgr.CountTokens(msgs), len(msgs), countsEpoch)

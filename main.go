@@ -86,7 +86,7 @@ func resolvePositionalArgs(dir, prompt string, args []string) (workingDir, resol
 			prompt = args[0]
 		}
 		if len(args) > 1 {
-			return workingDir, prompt, fmt.Errorf("Usage: gogen [flags] [dir] [prompt]")
+			return workingDir, prompt, fmt.Errorf("usage: gogen [flags] [dir] [prompt]")
 		}
 	}
 	return workingDir, prompt, nil

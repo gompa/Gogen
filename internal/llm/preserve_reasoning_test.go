@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -453,4 +454,44 @@ func TestProjectPromptCacheKeyStable(t *testing.T) {
 	if ProjectPromptCacheKey("/tmp/other") == a {
 		t.Fatal("different dirs should hash differently")
 	}
+}
+
+// TestApplyChatCompletionExtrasConcurrentModeChange pins that the mode read on
+// the request path is synchronized with the live settings push. Before the
+// modelsMu guard, SetPreserveReasoningMode (server/runtime_config.go's
+// applyPreserveReasoningToAll) assigned the field while applyChatCompletionExtras
+// read it on the request goroutine — a torn string read no existing test
+// overlapped, so -race could not see it. Both modes used here skip the /props
+// probe, so this is hermetic.
+func TestApplyChatCompletionExtrasConcurrentModeChange(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	defer srv.Close()
+
+	p := &OpenAIProvider{profiles: []*providerProfile{{name: "default", baseURL: srv.URL + "/v1"}}}
+	p.SetPreserveReasoningMode("on")
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if i%2 == 0 {
+				p.SetPreserveReasoningMode("off")
+				continue
+			}
+			p.SetPreserveReasoningMode("on")
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		params := openai.ChatCompletionNewParams{Model: "test-model"}
+		p.applyChatCompletionExtras(context.Background(), &params)
+	}
+	close(stop)
+	wg.Wait()
 }

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -14,8 +13,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/net/http2"
 
 	"gogen/internal/buildinfo"
 	"gogen/internal/onoff"
@@ -221,17 +218,17 @@ func ConfigureWebSearch(backend, apiKey string) {
 // CheckRedirect enforces max redirects, loop detection, and private-host blocking.
 var sharedFetchClient = newSharedFetchClient()
 
-// newSharedFetchClient builds the shared transport. ConfigureTransport fails
-// only for a misconfigured transport; HTTP/1.1 remains functional, so an
-// optional protocol upgrade must never crash the process at package init.
+// newSharedFetchClient builds the shared transport. A non-zero DialContext
+// conservatively disables HTTP/2, so ForceAttemptHTTP2 is set explicitly: it is
+// the supported replacement for the deprecated http2.ConfigureTransport, and
+// unlike it has no failure mode to guard (the h2 upgrade is configured lazily
+// by net/http and falls back to HTTP/1.1 on its own).
 func newSharedFetchClient() *http.Client {
 	tr := &http.Transport{
-		MaxIdleConns:    10,
-		IdleConnTimeout: 90 * time.Second,
-		DialContext:     dialContextPublicOnly,
-	}
-	if err := http2.ConfigureTransport(tr); err != nil {
-		log.Printf("web_fetch: http2 unavailable: %v", err)
+		MaxIdleConns:      10,
+		IdleConnTimeout:   90 * time.Second,
+		DialContext:       dialContextPublicOnly,
+		ForceAttemptHTTP2: true,
 	}
 	return &http.Client{
 		Transport: tr,

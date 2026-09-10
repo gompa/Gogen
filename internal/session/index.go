@@ -61,6 +61,33 @@ var (
 	listCacheMu sync.RWMutex
 )
 
+// listCacheSweepThreshold is the entry count above which cacheList sweeps
+// expired entries. The cache is keyed by effective store directory and every
+// entry is useless once its TTL has passed, so on a long-running process that
+// changes working directories (the web working-dir switch) the map would
+// otherwise retain one full session listing per directory for the life of the
+// process. The sweep is deliberately amortized (only past the threshold), so
+// the common single-directory case never pays for it.
+const listCacheSweepThreshold = 64
+
+// cacheList stores a freshly built listing for cacheKey and, past the
+// threshold, drops entries that are already past the TTL. Expired entries can
+// never be served (the read path requires age < 1s), so removing them is
+// transparent — it only bounds the map.
+func cacheList(cacheKey string, info []SessionInfo) {
+	now := time.Now()
+	listCacheMu.Lock()
+	if len(listCache) >= listCacheSweepThreshold {
+		for k, ce := range listCache {
+			if now.Sub(ce.time) >= time.Second {
+				delete(listCache, k)
+			}
+		}
+	}
+	listCache[cacheKey] = listCacheEntry{info: info, time: now}
+	listCacheMu.Unlock()
+}
+
 // sessionFiles returns the names of the .json session files in the store
 // directory for workingDir (excluding index.json). A missing directory
 // surfaces as an *os.PathError from os.ReadDir (os.IsNotExist).
@@ -195,9 +222,7 @@ func (s *Store) List(workingDir string) ([]SessionInfo, error) {
 				SubagentSummary: e.SubagentSummary,
 			}
 		}
-		listCacheMu.Lock()
-		listCache[cacheKey] = listCacheEntry{info: out, time: time.Now()}
-		listCacheMu.Unlock()
+		cacheList(cacheKey, out)
 		return out, nil
 	}
 
@@ -259,9 +284,7 @@ func (s *Store) List(workingDir string) ([]SessionInfo, error) {
 	}
 
 	// Populate in-memory cache.
-	listCacheMu.Lock()
-	listCache[cacheKey] = listCacheEntry{info: out, time: time.Now()}
-	listCacheMu.Unlock()
+	cacheList(cacheKey, out)
 
 	return out, nil
 }

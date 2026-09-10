@@ -130,6 +130,12 @@ func newSSEHTTPClient() *http.Client {
 	// succeeds through the proxy is followed by chat requests that cannot) and
 	// leaves TLSHandshakeTimeout at 0, bounding a stalled handshake only by the
 	// SSE idle read deadline. Only compression and dialing are overridden.
+	//
+	// ForceAttemptHTTP2 comes along with the clone (DefaultTransport sets it),
+	// so a stream may now negotiate h2 where the bare transport stayed on
+	// HTTP/1.1 — consistent with propsHTTPClient, which already cloned. Set
+	// tr.ForceAttemptHTTP2 = false here to pin HTTP/1.1 for an endpoint whose
+	// SSE behaves badly over h2.
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.DisableCompression = true
 	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
