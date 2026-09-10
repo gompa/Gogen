@@ -22,6 +22,7 @@ import (
 	"gogen/internal/profiling"
 	"gogen/internal/projectfile"
 	"gogen/internal/session"
+	"gogen/internal/spill"
 	"gogen/internal/treesitter"
 )
 
@@ -53,25 +54,42 @@ func parseCLIOptions() (cliFlags, string) {
 
 	flag.Parse()
 
-	workingDir := "."
-	if opts.dir != "" {
-		workingDir = opts.dir
-	} else if args := flag.Args(); len(args) > 0 {
-		workingDir = args[0]
-		if len(args) > 1 {
-			if opts.prompt == "" {
-				opts.prompt = args[1]
-			}
-			if len(args) > 2 {
-				log.Fatal("Usage: gogen [flags] [dir] [prompt]")
-			}
-		}
+	workingDir, resolvedPrompt, err := resolvePositionalArgs(opts.dir, opts.prompt, flag.Args())
+	if err != nil {
+		log.Fatal(err)
 	}
+	opts.prompt = resolvedPrompt
+
 	absWD, err := filepath.Abs(workingDir)
 	if err != nil {
 		log.Fatal(err)
 	}
 	return opts, absWD
+}
+
+// resolvePositionalArgs maps the positional arguments (`[dir] [prompt]`) plus
+// the --dir / -p flag values onto a working directory and prompt. The first
+// positional argument is the working directory, but --dir overrides it; when
+// --dir is set the first positional therefore becomes the prompt instead of
+// being silently discarded. A leftover prompt flag wins over a positional
+// prompt, and any extra positional argument is a usage error.
+func resolvePositionalArgs(dir, prompt string, args []string) (workingDir, resolvedPrompt string, err error) {
+	workingDir = "."
+	if dir != "" {
+		workingDir = dir
+	} else if len(args) > 0 {
+		workingDir = args[0]
+		args = args[1:]
+	}
+	if len(args) > 0 {
+		if prompt == "" {
+			prompt = args[0]
+		}
+		if len(args) > 1 {
+			return workingDir, prompt, fmt.Errorf("Usage: gogen [flags] [dir] [prompt]")
+		}
+	}
+	return workingDir, prompt, nil
 }
 
 func handleSaveConfigFlag(opts cliFlags, isGlobalMode bool, workingDir string, cfg *config.Config, pf *projectfile.ProjectFile) bool {
@@ -133,6 +151,11 @@ func run() error {
 	defer profiling.Stop()
 
 	isGlobalMode := opts.global || projectfile.IsGlobalModeEnv()
+	// Global mode keeps its state out of the project dir (sessions, board,
+	// config, guidelines): spill trees follow the sessions they belong to.
+	if isGlobalMode {
+		spill.SetGlobalRoot(projectfile.GlobalSpillDir())
+	}
 
 	var verboseOverride *bool
 	if opts.verbose {
@@ -204,9 +227,16 @@ func run() error {
 	mcpH := startMCP(a, cfg)
 	defer closeMCP(mcpH)
 
-	// Inherited SIG_IGN sticks across Notify unless cleared first.
-	signal.Reset(syscall.SIGINT, syscall.SIGTERM)
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	// Inherited SIG_IGN sticks across Notify unless cleared first. SIGHUP is
+	// included because closing the terminal (or a dropped SSH session) sends
+	// it: with no handler the runtime terminates the process immediately, so
+	// no defer runs — no session flush, no ShutdownSessions — and the last
+	// unsaved state is lost. Handling it routes a terminal close through the
+	// same graceful shutdown as SIGINT/SIGTERM (context cancellation → the
+	// mode's exit sweep). On Windows SIGHUP is defined but never delivered,
+	// so this is a no-op there.
+	signal.Reset(syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	defer stop()
 	defer a.FlushPending()
 
@@ -310,6 +340,7 @@ func applyRuntimeConfig(cfg *config.Config) {
 	treesitter.Configure(cfg.TreeSitterEnabled(), cfg.TreeSitterLangs)
 	agent.ConfigureWebFetch(cfg.WebFetchEnabled(), cfg.WebFetchMode, cfg.WebAllowedDomains)
 	agent.ConfigureWebSearchEnabled(cfg.WebSearchEnabled())
+	agent.ConfigureOutputSpill(cfg.OutputSpillEnabled())
 	agent.ConfigureWebSearch(cfg.WebSearchBackend, cfg.WebSearchAPIKey)
 	agent.ConfigureSystemPrompt(cfg.SystemPrompt)
 	agent.ConfigureSubagentPrompt(cfg.SubagentPrompt)

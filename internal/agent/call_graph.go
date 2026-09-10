@@ -43,13 +43,17 @@ func (e *Executor) CallGraph(ctx context.Context, symbol, subpath, glob string, 
 		return "", err
 	}
 
+	// skips collects unreadable-subtree errors from whichever walk runs so an
+	// incomplete call graph is flagged.
+	skips := &walkSkips{}
+
 	// Use AST fallback pattern: try AST first, then text search
 	fallback := &ASTFallback[*CallGraphResult]{
 		ASTFunc: func() (*CallGraphResult, error) {
-			return e.callGraphWithAST(ctx, searchRoot, relPrefix, glob, symbol)
+			return e.callGraphWithAST(ctx, searchRoot, relPrefix, glob, symbol, skips)
 		},
 		TextFunc: func() (*CallGraphResult, error) {
-			return e.callGraphWithText(ctx, searchRoot, relPrefix, glob, symbol)
+			return e.callGraphWithText(ctx, searchRoot, relPrefix, glob, symbol, skips)
 		},
 		HasResult: func(r *CallGraphResult) bool {
 			return r != nil && (len(r.Callers) > 0 || len(r.Callees) > 0)
@@ -60,7 +64,7 @@ func (e *Executor) CallGraph(ctx context.Context, symbol, subpath, glob string, 
 	if err != nil {
 		return "", err
 	}
-	return formatCallGraph(result, direction), nil
+	return formatCallGraph(result, direction) + skips.footer(), nil
 }
 
 // isDefinitionLine reports whether line is a definition of symbol: a
@@ -102,10 +106,10 @@ func isCallSite(line, symbol string) bool {
 	return idx >= 0
 }
 
-func (e *Executor) callGraphWithAST(ctx context.Context, searchRoot, relPrefix, glob, symbol string) (*CallGraphResult, error) {
+func (e *Executor) callGraphWithAST(ctx context.Context, searchRoot, relPrefix, glob, symbol string, skips *walkSkips) (*CallGraphResult, error) {
 	result := &CallGraphResult{Symbol: symbol, Method: "ast"}
 
-	err := e.walkSymbolReferences(ctx, searchRoot, relPrefix, glob, symbol,
+	err := e.walkSymbolReferences(ctx, searchRoot, relPrefix, glob, symbol, skips,
 		func(filePath string, refs []treesitter.Reference, content []byte) error {
 			lines := strings.Split(string(content), "\n")
 
@@ -149,12 +153,12 @@ func (e *Executor) callGraphWithAST(ctx context.Context, searchRoot, relPrefix, 
 	return result, err
 }
 
-func (e *Executor) callGraphWithText(ctx context.Context, searchRoot, relPrefix, glob, symbol string) (*CallGraphResult, error) {
+func (e *Executor) callGraphWithText(ctx context.Context, searchRoot, relPrefix, glob, symbol string, skips *walkSkips) (*CallGraphResult, error) {
 	result := &CallGraphResult{Symbol: symbol, Method: "text"}
 
 	// Search for call sites of the symbol → these are the Callers.
 	callPattern := `\b` + regexp.QuoteMeta(symbol) + `\s*\(`
-	err := e.walkSymbolReferencesText(ctx, searchRoot, relPrefix, glob, callPattern,
+	err := e.walkSymbolReferencesText(ctx, searchRoot, relPrefix, glob, callPattern, skips,
 		func(filePath string, lineNum int, line string) error {
 			if !isCallSite(line, symbol) {
 				return nil
@@ -175,7 +179,7 @@ func (e *Executor) callGraphWithText(ctx context.Context, searchRoot, relPrefix,
 	// (includes Go methods with receivers); the callback gates matches with
 	// isDefinitionLine so this agrees with the caller-detection path.
 	defPattern := definitionSearchPattern(symbol, "func")
-	if err := e.walkSymbolReferencesText(ctx, searchRoot, relPrefix, glob, defPattern,
+	if err := e.walkSymbolReferencesText(ctx, searchRoot, relPrefix, glob, defPattern, skips,
 		func(filePath string, lineNum int, line string) error {
 			if !isDefinitionLine(line, symbol) {
 				return nil

@@ -11,21 +11,94 @@ import (
 
 // streamReadIdleTimeout is the per-read deadline for SSE response bodies.
 // llama.cpp often stops sending without closing the connection or sending [DONE];
-// this bounds how long we block waiting for the next byte. Set
+// this bounds how long we block waiting for the next byte. The same window
+// also covers the wait for the FIRST byte: long prompt processing (llama.cpp
+// re-processes the whole prompt each round) and queued requests on a busy
+// backend send no bytes until the first token, so the default must tolerate
+// multi-minute (occasionally tens-of-minutes) prefills. Set
 // GOGEN_STREAM_IDLE_TIMEOUT=0 to disable (wait indefinitely).
 func streamReadIdleTimeout() time.Duration {
 	raw := strings.TrimSpace(os.Getenv("GOGEN_STREAM_IDLE_TIMEOUT"))
 	if raw == "" {
-		return 10 * time.Minute
+		return 30 * time.Minute
 	}
 	if raw == "0" || strings.EqualFold(raw, "off") || strings.EqualFold(raw, "false") {
 		return 0
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil || d <= 0 {
-		return 10 * time.Minute
+		return 30 * time.Minute
 	}
 	return d
+}
+
+// streamStallAfter is how long the SSE read loop may see no chunk before
+// OnStreamStall fires so hosts can surface a "still waiting" state — a long
+// prefill (llama.cpp re-processes the whole prompt each round) or a
+// server-side stall is otherwise indistinguishable from a dead UI. The
+// callback is informational: it never interrupts the stream (the per-read
+// idle deadline in idleTimeoutConn remains the hard bound). Set
+// GOGEN_STREAM_STALL=0/off to disable the signal.
+func streamStallAfter() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("GOGEN_STREAM_STALL"))
+	if raw == "" {
+		return 10 * time.Second
+	}
+	if raw == "0" || strings.EqualFold(raw, "off") || strings.EqualFold(raw, "false") {
+		return 0
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return 10 * time.Second
+	}
+	return d
+}
+
+// streamRetryBackoff is the delay inserted before a recovery re-request:
+// stage 0 is the muted streaming retry, stage 1 the non-streaming
+// fallback. The ladder used to fire each re-request within milliseconds
+// of the failed attempt, so a failure condition that persists for even a
+// short window (the router re-dialing a dead upstream, a LAN blip)
+// swallowed the retry AND the fallback, landing every such failure on the
+// slowest path. The delay doubles per stage (base, 2×base). Set
+// GOGEN_STREAM_RETRY_BACKOFF=0 to disable (immediate, as before).
+func streamRetryBackoff(stage int) time.Duration {
+	raw := strings.TrimSpace(os.Getenv("GOGEN_STREAM_RETRY_BACKOFF"))
+	var base time.Duration
+	switch {
+	case raw == "":
+		base = time.Second
+	case raw == "0" || strings.EqualFold(raw, "off") || strings.EqualFold(raw, "false"):
+		return 0
+	default:
+		d, err := time.ParseDuration(raw)
+		if err != nil || d < 0 {
+			base = time.Second
+		} else {
+			base = d
+		}
+	}
+	if stage < 0 {
+		stage = 0
+	}
+	return base * time.Duration(1<<uint(stage))
+}
+
+// waitStreamBackoff sleeps for the recovery backoff, returning early with
+// the context error when the turn is cancelled mid-wait so a stop request
+// is never held up by the delay.
+func waitStreamBackoff(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 type idleTimeoutConn struct {
@@ -52,7 +125,10 @@ func newSSEHTTPClient() *http.Client {
 	// still win when they are shorter.
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	return &http.Client{
-		Transport: &http.Transport{
+		// sseFilterTransport drops the SSE keep-alive frames that
+		// openai-go's stream decoder cannot digest (unexpected end of
+		// JSON input — see sse_filter.go for the per-version gap analysis).
+		Transport: &sseFilterTransport{base: &http.Transport{
 			DisableCompression: true,
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				conn, err := dialer.DialContext(ctx, network, addr)
@@ -64,13 +140,13 @@ func newSSEHTTPClient() *http.Client {
 				}
 				return conn, nil
 			},
-		},
+		}},
 	}
 }
 
 // newCatalogHTTPClient is for /v1/models and similar non-stream calls.
 // A hard client Timeout prevents startup/ListModels from sitting on the SSE
-// idle read deadline (default 10m) when a provider stalls after headers.
+// idle read deadline (default 30m) when a provider stalls after headers.
 func newCatalogHTTPClient() *http.Client {
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	return &http.Client{

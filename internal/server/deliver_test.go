@@ -214,10 +214,13 @@ func TestDeliverQueueOverflow(t *testing.T) {
 func TestDeliverToSessionOverflowNoDeadlock(t *testing.T) {
 	reg := newSessionRegistry(8)
 	rt := &sessionRuntime{
-		registry:       reg,
-		clients:        make(map[*wsConn]struct{}),
-		pendingDeliver: make([]string, defaultDeliverQueueCap),
-		deliverNotify:  make(chan struct{}, 1),
+		registry:      reg,
+		clients:       make(map[*wsConn]struct{}),
+		agent:         &agent.Agent{},
+		deliverNotify: make(chan struct{}, 1),
+	}
+	for i := 0; i < defaultDeliverQueueCap; i++ {
+		rt.pendingDeliver = append(rt.pendingDeliver, deliverItem{ID: newQueueItemID(), Text: "stale", Kind: deliverSystem})
 	}
 	// No worker goroutine for this unit test: the queue stays at cap so the
 	// overflow branch fires deterministically.
@@ -245,8 +248,8 @@ func TestDeliverToSessionOverflowNoDeadlock(t *testing.T) {
 	n := len(rt.pendingDeliver)
 	last := rt.pendingDeliver[n-1]
 	rt.deliverMu.Unlock()
-	if n != defaultDeliverQueueCap || last != "overflow notice" {
-		t.Fatalf("queue = %d entries, last %q; want cap=%d with the new notice at the tail", n, last, defaultDeliverQueueCap)
+	if n != defaultDeliverQueueCap || last.Text != "overflow notice" {
+		t.Fatalf("queue = %d entries, last %q; want cap=%d with the new notice at the tail", n, last.Text, defaultDeliverQueueCap)
 	}
 }
 

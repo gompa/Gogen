@@ -14,7 +14,7 @@
 // Wiring: app.js calls initDeleteApproval(deps) once at startup and
 // forwards the ws 'delete_approval' payload to showDeleteApproval.
 //   deps.getWs() — the chat WebSocket (or null)
-import { openModal, closeModal } from '/editor.js';
+import { openDialog } from '/components/dialog.js';
 import { sendNotification } from '/components/settings.js';
 
 const inputArea = document.getElementById('message-input');
@@ -22,8 +22,6 @@ const sendBtn = document.getElementById('send-btn');
 const deleteOverlay = document.getElementById('delete-approval-overlay');
 const deleteReason = document.getElementById('delete-approval-reason');
 const deletePaths = document.getElementById('delete-approval-paths');
-const deleteAllowBtn = document.getElementById('delete-allow-btn');
-const deleteDenyBtn = document.getElementById('delete-deny-btn');
 
 let deps = null;
 
@@ -38,14 +36,18 @@ function renderDeleteApproval(data) {
     deletePaths.textContent = (data.paths || []).map(p => `- ${p}`).join('\n');
 }
 
-function respondDeleteApproval(approved) {
+// Resolve the front queued approval (Allow/Deny click or Esc — openDialog
+// routes all three to the same callbacks): send the response, then present
+// the next queued approval or hand the composer back. By the time we run,
+// openDialog has already torn down its wiring and closed the overlay, so
+// presenting the next approval re-arms everything from scratch (no stale
+// handlers) and the last resolution just leaves it closed.
+function resolveDeleteApproval(approved) {
     const ws = deps.getWs();
-    deleteOverlay.removeEventListener('keydown', deleteApprovalEsc);
     if (!pendingDeleteApprovals.length || !ws || ws.readyState !== WebSocket.OPEN) {
         pendingDeleteApprovals = [];
         inputArea.disabled = false;
         sendBtn.disabled = false;
-        closeModal(deleteOverlay);
         return;
     }
     const current = pendingDeleteApprovals.shift();
@@ -57,26 +59,32 @@ function respondDeleteApproval(approved) {
     }));
     if (pendingDeleteApprovals.length) {
         // More approvals queued — show the next one.
-        renderDeleteApproval(pendingDeleteApprovals[0]);
-        // The keydown listener was removed above; re-arm it so Esc
-        // keeps resolving queued approvals too.
-        deleteOverlay.addEventListener('keydown', deleteApprovalEsc);
+        presentDeleteApproval();
     } else {
         inputArea.disabled = false;
         sendBtn.disabled = false;
-        closeModal(deleteOverlay);
     }
 }
 
-function deleteApprovalEsc(e) {
-    if (e.key === 'Escape') {
-        e.stopPropagation(); // keep the document handler from cancelling the agent turn
-        respondDeleteApproval(false);
-    }
+// Present the front queued approval: render it, freeze the composer and
+// arm the dialog plumbing (Allow/Deny buttons + Esc). openDialog closes
+// the overlay on every dismissal path before invoking the callbacks, so
+// this runs again — freshly armed — for each queued approval. Backdrop
+// clicks are NOT wired (backdrop: false): a stray outside click must not
+// deny a delete the user meant to allow.
+function presentDeleteApproval() {
+    renderDeleteApproval(pendingDeleteApprovals[0]);
+    inputArea.disabled = true;
+    sendBtn.disabled = true;
+    openDialog(deleteOverlay, {
+        // Allow = confirm; Deny = cancel (Esc denies too — the safe action).
+        confirm: 'delete-allow-btn',
+        cancel: 'delete-deny-btn',
+        backdrop: false,
+        onConfirm: () => resolveDeleteApproval(true),
+        onCancel: () => resolveDeleteApproval(false),
+    });
 }
-
-deleteAllowBtn.onclick = () => respondDeleteApproval(true);
-deleteDenyBtn.onclick = () => respondDeleteApproval(false);
 
 export function showDeleteApproval(data) {
     const first = pendingDeleteApprovals.length === 0;
@@ -91,11 +99,7 @@ export function showDeleteApproval(data) {
         // queued and renders when the current one resolves.
         return;
     }
-    renderDeleteApproval(pendingDeleteApprovals[0]);
-    inputArea.disabled = true;
-    sendBtn.disabled = true;
-    openModal(deleteOverlay);
-    deleteOverlay.addEventListener('keydown', deleteApprovalEsc);
+    presentDeleteApproval();
     // Always notify: delete approval requires user action even when
     // the tab is backgrounded.
     const paths = (data.paths || []).join(', ');

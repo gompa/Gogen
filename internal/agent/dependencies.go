@@ -50,13 +50,17 @@ func (e *Executor) DependencyAnalysis(ctx context.Context, symbol, subpath strin
 		return "", err
 	}
 
+	// skips collects unreadable-subtree errors from whichever walk runs so a
+	// partial impact analysis is flagged rather than presented as complete.
+	skips := &walkSkips{}
+
 	// Use AST fallback pattern: try AST first, then text search
 	fallback := &ASTFallback[*DependencyResult]{
 		ASTFunc: func() (*DependencyResult, error) {
-			return e.dependencyAnalysisWithAST(ctx, searchRoot, relPrefix, symbol)
+			return e.dependencyAnalysisWithAST(ctx, searchRoot, relPrefix, symbol, skips)
 		},
 		TextFunc: func() (*DependencyResult, error) {
-			return e.dependencyAnalysisWithText(ctx, searchRoot, relPrefix, symbol)
+			return e.dependencyAnalysisWithText(ctx, searchRoot, relPrefix, symbol, skips)
 		},
 		HasResult: func(r *DependencyResult) bool {
 			return r != nil && len(r.DirectDependents) > 0
@@ -67,13 +71,13 @@ func (e *Executor) DependencyAnalysis(ctx context.Context, symbol, subpath strin
 	if err != nil {
 		return "", err
 	}
-	return formatDependencyResult(result), nil
+	return formatDependencyResult(result) + skips.footer(), nil
 }
 
-func (e *Executor) dependencyAnalysisWithAST(ctx context.Context, searchRoot, relPrefix, symbol string) (*DependencyResult, error) {
+func (e *Executor) dependencyAnalysisWithAST(ctx context.Context, searchRoot, relPrefix, symbol string, skips *walkSkips) (*DependencyResult, error) {
 	result := &DependencyResult{Symbol: symbol, Method: "ast"}
 
-	err := e.walkSymbolReferences(ctx, searchRoot, relPrefix, "", symbol,
+	err := e.walkSymbolReferences(ctx, searchRoot, relPrefix, "", symbol, skips,
 		func(filePath string, refs []treesitter.Reference, content []byte) error {
 			result.DirectDependents = append(result.DirectDependents, filePath)
 			return nil
@@ -91,13 +95,13 @@ func (e *Executor) dependencyAnalysisWithAST(ctx context.Context, searchRoot, re
 	return result, nil
 }
 
-func (e *Executor) dependencyAnalysisWithText(ctx context.Context, searchRoot, relPrefix, symbol string) (*DependencyResult, error) {
+func (e *Executor) dependencyAnalysisWithText(ctx context.Context, searchRoot, relPrefix, symbol string, skips *walkSkips) (*DependencyResult, error) {
 	result := &DependencyResult{Symbol: symbol, Method: "text"}
 
 	// Use shared text-based search helper
 	pattern := `\b` + regexp.QuoteMeta(symbol) + `\b`
 	seenFiles := make(map[string]bool)
-	err := e.walkSymbolReferencesText(ctx, searchRoot, relPrefix, "", pattern,
+	err := e.walkSymbolReferencesText(ctx, searchRoot, relPrefix, "", pattern, skips,
 		func(filePath string, lineNum int, line string) error {
 			if !seenFiles[filePath] {
 				seenFiles[filePath] = true

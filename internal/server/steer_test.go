@@ -1,0 +1,442 @@
+package server
+
+import (
+	"strings"
+	"testing"
+	"time"
+
+	"gogen/internal/agent"
+	"gogen/internal/llm"
+	"gogen/internal/session"
+)
+
+// userMsgIndex returns the index of the first user message containing
+// needle (-1 when absent) — the FIFO-order probe for steering delivery.
+func userMsgIndex(a *agent.Agent, needle string) int {
+	for i, m := range a.SnapshotMessages() {
+		if m.Role == "user" && strings.Contains(m.Content, needle) {
+			return i
+		}
+	}
+	return -1
+}
+
+// waitTurnsPersisted waits until minDone released blocking-stub turns' final
+// state is ON DISK (each completed turn ends with the assistant "done"
+// reply) — a user message persists at turn START, so only the assistant
+// replies prove the turns' closing flushes landed; ending the test earlier
+// races TempDir teardown (the suite's documented "directory not empty"
+// flake). Every completed turn in the test must be released and counted.
+func waitTurnsPersisted(t *testing.T, store *session.Store, dir, sessionID string, minDone int) {
+	t.Helper()
+	waitFor(t, 10*time.Second, func() bool {
+		snap, err := store.LoadInWorkingDir(dir, sessionID)
+		if err != nil {
+			return false
+		}
+		done := 0
+		for _, m := range snap.Messages {
+			if m.Role == "assistant" && m.Content == "done" {
+				done++
+			}
+		}
+		return done >= minDone
+	})
+}
+
+// startBlockedTurn acquires the runtime's turn lock and hands it to
+// startTurn (whose goroutine defers the unlock), waiting until the turn is
+// actually inside the provider — the same pattern deliver_test.go uses so
+// the queue cannot be drained mid-arrangement.
+func startBlockedTurn(t *testing.T, rt *sessionRuntime, stub *blockingStub, content string) {
+	t.Helper()
+	rt.turnMu.Lock()
+	rt.startTurn(nil, content, nil)
+	stub.waitBlocked(1)
+}
+
+// TestUserSteerEnqueueDrainsFIFO pins the steering core: messages typed
+// while a turn runs are queued and drain in strict FIFO arrival order —
+// user items and system deliveries share one queue — one item per turn,
+// each as its own user turn.
+func TestUserSteerEnqueueDrainsFIFO(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, a, store := newContinuationServer(t, stub, dir)
+	rt, ok := s.registry.get(a.SessionID)
+	if !ok {
+		t.Fatal("default runtime not registered")
+	}
+
+	startBlockedTurn(t, rt, stub, "block me")
+	if !rt.enqueueUserTurn("q1", "steer-a", nil) {
+		t.Fatal("first steer enqueue refused")
+	}
+	if !rt.enqueueUserTurn("q2", "steer-b", nil) {
+		t.Fatal("second steer enqueue refused")
+	}
+	rt.deliverToSession("sys notice")
+
+	// Nothing is delivered while the turn runs.
+	time.Sleep(200 * time.Millisecond)
+	if userMsgIndex(a, "steer-a") >= 0 || userMsgIndex(a, "steer-b") >= 0 {
+		t.Fatal("steering messages must not be injected mid-turn")
+	}
+
+	// End the blocking turn: the worker wakes at turn end and drains the
+	// queue one item per turn. Each delivered turn blocks the stub, so the
+	// test releases calls as their user message lands.
+	rt.stream.cancelInFlight()
+	waitFor(t, 5*time.Second, func() bool { return userMsgIndex(a, "steer-a") >= 0 })
+	stub.releaseN(2)
+	waitFor(t, 5*time.Second, func() bool { return userMsgIndex(a, "steer-b") >= 0 })
+	stub.releaseN(3)
+	waitFor(t, 5*time.Second, func() bool { return userMsgIndex(a, "sys notice") >= 0 })
+
+	ia, ib, is := userMsgIndex(a, "steer-a"), userMsgIndex(a, "steer-b"), userMsgIndex(a, "sys notice")
+	if !(ia < ib && ib < is) {
+		t.Fatalf("FIFO order violated: steer-a@%d, steer-b@%d, sys@%d", ia, ib, is)
+	}
+	// Each queued item ran as its OWN turn: an assistant reply between the
+	// two user messages.
+	for i := ia; i < ib; i++ {
+		if m := a.SnapshotMessages()[i]; m.Role == "assistant" {
+			break
+		}
+	}
+
+	stub.releaseN(4)
+	// The delivered turns' final flushes must land before TempDir teardown
+	// (the store-wait pattern used across this suite): three completed
+	// turns (steer-a, steer-b, sys notice).
+	waitTurnsPersisted(t, store, dir, a.SessionID, 3)
+}
+
+// TestUserQueueCapRejects pins the user-side overflow policy: user text is
+// never silently dropped — the enqueue is REFUSED at the cap, and the
+// refusal does not disturb already-queued items.
+func TestUserQueueCapRejects(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, a, store := newContinuationServer(t, stub, dir)
+	rt, _ := s.registry.get(a.SessionID)
+
+	startBlockedTurn(t, rt, stub, "block me")
+	for i := 0; i < maxUserQueueCap; i++ {
+		if !rt.enqueueUserTurn("", "steer-"+string(rune('a'+i)), nil) {
+			t.Fatalf("enqueue %d refused before cap", i)
+		}
+	}
+	if rt.enqueueUserTurn("", "one too many", nil) {
+		t.Fatal("enqueue past the user cap must be refused")
+	}
+	if got := rt.countUser(); got != maxUserQueueCap {
+		t.Fatalf("countUser = %d, want %d", got, maxUserQueueCap)
+	}
+	rt.stream.cancelInFlight()
+	waitFor(t, 5*time.Second, func() bool { return userMsgIndex(a, "steer-a") >= 0 })
+	// Tear down cleanly: release every queued turn and wait for the LAST
+	// one's final flush so nothing races the TempDir teardown.
+	for i := 2; i <= maxUserQueueCap+1; i++ {
+		stub.releaseN(i)
+	}
+	waitTurnsPersisted(t, store, dir, a.SessionID, maxUserQueueCap)
+}
+
+// TestCancelClearsUserQueueKeepsSystem pins the interrupt semantics:
+// clearing the user queue on interrupt removes ONLY user items — system
+// deliveries are machine bookkeeping and keep draining.
+func TestCancelClearsUserQueueKeepsSystem(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, a, store := newContinuationServer(t, stub, dir)
+	rt, _ := s.registry.get(a.SessionID)
+
+	startBlockedTurn(t, rt, stub, "block me")
+	if !rt.enqueueUserTurn("q1", "steer-a", nil) || !rt.enqueueUserTurn("q2", "steer-b", nil) {
+		t.Fatal("steer enqueue refused")
+	}
+	rt.deliverToSession("sys notice")
+
+	if n := rt.clearUserQueue(); n != 2 {
+		t.Fatalf("clearUserQueue removed %d items, want 2", n)
+	}
+	if n := rt.clearUserQueue(); n != 0 {
+		t.Fatalf("second clear removed %d items, want 0", n)
+	}
+	// The system delivery survived the interrupt: it drains as the next
+	// turn (stub stream call 2, released so the turn completes).
+	rt.stream.cancelInFlight()
+	waitFor(t, 5*time.Second, func() bool { return userMsgIndex(a, "sys notice") >= 0 })
+	if userMsgIndex(a, "steer-a") >= 0 || userMsgIndex(a, "steer-b") >= 0 {
+		t.Fatal("interrupt must drop user steering messages")
+	}
+	stub.releaseN(2)
+	waitTurnsPersisted(t, store, dir, a.SessionID, 1)
+}
+
+// TestRemoveQueuedItem pins per-item cancel: one user item by id, leaving
+// its neighbors queued in order.
+func TestRemoveQueuedItem(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, a, store := newContinuationServer(t, stub, dir)
+	rt, _ := s.registry.get(a.SessionID)
+
+	startBlockedTurn(t, rt, stub, "block me")
+	for _, id := range []string{"q1", "q2", "q3"} {
+		if !rt.enqueueUserTurn(id, "steer-"+id, nil) {
+			t.Fatalf("enqueue %s refused", id)
+		}
+	}
+	if rt.removeQueuedItem("nope") {
+		t.Fatal("removing an unknown id must report false")
+	}
+	if !rt.removeQueuedItem("q2") {
+		t.Fatal("removing a queued id must report true")
+	}
+	// A removed id cannot be removed twice.
+	if rt.removeQueuedItem("q2") {
+		t.Fatal("double remove must report false")
+	}
+	rt.stream.cancelInFlight()
+	waitFor(t, 5*time.Second, func() bool { return userMsgIndex(a, "steer-q1") >= 0 })
+	stub.releaseN(2)
+	waitFor(t, 5*time.Second, func() bool { return userMsgIndex(a, "steer-q3") >= 0 })
+	if userMsgIndex(a, "steer-q2") >= 0 {
+		t.Fatal("removed queue item must not be delivered")
+	}
+	stub.releaseN(3)
+	waitTurnsPersisted(t, store, dir, a.SessionID, 2)
+}
+
+// TestSystemOverflowSparesUserItems pins the per-kind cap: a system
+// overflow drops the oldest SYSTEM delivery, never a queued user message.
+func TestSystemOverflowSparesUserItems(t *testing.T) {
+	rt := &sessionRuntime{agent: &agent.Agent{}, deliverNotify: make(chan struct{}, 1)}
+	rt.deliverWorker.Store(true) // no worker goroutine: the queue stays put
+	for i := 0; i < maxUserQueueCap; i++ {
+		if !rt.enqueueUserTurn("", "user-"+string(rune('a'+i)), nil) {
+			t.Fatalf("user enqueue %d refused", i)
+		}
+	}
+	for i := 0; i < defaultDeliverQueueCap+2; i++ {
+		rt.deliverToSession("sys-" + string(rune('a'+i)))
+	}
+	// Every user item survives the system burst.
+	if got := rt.countUser(); got != maxUserQueueCap {
+		t.Fatalf("countUser = %d after system overflow, want %d (user items must not be dropped)", got, maxUserQueueCap)
+	}
+	// System items are bounded at the cap.
+	rt.deliverMu.Lock()
+	sys := 0
+	for _, it := range rt.pendingDeliver {
+		if it.Kind == deliverSystem {
+			sys++
+		}
+	}
+	rt.deliverMu.Unlock()
+	if sys != defaultDeliverQueueCap {
+		t.Fatalf("queued system items = %d, want %d", sys, defaultDeliverQueueCap)
+	}
+}
+
+// TestSteerableInputWords pins the command-word classification the steering
+// branch runs BEFORE taking the turn lock: every bare word the dispatchers
+// match (including help, which the first cut of this list missed) keeps the
+// dispatch/busy path, while a word that merely STARTS with one stays chat and
+// queues. An image-only message is steerable (the attachments are content).
+func TestSteerableInputWords(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{"plain chat", "fix the parser bug", true},
+		{"bare help is a command", "help", false},
+		{"help with args", "help me debug", false},
+		{"slash help", "/help", false},
+		{"slash anything", "/new", false},
+		{"bare plan", "plan", false},
+		{"bare think", "think", false},
+		{"think with level", "think high", false},
+		{"bare models", "models", false},
+		{"model selector", "models gpt-4o", false},
+		{"bare resume", "resume", false},
+		{"resume arg", "resume latest", false},
+		{"word starting with new", "news about the build", true},
+		{"word starting with resume", "resumes are attached", true},
+		{"word starting with fork", "forklift is broken", true},
+		{"word starting with models", "modelsx is not a command", true},
+		{"word starting with think", "thinker needed", true},
+		{"empty", "", false},
+		{"whitespace", "   ", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isPlainChatInput(tc.in); got != tc.want {
+				t.Fatalf("isPlainChatInput(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+	// steerableInput: text is classified, an image-only message is steerable,
+	// and a message with neither is not.
+	if !steerableInput("", 1) {
+		t.Fatal("image-only message must be steerable")
+	}
+	if steerableInput("", 0) {
+		t.Fatal("empty message must not be steerable")
+	}
+	if !steerableInput("hello", 2) {
+		t.Fatal("chat with images must be steerable")
+	}
+	if steerableInput("/new", 1) {
+		t.Fatal("command with images must not be steerable")
+	}
+}
+
+// TestQueueIDValidationAndDedupe pins the queue-id policy: a usable
+// client id is kept (it correlates the sender's optimistic bubble), while a
+// missing, oversized, malformed, or DUPLICATE id gets a server-generated one
+// — two queued items sharing an id would collapse into one entry in every
+// client's per-id bubble map.
+func TestQueueIDValidationAndDedupe(t *testing.T) {
+	rt := &sessionRuntime{agent: &agent.Agent{}, deliverNotify: make(chan struct{}, 1)}
+	rt.deliverWorker.Store(true) // no worker goroutine: the queue stays put
+
+	for _, id := range []string{"q-keep", "q-keep", "", strings.Repeat("x", maxQueueIDLen+1), "bad id!", "q-ok_2.x"} {
+		if !rt.enqueueUserTurn(id, "text-"+id, nil) {
+			t.Fatalf("enqueue %q refused", id)
+		}
+	}
+	rt.deliverMu.Lock()
+	items := append([]deliverItem(nil), rt.pendingDeliver...)
+	rt.deliverMu.Unlock()
+	if len(items) != 6 {
+		t.Fatalf("queued items = %d, want 6", len(items))
+	}
+	if items[0].ID != "q-keep" {
+		t.Fatalf("first item id = %q, want the client's q-keep", items[0].ID)
+	}
+	if items[5].ID != "q-ok_2.x" {
+		t.Fatalf("token-shaped id = %q, want it kept verbatim", items[5].ID)
+	}
+	seen := map[string]bool{}
+	for i, it := range items {
+		if seen[it.ID] {
+			t.Fatalf("duplicate queue id %q at item %d", it.ID, i)
+		}
+		seen[it.ID] = true
+	}
+	if !strings.HasPrefix(items[1].ID, "q_") {
+		t.Fatalf("duplicate id was not replaced: %q", items[1].ID)
+	}
+	if validQueueID("") || validQueueID(strings.Repeat("x", maxQueueIDLen+1)) || validQueueID("bad id!") {
+		t.Fatal("validQueueID accepted an unusable id")
+	}
+}
+
+// TestImageOnlyMessageSteersWhileBusy pins the classification end-to-end: a
+// message carrying attachments and no text is QUEUED (the image is its
+// content — there is no text to classify) instead of getting the busy
+// rejection, and the drained turn receives the image.
+func TestImageOnlyMessageSteersWhileBusy(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, a, store := newContinuationServer(t, stub, dir)
+	rt, ok := s.registry.get(a.SessionID)
+	if !ok {
+		t.Fatal("default runtime not registered")
+	}
+	srv := startWSServer(t, s)
+	defer srv.Close()
+	conn := dialWS(t, srv, "/ws")
+	defer conn.Close()
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+
+	startBlockedTurn(t, rt, stub, "block me")
+	img := llm.ImageInput{DataURL: "data:image/png;base64,AAAA", Detail: "high"}
+	if err := conn.WriteJSON(WSMessage{Type: "message", Content: "", Images: []llm.ImageInput{img}, QueueID: "q-imgonly"}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	frame := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool {
+		return m.Type == "queue_update" || m.Type == "response"
+	})
+	if frame.Type != "queue_update" || len(frame.Queue) != 1 || frame.Queue[0].ID != "q-imgonly" {
+		t.Fatalf("image-only message was not queued: %+v", frame)
+	}
+	// Drain: the item runs as its own turn, carrying the image.
+	rt.stream.cancelInFlight()
+	waitFor(t, 5*time.Second, func() bool {
+		for _, m := range a.SnapshotMessages() {
+			if m.Role == "user" && len(m.Images) == 1 {
+				return true
+			}
+		}
+		return false
+	})
+	stub.releaseN(2)
+	waitTurnsPersisted(t, store, dir, a.SessionID, 1)
+}
+
+// TestSteerQueueFullRevokesOptimisticBubble pins the queue-full client
+// contract: the refusal answers on the conversation channel AND broadcasts the
+// (unchanged) queue state, so the sending tab's optimistic chip is revoked
+// instead of lingering as a phantom "queued" entry.
+func TestSteerQueueFullRevokesOptimisticBubble(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, a, store := newContinuationServer(t, stub, dir)
+	rt, ok := s.registry.get(a.SessionID)
+	if !ok {
+		t.Fatal("default runtime not registered")
+	}
+	srv := startWSServer(t, s)
+	defer srv.Close()
+	conn := dialWS(t, srv, "/ws")
+	defer conn.Close()
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+
+	startBlockedTurn(t, rt, stub, "block me")
+	for i := 0; i < maxUserQueueCap; i++ {
+		if !rt.enqueueUserTurn("", "fill-"+string(rune('a'+i)), nil) {
+			t.Fatalf("enqueue %d refused before the cap", i)
+		}
+		// Each fill broadcast its own queue_update: consume it so the frames
+		// below are unambiguously the refused message's.
+		fill := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "queue_update" })
+		if len(fill.Queue) != i+1 {
+			t.Fatalf("fill %d queue_update = %d items, want %d", i, len(fill.Queue), i+1)
+		}
+	}
+	// The refused send carries a correlation id: it must appear in the queue
+	// frames that follow only as an ABSENT id (the client's "removed before
+	// running" signal).
+	if err := conn.WriteJSON(WSMessage{Type: "message", Content: "one too many", QueueID: "q-phantom"}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	resp := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool {
+		return m.Type == "response" || m.Type == "queue_update"
+	})
+	if resp.Type != "response" || !strings.Contains(resp.Content, "too many queued messages") {
+		t.Fatalf("expected the queue-full rejection first, got %+v", resp)
+	}
+	qu := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "queue_update" })
+	if len(qu.Queue) != maxUserQueueCap {
+		t.Fatalf("queue_update queue = %d items, want the unchanged %d", len(qu.Queue), maxUserQueueCap)
+	}
+	for _, it := range qu.Queue {
+		if it.ID == "q-phantom" {
+			t.Fatal("the refused item must not be queued")
+		}
+	}
+	if len(qu.QueueLeft) != 0 {
+		t.Fatalf("queueLeft = %v, want none (the refused item was never queued)", qu.QueueLeft)
+	}
+	// Drain the queue so the blocked turn's followers land before teardown.
+	rt.stream.cancelInFlight()
+	waitFor(t, 5*time.Second, func() bool { return userMsgIndex(a, "fill-a") >= 0 })
+	for i := 2; i <= maxUserQueueCap+1; i++ {
+		stub.releaseN(i)
+	}
+	waitTurnsPersisted(t, store, dir, a.SessionID, maxUserQueueCap)
+}

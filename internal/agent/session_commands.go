@@ -514,6 +514,11 @@ func (a *Agent) ForkSession(ctx context.Context, args, newSessionID string) erro
 	if err != nil {
 		return err
 	}
+	// The forked transcript copies the original's spill locator lines;
+	// re-point them at the child's spill dir (hardlinks) so retrieval keeps
+	// working after the original session is deleted (delete removes the
+	// original's spill files).
+	a.RepointSpillLocators(forkedMsgs, newSessionID)
 
 	// Save current session (the original branch)
 	if a.SessionStore != nil {

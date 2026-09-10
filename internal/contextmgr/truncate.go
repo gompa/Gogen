@@ -1,6 +1,10 @@
 package contextmgr
 
-import "unicode/utf8"
+import (
+	"fmt"
+	"strings"
+	"unicode/utf8"
+)
 
 // TruncateRuneSafe cuts s to at most max bytes without splitting a UTF-8
 // rune: it backs off over continuation bytes until it lands on a rune
@@ -89,4 +93,84 @@ func Truncate(s string, max int, opts TruncateOptions) string {
 		return TruncateRuneSafe(s, max-len(opts.Marker)) + opts.Marker
 	}
 	return TruncateRuneSafe(s, max) + opts.Marker
+}
+
+// TruncateHeadTailOptions configures TruncateHeadTail.
+type TruncateHeadTailOptions struct {
+	// HeadBytes is the byte budget for the kept head. The cut is
+	// rune-safe (TruncateRuneSafe). 0 keeps no head.
+	HeadBytes int
+	// TailBytes is the byte budget for the kept tail. The cut is
+	// rune-safe (RuneSafeTailStart). 0 keeps no tail.
+	TailBytes int
+	// Marker is inserted between the kept head and tail when a cut is
+	// made. Empty joins head and tail directly. The marker is OUTSIDE the
+	// head/tail budgets: the result may exceed HeadBytes+TailBytes by
+	// len(marker).
+	//
+	// By default the marker passes through VERBATIM — a pre-rendered
+	// marker's literal '%' (e.g. an embedded file path) is never touched
+	// by Sprintf verb parsing. Only with FormatDropped is it treated as a
+	// format string.
+	Marker string
+	// FormatDropped opts the marker into the dropped-bytes contract: when
+	// set AND the marker contains a %d verb, it is Sprintf-formatted with
+	// the number of DROPPED bytes (the middle actually removed, rune-safe
+	// back-off included). A format-enabled marker without a %d verb still
+	// passes through unchanged (no %!(EXTRA) tail).
+	FormatDropped bool
+	// ForceMarker appends the Marker after the FULL input even when no
+	// cut is made (len(s) <= HeadBytes+TailBytes). Set it when the
+	// caller knows the content was persisted beyond the kept parts and
+	// the marker must appear regardless (spill previews do this: the
+	// locator line must show even when the preview happens to hold
+	// everything).
+	ForceMarker bool
+}
+
+// TruncateHeadTail keeps the first HeadBytes and the last TailBytes of s,
+// dropping the middle and inserting Marker between the two kept parts.
+// Both cut points are rune-safe — a multi-byte rune is never split at
+// either end of the result. It is the tail-preserving counterpart of
+// Truncate: build/test failures put their error summary at the END of the
+// output, which a head-only cut throws away.
+//
+// No-overlap guarantee: when len(s) <= HeadBytes+TailBytes the input fits
+// both budgets and is returned unchanged (Marker appended when ForceMarker
+// is set) — head and tail never duplicate or overlap bytes.
+//
+// dropped = len(s) - len(kept head) - len(kept tail) counts the middle
+// bytes actually removed (rune-safe back-off included) and is the %d
+// argument of a marker under the opt-in FormatDropped contract. A budget
+// of 0 keeps nothing on that side; when both are 0 the result is just the
+// marker. s is assumed valid UTF-8, like TruncateRuneSafe; for invalid
+// input the result is never worse than a raw byte cut.
+func TruncateHeadTail(s string, opts TruncateHeadTailOptions) string {
+	if len(s) <= opts.HeadBytes+opts.TailBytes {
+		if opts.ForceMarker && opts.Marker != "" {
+			return s + formatDroppedMarker(opts.Marker, 0, opts.FormatDropped)
+		}
+		return s
+	}
+	var head, tail string
+	if opts.HeadBytes > 0 {
+		head = TruncateRuneSafe(s, opts.HeadBytes)
+	}
+	if opts.TailBytes > 0 {
+		tail = s[RuneSafeTailStart([]byte(s), opts.TailBytes):]
+	}
+	return head + formatDroppedMarker(opts.Marker, len(s)-len(head)-len(tail), opts.FormatDropped) + tail
+}
+
+// formatDroppedMarker applies the opt-in %d dropped-bytes contract: when
+// format is set AND the marker contains a %d verb, it is Sprintf-formatted
+// with dropped; any other marker passes through unchanged. The verb check
+// keeps a format-enabled marker without %d from growing a %!(EXTRA) tail,
+// and a non-format marker's literal '%' — e.g. a pre-rendered locator with
+// an embedded file path — is never verb-parsed.
+func formatDroppedMarker(marker string, dropped int, format bool) string {
+	if !format || !strings.Contains(marker, "%d") {
+		return marker
+	}
+	return fmt.Sprintf(marker, dropped)
 }

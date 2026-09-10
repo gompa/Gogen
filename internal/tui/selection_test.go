@@ -7,6 +7,7 @@ import (
 
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func TestWrapLinePropagatesOpenStyles(t *testing.T) {
@@ -333,4 +334,100 @@ func TestMousePressRestartsSelection(t *testing.T) {
 // summary.
 func (m *Model) hasSelection() bool {
 	return m.selection != nil && m.selection.Active && m.getSelectedText() != ""
+}
+
+// Regression: pointer events with a modal up acted underneath the opaque
+// overlay — a press started a text selection in the covered transcript,
+// wheel events scrolled it invisibly, and a border press started a panel
+// drag. Only releases reach the selection handler now, so an in-flight
+// drag finalizes and scrolling is not left locked after the modal closes.
+func TestModalBlocksPointerUnderOverlay(t *testing.T) {
+	m := newSidebarTestModel(100)
+	m.sidebarVisible = false
+	m.SetSize(100, 10)
+	m.chatLines = []string{
+		"You: filler line " + strings.Repeat("x", 40),
+		"GoGen: reply " + strings.Repeat("y", 40),
+		"You: more content " + strings.Repeat("z", 40),
+		"GoGen: tail " + strings.Repeat("w", 40),
+	}
+	m.setViewportContent()
+	m.viewport.GotoBottom()
+	m.viewport.YOffset = 0
+	m.modal = ModalHelp
+
+	t.Run("press does not start a selection", func(t *testing.T) {
+		m.handleMouseMsg(tea.MouseClickMsg{X: 10, Y: 3, Button: tea.MouseLeft})
+		if m.selection != nil {
+			t.Fatalf("press with a modal open started a selection under the overlay")
+		}
+	})
+
+	t.Run("wheel does not scroll the covered chat", func(t *testing.T) {
+		before := m.viewport.YOffset
+		m.handleMouseMsg(tea.MouseWheelMsg{X: 10, Y: 3, Button: tea.MouseWheelDown})
+		if m.viewport.YOffset != before {
+			t.Fatalf("wheel scrolled the chat under the modal: %d -> %d", before, m.viewport.YOffset)
+		}
+	})
+
+	t.Run("release finalizes an in-flight drag", func(t *testing.T) {
+		m.modal = ModalNone
+		m.handleMouseMsg(tea.MouseClickMsg{X: 10, Y: 1, Button: tea.MouseLeft})
+		if m.selection == nil || !m.selection.Dragging {
+			t.Fatalf("drag did not start")
+		}
+		m.modal = ModalHelp
+		m.handleMouseMsg(tea.MouseReleaseMsg{X: 20, Y: 2, Button: tea.MouseLeft})
+		// Either finalized in place or cleared (empty selection) — either
+		// way Dragging must be off, so scrolling is unlocked afterwards.
+		if m.selection != nil && m.selection.Dragging {
+			t.Fatalf("release during a modal must finalize the drag (scroll stays unlocked)")
+		}
+		m.clearSelection()
+	})
+
+	t.Run("border press does not start a panel drag", func(t *testing.T) {
+		m.modal = ModalNone
+		m.sidebarVisible = true
+		m.sidebarWidth = defaultSidebarWidth
+		m.SetSize(100, 10)
+		m.modal = ModalHelp
+		m.handleMouseMsg(tea.MouseClickMsg{X: m.sidebarWidth - 1, Y: 3, Button: tea.MouseLeft})
+		if m.sidebarDragging {
+			t.Fatalf("border press with a modal open started a panel drag")
+		}
+	})
+}
+
+// Regression: the selection render cut [0, contentWidth) while the normal
+// render cut [xOffset, xOffset+contentWidth) — with the viewport scrolled
+// horizontally, the transcript visibly shifted the moment a drag started
+// (and mouseToContent mapped columns without the offset).
+func TestSelectionRenderMatchesHorizontalScroll(t *testing.T) {
+	m := newSidebarTestModel(60)
+	m.sidebarVisible = false
+	m.SetSize(60, 10)
+	long := "You: " + strings.Repeat("ab", 50) // 105 cells > the 56-cell content width
+	m.chatLines = []string{long}
+	m.setViewportContent()
+
+	m.viewport.xOffset = 8
+	m.viewport.longestLineWidth = ansi.StringWidth(stripANSI(long))
+
+	normal := stripANSI(m.viewport.View())
+	m.selection = &SelectionState{Active: true, StartX: 0, StartY: 0, EndX: 3, EndY: 0}
+	withSel := stripANSI(m.renderViewportWithSelection())
+
+	if normal != withSel {
+		t.Fatalf("selection render shows a different window than the normal render:\n normal %q\n select %q",
+			normal, withSel)
+	}
+
+	t.Run("mouse maps through the scroll offset", func(t *testing.T) {
+		contentX, _ := m.mouseToContent(1, 1)
+		if contentX != 8 {
+			t.Fatalf("contentX = %d, want 8 (the xOffset)", contentX)
+		}
+	})
 }

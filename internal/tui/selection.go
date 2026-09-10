@@ -303,9 +303,12 @@ func (m *Model) mouseToContent(mouseX, mouseY int) (int, int) {
 		return -1, -1
 	}
 
-	// Account for left padding (ViewportStyle has PaddingLeft(1))
+	// Account for left padding (ViewportStyle has PaddingLeft(1)) and the
+	// horizontal scroll offset: with xOffset > 0 the first visible content
+	// cell IS xOffset, so the content column is shifted right by it (the
+	// same mapping the render's [xOffset, xOffset+w) window implies).
 	leftPad := m.viewport.Style.GetPaddingLeft()
-	contentX := mouseX - leftPad
+	contentX := mouseX - leftPad + m.viewport.xOffset
 	if contentX < 0 {
 		contentX = 0
 	}
@@ -403,17 +406,16 @@ func (m *Model) renderViewportWithSelection() string {
 		selSX, selEX = selEX, selSX
 	}
 
-	// Match viewport.visibleLines: truncate (don't re-wrap) any line that
-	// still exceeds contentWidth. lipgloss MaxWidth would soft-wrap those
-	// into extra rows and shift everything below — the selection jump bug.
-	mustCut := false
-	for i := 0; i < contentHeight; i++ {
-		ci := yOff + i
-		if ci < len(styledLines) && ansi.StringWidth(styledLines[ci]) > contentWidth {
-			mustCut = true
-			break
-		}
-	}
+	// Match viewport.visibleLines' horizontal window EXACTLY: it cuts every
+	// visible line to [xOffset, xOffset+contentWidth) when the viewport is
+	// scrolled or when any content line overflows — the same
+	// truncate-don't-rewrap rule that keeps lipgloss MaxWidth from
+	// soft-wrapping long lines into extra rows and shifting everything
+	// below (the selection jump bug). The selection render must show the
+	// same cells as the normal render, or the transcript visibly shifts the
+	// moment a drag starts.
+	cutX := m.viewport.xOffset
+	cutAll := cutX > 0 || m.viewport.longestLineWidth > contentWidth
 
 	var lines []string
 	for i := 0; i < contentHeight; i++ {
@@ -440,8 +442,8 @@ func (m *Model) renderViewportWithSelection() string {
 					line = highlightPlainRange(line, m.wrappedLines[ci], hs, he)
 				}
 			}
-			if mustCut && contentWidth > 0 {
-				line = ansi.Cut(line, 0, contentWidth)
+			if cutAll && contentWidth > 0 {
+				line = ansi.Cut(line, cutX, cutX+contentWidth)
 			}
 			lines = append(lines, line)
 		} else {

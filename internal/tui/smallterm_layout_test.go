@@ -155,6 +155,65 @@ func TestSetSizeFrameNeverExceedsShortTerminal(t *testing.T) {
 	}
 }
 
+// TestSetSizeBusyBandFrameNeverExceedsTerminal pins the steering band's
+// layout contract: while a turn (or compaction) runs, the progress strip
+// renders inside the input band and the composer gives it a row, so the
+// frame height is IDENTICAL busy and idle — and never exceeds the terminal
+// (the inline renderer would scroll and desync the cell diff). The pre-fix
+// bug budgeted the viewport from the textarea height, handing the strip's
+// row back to the viewport: every busy frame was terminal+1 lines.
+func TestSetSizeBusyBandFrameNeverExceedsTerminal(t *testing.T) {
+	for _, h := range []int{24, 20, 10, 9, 8, 7, 6, 5, 4} {
+		t.Run(fmt.Sprintf("%d rows", h), func(t *testing.T) {
+			m := dragModel(t)
+			m.sidebarVisible = false
+			m.SetSize(60, h)
+			idleH := strings.Count(m.renderMainColumn(), "\n") + 1
+
+			m.spinner = newProgressSpinner()
+			m.progressPhase = progressTool
+			m.progressLabel = "running tool"
+			m.streaming = true
+			m.relayout()
+			busyFrame := m.renderMainColumn()
+			busyH := strings.Count(busyFrame, "\n") + 1
+
+			if busyH > h {
+				t.Fatalf("busy frame is %d lines in a %d-row terminal (inline renderer would scroll)", busyH, h)
+			}
+			if busyH != idleH {
+				t.Fatalf("turn boundary shifted the layout: idle frame %d lines, busy frame %d lines", idleH, busyH)
+			}
+			// Strip/composer split follows busyStripRows: the strip renders
+			// inside the band when the terminal can afford it (height >= 5)
+			// and is dropped below that (composer-only, the pre-steering
+			// presentation) — matching the SetSize budget either way.
+			plain := stripANSI(busyFrame)
+			if h >= 5 && !strings.Contains(plain, "running tool") {
+				t.Fatalf("busy frame missing the progress strip:\n%s", plain)
+			}
+			if h < 5 && strings.Contains(plain, "running tool") {
+				t.Fatalf("strip must not render on a %d-row terminal (band would overflow)", h)
+			}
+		})
+	}
+
+	// Compaction reserves the strip row by the same contract.
+	t.Run("compacting", func(t *testing.T) {
+		m := dragModel(t)
+		m.sidebarVisible = false
+		m.SetSize(60, 20)
+		idleH := strings.Count(m.renderMainColumn(), "\n") + 1
+		m.spinner = newProgressSpinner()
+		m.compacting = true
+		m.relayout()
+		busyH := strings.Count(m.renderMainColumn(), "\n") + 1
+		if busyH > 20 || busyH != idleH {
+			t.Fatalf("compacting frame %d lines vs idle %d in a 20-row terminal", busyH, idleH)
+		}
+	})
+}
+
 func TestSetSizeRestoresInputBandAfterGrowth(t *testing.T) {
 	m := dragModel(t)
 	m.sidebarVisible = false

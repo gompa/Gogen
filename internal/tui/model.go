@@ -14,6 +14,11 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
+// tabWidthCells mirrors the viewport render style's default TabWidth
+// (lipgloss expands every tab to this many spaces before its own wrap
+// pass — a plain replace, not tab stops).
+const tabWidthCells = 4
+
 // wrapWidth returns the available width for word-wrapping inside the viewport.
 func (m *Model) wrapWidth() int {
 	w := m.viewport.Width
@@ -35,6 +40,16 @@ func (m *Model) wrapWidth() int {
 // replaced was the source of the v2 label-bleed bug fixed in a3b358b).
 func (m *Model) wrapLine(line string) []string {
 	w := m.wrapWidth()
+	// Expand tabs BEFORE wrapping. Widths disagree on a raw tab: lipgloss.Wrap
+	// (via ansi.Wrap) counts it as one cell, ansi.StringWidth as zero, and the
+	// viewport's View render replaces it with tabWidthCells spaces before its
+	// own wrap pass. A tab near the wrap boundary therefore passed through
+	// here as a single ≤limit part and then re-wrapped inside View onto two
+	// terminal rows — every row below it shifted down one, scrolling landed
+	// on the wrong row, and the top of the message appeared stuck. Only
+	// tab-bearing lines were affected (diffs, tool output, pasted code).
+	// Pre-expanding makes the wrap pass see exactly what the render pass sees.
+	line = strings.ReplaceAll(line, "\t", strings.Repeat(" ", tabWidthCells))
 	wrapped := lipgloss.Wrap(line, w, "")
 	parts := strings.Split(wrapped, "\n")
 	// Strip trailing empty elements caused by a trailing newline.
@@ -239,13 +254,27 @@ func (m *Model) renderMainColumn() string {
 		vpView = m.viewport.View()
 	}
 
-	// Textarea
+	// Input band: the composer, plus — while a turn (or compaction) runs —
+	// the one-row progress strip ABOVE it (steering: the composer stays
+	// visible and editable while busy; Enter queues, ctrl+c interrupts).
+	// SetSize reserves the strip row out of the textarea's rows, so the
+	// band's total height never changes at turn boundaries. busyStripRows
+	// is the strip predicate shared with SetSize's budget: on a terminal
+	// too short to hold the strip next to the composer it reports 0 and
+	// the band stays composer-only, so the rendered band can never
+	// disagree with the budgeted one and overflow the terminal.
 	var inputArea string
 	switch {
 	case m.streaming:
-		inputArea = m.renderProgressInput()
+		inputArea = m.textarea.View()
+		if m.busyStripRows() > 0 {
+			inputArea = m.renderProgressInput() + "\n" + inputArea
+		}
 	case m.compacting:
-		inputArea = m.renderCompactingInput()
+		inputArea = m.textarea.View()
+		if m.busyStripRows() > 0 {
+			inputArea = m.renderCompactingInput() + "\n" + inputArea
+		}
 	default:
 		inputArea = m.textarea.View()
 	}
@@ -356,15 +385,6 @@ func (m *Model) requestContextStats() tea.Cmd {
 	}
 }
 
-// sliceRuneLen counts runes (sliceByRuneCount's measure companion).
-func sliceRuneLen(s string) int {
-	n := 0
-	for range s {
-		n++
-	}
-	return n
-}
-
 // renderModalOverlay covers the main view with an opaque background block
 // and centers the modal on top of it. lipgloss.Place is a noöp when the
 // modal exceeds the terminal in either dimension, matching the old manual
@@ -459,22 +479,46 @@ func (m *Model) refreshContextStatsMidTurn() {
 	m.contextLine = agent.FormatContextBrief(stats)
 }
 
-// flushAndQuit forces a final session write before the program exits.
-// Without this, the 5 s debounce could drop the last few seconds of state.
+// flushAndQuit persists any unsaved state before the program exits —
+// without this, the 5 s debounce could drop the last few seconds of state.
+// Clean sessions are left untouched: a forced write would re-stamp each
+// session's Updated timestamp with ~now in sweep order (the focused
+// session first, so it received the OLDEST stamp), reshuffling the
+// saved-session list on restart — recency must keep reflecting the last
+// interaction, not the quit sweep.
 func (m *Model) flushAndQuit() {
 	m.quitting = true
+	m.flushAllSessions()
+}
+
+// flushAllSessions persists any unsaved state on the focused agent and every
+// background live session. Each agent owns its persisted state and the
+// debounce window is per-agent, so a session whose last turn ended (or whose
+// last write failed) just before exit would otherwise lose its tail.
+//
+// FlushPending, not FlushSession: it writes only sessions that are DIRTY (an
+// unsaved turn tail, a debounced write, or a failed write awaiting retry),
+// so a clean session is left untouched and keeps its earned Updated
+// timestamp — a forced write on every session re-stamped them in sweep order
+// and reshuffled the saved-session list on restart (recency must reflect the
+// last interaction, not the exit sweep). This is the TUI twin of the web
+// ShutdownSessions / evictRuntime fix.
+//
+// Called by flushAndQuit (in-app quit) and by TUI.Run after the program
+// returns on a context cancellation (SIGINT/SIGTERM/SIGHUP) — the signal
+// exit used to skip the sweep entirely, so a dirty background session was
+// lost even though the default agent was still covered by main's deferred
+// FlushPending.
+func (m *Model) flushAllSessions() {
 	if m.agent != nil {
-		m.agent.FlushSession()
+		m.agent.FlushPending()
 	}
-	// Fan out to background live sessions: each owns its persisted state,
-	// and the debounce window is per-agent — a session whose last turn
-	// ended just before quit would otherwise lose its tail.
 	if m.lives != nil {
 		for _, s := range m.lives.sessions {
 			if s.agent == nil || s.agent == m.agent {
 				continue
 			}
-			s.agent.FlushSession()
+			s.agent.FlushPending()
 		}
 	}
 }

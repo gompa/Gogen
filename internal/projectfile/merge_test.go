@@ -310,6 +310,26 @@ func TestMergeAutomationsFlag(t *testing.T) {
 	}
 }
 
+// TestMergeOutputSpillFlag pins the output_spill feature flag merge:
+// default on, file value applies, env overrides file.
+func TestMergeOutputSpillFlag(t *testing.T) {
+	os.Unsetenv("GOGEN_OUTPUT_SPILL")
+	if !Merge(nil, FlagOverrides{}).OutputSpillEnabled() {
+		t.Fatal("output_spill should default on")
+	}
+	pf, err := ParseContent("GOGEN.md", "---\noutput_spill: off\n---\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if Merge(pf, FlagOverrides{}).OutputSpillEnabled() {
+		t.Fatal("file output_spill: off should disable")
+	}
+	t.Setenv("GOGEN_OUTPUT_SPILL", "on")
+	if !Merge(pf, FlagOverrides{}).OutputSpillEnabled() {
+		t.Fatal("env on should override file off")
+	}
+}
+
 func TestMergeBoardSubagentFlags(t *testing.T) {
 	for _, env := range []string{"GOGEN_BOARD", "GOGEN_SUBAGENT", "GOGEN_SUBAGENT_MAX_DEPTH", "GOGEN_SUBAGENT_MAX_CONCURRENT"} {
 		os.Unsetenv(env)

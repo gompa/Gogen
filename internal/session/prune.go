@@ -95,13 +95,16 @@ func (s *Store) prune(workingDir string, keepIDs ...string) {
 		others++
 	}
 
-	// Batch-delete without rewriting the index per file.
+	// Batch-delete without rewriting the index per file. The per-file
+	// sidecar cleanup (delta, archive, spill) is shared with
+	// deleteSessionFile so a pruned session cannot leak auxiliary state —
+	// notably its spill tree (oversized tool output), which this loop used
+	// to orphan by inlining only the delta/archive removals.
 	for _, id := range toDelete {
 		path := s.path(workingDir, id)
 		_ = os.Remove(path)
 		delete(s.createdCache, id)
-		_ = s.clearDeltaFile(workingDir, id)
-		s.removeArchiveFile(workingDir, id)
+		s.removeSessionSidecars(workingDir, id)
 		// Cascade: a pruned parent's nested children would otherwise be
 		// orphaned — invisible in the flat list (ParentID non-empty) and
 		// never touched again (the per-parent cap only runs on child

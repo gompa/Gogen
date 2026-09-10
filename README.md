@@ -124,10 +124,16 @@ While in the TUI:
 | `/resume del <id>` | Delete a saved session |
 | `sessions` | Alias for `/resume` (list sessions) |
 | `/fork` | Fork a new session from the last assistant message (`/fork <N>` from message N) |
+| `/queue` (or `ctrl+q`) | Show the queued messages for the focused session; `d` removes the selected one, `D` clears the user's queued items |
 | `/verbose` | Toggle verbose tool output |
 | `/save-config` | Write effective config to `.gogen/gogen.conf` |
 
 Type `/help` for the full list.
+
+While a turn runs the composer stays editable: **Enter** queues the message
+(queued items run in order when the turn ends — see the web UI's
+**Steering** note; the same queue backs both hosts) and **ctrl+c**
+interrupts, which also drops the user's own queued items.
 
 ## Supported languages
 
@@ -276,6 +282,7 @@ is passed.
 | `GOGEN_COMPACT_THRESHOLD` | `0.85` | Fraction of context limit that triggers auto-compaction (the UI warns earlier, at 75%) |
 | `GOGEN_COMPACT_KEEP_RECENT_MESSAGES` | `12` | Most recent messages kept verbatim when a compaction runs (older middle history is summarized; `0` keeps only the first user message) |
 | `GOGEN_MAX_TOOL_RESULT_BYTES` | `262144` | Max bytes for tool output before truncation (matches web_fetch's 256 KB limit) |
+| `GOGEN_OUTPUT_SPILL` | `on` | Spill oversized tool output to `.gogen/spill/` (session-scoped; global mode: `~/.local/share/gogen/spill/`) so the inline result is a head/tail preview + locator to the saved file, instead of a lossy head-only truncation (`on`/`off`) |
 | `GOGEN_COMPACT_RESERVE_TOKENS` | `4000` | Tokens reserved for new messages after compaction |
 | `GOGEN_COMPACT_LAST_RESORT` | `condense` | `condense` or `error`: what happens when a single message cannot fit the context window even after all compaction (e.g. a fresh session whose first message is bigger than the window) |
 
@@ -434,6 +441,16 @@ mode it is fixed to the project directory and the input is hidden.
   still-running turn finishes. The **Cancel** button (or `Esc` while
   streaming) is the only way to stop a turn, and it works even from a fresh
   connection.
+- **Steering**: the composer stays editable while a turn runs and typing a
+  message QUEUES it (FIFO, one item per turn) instead of interrupting — it is
+  delivered as the next user turn when the in-flight one ends, on the session
+  it was typed into. The queued bubble shows a **queued** chip whose ✕ removes
+  that one item; the input bar counts them ("· N queued") and **Cancel**
+  clears the user's own queued items (machine notices keep draining). Command
+  words (`/new`, `help`, `plan`, …) and image-only messages: commands keep
+  taking the turn lock, images queue like chat. At most 20 user messages may
+  wait per session — beyond that the send is refused with a visible error
+  rather than dropped.
 - **Idle sessions release themselves**: a session whose last tab closes while
   no turn is running is dropped from memory (it stays saved). The violet
   "resume to continue" indicator only appears for sessions that are genuinely
@@ -540,6 +557,10 @@ mode it is fixed to the project directory and the input is hidden.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GOGEN_PRESERVE_REASONING` | `auto` | Controls `preserve_reasoning` for llama.cpp endpoints: `auto`, `on`, or `off` |
+| `GOGEN_STREAM_IDLE_TIMEOUT` | `30m` | Streaming responses are killed after this long without receiving any bytes (Go duration, e.g. `45m`). The window also covers waiting for the **first** token: long prompt processing (llama.cpp re-processes the whole prompt each round) and queued requests on a busy backend send no bytes until generation starts. `0` or `off` waits indefinitely |
+| `GOGEN_STREAM_RETRY_BACKOFF` | `1s` | Delay before the stream recovery ladder re-requests after a failed stream attempt; doubles per stage (`1s` before the muted streaming retry, `2s` before the non-streaming fallback). An immediate re-request hammers an endpoint that is often busy — the very condition that broke the stream. `0` or `off` retries immediately |
+| `GOGEN_STREAM_STALL` | `10s` | How long a streaming round may see no SSE chunk before the UI switches from "thinking" to a "still waiting on model" label (long prefill or a stalled upstream; informational only — it never interrupts the stream). `0` or `off` disables the signal |
+| `GOGEN_STREAM_DRAIN_GRACE` | `5s` | How long to wait for the promised usage chunk (`stream_options.include_usage`) AFTER the round's finish_reason before treating the round as complete; an endpoint that finishes without usage and holds the connection open would otherwise park the turn until the read idle timeout. `0` or `off` waits for the read idle timeout |
 
 ### Example
 ```bash
@@ -643,6 +664,7 @@ main.go
     ├── mcp/         — MCP stdio client and tool registry
     ├── session/     — Conversation persistence (JSON snapshots on disk)
     ├── skills/      — Skill discovery and loading (project + user dirs)
+    ├── spill/       — Oversized tool output persisted to .gogen/spill (session-scoped, 0700/0600; the global data dir in global mode) so caps preview instead of losing data
     ├── tui/         — Interactive terminal interface (Bubble Tea)
     ├── config/      — Environment-based configuration
     ├── contextmgr/  — Token-aware context window management and auto-compaction

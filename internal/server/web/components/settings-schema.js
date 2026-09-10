@@ -1,0 +1,144 @@
+// Declarative schema for the GoGen web settings modal.
+//
+// SETTINGS_TABS is the sidebar order (top to bottom); the renderer
+// (components/settings-render.js) builds one nav button + one
+// `.settings-group[role=tabpanel]` per tab, in this order. SETTINGS_SCHEMA
+// is the flat list of settings; each entry names its tab, so grouping and
+// order are pure data — regrouping is an edit here, not an HTML shuffle.
+//
+// Entry shape (simple controls; composites carry only `custom`):
+//   id          element id (also the RUNTIME_CONTROLS key)
+//   tab         SETTINGS_TABS id
+//   type        select | number | text | password | textarea | color
+//   label       the <label> text (also the default aria-label)
+//   ariaLabel   override the aria-label when it differs from the label
+//   options     [[value, text], ...] for `select`
+//   min/max/step  for `number`
+//   rows        for `textarea`
+//   placeholder for text/password
+//   value       initial value for `color`
+//   button      {id, label} trailing secondary button (e.g. accent reset)
+//   note        <p class="settings-note"> text under the control
+//   resetToDefault  renders a "Reset to default" button (+ `resetId`)
+//   rowId       the .setting-row id when feature gates target the row
+//   storage     'server' | 'local'
+//   channel     'runtime' | 'feature' (server only) | 'local'
+//   field       config field name (server runtime controls)
+//   prop        WSMessage prop override when it differs from `field`
+//   featureKey  feature-config key (server feature toggles)
+//   localKey    localStorage key (local controls)
+//   default     initial/fallback value (local controls)
+//   custom      id of a composite block moved in from #settings-composites
+//
+// The server-backed runtime controls are wired generically (settings.js
+// derives RUNTIME_CONTROLS from this list); the feature toggles and local
+// preferences keep their bespoke wiring in settings.js but their markup is
+// generated here, so a new control no longer duplicates its id/label in
+// index.html and settings.js.
+
+// NOTE: `var` (not `const`) so the jsdom harness (scripts/web-harness.js),
+// which evals each module as an indirect global script and strips imports,
+// sees these as globals — top-level `const`/`let` bindings are eval-scoped
+// and invisible to later modules. In real ESM this is module-scoped either
+// way, and exported normally.
+export var SETTINGS_TABS = [
+    { id: 'editor', label: 'Editor' },
+    { id: 'chat', label: 'Chat' },
+    { id: 'appearance', label: 'Appearance' },
+    { id: 'agent', label: 'Agent' },
+    { id: 'subagents', label: 'Subagents' },
+    { id: 'automations', label: 'Automations' },
+    { id: 'tools', label: 'Tools' },
+    { id: 'context', label: 'Context' },
+    { id: 'security', label: 'Security' },
+    { id: 'sessions', label: 'Sessions' },
+    { id: 'providers', label: 'Providers' },
+    { id: 'mcp', label: 'MCP' },
+    { id: 'server', label: 'Server' },
+];
+
+export var SETTINGS_SCHEMA = [
+    // ── Editor (local) ─────────────────────────────────────────────────
+    { id: 'editor-minimap', tab: 'editor', type: 'select', label: 'Minimap', storage: 'local', channel: 'local', localKey: 'gogen_editor_minimap', default: 'off', options: [['off', 'Off'], ['on', 'On']] },
+    { id: 'editor-wordwrap', tab: 'editor', type: 'select', label: 'Word wrap', storage: 'local', channel: 'local', localKey: 'gogen_editor_wordwrap', default: 'on', options: [['on', 'On'], ['off', 'Off']] },
+    { id: 'editor-sticky', tab: 'editor', type: 'select', label: 'Sticky scroll', storage: 'local', channel: 'local', localKey: 'gogen_editor_sticky', default: 'on', options: [['on', 'On'], ['off', 'Off']] },
+    { id: 'editor-fontsize', tab: 'editor', type: 'number', label: 'Font size', storage: 'local', channel: 'local', localKey: 'gogen_editor_fontsize', default: '13', min: 8, max: 32, step: 1 },
+
+    // ── Chat (local) ───────────────────────────────────────────────────
+    { id: 'file-click-behavior', tab: 'chat', type: 'select', label: 'Click file in chat', storage: 'local', channel: 'local', localKey: 'gogen_file_click_behavior', default: 'open', options: [['open', 'Open (background)'], ['open-switch', 'Open & switch to editor']] },
+    { id: 'chat-diff-viewer', tab: 'chat', type: 'select', label: 'Chat diff viewer', storage: 'local', channel: 'local', localKey: 'gogen_chat_diff_viewer', default: 'tokenizer', options: [['tokenizer', 'Static (line numbers)'], ['monaco', 'Monaco (full editor)']] },
+    { id: 'show-reply-model', tab: 'chat', type: 'select', label: 'Show reply model', storage: 'local', channel: 'local', localKey: 'gogen_show_reply_model', default: 'off', options: [['off', 'Off'], ['on', 'On']] },
+
+    // ── Appearance (local; was the "Global" tab) ───────────────────────
+    { id: 'theme-select', tab: 'appearance', type: 'select', label: 'Theme', storage: 'local', channel: 'local', localKey: 'gogen-theme', default: 'auto', options: [['auto', 'Auto (system)'], ['dark', 'Dark'], ['light', 'Light']] },
+    { id: 'accent-color-input', tab: 'appearance', type: 'color', label: 'Accent color', storage: 'local', channel: 'local', localKey: 'gogen-accent-color', default: '', value: '#7aa2f7', button: { id: 'accent-reset-btn', label: 'Default' } },
+    { id: 'notifications-select', tab: 'appearance', type: 'select', label: 'Desktop notifications', storage: 'local', channel: 'local', localKey: 'gogen_notifications', default: 'off', options: [['off', 'Off'], ['background', 'When tab is hidden'], ['always', 'Always']] },
+
+    // ── Agent (server feature toggles + board/review + prompt templates) ─
+    { id: 'board-enabled-select', tab: 'agent', type: 'select', label: 'Project board', storage: 'server', channel: 'feature', featureKey: 'board', options: [['off', 'Off'], ['on', 'On']] },
+    { id: 'board-start-prompt-input', tab: 'agent', type: 'textarea', label: 'Board agent prompt', storage: 'server', channel: 'runtime', field: 'boardStartPrompt', rows: 6, rowId: 'board-prompt-row', resetToDefault: true, resetId: 'board-prompt-reset-btn', note: 'Template for the agent started from a board ticket. Placeholders: {id} {title} {description} {priority} {context}. Empty = built-in default.' },
+    { id: 'review-agent-enabled-select', tab: 'agent', type: 'select', label: 'Board review agent', storage: 'server', channel: 'feature', featureKey: 'reviewAgent', options: [['off', 'Off'], ['on', 'On']], note: 'When on, a ticket moved into in_review automatically starts a review session that verifies the work, then marks the ticket done or comments findings and moves it back to in_progress. Max 5 review rounds per ticket. Web mode only.' },
+    { custom: 'review-agent-model-row', tab: 'agent' },
+    { custom: 'review-agent-thinking-row', tab: 'agent' },
+    { id: 'board-review-prompt-input', tab: 'agent', type: 'textarea', label: 'Board review prompt', storage: 'server', channel: 'runtime', field: 'boardReviewPrompt', rows: 6, rowId: 'board-review-prompt-row', resetToDefault: true, resetId: 'board-review-prompt-reset-btn', note: 'Template for the auto review agent started when a ticket enters in_review. Placeholders: {id} {title} {description} {priority} {context} {assignee}. Empty = built-in default.' },
+    { id: 'system-prompt-input', tab: 'agent', type: 'textarea', label: 'System prompt', storage: 'server', channel: 'runtime', field: 'systemPrompt', rows: 6, resetToDefault: true, resetId: 'system-prompt-reset-btn', note: 'Replaces the built-in system prompt; {working_dir} is substituted. Project rules and plan mode still apply. Empty = built-in default.' },
+
+    // ── Subagents (split out of Agent) ─────────────────────────────────
+    { id: 'subagent-enabled-select', tab: 'subagents', type: 'select', label: 'Subagents', storage: 'server', channel: 'feature', featureKey: 'subagent', options: [['off', 'Off'], ['on', 'On']] },
+    { id: 'subagent-depth-input', tab: 'subagents', type: 'number', label: 'Max subagent depth', storage: 'server', channel: 'feature', featureKey: 'subagentMaxDepth', min: 1, max: 10, step: 1 },
+    { id: 'subagent-limit-input', tab: 'subagents', type: 'number', label: 'Max concurrent subagents', storage: 'server', channel: 'feature', featureKey: 'subagentMaxConcurrent', min: 1, max: 32, step: 1, note: 'Per session: how many subagents may run at the same time. Spawning beyond the limit is refused (the agent can interrupt or wait). Web mode only — the TUI runs subagents one at a time.' },
+    { custom: 'row-subagent-model-picker', tab: 'subagents' },
+    { custom: 'row-subagent-thinking-picker', tab: 'subagents' },
+    { id: 'subagent-prompt-input', tab: 'subagents', type: 'textarea', label: 'Subagent prompt', storage: 'server', channel: 'runtime', field: 'subagentPrompt', rows: 4, resetToDefault: true, resetId: 'subagent-prompt-reset-btn', note: 'Wraps the subagent job; {job} is substituted. Empty = built-in default.' },
+
+    // ── Automations (server feature toggle) ────────────────────────────
+    { id: 'automations-enabled-select', tab: 'automations', type: 'select', label: 'Automations', storage: 'server', channel: 'feature', featureKey: 'automations', options: [['off', 'Off'], ['on', 'On']], note: 'When on, GoGen sweeps the saved automations every 30 s and fires each due one as a headless run in its working directory (runs recorded with their session id). Create automations with `gogen automation create <title> --prompt ... --daily|--hourly|--weekly ...`; list them with `gogen automation ls`. Automations fire only while GoGen is running.' },
+
+    // ── Tools (server runtime) ─────────────────────────────────────────
+    { id: 'web-fetch-select', tab: 'tools', type: 'select', label: 'Web fetch', storage: 'server', channel: 'runtime', field: 'webFetch', options: [['on', 'On'], ['off', 'Off']] },
+    { id: 'web-fetch-mode-select', tab: 'tools', type: 'select', label: 'Web fetch mode', storage: 'server', channel: 'runtime', field: 'webFetchMode', options: [['https', 'HTTPS only'], ['all', 'HTTP + HTTPS']] },
+    { id: 'web-allowed-domains-input', tab: 'tools', type: 'text', label: 'Allowed domains (comma-separated)', storage: 'server', channel: 'runtime', field: 'webAllowedDomains' },
+    { id: 'web-search-select', tab: 'tools', type: 'select', label: 'Web search', storage: 'server', channel: 'runtime', field: 'webSearch', options: [['on', 'On'], ['off', 'Off']] },
+    { id: 'web-search-backend-select', tab: 'tools', type: 'select', label: 'Search backend', storage: 'server', channel: 'runtime', field: 'webSearchBackend', options: [['', 'DuckDuckGo'], ['brave', 'Brave']] },
+    { id: 'web-search-api-key-input', tab: 'tools', type: 'password', label: 'Search API key', ariaLabel: 'Web search API key', storage: 'server', channel: 'runtime', field: 'webSearchApiKey', placeholder: 'API key' },
+    { id: 'treesitter-select', tab: 'tools', type: 'select', label: 'Tree-sitter', storage: 'server', channel: 'runtime', field: 'treesitter', options: [['on', 'On'], ['off', 'Off']] },
+    { id: 'treesitter-langs-input', tab: 'tools', type: 'text', label: 'Tree-sitter languages (comma-separated)', storage: 'server', channel: 'runtime', field: 'treesitterLangs' },
+
+    // ── Context (server runtime) ───────────────────────────────────────
+    { id: 'context-limit-input', tab: 'context', type: 'number', label: 'Context limit (0 = auto)', storage: 'server', channel: 'runtime', field: 'contextLimit', prop: 'contextLimitConfig', min: 0, step: 1000 },
+    { id: 'compact-threshold-input', tab: 'context', type: 'number', label: 'Compact threshold (0–1, 0 = off)', storage: 'server', channel: 'runtime', field: 'compactThreshold', min: 0, max: 1, step: 0.05 },
+    { id: 'compact-keep-input', tab: 'context', type: 'number', label: 'Keep recent messages on compact (0 = only first user message)', storage: 'server', channel: 'runtime', field: 'compactKeepRecentMessages', min: 0, step: 1 },
+    { id: 'compact-reserve-input', tab: 'context', type: 'number', label: 'Compact reserve tokens', storage: 'server', channel: 'runtime', field: 'compactReserveTokens', min: 0, step: 100 },
+    { id: 'compact-last-resort-select', tab: 'context', type: 'select', label: 'Last-resort condensation (message too large for the window)', storage: 'server', channel: 'runtime', field: 'compactLastResort', options: [['condense', 'Condense (archive the original)'], ['error', 'Error (diagnostic, no condensation)']] },
+    { id: 'preserve-reasoning-select', tab: 'context', type: 'select', label: 'Preserve reasoning', storage: 'server', channel: 'runtime', field: 'preserveReasoning', options: [['auto', 'Auto'], ['on', 'On'], ['off', 'Off']] },
+    { id: 'max-tool-bytes-input', tab: 'context', type: 'number', label: 'Max tool result bytes (0 = no cap)', storage: 'server', channel: 'runtime', field: 'maxToolResultBytes', min: 0, step: 1024 },
+    { id: 'output-spill-select', tab: 'context', type: 'select', label: 'Spill oversized tool output (off = legacy head-only truncation)', storage: 'server', channel: 'runtime', field: 'outputSpill', options: [['on', 'On (save to disk, head/tail preview)'], ['off', 'Off']] },
+
+    // ── Security (server runtime; absorbed Approval hold) ──────────────
+    { id: 'command-safety-select', tab: 'security', type: 'select', label: 'Command safety', storage: 'server', channel: 'runtime', field: 'commandSafety', options: [['blocklist', 'Blocklist'], ['allowlist', 'Allowlist'], ['off', 'Off']] },
+    { id: 'command-allowlist-input', tab: 'security', type: 'text', label: 'Command allowlist (comma-separated)', storage: 'server', channel: 'runtime', field: 'commandAllowlist' },
+    { id: 'delete-approval-select', tab: 'security', type: 'select', label: 'Delete approval', storage: 'server', channel: 'runtime', field: 'deleteApproval', options: [['required', 'Required'], ['off', 'Off']] },
+    { id: 'command-sandbox-select', tab: 'security', type: 'select', label: 'Command sandbox', storage: 'server', channel: 'runtime', field: 'commandSandbox', options: [['off', 'Off'], ['bwrap', 'bwrap']] },
+    { id: 'command-idle-timeout-input', tab: 'security', type: 'number', label: 'Command idle timeout (seconds, 0 = default 300)', storage: 'server', channel: 'runtime', field: 'commandIdleTimeoutSecs', min: 0, step: 1 },
+    { id: 'approval-hold-input', tab: 'security', type: 'number', label: 'Approval hold (seconds)', storage: 'server', channel: 'runtime', field: 'webApprovalHoldSecs', min: 0, step: 1 },
+
+    // ── Sessions (server runtime) ──────────────────────────────────────
+    { id: 'session-max-count-input', tab: 'sessions', type: 'number', label: 'Max saved sessions', storage: 'server', channel: 'runtime', field: 'sessionMaxCount', min: 1, step: 1 },
+    { id: 'session-max-age-input', tab: 'sessions', type: 'number', label: 'Session retention (days)', ariaLabel: 'Session retention days (-1 = keep forever)', storage: 'server', channel: 'runtime', field: 'sessionMaxAgeDays', min: -1, step: 1 },
+
+    // ── Providers (composite) ──────────────────────────────────────────
+    { custom: 'provider-block', tab: 'providers' },
+
+    // ── MCP (simple toggle + composite list/form) ──────────────────────
+    { id: 'mcp-select', tab: 'mcp', type: 'select', label: 'MCP (restart)', storage: 'server', channel: 'runtime', field: 'mcp', options: [['off', 'Off'], ['on', 'On']], note: 'MCP changes take effect after a restart.' },
+    { custom: 'mcp-block', tab: 'mcp' },
+
+    // ── Server (restart-staged, server runtime) ────────────────────────
+    { custom: 'restart-banner', tab: 'server' },
+    { id: 'web-bind-input', tab: 'server', type: 'text', label: 'Web bind (restart)', ariaLabel: 'Web bind address', storage: 'server', channel: 'runtime', field: 'webBind' },
+    { id: 'web-allowed-origins-input', tab: 'server', type: 'text', label: 'Allowed origins (restart)', storage: 'server', channel: 'runtime', field: 'webAllowedOrigins' },
+    { id: 'web-auth-token-input', tab: 'server', type: 'password', label: 'Auth token (restart)', ariaLabel: 'Auth token', storage: 'server', channel: 'runtime', field: 'webAuthToken', placeholder: 'Auth token' },
+    { id: 'web-tls-cert-input', tab: 'server', type: 'text', label: 'TLS cert file (restart)', ariaLabel: 'TLS cert file', storage: 'server', channel: 'runtime', field: 'webTLSCertFile' },
+    { id: 'web-tls-key-input', tab: 'server', type: 'text', label: 'TLS key file (restart)', ariaLabel: 'TLS key file', storage: 'server', channel: 'runtime', field: 'webTLSKeyFile' },
+    { id: 'web-max-active-input', tab: 'server', type: 'number', label: 'Max active sessions (restart)', storage: 'server', channel: 'runtime', field: 'webMaxActiveSessions', min: 1, step: 1 },
+];

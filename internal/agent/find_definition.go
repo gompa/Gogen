@@ -22,10 +22,15 @@ func (e *Executor) FindDefinition(ctx context.Context, symbol, subpath, glob str
 		return "", err
 	}
 
+	// skips collects unreadable-subtree errors from the AST walk so the
+	// result is never silently partial. The text fallback runs through
+	// SearchCode, which surfaces its own skipped-path footer.
+	skips := &walkSkips{}
+
 	// Use AST fallback pattern: try AST first, then text search
 	fallback := &ASTFallback[[]string]{
 		ASTFunc: func() ([]string, error) {
-			return e.findDefinitionAST(ctx, searchRoot, relPrefix, glob, symbol)
+			return e.findDefinitionAST(ctx, searchRoot, relPrefix, glob, symbol, skips)
 		},
 		TextFunc: func() ([]string, error) {
 			return e.findDefinitionText(ctx, subpath, glob, symbol)
@@ -41,7 +46,7 @@ func (e *Executor) FindDefinition(ctx context.Context, symbol, subpath, glob str
 	}
 
 	if len(defs) == 0 {
-		return fmt.Sprintf("No definition found for %q", symbol), nil
+		return fmt.Sprintf("No definition found for %q", symbol) + skips.footer(), nil
 	}
 
 	var b strings.Builder
@@ -50,7 +55,7 @@ func (e *Executor) FindDefinition(ctx context.Context, symbol, subpath, glob str
 		b.WriteString(def + "\n")
 	}
 	b.WriteString(fmt.Sprintf("\n(%d definition(s) found)", len(defs)))
-	return b.String(), nil
+	return b.String() + skips.footer(), nil
 }
 
 // findDefinitionText performs text-based search for symbol definitions.
@@ -84,13 +89,13 @@ func (e *Executor) findDefinitionText(ctx context.Context, subpath, glob, symbol
 	return allDefs, nil
 }
 
-func (e *Executor) findDefinitionAST(ctx context.Context, searchRoot, relPrefix, glob, symbol string) ([]string, error) {
+func (e *Executor) findDefinitionAST(ctx context.Context, searchRoot, relPrefix, glob, symbol string, skips *walkSkips) ([]string, error) {
 	if !treesitter.Enabled() {
 		return nil, nil
 	}
 
 	var defs []string
-	err := walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true}, func(path, rel string, d os.DirEntry) error {
+	err := walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true, onSkip: skips.observe}, func(path, rel string, d os.DirEntry) error {
 		if !treesitter.ReferenceSearchSupported(path) {
 			return nil
 		}

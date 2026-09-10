@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 
 	"gogen/internal/agent"
@@ -52,6 +53,13 @@ func (m *Model) handleInputHelpKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd, boo
 		m.modal = ModalHelp
 		return m, nil, true
 	}
+	// ctrl+q opens the queued-messages modal (per-item cancel — steering),
+	// any time input has focus, busy or idle.
+	if key.Matches(msg, m.keys.QueueModal) {
+		m.queueCursor = 0
+		m.modal = ModalQueue
+		return m, nil, true
+	}
 	return m, nil, false
 }
 
@@ -80,7 +88,22 @@ func (m *Model) handleCancelKey() (tea.Model, tea.Cmd, bool) {
 		// started by then, the epoch guard drops that terminal.
 		m.cancelActiveStream()
 		m.resetStreamState(false)
-		m.appendChatLine(SystemStyle.Render("Cancelled."))
+		// Interrupt semantics (documented decision, ticket #78): the
+		// user's own queued steering messages are cleared with the turn —
+		// "stop what you're doing". SYSTEM deliveries are machine
+		// bookkeeping (job notices, subagent reports) whose loss strands
+		// the delivery machinery, so they keep draining.
+		dropped := 0
+		if s := m.focusedSession(); s != nil {
+			dropped = s.clearUserSteer()
+		}
+		if dropped > 0 {
+			m.appendChatLine(SystemStyle.Render(fmt.Sprintf("Cancelled — %d queued message(s) removed.", dropped)))
+		} else {
+			m.appendChatLine(SystemStyle.Render("Cancelled."))
+		}
+		m.applyComposerPlaceholder()
+		m.relayout()
 		// refocusInput is a no-op outside input focus (viewport/sidebar
 		// stay where they are).
 		return m, m.refocusInput(), true
@@ -115,14 +138,39 @@ func (m *Model) handleCancelOrQuitKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd, 
 func (m *Model) handleSubmitKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd, bool) {
 	// Submit (enter)
 	if key.Matches(msg, m.keys.Submit) {
-		// A running /compact owns Messages until its result lands — a
-		// turn started now would race the compaction's history rewrite.
-		if m.streaming || m.compacting {
-			return m, nil, true
-		}
 		input := strings.TrimRight(m.textarea.Value(), "\n")
 		if strings.TrimSpace(input) == "" {
 			return m, nil, true
+		}
+
+		// Busy (a turn running or a compaction in flight): the composer is
+		// NOT locked — steering. Plain text is QUEUED (FIFO, delivered as
+		// the next user turn when the in-flight one ends); /queue opens the
+		// management modal; other commands are refused with a hint (they
+		// would rebind the session or rewrite history mid-turn). A running
+		// /compact also queues: the drain waits for it (drainDeliveries
+		// gates on both m.streaming and m.compacting).
+		if m.streaming || m.compacting {
+			trimmed := strings.TrimSpace(input)
+			// History bookkeeping: queued text is typed input.
+			if len(m.inputHistory) == 0 || m.inputHistory[len(m.inputHistory)-1] != input {
+				m.inputHistory = append(m.inputHistory, input)
+			}
+			m.historyIdx = len(m.inputHistory)
+
+			if trimmed == "queue" || trimmed == "/queue" {
+				m.queueCursor = 0
+				m.modal = ModalQueue
+				m.textarea.Reset()
+				return m, m.textarea.Focus(), true
+			}
+			if isBusyCommand(trimmed) {
+				m.statusMsg = "Busy — commands wait for the idle state; Enter queues plain text."
+				return m, nil, true
+			}
+			cmd := m.enqueueSteer(input)
+			m.textarea.Reset()
+			return m, tea.Batch(cmd, m.textarea.Focus()), true
 		}
 
 		// Add to history

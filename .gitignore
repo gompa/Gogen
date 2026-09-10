@@ -18,9 +18,10 @@
 # --- Diff scratch files ---
 .diff_output.txt
 
-# --- Temporary planning / review docs ---
-/PLAN.md
-/CODE_REVIEW*.md
+# --- Markdown docs ---
+# Not tracked for now: planning / review docs are scratch. Already-tracked
+# markdown (README.md, vendored READMEs and licenses) is unaffected.
+*.md
 
 # --- Scratch work ---
 # tmp/ holds ad-hoc probes and repro scripts; not part of the module surface.

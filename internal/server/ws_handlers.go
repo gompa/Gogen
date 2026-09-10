@@ -47,7 +47,35 @@ var wsHandlers = map[string]wsHandlerEntry{
 	"user_term_resize":   {handle: wsHandleUserTermResize},
 	"user_term_request":  {handle: wsHandleUserTermRequest},
 	"compact":            {handle: wsHandleCompact},
+	"queue_remove":       {handle: wsHandleQueueRemove},
+	"queue_clear":        {handle: wsHandleQueueClear},
 	"message":            {handle: wsHandleMessage},
+}
+
+// wsHandleQueueRemove drops one queued user steering message (the queued
+// bubble's ✕). The broadcast inside enqueue/clear keeps every tab's queue
+// state converged; here the removal reports the new state on success.
+func wsHandleQueueRemove(req *wsRequest) {
+	target := req.target
+	if target == nil {
+		return
+	}
+	if target.removeQueuedItem(req.msg.QueueID) {
+		target.broadcastQueueState()
+	}
+}
+
+// wsHandleQueueClear drops every queued user steering message ("clear all"
+// in the queued UI). System deliveries are kept (they are machine
+// bookkeeping — see clearUserQueue).
+func wsHandleQueueClear(req *wsRequest) {
+	target := req.target
+	if target == nil {
+		return
+	}
+	if target.clearUserQueue() > 0 {
+		target.broadcastQueueState()
+	}
 }
 
 // wsHandleFork handles session_fork: the fork source is the pane named by
@@ -294,13 +322,19 @@ func wsHandleConfig(req *wsRequest) {
 
 // wsHandleCancel cancels the targeted session's in-flight turn. Cancel is
 // the ONLY way to stop a turn, and it works cross-connection (scoped to the
-// targeted session).
+// targeted session). Interrupt semantics: the user's own queued steering
+// messages are cleared with the turn ("stop what you're doing") and the
+// cleared queue is broadcast; system deliveries are kept (machine
+// bookkeeping — job notices, subagent reports, reply capture).
 func wsHandleCancel(req *wsRequest) {
 	target := req.target
 	if target == nil {
 		return
 	}
 	target.stream.cancelInFlight()
+	if n := target.clearUserQueue(); n > 0 {
+		target.broadcastQueueState()
+	}
 }
 
 // wsHandleAttach makes the session the connection's current pane and resends

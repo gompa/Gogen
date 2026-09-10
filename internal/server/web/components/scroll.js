@@ -8,6 +8,9 @@
 // at app.js module scope; app.js reaches it through the exported
 // isPinned / enableFollow / smartScroll / pinToBottom / unpinFromBottom /
 // distanceFromBottom / updateScrollBottomBtn / scheduleRepinIfPinned.
+// measureChatAnchor / restoreChatAnchor are the reading-position anchor
+// pair app.js uses to restore the viewport across transcript rebuilds
+// (see the section at the bottom).
 //
 // Wiring: app.js calls initScroll(deps) once at startup.
 //   deps.isReplaying() — true while replayHistory() rebuilds the pane
@@ -405,4 +408,69 @@ export function smartScroll() {
         messagesDiv.scrollTo({ top: 1 << 30 });
         requestAnimationFrame(() => { ignoreScrollEvent = false; });
     });
+}
+
+// ── Scroll anchor (reading-position restore) ──
+// A raw scrollTop is only valid against the exact DOM it was measured
+// on: it breaks when the transcript is rebuilt from a history snapshot
+// (pane switched away mid-turn, stale pane cache, reopened session) or
+// when content above the viewport changes height. The anchor instead
+// records WHICH rendered message crossed the container's top edge (its
+// history index, data-hist-idx) and where its top edge sat relative to
+// the container top (subPx — ≤ 0 when the message starts above the top
+// edge). A rebuild renders the same content in the same order, so
+// finding the message with that index and re-positioning it reproduces
+// the reading position. app.js stores one anchor per session id and
+// hands it back through the history-replay settle hook
+// (paneScrollRestoreSettle); the settled-pane cache (domCache) keeps its
+// exact scrollTop — the anchor is the fallback for every path that must
+// rebuild.
+export function measureChatAnchor() {
+    const base = messagesDiv.getBoundingClientRect().top;
+    const els = messagesDiv.querySelectorAll('[data-hist-idx]');
+    if (!els.length) return null;
+    // The anchor is the LAST history-indexed message that starts at or
+    // above the container's top edge (the one being read across), or the
+    // first message when the viewport sits above all content. Full scan
+    // (no early break): DOM order is normally history order, but rewind
+    // merges and late ack stamps must not make the scan miss the real
+    // top-crossing message.
+    let anchor = els[0];
+    for (const el of els) {
+        if (el.getBoundingClientRect().top <= base) anchor = el;
+    }
+    const histIdx = parseInt(anchor.dataset.histIdx, 10);
+    if (!Number.isFinite(histIdx) || histIdx < 0) return null;
+    return { histIdx, subPx: anchor.getBoundingClientRect().top - base };
+}
+
+// Put the viewport back on a measured anchor. Returns false when the
+// anchor is unusable (invalid index, or the message is no longer in the
+// DOM) so the caller can fall back to its default (pin-to-bottom).
+export function restoreChatAnchor(anchor) {
+    if (!anchor || !Number.isFinite(anchor.histIdx) || anchor.histIdx < 0) return false;
+    const el = messagesDiv.querySelector('[data-hist-idx="' + anchor.histIdx + '"]');
+    if (!el) return false;
+    // Reading position, not follow: disableFollow (not unpinFromBottom)
+    // — no grace window / near-bottom recovery probe; this is a restore,
+    // not a live gesture. disableFollow also refreshes the jump button.
+    disableFollow();
+    positionChatAnchor(el, anchor.subPx);
+    // Late layout (Monaco colorization, image loads, content-visibility
+    // placeholders resolving) shifts the anchor after the first pass;
+    // re-check one frame later, mirroring the double-pass settle cadence.
+    requestAnimationFrame(() => positionChatAnchor(el, anchor.subPx));
+    return true;
+}
+
+// Move the scroll offset so the anchor message's top edge sits subPx
+// below the container's top edge (negative subPx = starts above it).
+// Measured delta rather than offsetTop math: offsetTop is relative to
+// the offsetParent, which is not necessarily #messages; the delta
+// between the current and desired viewport-relative positions is exact
+// either way, and self-corrects on the follow-up frame above.
+function positionChatAnchor(el, subPx) {
+    const desired = Number.isFinite(subPx) ? subPx : 0;
+    const delta = (el.getBoundingClientRect().top - messagesDiv.getBoundingClientRect().top) - desired;
+    if (Math.abs(delta) >= 1) messagesDiv.scrollTop += delta;
 }

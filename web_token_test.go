@@ -137,3 +137,43 @@ func TestWriteWebTokenAtomic(t *testing.T) {
 		t.Fatalf("leftover temp files: %v", matches)
 	}
 }
+
+// TestWriteWebTokenTightensExistingPermissions is a regression test for the
+// credential-leak bug where a pre-existing world-readable web_token kept its
+// mode on overwrite: ioutil.WriteFileAtomic deliberately preserves an
+// existing file's mode, so writeWebToken must force 0600 itself after the
+// atomic write (mirroring projectfile.SaveConfig/SaveGlobalConfig).
+func TestWriteWebTokenTightensExistingPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not track POSIX mode bits")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "web_token")
+	// Pre-existing token file left world-readable (e.g. by an older gogen or
+	// a manual copy). Chmod explicitly so the fixture is not umask-dependent.
+	if err := os.WriteFile(path, []byte("old-token\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := writeWebToken(path, "fresh-token"); err != nil {
+		t.Fatalf("writeWebToken: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("pre-existing token kept mode %o, want 600", got)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "fresh-token\n" {
+		t.Fatalf("content = %q, want the fresh token", data)
+	}
+}

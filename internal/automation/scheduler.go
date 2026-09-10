@@ -40,7 +40,9 @@ type Scheduler struct {
 	catchup  time.Duration
 	logf     func(format string, args ...any)
 
-	// fires serializes spawn slots (maxConcurrentFires).
+	// fires caps concurrent spawn slots (maxConcurrentFires). Slots are
+	// taken inside the fire goroutine, so a saturated pool never blocks the
+	// sweep loop.
 	fires chan struct{}
 
 	mu      sync.Mutex
@@ -177,12 +179,16 @@ func (s *Scheduler) sweep() {
 }
 
 // fireOne dispatches one claim: spawn the headless run, record the run row,
-// and finish it when the child exits. Runs in its own goroutine with a
-// bounded spawn-slot semaphore (claimed rows always fire; the slot wait is
-// bounded by maxConcurrentFires in-flight spawns).
+// and finish it when the child exits. The spawn-slot semaphore is acquired
+// inside the spawned goroutine, never on the caller (the sweep goroutine):
+// a full slot set (maxConcurrentFires long-running fires) parks the fire
+// goroutine on the semaphore rather than the sweep, so the ticker keeps
+// claiming due rows — advancing their next_run_at — and Stop() stays
+// responsive instead of waiting behind a blocked send. Claimed rows always
+// fire: the goroutine waits for a slot instead of dropping the occurrence.
 func (s *Scheduler) fireOne(c Claim) {
-	s.fires <- struct{}{}
 	go func() {
+		s.fires <- struct{}{}
 		defer func() { <-s.fires }()
 		defer func() {
 			if r := recover(); r != nil {

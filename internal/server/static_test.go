@@ -27,6 +27,9 @@ func TestHandleStaticGzipCacheAnd304(t *testing.T) {
 	if rec.Header().Get("Content-Encoding") != "gzip" {
 		t.Fatalf("expected gzip encoding, got %q", rec.Header().Get("Content-Encoding"))
 	}
+	if got := rec.Header().Get("Vary"); got != "Accept-Encoding" {
+		t.Fatalf("gzip Vary=%q, want Accept-Encoding", got)
+	}
 	etag := rec.Header().Get("ETag")
 	if etag == "" {
 		t.Fatal("expected ETag header")
@@ -68,6 +71,9 @@ func TestHandleStaticGzipCacheAnd304(t *testing.T) {
 	if rec304.Header().Get("ETag") != etag {
 		t.Fatalf("304 ETag=%q, want %q", rec304.Header().Get("ETag"), etag)
 	}
+	if got := rec304.Header().Get("Vary"); got != "Accept-Encoding" {
+		t.Fatalf("304 Vary=%q, want Accept-Encoding", got)
+	}
 
 	// A stale/wrong ETag must serve the full body.
 	reqStale := httptest.NewRequest("GET", "/monaco/editor.main.css", nil)
@@ -100,6 +106,11 @@ func TestHandleStaticIdentityNoGzip(t *testing.T) {
 	}
 	if !bytes.Equal(rec.Body.Bytes(), raw) {
 		t.Fatal("identity body does not match embedded asset")
+	}
+	// The identity variant must advertise encoding negotiation too, so a cache
+	// that stores it does not later serve it for a gzip-accepting client.
+	if got := rec.Header().Get("Vary"); got != "Accept-Encoding" {
+		t.Fatalf("identity Vary=%q, want Accept-Encoding", got)
 	}
 
 	// Fonts are binary/already-compressed: never gzip even when accepted.

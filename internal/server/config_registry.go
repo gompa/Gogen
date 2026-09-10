@@ -283,6 +283,22 @@ func buildConfigFields() map[string]fieldSpec {
 	f.sample = 65536
 	add(f)
 
+	// Gates the spill feature: oversized tool output is persisted to the
+	// session's spill dir and the inline result becomes a head/tail
+	// preview + locator (on, default) instead of the legacy plain-cap
+	// head-only truncation (off).
+	f = strSpec("outputSpill",
+		func(r *config.Config) string { return r.OutputSpill },
+		func(r *config.Config, v string) { r.OutputSpill = v },
+		func(m *WSMessage) string { return m.OutputSpill },
+		func(m *WSMessage, v string) { m.OutputSpill = v })
+	f.normalize = onOffNormalize("outputSpill")
+	f.applyLive = func(s *Server, r *config.Config) {
+		agent.ConfigureOutputSpill(onoff.Enabled(r.OutputSpill))
+	}
+	f.sample = "off"
+	add(f)
+
 	f = intSpec("compactReserveTokens",
 		func(r *config.Config) int { return r.CompactReserveTokens },
 		func(r *config.Config, v int) { r.CompactReserveTokens = v },

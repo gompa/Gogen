@@ -9,6 +9,7 @@ import (
 
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"gogen/internal/agent"
 	"gogen/internal/llm"
@@ -1179,6 +1180,12 @@ func TestSidebarCloseFocusedRow(t *testing.T) {
 	// Give the focused session content: empty (0-message, unlabeled)
 	// sessions are deliberately not persisted (skipEmptySave).
 	m.agent.Messages = append(m.agent.Messages, llm.Message{Role: "user", Content: "hi"})
+	// Persist it the way the turn pipeline leaves a real session (every
+	// round ends in persistSession): Close no longer force-saves clean
+	// sessions — that forced write re-stamped Updated=now and reshuffled
+	// the saved-session list (close must keep the earned recency); it
+	// flushes only dirty state now.
+	m.agent.FlushSession()
 	// bg was just spawned (newest) → row 0; the focused "cur" is row 1.
 	m.sidebarCursor = 1
 	m.handleSidebarKey(keyMsg("x"))
@@ -1567,5 +1574,52 @@ func TestSidebarOpenRowAnnouncesSwitch(t *testing.T) {
 	last := m.chatLines[len(m.chatLines)-1]
 	if !strings.Contains(last, "Switched to session:") {
 		t.Fatalf("last chat line = %q, want the switch feedback line", last)
+	}
+}
+
+// Regression: the title row truncated and padded its label by RUNE count,
+// so a wide-rune label (CJK, emoji) rendered wider than its cell budget —
+// the ✕ and the right border were pushed past the panel edge and the
+// joined frame grew wider than the terminal (the inline renderer would
+// soft-wrap and desync). Truncation/padding are visible-cell based now.
+func TestSidebarTitleWideLabelStaysInPanel(t *testing.T) {
+	m := newSidebarTestModel(100)
+	m.sidebarVisible = true
+	m.sidebarWidth = defaultSidebarWidth
+
+	for name, label := range map[string]string{
+		"ascii": strings.Repeat("x", 120),
+		"cjk":   "日本語のセッションラベルです",
+		"emoji": "🚀🎉 bug hunt 🎉🚀",
+	} {
+		t.Run(name, func(t *testing.T) {
+			row := m.renderSidebarTitle(sidebarRow{id: "a", label: label}, false, m.sidebarWidth-3)
+			// The row fills the inner budget exactly (renderSidebar appends
+			// the right border): never wider.
+			if w := ansi.StringWidth(row); w > m.sidebarWidth-1 {
+				t.Fatalf("title row is %d cells, budget is %d:\n%q", w, m.sidebarWidth-3, ansi.Strip(row))
+			}
+		})
+	}
+}
+
+// Regression (end to end): a wide label on a saved row must not widen the
+// joined frame past the terminal.
+func TestViewFrameWidthWideSidebarLabel(t *testing.T) {
+	m := newSidebarTestModel(100)
+	m.sidebarVisible = true
+	m.sidebarWidth = defaultSidebarWidth
+	m.savedCache = []agent.SessionInfo{{ID: "wide-1", Label: "日本語のセッションラベルです"}}
+	m.SetSize(100, 24)
+
+	frame := m.View().Content
+	widest := 0
+	for _, l := range strings.Split(frame, "\n") {
+		if lw := ansi.StringWidth(l); lw > widest {
+			widest = lw
+		}
+	}
+	if widest > 100 {
+		t.Fatalf("joined frame is %d cells wide in a 100-col terminal", widest)
 	}
 }

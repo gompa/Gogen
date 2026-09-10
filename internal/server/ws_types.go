@@ -226,6 +226,14 @@ type HistoryEntry struct {
 	CreatedAt  string            `json:"createdAt,omitempty"` // RFC3339Nano UTC when the message was created
 }
 
+// QueueItem is one queued user steering message on the wire (server→client,
+// on queue_update frames and session_state): the client correlates its
+// queued bubble by ID and cancels the item with queue_remove{queueId}.
+type QueueItem struct {
+	ID   string `json:"id"`
+	Text string `json:"text"`
+}
+
 type WSMessage struct {
 	Type            string         `json:"type"`
 	Content         string         `json:"content,omitempty"`
@@ -415,6 +423,7 @@ type WSMessage struct {
 	CompactLastResort         string  `json:"compactLastResort,omitempty"` // condense (default) | error
 	WebFetch                  string  `json:"webFetch,omitempty"`
 	WebSearch                 string  `json:"webSearch,omitempty"`
+	OutputSpill               string  `json:"outputSpill,omitempty"` // on (default) | off — spill oversized tool output to the session spill dir
 	WebSearchBackend          string  `json:"webSearchBackend,omitempty"`
 	WebSearchAPIKey           string  `json:"webSearchApiKey,omitempty"` // client→server only
 	WebSearchAPIKeySet        bool    `json:"webSearchApiKeySet,omitempty"`
@@ -462,7 +471,26 @@ type WSMessage struct {
 	Kind string `json:"kind,omitempty"`
 	// TurnActive describes a session's in-flight turn; sent in session_state
 	// replies so a reconnecting client can render "resuming…".
-	TurnActive   bool           `json:"turnActive,omitempty"`
+	TurnActive bool `json:"turnActive,omitempty"`
+	// QueueID is the client-provided correlation id for a user steering
+	// message sent while a turn is running (client→server, on "message"
+	// frames): the server stores it as the queue item's ID and echoes it on
+	// queue_update, so the sending tab can resolve its optimistic queued
+	// bubble without a matching round trip.
+	QueueID string `json:"queueId,omitempty"`
+	// Queue carries the session's pending user steering messages
+	// (server→client, on queue_update frames and session_state) so every
+	// attached client renders the same queued state.
+	Queue []QueueItem `json:"queue,omitempty"`
+	// QueueLeft lists queue-item ids that left the queue because their turn
+	// STARTED (server→client, on the queue_update frame emitted at the
+	// drain's pop, which reaches every attached client before the started
+	// turn's user_acked): the client clears those items' queued chips and
+	// resolves the paired user_acked normally. Ids absent from both Queue
+	// and QueueLeft left the queue by REMOVAL (per-item ✕, clear-all,
+	// interrupt) and render as cancelled-before-running. session_state
+	// snapshots never carry it (an attach has no "left" to report).
+	QueueLeft    []string       `json:"queueLeft,omitempty"`
 	MessageIndex int            `json:"messageIndex,omitempty"`
 	Sessions     []SessionEntry `json:"sessions,omitempty"`
 	History      []HistoryEntry `json:"history,omitempty"`

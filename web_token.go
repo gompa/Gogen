@@ -57,10 +57,22 @@ func loadOrCreateWebToken(path string) (string, error) {
 // ioutil.WriteFileAtomic (temp file + fsync + rename), so a crash mid-write
 // cannot corrupt the token and the shared helper's chmod-unsupported handling
 // is reused. The parent dir is created with 0700.
+//
+// ioutil.WriteFileAtomic preserves a pre-existing file's mode on overwrite
+// (so script execute bits survive regeneration), which means an earlier
+// world-readable web_token would keep that mode when a fresh token is
+// written. Force the restrictive mode explicitly, matching the
+// projectfile.SaveConfig/SaveGlobalConfig secret-handling workaround.
 func writeWebToken(path, tok string) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	return ioutil.WriteFileAtomic(path, []byte(tok+"\n"), 0o600)
+	if err := ioutil.WriteFileAtomic(path, []byte(tok+"\n"), 0o600); err != nil {
+		return err
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fmt.Errorf("restrict permissions on %s: %w", path, err)
+	}
+	return nil
 }

@@ -160,8 +160,14 @@ type Config struct {
 	SessionMaxCount   int // max saved sessions per working dir (0 = default 50)
 	SessionMaxAgeDays int // delete sessions older than N days (0 = default 30, negative = keep forever)
 
-	WebFetch          string // on, off
-	WebSearch         string // on, off
+	WebFetch  string // on, off
+	WebSearch string // on, off
+	// OutputSpill gates the spill feature: oversized tool output (command
+	// output, show_diff, …) is persisted to the session's spill dir and the
+	// inline result becomes a head/tail preview + locator instead of a
+	// lossy head-only truncation ("on"/"off"; default on). When off, the
+	// legacy plain-cap truncation applies.
+	OutputSpill       string
 	WebSearchBackend  string // brave or "" for ddg
 	WebSearchAPIKey   string // Brave API key
 	WebAllowedDomains string // comma-separated domain suffix allowlist
@@ -299,6 +305,7 @@ func Defaults() Config {
 		WebApprovalHoldSecs:       0,
 		WebFetch:                  "on",
 		WebSearch:                 "on",
+		OutputSpill:               "on",
 		WebSearchBackend:          "",
 		WebSearchAPIKey:           "",
 		WebAllowedDomains:         "",
@@ -435,4 +442,15 @@ func (c *Config) WebSearchEnabled() bool {
 		return false
 	}
 	return configOn(c.WebSearch)
+}
+
+// OutputSpillEnabled reports whether the spill feature is active (oversized
+// tool output persisted to the session's spill dir with a head/tail
+// preview + locator). Enabled by default: on unless explicitly set to an
+// "off" spelling (absence of a value does not disable it).
+func (c *Config) OutputSpillEnabled() bool {
+	if c == nil {
+		return true
+	}
+	return !configOff(c.OutputSpill)
 }

@@ -28,7 +28,7 @@
 //   deps.getMessagesDiv()              — the #messages element
 //   deps.getMessageRawStore()          — the per-message raw-text WeakMap
 
-import { openModal, closeModal } from '/editor.js';
+import { openDialog } from '/components/dialog.js';
 import { icon } from '/components/icons.js';
 
 let deps = null;
@@ -497,29 +497,18 @@ function showSessionDeleteModal(displayName) {
     return new Promise((resolve) => {
         const overlay = document.getElementById('session-delete-overlay');
         const filenameEl = document.getElementById('session-delete-filename');
-        const cancelBtn = document.getElementById('session-delete-cancel-btn');
-        const confirmBtn = document.getElementById('session-delete-confirm-btn');
         if (!overlay) { resolve(window.confirm(`Delete session "${displayName}"? This cannot be undone.`)); return; }
         filenameEl.textContent = `Session "${displayName}" and its message history will be permanently deleted.`;
-        openModal(overlay);
-        const cleanup = (result) => {
-            closeModal(overlay);
-            cancelBtn.removeEventListener('click', onCancel);
-            confirmBtn.removeEventListener('click', onConfirm);
-            overlay.removeEventListener('keydown', onKey);
-            resolve(result);
-        };
-        const onCancel = () => cleanup(false);
-        const onConfirm = () => cleanup(true);
-        const onKey = (e) => {
-            if (e.key === 'Escape') {
-                e.stopPropagation(); // keep the document handler from cancelling the agent turn
-                onCancel();
-            }
-        };
-        cancelBtn.addEventListener('click', onCancel);
-        confirmBtn.addEventListener('click', onConfirm);
-        overlay.addEventListener('keydown', onKey);
+        // Delete = confirm (the destructive action), Cancel = cancel; Esc
+        // and a backdrop click cancel. openDialog wires buttons, Esc,
+        // backdrop and the teardown; the safe default (Cancel) is focused
+        // on open (first focusable, via openModal).
+        openDialog(overlay, {
+            confirm: 'session-delete-confirm-btn',
+            cancel: 'session-delete-cancel-btn',
+            onConfirm: () => resolve(true),
+            onCancel: () => resolve(false),
+        });
     });
 }
 

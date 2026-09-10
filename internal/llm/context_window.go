@@ -4,7 +4,7 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/v3"
 )
 
 // ErrContextWindowExceeded is the sentinel for a provider context-window

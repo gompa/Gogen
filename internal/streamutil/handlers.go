@@ -24,6 +24,14 @@ type Sink interface {
 	OnCompacting()
 	OnCondensed(note string)
 	OnStreamStall()
+	// OnStreamRetry reports that a failed stream attempt is being retried
+	// (muted streaming retry, or the non-streaming fallback): the retry
+	// regenerates the whole response with live delivery muted, so hosts
+	// should swap their "streaming" state for a "retrying" state until the
+	// next round-start/token. reason is a short human-readable cause that
+	// includes the underlying failure (e.g. "stream interrupted: read tcp
+	// ...: connection reset by peer").
+	OnStreamRetry(reason string)
 	OnThinkingToken(token string)
 	OnToken(token string)
 	OnStreamEnd()
@@ -112,6 +120,9 @@ func BuildStreamHandlers(s Sink, cfg HandlersConfig) *llm.StreamHandlers {
 		},
 		OnStreamStall: func() {
 			s.OnStreamStall()
+		},
+		OnStreamRetry: func(reason string) {
+			s.OnStreamRetry(reason)
 		},
 		OnStreamActivity: func() {
 			s.OnStreamActivity()

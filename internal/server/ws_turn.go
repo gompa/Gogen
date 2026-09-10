@@ -98,6 +98,32 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 		return
 	}
 
+	// Steering: a plain chat message typed while a turn is running is
+	// QUEUED (FIFO) and delivered as the next user turn when the in-flight
+	// one ends — it never interrupts. The check must run BEFORE the turn
+	// lock (and before acquireTurnForHandler's cancel-then-lock, which
+	// would kill the turn we are steering around); turnState is a cheap
+	// read, and a turn ending in the check→acquire window just means the
+	// message runs immediately below (the queue is empty either way).
+	// Command-shaped inputs keep the old behavior: they take the lock (and
+	// interrupt, E29) — only chat (and image-only) messages queue.
+	if active, _ := rt.turnState(); active && steerableInput(msg.Content, len(images)) {
+		if rt.enqueueUserTurn(msg.QueueID, msg.Content, images) {
+			return
+		}
+		// Queue full: reject at submit — user text is never silently
+		// dropped. On the conversation channel, as the reply to the message
+		// that was refused, and as a queue_update so the sending tab's
+		// OPTIMISTIC bubble is revoked: the refused item is in neither the
+		// queue nor queueLeft, which is exactly the client's "removed before
+		// running" signal (otherwise the phantom queued chip would survive
+		// until some later unrelated queue frame).
+		_ = ws.writeJSON(WSMessage{Type: "response", Content: fmt.Sprintf(
+			"Error: too many queued messages (limit %d) — wait for the current turn or stop it.", maxUserQueueCap)})
+		rt.broadcastQueueState()
+		return
+	}
+
 	// The turn lock is held across the whole command dispatch below, exactly
 	// like the old global turnMu: tryAcquireTurn acquires it, each handled
 	// branch releases it before returning, and the unhandled fall-through
@@ -112,7 +138,9 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 	}
 	if !rt.acquireTurnForHandler(ws) {
 		// Busy rejection on the CONVERSATION channel: the user typed a chat
-		// message (or a chat command) and the error is its reply.
+		// message (or a chat command) and the error is its reply. Plain
+		// chat text never reaches this point while busy (queued above);
+		// command-shaped inputs keep the explicit busy rejection.
 		_ = ws.writeJSON(WSMessage{Type: "response", Content: errAgentBusy})
 		return
 	}
@@ -200,11 +228,17 @@ func (s *Server) handleWSUserMessage(ws *wsConn, r *http.Request, pane **session
 	rt.startTurn(ws, msg.Content, images)
 }
 
-// preprocessWSUserMessage validates user-attached images, applies the
-// interrupt semantics, and routes the commands that never need the turn
-// lock (a literal /compact, /help, and a bare /models list). Returns the
-// validated images (for the turn fall-through) and whether the message was
-// fully handled.
+// preprocessWSUserMessage validates user-attached images and routes the
+// commands that never need the turn lock (a literal /compact, /help, and a
+// bare /models list). Returns the validated images (for the turn
+// fall-through) and whether the message was fully handled.
+//
+// Deliberately NO interrupt here (the old owner-cancel moved out): a plain
+// chat message from the turn owner no longer cancels the in-flight turn —
+// it is QUEUED as a steering message (see handleWSUserMessage). Interrupt
+// stays explicit: the "cancel" frame (wsHandleCancel), and the
+// cancel-then-lock path inside acquireTurnForHandler for commands that need
+// the turn lock (E29).
 func (s *Server) preprocessWSUserMessage(ws *wsConn, r *http.Request, rt *sessionRuntime, msg WSMessage) ([]llm.ImageInput, bool) {
 	// Validate user-attached images first: a malformed image frame must be
 	// rejected without cancelling an in-flight turn or taking the turn lock.
@@ -212,12 +246,6 @@ func (s *Server) preprocessWSUserMessage(ws *wsConn, r *http.Request, rt *sessio
 	if err != nil {
 		_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: " + err.Error()})
 		return nil, true
-	}
-	// Interrupt semantics apply only to the connection that owns the current
-	// turn; a second connection's message must not cancel a turn it does not
-	// own — it gets the busy rejection below.
-	if rt.ownsTurn(ws) {
-		rt.stream.cancelInFlight()
 	}
 
 	// A literal /compact typed into the composer (or sent by older clients)
@@ -313,6 +341,48 @@ func (rt *sessionRuntime) startTurn(owner *wsConn, content string, images []llm.
 			persist:      true,
 		})
 	}(content, images, streamCtx, errCh)
+}
+
+// steerableInput reports whether a message typed while a turn is running
+// should be QUEUED (steering) instead of taking the turn lock (and getting
+// the busy rejection). Chat text queues; command-shaped input keeps the
+// dispatch/busy path. An image-only message (no text to classify) is
+// steerable too: the attachments ARE its content, and the queue item carries
+// them through to the drained turn.
+func steerableInput(content string, images int) bool {
+	if strings.TrimSpace(content) == "" {
+		return images > 0
+	}
+	return isPlainChatInput(content)
+}
+
+// isPlainChatInput reports whether input is chat text (steerable) rather
+// than one of the command shapes the turn-taking dispatch handles. Pure — it
+// runs BEFORE the turn lock, so it is deliberately conservative in both
+// directions: a false positive queues a command word as chat (the model then
+// answers it as a prompt), a false negative gives a chat message the busy
+// rejection instead of queueing it. Any slash-prefixed input is a command;
+// bare input is chat unless its FIRST word is one of the command words the
+// dispatchers match (mode: plan/act/mode; help: help; thinking: think…;
+// context: context; models: models…; sessions: new/sessions/resume/fork…) —
+// the same word-then-args shape agent.ParseSessionCommand and the
+// /models,/think parsers use, so a word that merely STARTS with a command
+// word ("news", "forklift", "resumes") stays chat.
+func isPlainChatInput(content string) bool {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return false
+	}
+	if strings.HasPrefix(trimmed, "/") {
+		return false
+	}
+	word, _, _ := strings.Cut(trimmed, " ")
+	switch word {
+	case "help", "plan", "act", "mode", "context", "think", "models",
+		"new", "sessions", "resume", "fork":
+		return false
+	}
+	return true
 }
 
 // errTurnEvicted is returned by runTurnBody when the runtime was evicted

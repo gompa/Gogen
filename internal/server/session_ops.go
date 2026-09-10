@@ -350,6 +350,10 @@ func (s *Server) sessionFork(ctx context.Context, ws *wsConn, pane **sessionRunt
 		return agent.SessionCommandResult{}, true, err
 	}
 	newID := session.NewID()
+	// Re-point the forked transcript's spill locators at the child's spill
+	// dir (hardlinks) so retrieval keeps working after the source session
+	// is deleted (delete removes the source's spill files).
+	src.agent.RepointSpillLocators(forkedMsgs, newID)
 	// Carry the source's session state into the fork. The TUI fork
 	// (ForkSession) replaces messages on the SAME agent, so it keeps the
 	// source's mode, thinking level, model, and todos; the web fork must

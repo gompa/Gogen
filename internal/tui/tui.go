@@ -141,10 +141,16 @@ func (t *TUI) Run(ctx context.Context) {
 	// Job-completion notices are focus-aware: a focused root session gets
 	// the normal delivery turn (deliveryRequestMsg on the tea loop); a
 	// backgrounded one buffers an attributed condensed note that
-	// switchToLive surfaces when focus returns.
-	t.installJobNoticeHook(m, func(summary string) {
-		p.Send(deliveryRequestMsg{text: summary})
-	})
+	// switchToLive surfaces when focus returns. The delivery names the ROOT
+	// slot (the hook's session, captured here on the Update thread), so the
+	// notice lands on its own queue even if focus moved before tea delivers
+	// the message.
+	if m.lives != nil {
+		rootID := m.lives.Active().id
+		t.installJobNoticeHook(m, func(summary string) {
+			p.Send(deliveryRequestMsg{sid: rootID, text: summary})
+		})
+	}
 	// A validation finishing before Run started would have missed the
 	// program; drain the pending flag so the first render already reflects
 	// the change.
@@ -155,4 +161,12 @@ func (t *TUI) Run(ctx context.Context) {
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "TUI error: %v\n", err)
 	}
+	// The event loop has stopped: either an in-app quit (flushAndQuit already
+	// swept every session) or a context cancellation from SIGINT/SIGTERM/
+	// SIGHUP, which does NOT run flushAndQuit. Sweep here so a signal-driven
+	// exit persists dirty sessions too — including background live sessions
+	// that main's deferred FlushPending (which only covers the default agent)
+	// cannot reach. FlushPending is idempotent and writes only dirty
+	// sessions, so the in-app quit path is unaffected.
+	m.flushAllSessions()
 }

@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/v3"
 )
 
 // reasoningStopGrace is how long the stream waits for content to resume after
@@ -15,7 +15,7 @@ import (
 // complete. Two-phase streams (reasoning → content) legitimately continue
 // within the grace, so only a provider that sends the stop and then HOLDS the
 // connection open without [DONE] is cut short — otherwise the read would
-// block for the full idle timeout (streamReadIdleTimeout, default 10m). Set
+// block for the full idle timeout (streamReadIdleTimeout, default 30m). Set
 // GOGEN_REASONING_STOP_GRACE=0/off to disable the bound (wait indefinitely).
 func reasoningStopGrace() time.Duration {
 	raw := strings.TrimSpace(os.Getenv("GOGEN_REASONING_STOP_GRACE"))
@@ -28,6 +28,35 @@ func reasoningStopGrace() time.Duration {
 	d, err := time.ParseDuration(raw)
 	if err != nil || d <= 0 {
 		return 30 * time.Second
+	}
+	return d
+}
+
+// streamDrainGrace bounds how long the consuming loop waits for the usage
+// chunk AFTER the finish_reason chunk (the drain whose chunk-count bound is
+// streamDrainLimit). gogen requests usage via stream_options.include_usage
+// and compliant endpoints deliver it immediately (and often close the body
+// after [DONE], which also ends the drain); but an endpoint that finishes
+// without usage AND holds the connection open — llama-swap proxies and
+// older llama.cpp builds do exactly this, and llama.cpp also "often stops
+// sending without closing" (see streamReadIdleTimeout) — would otherwise
+// block the read for the full idle timeout (default 30m) with the reply
+// already fully rendered on screen: the turn looks hung, the composer stays
+// busy, and a user who closes with ctrl+c loses the whole round (it was
+// never appended). The timer closes the stream; drainExpired makes that
+// close read as a normal completion. Set GOGEN_STREAM_DRAIN_GRACE=0/off to
+// disable the bound (wait for the read idle timeout).
+func streamDrainGrace() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("GOGEN_STREAM_DRAIN_GRACE"))
+	if raw == "" {
+		return 5 * time.Second
+	}
+	if raw == "0" || strings.EqualFold(raw, "off") || strings.EqualFold(raw, "false") {
+		return 0
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return 5 * time.Second
 	}
 	return d
 }
@@ -54,6 +83,12 @@ func ensureStreamCallbacks(h *StreamHandlers) *StreamHandlers {
 	}
 	if h.OnRecoverPartialStream == nil {
 		h.OnRecoverPartialStream = func() {}
+	}
+	if h.OnStreamStall == nil {
+		h.OnStreamStall = func() {}
+	}
+	if h.OnStreamRetry == nil {
+		h.OnStreamRetry = func(string) {}
 	}
 	if h.OnToken == nil {
 		h.OnToken = func(string) {}
@@ -88,6 +123,14 @@ type streamAccumulator struct {
 	// provider held the connection open without resuming or sending [DONE]),
 	// so the loop can distinguish a grace close from a real stream error.
 	graceExpired atomic.Bool
+	// drainExpired is set when the post-finish usage-drain timer fires: the
+	// round finished (finish_reason seen) but the promised usage chunk
+	// (stream_options.include_usage) never arrived and the endpoint held the
+	// connection open instead of closing. Closing the stream unblocks
+	// Next(); the flag tells the consuming loop to treat that close as a
+	// NORMAL completion — the round is done — rather than a transport
+	// failure that would trigger the retry/fallback ladder.
+	drainExpired atomic.Bool
 }
 
 func newStreamAccumulator() *streamAccumulator {
@@ -95,6 +138,16 @@ func newStreamAccumulator() *streamAccumulator {
 		tcIndexMap: make(map[int]int),
 		extras:     newExtraFieldAccums(),
 	}
+}
+
+// renderedOutput reports whether the attempt already surfaced any content,
+// reasoning, refusal, or tool-call fragments. An interrupted attempt with
+// no rendered output died during the silent pre-first-token wait (long
+// prompt processing, backend queueing, or a middlebox idle timeout);
+// rendered output means the break hit mid-generation.
+func (a *streamAccumulator) renderedOutput() bool {
+	return a.fullContent.Len() > 0 || a.fullReasoning.Len() > 0 ||
+		a.fullRefusal.Len() > 0 || len(a.tcAccums) > 0
 }
 
 func (a *streamAccumulator) processChunk(chunk openai.ChatCompletionChunk, onToken, onThinking func(string), h *StreamHandlers) bool {

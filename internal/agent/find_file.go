@@ -36,7 +36,8 @@ func (e *Executor) FindFile(ctx context.Context, name string, subpath string, li
 	}
 
 	var matches []string
-	err = walkTree(ctx, searchRoot, relPrefix, walkOpts{}, func(path, rel string, d os.DirEntry) error {
+	skips := &walkSkips{}
+	err = walkTree(ctx, searchRoot, relPrefix, walkOpts{onSkip: skips.observe}, func(path, rel string, d os.DirEntry) error {
 		base := d.Name()
 		if strings.Contains(strings.ToLower(base), strings.ToLower(name)) {
 			matches = append(matches, rel)
@@ -51,7 +52,7 @@ func (e *Executor) FindFile(ctx context.Context, name string, subpath string, li
 	}
 
 	if len(matches) == 0 {
-		return fmt.Sprintf("No files found matching name %q", name), nil
+		return fmt.Sprintf("No files found matching name %q", name) + skips.footer(), nil
 	}
 
 	slices.Sort(matches)
@@ -62,5 +63,5 @@ func (e *Executor) FindFile(ctx context.Context, name string, subpath string, li
 		b.WriteString(m + "\n")
 	}
 	b.WriteString(fmt.Sprintf("\n(%d result(s))", len(matches)))
-	return strings.TrimRight(b.String(), "\n"), nil
+	return strings.TrimRight(b.String(), "\n") + skips.footer(), nil
 }

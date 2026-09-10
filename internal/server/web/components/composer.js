@@ -1,11 +1,13 @@
 // Composer input helpers for the GoGen web UI: the slash-command
-// suggest box and the image-attachment flow (file picker, paste,
-// preview chips).
+// suggest box and the attachment flow (file picker, clipboard paste,
+// drag-and-drop onto the input area, preview chips).
 //
 // The send path itself (sendMessage) stays in app.js — it is glue over
 // the socket, panes and stream state. app.js reads the pending
-// attachments through getPendingAttachments / clearAttachments and
-// routes the composer's keydown through slashKeydown (true = consumed).
+// attachments through getPendingAttachments / clearAttachments, asks
+// composeMessageContent to inline text-file attachments into the
+// outgoing content, and routes the composer's keydown through
+// slashKeydown (true = consumed).
 //
 // Wiring: app.js calls initComposer(deps) once at startup.
 //   deps.showToast(message, kind) — the toast stack
@@ -16,6 +18,10 @@ const slashSuggest = document.getElementById('slash-suggest');
 const attachBtn = document.getElementById('attach-btn');
 const imageUpload = document.getElementById('image-upload');
 const attachmentPreview = document.getElementById('attachment-preview');
+// The whole composer row (textarea + buttons) is the drop target —
+// dropping on the buttons or the attachment strip must work too.
+const composerEl = document.getElementById('input-area');
+const dropOverlay = document.getElementById('composer-drop-overlay');
 
 let deps = null;
 
@@ -146,12 +152,18 @@ export function slashKeydown(e) {
     return false;
 }
 
-// ── Image attachments (vision input) ──
-// Mirrors the server's limits (internal/server/server.go
-// validateImageInputs).
+// ── Attachments (vision input + dropped text context) ──
+// Image limits mirror the server's (internal/server/server.go
+// validateImageInputs). The attachment-count cap is shared across both
+// kinds; images additionally ride the payload's images array (max 4
+// server-side), so the client cap can never exceed it.
 const MAX_ATTACHMENTS = 4;
 const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
-let pendingAttachments = []; // [{dataUrl, name}]
+// Text files are capped tighter than images: their content is inlined
+// verbatim into the message text (and so into the LLM context and the
+// persisted transcript), where even a few hundred KB is a lot of tokens.
+const MAX_TEXT_ATTACHMENT_BYTES = 256 * 1024;
+let pendingAttachments = []; // images: [{dataUrl, name}] · text files: [{text, name}]
 
 export function getPendingAttachments() {
     return pendingAttachments;
@@ -165,7 +177,7 @@ function addImageAttachment(file) {
         return;
     }
     if (pendingAttachments.length >= MAX_ATTACHMENTS) {
-        deps.showToast(`Max ${MAX_ATTACHMENTS} images per message`, 'error');
+        deps.showToast(`Max ${MAX_ATTACHMENTS} attachments per message`, 'error');
         return;
     }
     const reader = new FileReader();
@@ -181,6 +193,85 @@ function addImageAttachment(file) {
     reader.readAsDataURL(file);
 }
 
+// ── Text/code files (dropped only — the picker stays image-only) ──
+// Attached as context: read as UTF-8 and inlined into the outgoing
+// message content by composeMessageContent. The server's wire format
+// only carries image attachments separately, so text rides inside the
+// message body — which also means edit/resend and the persisted
+// transcript reproduce exactly what the model saw.
+//
+// Files dropped from the OS expose no filesystem path (browsers hide
+// it), and the editor pane opens files by workspace-relative path over
+// its socket, so "open in the editor" is not offered for drops —
+// context attachment is the one behavior that always works.
+
+// Common text/code MIME prefixes (checked before the extension: an
+// explicit text/* from the OS beats any guessing).
+const TEXT_MIME_PREFIXES = [
+    'text/',
+    'application/json', 'application/xml', 'application/javascript',
+    'application/x-yaml', 'application/yaml', 'application/toml',
+    'application/x-sh', 'application/graphql',
+];
+// Extensions accepted when the OS reports no MIME type. Includes
+// extension-less dotfiles and bare names ("Makefile", ".gitignore").
+const TEXT_EXTENSIONS = new Set([
+    'go', 'js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'py', 'rb', 'rs', 'java',
+    'kt', 'kts', 'swift', 'c', 'h', 'cpp', 'hpp', 'cc', 'cxx', 'cs', 'php',
+    'sh', 'bash', 'zsh', 'fish', 'ps1', 'sql', 'json', 'jsonc', 'yaml',
+    'yml', 'toml', 'xml', 'html', 'htm', 'css', 'scss', 'sass', 'less',
+    'md', 'markdown', 'txt', 'text', 'csv', 'tsv', 'ini', 'cfg', 'conf',
+    'env', 'properties', 'proto', 'graphql', 'gql', 'vue', 'svelte', 'astro',
+    'dart', 'scala', 'pl', 'pm', 'lua', 'r', 'jl', 'ex', 'exs', 'erl', 'hrl',
+    'clj', 'cljs', 'lisp', 'el', 'vim', 'dockerfile', 'makefile', 'cmake',
+    'gradle', 'tf', 'tfvars', 'hcl', 'gitignore', 'gitattributes', 'editorconfig',
+    'npmrc', 'babelrc', 'eslintrc', 'prettierrc', 'patch', 'diff', 'lock',
+    'log', 'rst', 'adoc',
+]);
+
+// Extension of `name` — for extension-less files the whole lowercase
+// basename, so "Makefile" → "makefile" and ".gitignore" → "gitignore".
+function fileNameExtension(name) {
+    const base = String(name || '').toLowerCase();
+    const dot = base.lastIndexOf('.');
+    return dot === -1 ? base : base.slice(dot + 1);
+}
+
+function isTextFile(file) {
+    const type = String(file.type || '');
+    if (type) {
+        for (const prefix of TEXT_MIME_PREFIXES) {
+            if (type.startsWith(prefix)) return true;
+        }
+        return false;
+    }
+    return TEXT_EXTENSIONS.has(fileNameExtension(file.name));
+}
+
+function addTextAttachment(file) {
+    if (!file) return;
+    // Only the text cap applies here: it is far tighter than
+    // MAX_ATTACHMENT_BYTES (the image limit), so a 5 MB check would be dead
+    // code with a misleading message.
+    if (file.size > MAX_TEXT_ATTACHMENT_BYTES) {
+        deps.showToast(
+            `"${file.name}" is larger than 256 KB — text files are inlined into the message`,
+            'error');
+        return;
+    }
+    if (pendingAttachments.length >= MAX_ATTACHMENTS) {
+        deps.showToast(`Max ${MAX_ATTACHMENTS} attachments per message`, 'error');
+        return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+        pendingAttachments.push({ name: file.name || 'file', text: String(reader.result || '') });
+        renderAttachmentPreview();
+    };
+    reader.onerror = () => deps.showToast(`Could not read "${file.name}"`, 'error');
+    reader.readAsText(file);
+}
+
 function removeAttachment(index) {
     pendingAttachments.splice(index, 1);
     renderAttachmentPreview();
@@ -189,6 +280,42 @@ function removeAttachment(index) {
 export function clearAttachments() {
     pendingAttachments = [];
     renderAttachmentPreview();
+}
+
+// Outgoing message content: the typed text with every text-file
+// attachment inlined as a fenced code block (images ride separately in
+// the payload's images array — see sendMessage in app.js). Called once
+// per send; empty when there is nothing to inline.
+export function composeMessageContent(text) {
+    let content = text;
+    for (const att of pendingAttachments) {
+        if (att.text === undefined) continue;
+        if (content) content += '\n\n';
+        content += fencedFileBlock(att);
+    }
+    return content;
+}
+
+// One attachment as "[Attached file: name]" + a fenced block. The fence
+// grows past the longest backtick run inside the file so the block can
+// never terminate early (markdown's own rule for embedding fences).
+function fencedFileBlock(att) {
+    const body = String(att.text || '');
+    let run = 0;
+    let longest = 0;
+    for (const ch of body) {
+        if (ch === '`') {
+            run++;
+            if (run > longest) longest = run;
+        } else {
+            run = 0;
+        }
+    }
+    const fence = '`'.repeat(Math.max(3, longest + 1));
+    const dot = String(att.name || '').lastIndexOf('.');
+    const ext = dot === -1 ? '' : att.name.slice(dot + 1).toLowerCase();
+    const lang = /^[a-z0-9]+$/.test(ext) ? ext : '';
+    return '[Attached file: ' + att.name + ']\n' + fence + lang + '\n' + body + '\n' + fence;
 }
 
 function renderAttachmentPreview() {
@@ -203,17 +330,30 @@ function renderAttachmentPreview() {
         const chip = document.createElement('span');
         chip.className = 'attachment-chip';
         chip.title = att.name;
-        const img = document.createElement('img');
-        img.src = att.dataUrl;
-        img.alt = att.name;
+        if (att.text !== undefined) {
+            // Text/code file: icon + name instead of the image thumbnail.
+            chip.classList.add('text');
+            const fileIcon = document.createElement('span');
+            fileIcon.className = 'attachment-file-icon';
+            fileIcon.innerHTML = icon('code');
+            const name = document.createElement('span');
+            name.className = 'attachment-file-name';
+            name.textContent = att.name;
+            chip.appendChild(fileIcon);
+            chip.appendChild(name);
+        } else {
+            const img = document.createElement('img');
+            img.src = att.dataUrl;
+            img.alt = att.name;
+            chip.appendChild(img);
+        }
         const remove = document.createElement('button');
         remove.type = 'button';
         remove.className = 'attachment-remove';
         remove.innerHTML = icon('x');
-        remove.title = 'Remove image';
-        remove.setAttribute('aria-label', 'Remove image');
+        remove.title = att.text !== undefined ? 'Remove file' : 'Remove image';
+        remove.setAttribute('aria-label', remove.title);
         remove.addEventListener('click', () => removeAttachment(i));
-        chip.appendChild(img);
         chip.appendChild(remove);
         attachmentPreview.appendChild(chip);
     }
@@ -243,4 +383,84 @@ inputArea.addEventListener('paste', (e) => {
         }
     }
     if (handled) e.preventDefault();
+});
+
+// ── Drag-and-drop attachments ──
+// Dropping files anywhere on the composer row (#input-area) attaches
+// them: images take the exact picker/paste path (same limits), text and
+// code files attach as context (see addTextAttachment). Only drags that
+// actually carry files are claimed — dragging a text selection onto the
+// textarea keeps the browser's native insert-on-drop.
+
+// `types` includes the literal "Files" token whenever the drag carries
+// file system items (OS file manager, attachments from other apps).
+function dragHasFiles(e) {
+    const types = e.dataTransfer && e.dataTransfer.types;
+    if (!types) return false;
+    for (const type of types) {
+        if (type === 'Files') return true;
+    }
+    return false;
+}
+
+function addDroppedFiles(files) {
+    for (const file of files) {
+        if (!file) continue;
+        if (file.type && file.type.startsWith('image/')) {
+            addImageAttachment(file);
+        } else if (isTextFile(file)) {
+            addTextAttachment(file);
+        } else {
+            deps.showToast(
+                `"${file.name}" was not attached — only images and text/code files are supported`,
+                'error');
+        }
+    }
+}
+
+// Overlay visibility via an enter/leave depth counter: the events bubble
+// from every child of #input-area, and dragenter on the new target fires
+// before dragleave on the old one, so the depth never dips to 0 while
+// the pointer moves between children.
+let dragDepth = 0;
+
+function resetDragState() {
+    dragDepth = 0;
+    dropOverlay.hidden = true;
+}
+
+composerEl.addEventListener('dragenter', (e) => {
+    if (!dragHasFiles(e)) return;
+    e.preventDefault();
+    dragDepth++;
+    dropOverlay.hidden = false;
+});
+composerEl.addEventListener('dragleave', () => {
+    if (dragDepth > 0) dragDepth--;
+    if (dragDepth === 0) dropOverlay.hidden = true;
+});
+// Accepting the drop (preventDefault on dragover) is also what makes the
+// drop event fire at all; copy fits "attach a duplicate of this file".
+composerEl.addEventListener('dragover', (e) => {
+    if (!dragHasFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+});
+composerEl.addEventListener('drop', (e) => {
+    if (!dragHasFiles(e)) return; // text drops fall through to the textarea
+    e.preventDefault();
+    resetDragState();
+    addDroppedFiles(e.dataTransfer.files || []);
+});
+
+// Safety net: a file drop that misses the composer must not trigger the
+// browser default — navigating this tab away to the raw file. The
+// composer's and board's own handlers run first (target phase) and are
+// unaffected; this only cancels truly unhandled file drops. Board card
+// drags set only text/plain, so they never match dragHasFiles.
+window.addEventListener('dragover', (e) => {
+    if (dragHasFiles(e)) e.preventDefault();
+});
+window.addEventListener('drop', (e) => {
+    if (dragHasFiles(e)) e.preventDefault();
 });

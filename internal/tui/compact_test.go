@@ -56,18 +56,31 @@ func TestCmdCompactGuards(t *testing.T) {
 		}
 	})
 
-	t.Run("submit is swallowed while compacting", func(t *testing.T) {
+	t.Run("submit queues while compacting", func(t *testing.T) {
+		// Steering: the composer is never locked. A running /compact owns
+		// Messages, so a turn cannot START — but the message is queued and
+		// the drain waits for the compaction gate (drainDeliveries gates
+		// on m.compacting too), so it runs after the compact finishes.
 		m := dragModel(t)
 		m.keys = DefaultKeyMap
 		m.lives.Active().compacting = true
 		m.compacting = true
 		m.textarea.SetValue("hello")
-		_, cmd, ok := m.handleSubmitKey(keyMsg("enter"))
-		if !ok || cmd != nil {
-			t.Fatalf("enter must be consumed without starting a turn: ok=%v cmd=%v", ok, cmd != nil)
+		_, _, ok := m.handleSubmitKey(keyMsg("enter"))
+		// The returned command is the composer refocus (cursor blink) — a
+		// turn must NOT start.
+		if !ok {
+			t.Fatal("enter must be consumed")
 		}
 		if m.streaming {
 			t.Fatal("turn started during compaction")
+		}
+		if q := m.lives.Active().steerQueue; len(q) != 1 || q[0].text != "hello" {
+			t.Fatalf("queue = %v, want one queued item [hello]", q)
+		}
+		// The queue cannot drain while the compaction runs.
+		if cmd := m.drainDeliveries(); cmd != nil {
+			t.Fatal("drain must wait for the compaction gate")
 		}
 	})
 }

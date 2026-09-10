@@ -1,5 +1,8 @@
 // Monaco editor workspace for GoGen web UI.
 import DOMPurify from '/vendor/dompurify.esm.js';
+// Shared decision-dialog plumbing (components/dialog.js). It imports this
+// module's openModal/closeModal — a safe ESM cycle, see dialog.js's header.
+import { openDialog } from '/components/dialog.js';
 
 let monaco = null;
 
@@ -1327,29 +1330,17 @@ function showCloseTabModal(filename) {
   return new Promise((resolve) => {
     const overlay = document.getElementById('close-tab-overlay');
     const filenameEl = document.getElementById('close-tab-filename');
-    const discardBtn = document.getElementById('close-tab-discard-btn');
-    const keepBtn = document.getElementById('close-tab-keep-btn');
     if (!overlay) { resolve(window.confirm(`Close ${filename} and discard unsaved changes?`)); return; }
     filenameEl.textContent = `${filename} has unsaved changes that will be lost.`;
-    openModal(overlay);
-    const cleanup = (result) => {
-      closeModal(overlay);
-      discardBtn.removeEventListener('click', onDiscard);
-      keepBtn.removeEventListener('click', onKeep);
-      overlay.removeEventListener('keydown', onKey);
-      resolve(result);
-    };
-    const onDiscard = () => cleanup(true);
-    const onKeep = () => cleanup(false);
-    const onKey = (e) => {
-      if (e.key === 'Escape') {
-        e.stopPropagation(); // keep the document handler from cancelling the agent turn
-        onKeep();
-      }
-    };
-    discardBtn.addEventListener('click', onDiscard);
-    keepBtn.addEventListener('click', onKeep);
-    overlay.addEventListener('keydown', onKey);
+    // Discard = confirm (the destructive action), Keep = cancel; Esc and a
+    // backdrop click keep editing. openDialog wires buttons, Esc, backdrop
+    // and the teardown; the focus trap / restore come from openModal.
+    openDialog(overlay, {
+      confirm: 'close-tab-discard-btn',
+      cancel: 'close-tab-keep-btn',
+      onConfirm: () => resolve(true),
+      onCancel: () => resolve(false),
+    });
   });
 }
 
@@ -1472,7 +1463,7 @@ async function savePath(path) {
     toast(`Saved ${basename(path)}`, 'success');
     return true;
   } catch (err) {
-    toast(`Save failed: ${err.message}`, 'error');
+    toast(`Save failed ${basename(path)}: ${err.message}`, 'error');
     return false;
   }
 }
@@ -2163,37 +2154,18 @@ export function setupEditorUI() {
       const overlay = $('replace-preview-overlay');
       const summary = $('replace-preview-summary');
       const body = $('replace-preview-body');
-      const confirmBtn = $('rp-confirm');
-      const cancelBtn = $('rp-cancel');
       if (!overlay) { resolve(window.confirm(`Replace ${matches.length} occurrence(s)?`)); return; }
 
       // Set summary
       const fileCount = new Set(matches.map(m => m.path)).size;
       summary.textContent = `${matches.length} occurrence(s) in ${fileCount} file(s)${scopeLabel ? ' — ' + scopeLabel : ''}`;
       body.innerHTML = buildPreviewHTML(matches, search, replacement);
-      openModal(overlay);
-
-      const cleanup = (result) => {
-        closeModal(overlay);
-        confirmBtn.removeEventListener('click', onConfirm);
-        cancelBtn.removeEventListener('click', onCancel);
-        overlay.removeEventListener('click', onBackdrop);
-        overlay.removeEventListener('keydown', onKey);
-        resolve(result);
-      };
-      const onConfirm = () => cleanup(true);
-      const onCancel = () => cleanup(false);
-      const onBackdrop = (e) => { if (e.target === overlay) cleanup(false); };
-      const onKey = (e) => {
-        if (e.key === 'Escape') {
-          e.stopPropagation(); // keep the document handler from cancelling the agent turn
-          onCancel();
-        }
-      };
-      confirmBtn.addEventListener('click', onConfirm);
-      cancelBtn.addEventListener('click', onCancel);
-      overlay.addEventListener('click', onBackdrop);
-      overlay.addEventListener('keydown', onKey);
+      openDialog(overlay, {
+        confirm: 'rp-confirm',
+        cancel: 'rp-cancel',
+        onConfirm: () => resolve(true),
+        onCancel: () => resolve(false),
+      });
     });
   }
 

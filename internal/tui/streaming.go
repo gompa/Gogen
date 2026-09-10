@@ -57,6 +57,33 @@ type streamStatsMsg struct {
 	seq        uint64
 }
 
+// streamCompactingMsg is sent when the agent compacts history mid-turn
+// (auto/forced compaction inside prepareMessages): the summarization is a
+// full non-streaming LLM call, so without this the strip shows a bare
+// "thinking" spinner for the whole silent summarization.
+type streamCompactingMsg struct {
+	sid string
+	seq uint64
+}
+
+// streamStallMsg is sent when no SSE chunk has arrived for several seconds
+// while the round streams (long prefill, stalled upstream): swaps the bare
+// "thinking" spinner for a "still waiting" label. Cleared by the next
+// progress event (any token/stats/round boundary).
+type streamStallMsg struct {
+	sid string
+	seq uint64
+}
+
+// streamRetryMsg is sent when a failed stream attempt is retried with live
+// delivery muted (streaming retry, or the non-streaming fallback): the
+// silent stretch that follows is a whole regeneration, not a hang.
+type streamRetryMsg struct {
+	reason string
+	sid    string
+	seq    uint64
+}
+
 type streamToolCallMsg struct {
 	index int
 	id    string
@@ -275,11 +302,12 @@ func (s *StreamAdapter) Handlers() *llm.StreamHandlers {
 // without a session, unit tests) is a no-op.
 //
 // The intentionally-empty methods are the callbacks the TUI does not
-// consume: OnStreamOpened/OnStreamActivity/OnStreamStall are
-// connection-level signals with no TUI surface, OnCompacting/OnReplyModel
-// have no TUI indicator yet, and OnToolOutput/OnToolOutputEnd are unused
-// because the TUI renders only the final tool result (no live terminal
-// tabs). They are explicit no-ops, not omissions.
+// consume: OnStreamOpened/OnStreamActivity are connection-level signals
+// with no TUI surface (stall/retry/compacting DO surface — see their
+// messages), OnReplyModel has no TUI indicator yet, and
+// OnToolOutput/OnToolOutputEnd are unused because the TUI renders only
+// the final tool result (no live terminal tabs). They are explicit
+// no-ops, not omissions.
 var _ streamutil.Sink = (*StreamAdapter)(nil)
 
 func (s *StreamAdapter) OnStart() {
@@ -296,13 +324,28 @@ func (s *StreamAdapter) OnStreamOpened() {}
 
 func (s *StreamAdapter) OnStreamActivity() {}
 
-func (s *StreamAdapter) OnCompacting() {}
+// OnCompacting flips the strip to a compacting indicator while the
+// mid-turn summarization runs (a full silent LLM call).
+func (s *StreamAdapter) OnCompacting() {
+	s.send(streamCompactingMsg{sid: s.owner, seq: s.seq})
+}
 
 func (s *StreamAdapter) OnCondensed(note string) {
 	s.send(condensedNoteMsg{note: note, sid: s.owner, seq: s.seq})
 }
 
-func (s *StreamAdapter) OnStreamStall() {}
+// OnStreamStall swaps the bare spinner for a "still waiting" label after a
+// silent stretch (long prefill, stalled upstream). Informational only.
+func (s *StreamAdapter) OnStreamStall() {
+	s.send(streamStallMsg{sid: s.owner, seq: s.seq})
+}
+
+// OnStreamRetry reports a muted regeneration (streaming retry or the
+// non-streaming fallback): the progress label must explain the silent
+// stretch instead of leaving the bare spinner.
+func (s *StreamAdapter) OnStreamRetry(reason string) {
+	s.send(streamRetryMsg{reason: reason, sid: s.owner, seq: s.seq})
+}
 
 func (s *StreamAdapter) OnThinkingToken(token string) {
 	s.rounds.Thinking(token)

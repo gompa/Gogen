@@ -13,20 +13,28 @@ import (
 // WriteFileAtomic writes content to a file atomically using a temp file + rename.
 // It creates parent directories as needed, preserves existing file permissions
 // when overwriting, and handles unsupported chmod gracefully on some filesystems.
-// The temp file is fsynced before rename for crash safety.
+// The temp file is fsynced before the rename and the containing directory is
+// fsynced after it, so the new content survives a crash or power loss.
 func WriteFileAtomic(path string, content []byte, perm os.FileMode) error {
 	return writeFileSync(path, content, perm, false)
 }
 
 // WriteFileAtomicNoSync is like WriteFileAtomic but skips fsync to reduce
-// SSD wear.  Use only for session files where durability is less critical
-// and writes are frequent.
+// SSD wear.  Use for high-frequency internal state files (session
+// snapshots and deltas, the session index, board state) where write
+// volume matters more than last-write durability: temp+rename still
+// guarantees readers never observe a torn file, and the worst case after
+// a power loss is losing the most recent write. Neither the temp file nor
+// the containing directory is fsynced, so the rename itself may also be
+// lost, reverting to the previous file. Keep fsync (plain
+// WriteFileAtomic) for user-requested file edits and configuration.
 func WriteFileAtomicNoSync(path string, content []byte, perm os.FileMode) error {
 	return writeFileSync(path, content, perm, true)
 }
 
-// writeFileSync is the shared implementation. When skipFSync is true the
-// temp file is not fsynced before rename (trades durability for less SSD wear).
+// writeFileSync is the shared implementation. When skipFSync is true neither
+// the temp file nor the containing directory is fsynced before/after rename
+// (trades durability for less SSD wear).
 func writeFileSync(path string, content []byte, perm os.FileMode, skipFSync bool) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -81,7 +89,60 @@ func writeFileSync(path string, content []byte, perm os.FileMode, skipFSync bool
 		return err
 	}
 	cleanup = false
+	if !skipFSync {
+		// Fsyncing the temp file guarantees its content is durable, but the
+		// directory entry that makes path point at it is not. Fsync the
+		// containing directory so a power loss cannot revert path to the
+		// previous file.
+		if err := syncDir(dir); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// syncDir fsyncs a directory so that a preceding rename or create within it
+// is durable. Some platforms (Windows) and filesystems (FUSE, 9p, network
+// mounts) do not support directory fsync; such an error is logged and treated
+// as success since there is nothing more the caller can do.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		if isDirSyncUnsupported(err) {
+			debuglog.Write("ioutil/write", "directory fsync unsupported; rename durability not guaranteed", "fs-dirsync-unsupported", map[string]any{
+				"dir": dir,
+				"err": err.Error(),
+			})
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// isDirSyncUnsupported reports whether a directory fsync failure is due to the
+// platform or filesystem not supporting the operation rather than a real I/O
+// error. Windows returns ERROR_ACCESS_DENIED (FlushFileBuffers on a directory
+// handle) and some filesystems (e.g. overlayfs) return EINVAL.
+func isDirSyncUnsupported(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.ENOSYS) ||
+		errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.EINVAL) {
+		return true
+	}
+	var pe *os.PathError
+	if errors.As(err, &pe) {
+		if containsAny(strings.ToLower(pe.Err.Error()), "not supported", "not implemented", "operation not supported", "access is denied", "incorrect function", "invalid argument") {
+			return true
+		}
+	}
+	return containsAny(strings.ToLower(err.Error()), "not supported", "not implemented", "operation not supported", "access is denied", "incorrect function", "invalid argument")
 }
 
 // isChmodUnsupported reports whether a chmod failure is a "not supported"

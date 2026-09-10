@@ -8,6 +8,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"gogen/internal/agent"
 	"gogen/internal/llm"
@@ -584,5 +585,34 @@ func TestModelsModalMouse(t *testing.T) {
 	// Non-press events are ignored.
 	if m.handleModelsModalMouse(mouseEvent{x: ox + 5, y: oy + 1 + rowY, button: tea.MouseNone, kind: mouseMotion}) {
 		t.Fatal("motion event was consumed")
+	}
+}
+
+// Regression: the help modal padded its key column with %-24s, which
+// measures the STYLED string (escape runes included) — with colors on the
+// pad never applied and the description column started right after the
+// key. The column is padded by visible width now, so every description
+// starts at the same column.
+func TestHelpModalKeyColumnAligned(t *testing.T) {
+	m := newSidebarTestModel(120)
+	m.SetSize(120, 60)
+	m.modal = ModalHelp
+
+	descs := []string{
+		"Submit input", "Cancel turn", "Line start", "Kill to end",
+		"Scroll line", "Focus / resume", "Show this help",
+	}
+	cols := map[int]int{}
+	for _, l := range strings.Split(stripANSI(m.renderHelpModal()), "\n") {
+		for _, d := range descs {
+			if i := strings.Index(l, d); i >= 0 {
+				// Compare CELL columns (byte indices skew on multibyte
+				// keys like "↑ ↓ j k").
+				cols[ansi.StringWidth(l[:i])]++
+			}
+		}
+	}
+	if len(cols) != 1 {
+		t.Fatalf("help key column is ragged: descriptions start at cells %v", cols)
 	}
 }

@@ -94,6 +94,48 @@ func TestCreateAndReload(t *testing.T) {
 	}
 }
 
+// TestCreateDoesNotAliasCallerStruct pins the store's ownership boundary:
+// Create must store its own copy of the row. Aliasing the caller's struct
+// made post-Create reads (the web handler's "Created automation" notice,
+// the CLI's "Created %s" line) race concurrent mutators — the scheduler's
+// advance or another connection's Update — all writing the same struct
+// (a -race failure in TestAutomationsUpdateOpViaWS). The caller's struct
+// keeps the assigned fields (id, timestamps, next run); store mutations
+// must not reach it, and Get must see the store's own state.
+func TestCreateDoesNotAliasCallerStruct(t *testing.T) {
+	st, _ := newTestStore(t)
+	a := Automation{
+		Title:      "Nightly",
+		Prompt:     "p",
+		WorkingDir: "/x",
+		Schedule:   Schedule{Kind: KindDaily, Time: "09:00", Timezone: "UTC"},
+		Enabled:    true,
+	}
+	if err := st.Create(&a); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// Mutate the STORED row through the sanctioned API. With the pre-fix
+	// aliasing, SetEnabled(false) wrote the SHARED struct and the caller's
+	// read saw the store's value; with the copy boundary, the caller's own
+	// struct keeps what Create assigned.
+	if err := st.SetEnabled(a.ID, false); err != nil {
+		t.Fatalf("SetEnabled: %v", err)
+	}
+	if !a.Enabled {
+		t.Fatal("Create aliased the caller's struct: a store-side mutation reached it")
+	}
+	got, ok := st.Get(a.ID)
+	if !ok {
+		t.Fatal("created row vanished")
+	}
+	if got.Enabled {
+		t.Fatal("SetEnabled did not reach the stored row")
+	}
+	if got.Title != a.Title || got.Prompt != a.Prompt {
+		t.Fatalf("store row drifted from the created values: %+v vs caller %+v", got, a)
+	}
+}
+
 func TestCreateRejectsInvalid(t *testing.T) {
 	st, _ := newTestStore(t)
 	cases := []struct {

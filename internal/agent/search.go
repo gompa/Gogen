@@ -79,7 +79,9 @@ func (e *Executor) SearchCodeMatches(ctx context.Context, pattern, subpath, glob
 	if err != nil {
 		return nil, false, err
 	}
-	matches, truncated, _, err = e.searchStructured(ctx, searchRoot, relPrefix, pattern, glob, false)
+	// Structured results for the UI: skipped subtrees are not surfaced here
+	// (nil skips); SearchCode carries the footer for the model.
+	matches, truncated, _, err = e.searchStructured(ctx, searchRoot, relPrefix, pattern, glob, false, nil)
 	return matches, truncated, err
 }
 
@@ -149,18 +151,23 @@ func (e *Executor) SearchCode(ctx context.Context, pattern, subpath, glob string
 		return "", err
 	}
 
+	// skips accumulates unreadable-subtree errors from the Go-fallback walk
+	// and is appended as a footer so a partial result is never presented as
+	// complete. The rg path never walks, so it leaves skips empty.
+	skips := &walkSkips{}
+
 	// Context-free searches go through the structured path shared with
 	// SearchCodeMatches; context-lines mode keeps the raw-output formatter.
 	if contextLines == 0 {
-		matches, truncated, engine, sErr := e.searchStructured(ctx, searchRoot, relPrefix, pattern, glob, ignoreCase)
+		matches, truncated, engine, sErr := e.searchStructured(ctx, searchRoot, relPrefix, pattern, glob, ignoreCase, skips)
 		if sErr != nil {
 			return "", sErr
 		}
 		if len(matches) == 0 {
 			if engine == "go" {
-				return "No matches found (go fallback; install ripgrep for faster search)", nil
+				return "No matches found (go fallback; install ripgrep for faster search)" + skips.footer(), nil
 			}
-			return "No matches found", nil
+			return "No matches found" + skips.footer(), nil
 		}
 		out := formatSearchMatches(matches)
 		if engine == "go" {
@@ -169,21 +176,21 @@ func (e *Executor) SearchCode(ctx context.Context, pattern, subpath, glob string
 		if truncated {
 			out += fmt.Sprintf("\n… truncated (showing first %d matches)", len(matches))
 		}
-		return out, nil
+		return out + skips.footer(), nil
 	}
 
 	if _, err := exec.LookPath("rg"); err == nil {
 		out, rgErr := e.searchWithRipgrep(ctx, searchRoot, relPrefix, pattern, glob, contextLines, ignoreCase)
 		if rgErr == nil {
-			return out, nil
+			return out + skips.footer(), nil
 		}
 	}
 
-	out, goErr := e.searchWithGo(ctx, searchRoot, relPrefix, pattern, glob, contextLines, ignoreCase)
+	out, goErr := e.searchWithGo(ctx, searchRoot, relPrefix, pattern, glob, contextLines, ignoreCase, skips)
 	if goErr != nil {
 		return "", goErr
 	}
-	return out, nil
+	return out + skips.footer(), nil
 }
 
 // ReplaceInTree replaces every regex match of pattern with replacement under
@@ -351,7 +358,7 @@ func runRipgrep(ctx context.Context, searchRoot, pattern, glob string, contextLi
 
 	cmd := exec.CommandContext(ctx, "rg", args...)
 	cmd.Dir = searchRoot
-	out := newCommandOutputWriter("rg", nil, searchMaxOutputBytes)
+	out := newCommandOutputWriter("rg", nil, searchMaxOutputBytes, nil)
 	cmd.Stdout = out
 	cmd.Stderr = out
 	runErr := cmd.Run()
@@ -520,7 +527,7 @@ func splitSearchMatchLine(line string) (path string, lineNum int, content string
 // Go fallback, and returns structured matches (context_lines=0 semantics).
 // engine is "rg" or "go" so callers can reproduce the per-engine output
 // footer SearchCode shows.
-func (e *Executor) searchStructured(ctx context.Context, searchRoot, relPrefix, pattern, glob string, ignoreCase bool) (matches []SearchMatch, truncated bool, engine string, err error) {
+func (e *Executor) searchStructured(ctx context.Context, searchRoot, relPrefix, pattern, glob string, ignoreCase bool, skips *walkSkips) (matches []SearchMatch, truncated bool, engine string, err error) {
 	if _, err := exec.LookPath("rg"); err == nil {
 		ms, trunc, rgErr := e.searchWithRipgrepMatches(ctx, searchRoot, relPrefix, pattern, glob, ignoreCase)
 		if rgErr == nil {
@@ -528,7 +535,7 @@ func (e *Executor) searchStructured(ctx context.Context, searchRoot, relPrefix, 
 		}
 		// Real rg failure — fall back to the Go walker (matches SearchCode).
 	}
-	ms, truncated, err := e.searchWithGoMatches(ctx, searchRoot, relPrefix, pattern, glob, ignoreCase)
+	ms, truncated, err := e.searchWithGoMatches(ctx, searchRoot, relPrefix, pattern, glob, ignoreCase, skips)
 	return ms, truncated, "go", err
 }
 
@@ -580,7 +587,7 @@ var errSearchWalkStop = errors.New("search walk stopped")
 // is compiled once and the glob trimmed once by the walker, so the formatted
 // and structured search paths cannot drift on setup. scan errors are
 // swallowed (the file is skipped), matching the historical behavior.
-func walkSearchFiles[T any](ctx context.Context, searchRoot, relPrefix, pattern, glob string, ignoreCase bool,
+func walkSearchFiles[T any](ctx context.Context, searchRoot, relPrefix, pattern, glob string, ignoreCase bool, skips *walkSkips,
 	scan func(reader io.Reader, rel string, re *regexp.Regexp, matchLimit int) ([]T, error),
 	size func(item T) int) (items []T, truncated bool, err error) {
 	re, err := compileSearchPattern(pattern, ignoreCase)
@@ -590,7 +597,7 @@ func walkSearchFiles[T any](ctx context.Context, searchRoot, relPrefix, pattern,
 	glob = strings.TrimSpace(glob)
 
 	var bytesUsed int
-	err = walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true}, func(path, rel string, d os.DirEntry) error {
+	err = walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true, onSkip: skips.observe}, func(path, rel string, d os.DirEntry) error {
 		limit := searchMaxMatches - len(items)
 		if limit <= 0 {
 			// Match cap reached: stop the walk and report truncation.
@@ -633,8 +640,8 @@ func walkSearchFiles[T any](ctx context.Context, searchRoot, relPrefix, pattern,
 // the rendered output. The match cap, byte budget, and file probing are
 // shared with searchWithGoMatches via walkSearchFiles; only the per-file
 // scanner (scanFileSinglePass) and the rendering differ.
-func (e *Executor) searchWithGo(ctx context.Context, searchRoot, relPrefix, pattern, glob string, contextLines int, ignoreCase bool) (string, error) {
-	lines, truncated, err := walkSearchFiles(ctx, searchRoot, relPrefix, pattern, glob, ignoreCase,
+func (e *Executor) searchWithGo(ctx context.Context, searchRoot, relPrefix, pattern, glob string, contextLines int, ignoreCase bool, skips *walkSkips) (string, error) {
+	lines, truncated, err := walkSearchFiles(ctx, searchRoot, relPrefix, pattern, glob, ignoreCase, skips,
 		func(reader io.Reader, rel string, re *regexp.Regexp, matchLimit int) ([]string, error) {
 			return scanFileSinglePass(reader, rel, re, contextLines, matchLimit)
 		},
@@ -655,8 +662,8 @@ func (e *Executor) searchWithGo(ctx context.Context, searchRoot, relPrefix, patt
 // searchWithGoMatches runs the Go fallback walker and returns structured
 // matches (context_lines=0 semantics) plus the truncation flag. Paths are
 // already workspace-relative with relPrefix applied by walkTree.
-func (e *Executor) searchWithGoMatches(ctx context.Context, searchRoot, relPrefix, pattern, glob string, ignoreCase bool) ([]SearchMatch, bool, error) {
-	matches, truncated, err := walkSearchFiles(ctx, searchRoot, relPrefix, pattern, glob, ignoreCase,
+func (e *Executor) searchWithGoMatches(ctx context.Context, searchRoot, relPrefix, pattern, glob string, ignoreCase bool, skips *walkSkips) ([]SearchMatch, bool, error) {
+	matches, truncated, err := walkSearchFiles(ctx, searchRoot, relPrefix, pattern, glob, ignoreCase, skips,
 		scanFileMatches,
 		func(m SearchMatch) int { return searchMatchLineLen(m) + 1 })
 	if err != nil {

@@ -232,6 +232,48 @@ func TestSchedulerStopPreventsFiring(t *testing.T) {
 	}
 }
 
+// TestSchedulerSaturatedPoolDoesNotStallSweep pins the sweep/spawn-slot
+// decoupling: with every slot busy on a long-running fire, the sweep
+// goroutine must not block on the spawn semaphore. A stalled sweep would
+// stop claiming later-due rows (their next_run_at would not advance) and,
+// because Stop() cannot interrupt a blocked channel send, would leave
+// Done() open until a slot frees.
+func TestSchedulerSaturatedPoolDoesNotStallSweep(t *testing.T) {
+	fire := &recordingFire{delay: 600 * time.Millisecond}
+	s, st, cursor := newSchedulerTest(t, fire.Fire)
+
+	// One more due row than slots: the extra claim must park on the
+	// semaphore inside its own goroutine without stalling the sweep.
+	ids := make([]string, 0, maxConcurrentFires+1)
+	for i := 0; i < maxConcurrentFires+1; i++ {
+		ids = append(ids, dueAutomation(t, st, cursor).ID)
+	}
+
+	s.Start(context.Background())
+	waitCond(t, 2*time.Second, "spawn slots saturated", func() bool {
+		return fire.count() == maxConcurrentFires
+	})
+
+	// The sweep has spawned every claim and returned to its select even
+	// though the pool is full and one fire is queued: Done must close on
+	// Stop, well before the in-flight fires drain.
+	s.Stop()
+	select {
+	case <-s.Done():
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("sweep goroutine blocked on the spawn semaphore: Stop did not close Done")
+	}
+
+	// Claimed-before-stop rows still fire (the queued fire waits for a
+	// slot instead of being dropped).
+	for _, id := range ids {
+		awaitRunTerminal(t, st, id)
+	}
+	if n := fire.count(); n != maxConcurrentFires+1 {
+		t.Fatalf("fires = %d, want %d (a queued claim must still fire)", n, maxConcurrentFires+1)
+	}
+}
+
 func TestSchedulerStartIdempotent(t *testing.T) {
 	fire := &recordingFire{delay: time.Second}
 	s, st, cursor := newSchedulerTest(t, fire.Fire)
@@ -293,6 +335,12 @@ func TestHelperProcess(t *testing.T) {
 		os.Exit(0)
 	case "fail":
 		report()
+		// Emit more than stderrTailCap of leading noise, then the real error:
+		// the captured detail keeps the TAIL, so the error line must survive
+		// and the earliest noise must be evicted (cappedTail regression).
+		for i := 0; i < 64; i++ {
+			fmt.Fprintf(os.Stderr, "noise line %03d %s\n", i, strings.Repeat("x", 72))
+		}
 		fmt.Fprintln(os.Stderr, "Error: model unreachable")
 		os.Exit(3)
 	case "hang":
@@ -380,6 +428,12 @@ func TestProcessFireFailureCapturesStderr(t *testing.T) {
 		}
 		if !strings.Contains(res.Detail, "model unreachable") {
 			t.Fatalf("stderr tail lost: %q", res.Detail)
+		}
+		// The helper writes > stderrTailCap of noise before the error: the
+		// earliest line must have been evicted, proving the writer keeps the
+		// newest bytes (a head-only cap would return only the noise).
+		if strings.Contains(res.Detail, "noise line 000") {
+			t.Fatalf("cappedTail kept the head instead of the tail: %q", res.Detail)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("run did not finish")

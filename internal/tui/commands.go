@@ -94,6 +94,12 @@ var tuiCommands = []tuiCommand{
 		return trimmed == "open" || trimmed == "/open" ||
 			strings.HasPrefix(trimmed, "open ") || strings.HasPrefix(trimmed, "/open ")
 	}, run: cmdOpen},
+	// /queue opens the queued-messages modal (per-item cancel). Reachable
+	// mid-turn too — handleSubmitKey intercepts it before the busy
+	// command refusal.
+	{match: func(input, trimmed string) bool {
+		return trimmed == "queue" || trimmed == "/queue"
+	}, run: cmdQueue},
 }
 
 // cmdOpen handles /open [label]: spawn an additional live session via the
@@ -190,6 +196,8 @@ func cmdCompact(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 	sess.compactSeq++
 	seq := sess.compactSeq
 	m.compacting = true
+	m.applyComposerPlaceholder()
+	m.relayout()
 	a := m.agent
 	compactCmd := func() tea.Msg {
 		defer cancel()
@@ -389,71 +397,43 @@ func (m *Model) saveConfig(includeSecrets bool) error {
 
 // deliveryRequestMsg requests a system message delivery (job completion
 // notice, scheduled reminder, subagent report). Producers send it via
-// m.program.Send from arbitrary goroutines; Update appends it to
-// pendingDeliveries and drains when the TUI is idle, so Messages is only
-// ever touched on the Update thread (via the streamCmd goroutine, the same
-// ownership contract as user input).
+// m.program.Send from arbitrary goroutines; Update appends it to the
+// target session's steering queue and drains when that session is idle, so
+// Messages is only ever touched on the Update thread (via the streamCmd
+// goroutine, the same ownership contract as user input).
 type deliveryRequestMsg struct {
+	// sid is the routing id of the session the notice belongs to (the
+	// producer's own slot — job notices are per-session). Update resolves
+	// it so a focus switch between the hook firing (background goroutine)
+	// and this handler cannot land the notice on another session; empty
+	// falls back to the focused session (direct constructions, tests).
+	sid  string
 	text string
 }
 
-// startTurn runs an agent turn on text, rendering chatLine as the
-// user-facing chat entry and wiring the per-session streaming state (seq,
-// cancel, adapter, delete approver) shared by every turn entry point.
-// chatLine is passed pre-rendered because the entry points style it
-// differently (UserStyle label + plain text vs a fully SystemStyle line).
-// Callers must ensure !m.streaming.
+// startTurn runs an agent turn on text for the FOCUSED session, rendering
+// chatLine as the user-facing chat entry and wiring the per-session
+// streaming state. chatLine is passed pre-rendered because the entry
+// points style it differently (UserStyle label + plain text vs a fully
+// SystemStyle line). Callers must ensure !m.streaming; the per-session
+// wiring itself lives in startTurnOn (steering.go), which also serves
+// background sessions' queue drains.
 func (m *Model) startTurn(text, chatLine string) tea.Cmd {
 	m.appendChatLine(chatLine)
 	m.streaming = true
 	m.resetStreamState(false)
+	m.applyComposerPlaceholder()
 	startProgress := m.setProgress(progressThinking, "thinking")
-
-	// Create cancelable context for the LLM call (no lastActive stamp:
-	// only a COMPLETED turn produces output — the web bumps a row on
-	// output, not on submit).
-	sess := m.turnSession()
-	sess.streaming = true
-	// Bump the turn generation BEFORE the goroutine starts: every message
-	// this turn emits (and its terminal) carries the new seq, so a later
-	// cancel + resubmit supersedes it cleanly.
-	sess.turnSeq++
-	seq := sess.turnSeq
-	streamCtx, cancelFn := context.WithCancel(m.ctx)
-	sess.cancel = cancelFn
-
-	adapter := NewStreamAdapter(sess.id, seq, m.program, sess)
-	a := m.agent
-	approver := m.makeDeleteApprover(sess.id, m.program)
-
-	streamCmd := func() tea.Msg {
-		defer cancelFn()
-		_, err := a.StreamProcessInput(
-			agent.ContextWithDeleteApprover(streamCtx, approver),
-			text,
-			adapter.Handlers(),
-		)
-		if err != nil {
-			return failOfStream(sess.id, seq, err)
-		}
-		// Return streamEndMsg directly so handleStreamEnd refreshes context
-		// stats synchronously after Messages are final.
-		return endOfStream(sess.id, seq)
-	}
-	return tea.Batch(startProgress, streamCmd)
+	m.relayout()
+	return tea.Batch(startProgress, m.startTurnOn(m.turnSession(), text))
 }
 
-// submitDeliveredText renders a system-delivered message as a user line and
-// runs a turn on it — the same flow as submitUserInput minus the input
-// history bookkeeping. Callers must ensure !m.streaming.
-func (m *Model) submitDeliveredText(text string) tea.Cmd {
-	return m.startTurn(text, SystemStyle.Render(noticeLabel+" "+text))
-}
-
-// drainDeliveries starts the next queued system delivery when the TUI is
-// idle. Returns nil when nothing is queued or a turn (or an async
-// /compact) is running; the next delivery (if any) drains at the next
-// stream end.
+// drainDeliveries starts the next queued item (system delivery or user
+// steering message — one FIFO queue per session, see steering.go) when the
+// FOCUSED session is idle. Returns nil when nothing is queued or a turn
+// (or an async /compact) is running; the next item drains at the next
+// terminal boundary. Background sessions drain their own queues at their
+// own turn boundaries (handleTurnFinishedMsg).
 func (m *Model) drainDeliveries() tea.Cmd {
 	if m.streaming || m.compacting {
 		return nil
@@ -465,12 +445,7 @@ func (m *Model) drainDeliveries() tea.Cmd {
 		m.appendChatLine(SystemStyle.Render(fmt.Sprintf("%d background message(s) dropped (delivery queue full).", m.deliveryDrops)))
 		m.deliveryDrops = 0
 	}
-	if len(m.pendingDeliveries) == 0 {
-		return nil
-	}
-	text := m.pendingDeliveries[0]
-	m.pendingDeliveries = m.pendingDeliveries[1:]
-	return m.submitDeliveredText(text)
+	return m.drainSessionQueue(m.focusedSession())
 }
 
 // submitUserInput sends user input to the agent for processing.

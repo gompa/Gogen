@@ -55,6 +55,7 @@ func (r *recordingSink) OnStreamActivity()            { r.record("OnStreamActivi
 func (r *recordingSink) OnCompacting()                { r.record("OnCompacting") }
 func (r *recordingSink) OnCondensed(note string)      { r.record("OnCondensed") }
 func (r *recordingSink) OnStreamStall()               { r.record("OnStreamStall") }
+func (r *recordingSink) OnStreamRetry(reason string)  { r.record("OnStreamRetry") }
 func (r *recordingSink) OnThinkingToken(token string) { r.record("OnThinkingToken") }
 func (r *recordingSink) OnToken(token string)         { r.record("OnToken") }
 func (r *recordingSink) OnStreamEnd()                 { r.record("OnStreamEnd") }

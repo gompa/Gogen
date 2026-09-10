@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/v3"
 )
 
 func TestDecodeJSONFieldText(t *testing.T) {

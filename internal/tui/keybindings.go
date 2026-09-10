@@ -7,6 +7,7 @@ type KeyMap struct {
 	// Input
 	Submit        key.Binding
 	CancelTurn    key.Binding
+	QueueModal    key.Binding
 	ForceQuit     key.Binding
 	BackwardWord  key.Binding
 	ForwardWord   key.Binding
@@ -43,6 +44,7 @@ type KeyMap struct {
 var DefaultKeyMap = KeyMap{
 	Submit:        key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "submit")),
 	CancelTurn:    key.NewBinding(key.WithKeys("ctrl+c"), key.WithHelp("ctrl+c", "cancel turn / quit")),
+	QueueModal:    key.NewBinding(key.WithKeys("ctrl+q"), key.WithHelp("ctrl+q", "queued messages")),
 	ForceQuit:     key.NewBinding(key.WithKeys("ctrl+\\"), key.WithHelp("ctrl+\\", "force quit")),
 	BackwardWord:  key.NewBinding(key.WithKeys("ctrl+left"), key.WithHelp("ctrl+←", "word left")),
 	ForwardWord:   key.NewBinding(key.WithKeys("ctrl+right"), key.WithHelp("ctrl+→", "word right")),

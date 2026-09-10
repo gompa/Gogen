@@ -116,6 +116,16 @@ func (sk *wsStreamSink) OnCondensed(note string) {
 
 func (sk *wsStreamSink) OnStreamStall() {}
 
+// OnStreamRetry tells the client a failed stream attempt is being retried
+// (muted streaming retry, or the non-streaming fallback): the retry
+// regenerates the whole response with live delivery muted, so the client's
+// progress label should explain the silent window instead of a bare
+// "Thinking…". Clients without a stream_retry handler ignore the frame
+// (unknown types fall through both dispatcher switches).
+func (sk *wsStreamSink) OnStreamRetry(reason string) {
+	sk.write(WSMessage{Type: "stream_retry", Reason: reason})
+}
+
 func (sk *wsStreamSink) OnThinkingToken(token string) {
 	sk.rounds.Thinking(token)
 }

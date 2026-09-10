@@ -28,7 +28,8 @@ func (e *Executor) RepoOverview(ctx context.Context) (string, error) {
 	var rootFiles []string
 	total := 0
 
-	err = walkTree(ctx, searchRoot, "", walkOpts{}, func(path, rel string, d os.DirEntry) error {
+	skips := &walkSkips{}
+	err = walkTree(ctx, searchRoot, "", walkOpts{onSkip: skips.observe}, func(path, rel string, d os.DirEntry) error {
 		top := firstPathSegment(rel)
 		if top == "" {
 			// Root-level file
@@ -86,7 +87,7 @@ func (e *Executor) RepoOverview(ctx context.Context) (string, error) {
 		b.WriteString("\n\nSuggested reads: " + strings.Join(hints, ", "))
 	}
 
-	return strings.TrimRight(b.String(), "\n"), nil
+	return strings.TrimRight(b.String(), "\n") + skips.footer(), nil
 }
 
 // firstPathSegment returns the first component of a slash-separated path.

@@ -418,6 +418,34 @@ func (m *Manager) SetContextLimit(limit int) {
 
 const toolResultTruncationMarker = "\n… truncated ("
 
+// HasTruncationMarker reports whether content carries the standard
+// tool-result truncation marker ANYWHERE. It is the cheap "looks capped"
+// signal: usage stats, and the conservative rule that a later cap must not
+// rewrite a body that may already be partial (a false positive leaves an
+// oversized body alone, which the spill preview needs — its marker sits
+// mid-body, before the retained tail). Callers that must know whether the
+// body's data beyond the cut still exists — i.e. whether re-salvaging it is
+// worthwhile — use the precise HasTruncatedTail instead.
+func HasTruncationMarker(content string) bool {
+	return strings.Contains(content, toolResultTruncationMarker)
+}
+
+// HasTruncatedTail reports whether content was capped by a truncation
+// producer: the standard marker opens the body's LAST line, which is the
+// shape every producer writes (truncateToolResult appends it inside the
+// budget, and the per-tool cap footers in internal/agent append it last).
+// The precise form of HasTruncationMarker for decisions that must not fire
+// on a body that merely quotes the marker text (a file being read, a session
+// snapshot, a log line): such a body was not truncated, and only this form
+// distinguishes it from a genuinely capped one.
+func HasTruncatedTail(content string) bool {
+	i := strings.LastIndex(content, toolResultTruncationMarker)
+	if i < 0 {
+		return false
+	}
+	return !strings.Contains(content[i+len(toolResultTruncationMarker):], "\n")
+}
+
 // TruncateToolResult caps tool output stored in canonical history / LLM views.
 func (m *Manager) TruncateToolResult(content string) string {
 	m.mu.RLock()

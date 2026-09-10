@@ -1,13 +1,226 @@
 package server
 
 import (
+	"fmt"
+	"sync"
 	"time"
+
+	"gogen/internal/llm"
 )
 
-// defaultDeliverQueueCap bounds pending system message deliveries per
-// runtime. Overflow drops the OLDEST delivery (freshness wins — a stale job
-// notice is worse than none) and toasts the drop.
+// deliverKind distinguishes the two producers sharing one FIFO queue per
+// runtime: system-generated messages (job notices, scheduled reminders,
+// subagent reports — rendered as notices) and user steering messages (typed
+// into a busy session — rendered as the user's own message). One queue, one
+// drain path; the kind only changes presentation and policy.
+type deliverKind int
+
+const (
+	deliverSystem deliverKind = iota
+	deliverUser
+)
+
+// deliverItem is one queued turn waiting for the session to go idle.
+type deliverItem struct {
+	// ID is the queue-item identity the client correlates its queued
+	// bubble against (queue_update reconciliation). Client-provided for
+	// user items (queueId on the inbound message frame); generated for
+	// system items.
+	ID   string
+	Text string
+	Kind deliverKind
+	// Images carries user-attached images (nil for system items).
+	Images []llm.ImageInput
+}
+
+// defaultDeliverQueueCap bounds pending SYSTEM message deliveries per
+// runtime. Overflow drops the OLDEST system delivery (freshness wins — a
+// stale job notice is worse than none) and toasts the drop. User items are
+// never dropped by system overflow (the scan below drops the oldest
+// system-kind entry), and system enqueue is never blocked by a queue full
+// of user steering messages: the caps are per-kind.
 const defaultDeliverQueueCap = 5
+
+// maxUserQueueCap bounds USER steering messages per runtime. Unlike system
+// deliveries, user text is never silently dropped: overflow REJECTS the new
+// message at submit time with a visible error.
+const maxUserQueueCap = 20
+
+var (
+	queueIDMu  sync.Mutex
+	queueIDSeq uint64
+	queueIDAdd = uint64(time.Now().UnixNano() & 0xffff)
+)
+
+// newQueueItemID generates a unique queue-item id ("q_<seed>_<seq>").
+func newQueueItemID() string {
+	queueIDMu.Lock()
+	queueIDSeq++
+	seq := queueIDSeq
+	queueIDMu.Unlock()
+	return fmt.Sprintf("q_%x_%x", queueIDAdd, seq)
+}
+
+// maxQueueIDLen bounds a client-supplied queue id: it is a correlation
+// token, never content, and the server-generated form is ~20 characters.
+const maxQueueIDLen = 64
+
+// validQueueID reports whether a client-supplied queue id is usable as a
+// correlation token: non-empty, bounded, and made of URL-safe token
+// characters (the client's own "q-<n>-<base36>" shape). Anything else is
+// replaced by a generated id rather than stored and broadcast verbatim.
+func validQueueID(id string) bool {
+	if id == "" || len(id) > maxQueueIDLen {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
+			c == '-', c == '_', c == '.':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// queueIDInUseLocked reports whether id is already queued for this runtime.
+// Caller holds deliverMu.
+func (rt *sessionRuntime) queueIDInUseLocked(id string) bool {
+	for _, it := range rt.pendingDeliver {
+		if it.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// enqueueUserTurn queues a user steering message typed while a turn is
+// running: it is delivered FIFO as the next user turn after the in-flight
+// one ends. id is the client-provided correlation id (empty → generated).
+//
+// User text is never silently dropped: when the per-kind cap is reached the
+// enqueue is REFUSED (ok=false) and the caller reports the rejection. The
+// item keeps the runtime alive (hasPendingDeliveries counts it), so a
+// queued message still runs after the user closes every tab.
+func (rt *sessionRuntime) enqueueUserTurn(id, content string, images []llm.ImageInput) bool {
+	if rt == nil || rt.evicted.Load() {
+		return false
+	}
+	rt.deliverMu.Lock()
+	if rt.countUser() >= maxUserQueueCap {
+		rt.deliverMu.Unlock()
+		return false
+	}
+	// The client's id is the correlation key for its optimistic bubble, so a
+	// usable one is kept verbatim; a missing, oversized, or non-token-shaped
+	// id gets a server-generated one, and so does a DUPLICATE — two queued
+	// items sharing an id would collapse into one entry in every client's
+	// per-id bubble map, so a removal or drain would clear the wrong chip.
+	// (The client's own ids carry a per-tab nonce, so a duplicate only ever
+	// arrives from a hand-built frame.)
+	if !validQueueID(id) || rt.queueIDInUseLocked(id) {
+		id = newQueueItemID()
+	}
+	rt.pendingDeliver = append(rt.pendingDeliver, deliverItem{ID: id, Text: content, Kind: deliverUser, Images: images})
+	if !rt.deliverWorker.Swap(true) {
+		go rt.deliverLoop()
+	}
+	rt.deliverMu.Unlock()
+	rt.broadcastQueueState()
+	select {
+	case rt.deliverNotify <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+// countUser counts queued user items. Caller holds deliverMu.
+func (rt *sessionRuntime) countUser() int {
+	n := 0
+	for _, it := range rt.pendingDeliver {
+		if it.Kind == deliverUser {
+			n++
+		}
+	}
+	return n
+}
+
+// broadcastQueueState sends a queue_update frame describing the runtime's
+// queued items. Called on every queue mutation so every attached client
+// (all tabs, background panes) renders the same queue state. left lists
+// item ids that left the queue because their turn STARTED (the drain's
+// pop — the frame reaches every client before the started turn's
+// user_acked): the client clears those items' queued chips and resolves
+// the paired user_acked normally. Ids absent from the frame entirely were
+// REMOVED before running (per-item ✕, clear-all, interrupt) and render as
+// cancelled-before-running. Deliberately OUTSIDE deliverMu (same
+// self-deadlock chain as deliverToSession's overflow notice: broadcast →
+// detach → evictOrphaned → deliverMu).
+func (rt *sessionRuntime) broadcastQueueState(left ...string) {
+	rt.broadcast(WSMessage{Type: "queue_update", SessionID: rt.agent.SessionID, Queue: rt.queueItems(), QueueLeft: left})
+}
+
+// queueItems snapshots the queue for the wire (user items only are sent:
+// system deliveries are the agent's internal bookkeeping, and image data
+// stays out of the frame — the sending tab already rendered its bubble).
+func (rt *sessionRuntime) queueItems() []QueueItem {
+	rt.deliverMu.Lock()
+	defer rt.deliverMu.Unlock()
+	out := make([]QueueItem, 0, len(rt.pendingDeliver))
+	for _, it := range rt.pendingDeliver {
+		if it.Kind == deliverUser {
+			out = append(out, QueueItem{ID: it.ID, Text: it.Text})
+		}
+	}
+	return out
+}
+
+// removeQueuedItem drops one USER queue item by id. System deliveries are
+// not individually removable (machine bookkeeping). Reports whether an item
+// was removed; the caller broadcasts the new state.
+func (rt *sessionRuntime) removeQueuedItem(id string) bool {
+	if rt == nil || id == "" {
+		return false
+	}
+	rt.deliverMu.Lock()
+	removed := false
+	for i, it := range rt.pendingDeliver {
+		if it.Kind == deliverUser && it.ID == id {
+			rt.pendingDeliver = append(rt.pendingDeliver[:i], rt.pendingDeliver[i+1:]...)
+			removed = true
+			break
+		}
+	}
+	rt.deliverMu.Unlock()
+	return removed
+}
+
+// clearUserQueue drops every USER queue item (the interrupt semantic:
+// "stop what you're doing" removes the user's own queued text) and returns
+// how many were removed. SYSTEM deliveries are deliberately kept — they are
+// machine bookkeeping (job notices, subagent reports, reply capture) whose
+// loss strands the delivery machinery. Caller broadcasts the new state when
+// the count is non-zero.
+func (rt *sessionRuntime) clearUserQueue() int {
+	if rt == nil {
+		return 0
+	}
+	rt.deliverMu.Lock()
+	kept := rt.pendingDeliver[:0]
+	removed := 0
+	for _, it := range rt.pendingDeliver {
+		if it.Kind == deliverUser {
+			removed++
+			continue
+		}
+		kept = append(kept, it)
+	}
+	rt.pendingDeliver = kept
+	rt.deliverMu.Unlock()
+	return removed
+}
 
 // deliverToSession injects a system-generated message into the session as a
 // user message and runs a turn on it at the next idle boundary. It never
@@ -31,12 +244,24 @@ func (rt *sessionRuntime) deliverToSession(text string) bool {
 	}
 	rt.deliverMu.Lock()
 	dropped := false
-	if len(rt.pendingDeliver) >= defaultDeliverQueueCap {
-		copy(rt.pendingDeliver, rt.pendingDeliver[1:])
-		rt.pendingDeliver = rt.pendingDeliver[:len(rt.pendingDeliver)-1]
-		dropped = true
+	nSys := 0
+	for _, it := range rt.pendingDeliver {
+		if it.Kind == deliverSystem {
+			nSys++
+		}
 	}
-	rt.pendingDeliver = append(rt.pendingDeliver, text)
+	if nSys >= defaultDeliverQueueCap {
+		// Per-kind cap: drop the OLDEST SYSTEM item. A queue holding user
+		// steering messages must not lose them to a system overflow.
+		for i, it := range rt.pendingDeliver {
+			if it.Kind == deliverSystem {
+				rt.pendingDeliver = append(rt.pendingDeliver[:i], rt.pendingDeliver[i+1:]...)
+				dropped = true
+				break
+			}
+		}
+	}
+	rt.pendingDeliver = append(rt.pendingDeliver, deliverItem{ID: newQueueItemID(), Text: text, Kind: deliverSystem})
 	if !rt.deliverWorker.Swap(true) {
 		go rt.deliverLoop()
 	}
@@ -121,10 +346,12 @@ func (r *sessionRegistry) clearParentDeliveries(id string) {
 	r.parentDeliverMu.Unlock()
 }
 
-// deliverLoop is the per-runtime delivery worker (at most one per runtime,
-// guarded by deliverWorker). It pops one queued message, waits for the
-// session turn lock (the idle check), hands the lock to startTurn (whose
-// goroutine defers the unlock), and repeats until the queue is empty.
+// deliverLoop is the per-runtime queue worker (at most one per runtime,
+// guarded by deliverWorker). It pops one queued item — a system delivery or
+// a user steering message, strict FIFO arrival order across both kinds —
+// waits for the session turn lock (the idle check), hands the lock to
+// startTurn (whose goroutine defers the unlock), and repeats until the
+// queue is empty.
 //
 // The wake-up signal comes from setTurnActive(false), which every turn
 // runner (startTurn, runChildTurn, compact) calls on exit — so the worker
@@ -143,11 +370,11 @@ func (rt *sessionRuntime) deliverLoop() {
 			return
 		}
 		// Peek, do NOT pop yet: the item must stay visible to
-		// evictOrphaned's hasPendingDeliveries until the delivery turn is
+		// evictOrphaned's hasPendingDeliveries until the delivered turn is
 		// actually starting. Popping first opened a handoff window (queue
 		// empty, turnMu still free) where the just-ended turn's orphan
-		// re-check could evict the runtime and drop the delivery.
-		text := rt.pendingDeliver[0]
+		// re-check could evict the runtime and drop the item.
+		item := rt.pendingDeliver[0]
 		rt.deliverMu.Unlock()
 
 		if rt.evicted.Load() {
@@ -181,7 +408,9 @@ func (rt *sessionRuntime) deliverLoop() {
 		// lock to startTurn (its goroutine defers the unlock). The
 		// delivery-start hook (if any) fires immediately before, so
 		// consumers can arm per-delivery state exactly when the delivered
-		// turn begins.
+		// turn begins — SYSTEM items only: the hook arms send_message
+		// reply capture, which must not treat a user steering message as
+		// a system delivery.
 		//
 		// Re-verify the head under the lock before popping: the queue can
 		// shift between the peek above and this pop (an overflow drop or an
@@ -190,17 +419,34 @@ func (rt *sessionRuntime) deliverLoop() {
 		// do NOT pop the (different) item now at the head and deliver the
 		// stale one; release the turn lock and re-peek instead.
 		rt.deliverMu.Lock()
-		if len(rt.pendingDeliver) == 0 || rt.pendingDeliver[0] != text {
+		if len(rt.pendingDeliver) == 0 || rt.pendingDeliver[0].ID != item.ID {
 			rt.deliverMu.Unlock()
 			rt.turnMu.Unlock()
 			continue
 		}
+		item = rt.pendingDeliver[0]
 		rt.pendingDeliver = rt.pendingDeliver[1:]
 		rt.deliverMu.Unlock()
-		if rt.deliverStartHook != nil {
+		// A USER item left the queue to run: every attached client must see
+		// the queue state converge (the sending tab's optimistic queued
+		// bubble resolves against this frame; the paired user_acked —
+		// emitted by the turn this pop starts, after this broadcast —
+		// resolves its pending ack and carries the real history index).
+		// The frame carries the id in queueLeft so the client clears the
+		// queued chip instead of rendering the bubble
+		// cancelled-before-running. SYSTEM deliveries are not on the wire
+		// queue (queueItems sends user items only), so their pops change
+		// nothing client-visible — no frame.
+		if item.Kind == deliverUser {
+			rt.broadcastQueueState(item.ID)
+		}
+		if item.Kind == deliverSystem && rt.deliverStartHook != nil {
 			rt.deliverStartHook()
 		}
-		rt.startTurn(nil, text, nil)
+		// The drain pops ONE item per turn: the turn-end signal wakes the
+		// worker for the next one, so multiple queued items drain in order
+		// across consecutive turns.
+		rt.startTurn(nil, item.Text, item.Images)
 	}
 }
 
@@ -216,8 +462,9 @@ func (rt *sessionRuntime) signalDeliveries() {
 }
 
 // hasPendingDeliveries reports whether the runtime has undelivered queued
-// system messages. Consulted by orphan eviction: a runtime with a non-empty
-// queue is not idle.
+// items (system deliveries AND user steering messages). Consulted by orphan
+// eviction: a runtime with a non-empty queue is not idle — a queued message
+// still runs after the user closes every tab.
 func (rt *sessionRuntime) hasPendingDeliveries() bool {
 	if rt == nil {
 		return false

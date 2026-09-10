@@ -33,6 +33,8 @@ func (m *Model) renderModal() string {
 		return m.renderSubagentsModal()
 	case ModalConfirm:
 		return m.renderConfirmModal()
+	case ModalQueue:
+		return m.renderQueueModal()
 	}
 	return ""
 }
@@ -56,6 +58,8 @@ func (m *Model) handleModalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.handleLiveSessionsKey(msg)
 	case ModalConfirm:
 		return m.handleConfirmKey(msg)
+	case ModalQueue:
+		return m.handleQueueKey(msg)
 	}
 	return m, nil
 }
@@ -112,7 +116,7 @@ func (m *Model) renderLiveSessionsModal() string {
 		if i == m.liveCursor {
 			cursor = ">"
 		}
-		line := fmt.Sprintf("%s%s %-12s %-14s %s", cursor, marker, s.label, "("+s.id+")", state)
+		line := cursor + marker + " " + padVisible(s.label, 12) + " " + padVisible("("+s.id+")", 14) + " " + state
 		rows = append(rows, styleLine{text: line, highlight: i == m.liveCursor})
 	}
 	rows = append(rows, styleLine{text: "", highlight: false},
@@ -530,6 +534,17 @@ type styleLine struct {
 	text      string
 	highlight bool // if true, apply ansiHighlightOn; if false, ansiDimOn
 	preStyled bool // if true, text already contains ANSI; don't add prefix
+}
+
+// padVisible pads s with trailing spaces to n VISIBLE cells (ANSI-aware).
+// fmt's %-Ns width counts escape runes (and miscounts wide runes), so
+// padding a styled string with it never applied and the columns it was
+// used on rendered ragged.
+func padVisible(s string, n int) string {
+	if w := lipgloss.Width(s); w < n {
+		return s + strings.Repeat(" ", n-w)
+	}
+	return s
 }
 
 // renderBorderedModal draws a plain border box around styled text lines,
@@ -1139,8 +1154,9 @@ func (m *Model) renderHelpModal() string {
 		binds [][]string
 	}{
 		{"Commands", [][]string{
-			{"enter", "Submit input"},
+			{"enter", "Submit input (queues while busy)"},
 			{"ctrl+c", "Cancel turn / Quit"},
+			{"ctrl+q", "Queued messages (cancel/remove)"},
 			{"ctrl+\\", "Force quit"},
 			{"F1 / /help", "Show this help"},
 			{"ctrl+v", "Toggle verbose"},
@@ -1179,6 +1195,7 @@ func (m *Model) renderHelpModal() string {
 			{"/open", "Open a new live session"},
 			{"/switch", "Switch live sessions"},
 			{"/compact", "Compact history"},
+			{"/queue", "Queued messages (per-item cancel)"},
 			{"/verbose", "Toggle verbose output"},
 			{"/save-config", "Write config to .gogen/"},
 			{"dir <path>", "Change working dir"},
@@ -1216,9 +1233,12 @@ func (m *Model) renderHelpModal() string {
 		for _, bind := range sec.binds {
 			key := bind[0]
 			desc := bind[1]
-			// Pre-style: cyan key, plain desc, 24-char key column
+			// Pre-style: cyan key, plain desc, 24-char key column —
+			// padded by VISIBLE width (%-24s measures the escape runes,
+			// so with colors on the pad never applied and the description
+			// column started right after the key).
 			keyCol := ansiCyanOn + key + ansiReset
-			line := fmt.Sprintf("  %-24s %s", keyCol, desc)
+			line := "  " + padVisible(keyCol, 24) + " " + desc
 			rows = append(rows, styleLine{text: line, preStyled: true})
 		}
 		rows = append(rows, styleLine{text: "", highlight: false})

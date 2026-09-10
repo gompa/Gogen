@@ -7,10 +7,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"gogen/internal/agent"
 	"gogen/internal/llm"
+	"gogen/internal/session"
 )
 
 // ── A1/A3: close semantics ──
@@ -42,6 +44,90 @@ func TestLiveSessionsClose(t *testing.T) {
 			t.Fatalf("active desynced: %d", ls.active)
 		}
 	})
+}
+
+// ── A4: close/quit must not reshuffle the saved-session list ──
+
+// Regression for the sidebar-order shuffle on close/quit: Close and
+// flushAndQuit used to force a full save (FlushSession) on every session
+// they swept, re-stamping each one's store Updated timestamp with ~now.
+// Store.List/LatestID order by that timestamp, so a merely-closed CLEAN
+// session jumped to the top of the saved list and the focused session was
+// demoted on quit — instead of the intended semantics: the session that
+// received the last message is the newest. Both paths now flush through
+// FlushPending, which writes only dirty sessions, so clean sessions keep
+// their earned timestamp (the TUI twin of the web ShutdownSessions /
+// evictRuntime fixes).
+func TestCloseAndQuitPreserveSavedSessionOrdering(t *testing.T) {
+	m := newSidebarFullModel(t)
+	store := m.agent.SessionStore.(*session.Store)
+	dir := m.agent.WorkingDir
+
+	now := time.Now()
+	saveAt := func(id string, ago time.Duration) {
+		t.Helper()
+		if err := store.Save(id, agent.SessionSnapshot{
+			WorkingDir: dir,
+			Messages:   []llm.Message{{Role: "user", Content: "hi"}},
+		}); err != nil {
+			t.Fatalf("save %s: %v", id, err)
+		}
+		if err := store.SetUpdatedAt(dir, id, now.Add(-ago).UTC()); err != nil {
+			t.Fatalf("stamp %s: %v", id, err)
+		}
+	}
+	// "newest" received the last message a minute ago; "old" is a
+	// background pane restored from a 2 h-old save.
+	saveAt("newest", time.Minute)
+	saveAt("old", 2*time.Hour)
+	topIsNewest := func(what string) {
+		t.Helper()
+		list, err := store.List(dir)
+		if err != nil {
+			t.Fatalf("list after %s: %v", what, err)
+		}
+		if len(list) == 0 || list[0].ID != "newest" {
+			got := "(none)"
+			if len(list) > 0 {
+				got = list[0].ID
+			}
+			t.Fatalf("List[0] after %s = %s, want newest (close/quit must not reshuffle recency)", what, got)
+		}
+	}
+	topIsNewest("setup")
+
+	// Closing a CLEAN background pane must not write: it received nothing
+	// since its last save, so its timestamp — and list position — must
+	// survive untouched.
+	bg := newSwitchTestAgent(t)
+	bg.SessionStore = m.agent.SessionStore
+	bg.WorkingDir = dir
+	bg.SessionID = "old"
+	m.lives.Add(bg, "old")
+	if err := m.lives.Close(1); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if got, want := store.UpdatedAt(dir, "old"), now.Add(-2*time.Hour).UTC(); !got.Equal(want) {
+		t.Fatalf("clean close re-stamped Updated = %v, want %v", got, want)
+	}
+	topIsNewest("clean close")
+
+	// Quit must not reshuffle either: the fan-out used to stamp every
+	// session in sweep order, demoting the focused one on restart. The
+	// focused session here was never saved (clean) — FlushPending must
+	// leave it unsaved, not create a fresh "just updated" entry.
+	m.flushAndQuit()
+	topIsNewest("quit")
+	if got, want := store.UpdatedAt(dir, "old"), now.Add(-2*time.Hour).UTC(); !got.Equal(want) {
+		t.Fatalf("quit re-stamped Updated = %v, want %v", got, want)
+	}
+	list, err := store.List(dir)
+	if err != nil {
+		t.Fatalf("list after quit: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("store has %d sessions after quit, want 2 (a clean never-saved session must not be written)", len(list))
+	}
 }
 
 // ── A2: owner tagging drops switch-boundary stragglers ──
@@ -577,12 +663,17 @@ func TestSwitchDuringCompact(t *testing.T) {
 		if !m.compacting {
 			t.Fatal("focused mirror must restore on join")
 		}
-		// Input is blocked on the compacting session.
+		// Steering: input is never blocked on the compacting session —
+		// submit QUEUES (the drain waits for the compaction gate).
 		m.textarea.SetValue("x")
-		_, cmd, ok = m.handleSubmitKey(keyMsg("enter"))
-		if ok && cmd != nil {
-			t.Fatal("submit must be swallowed while the focused session compacts")
+		_, _, ok = m.handleSubmitKey(keyMsg("enter"))
+		if !ok {
+			t.Fatal("submit must be consumed while compacting (it queues)")
 		}
+		if q := m.lives.Active().steerQueue; len(q) != 1 || q[0].text != "x" {
+			t.Fatalf("queue = %v, want the queued text", q)
+		}
+		m.lives.Active().steerQueue = nil
 		// ctrl+c cancels THIS session's compaction.
 		var cancelled bool
 		s1.compactCancel = func() { cancelled = true }

@@ -277,7 +277,18 @@ func (s *Store) Create(a *Automation) error {
 	if s.autos == nil {
 		s.autos = map[string]*Automation{}
 	}
-	s.autos[a.ID] = a
+	// Store a CLONE, not the caller's pointer: Create only assigns the
+	// caller's fields (id/timestamps/next run) — after it returns, the
+	// caller keeps reading its own struct (the CLI's "Created %s" line, the
+	// web handler's "Created automation" notice) while the scheduler or
+	// another connection's Update mutates the stored row. Aliasing the
+	// caller's struct made those reads race the mutators (seen as a -race
+	// failure in TestAutomationsUpdateOpViaWS: the create connection's
+	// notice read raced another connection's Update through the same
+	// struct). Get/listLocked already hand out clones; Create must respect
+	// the same ownership boundary.
+	stored := a.clone()
+	s.autos[a.ID] = &stored
 	if err := s.saveAutomations(); err != nil {
 		delete(s.autos, a.ID) // don't leave a phantom row behind a failed write
 		return err

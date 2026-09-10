@@ -41,27 +41,31 @@ func (e *Executor) RenameSymbol(ctx context.Context, oldName, newName, subpath, 
 
 	var changes []FileChange
 
+	// skips collects unreadable-subtree errors from the walk so a rename that
+	// missed files under an unreadable directory is not reported as complete.
+	skips := &walkSkips{}
+
 	// Try tree-sitter first for supported languages
 	if treesitter.Enabled() {
-		changes, err = e.renameWithAST(ctx, searchRoot, relPrefix, glob, oldName, newName, dryRun)
+		changes, err = e.renameWithAST(ctx, searchRoot, relPrefix, glob, oldName, newName, dryRun, skips)
 		if err == nil && len(changes) > 0 {
-			return formatRenameResult(oldName, newName, changes, dryRun), nil
+			return formatRenameResult(oldName, newName, changes, dryRun) + skips.footer(), nil
 		}
 	}
 
 	// Fallback: word-boundary text search (works for all languages)
-	changes, err = e.renameWithText(ctx, searchRoot, relPrefix, glob, oldName, newName, dryRun)
+	changes, err = e.renameWithText(ctx, searchRoot, relPrefix, glob, oldName, newName, dryRun, skips)
 	if err != nil {
 		return "", err
 	}
 
-	return formatRenameResult(oldName, newName, changes, dryRun), nil
+	return formatRenameResult(oldName, newName, changes, dryRun) + skips.footer(), nil
 }
 
-func (e *Executor) renameWithAST(ctx context.Context, searchRoot, relPrefix, glob, oldName, newName string, dryRun bool) ([]FileChange, error) {
+func (e *Executor) renameWithAST(ctx context.Context, searchRoot, relPrefix, glob, oldName, newName string, dryRun bool, skips *walkSkips) ([]FileChange, error) {
 	var changes []FileChange
 
-	err := walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true}, func(path, rel string, d os.DirEntry) error {
+	err := walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true, onSkip: skips.observe}, func(path, rel string, d os.DirEntry) error {
 		if !treesitter.ReferenceSearchSupported(path) {
 			return nil
 		}
@@ -120,14 +124,14 @@ func (e *Executor) renameWithAST(ctx context.Context, searchRoot, relPrefix, glo
 	return changes, err
 }
 
-func (e *Executor) renameWithText(ctx context.Context, searchRoot, relPrefix, glob, oldName, newName string, dryRun bool) ([]FileChange, error) {
+func (e *Executor) renameWithText(ctx context.Context, searchRoot, relPrefix, glob, oldName, newName string, dryRun bool, skips *walkSkips) ([]FileChange, error) {
 	// Word-boundary pattern for text fallback
 	pattern := `\b` + regexp.QuoteMeta(oldName) + `\b`
 	re := regexp.MustCompile(pattern)
 
 	var changes []FileChange
 
-	err := walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true}, func(path, rel string, d os.DirEntry) error {
+	err := walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true, onSkip: skips.observe}, func(path, rel string, d os.DirEntry) error {
 		content, err := os.ReadFile(path)
 		if err != nil {
 			return nil

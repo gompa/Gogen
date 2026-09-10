@@ -3,7 +3,7 @@ package llm
 import (
 	"testing"
 
-	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/v3"
 )
 
 func TestUsageFromOpenAI(t *testing.T) {

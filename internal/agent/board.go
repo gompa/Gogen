@@ -247,6 +247,13 @@ func (m *BoardManager) rebuildIndexLocked() error {
 	return nil
 }
 
+// saveIndexLocked rewrites the board index. Board ops are agent- and
+// user-driven actions that touch BOTH files (index + item), so the
+// fsync-free write is deliberate (SSD wear policy, matching session
+// files): temp+rename still guarantees readers never see a torn file, and
+// the worst case after a power loss is losing the most recent board
+// operation — the same tradeoff Store.Save already makes for sessions.
+// Caller must hold m.mu.
 func (m *BoardManager) saveIndexLocked() error {
 	data, err := json.MarshalIndent(m.idx, "", "  ")
 	if err != nil {
@@ -255,7 +262,7 @@ func (m *BoardManager) saveIndexLocked() error {
 	if err := os.MkdirAll(m.dir, 0o755); err != nil {
 		return err
 	}
-	return ioutil.WriteFileAtomic(m.indexPath(), data, 0o644)
+	return ioutil.WriteFileAtomicNoSync(m.indexPath(), data, 0o644)
 }
 
 func (m *BoardManager) loadItemLocked(id string) (*BoardItem, error) {
@@ -273,6 +280,8 @@ func (m *BoardManager) loadItemLocked(id string) (*BoardItem, error) {
 	return &item, nil
 }
 
+// saveItemLocked rewrites one board item; see saveIndexLocked for the
+// fsync-free wear rationale. Caller must hold m.mu.
 func (m *BoardManager) saveItemLocked(item *BoardItem) error {
 	data, err := json.MarshalIndent(item, "", "  ")
 	if err != nil {
@@ -281,7 +290,7 @@ func (m *BoardManager) saveItemLocked(item *BoardItem) error {
 	if err := os.MkdirAll(m.dir, 0o755); err != nil {
 		return err
 	}
-	return ioutil.WriteFileAtomic(m.itemPath(item.ID), data, 0o644)
+	return ioutil.WriteFileAtomicNoSync(m.itemPath(item.ID), data, 0o644)
 }
 
 // appendActivityLocked records an activity entry, capping the log at

@@ -3,15 +3,18 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"gogen/internal/debuglog"
 
-	"github.com/openai/openai-go"
-	"github.com/openai/openai-go/packages/param"
-	"github.com/openai/openai-go/shared"
+	"github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/packages/param"
+	"github.com/openai/openai-go/v3/shared"
 )
 
 // clientForModel returns the openai.Client that should serve the currently
@@ -174,19 +177,21 @@ func (p *OpenAIProvider) ownerClientForModel(model string) (*openai.Client, stri
 	return nil, ""
 }
 
-func toolsToOpenAI(tools []Tool, allowed map[string]struct{}) []openai.ChatCompletionToolParam {
-	out := make([]openai.ChatCompletionToolParam, 0, len(tools))
+func toolsToOpenAI(tools []Tool, allowed map[string]struct{}) []openai.ChatCompletionToolUnionParam {
+	out := make([]openai.ChatCompletionToolUnionParam, 0, len(tools))
 	for _, t := range tools {
 		if allowed != nil {
 			if _, ok := allowed[t.Name]; !ok {
 				continue
 			}
 		}
-		out = append(out, openai.ChatCompletionToolParam{
-			Function: shared.FunctionDefinitionParam{
-				Name:        t.Name,
-				Description: param.NewOpt(t.Description),
-				Parameters:  shared.FunctionParameters(t.Parameters),
+		out = append(out, openai.ChatCompletionToolUnionParam{
+			OfFunction: &openai.ChatCompletionFunctionToolParam{
+				Function: shared.FunctionDefinitionParam{
+					Name:        t.Name,
+					Description: param.NewOpt(t.Description),
+					Parameters:  shared.FunctionParameters(t.Parameters),
+				},
 			},
 		})
 	}
@@ -250,11 +255,13 @@ func (p *OpenAIProvider) messagesToChat(messages []Message) []openai.ChatComplet
 				})
 			}
 			for i := range m.ToolCalls {
-				asst.ToolCalls = append(asst.ToolCalls, openai.ChatCompletionMessageToolCallParam{
-					ID: m.ToolCalls[i].ID,
-					Function: openai.ChatCompletionMessageToolCallFunctionParam{
-						Name:      m.ToolCalls[i].Name,
-						Arguments: toolCallArgumentsJSON(&m.ToolCalls[i]),
+				asst.ToolCalls = append(asst.ToolCalls, openai.ChatCompletionMessageToolCallUnionParam{
+					OfFunction: &openai.ChatCompletionMessageFunctionToolCallParam{
+						ID: m.ToolCalls[i].ID,
+						Function: openai.ChatCompletionMessageFunctionToolCallFunctionParam{
+							Name:      m.ToolCalls[i].Name,
+							Arguments: toolCallArgumentsJSON(&m.ToolCalls[i]),
+						},
 					},
 				})
 			}
@@ -416,8 +423,228 @@ func (p *OpenAIProvider) GenerateResponse(ctx context.Context, messages []Messag
 	}, nil
 }
 
+// streamRetryLabel builds the reason surfaced to hosts when a failed stream
+// attempt is retried. Hosts render it verbatim in progress labels, so it
+// stays one bounded line: how far the attempt got (an interruption before
+// any rendered output means the stream died during the silent
+// pre-first-token wait — long prompt processing, backend queueing, or a
+// middlebox idle timeout) plus a short single-line cause. The raw error can
+// embed the whole response body (SDK error text) or wrap several lines.
+func streamRetryLabel(stage string, acc *streamAccumulator, err error) string {
+	cause := ""
+	if err != nil {
+		cause = err.Error()
+		if i := strings.IndexByte(cause, '\n'); i >= 0 {
+			cause = cause[:i]
+		}
+		const max = 120
+		if len(cause) > max {
+			cause = cause[:max]
+		}
+	}
+	label := stage
+	if acc != nil && !acc.renderedOutput() {
+		label += " before any output"
+	}
+	if cause == "" {
+		return label
+	}
+	return label + ": " + cause
+}
+
+// GenerateResponseStream streams one chat completion with a two-stage
+// recovery ladder for failed streams: one muted streaming retry first, then
+// the non-streaming fallback (handleStreamFallback). The retry stays on the
+// streaming path, so arriving chunks keep resetting the per-read idle
+// deadline (sse_http.go) — a long regeneration cannot hit the hard read cap
+// the non-streaming path dies on (llama.cpp sends nothing until the whole
+// completion is done). Round-end callbacks (OnStreamEnd /
+// OnRecoverPartialStream) stay owned by the agent loop on every path.
 func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []Message, allowedTools map[string]struct{}, tools []Tool, h *StreamHandlers) (*StreamResult, error) {
 	h = ensureStreamCallbacks(h)
+
+	at := p.streamChatAttempt(ctx, messages, allowedTools, tools, h)
+	if at.err == nil {
+		return at.result, nil
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if !at.fallbackEligible {
+		// Terminal failure (a reasoning-stop grace expiration or a clean
+		// close that built no result): returned as-is, exactly as before the
+		// retry existed — re-requesting the turn is what those paths avoid.
+		return at.result, at.err
+	}
+	streamErr := at.err
+	debuglog.Write("llm/stream_recovery", "stream attempt failed; recovery ladder entered", "", map[string]any{
+		"streamError": clipErrForLog(streamErr),
+		"retryable":   retryableStreamError(streamErr),
+		"hadPartial": at.acc.fullContent.Len() > 0 || at.acc.fullReasoning.Len() > 0 ||
+			at.acc.fullRefusal.Len() > 0 || len(at.acc.tcAccums) > 0,
+	})
+	// trimAcc is the rendered text the final recovery must trim against
+	// (see trimRecoveredText): attempt 1's partial output normally, or —
+	// when the retry delivered live — the retry's own partial output.
+	trimAcc := at.acc
+	if retryableStreamError(streamErr) {
+		// Hosts must know so the UI can leave the bare-spinner state; the
+		// reason carries how far the attempt got and the underlying cause,
+		// so hosts (and users) can see WHY the stream broke without
+		// enabling the debug log.
+		h.OnStreamRetry(streamRetryLabel("stream interrupted", at.acc, streamErr))
+		// Let a briefly-persistent failure condition (router re-dialing a
+		// dead upstream, a LAN blip) clear before re-requesting: an
+		// immediate retry lands in the same dead window and burns the
+		// ladder's only streaming attempt.
+		if waitErr := waitStreamBackoff(ctx, streamRetryBackoff(0)); waitErr != nil {
+			return nil, waitErr
+		}
+		if at.acc.renderedOutput() {
+			// Muted retry: a fresh generation matches the already-rendered
+			// prefix only until it diverges, and the trim contract forbids
+			// splicing two divergent generations into one bubble — so
+			// delivery is buffered and suffix-only.
+			if res, retryErr := p.retryStreamChat(ctx, messages, allowedTools, tools, h, at.acc); retryErr == nil {
+				debuglog.Write("llm/stream_recovery", "muted streaming retry recovered the round", "", nil)
+				return res, nil
+			} else {
+				debuglog.Write("llm/stream_retry", "streaming retry failed; using non-streaming fallback", "", map[string]any{
+					"streamError": clipErrForLog(streamErr),
+					"retryError":  clipErrForLog(retryErr),
+				})
+				streamErr = fmt.Errorf("%w; streaming retry also failed: %v", streamErr, retryErr)
+			}
+		} else {
+			// Attempt 1 rendered NOTHING (the break hit before any output):
+			// there is no rendered prefix to diverge from, so muting serves
+			// no purpose — the retry delivers live, exactly like a normal
+			// stream, instead of a silent end-of-retry batch.
+			live := p.streamChatAttempt(ctx, messages, allowedTools, tools, h)
+			if live.err == nil {
+				if live.result.Model == "" {
+					live.result.Model = at.acc.model
+				}
+				debuglog.Write("llm/stream_recovery", "live streaming retry recovered the round", "", nil)
+				return live.result, nil
+			}
+			debuglog.Write("llm/stream_retry", "streaming retry failed; using non-streaming fallback", "", map[string]any{
+				"streamError": clipErrForLog(streamErr),
+				"retryError":  clipErrForLog(live.err),
+			})
+			streamErr = fmt.Errorf("%w; streaming retry also failed: %v", streamErr, live.err)
+			trimAcc = live.acc
+		}
+	}
+	// The fallback re-requests the turn non-streaming (llama.cpp delivers
+	// nothing until the whole completion is done); hosts must know the
+	// spinner now covers a full silent regeneration.
+	h.OnStreamRetry(streamRetryLabel("non-streaming recovery", trimAcc, streamErr))
+	// Longer wait than the streaming retry: the fallback re-requests the
+	// whole turn, so it is worth giving the upstream a bigger window to
+	// recover before spending a full silent regeneration on it.
+	if waitErr := waitStreamBackoff(ctx, streamRetryBackoff(1)); waitErr != nil {
+		return nil, waitErr
+	}
+	return p.handleStreamFallback(ctx, messages, allowedTools, tools, h, streamErr, trimAcc)
+}
+
+// streamAttempt is the outcome of one streaming request. acc is always
+// non-nil; result is non-nil only when err is nil.
+type streamAttempt struct {
+	result *StreamResult
+	acc    *streamAccumulator
+	err    error
+	// fallbackEligible marks recoverable stream failures — everything that
+	// surfaces as stream.Err() on a non-grace close: transport drops and
+	// read timeouts, malformed SSE payloads, mid-stream SSE error frames,
+	// and HTTP statuses on the streaming POST (which arrive only after the
+	// SDK's own transport-level retries are exhausted). Clean closes that
+	// built no result and grace expirations are terminal.
+	fallbackEligible bool
+}
+
+// retryableStreamError reports whether a failed streaming attempt is worth
+// one streaming retry. Transport-level failures (truncated SSE frames,
+// dropped connections, read timeouts, malformed SSE payloads) are transient
+// and worth the retry; so are transient HTTP statuses (429 rate limits, 5xx
+// gateway/upstream hiccups, 408) — the SDK already retries each request
+// twice at the transport level, so such a status only reaches this ladder
+// after a sustained burst of failures, and skipping the streaming retry
+// landed every one of those directly on the non-streaming fallback. A
+// successful retry also keeps the round's live rendering, which the
+// fallback trades away entirely. Context-window refusals are deterministic
+// (the agent loop recovers them via forced compaction) and definitive 4xx
+// errors (auth, bad request, unknown model) cannot succeed on a
+// regeneration, so neither is retried.
+func retryableStreamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if IsContextWindowError(err) {
+		return false
+	}
+	var oerr *openai.Error
+	if errors.As(err, &oerr) {
+		return retryableHTTPStatus(oerr.StatusCode)
+	}
+	return true
+}
+
+// retryableHTTPStatus reports whether an HTTP status from the streaming
+// endpoint is worth one streaming retry: rate limits and server-side
+// failures are usually transient; client errors are not.
+func retryableHTTPStatus(code int) bool {
+	switch code {
+	case http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests:
+		return true
+	}
+	return code >= 500
+}
+
+// retryStreamChat runs ONE additional streaming attempt with live-delivery
+// callbacks muted, and on success delivers only the text the client has not
+// already rendered: the suffix beyond the first attempt's partial output,
+// via trimRecoveredText — the same contract as the non-streaming fallback.
+// Tokens cannot be delivered live during the retry: a fresh generation
+// matches the already-rendered prefix only until it diverges, and the trim
+// contract forbids splicing two divergent generations into one bubble.
+// Tool-call UI callbacks stay muted too: partial chips from the dead attempt
+// are left as rendered, like the non-streaming fallback, and the round-end
+// callbacks remain with the agent loop.
+func (p *OpenAIProvider) retryStreamChat(ctx context.Context, messages []Message, allowedTools map[string]struct{}, tools []Tool, h *StreamHandlers, first *streamAccumulator) (*StreamResult, error) {
+	quiet := ensureStreamCallbacks(&StreamHandlers{})
+	at := p.streamChatAttempt(ctx, messages, allowedTools, tools, quiet)
+	if at.err != nil {
+		return nil, at.err
+	}
+	result := at.result
+	reasoning := trimRecoveredText(first.fullReasoning.String(), result.Reasoning)
+	content := trimRecoveredText(first.fullContent.String(), result.Content)
+	refusal := trimRecoveredText(first.fullRefusal.String(), result.Refusal)
+	if reasoning != "" {
+		h.OnThinkingToken(reasoning)
+	}
+	if content != "" {
+		h.OnToken(content)
+	} else if refusal != "" {
+		h.OnToken(refusal)
+	}
+	if result.Model == "" {
+		result.Model = first.model
+	}
+	result.PartialStream = len(first.tcAccums) > 0 || first.fullContent.Len() > 0 || first.fullRefusal.Len() > 0 || first.extras.textLen() > 0
+	return result, nil
+}
+
+// streamChatAttempt performs ONE streaming chat-completion request,
+// forwarding live delivery callbacks (OnToken/OnThinkingToken/tool-call
+// deltas) as chunks arrive. It never recovers: failures come back in
+// streamAttempt for GenerateResponseStream to run the retry/fallback ladder.
+func (p *OpenAIProvider) streamChatAttempt(ctx context.Context, messages []Message, allowedTools map[string]struct{}, tools []Tool, h *StreamHandlers) streamAttempt {
 	onToken := h.OnToken
 	onThinking := h.OnThinkingToken
 
@@ -466,9 +693,51 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 	// timer unblocks Next() promptly (same mechanism as the ctx watcher).
 	grace := reasoningStopGrace()
 	var stopGrace *time.Timer
+
+	// Stall watchdog: a stretch with no surfaced SSE chunk (long prefill,
+	// server-side queueing, a stalled upstream) fires OnStreamStall so hosts
+	// can show a "still waiting" state instead of a bare spinner.
+	// Informational only: chunk arrivals reset the clock, and the signal
+	// never interrupts the stream — the per-read idle deadline
+	// (streamReadIdleTimeout) remains the hard bound.
+	stallAfter := streamStallAfter()
+	var lastChunk atomic.Int64
+	lastChunk.Store(time.Now().UnixNano())
+	if stallAfter > 0 {
+		onStall := h.OnStreamStall
+		if onStall == nil {
+			onStall = func() {}
+		}
+		go func() {
+			ticker := time.NewTicker(stallAfter)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopWatch:
+					return
+				case <-ticker.C:
+					if time.Since(time.Unix(0, lastChunk.Load())) >= stallAfter {
+						onStall()
+					}
+				}
+			}
+		}()
+	}
+
+	// Usage-drain grace: once the round is finished (finish_reason seen) but
+	// the usage chunk hasn't arrived, bound the wait — a silent endpoint that
+	// holds the connection open would otherwise park the turn on the read
+	// idle timeout with the reply already complete on screen. Same
+	// close-from-timer mechanism as the reasoning-stop grace above.
+	drainGrace := streamDrainGrace()
+	var drainTimer *time.Timer
+
 	for stream.Next() {
+		// Every surfaced chunk (even a no-op delta) proves the pipe is
+		// moving: reset the stall clock.
+		lastChunk.Store(time.Now().UnixNano())
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return streamAttempt{acc: acc, err: ctx.Err()}
 		}
 		if stop := acc.processChunk(stream.Current(), onToken, onThinking, h); stop {
 			break
@@ -486,13 +755,26 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 			stopGrace.Stop()
 			stopGrace = nil
 		}
+		// streamDone without usage: only the usage chunk (or body EOF) can
+		// end the drain — arm the bound once. processChunk returns true the
+		// moment usage arrives, which breaks the loop below; the timer never
+		// fires on a compliant endpoint.
+		if acc.streamDone && acc.streamUsage == nil && drainGrace > 0 && drainTimer == nil {
+			drainTimer = time.AfterFunc(drainGrace, func() {
+				acc.drainExpired.Store(true)
+				_ = stream.Close()
+			})
+		}
 	}
 	if stopGrace != nil {
 		stopGrace.Stop()
 	}
+	if drainTimer != nil {
+		drainTimer.Stop()
+	}
 
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return streamAttempt{acc: acc, err: err}
 	}
 
 	if err := stream.Err(); err != nil {
@@ -502,16 +784,29 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 			// complete response (the provider held the connection open
 			// instead of sending [DONE]) rather than triggering the
 			// non-streaming fallback, which would re-request the turn.
-			return acc.buildResult()
+			res, berr := acc.buildResult()
+			return streamAttempt{result: res, acc: acc, err: berr}
 		}
-		return p.handleStreamFallback(ctx, messages, allowedTools, tools, h, err, acc)
+		if acc.drainExpired.Load() {
+			// The stream was closed by the usage-drain grace timer (see
+			// streamDrainGrace): the round is finished — finish_reason was
+			// seen, only the promised usage chunk never arrived on an
+			// endpoint that holds the connection open. A completion, not a
+			// transport failure: no retry, no non-streaming fallback (both
+			// would re-request a turn whose answer is already complete).
+			res, berr := acc.buildResult()
+			return streamAttempt{result: res, acc: acc, err: berr}
+		}
+		return streamAttempt{acc: acc, err: err, fallbackEligible: true}
 	}
 
-	return acc.buildResult()
+	res, berr := acc.buildResult()
+	return streamAttempt{result: res, acc: acc, err: berr}
 }
 
-// handleStreamFallback is called when a streaming error occurs. It attempts a
-// non-streaming fallback to recover partial results.
+// handleStreamFallback is the last stage of the stream recovery ladder: the
+// streaming attempt AND the muted streaming retry both failed, so it attempts
+// a non-streaming request to recover partial results.
 func (p *OpenAIProvider) handleStreamFallback(ctx context.Context, messages []Message, allowedTools map[string]struct{}, tools []Tool, h *StreamHandlers, streamErr error, acc *streamAccumulator) (*StreamResult, error) {
 	// Deliberately NOT firing OnStreamEnd / OnRecoverPartialStream here: the
 	// agent loop owns those and fires them exactly once when it finalizes the
@@ -523,6 +818,10 @@ func (p *OpenAIProvider) handleStreamFallback(ctx context.Context, messages []Me
 	// ran ensureStreamCallbacks, so the callbacks used below are non-nil.
 	resp, fbErr := p.GenerateResponse(ctx, messages, allowedTools, tools)
 	if fbErr != nil {
+		debuglog.Write("llm/stream_recovery", "non-streaming fallback failed", "", map[string]any{
+			"streamError":   clipErrForLog(streamErr),
+			"fallbackError": clipErrForLog(fbErr),
+		})
 		// Classify the STREAM error (the primary cause): a context-window
 		// refusal that also fails the fallback must reach the agent run
 		// loop still classified, so it recovers in-loop instead of
@@ -552,6 +851,11 @@ func (p *OpenAIProvider) handleStreamFallback(ctx context.Context, messages []Me
 	if model == "" {
 		model = acc.model
 	}
+	logFallbackResponse(model, streamErr, resp)
+	debuglog.Write("llm/stream_recovery", "non-streaming fallback recovered the round", "", map[string]any{
+		"streamError": clipErrForLog(streamErr),
+		"model":       model,
+	})
 	return &StreamResult{
 		Content:       resp.Content,
 		Reasoning:     resp.Reasoning,

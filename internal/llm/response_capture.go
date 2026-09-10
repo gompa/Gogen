@@ -6,7 +6,7 @@ import (
 
 	"gogen/internal/debuglog"
 
-	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/v3"
 )
 
 type extraFieldAccums map[string]*strings.Builder
@@ -197,6 +197,22 @@ func extraFieldsFromMessage(msg openai.ChatCompletionMessage) map[string]string 
 }
 
 func logNonStreamResponse(model, source string, content, refusal, displayContent string, extras map[string]string, toolCalls []ToolCall, usage *Usage) {
+	debuglog.WriteLLMResponse(debuglog.LLMResponseRecord{
+		Model:          model,
+		Source:         source,
+		Content:        content,
+		Refusal:        refusal,
+		DisplayContent: displayContent,
+		Reasoning:      primaryDisplayFromExtrasMap(extras),
+		ExtraFields:    extras,
+		ToolCalls:      toolCallRecords(toolCalls),
+		Usage:          usageRecord(usage),
+	})
+}
+
+// toolCallRecords shapes tool calls for the response log (index/id/name,
+// parsed args when present, and the exact wire bytes as argsJson).
+func toolCallRecords(toolCalls []ToolCall) []debuglog.LLMToolCallRecord {
 	tools := make([]debuglog.LLMToolCallRecord, 0, len(toolCalls))
 	for _, tc := range toolCalls {
 		argsJSON, _ := json.Marshal(tc.Args)
@@ -208,24 +224,54 @@ func logNonStreamResponse(model, source string, content, refusal, displayContent
 			ArgsJSON: string(argsJSON),
 		})
 	}
-	var usageMap map[string]int
-	if usage != nil {
-		usageMap = map[string]int{
-			"promptTokens":     usage.PromptTokens,
-			"completionTokens": usage.CompletionTokens,
-			"totalTokens":      usage.TotalTokens,
-			"cachedTokens":     usage.CachedTokens,
-		}
+	return tools
+}
+
+// usageRecord shapes usage for the response log; nil becomes an absent map.
+func usageRecord(usage *Usage) map[string]int {
+	if usage == nil {
+		return nil
 	}
+	return map[string]int{
+		"promptTokens":     usage.PromptTokens,
+		"completionTokens": usage.CompletionTokens,
+		"totalTokens":      usage.TotalTokens,
+		"cachedTokens":     usage.CachedTokens,
+	}
+}
+
+// logFallbackResponse records a successful non-streaming fallback in the
+// response log: Source "stream-fallback" with UsedFallback set and the
+// stream error that forced the recovery, so offline review can see both
+// the recovered round and why it was not delivered as a stream. The record
+// vocabulary matches LLMResponseRecord.Source ("stream-fallback"); plain
+// stream and non-stream successes stay unlogged (logNonStreamResponse is
+// only wired on the non-stream path).
+func logFallbackResponse(model string, streamErr error, resp Response) {
 	debuglog.WriteLLMResponse(debuglog.LLMResponseRecord{
-		Model:          model,
-		Source:         source,
-		Content:        content,
-		Refusal:        refusal,
-		DisplayContent: displayContent,
-		Reasoning:      primaryDisplayFromExtrasMap(extras),
-		ExtraFields:    extras,
-		ToolCalls:      tools,
-		Usage:          usageMap,
+		Model:        model,
+		Source:       "stream-fallback",
+		UsedFallback: true,
+		Error:        clipErrForLog(streamErr),
+		Content:      resp.Content,
+		Refusal:      resp.Refusal,
+		Reasoning:    resp.Reasoning,
+		ToolCalls:    toolCallRecords(resp.ToolCalls),
+		Usage:        usageRecord(resp.Usage),
 	})
+}
+
+// clipErrForLog bounds an error string for the JSON logs: stream errors can
+// embed the raw response body (the SDK error text carries it), which would
+// otherwise bloat every record with the same oversized blob.
+func clipErrForLog(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	const max = 1024
+	if len(s) > max {
+		s = s[:max]
+	}
+	return s
 }

@@ -71,12 +71,18 @@ type StreamHandlers struct {
 	// replaced a message that could not fit the context window: note is
 	// the human-readable announcement (message size vs window, original
 	// archived) for an in-band system line / banner.
-	OnCondensed      func(note string)
-	OnStreamStall    func()         // called when no SSE chunk arrives for several seconds
-	OnStreamActivity func()         // called on the first visible content/refusal token
-	OnThinkingToken  StreamCallback // called for each reasoning/thinking token (display separately)
-	OnToken          StreamCallback // called for each content token
-	OnStreamEnd      func()         // called when a streamed LLM turn completes with pending tool calls
+	OnCondensed func(note string)
+	// OnStreamStall is called when no SSE chunk has arrived for several
+	// seconds while the round is still streaming (see streamStallAfter).
+	// Hosts use it to show a "still waiting" state: a long prefill or a
+	// server-side stall is otherwise indistinguishable from a dead UI.
+	// Informational only — it does not affect the stream.
+	OnStreamStall    func()
+	OnStreamRetry    func(reason string) // called when a failed stream attempt is retried (muted retry / non-stream fallback)
+	OnStreamActivity func()              // called on the first visible content/refusal token
+	OnThinkingToken  StreamCallback      // called for each reasoning/thinking token (display separately)
+	OnToken          StreamCallback      // called for each content token
+	OnStreamEnd      func()              // called when a streamed LLM turn completes with pending tool calls
 	// OnReplyModel is called with the provider-reported model ID for every
 	// completed round, right before OnStreamEnd finalizes it. Receives ""
 	// when the provider did not report a model.

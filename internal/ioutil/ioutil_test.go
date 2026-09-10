@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -228,6 +229,54 @@ func TestIsChmodUnsupportedStringFallback(t *testing.T) {
 			got := isChmodUnsupported(err)
 			if got != tt.want {
 				t.Errorf("isChmodUnsupported(PathError{msg=%q}) = %v, want %v", tt.msg, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsDirSyncUnsupported(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "nil",
+			err:  nil,
+			want: false,
+		},
+		{
+			name: "permission denied",
+			err:  os.ErrPermission,
+			want: false,
+		},
+		{
+			name: "not supported syscall",
+			err:  syscall.ENOTSUP,
+			want: true,
+		},
+		{
+			name: "invalid argument syscall",
+			err:  syscall.EINVAL,
+			want: true,
+		},
+		{
+			name: "windows access denied string fallback",
+			err:  &os.PathError{Op: "sync", Path: "x", Err: fakeErr{"Access is denied."}},
+			want: true,
+		},
+		{
+			name: "wrong category of error",
+			err:  os.ErrNotExist,
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isDirSyncUnsupported(tt.err)
+			if got != tt.want {
+				t.Errorf("isDirSyncUnsupported(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
 	}

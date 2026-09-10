@@ -9,7 +9,7 @@ import (
 
 	"gogen/internal/modelinfo"
 
-	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/v3"
 )
 
 // effortRegistry writes a models.dev-style registry (opencode provider) with

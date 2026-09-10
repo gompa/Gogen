@@ -2,6 +2,9 @@ package agent
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 )
@@ -28,6 +31,15 @@ type walkOpts struct {
 	// .gitignore via ".*" or "*.env"); content/listing walkers keep the
 	// ripgrep-like default of skipping them.
 	includeHidden bool
+
+	// onSkip, when non-nil, is called for every non-fatal walk error: a path
+	// that could not be stat'd, or a directory that could not be read
+	// (permission denied, vanished mid-walk). The walk continues past the
+	// error so one unreadable subtree never aborts a whole search, and the
+	// callback lets the caller surface how much of the tree was skipped
+	// instead of silently omitting it. rel is the workspace-relative slash
+	// path (with relPrefix applied), matching what visit receives.
+	onSkip func(rel string, err error)
 }
 
 // walkTree is the shared file-walk skeleton used by every Executor tree
@@ -48,9 +60,40 @@ type walkOpts struct {
 // DirEntry. Returning a sentinel error from visit (errExploreTruncated,
 // errFindFileLimit) stops the walk and is propagated unchanged; any other
 // non-nil error also stops the walk.
+//
+// Errors reported by WalkDir itself (an entry that cannot be stat'd, or a
+// directory that cannot be read) are non-fatal: the walk skips past them and
+// continues, so a single permission-denied subtree does not abort a search.
+// They are reported through opts.onSkip (when set) rather than swallowed
+// silently, so callers can tell the model/user that part of the tree was
+// omitted. Beware that without an onSkip handler an unreadable directory is
+// indistinguishable from an empty one.
 func walkTree(ctx context.Context, searchRoot, relPrefix string, opts walkOpts, visit func(path, rel string, d os.DirEntry) error) error {
+	// relOf renders a walk path as the workspace-relative slash path visit
+	// sees (relPrefix applied). Shared by the visitor path and the onSkip
+	// error path so both use one path convention.
+	relOf := func(walkPath string) (string, bool) {
+		rel, err := filepath.Rel(searchRoot, walkPath)
+		if err != nil {
+			return "", false
+		}
+		rel = filepath.ToSlash(rel)
+		if relPrefix != "" {
+			rel = filepath.ToSlash(filepath.Join(relPrefix, rel))
+		}
+		return rel, true
+	}
 	return filepath.WalkDir(searchRoot, func(walkPath string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
+			if opts.onSkip != nil {
+				rel, ok := relOf(walkPath)
+				if !ok {
+					rel = filepath.ToSlash(walkPath)
+				}
+				opts.onSkip(rel, walkErr)
+			}
+			// Returning nil keeps walking the rest of the tree; the error is
+			// surfaced through onSkip instead of aborting (see walkTree doc).
 			return nil
 		}
 		if ctx != nil {
@@ -71,13 +114,9 @@ func walkTree(ctx context.Context, searchRoot, relPrefix string, opts walkOpts, 
 		} else if !opts.includeHidden && shouldSkipSearchEntry(d.Name(), false) {
 			return nil
 		}
-		rel, err := filepath.Rel(searchRoot, walkPath)
-		if err != nil {
+		rel, ok := relOf(walkPath)
+		if !ok {
 			return nil
-		}
-		rel = filepath.ToSlash(rel)
-		if relPrefix != "" {
-			rel = filepath.ToSlash(filepath.Join(relPrefix, rel))
 		}
 		if opts.glob != "" && !matchGlobPattern(opts.glob, rel) {
 			return nil
@@ -90,4 +129,61 @@ func walkTree(ctx context.Context, searchRoot, relPrefix string, opts walkOpts, 
 		}
 		return visit(walkPath, rel, d)
 	})
+}
+
+// walkSkips accumulates the non-fatal errors walkTree reports through
+// walkOpts.onSkip so a walker can append one compact note to its
+// model-facing output. A nil *walkSkips is a valid no-op receiver, so a
+// caller that does not surface skips can pass nil. Repeated reports for the
+// same path are collapsed (e.g. an AST walk and its text fallback both hit
+// the same unreadable directory) so the count stays truthful. It is not safe
+// for concurrent use; each walk owns one.
+type walkSkips struct {
+	seen     map[string]struct{}
+	count    int
+	firstRel string
+	firstErr error
+}
+
+// observe records one skipped path; it is the value assigned to
+// walkOpts.onSkip.
+func (w *walkSkips) observe(rel string, err error) {
+	if w == nil {
+		return
+	}
+	if w.seen == nil {
+		w.seen = make(map[string]struct{})
+	}
+	if _, dup := w.seen[rel]; dup {
+		return
+	}
+	w.seen[rel] = struct{}{}
+	w.count++
+	if w.firstErr == nil {
+		w.firstRel = rel
+		w.firstErr = err
+	}
+}
+
+// footer renders the skipped-path note appended to a walker's output, or ""
+// when nothing was skipped.
+func (w *walkSkips) footer() string {
+	if w == nil || w.count == 0 {
+		return ""
+	}
+	if w.count == 1 {
+		return fmt.Sprintf("\n… skipped 1 unreadable path (%s: %s)", w.firstRel, walkErrText(w.firstErr))
+	}
+	return fmt.Sprintf("\n… skipped %d unreadable paths (first: %s: %s)", w.count, w.firstRel, walkErrText(w.firstErr))
+}
+
+// walkErrText extracts the OS-level reason from a walk error without the
+// absolute path, which is redundant with the reported relative path and would
+// leak the workspace location into tool output.
+func walkErrText(err error) string {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		return pe.Err.Error()
+	}
+	return err.Error()
 }

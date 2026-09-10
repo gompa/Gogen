@@ -463,7 +463,12 @@ func (s *Server) serveEmbedded(w http.ResponseWriter, r *http.Request, name, con
 		content, err := webAssets.ReadFile(name)
 		if err != nil {
 			if gzipAlways {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				// The bootstrap document (index.html) is always in the embed
+				// tree, so a read failure here means the binary was packaged
+				// incorrectly. Keep the filesystem detail in the log, not the
+				// response body.
+				log.Printf("static: read embedded bootstrap asset %q: %v", name, err)
+				http.Error(w, "internal server error", http.StatusInternalServerError)
 			} else {
 				http.Error(w, "not found", http.StatusNotFound)
 			}
@@ -479,16 +484,18 @@ func (s *Server) serveEmbedded(w http.ResponseWriter, r *http.Request, name, con
 	w.Header().Set("Content-Type", asset.contentType)
 	w.Header().Set("Cache-Control", cacheControl)
 	w.Header().Set("ETag", asset.etag)
+	// Advertise the encoding negotiation on every response for this URL, not
+	// only the gzip/304 variants: a shared cache that saw just the identity
+	// response must still key gzip and identity apart for the same weak ETag.
+	w.Header().Set("Vary", "Accept-Encoding")
 
 	if match := strings.TrimSpace(r.Header.Get("If-None-Match")); match != "" && etagMatches(match, asset.etag) {
-		w.Header().Set("Vary", "Accept-Encoding")
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 
 	if asset.gzip != nil && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 		w.Header().Set("Content-Encoding", "gzip")
-		w.Header().Add("Vary", "Accept-Encoding")
 		_, _ = w.Write(asset.gzip)
 		return
 	}

@@ -52,14 +52,14 @@ func (a *ASTFallback[T]) Run() (T, error) {
 // walkSymbolReferences is a shared helper that walks the filesystem, finds symbol references
 // using tree-sitter AST when available, and calls the visitor for each file with references.
 // This eliminates code duplication across find_symbol and call_graph.
-func (e *Executor) walkSymbolReferences(ctx context.Context, searchRoot, relPrefix, glob, symbol string,
+func (e *Executor) walkSymbolReferences(ctx context.Context, searchRoot, relPrefix, glob, symbol string, skips *walkSkips,
 	visitor func(filePath string, refs []treesitter.Reference, content []byte) error) error {
 
 	if !treesitter.Enabled() {
 		return nil
 	}
 
-	return walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true}, func(path, rel string, d os.DirEntry) error {
+	return walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true, onSkip: skips.observe}, func(path, rel string, d os.DirEntry) error {
 		if !treesitter.ReferenceSearchSupported(path) {
 			return nil
 		}
@@ -84,7 +84,7 @@ func (e *Executor) walkSymbolReferences(ctx context.Context, searchRoot, relPref
 // walkSymbolReferencesText is a shared helper for text-based symbol search.
 // It walks the filesystem and finds symbol references using regex patterns.
 // The pattern parameter should be a pre-compiled regex pattern (callers use regexp.QuoteMeta).
-func (e *Executor) walkSymbolReferencesText(ctx context.Context, searchRoot, relPrefix, glob, pattern string,
+func (e *Executor) walkSymbolReferencesText(ctx context.Context, searchRoot, relPrefix, glob, pattern string, skips *walkSkips,
 	visitor func(filePath string, lineNum int, line string) error) error {
 
 	re, err := compileSearchPattern(pattern, false)
@@ -92,7 +92,7 @@ func (e *Executor) walkSymbolReferencesText(ctx context.Context, searchRoot, rel
 		return err
 	}
 
-	return walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true}, func(path, rel string, d os.DirEntry) error {
+	return walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: glob, checkReadable: true, onSkip: skips.observe}, func(path, rel string, d os.DirEntry) error {
 		// Read file and find matches
 		content, err := os.ReadFile(path)
 		if err != nil {

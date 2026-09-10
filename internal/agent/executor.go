@@ -16,6 +16,7 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/contextmgr"
 	"gogen/internal/ioutil"
+	"gogen/internal/spill"
 )
 
 const (
@@ -584,7 +585,12 @@ func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, 
 	// (bounded by maxToolOutputBytes when configured) while streaming each
 	// chunk to the optional ToolOutputSink so frontends can render live
 	// terminal output.
-	out := newCommandOutputWriter(command, ToolOutputFromContext(ctx), e.maxToolOutputBytes())
+	out := newCommandOutputWriter(command, ToolOutputFromContext(ctx), e.maxToolOutputBytes(), spill.TargetFromContext(ctx))
+	// The spill target is session state handed in by the caller: whatever
+	// this command does (including every error return below), nobody else
+	// will finish or discard it. The cap path consumes it via finishSpill;
+	// this defer covers the paths that don't (see discardSpill).
+	defer out.discardSpill()
 
 	// Idle timeout: a foreground command that produces no output for the
 	// configured window is killed. Any output resets the window, so a
@@ -613,7 +619,7 @@ func (e *Executor) ExecuteCommand(ctx context.Context, command string) (string, 
 	}
 	outStr := out.String()
 	if out.overflowed {
-		outStr = e.applyToolOutputCap(outStr)
+		outStr = e.applyToolOutputCap(outStr, out)
 	}
 	if err != nil {
 		if idleKilled.Load() {
@@ -660,19 +666,27 @@ func watchCommandIdle(out *commandOutputWriter, idle time.Duration, cancel conte
 	}
 }
 
-// applyToolOutputCap appends the truncation marker when the bounded writer
-// dropped output beyond the configured cap. The writer keeps the FIRST cap
-// bytes — the same prefix the context manager's tool-result cap preserves —
-// and the content is known to have been cut, so ForceMarker appends the
-// marker even when the content sits at exactly the cap, with its length
-// reserved inside the cap (same budget discipline as contextmgr's
-// tool-result cap). The marker shares the manager's standard prefix, so the
-// later truncation pass sees it and leaves the result untouched (no
-// double-marking).
-func (e *Executor) applyToolOutputCap(content string) string {
+// applyToolOutputCap caps the model-facing result of a command whose
+// bounded writer dropped output beyond the configured cap. When the
+// command's full stream was spilled to the session's spill dir (the spill
+// target rides in on the command's context), the result becomes a head +
+// locator + tail preview within the cap and nothing is lost — the model
+// retrieves the rest from the saved path. Without a spill (no session
+// context, or the spill failed — best-effort), the result is the FIRST cap
+// bytes with the plain truncation marker, exactly as before the spill
+// feature existed. Both forms carry the standard marker prefix, so the
+// later context-manager pass sees it and leaves the result untouched (no
+// double-marking), and the preview is built within the same budget
+// discipline (marker/locator length reserved inside the cap).
+func (e *Executor) applyToolOutputCap(content string, out *commandOutputWriter) string {
 	cap := e.maxToolOutputBytes()
 	if cap <= 0 {
 		return content
+	}
+	if out != nil {
+		if path, total, ok := out.finishSpill(); ok {
+			return spill.PreviewStreamed(content, cap, path, total)
+		}
 	}
 	marker := fmt.Sprintf("\n… truncated (command output exceeds %d bytes)", cap)
 	return contextmgr.Truncate(content, cap, contextmgr.TruncateOptions{
@@ -738,10 +752,14 @@ func (b *outputBuffer) string() string {
 // prefix the context manager's tool-result cap preserves) and stops
 // growing once full, so a noisy command cannot consume unbounded memory for
 // its whole runtime; the sink still receives every chunk, so live terminal
-// output is never capped. Write may be called concurrently by exec's
-// pipe-copy goroutines, so the buffer and the sink callback are serialized
-// by an internal lock to preserve chunk ordering. Sinks must therefore be
-// fast and must not call back into the executor.
+// output is never capped. When spill is non-nil, every chunk that would
+// push past the cap is persisted to the session's spill file first (the
+// file is opened lazily on the first overflowing chunk), so the full
+// stream survives on disk even though the in-memory buffer trims its
+// head. Write may be called concurrently by exec's
+// pipe-copy goroutines, so the buffer, the sink callback, and the spill
+// file are serialized by an internal lock to preserve chunk ordering.
+// Sinks must therefore be fast and must not call back into the executor.
 type commandOutputWriter struct {
 	mu         sync.Mutex
 	buf        bytes.Buffer
@@ -749,6 +767,15 @@ type commandOutputWriter struct {
 	overflowed bool
 	command    string
 	sink       ToolOutputSink
+	// spill persists the full stream once the buffer overflows; nil
+	// disables spilling. Set to nil permanently on the first spill error
+	// (best-effort: the capped result falls back to the plain marker).
+	// Only mutated under mu.
+	spill *spill.Target
+	// spillStarted records whether the spill file has caught up with the
+	// in-memory buffer (first overflow opens the file and writes the
+	// buffered prefix before the overflowing chunk). Only accessed under mu.
+	spillStarted bool
 	// lastActive is the monotonic-free unix-nano timestamp of the most
 	// recent output write (the command's start when it has produced no
 	// output yet). Updated atomically: Write runs on exec's pipe-copy
@@ -756,8 +783,8 @@ type commandOutputWriter struct {
 	lastActive atomic.Int64
 }
 
-func newCommandOutputWriter(command string, sink ToolOutputSink, max int) *commandOutputWriter {
-	w := &commandOutputWriter{command: command, sink: sink, max: max}
+func newCommandOutputWriter(command string, sink ToolOutputSink, max int, spill *spill.Target) *commandOutputWriter {
+	w := &commandOutputWriter{command: command, sink: sink, max: max, spill: spill}
 	w.lastActive.Store(time.Now().UnixNano())
 	return w
 }
@@ -769,6 +796,23 @@ func (w *commandOutputWriter) Write(p []byte) (int, error) {
 	w.lastActive.Store(time.Now().UnixNano())
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	// Spill BEFORE the buffer update: once this chunk pushes past the cap,
+	// the buffer trims (or stops taking) those bytes and they are gone
+	// from memory. On the first overflowing chunk the file is opened and
+	// caught up with the buffered prefix, so the file receives the full
+	// stream. Best-effort: the first spill error disables spilling for
+	// the rest of the command.
+	if w.max > 0 && w.spill != nil && len(p) > w.max-w.buf.Len() {
+		if err := w.spillChunk(p); err != nil {
+			// Best-effort: disable spilling for the rest of the command.
+			// Discard (not a bare drop of the reference) closes the file and
+			// removes the partial, per the spill package's contract — a
+			// dropped target would leave the file on disk and its descriptor
+			// open until the GC got to it.
+			w.spill.Discard()
+			w.spill = nil
+		}
+	}
 	if w.max > 0 {
 		if room := w.max - w.buf.Len(); room > 0 {
 			if len(p) > room {
@@ -801,6 +845,52 @@ func (w *commandOutputWriter) String() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.buf.String()
+}
+
+// spillChunk appends p to the spill file, opening the file and writing the
+// buffered prefix first on the first call so the file ends up with the
+// complete stream. Called under w.mu (from Write), before the buffer
+// consumes the chunk.
+func (w *commandOutputWriter) spillChunk(p []byte) error {
+	if !w.spillStarted {
+		if _, err := w.spill.Write(w.buf.Bytes()); err != nil {
+			return err
+		}
+		w.spillStarted = true
+	}
+	_, err := w.spill.Write(p)
+	return err
+}
+
+// finishSpill closes any spill file opened for this command's output and
+// reports (path, total bytes, whether a file was written). Called once,
+// after the command has finished and the pipes are drained, so no Write
+// can race it.
+func (w *commandOutputWriter) finishSpill() (string, int64, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.spill == nil {
+		return "", 0, false
+	}
+	t := w.spill
+	w.spill = nil
+	return t.Finish()
+}
+
+// discardSpill drops an unused spill file: called when the command has
+// finished but nobody consumed the target — the cap changed to 0 between the
+// first overflowing chunk and the result (applyToolOutputCap returns before
+// finishSpill), or any future early return. A consumed target is already nil
+// here, so this is a no-op on the normal paths. Called from a defer: no Write
+// can race it (the pipes are drained when ExecuteCommand returns).
+func (w *commandOutputWriter) discardSpill() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.spill == nil {
+		return
+	}
+	w.spill.Discard()
+	w.spill = nil
 }
 
 func (e *Executor) ReplaceInFile(path string, search string, replace string, replaceAll bool) (string, error) {

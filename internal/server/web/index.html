@@ -3,8 +3,23 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <!-- Address-bar color; kept in sync with the theme by app.js (applyTheme). -->
+    <!-- Address-bar color; kept in sync with the theme by applyTheme. -->
     <meta name="theme-color" content="#131418">
+    <!-- Early theme bootstrap: resolve the saved theme (gogen-theme) and
+         apply the .light class + address-bar color before the module graph
+         runs. components/settings.js applyTheme() re-applies it (the only
+         other writer), so this just closes the flash-of-default window on a
+         light/auto-light setup. Keep in sync with resolveTheme there; the
+         colors mirror --bg in styles.css (#131418 / #f7f8fa). -->
+    <script>
+        (function () {
+            var pref = localStorage.getItem('gogen-theme') || 'auto';
+            var light = pref === 'light' || (pref === 'auto' && !!window.matchMedia && !window.matchMedia('(prefers-color-scheme: dark)').matches);
+            if (light) document.documentElement.classList.add('light');
+            var meta = document.querySelector('meta[name="theme-color"]');
+            if (meta) meta.setAttribute('content', light ? '#f7f8fa' : '#131418');
+        })();
+    </script>
     <title>GoGen AI Agent</title>
     <link rel="stylesheet" href="/styles.css">
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤖</text></svg>">
@@ -105,7 +120,7 @@
                                 <div class="tb-popover-heading">Thinking level</div>
                                 <div id="tb-thinking-grid" class="tb-thinking-grid"></div>
                             </div>
-                            <div class="tb-popover-section">
+                            <div class="tb-popover-section" id="tb-model-section">
                                 <div class="tb-popover-heading">Model</div>
                                 <input type="search" id="tb-model-filter" class="tb-model-filter" placeholder="Filter models…" autocomplete="off">
                                 <div id="tb-model-list" class="tb-model-list"></div>
@@ -148,10 +163,18 @@
                             <span class="progress-label"></span>
                         </div>
                     </div>
-                    <button type="button" id="attach-btn" title="Attach image (or paste an image into the input)" aria-label="Attach image"><svg class="icon"><use href="#i-paperclip"></use></svg></button>
+                    <button type="button" id="attach-btn" title="Attach image (or paste or drop files into the input)" aria-label="Attach image"><svg class="icon"><use href="#i-paperclip"></use></svg></button>
                     <input type="file" id="image-upload" accept="image/*" multiple hidden>
                     <button id="send-btn" title="Send" aria-label="Send"><svg class="icon"><use href="#i-arrow-up"></use></svg></button>
                     <button id="cancel-btn" disabled title="Cancel current turn">Cancel</button>
+                    <!-- Drop-zone overlay (components/composer.js): shown
+                         while a file drag hovers the composer. Last child so
+                         it paints above the row; pointer-events:none keeps
+                         drag events targeting the real children underneath. -->
+                    <div id="composer-drop-overlay" hidden>
+                        <strong>Drop files to attach</strong>
+                        <span>Images attach to the message · text files become context</span>
+                    </div>
                 </div>
                 <!-- Terminal strip: docked below the input bar at the bottom
                      of the chat pane, scoped to the chat pane so it stays to
@@ -331,7 +354,7 @@
             </div>
         </div>
     </div>
-    <div id="delete-approval-overlay">
+    <div id="delete-approval-overlay" aria-hidden="true">
         <div id="delete-approval-dialog" role="dialog" aria-labelledby="delete-approval-title">
             <h3 id="delete-approval-title">Approve file delete?</h3>
             <p id="delete-approval-reason"></p>
@@ -342,8 +365,8 @@
             </div>
         </div>
     </div>
-    <div id="close-tab-overlay">
-        <div id="close-tab-dialog">
+    <div id="close-tab-overlay" aria-hidden="true">
+        <div id="close-tab-dialog" role="dialog" aria-label="Discard unsaved changes">
             <h3>Discard unsaved changes?</h3>
             <p id="close-tab-filename"></p>
             <div id="close-tab-actions">
@@ -352,7 +375,7 @@
             </div>
         </div>
     </div>
-    <div id="session-delete-overlay">
+    <div id="session-delete-overlay" aria-hidden="true">
         <div id="session-delete-dialog" role="dialog" aria-label="Delete session">
             <h3>Delete session?</h3>
             <p id="session-delete-filename"></p>
@@ -362,7 +385,7 @@
             </div>
         </div>
     </div>
-    <div id="replace-preview-overlay">
+    <div id="replace-preview-overlay" aria-hidden="true">
         <div id="replace-preview-dialog" role="dialog" aria-labelledby="replace-preview-title">
             <h3 id="replace-preview-title">Replace Preview</h3>
             <div id="replace-preview-summary"></div>
@@ -373,167 +396,25 @@
             </div>
         </div>
     </div>
-    <div id="settings-overlay">
+    <div id="settings-overlay" aria-hidden="true">
         <div id="settings-dialog" role="dialog" aria-label="Settings">
             <div class="settings-header">
                 <h3>Settings</h3>
                 <button type="button" id="settings-close-btn" title="Close (Esc)" aria-label="Close settings"><svg class="icon"><use href="#i-x"></use></svg></button>
             </div>
+            <!-- The sidebar buttons and the tab panels are generated from
+                 components/settings-schema.js by components/settings-render.js
+                 (called from initSettings), so the tab order/grouping is data,
+                 not hand-written markup. -->
             <div class="settings-layout">
-                <nav class="settings-sidebar" aria-label="Settings sections">
-                    <button type="button" class="settings-tab-btn" data-tab="editor" role="tab" aria-selected="true" aria-controls="settings-tab-editor">Editor</button>
-                    <button type="button" class="settings-tab-btn" data-tab="chat" role="tab" aria-selected="false" aria-controls="settings-tab-chat">Chat</button>
-                    <button type="button" class="settings-tab-btn" data-tab="global" role="tab" aria-selected="false" aria-controls="settings-tab-global">Global</button>
-                    <button type="button" class="settings-tab-btn" data-tab="agent" role="tab" aria-selected="false" aria-controls="settings-tab-agent">Agent</button>
-                    <button type="button" class="settings-tab-btn" data-tab="security" role="tab" aria-selected="false" aria-controls="settings-tab-security">Security</button>
-                    <button type="button" class="settings-tab-btn" data-tab="context" role="tab" aria-selected="false" aria-controls="settings-tab-context">Context</button>
-                    <button type="button" class="settings-tab-btn" data-tab="tools" role="tab" aria-selected="false" aria-controls="settings-tab-tools">Tools</button>
-                    <button type="button" class="settings-tab-btn" data-tab="sessions" role="tab" aria-selected="false" aria-controls="settings-tab-sessions">Sessions</button>
-                    <button type="button" class="settings-tab-btn" data-tab="server" role="tab" aria-selected="false" aria-controls="settings-tab-server">Server</button>
-                    <button type="button" class="settings-tab-btn" data-tab="mcp" role="tab" aria-selected="false" aria-controls="settings-tab-mcp">MCP</button>
-                    <button type="button" class="settings-tab-btn" data-tab="providers" role="tab" aria-selected="false" aria-controls="settings-tab-providers">Providers</button>
-                </nav>
-                <div class="settings-content">
-            <div class="settings-group" id="settings-tab-editor" role="tabpanel">
-                <h4 class="settings-group-title">Editor</h4>
-                <div class="setting-row">
-                    <div>
-                        <label>Minimap</label>
-                        <select id="editor-minimap" aria-label="Minimap">
-                            <option value="off">Off</option>
-                            <option value="on">On</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Word wrap</label>
-                        <select id="editor-wordwrap" aria-label="Word wrap">
-                            <option value="on">On</option>
-                            <option value="off">Off</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Sticky scroll</label>
-                        <select id="editor-sticky" aria-label="Sticky scroll">
-                            <option value="on">On</option>
-                            <option value="off">Off</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Font size</label>
-                        <input type="number" id="editor-fontsize" min="8" max="32" step="1" aria-label="Font size">
-                    </div>
-                </div>
+                <nav class="settings-sidebar" aria-label="Settings sections"></nav>
+                <div class="settings-content"></div>
             </div>
-            <div class="settings-group" id="settings-tab-chat" role="tabpanel">
-                <h4 class="settings-group-title">Chat</h4>
-                <div class="setting-row">
-                    <div>
-                        <label>Click file in chat</label>
-                        <select id="file-click-behavior" aria-label="File click behavior">
-                            <option value="open">Open (background)</option>
-                            <option value="open-switch">Open &amp; switch to editor</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Chat diff viewer</label>
-                        <select id="chat-diff-viewer" aria-label="Chat diff viewer">
-                            <option value="tokenizer">Static (line numbers)</option>
-                            <option value="monaco">Monaco (full editor)</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Show reply model</label>
-                        <select id="show-reply-model" aria-label="Show reply model">
-                            <option value="off">Off</option>
-                            <option value="on">On</option>
-                        </select>
-                    </div>
-                </div>
-            </div>
-            <div class="settings-group" id="settings-tab-global" role="tabpanel">
-                <h4 class="settings-group-title">Global</h4>
-                <div class="setting-row">
-                    <div>
-                        <label>Theme</label>
-                        <select id="theme-select" aria-label="Theme">
-                            <option value="auto">Auto (system)</option>
-                            <option value="dark">Dark</option>
-                            <option value="light">Light</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Accent color</label>
-                        <input type="color" id="accent-color-input" value="#7aa2f7" aria-label="Accent color">
-                        <button type="button" id="accent-reset-btn" class="settings-btn-secondary">Default</button>
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Desktop notifications</label>
-                        <select id="notifications-select" aria-label="Desktop notifications">
-                            <option value="off">Off</option>
-                            <option value="background">When tab is hidden</option>
-                            <option value="always">Always</option>
-                        </select>
-                    </div>
-                </div>
-            </div>
-            <div class="settings-group" id="settings-tab-agent" role="tabpanel">
-                <h4 class="settings-group-title">Agent</h4>
-                <!-- These controls are server-backed: changing them sends a
-                     config WS message (app.js sendFeatureConfig) and the
-                     select state follows the server's config push, so every
-                     tab stays in sync. No localStorage here. -->
-                <div class="setting-row">
-                    <div>
-                        <label>Project board</label>
-                        <select id="board-enabled-select" aria-label="Project board">
-                            <option value="off">Off</option>
-                            <option value="on">On</option>
-                        </select>
-                    </div>
-                </div>
-                <!-- Prompt templates: server-backed (runtime-config WS
-                     message). The fields are pre-populated with the RESOLVED
-                     effective templates (empty config = the built-in
-                     default); Reset sends the explicit empty value, which
-                     resolves back to the built-in default. -->
-                <div class="setting-row" id="board-prompt-row">
-                    <div>
-                        <label>Board agent prompt</label>
-                        <textarea id="board-start-prompt-input" rows="6" spellcheck="false" aria-label="Board agent prompt template"></textarea>
-                        <p class="settings-note">Template for the agent started from a board ticket. Placeholders: {id} {title} {description} {priority} {context}. Empty = built-in default.</p>
-                        <button type="button" class="settings-btn-secondary" id="board-prompt-reset-btn">Reset to default</button>
-                    </div>
-                </div>
-                <!-- Board review agent: spawns a headless review session
-                     when a ticket moves into in_review (agent board tool or
-                     user drag-drop). Server-backed toggle + model/effort
-                     pickers (same ModelThinkingPicker as the subagent
-                     settings); the review prompt is a configurable
-                     template like the board agent prompt above. -->
-                <div class="setting-row">
-                    <div>
-                        <label>Board review agent</label>
-                        <select id="review-agent-enabled-select" aria-label="Board review agent">
-                            <option value="off">Off</option>
-                            <option value="on">On</option>
-                        </select>
-                        <p class="settings-note">When on, a ticket moved into in_review automatically starts a review session that verifies the work, then marks the ticket done or comments findings and moves it back to in_progress. Max 5 review rounds per ticket. Web mode only.</p>
-                    </div>
-                </div>
+            <!-- Composite settings blocks (the shared model/effort pickers, the
+                 MCP and provider editors): settings-render.js moves each into
+                 its tab panel by id, so their ids and internal structure stay
+                 in one place. -->
+            <div id="settings-composites" hidden>
                 <div class="setting-row" id="review-agent-model-row">
                     <div>
                         <label>Default review model</label>
@@ -553,77 +434,9 @@
                         </div>
                     </div>
                 </div>
-                <div class="setting-row" id="board-review-prompt-row">
-                    <div>
-                        <label>Board review prompt</label>
-                        <textarea id="board-review-prompt-input" rows="6" spellcheck="false" aria-label="Board review prompt template"></textarea>
-                        <p class="settings-note">Template for the auto review agent started when a ticket enters in_review. Placeholders: {id} {title} {description} {priority} {context} {assignee}. Empty = built-in default.</p>
-                        <button type="button" class="settings-btn-secondary" id="board-review-prompt-reset-btn">Reset to default</button>
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>System prompt</label>
-                        <textarea id="system-prompt-input" rows="6" spellcheck="false" aria-label="System prompt template"></textarea>
-                        <p class="settings-note">Replaces the built-in system prompt; {working_dir} is substituted. Project rules and plan mode still apply. Empty = built-in default.</p>
-                        <button type="button" class="settings-btn-secondary" id="system-prompt-reset-btn">Reset to default</button>
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Subagent prompt</label>
-                        <textarea id="subagent-prompt-input" rows="4" spellcheck="false" aria-label="Subagent prompt template"></textarea>
-                        <p class="settings-note">Wraps the subagent job; {job} is substituted. Empty = built-in default.</p>
-                        <button type="button" class="settings-btn-secondary" id="subagent-prompt-reset-btn">Reset to default</button>
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Subagents</label>
-                        <select id="subagent-enabled-select" aria-label="Subagents">
-                            <option value="off">Off</option>
-                            <option value="on">On</option>
-                        </select>
-                    </div>
-                </div>
-                <!-- Automations: the file-based cron scheduler. Server-backed
-                     toggle (config WS message); toggling starts/stops the
-                     host-side scheduler live. Records are managed via the
-                     `gogen automation` CLI (ls/get/create/enable/disable/
-                     runs/delete); this toggle only gates firing. -->
-                <div class="setting-row">
-                    <div>
-                        <label>Automations</label>
-                        <select id="automations-enabled-select" aria-label="Automations scheduler">
-                            <option value="off">Off</option>
-                            <option value="on">On</option>
-                        </select>
-                        <p class="settings-note">When on, GoGen sweeps the saved automations every 30 s and fires each due one as a headless run in its working directory (runs recorded with their session id). Create automations with `gogen automation create &lt;title&gt; --prompt ... --daily|--hourly|--weekly ...`; list them with `gogen automation ls`. Automations fire only while GoGen is running.</p>
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Max subagent depth</label>
-                        <input type="number" id="subagent-depth-input" min="1" max="10" step="1" aria-label="Max subagent depth">
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Max concurrent subagents</label>
-                        <input type="number" id="subagent-limit-input" min="1" max="32" step="1" aria-label="Max concurrent subagents">
-                        <p class="settings-note">Per session: how many subagents may run at the same time. Spawning beyond the limit is refused (the agent can interrupt or wait). Web mode only — the TUI runs subagents one at a time.</p>
-                    </div>
-                </div>
-                <div class="setting-row">
+                <div class="setting-row" id="row-subagent-model-picker">
                     <div>
                         <label>Default subagent model</label>
-                        <!-- Server-backed (runtime-config WS message): the
-                             list reuses the toolbar model picker's rendering
-                             (same grouping/filter/rows) and the selection
-                             round-trips through configFields
-                             ["subagentModel"]. Empty = inherit the parent's
-                             model; the tool's explicit model argument always
-                             wins. -->
                         <div id="subagent-model-picker">
                             <input type="text" id="subagent-model-filter" class="tb-model-filter" placeholder="Filter models…" autocomplete="off" aria-label="Filter subagent models">
                             <div id="subagent-model-list" class="tb-model-list"></div>
@@ -631,300 +444,51 @@
                         </div>
                     </div>
                 </div>
-                <div class="setting-row">
+                <div class="setting-row" id="row-subagent-thinking-picker">
                     <div>
                         <label>Subagent reasoning effort</label>
-                        <!-- Server-backed (runtime-config WS message), paired
-                             with the subagent model picker above: the chips
-                             are MODEL-AWARE — the selected subagent model's
-                             accepted values (catalog reasoningEfforts), or
-                             the active pane's model values while the model
-                             is "Inherit" (the child then runs the parent's
-                             model). The selection round-trips through
-                             configFields ["subagentThinkingLevel"]; empty =
-                             inherit the parent session's live level. -->
                         <div id="subagent-thinking-picker">
                             <div id="subagent-thinking-options" class="tb-thinking-grid"></div>
                             <p class="settings-note">Empty = inherit the parent session's level. Options follow the subagent model's accepted values; a level the model does not accept is never sent.</p>
                         </div>
                     </div>
                 </div>
-            </div>
-            <div class="settings-group" id="settings-tab-security" role="tabpanel">
-                <h4 class="settings-group-title">Security</h4>
-                <div class="setting-row">
-                    <div>
-                        <label>Command safety</label>
-                        <select id="command-safety-select" aria-label="Command safety">
-                            <option value="blocklist">Blocklist</option>
-                            <option value="allowlist">Allowlist</option>
-                            <option value="off">Off</option>
-                        </select>
+                <div id="mcp-block">
+                    <div id="mcp-server-list" class="mcp-server-list"></div>
+                    <div class="provider-form">
+                        <input type="text" id="mcp-test-name" placeholder="Name (for saved servers)" autocomplete="off" aria-label="MCP server name">
+                        <input type="text" id="mcp-test-command" placeholder="Command (e.g. npx)" autocomplete="off" aria-label="MCP server command">
+                        <input type="text" id="mcp-test-args" placeholder="Args (space-separated)" autocomplete="off" aria-label="MCP server args">
+                        <input type="text" id="mcp-test-env" placeholder="Env KEY=VALUE (space-separated)" autocomplete="off" aria-label="MCP server env">
+                        <div class="provider-form-actions">
+                            <button type="button" id="mcp-test-btn" class="settings-btn-secondary">Test</button>
+                        </div>
                     </div>
+                    <div id="mcp-test-result" class="settings-note"></div>
                 </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Command allowlist (comma-separated)</label>
-                        <input type="text" id="command-allowlist-input" autocomplete="off" aria-label="Command allowlist">
+                <div id="provider-block">
+                    <p class="settings-warning" id="provider-key-warning">
+                        <svg class="icon"><use href="#i-alert"></use></svg>
+                        Provider API keys are stored in the config file (<span id="provider-config-path"></span>, readable only by your user).
+                    </p>
+                    <div id="provider-list"></div>
+                    <div class="provider-form">
+                        <input type="text" id="provider-name" placeholder="Name (e.g. local-llama)" autocomplete="off" aria-label="Provider name">
+                        <input type="text" id="provider-base-url" placeholder="Base URL (https://…/v1)" autocomplete="off" aria-label="Provider base URL">
+                        <input type="password" id="provider-api-key" placeholder="API key (blank keeps stored)" autocomplete="new-password" aria-label="Provider API key">
+                        <input type="text" id="provider-model" placeholder="Default model (optional)" autocomplete="off" aria-label="Provider default model">
+                        <div class="provider-form-actions">
+                            <button type="button" id="provider-test-btn" class="settings-btn-secondary">Test</button>
+                            <button type="button" id="provider-add-btn">Add / Save</button>
+                        </div>
                     </div>
+                    <div id="provider-test-result" class="settings-note"></div>
                 </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Delete approval</label>
-                        <select id="delete-approval-select" aria-label="Delete approval">
-                            <option value="required">Required</option>
-                            <option value="off">Off</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Command sandbox</label>
-                        <select id="command-sandbox-select" aria-label="Command sandbox">
-                            <option value="off">Off</option>
-                            <option value="bwrap">bwrap</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Command idle timeout (seconds, 0 = default 300)</label>
-                        <input type="number" id="command-idle-timeout-input" min="0" step="1" aria-label="Command idle timeout seconds">
-                    </div>
-                </div>
-            </div>
-            <div class="settings-group" id="settings-tab-context" role="tabpanel">
-                <h4 class="settings-group-title">Context</h4>
-                <div class="setting-row">
-                    <div>
-                        <label>Context limit (0 = auto)</label>
-                        <input type="number" id="context-limit-input" min="0" step="1000" aria-label="Context limit">
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Compact threshold (0–1, 0 = off)</label>
-                        <input type="number" id="compact-threshold-input" min="0" max="1" step="0.05" aria-label="Compact threshold">
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Keep recent messages on compact (0 = only first user message)</label>
-                        <input type="number" id="compact-keep-input" min="0" step="1" aria-label="Keep recent messages on compact">
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Max tool result bytes (0 = no cap)</label>
-                        <input type="number" id="max-tool-bytes-input" min="0" step="1024" aria-label="Max tool result bytes">
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Compact reserve tokens</label>
-                        <input type="number" id="compact-reserve-input" min="0" step="100" aria-label="Compact reserve tokens">
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Last-resort condensation (message too large for the window)</label>
-                        <select id="compact-last-resort-select" aria-label="Last-resort condensation">
-                            <option value="condense">Condense (archive the original)</option>
-                            <option value="error">Error (diagnostic, no condensation)</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Preserve reasoning</label>
-                        <select id="preserve-reasoning-select" aria-label="Preserve reasoning">
-                            <option value="auto">Auto</option>
-                            <option value="on">On</option>
-                            <option value="off">Off</option>
-                        </select>
-                    </div>
-                </div>
-            </div>
-            <div class="settings-group" id="settings-tab-tools" role="tabpanel">
-                <h4 class="settings-group-title">Tools</h4>
-                <div class="setting-row">
-                    <div>
-                        <label>Web fetch</label>
-                        <select id="web-fetch-select" aria-label="Web fetch">
-                            <option value="on">On</option>
-                            <option value="off">Off</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Web search</label>
-                        <select id="web-search-select" aria-label="Web search">
-                            <option value="on">On</option>
-                            <option value="off">Off</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Search backend</label>
-                        <select id="web-search-backend-select" aria-label="Web search backend">
-                            <option value="">DuckDuckGo</option>
-                            <option value="brave">Brave</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Search API key</label>
-                        <input type="password" id="web-search-api-key-input" placeholder="API key" autocomplete="new-password" aria-label="Web search API key">
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Allowed domains (comma-separated)</label>
-                        <input type="text" id="web-allowed-domains-input" autocomplete="off" aria-label="Allowed domains">
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Web fetch mode</label>
-                        <select id="web-fetch-mode-select" aria-label="Web fetch mode">
-                            <option value="https">HTTPS only</option>
-                            <option value="all">HTTP + HTTPS</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Tree-sitter</label>
-                        <select id="treesitter-select" aria-label="Tree-sitter">
-                            <option value="on">On</option>
-                            <option value="off">Off</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Tree-sitter languages (comma-separated)</label>
-                        <input type="text" id="treesitter-langs-input" autocomplete="off" aria-label="Tree-sitter languages">
-                    </div>
-                </div>
-            </div>
-            <div class="settings-group" id="settings-tab-sessions" role="tabpanel">
-                <h4 class="settings-group-title">Sessions</h4>
-                <div class="setting-row">
-                    <div>
-                        <label>Max saved sessions</label>
-                        <input type="number" id="session-max-count-input" min="1" step="1" aria-label="Max saved sessions">
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Session retention (days)</label>
-                        <input type="number" id="session-max-age-input" min="-1" step="1" aria-label="Session retention days (-1 = keep forever)">
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Approval hold (seconds)</label>
-                        <input type="number" id="approval-hold-input" min="0" step="1" aria-label="Approval hold seconds">
-                    </div>
-                </div>
-            </div>
-            <div class="settings-group" id="settings-tab-server" role="tabpanel">
-                <h4 class="settings-group-title">Server</h4>
                 <p class="settings-warning" id="restart-banner" hidden></p>
-                <div class="setting-row">
-                    <div>
-                        <label>Web bind (restart)</label>
-                        <input type="text" id="web-bind-input" autocomplete="off" aria-label="Web bind address">
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Allowed origins (restart)</label>
-                        <input type="text" id="web-allowed-origins-input" autocomplete="off" aria-label="Allowed origins">
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Auth token (restart)</label>
-                        <input type="password" id="web-auth-token-input" placeholder="Auth token" autocomplete="new-password" aria-label="Auth token">
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>TLS cert file (restart)</label>
-                        <input type="text" id="web-tls-cert-input" autocomplete="off" aria-label="TLS cert file">
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>TLS key file (restart)</label>
-                        <input type="text" id="web-tls-key-input" autocomplete="off" aria-label="TLS key file">
-                    </div>
-                </div>
-                <div class="setting-row">
-                    <div>
-                        <label>Max active sessions (restart)</label>
-                        <input type="number" id="web-max-active-input" min="1" step="1" aria-label="Max active sessions">
-                    </div>
-                </div>
-            </div>
-            <div class="settings-group" id="settings-tab-mcp" role="tabpanel">
-                <h4 class="settings-group-title">MCP</h4>
-                <p class="settings-note">MCP changes take effect after a restart.</p>
-                <div class="setting-row">
-                    <div>
-                        <label>MCP (restart)</label>
-                        <select id="mcp-select" aria-label="MCP">
-                            <option value="off">Off</option>
-                            <option value="on">On</option>
-                        </select>
-                    </div>
-                </div>
-                <div id="mcp-server-list" class="mcp-server-list"></div>
-                <div class="provider-form">
-                    <input type="text" id="mcp-test-name" placeholder="Name (for saved servers)" autocomplete="off" aria-label="MCP server name">
-                    <input type="text" id="mcp-test-command" placeholder="Command (e.g. npx)" autocomplete="off" aria-label="MCP server command">
-                    <input type="text" id="mcp-test-args" placeholder="Args (space-separated)" autocomplete="off" aria-label="MCP server args">
-                    <input type="text" id="mcp-test-env" placeholder="Env KEY=VALUE (space-separated)" autocomplete="off" aria-label="MCP server env">
-                    <div class="provider-form-actions">
-                        <button type="button" id="mcp-test-btn" class="settings-btn-secondary">Test</button>
-                    </div>
-                </div>
-                <div id="mcp-test-result" class="settings-note"></div>
-            </div>
-            <div class="settings-group" id="settings-tab-providers" role="tabpanel">
-                <h4 class="settings-group-title">Providers</h4>
-                <!-- Server-backed (config WS message): the list follows the
-                     config push (applyProviderSettings) and add/delete/test
-                     round-trip through provider_save / provider_delete /
-                     test_provider. Keys are stored in the config file — the
-                     warning below renders the actual path from the server. -->
-                <p class="settings-warning" id="provider-key-warning">
-                    <svg class="icon"><use href="#i-alert"></use></svg>
-                    Provider API keys are stored in the config file (<span id="provider-config-path"></span>, readable only by your user).
-                </p>
-                <div id="provider-list"></div>
-                <div class="provider-form">
-                    <input type="text" id="provider-name" placeholder="Name (e.g. local-llama)" autocomplete="off" aria-label="Provider name">
-                    <input type="text" id="provider-base-url" placeholder="Base URL (https://…/v1)" autocomplete="off" aria-label="Provider base URL">
-                    <input type="password" id="provider-api-key" placeholder="API key (blank keeps stored)" autocomplete="new-password" aria-label="Provider API key">
-                    <input type="text" id="provider-model" placeholder="Default model (optional)" autocomplete="off" aria-label="Provider default model">
-                    <div class="provider-form-actions">
-                        <button type="button" id="provider-test-btn" class="settings-btn-secondary">Test</button>
-                        <button type="button" id="provider-add-btn">Add / Save</button>
-                    </div>
-                </div>
-                <div id="provider-test-result" class="settings-note"></div>
-            </div>
-            </div>
             </div>
         </div>
     </div>
-    <div id="keybindings-overlay">
+    <div id="keybindings-overlay" aria-hidden="true">
         <div id="keybindings-dialog" role="dialog" aria-label="Keyboard shortcuts">
             <div class="settings-header">
                 <h3>Keyboard shortcuts</h3>

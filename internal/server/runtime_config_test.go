@@ -30,7 +30,7 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 		Type: "config",
 		ConfigFields: []string{
 			"commandSafety", "commandAllowlist", "deleteApproval", "commandSandbox", "commandIdleTimeoutSecs",
-			"contextLimit", "compactThreshold", "compactKeepRecentMessages", "maxToolResultBytes", "compactReserveTokens", "compactLastResort",
+			"contextLimit", "compactThreshold", "compactKeepRecentMessages", "maxToolResultBytes", "outputSpill", "compactReserveTokens", "compactLastResort",
 			"webFetch", "webSearch", "treesitter", "preserveReasoning",
 			"sessionMaxCount", "sessionMaxAgeDays", "webApprovalHoldSecs",
 			"subagentModel", "subagentThinkingLevel", "boardStartPrompt", "systemPrompt", "subagentPrompt",
@@ -44,6 +44,7 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 		CompactThreshold:          0.5,
 		CompactKeepRecentMessages: 3,
 		MaxToolResultBytes:        65536,
+		OutputSpill:               "off",
 		CompactReserveTokens:      1000,
 		CompactLastResort:         "error",
 		WebFetch:                  "off",
@@ -64,6 +65,8 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 		// no other test observes this test's templates.
 		agent.ConfigureSystemPrompt("")
 		agent.ConfigureSubagentPrompt("")
+		// The spill gate is package-global too: this test applied "off".
+		agent.ConfigureOutputSpill(true)
 	})
 	if err := conn.WriteJSON(msg); err != nil {
 		t.Fatalf("send config: %v", err)
@@ -78,6 +81,7 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 		cfg.ContextLimitConfig != 20000 || cfg.CompactThreshold != 0.5 ||
 		cfg.CompactKeepRecentMessages != 3 || cfg.MaxToolResultBytes != 65536 || cfg.CompactReserveTokens != 1000 ||
 		cfg.CompactLastResort != "error" ||
+		cfg.OutputSpill != "off" ||
 		cfg.WebFetch != "off" || cfg.WebSearch != "off" || cfg.TreeSitter != "off" ||
 		cfg.PreserveReasoning != "on" || cfg.SessionMaxCount != 4 || cfg.SessionMaxAgeDays != 9 ||
 		cfg.WebApprovalHoldSecs != 7 || cfg.SubagentModel == nil || *cfg.SubagentModel != "gpt-4o-mini" ||
@@ -117,6 +121,9 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 	if got := s.ws.GetRuntimeConfig().SubagentThinkingLevel; got != "high" {
 		t.Fatalf("runtime subagentThinkingLevel = %q, want high", got)
 	}
+	if agent.OutputSpillEnabled() {
+		t.Fatal("spill gate should be off after applying outputSpill=off")
+	}
 	// Live prompt setters: the next turn's system prompt and subagent jobs
 	// resolve the configured templates.
 	if got := agent.SystemPrompt("/w"); got != "sys tmpl /w" {
@@ -132,7 +139,7 @@ func TestRuntimeConfigLiveViaWS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"command_safety: allowlist", "command_allowlist: ls, cat", `delete_approval: "off"`, "command_idle_timeout_secs: 45", "context_limit: 20000", "session_max_count: 4", "web_approval_hold_secs: 7", "subagent_model: gpt-4o-mini", "subagent_thinking_level: high", "board_start_prompt: board tmpl {title}", "system_prompt: sys tmpl {working_dir}", "subagent_prompt: sub tmpl {job}"} {
+	for _, want := range []string{"command_safety: allowlist", "command_allowlist: ls, cat", `delete_approval: "off"`, "command_idle_timeout_secs: 45", "context_limit: 20000", "session_max_count: 4", "web_approval_hold_secs: 7", `output_spill: "off"`, "subagent_model: gpt-4o-mini", "subagent_thinking_level: high", "board_start_prompt: board tmpl {title}", "system_prompt: sys tmpl {working_dir}", "subagent_prompt: sub tmpl {job}"} {
 		if !strings.Contains(string(data), want) {
 			t.Fatalf("expected %q in persisted config:\n%s", want, data)
 		}

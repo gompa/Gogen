@@ -713,7 +713,7 @@ func TestSearchWithGoIgnoreCase(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			matches, truncated, err := executor.searchWithGoMatches(context.Background(), dir, "", tc.pattern, "", tc.ignoreCase)
+			matches, truncated, err := executor.searchWithGoMatches(context.Background(), dir, "", tc.pattern, "", tc.ignoreCase, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -731,7 +731,7 @@ func TestSearchWithGoIgnoreCase(t *testing.T) {
 
 			// The rendered form agrees: compacted layout shows the file
 			// header once, then "line:content" per match.
-			out, err := executor.searchWithGo(context.Background(), dir, "", tc.pattern, "", 0, tc.ignoreCase)
+			out, err := executor.searchWithGo(context.Background(), dir, "", tc.pattern, "", 0, tc.ignoreCase, nil)
 			if err != nil {
 				t.Fatal(err)
 			}

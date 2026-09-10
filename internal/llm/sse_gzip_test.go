@@ -1,15 +1,14 @@
 package llm
 
 import (
-	"net/http"
 	"testing"
 )
 
 func TestSSEHTTPClientDisablesCompression(t *testing.T) {
 	t.Parallel()
-	tr, ok := newSSEHTTPClient().Transport.(*http.Transport)
+	tr, ok := baseHTTPTransport(newSSEHTTPClient())
 	if !ok {
-		t.Fatal("expected *http.Transport")
+		t.Fatal("expected *http.Transport under the SSE filter transport")
 	}
 	if !tr.DisableCompression {
 		t.Fatal("expected DisableCompression on SSE client")

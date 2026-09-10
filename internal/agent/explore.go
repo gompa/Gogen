@@ -90,7 +90,8 @@ func (e *Executor) ListFiles(ctx context.Context, path string, recursive, tracke
 	}
 
 	var lines []string
-	err = walkTree(ctx, searchRoot, relPrefix, walkOpts{includeDirs: true}, func(path, rel string, d os.DirEntry) error {
+	skips := &walkSkips{}
+	err = walkTree(ctx, searchRoot, relPrefix, walkOpts{includeDirs: true, onSkip: skips.observe}, func(path, rel string, d os.DirEntry) error {
 		if d.IsDir() {
 			rel += "/"
 		}
@@ -112,9 +113,9 @@ func (e *Executor) ListFiles(ctx context.Context, path string, recursive, tracke
 		out += fmt.Sprintf("\n… truncated (showing first %d entries)", len(lines))
 	}
 	if out == "" {
-		return "(empty)", nil
+		out = "(empty)"
 	}
-	return out, nil
+	return out + skips.footer(), nil
 }
 
 // workspaceRelPath joins a workspace-relative prefix with a path segment.
@@ -206,7 +207,8 @@ func (e *Executor) GlobFiles(ctx context.Context, pattern, subpath string, track
 	}
 
 	var matches []string
-	err = walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: pattern, includeHidden: true}, func(path, rel string, d os.DirEntry) error {
+	skips := &walkSkips{}
+	err = walkTree(ctx, searchRoot, relPrefix, walkOpts{glob: pattern, includeHidden: true, onSkip: skips.observe}, func(path, rel string, d os.DirEntry) error {
 		matches = append(matches, rel)
 		if len(matches) >= exploreMaxEntries {
 			return errExploreTruncated
@@ -217,7 +219,7 @@ func (e *Executor) GlobFiles(ctx context.Context, pattern, subpath string, track
 		return "", err
 	}
 	if len(matches) == 0 {
-		return "No matches found", nil
+		return "No matches found" + skips.footer(), nil
 	}
 	slices.Sort(matches)
 	if trackedOnly {
@@ -227,7 +229,7 @@ func (e *Executor) GlobFiles(ctx context.Context, pattern, subpath string, track
 	if err == errExploreTruncated {
 		out += fmt.Sprintf("\n… truncated (showing first %d matches)", len(matches))
 	}
-	return out, nil
+	return out + skips.footer(), nil
 }
 
 func matchGlobPattern(pattern, relPath string) bool {

@@ -165,6 +165,63 @@ func TestParseMissingClosingDelimiter(t *testing.T) {
 	}
 }
 
+// With mixed line endings several delimiter patterns can match at different
+// offsets; the earliest delimiter must win, not the first pattern tried.
+func TestFindClosingDelimiterEarliestWins(t *testing.T) {
+	cases := []struct {
+		name  string
+		s     string
+		index int
+		len   int
+	}{
+		{
+			// A CRLF delimiter appears before a later LF delimiter; the fixed
+			// pattern order used to skip the CRLF one and split too late.
+			name:  "crlf delimiter before later lf delimiter",
+			s:     "command_safety: off\r\n---\r\n# Rules\n\n---\nmore\n",
+			index: 19,
+			len:   7,
+		},
+		{
+			// Mirror image: an LF delimiter appears before a later CRLF one.
+			name:  "lf delimiter before later crlf delimiter",
+			s:     "a: 1\n---\nb: 2\r\n---\r\n",
+			index: 4,
+			len:   5,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			idx, l, err := findClosingDelimiter(tc.s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if idx != tc.index || l != tc.len {
+				t.Fatalf("got index=%d len=%d, want index=%d len=%d", idx, l, tc.index, tc.len)
+			}
+		})
+	}
+}
+
+// End-to-end: the mixed-ending file above must split at the CRLF delimiter so
+// the front matter parses and the whole markdown body is preserved.
+func TestParseFrontMatterEarliestDelimiter(t *testing.T) {
+	content := "---\r\ncommand_safety: off\r\n---\r\n# Rules\n\n---\nmore\n"
+	pf, err := ParseContent("GOGEN.md", content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pf.HasConfig {
+		t.Fatal("expected config")
+	}
+	if pf.Config.CommandSafety != "off" {
+		t.Fatalf("command_safety=%q, want off", pf.Config.CommandSafety)
+	}
+	if pf.Guidelines != "# Rules\n\n---\nmore" {
+		t.Fatalf("guidelines=%q", pf.Guidelines)
+	}
+}
+
 func TestMergeEnvOverridesFile(t *testing.T) {
 	t.Setenv("GOGEN_COMMAND_SAFETY", "blocklist")
 	pf, err := ParseContent("GOGEN.md", "---\ncommand_safety: off\n---\n")

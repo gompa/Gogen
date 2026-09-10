@@ -117,9 +117,13 @@ type sessionRuntime struct {
 	held atomic.Bool
 
 	// deliverMu guards pendingDeliver; deliverWorker gates the single
-	// delivery worker; deliverNotify wakes it at turn end (see deliver.go).
+	// queue worker; deliverNotify wakes it at turn end (see deliver.go).
+	// pendingDeliver is the per-session FIFO queue shared by system
+	// deliveries (job notices, subagent reports) and user steering
+	// messages (typed while a turn runs) — one queue, one drain path;
+	// deliverItem.Kind scopes presentation and policy.
 	deliverMu      sync.Mutex
-	pendingDeliver []string
+	pendingDeliver []deliverItem
 	deliverWorker  atomic.Bool
 	deliverNotify  chan struct{}
 

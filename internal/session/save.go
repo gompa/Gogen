@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"gogen/internal/ioutil"
+	"gogen/internal/spill"
 )
 
 // maxCreatedCacheEntries limits the in-memory created-timestamp cache so it
@@ -582,11 +583,11 @@ func (s *Store) pruneNestedSiblings(workingDir, keepID, parentID string) {
 	}
 }
 
-// deleteSessionFile removes one session's file, delta, archive file, index
-// entry, created-cache entry, and invalidates the list cache. A missing
-// session file is not an error (the session may exist only in memory or
-// have been deleted already); any other removal error aborts before the
-// cleanup runs. Callers must hold s.mu.
+// deleteSessionFile removes one session's file, delta, archive file, spill
+// dir, index entry, created-cache entry, and invalidates the list cache. A
+// missing session file is not an error (the session may exist only in
+// memory or have been deleted already); any other removal error aborts
+// before the cleanup runs. Callers must hold s.mu.
 func (s *Store) deleteSessionFile(workingDir, id string) error {
 	if err := validateSessionID(id); err != nil {
 		return err
@@ -599,12 +600,32 @@ func (s *Store) deleteSessionFile(workingDir, id string) error {
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	if cerr := s.clearDeltaFile(workingDir, id); cerr != nil && !os.IsNotExist(cerr) {
-		log.Printf("warning: failed to remove delta for session %s: %v", id, cerr)
-	}
-	s.removeArchiveFile(workingDir, id)
+	s.removeSessionSidecars(workingDir, id)
 	delete(s.createdCache, id)
 	s.removeFromIndex(workingDir, id)
 	s.invalidateListCache(workingDir)
 	return nil
+}
+
+// removeSessionSidecars removes the per-session on-disk state that lives
+// alongside a session's snapshot file: its delta, its archive sidecar, and
+// its spill dir (oversized tool output). The snapshot file itself is not
+// touched. Extracted so the two destroy paths — deleteSessionFile (user
+// delete / nested cascade / sibling cap) and prune's batch deletion
+// (count/age retention) — cannot drift on the sidecar list; prune used to
+// inline this cleanup and silently orphaned pruned sessions' spill trees.
+// Best-effort: removal failures are logged, never returned — a leftover
+// sidecar must not fail the session's destruction. Callers must hold s.mu.
+func (s *Store) removeSessionSidecars(workingDir, id string) {
+	if cerr := s.clearDeltaFile(workingDir, id); cerr != nil && !os.IsNotExist(cerr) {
+		log.Printf("warning: failed to remove delta for session %s: %v", id, cerr)
+	}
+	s.removeArchiveFile(workingDir, id)
+	// Spill dir (oversized tool output, .gogen/spill/session-<id>): per-
+	// session auxiliary state like the archive sidecar, removed with the
+	// session wherever this helper runs — user delete, prune, nested
+	// cascade. Best-effort: a failed removal must not fail the delete.
+	if serr := spill.RemoveSessionDir(workingDir, id); serr != nil {
+		log.Printf("warning: failed to remove spill dir for session %s: %v", id, serr)
+	}
 }

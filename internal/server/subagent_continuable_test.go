@@ -250,6 +250,16 @@ func TestBackgroundChildBusy(t *testing.T) {
 	child.mu.Lock()
 	child.pendingReply = false
 	child.mu.Unlock()
+
+	// Neutralize the queued delivery before returning: the t.Cleanup unlock
+	// (LIFO — it runs before TempDir RemoveAll) would otherwise let the
+	// delivery worker acquire the lock and START the queued turn, whose
+	// session writes race the temp-dir cleanup (flake: "directory not
+	// empty"). Emptying the queue makes the worker's post-acquire re-check
+	// drop the item and exit without a turn.
+	child.rt.deliverMu.Lock()
+	child.rt.pendingDeliver = nil
+	child.rt.deliverMu.Unlock()
 }
 
 // TestRetentionReleasesAfterQueuedDelivery pins the retention/queue

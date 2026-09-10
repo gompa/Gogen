@@ -122,6 +122,25 @@ func newContinuationServer(t *testing.T, stub *blockingStub, dir string) (*Serve
 	store := session.NewStoreWithOptions(true, session.StoreOptions{})
 	a.SessionStore = store
 	s := NewServer(a, &config.Config{})
+	// Quiesce async writers BEFORE the caller's t.TempDir() removal
+	// (cleanups run LIFO, so this later-registered cleanup runs first).
+	// ShutdownSessions cancels every in-flight stream and drains the turn
+	// goroutine's done-signal (the blocking stub honors ctx), making the
+	// turns' own flushes synchronous inside this cleanup. Marking the
+	// runtimes evicted afterwards turns the turn goroutine's final orphan
+	// check — which runs AFTER the drained done-signal — into a no-op; that
+	// check would otherwise flush/rewrite the sessions dir while RemoveAll
+	// is deleting it ("TempDir RemoveAll cleanup: directory not empty",
+	// the same flake class 861a5c1 fixed for the spawn sweep; seen on
+	// TestBackgroundChildBusy and TestReviewAgentGuards).
+	t.Cleanup(func() {
+		s.ShutdownSessions()
+		for _, id := range s.registry.activeIDs() {
+			if rt, ok := s.registry.get(id); ok {
+				s.registry.evictRuntime(rt)
+			}
+		}
+	})
 	return s, a, store
 }
 
@@ -390,11 +409,13 @@ func TestApprovalAutoDeniedOnDetach(t *testing.T) {
 
 // TestFanOutToTwoAttachedConnections verifies E29: two connections attached
 // to one session both receive the same stream events, and only one can start
-// a turn (the second gets the busy response while the first streams).
+// a turn (the second connection's plain chat message is QUEUED as a steering
+// message while the first streams; command-shaped input still gets the busy
+// response).
 func TestFanOutToTwoAttachedConnections(t *testing.T) {
 	dir := t.TempDir()
 	stub := newBlockingStub()
-	s, a, _ := newContinuationServer(t, stub, dir)
+	s, a, store := newContinuationServer(t, stub, dir)
 	srv := startWSServer(t, s)
 	defer srv.Close()
 
@@ -426,24 +447,80 @@ func TestFanOutToTwoAttachedConnections(t *testing.T) {
 		})
 	}
 
-	// A second turn from conn1 blocks in the provider; a message from conn2
-	// (a different connection attached to the same session) must get the busy
-	// response (per-session turnMu, E3) — and must NOT cancel conn1's turn.
+	// A second turn from conn1 blocks in the provider; a plain chat message
+	// from conn2 (a different connection attached to the same session) is
+	// now QUEUED as a steering message instead of rejected: queuing never
+	// touches the running turn, so the old "must not cancel a turn it does
+	// not own" hazard (E3/E29) cannot occur — the busy rejection survives
+	// only for command-shaped input (which takes the turn lock).
 	if err := conn1.WriteJSON(WSMessage{Type: "message", Content: "second turn"}); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 	stub.waitBlocked(2)
-	if err := conn2.WriteJSON(WSMessage{Type: "message", Content: "busy me"}); err != nil {
+	if err := conn2.WriteJSON(WSMessage{Type: "message", Content: "busy me", QueueID: "q-fanout"}); err != nil {
 		t.Fatalf("send: %v", err)
 	}
-	resp := readUntil(t, conn2, 5*time.Second, func(m WSMessage) bool { return m.Type == "response" })
-	if resp.Content != "Error: agent is busy with another client" {
-		t.Fatalf("second message got %q, want busy rejection", resp.Content)
+	// Both connections learn the queue state (queue_update broadcasts to
+	// every attached client). conn2's own user_acked for "second turn" may
+	// interleave; readUntil skips non-matching frames.
+	for _, c := range []*websocket.Conn{conn1, conn2} {
+		qu := readUntil(t, c, 5*time.Second, func(m WSMessage) bool { return m.Type == "queue_update" })
+		if len(qu.Queue) != 1 || qu.Queue[0].ID != "q-fanout" || qu.Queue[0].Text != "busy me" {
+			t.Fatalf("queue_update queue = %+v, want one item q-fanout \"busy me\"", qu.Queue)
+		}
 	}
 	// conn1's turn must still be alive (not cancelled by conn2's message):
-	// releasing the stub completes it.
+	// releasing the stub completes it AND pops the queued item. The drain's
+	// pop broadcast must mark the item as STARTED (queueLeft) — not removed
+	// — so clients clear the queued chip and resolve the paired user_acked
+	// instead of rendering the bubble cancelled-before-running. The pop
+	// broadcast and the turn_end frame can interleave either way.
 	stub.releaseN(2)
-	_ = readUntil(t, conn1, 10*time.Second, func(m WSMessage) bool { return m.Type == "turn_end" })
+	sawTurnEnd, sawQueueLeft := false, false
+	for !sawTurnEnd || !sawQueueLeft {
+		m := readUntil(t, conn1, 10*time.Second, func(m WSMessage) bool {
+			return m.Type == "turn_end" ||
+				(m.Type == "queue_update" && len(m.QueueLeft) > 0)
+		})
+		if m.Type == "turn_end" {
+			sawTurnEnd = true
+			continue
+		}
+		sawQueueLeft = true
+		if len(m.QueueLeft) != 1 || m.QueueLeft[0] != "q-fanout" {
+			t.Fatalf("queue_update queueLeft = %v, want [q-fanout]", m.QueueLeft)
+		}
+	}
+
+	// The queued steering message drains as the NEXT user turn once
+	// "second turn" ends, on this session (FIFO, one item per turn).
+	for _, c := range []*websocket.Conn{conn1, conn2} {
+		_ = readUntil(t, c, 10*time.Second, func(m WSMessage) bool {
+			return m.Type == "user_acked" && m.SessionID == a.SessionID
+		})
+	}
+	stub.releaseN(3)
+	waitFor(t, 10*time.Second, func() bool {
+		return deliveredMessages(a, "busy me")
+	})
+	// The delivered turn's final flush must land on disk before TempDir
+	// teardown (the store-wait pattern used across this suite) — the
+	// in-memory snapshot is not enough. The wait covers the two turns whose
+	// stub replies are "done" (second turn + the queued "busy me"); the
+	// first turn's released reply is "headless-done".
+	waitFor(t, 10*time.Second, func() bool {
+		snap, err := store.LoadInWorkingDir(dir, a.SessionID)
+		if err != nil {
+			return false
+		}
+		done := 0
+		for _, m := range snap.Messages {
+			if m.Role == "assistant" && m.Content == "done" {
+				done++
+			}
+		}
+		return done >= 2
+	})
 }
 
 // ── helpers ──

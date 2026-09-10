@@ -264,7 +264,7 @@ func formatToolError(result string, err error) string {
 }
 func (a *Agent) appendToolResult(tc llm.ToolCall, result string) {
 	if a.Context != nil {
-		result = a.Context.TruncateToolResult(result)
+		result = a.capToolResult(tc.Name, result)
 	}
 	a.appendMessage(llm.Message{
 		Role:       "tool",

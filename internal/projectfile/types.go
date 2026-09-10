@@ -53,6 +53,7 @@ type FileConfig struct {
 	LintCommand               string                `yaml:"lint_command"`
 	WebFetch                  string                `yaml:"web_fetch"`
 	WebSearch                 string                `yaml:"web_search"`
+	OutputSpill               string                `yaml:"output_spill"`
 	WebSearchBackend          string                `yaml:"web_search_backend"`
 	WebSearchAPIKey           string                `yaml:"web_search_api_key"`
 	WebAllowedDomains         string                `yaml:"web_allowed_domains"`

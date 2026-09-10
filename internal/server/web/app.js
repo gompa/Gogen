@@ -68,8 +68,10 @@
             enableFollow,
             initScroll,
             isPinned,
+            measureChatAnchor,
             nearBottomPx,
             pinToBottom,
+            restoreChatAnchor,
             scheduleRepinIfPinned,
             sidebarDragEnd,
             sidebarDragStart,
@@ -148,12 +150,15 @@
             showDeleteApproval,
         } from '/components/delete-approval.js';
         // Composer input helpers (components/composer.js): the slash-command
-        // suggest box and the image-attachment flow. The send path
-        // (sendMessage) stays here; app.js reads attachments through
-        // getPendingAttachments / clearAttachments and routes keydown
-        // through slashKeydown.
+        // suggest box and the attachment flow (file picker, paste,
+        // drag-and-drop). The send path (sendMessage) stays here; app.js
+        // reads attachments through getPendingAttachments /
+        // clearAttachments, inlines text-file attachments into the outgoing
+        // content via composeMessageContent, and routes keydown through
+        // slashKeydown.
         import {
             clearAttachments,
+            composeMessageContent,
             getPendingAttachments,
             getSlashCommands,
             hideSlashSuggest,
@@ -219,6 +224,11 @@
         let currentMode = 'act';
         let isGlobalMode = false;
         const inputProgress = document.getElementById('input-progress');
+        // Composer container (#input-wrap): carries .progress-active in
+        // lockstep with #input-progress.active so the textarea can hand its
+        // reserved strip-row height to the strip without changing the input
+        // bar's height (see --progress-row-h in styles.css).
+        const inputWrap = document.getElementById('input-wrap');
         const globalModeBadge = document.getElementById('global-mode-badge');
         const toastHost = document.getElementById('toast-host');
         // The conversation TOC rail (one dot per user prompt) and its
@@ -324,29 +334,16 @@
         }
 
         document.querySelectorAll('.main-tab').forEach((btn) => {
-            btn.addEventListener('click', async () => {
+            btn.addEventListener('click', () => {
+                // The terminal pane toggles the mobile full-screen overlay
+                // instead of switching panes; every other pane switch (tab
+                // click, palette, settings, board/automations links) goes
+                // through switchMainPane.
                 if (btn.dataset.pane === 'terminal') {
                     terminalToggleMobile();
                     return;
                 }
-                // Switching to a regular pane on mobile dismisses the
-                // full-screen terminal overlay so it can't cover the chat.
-                terminalDismissMobile();
-                document.querySelectorAll('.main-tab').forEach((b) => b.classList.remove('active'));
-                document.querySelectorAll('.pane').forEach((p) => p.classList.remove('active'));
-                btn.classList.add('active');
-                const pane = document.getElementById(btn.dataset.pane + '-pane');
-                if (pane) pane.classList.add('active');
-                if (btn.dataset.pane === 'editor') {
-                    await initMonaco();
-                    await refreshExplorer();
-                }
-                if (btn.dataset.pane === 'board') {
-                    requestBoardState();
-                }
-                if (btn.dataset.pane === 'automations') {
-                    requestAutomationsState();
-                }
+                switchMainPane(btn.dataset.pane);
             });
         });
 
@@ -725,8 +722,10 @@
         // ── Near-compact banner ──
         // The server flags warnNearCompact once usage reaches 75% of the
         // window — before the auto-compaction trigger (nearCompact) — so the
-        // user gets lead time to compact manually. Dismissed state resets on
-        // session change.
+        // user gets lead time to compact manually. The dismissed flag is a
+        // per-pane working copy mirrored to/from the pane object in
+        // save/loadActivePaneState, so dismissing it on one pane does not
+        // suppress the banner on another. Fresh panes start undismissed.
         let nearCompactDismissed = false;
 
         // True while a compact command is in flight (server-side summarization
@@ -997,6 +996,80 @@
             return true;
         }
 
+        // ── Per-session scroll anchor ──
+        // The settled-pane cache above restores the EXACT scroll offset
+        // (raw scrollTop against the same DOM). Every other path that
+        // brings a session's transcript back — a mid-turn switch-away (no
+        // cache), a stale cache rebuilt from a fresh snapshot, a pane
+        // closed and reopened — rebuilds the DOM and lands pin-to-bottom,
+        // losing the part of the transcript the user was reading. The
+        // anchor records WHICH message crossed the viewport top (history
+        // index + px offset, see components/scroll.js) so a rebuild can
+        // put the viewport back on it. Keyed by session id, not by pane:
+        // panes close and reopen, and domCache is consumed on restore.
+        // Invalidated when the history epoch reshapes (compaction /
+        // rollback renumber the indexes) or the session is removed; when
+        // the user was following the bottom there is nothing to remember
+        // (a rebuild lands at the bottom anyway).
+        const paneScrollAnchors = new Map();
+
+        // Capture the outgoing pane's reading position. Runs in
+        // transitionToPane BEFORE the transcript is cached or wiped — the
+        // measurement reads live layout, which is gone once the DOM moves
+        // offscreen or is dropped.
+        function capturePaneScrollAnchor(pane) {
+            if (!pane || !pane.id) return;
+            if (isPinned()) {
+                // Following the bottom: a rebuild lands at the bottom
+                // anyway — drop any stale anchor.
+                paneScrollAnchors.delete(pane.id);
+                return;
+            }
+            const a = measureChatAnchor();
+            if (a) {
+                paneScrollAnchors.set(pane.id, {
+                    histIdx: a.histIdx,
+                    subPx: a.subPx,
+                    // The epoch under which the anchor's index is valid is
+                    // the pane's last-applied history epoch. undefined (the
+                    // transcript was never built from a snapshot) is stored
+                    // as null so it can never match an incoming snapshot
+                    // epoch — a conservative drop to the old behavior.
+                    histEpoch: typeof pane.histEpoch === 'number' ? pane.histEpoch : null,
+                });
+            } else {
+                paneScrollAnchors.delete(pane.id);
+            }
+        }
+
+        // Build the scroll settlement for a history rebuild: a callback
+        // that puts the viewport back on the reader's anchor instead of
+        // the replay's default pin-to-bottom, or null when the anchor
+        // must not apply. Guards:
+        //   - pane.id must already match the payload's session: a session
+        //     change (/new, /resume, /fork, edit-resend) delivers the NEW
+        //     session's history while the pane still holds the OLD id,
+        //     and the old session's anchor must never position a
+        //     different session's transcript;
+        //   - no in-flight session change / resend fork (same reason —
+        //     belt and braces with the per-pane flag mirrors);
+        //   - the anchor's epoch must equal the snapshot's: a reshaped
+        //     history renumbered the indexes and the anchor is garbage;
+        //   - an anchor must exist at all.
+        // The anchor is kept on use: repeated rebuilds for the same
+        // session (turn_end convergence refetch) restore again, and the
+        // next switch-away re-captures a fresher one anyway.
+        function paneScrollRestoreSettle(pane, sessionId, incomingEpoch) {
+            if (!pane || pane.id !== sessionId) return null;
+            if (pendingSessionResponse || pane.pendingSessionResponse) return null;
+            if (resendAwaitingHistory || pane.resendAwaitingHistory) return null;
+            const anchor = paneScrollAnchors.get(sessionId);
+            if (!anchor || anchor.histEpoch !== incomingEpoch) return null;
+            return () => {
+                if (!restoreChatAnchor(anchor)) pinToBottom();
+            };
+        }
+
         // ── Empty chat state (fresh session) ──
         // Shown only while the transcript is truly empty; any message render
         // (appendMessageAtTime / startStream / showThinking) removes it.
@@ -1091,6 +1164,98 @@
             pendingAcks.push(el);
         }
 
+        // ── queued (steering) message tracking ───────────────────────────
+        // A send while the pane's turn is active is QUEUED server-side and
+        // delivered as the next user turn when the in-flight one ends. The
+        // bubble is marked optimistically at send time and reconciled
+        // against server truth: queued → running (user_acked at the drain
+        // clears the chip; user_acked semantics are unchanged — it still
+        // fires at turn start and carries the real history index), or
+        // queued → cancelled (the item was removed before running). Other
+        // tabs render the queued item from the queue_update frame itself.
+
+        // Monotonic local correlation id for queued sends (crypto.randomUUID
+        // is unavailable on non-secure origins). The per-PAGE nonce keeps two
+        // tabs from minting the same id: the seq counter starts at 1 in every
+        // tab and Date.now() has millisecond resolution, so without it two
+        // tabs sending in the same millisecond would collide — and the id is
+        // the correlation key in the server's queue and in every client's
+        // per-id bubble map (the server replaces a duplicate defensively, but
+        // the sender's own bubble could then not reconcile).
+        let queueIdSeq = 0;
+        const queueIdNonce = Math.random().toString(36).slice(2, 8);
+
+        function nextQueueId() {
+            return 'q-' + queueIdNonce + '-' + (++queueIdSeq) + '-' + Date.now().toString(36);
+        }
+
+        function queuedBubblesFor(pane) {
+            if (!pane.queuedBubbles) pane.queuedBubbles = new Map();
+            return pane.queuedBubbles;
+        }
+
+        /** Stamp a user bubble as queued: chip + hover ✕ (remove from queue). */
+        function markQueuedBubble(el, qid) {
+            if (!el) return;
+            el.dataset.queueId = qid;
+            el.classList.add('queued');
+            const chip = document.createElement('span');
+            chip.className = 'queued-chip';
+            chip.textContent = 'queued';
+            el.appendChild(chip);
+            const rm = document.createElement('button');
+            rm.className = 'queue-remove-btn';
+            rm.type = 'button';
+            rm.innerHTML = '✕';
+            rm.title = 'Remove from queue';
+            rm.addEventListener('click', (ev) => {
+                ev.stopPropagation();
+                removeQueuedItem(qid);
+            });
+            el.appendChild(rm);
+        }
+
+        /** Clear the queued mark (chip + ✕) — the item's turn has started. */
+        function clearQueuedMark(el) {
+            if (!el || el.dataset.queueId === undefined) return;
+            el.classList.remove('queued');
+            delete el.dataset.queueId;
+            const chip = el.querySelector(':scope > .queued-chip');
+            if (chip) chip.remove();
+            const rm = el.querySelector(':scope > .queue-remove-btn');
+            if (rm) rm.remove();
+        }
+
+        /**
+         * A queued item left the queue WITHOUT running (removed or cleared
+         * by an interrupt): resolve its pending-ack entry so it cannot steal
+         * a later ack, and restyle the bubble as cancelled-before-running.
+         */
+        function resolveCancelledQueued(el) {
+            if (!el || !el.isConnected || el.dataset.queueId === undefined) return;
+            dropPendingAck(el);
+            clearQueuedMark(el);
+            el.classList.add('queue-cancelled');
+        }
+
+        function removeQueuedItem(qid) {
+            const pane = activePane();
+            if (!ws || ws.readyState !== WebSocket.OPEN || !pane || !pane.id) return;
+            ws.send(JSON.stringify({ type: 'queue_remove', queueId: qid, sessionId: pane.id }));
+        }
+
+        /** Re-register a RE-RENDERED bubble as awaiting its user_acked (the
+         * re-render of an item this tab sent that is still queued). Unlike
+         * markPendingAck it consumes no cancel target: a re-render is not a
+         * send, and a pending resend's lastCancelTarget belongs to its own
+         * element. Keeps the ack FIFO resolving through pendingAcks instead
+         * of the DOM fallback. */
+        function rearmPendingAck(el) {
+            if (!el) return;
+            el.dataset.pendingAck = '1';
+            pendingAcks.push(el);
+        }
+
         /** Remove a bubble from pending-ack tracking and clear its flag. */
         function dropPendingAck(el) {
             const i = pendingAcks.indexOf(el);
@@ -1114,8 +1279,16 @@
             prunePendingAcks();
             const el = pendingAcks[0];
             if (el && el.dataset.histIdx === undefined) return el;
+            // The DOM fallback covers re-rendered transcripts and frames
+            // whose local pending entry is gone (an item another tab sent).
+            // Still-queued bubbles are excluded: their turn has NOT started,
+            // so stamping one with the ack's history index (used by
+            // resend/fork) would target a message that never ran. The ack of
+            // an item that just drained is unaffected — the server's
+            // queue_update(left) clears the mark before the user_acked
+            // (FIFO on the same socket).
             return messagesDiv.querySelector('.message.user[data-pending-ack="1"]')
-                || [...messagesDiv.querySelectorAll('.message.user:not([data-hist-idx])')].at(-1);
+                || [...messagesDiv.querySelectorAll('.message.user:not([data-hist-idx]):not(.queued)')].at(-1);
         }
 
         /**
@@ -1165,6 +1338,15 @@
         // stream already ended); reset at each round start so a round that
         // never produced a bubble cannot stamp a previous turn's reply.
         let lastStreamDiv = null;
+        // Waiting placeholder: a visible transcript bubble for the silent
+        // pre-first-token window (long prefill, muted streaming retry,
+        // non-streaming fallback) so the user is not left with a blank
+        // screen. Shown at round start, re-labelled on stream_retry,
+        // removed when the first real token (thinking or content) lands.
+        let waitingPlaceholder = null;
+        let waitingPlaceholderTimer = null;
+        let waitingPlaceholderBase = '';
+        let waitingPlaceholderStart = 0;
         const STREAM_RENDER_INTERVAL = 32; // ms between renders (~2 frames at 60fps)
         let streamRafPending = false;
         let streamLastRender = 0;
@@ -1227,6 +1409,10 @@
         }
 
         let _prevTurnActive = false;
+        // Composer placeholder per state: while a turn is active, Enter
+        // QUEUES the message — the placeholder says so before the keypress.
+        const COMPOSER_PLACEHOLDER = 'Ask the agent\u2026 (type / for commands, Enter to send)';
+        const QUEUE_PLACEHOLDER = 'Queue a message\u2026 (runs after the current turn)';
         function setTurnActive(active, opts) {
             const silent = !!(opts && opts.silent);
             const noMirror = !!(opts && opts.noMirror);
@@ -1234,8 +1420,18 @@
             turnActive = !!active;
             if (turnActive && !wasActive) announceLive('Agent started responding.');
             if (cancelBtn) cancelBtn.disabled = !turnActive;
-            if (sendBtn) sendBtn.disabled = false; // send cancels+restarts; keep enabled
-            // Toggle class so Send/Cancel swap places
+            // Send is always enabled: while a turn is active it QUEUES the
+            // message (steering — runs after the current turn) instead of
+            // cancelling. Interrupt is the Cancel button / Esc. The old
+            // Send/Cancel CSS swap (which made send-while-busy mean
+            // cancel-then-send) is gone; the .turn-active class now only
+            // styles the busy state.
+            if (sendBtn) {
+                sendBtn.disabled = false;
+                sendBtn.title = turnActive ? 'Queue message (runs after the current turn)' : 'Send';
+            }
+            inputArea.placeholder = turnActive ? QUEUE_PLACEHOLDER : COMPOSER_PLACEHOLDER;
+            // Toggle class so the busy styling applies
             document.getElementById('input-area').classList.toggle('turn-active', turnActive);
             if (!active) {
                 toolsStartedThisTurn = false;
@@ -1381,6 +1577,7 @@
                 contextLimit: 0,
                 contextEstAdded: 0,
                 contextLimitResolved: false,
+                nearCompactDismissed: false,
                 mode: 'act',
                 thinkingLevel: 'off',
                 reasoningEffortsUnsupported: false,
@@ -1490,6 +1687,7 @@
             pane.contextLimit = contextLimit;
             pane.contextEstAdded = contextEstAdded;
             pane.contextLimitResolved = contextLimitResolved;
+            pane.nearCompactDismissed = nearCompactDismissed;
         }
 
         function loadActivePaneState() {
@@ -1510,8 +1708,11 @@
             // seed onto a resolved pane (or skip an unresolved one) before
             // the re-attach context echo corrects it.
             contextLimitResolved = !!pane.contextLimitResolved;
+            nearCompactDismissed = !!pane.nearCompactDismissed;
             _prevTurnActive = turnActive;
             if (cancelBtn) cancelBtn.disabled = !turnActive;
+            if (sendBtn) sendBtn.title = turnActive ? 'Queue message (runs after the current turn)' : 'Send';
+            inputArea.placeholder = turnActive ? QUEUE_PLACEHOLDER : COMPOSER_PLACEHOLDER;
             document.getElementById('input-area').classList.toggle('turn-active', turnActive);
             if (!turnActive) toolsStartedThisTurn = false;
         }
@@ -1558,6 +1759,7 @@
         const OUTPUT_ACTIVITY_TYPES = new Set([
             'thinking', 'waiting', 'thinking_token',
             'stream', 'stream_end',
+            'stream_retry',
             'tool_call_start', 'tool_call_delta', 'tool_call', 'tool_execute', 'tool_result',
             'term_opened', 'term_output', 'term_exit',
             'turn_end', 'cancelled',
@@ -1610,6 +1812,13 @@
                     // pane's handler: an idle attach means the snapshot is
                     // complete, a busy attach needs the turn-end refetch.
                     pane.needsFreshHistory = !!pane.turnActive;
+                    // Seed the pane's queue mirror from server truth (the
+                    // transcript re-derives from the server when focused,
+                    // which re-renders the queued bubbles then).
+                    applyQueueUpdate(pane, data, false);
+                    break;
+                case 'queue_update':
+                    applyQueueUpdate(pane, data, false);
                     break;
                 case 'context':
                     pane.lastContextData = data || pane.lastContextData;
@@ -1714,17 +1923,22 @@
             }
         }
 
-        // Make a pane the active/visible one. The transcript is restored
-        // from the pane's offscreen cache when one was captured (settled
-        // pane) and re-attached so the server resends the pane's state —
-        // with the pane's history fingerprint, so an unchanged session
-        // skips the history snapshot entirely (conditional attach).
-        function focusPane(key) {
-            if (key === activePaneKey) return;
-            const pane = panes.get(key);
-            if (!pane) return;
-            const outgoing = activePane();
+        // Hand the transcript over from the outgoing (still-active) pane to
+        // `pane` and make it the active one: save the outgoing pane's flags,
+        // cache its rendered transcript when it is settled, re-key the
+        // module state to the incoming pane and load its saved flags. Every
+        // pane switch funnels through here (focusPane, replaceActivePane,
+        // openSessionPane, forkSession, newSession); the save/capture are
+        // no-ops when the outgoing pane was already deleted (closePane →
+        // replaceActivePane). See the per-pane transcript cache above for
+        // why the cache-vs-clear decision matters.
+        function transitionToPane(pane) {
             saveActivePaneState();
+            const outgoing = activePane();
+            // Remember the outgoing pane's reading position BEFORE its DOM
+            // is cached or wiped — the anchor measurement needs live
+            // layout (see capturePaneScrollAnchor).
+            capturePaneScrollAnchor(outgoing);
             // Cache the outgoing pane's transcript when it is settled; only
             // non-cacheable panes (mid-turn, pending acks/change) and the
             // already-deleted outgoing pane (closePane) pay the old
@@ -1736,15 +1950,33 @@
             } else {
                 resetChatTranscriptState();
             }
-            activePaneKey = key;
-            // load the pane's state AFTER the outgoing state was saved/reset
-            // so the restored flags survive.
+            activePaneKey = pane.key;
+            // Load the incoming pane's state AFTER the outgoing state was
+            // saved/reset so the restored flags survive.
             loadActivePaneState();
+        }
+
+        // Make a pane the active/visible one. The transcript is restored
+        // from the pane's offscreen cache when one was captured (settled
+        // pane) and re-attached so the server resends the pane's state —
+        // with the pane's history fingerprint, so an unchanged session
+        // skips the history snapshot entirely (conditional attach).
+        function focusPane(key) {
+            if (key === activePaneKey) return;
+            const pane = panes.get(key);
+            if (!pane) return;
+            transitionToPane(pane);
             let restored = false;
             if (!restorePaneTranscript(pane)) {
                 ensureEmptyState();
             } else {
                 restored = true;
+                // The restored DOM predates any queue change made while this
+                // pane was backgrounded (queue frames for a background pane
+                // update the mirror only — never the DOM), so re-derive the
+                // queued bubbles from the mirror: without this a queued
+                // message stays invisible until the next queue frame.
+                rerenderQueuedBubbles(pane);
             }
             // Mode/thinking/model are per-session; restore the toolbar to
             // this pane's last-known values.
@@ -1782,19 +2014,12 @@
         // next session_new reply. `pendingSessionResponse` gates the reply
         // so the config handler re-keys the pane.
         function replaceActivePane() {
-            const outgoing = activePane();
             const p = makePane();
             // Same transcript-cache decision as focusPane: a settled pane
             // (e.g. /new typed into an idle session) keeps its transcript
             // cacheable; makePane already refreshed the sidebar with the
             // new pane first, which does not touch the transcript DOM.
-            if (!outgoing || !cachePaneTranscript(outgoing)) {
-                clearChat();
-            } else {
-                resetChatTranscriptState();
-            }
-            activePaneKey = p.key;
-            loadActivePaneState();
+            transitionToPane(p);
             ensureEmptyState();
             if (ws && ws.readyState === WebSocket.OPEN) {
                 pendingSessionResponse = true;
@@ -1813,6 +2038,10 @@
                 ws.send(JSON.stringify({ type: 'session_close', sessionId: pane.id }));
             }
             panes.delete(key);
+            // The pane is explicitly closed: its scroll anchor (if any)
+            // described the last reading position of a session the user
+            // walked away from — reopening starts fresh at the bottom.
+            if (pane.id) paneScrollAnchors.delete(pane.id);
             if (activePaneKey === key) {
                 if (panes.size === 0) {
                     replaceActivePane();
@@ -1846,7 +2075,6 @@
                 focusPane(existing.key);
                 return;
             }
-            saveActivePaneState();
             // Seed the pane's recency stamp from the session's REAL last
             // activity: activating a SAVED session must not jump it to the
             // top of the sidebar. Its row keeps its earned position and
@@ -1857,20 +2085,13 @@
             pane.id = id;
             // Same outgoing-pane transcript handling as focusPane: cache the
             // pane we are leaving (if settled) instead of wiping it.
-            const outgoing = activePane();
-            if (!outgoing || !cachePaneTranscript(outgoing)) {
-                clearChat();
-            } else {
-                resetChatTranscriptState();
-            }
-            activePaneKey = pane.key;
+            transitionToPane(pane);
             // makePane refreshed the sidebar while the id was still unknown.
             // Refresh again so the new active row is marked "current": the
             // attach reply's config echo carries the SAME id, so the config
             // handler would not re-render (id unchanged) and the row would
             // stay stale until the next pane switch.
             refreshSidebarSessions();
-            loadActivePaneState();
             ensureEmptyState();
             if (sessionInfoDiv) sessionInfoDiv.textContent = id;
             pendingSessionResponse = false;
@@ -2022,18 +2243,10 @@
             }
             const srcId = activePane().id;
             // Open a new pane; the source pane stays open in the background.
-            saveActivePaneState();
-            const outgoing = activePane();
             const pane = makePane();
             // Same outgoing-pane transcript handling as focusPane: cache the
             // source pane (if settled) instead of wiping it.
-            if (!outgoing || !cachePaneTranscript(outgoing)) {
-                clearChat();
-            } else {
-                resetChatTranscriptState();
-            }
-            activePaneKey = pane.key;
-            loadActivePaneState();
+            transitionToPane(pane);
             ensureEmptyState();
             pendingSessionResponse = true;
             ws.send(JSON.stringify({ type: 'session_fork', messageIndex: msgIdx, sessionId: srcId }));
@@ -2322,6 +2535,57 @@
             }
         }
 
+        // Show (or re-label) the waiting placeholder bubble. The elapsed
+        // timer runs from the FIRST show of the current window, so a
+        // stream_retry re-label does not restart the clock — the user sees
+        // how long the whole silent stretch has lasted.
+        function showWaitingPlaceholder(text) {
+            if (!waitingPlaceholder || !waitingPlaceholder.isConnected) {
+                removeEmptyState();
+                waitingPlaceholder = document.createElement('div');
+                waitingPlaceholder.className = 'message assistant waiting-placeholder';
+                const spin = document.createElement('span');
+                spin.className = 'waiting-spinner';
+                const label = document.createElement('span');
+                label.className = 'waiting-placeholder-label';
+                waitingPlaceholder.appendChild(spin);
+                waitingPlaceholder.appendChild(label);
+                messagesDiv.appendChild(waitingPlaceholder);
+                waitingPlaceholderStart = Date.now();
+                waitingPlaceholderTimer = setInterval(tickWaitingPlaceholder, 1000);
+                smartScroll();
+            }
+            if (text) waitingPlaceholderBase = text;
+            tickWaitingPlaceholder();
+        }
+
+        function tickWaitingPlaceholder() {
+            if (!waitingPlaceholder) return;
+            // The transcript is re-derived from the server when a pane is
+            // focused or history reloads: a detached placeholder is dead
+            // DOM, stop the timer with it.
+            if (!waitingPlaceholder.isConnected) {
+                clearWaitingPlaceholder();
+                return;
+            }
+            const s = Math.floor((Date.now() - waitingPlaceholderStart) / 1000);
+            const elapsed = s < 60 ? s + 's' : Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+            const label = waitingPlaceholder.querySelector('.waiting-placeholder-label');
+            if (label) label.textContent = waitingPlaceholderBase + ' ' + elapsed;
+        }
+
+        function clearWaitingPlaceholder() {
+            if (waitingPlaceholderTimer) {
+                clearInterval(waitingPlaceholderTimer);
+                waitingPlaceholderTimer = null;
+            }
+            if (waitingPlaceholder) {
+                waitingPlaceholder.remove();
+                waitingPlaceholder = null;
+            }
+            waitingPlaceholderBase = '';
+        }
+
         function startStream() {
             removeEmptyState();
             streamRafPending = false;
@@ -2365,10 +2629,13 @@
             scheduleStreamRender();
         }
 
-        function showThinking() {
-            removeEmptyState();
-            finalizeThinking();
-            thinkingContentPos = 0;
+        // Build the "Thinking" card shared by the live streaming path
+        // (showThinking) and the history replay (renderHistoryEntry): header
+        // with the italic label + collapse chevron, markdown body, and the
+        // collapse toggle wired. The caller fills the body (live markdown
+        // stream or the replayed reasoning render), adds any metadata, and
+        // appends the card to the transcript.
+        function createThoughtCard() {
             const div = document.createElement('div');
             div.className = 'thought-card';
 
@@ -2390,7 +2657,6 @@
 
             div.appendChild(header);
             div.appendChild(body);
-            messagesDiv.appendChild(div);
 
             // Collapse toggle active from the start
             header.addEventListener('click', () => {
@@ -2398,6 +2664,16 @@
                 body.style.display = collapsed ? '' : 'none';
                 toggle.innerHTML = icon(collapsed ? 'chevron-down' : 'chevron-right');
             });
+
+            return { card: div, header, toggle, body };
+        }
+
+        function showThinking() {
+            removeEmptyState();
+            finalizeThinking();
+            thinkingContentPos = 0;
+            const { card: div, body } = createThoughtCard();
+            messagesDiv.appendChild(div);
 
             smartScroll();
             currentThinkingRaw = '';
@@ -2465,10 +2741,9 @@
             return 'Thinking\u2026' + (lastStreamSpeed >= 1 ? ' ' + Math.round(lastStreamSpeed) + ' tok/s' : '');
         }
 
-        // True when focus was in the chat textarea when the progress
-        // indicator replaced it. Only then is focus restored on hide, so a
-        // turn end/cancel can't yank the user out of the terminal/Monaco/modals.
-        let progressFocusOwner = false;
+        // The progress strip coexists with the composer (steering): the
+        // textarea is never hidden, so no focus handoff is needed between
+        // the indicator and the composer.
 
         // Cached progress-indicator node refs. The spinner/label structure
         // is static (index.html #input-progress), so resolve them once when
@@ -2490,28 +2765,20 @@
         function setInputProgress(phase, label) {
             if (!inputProgress) return;
             if (phase == null) {
-                // Hide progress, restore textarea. Refocus only when the
-                // textarea owned focus when the indicator appeared AND no
-                // modal is open — never steal focus from elsewhere.
+                // Hide the progress strip; the composer was never hidden
+                // (steering keeps it editable while a turn runs). The wrap
+                // class flips with it so the textarea reclaims the strip's
+                // row (same bar height in both states).
                 inputProgress.classList.remove('active');
-                inputArea.style.display = '';
-                if (progressFocusOwner &&
-                    !document.querySelector('[id$="-overlay"].active, [id$="-overlay"].open')) {
-                    inputArea.focus();
-                }
-                progressFocusOwner = false;
+                if (inputWrap) inputWrap.classList.remove('progress-active');
                 currentProgressPhase = null;
                 progressLabelText = '';
                 return;
             }
             const phaseChanged = currentProgressPhase !== phase;
-            // Capture once, when the indicator first replaces the textarea
-            // (repeated same-phase updates must not re-evaluate it: the
-            // textarea is hidden by then, so activeElement is no longer it).
             if (currentProgressPhase === null) {
-                progressFocusOwner = (document.activeElement === inputArea);
-                inputArea.style.display = 'none';
                 inputProgress.classList.add('active');
+                if (inputWrap) inputWrap.classList.add('progress-active');
                 progressSpinnerEl = inputProgress.querySelector('.progress-spinner');
                 progressLabelEl = inputProgress.querySelector('.progress-label');
             }
@@ -2519,19 +2786,29 @@
             if (progressSpinnerEl && phaseChanged) {
                 progressSpinnerEl.className = 'progress-spinner ' + phase;
             }
-            const text = label || phase;
+            // Queued steering messages are part of the input bar's truth:
+            // "· N queued" rides every progress label while items wait.
+            const nq = queuedCount();
+            const text = (label || phase) + (nq > 0 ? ' · ' + nq + ' queued' : '');
             if (progressLabelEl && text !== progressLabelText) {
                 progressLabelEl.textContent = text;
                 progressLabelText = text;
             }
         }
 
-        // If the user focuses anywhere else while the indicator is up (the
-        // terminal, Monaco, a modal, the sidebar), the textarea no longer
-        // owns the next focus restore.
-        document.addEventListener('focusin', () => {
-            if (currentProgressPhase !== null) progressFocusOwner = false;
-        });
+        function queuedCount() {
+            const pane = activePane();
+            return (pane && pane.queueItems || []).length;
+        }
+
+        // Re-render the progress label after a queue-count change that did
+        // not come from a stream event (optimistic enqueue, queue_update).
+        // setInputProgress is the single writer of the label (it re-appends
+        // the queued suffix).
+        function updateQueuedProgressLabel() {
+            if (currentProgressPhase === null) return;
+            setInputProgress(currentProgressPhase, progressLabelText.replace(/ · \d+ queued$/, ''));
+        }
 
         function finalizeThinking() {
             if (!currentThinkingDiv) return;
@@ -2603,6 +2880,20 @@
             }
         });
 
+        // Render a single tool-arg value for a card header: strings are
+        // quoted, long ones truncated to bigArgChars with an ellipsis,
+        // everything else String()-ed. Shared by formatToolArgs and
+        // formatToolArgsFragment so the two headers can't drift.
+        function formatToolArgValue(value) {
+            if (typeof value === 'string' && value.length > bigArgChars()) {
+                return `"${value.substring(0, bigArgChars() - 3)}..."`;
+            }
+            if (typeof value === 'string') {
+                return `"${value}"`;
+            }
+            return String(value);
+        }
+
         function formatToolArgs(args) {
             if (!args || typeof args !== 'object') return '';
             const parts = [];
@@ -2612,15 +2903,7 @@
                     parts.push(`diff=<${value.length} chars>`);
                     continue;
                 }
-                let displayValue;
-                if (typeof value === 'string' && value.length > bigArgChars()) {
-                    displayValue = `"${value.substring(0, bigArgChars() - 3)}..."`;
-                } else if (typeof value === 'string') {
-                    displayValue = `"${value}"`;
-                } else {
-                    displayValue = String(value);
-                }
-                parts.push(`${key}=${displayValue}`);
+                parts.push(`${key}=${formatToolArgValue(value)}`);
             }
             return parts.length > 0 ? `(${parts.join(', ')})` : '';
         }
@@ -2643,15 +2926,7 @@
                     link.onclick = (e) => { e.stopPropagation(); openFileAtLine(value).catch(() => {}); };
                     frag.appendChild(link);
                 } else {
-                    let displayValue;
-                    if (typeof value === 'string' && value.length > bigArgChars()) {
-                        displayValue = `"${value.substring(0, bigArgChars() - 3)}..."`;
-                    } else if (typeof value === 'string') {
-                        displayValue = `"${value}"`;
-                    } else {
-                        displayValue = String(value);
-                    }
-                    frag.appendChild(document.createTextNode(displayValue));
+                    frag.appendChild(document.createTextNode(formatToolArgValue(value)));
                 }
             }
             return frag;
@@ -3180,7 +3455,11 @@
             }
         }
 
-        async function replayHistory(history) {
+        // settleScroll (optional) overrides the final scroll settlement:
+        // default pin-to-bottom; the history handler passes a hook that
+        // restores the reader's scroll anchor when one is valid (see
+        // paneScrollRestoreSettle).
+        async function replayHistory(history, settleScroll) {
             // Session/history loads should always land at the bottom.
             enableFollow();
             historyToolCallArgs = {};
@@ -3192,7 +3471,7 @@
             bgTermCards = {};
             toolsStartedThisTurn = false;
             // Suppress per-message smartScroll while rebuilding; the final
-            // pinToBottom() below does a single scroll pass instead of O(n)
+            // settle below does a single scroll pass instead of O(n)
             // forced layouts. The history handler's error fallback also resets
             // this so a failed replay still scrolls while re-appending.
             replayInProgress = true;
@@ -3206,29 +3485,9 @@
                 } else if (h.role === 'assistant') {
                     // Skip when reasoning was promoted into content (same text).
                     if (h.reasoning && h.reasoning !== h.content) {
-                        const div = document.createElement('div');
-                        div.className = 'thought-card';
-                        const header = document.createElement('div');
-                        header.style.cssText = 'display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;font-size:0.85em;color:var(--fg-muted);padding:2px 0;';
-                        const label = document.createElement('span');
-                        label.style.fontStyle = 'italic';
-                        label.textContent = 'Thinking';
-                        const toggle = document.createElement('span');
-                        toggle.innerHTML = icon('chevron-down');
-                        toggle.style.fontSize = '0.8em';
-                        header.appendChild(label);
-                        header.appendChild(toggle);
-                        const body = document.createElement('div');
-                        body.style.cssText = 'font-size:0.85em;padding:4px 0 0 0;';
+                        const { card: div, body } = createThoughtCard();
                         // Same live-style markdown render as streaming thinking.
                         setMessageMarkdown(body, h.reasoning || '');
-                        div.appendChild(header);
-                        div.appendChild(body);
-                        header.addEventListener('click', () => {
-                            const collapsed = body.style.display === 'none';
-                            body.style.display = collapsed ? '' : 'none';
-                            toggle.innerHTML = icon(collapsed ? 'chevron-down' : 'chevron-right');
-                        });
                         if (h.createdAt) {
                             div.title = formatExactTime(msgDate(h.createdAt));
                             div.dataset.createdAt = h.createdAt;
@@ -3304,11 +3563,15 @@
             replayInProgress = false;
             disarmReplayWatchdog();
             flushDeferredResultColorize();
-            // Pin twice: once immediately, then again after a frame to catch
-            // late DOM mutations (Monaco colorization, image loads, etc.).
-            pinToBottom();
+            // Settle twice: once immediately, then again after a frame to
+            // catch late DOM mutations (Monaco colorization, image loads,
+            // etc.). Default settlement is pin-to-bottom; a settle hook
+            // (paneScrollRestoreSettle) re-positions the reader's scroll
+            // anchor with the same double-pass cadence instead.
+            const settle = settleScroll || pinToBottom;
+            settle();
             requestAnimationFrame(() => {
-                pinToBottom();
+                settle();
                 // Dispatch event so the gogen-colorized handler re-scrolls if
                 // Monaco finishes coloring after this rAF.
                 window.dispatchEvent(
@@ -3621,6 +3884,7 @@
             thinking_token: handleThinkingToken,
             stream: handleStream,
             stream_stats: handleStreamStats,
+            stream_retry: handleStreamRetry,
             stream_end: handleStreamEnd,
             model_used: handleModelUsed,
             tool_call_start: handleToolCallStart,
@@ -3638,6 +3902,7 @@
             turn_end: handleTurnEnd,
             clear_chat: handleClearChat,
             user_acked: handleUserAcked,
+            queue_update: handleQueueUpdate,
             sessions: handleSessions,
             session_state: handleSessionState,
             session_removed: handleSessionRemoved,
@@ -3721,6 +3986,10 @@
             lastStreamDiv = null; // new round: forget any prior bubble
             lastStreamSpeed = 0; // the server re-arms its meter per round
             finalizeThinking();
+            // New round = a fresh silent window: restart the placeholder
+            // (and its elapsed clock) for this round.
+            clearWaitingPlaceholder();
+            showWaitingPlaceholder('Thinking\u2026');
             setInputProgress('thinking', 'Thinking\u2026');
 
         }
@@ -3729,6 +3998,10 @@
 
             setTurnActive(true);
             updateTitle('thinking');
+            // The stream socket is open but no chunk has arrived yet:
+            // re-label the placeholder (the elapsed clock keeps running
+            // from the round start).
+            showWaitingPlaceholder('Waiting for model\u2026');
             setInputProgress('thinking', 'Waiting for model\u2026');
 
         }
@@ -3736,6 +4009,8 @@
         function handleThinkingToken(data) {
 
             setTurnActive(true);
+            // The model is producing: the placeholder's job is done.
+            clearWaitingPlaceholder();
             appendThinkingToken(data.content || '', data.thinkingPos);
             // The model is producing: the round-start "Waiting for
             // model…" label is stale once the first thinking token
@@ -3747,10 +4022,30 @@
 
         }
 
+        function handleStreamRetry(data) {
+
+            // A failed stream attempt is being retried with live delivery
+            // muted (streaming retry, or the non-streaming fallback): the
+            // following silent stretch is a whole regeneration, not a hang.
+            // The next thinking/stream/stats frame restores the normal
+            // label. Older handlers simply never registered this type.
+            setTurnActive(true);
+            updateTitle('thinking');
+            // Re-label the placeholder with the failure cause; the elapsed
+            // clock keeps running from the round start, so the user sees
+            // the whole silent stretch, not just the retry's.
+            showWaitingPlaceholder('Retrying stream (' + (data.reason || 'connection issue') + ')\u2026');
+            setInputProgress('thinking', 'Retrying stream (' + (data.reason || 'connection issue') + ')\u2026');
+
+        }
+
         function handleStream(data) {
 
             setTurnActive(true);
             updateTitle('streaming');
+            // First content token: the placeholder is replaced by the real
+            // bubble startStream creates below.
+            clearWaitingPlaceholder();
             // The rate (when known) is carried in the label so stream
             // frames and stream_stats frames never fight over it.
             setInputProgress('streaming', streamProgressLabel());
@@ -3778,6 +4073,9 @@
 
         function handleStreamEnd(data) {
 
+            // Round over without any token (e.g. an empty completion): do
+            // not leave the placeholder up for the next frame.
+            clearWaitingPlaceholder();
             finalizeThinking();
             endStream();
 
@@ -3801,6 +4099,9 @@
         function handleToolCallStart(data) {
 
             setTurnActive(true);
+            // The round produced a tool call instead of text: the tool card
+            // takes over from the placeholder.
+            clearWaitingPlaceholder();
             setInputProgress('tool', 'Running ' + (data.tool || 'tool') + '\u2026');
             startStreamingToolCard(data.index, data.tool);
 
@@ -3969,6 +4270,7 @@
             if (suppressTurnEnds > 0) return;
             abortInFlightUI(data.content || 'Cancelled.');
             setTurnActive(false);
+            clearWaitingPlaceholder();
             lastStreamSpeed = 0;
             setInputProgress(null);
             refreshSidebarSessions();
@@ -3997,6 +4299,7 @@
             }
             setTurnActive(false);
             updateTitle('idle');
+            clearWaitingPlaceholder();
             lastStreamSpeed = 0;
             setInputProgress(null);
             pendingSessionResponse = false;
@@ -4022,9 +4325,41 @@
 
         }
 
+        /** Re-render a pane's queued steering bubbles from its server-truth
+         * queue mirror (queued items are not part of history — they come from
+         * session_state/queue_update): transcript rebuilds wipe the DOM, and a
+         * cache restore brings back a DOM that predates queue changes made
+         * while the pane was backgrounded (background queue frames only update
+         * the mirror, never the DOM).
+         *
+         * Idempotent: it first drops the queued bubbles the container still
+         * holds (only ones actually marked queued — a bubble merely TAGGED
+         * with a correlation id is an in-flight send and must stay), then
+         * renders the mirror. A locally-sent item that is still queued keeps
+         * its pending-ack correlation, so its user_acked still resolves FIFO
+         * through pendingAcks instead of the DOM fallback. */
+        function rerenderQueuedBubbles(pane) {
+            if (!pane) return;
+            const bubbles = queuedBubblesFor(pane);
+            const local = new Set(bubbles.keys());
+            for (const el of messagesDiv.querySelectorAll('.message.user.queued')) {
+                cancelTarget.delete(el);
+                el.remove();
+            }
+            prunePendingAcks();
+            bubbles.clear();
+            for (const it of pane.queueItems || []) {
+                const el = appendMessage('user', it.text);
+                markQueuedBubble(el, it.id);
+                if (local.has(it.id)) rearmPendingAck(el);
+                bubbles.set(it.id, el);
+            }
+        }
+
         function handleClearChat(data) {
 
             clearChat();
+            rerenderQueuedBubbles(activePane());
             // Do NOT re-arm pendingSessionResponse here: the response
             // handler already re-keyed the pane to the new session id
             // and cleared the flag, so the follow-up history/config
@@ -4052,8 +4387,80 @@
                 dropPendingAck(el);
                 el.dataset.histIdx = String(idx);
                 ensureUserResendActions(el);
+                // A queued steering message just became a real user turn:
+                // its chip clears (the pending-ack FIFO still held — drains
+                // are FIFO, so acks resolve in send order).
+                clearQueuedMark(el);
+                // Clean the optimistic queue mirror when this bubble was
+                // marked queued locally but the server raced it idle (the
+                // turn started immediately — no queue_update will come).
+                const pane = activePane();
+                if (pane) {
+                    const bubbles = queuedBubblesFor(pane);
+                    for (const [id, e] of [...bubbles]) {
+                        if (e === el) {
+                            bubbles.delete(id);
+                            pane.queueItems = (pane.queueItems || []).filter((it) => it.id !== id);
+                            updateQueuedProgressLabel();
+                            break;
+                        }
+                    }
+                }
             }
 
+        }
+
+        /**
+         * Reconcile a pane's queued state from server truth (queue_update
+         * frames and the Queue snapshot on session_state). For the ACTIVE
+         * pane the DOM is reconciled too:
+         *   - an item that left the queue because its turn STARTED
+         *     (queueLeft) only clears its chip — the paired user_acked is
+         *     next on the socket (worker broadcast happens-before turn
+         *     start) and its pending entry resolves there;
+         *   - an item that left the queue any other way (✕, clear-all,
+         *     interrupt) is cancelled-before-running: its pending entry is
+         *     dropped (it has no terminal frame to do it) and the bubble
+         *     restyles;
+         *   - an item with no bubble (sent by another tab, or the attach
+         *     snapshot) renders as a new queued bubble.
+         */
+        function applyQueueUpdate(pane, data, dom) {
+            const items = data.queue || [];
+            const left = new Set(data.queueLeft || []);
+            const live = new Set(items.map((it) => it.id));
+            const bubbles = queuedBubblesFor(pane);
+            for (const [id, el] of [...bubbles]) {
+                if (!el.isConnected) { bubbles.delete(id); continue; }
+                if (live.has(id)) continue;
+                bubbles.delete(id);
+                if (left.has(id)) clearQueuedMark(el);
+                else resolveCancelledQueued(el);
+            }
+            if (dom) {
+                for (const it of items) {
+                    if (bubbles.has(it.id)) continue;
+                    // The sending tab's optimistic bubble may exist but be
+                    // unmarked (its turnActive mirror raced the server's):
+                    // adopt it instead of creating a duplicate.
+                    const existing = messagesDiv.querySelector(
+                        '.message.user[data-queue-id="' + CSS.escape(it.id) + '"]');
+                    if (existing) {
+                        markQueuedBubble(existing, it.id);
+                        bubbles.set(it.id, existing);
+                        continue;
+                    }
+                    const el = appendMessage('user', it.text);
+                    markQueuedBubble(el, it.id);
+                    bubbles.set(it.id, el);
+                }
+            }
+            pane.queueItems = items;
+            if (pane === activePane()) updateQueuedProgressLabel();
+        }
+
+        function handleQueueUpdate(data) {
+            applyQueueUpdate(activePane(), data, true);
         }
 
         function handleSessions(data) {
@@ -4096,6 +4503,11 @@
             }
             pane.turnActive = !!data.turnActive;
             setTurnActive(pane.turnActive, { silent: true });
+            // Seed the queue mirror from server truth. DOM-only: the queued
+            // bubbles re-render with the transcript rebuild (session_state
+            // precedes the history payload on attach; afterHistory re-renders
+            // them from this mirror).
+            applyQueueUpdate(pane, data, false);
             if (pane.turnActive) {
                 setInputProgress('thinking', 'Resuming\u2026');
                 // Attached to a running turn: the history snapshot
@@ -4128,6 +4540,9 @@
             // a deleted runtime (messages would route to a stale
             // agent and silently re-persist the deleted file).
             const pane = findPaneBySession(data.sessionId);
+            // The session is gone (store file deleted): its scroll anchor
+            // is meaningless.
+            paneScrollAnchors.delete(data.sessionId);
             if (pane === activePane() && !pendingSessionResponse) {
                 // Drop the stale pane FIRST (mirrors session_detached):
                 // leaving it in the map rendered a ghost sidebar row for
@@ -4156,6 +4571,9 @@
             for (const [id, rec] of nestedSessions) {
                 if (rec.parentId === data.sessionId) {
                     nestedSessions.delete(id);
+                    // Cascade also drops the child's scroll anchor (the
+                    // store deletes child sessions recursively).
+                    paneScrollAnchors.delete(id);
                     nestedChanged = true;
                 }
             }
@@ -4436,6 +4854,10 @@
             // NUMBER so the stale-skip epoch comparison works for sessions
             // that were never compacted/rolled back either.
             histPane.histEpoch = data.historyEpoch || 0;
+            // The rebuild wipes the reading position; restore it from the
+            // per-session scroll anchor when one is valid for this
+            // snapshot (null settle → the replay's default pin-to-bottom).
+            const scrollSettle = paneScrollRestoreSettle(histPane, data.sessionId, data.historyEpoch || 0);
             const afterHistory = () => {
                 // Render the in-flight partial (the server's live-turn
                 // buffer) through the normal stream machinery, then
@@ -4454,6 +4876,10 @@
                     setTurnActive(true, { silent: true });
                     setInputProgress('thinking', 'Resuming\u2026');
                 }
+                // Re-render the pane's queued steering bubbles: the rebuild
+                // wiped the DOM (clearChat) and queued items are not part of
+                // history — they come from the pane's queue mirror.
+                rerenderQueuedBubbles(activePane());
                 // Refresh the TOC active dot once the transcript is rebuilt:
                 // the replay path pins (updateTocActive in pinToBottom), the
                 // fallback path has no scroll event to trigger it.
@@ -4469,7 +4895,7 @@
                 // server sends history before config).
             };
             if (data.history && data.history.length) {
-                replayHistory(data.history).then(afterHistory).catch((err) => {
+                replayHistory(data.history, scrollSettle).then(afterHistory).catch((err) => {
                     console.warn('history replay failed', err);
                     // Ensure the replay scroll-suppression flag is off
                     // so the fallback re-append below scrolls normally.
@@ -4490,6 +4916,10 @@
                             }
                         }
                     }
+                    // Same settlement contract as the replay path: anchor
+                    // when valid, bottom otherwise (the fallback's appends
+                    // just pinned to bottom via smartScroll).
+                    if (scrollSettle) scrollSettle();
                     afterHistory();
                 });
             } else {
@@ -4839,10 +5269,13 @@
                     }
                 }
             }
-            // Sending while busy cancels the current turn (same as TUI interrupt + new prompt).
-            cancelActiveTurn();
-            // A turn started from the focused pane is fully live-rendered —
-            // no turn_end convergence refetch needed.
+            // Sending while busy QUEUES the message (steering): it is
+            // delivered as the next user turn when the in-flight one ends,
+            // FIFO with the server's delivery queue. Interrupt is explicit
+            // (Cancel / Esc / cancel frame) — never implicit in a send.
+            // A turn started from the focused pane (now, or when the queue
+            // drains) is fully live-rendered — no turn_end convergence
+            // refetch needed.
             if (activePane()) activePane().needsFreshHistory = false;
             hideSlashSuggest();
             enableFollow();
@@ -4859,17 +5292,46 @@
                 const p = activePane();
                 if (p && p.id) p.ignoreTurnEndsFor = p.id;
             }
-            const images = getPendingAttachments().map((a) => ({ dataUrl: a.dataUrl }));
-            const el = appendMessage('user', text, undefined, undefined, images);
+            // Images ride the payload's images array; text-file attachments
+            // (dropped on the composer) are inlined into the content by the
+            // composer — the wire format carries no other attachment kind.
+            // The bubble shows the composed content, so what the user sees
+            // (and later edits/resends via rawContent) matches what the
+            // model received. Queue labels keep the short typed text.
+            const images = getPendingAttachments()
+                .filter((a) => a.dataUrl)
+                .map((a) => ({ dataUrl: a.dataUrl }));
+            const content = composeMessageContent(text);
+            const el = appendMessage('user', content, undefined, undefined, images);
             markPendingAck(el);
             streamingToolCards = {};
             pendingToolCards = {};
             bgTermCards = {};
             toolsStartedThisTurn = false;
             contextEstAdded = 0;
-            const payload = { type: 'message', content: text, sessionId: activePane().id };
+            const payload = { type: 'message', content, sessionId: activePane().id };
             if (images.length > 0) payload.images = images;
+            // Correlation id: when the pane's turn is active the message is
+            // queued server-side; this id ties the optimistic bubble to its
+            // queue_update entry and lets other tabs render the same item.
+            // The bubble is TAGGED with it unconditionally: if the send races
+            // the server's busy state (our turnActive mirror still says idle
+            // while the server queues the message), the queue_update adopts
+            // this very bubble by data-queue-id instead of appending a
+            // duplicate. markQueuedBubble below adds the chip/✕ on top.
+            const qid = nextQueueId();
+            payload.queueId = qid;
+            el.dataset.queueId = qid;
             ws.send(JSON.stringify(payload));
+            // Optimistic queued mark when the pane is busy: the bubble shows
+            // a queued chip immediately; the server's queue_update (or
+            // user_acked, when the send raced an idle turn) reconciles it.
+            if (activePane().turnActive) {
+                markQueuedBubble(el, qid);
+                queuedBubblesFor(activePane()).set(qid, el);
+                activePane().queueItems = (activePane().queueItems || []).concat([{ id: qid, text }]);
+                updateQueuedProgressLabel();
+            }
             inputArea.value = '';
             clearAttachments();
             // Mouse-click sends leave focus on the Send button; hand it
@@ -4956,18 +5418,10 @@
             // The sidebar "New" button opens a NEW pane; the previous
             // pane stays open in the background. The new pane's session id
             // arrives in the config reply (re-key via the config handler).
-            saveActivePaneState();
-            const outgoing = activePane();
             const pane = makePane();
             // Same outgoing-pane transcript handling as focusPane: cache the
             // previous pane (if settled) instead of wiping it.
-            if (!outgoing || !cachePaneTranscript(outgoing)) {
-                clearChat();
-            } else {
-                resetChatTranscriptState();
-            }
-            activePaneKey = pane.key;
-            loadActivePaneState();
+            transitionToPane(pane);
             ensureEmptyState();
             pendingSessionResponse = true;
             ws.send(JSON.stringify({ type: 'session_new' }));
@@ -4978,6 +5432,8 @@
         }
 
         function switchMainPane(pane) {
+            // Switching to a regular pane on mobile dismisses the
+            // full-screen terminal overlay so it can't cover the chat.
             if (pane !== 'terminal') terminalDismissMobile();
             document.querySelectorAll('.main-tab').forEach((t) => {
                 t.classList.toggle('active', t.dataset.pane === pane);
@@ -4989,14 +5445,18 @@
                 initMonaco().then(() => refreshExplorer()).catch(() => {});
             }
             if (pane === 'board') {
-                // Board re-renders are gated on pane visibility
-                // (handleBoardState skips hidden panes), so paint the
-                // stored lastBoardState now that it's on screen.
+                // Paint the stored lastBoardState now — board re-renders are
+                // gated on pane visibility (handleBoardState skips hidden
+                // panes) — and request a fresh snapshot; the reply renders
+                // through the same now-visible pane.
                 renderBoard();
+                requestBoardState();
             }
             if (pane === 'automations') {
-                // Same visibility-gated render contract as the board.
+                // Same visibility-gated render contract as the board:
+                // paint the stored snapshot, then refresh it.
                 renderAutomations();
+                requestAutomationsState();
             }
         }
 

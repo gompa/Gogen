@@ -91,6 +91,28 @@ func TestWebSearchEnabled(t *testing.T) {
 	}
 }
 
+func TestOutputSpillEnabled(t *testing.T) {
+	if !((*Config)(nil)).OutputSpillEnabled() {
+		t.Fatal("nil config should enable output spill (default on)")
+	}
+	def := Defaults()
+	if !def.OutputSpillEnabled() {
+		t.Fatal("default output spill should be on")
+	}
+	for _, on := range []string{"on", "ON", "1", "true", "", "random"} {
+		c := Config{OutputSpill: on}
+		if !c.OutputSpillEnabled() {
+			t.Fatalf("OutputSpill=%q should enable (default on)", on)
+		}
+	}
+	for _, off := range []string{"off", "OFF", "0", "false"} {
+		c := Config{OutputSpill: off}
+		if c.OutputSpillEnabled() {
+			t.Fatalf("OutputSpill=%q should disable", off)
+		}
+	}
+}
+
 func TestWebToolsEnabled(t *testing.T) {
 	if ((*Config)(nil)).WebToolsEnabled() {
 		t.Fatal("nil config should not enable web tools")

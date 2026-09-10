@@ -232,12 +232,16 @@ func (s *Server) modelEntries(models []llm.ModelInfo) []ModelEntry {
 }
 
 // sendSessionState writes the session_state message describing the session's
-// in-flight turn so a reconnecting client can render "resuming…".
+// in-flight turn so a reconnecting client can render "resuming…". It also
+// carries the queued steering messages so an attaching/reconnecting client
+// seeds the queued UI from server truth (the same snapshot every attached
+// client got via queue_update).
 func (s *Server) sendSessionState(ws *wsConn, rt *sessionRuntime) {
 	active, _ := rt.turnState()
 	_ = ws.writeJSON(WSMessage{
 		Type:       "session_state",
 		SessionID:  rt.agent.SessionID,
 		TurnActive: active,
+		Queue:      rt.queueItems(),
 	})
 }

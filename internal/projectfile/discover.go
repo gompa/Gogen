@@ -130,6 +130,17 @@ func GlobalBoardDir() string {
 	return filepath.Join(GlobalDataDir(), "board")
 }
 
+// GlobalSpillDir returns the directory for spilled oversized tool output in
+// global mode. Sessions live in the global data dir there (GlobalSessionDir),
+// so their spill trees must too — project mode keeps the spill dir inside the
+// project (<workingDir>/.gogen/spill, mirroring the session files next to it).
+// Unlike GlobalBoardDir/GlobalSessionDir the path is pushed to the spill
+// package once at startup (spill.SetGlobalRoot), since the spill root is read
+// on every tool result.
+func GlobalSpillDir() string {
+	return filepath.Join(GlobalDataDir(), "spill")
+}
+
 // HomeDir returns the user's home directory. Returns "." if it cannot be determined.
 func HomeDir() string {
 	home, err := os.UserHomeDir()

@@ -17,6 +17,8 @@ import (
 var errReferenceLimit = errors.New("reference search: result limit reached")
 
 // FindReferences locates usages of a symbol via tree-sitter when available, otherwise word-boundary search.
+// The AST walk stops after searchMaxMatches matches; when it does, the result carries the standard
+// truncation footer so a partial list is never presented as complete — narrow with subpath/glob for more.
 func (e *Executor) FindReferences(ctx context.Context, symbol, subpath, glob string) (string, error) {
 	symbol = strings.TrimSpace(symbol)
 	if symbol == "" {
@@ -28,15 +30,19 @@ func (e *Executor) FindReferences(ctx context.Context, symbol, subpath, glob str
 		return "", err
 	}
 
-	// Collect AST matches using shared helper
+	// Collect AST matches using shared helper. skips collects unreadable
+	// subtrees from the AST walk so a partial result is flagged.
+	skips := &walkSkips{}
 	var astMatches []string
 	astFiles := 0
+	limitHit := false
 	if treesitter.Enabled() {
-		err = e.walkSymbolReferences(ctx, searchRoot, relPrefix, glob, symbol,
+		err = e.walkSymbolReferences(ctx, searchRoot, relPrefix, glob, symbol, skips,
 			func(filePath string, refs []treesitter.Reference, content []byte) error {
 				astFiles++
 				astMatches = append(astMatches, treesitter.FormatReferenceMatches(filePath, refs)...)
 				if len(astMatches) >= searchMaxMatches {
+					limitHit = true
 					return errReferenceLimit
 				}
 				return nil
@@ -53,7 +59,14 @@ func (e *Executor) FindReferences(ctx context.Context, symbol, subpath, glob str
 	if len(astMatches) > 0 {
 		fmt.Fprintf(&b, "References for %q (%d via AST in %d files):\n", symbol, len(astMatches), astFiles)
 		b.WriteString(strings.Join(astMatches, "\n"))
-		return b.String(), nil
+		if limitHit {
+			// Standard truncation footer: the "\n… truncated (" prefix is the
+			// upstream marker contextmgr/spill key on (HasTruncationMarker), so
+			// later byte caps treat this result as already-partial. The hint
+			// points at the tool's own subpath/glob params for retrieval.
+			fmt.Fprintf(&b, "\n… truncated (showing first %d matches; narrow with subpath/glob for more)", len(astMatches))
+		}
+		return b.String() + skips.footer(), nil
 	}
 
 	// Text search fallback
@@ -64,7 +77,7 @@ func (e *Executor) FindReferences(ctx context.Context, symbol, subpath, glob str
 	}
 
 	if strings.HasPrefix(textOut, "No matches found") {
-		return fmt.Sprintf("No references found for %q", symbol), nil
+		return fmt.Sprintf("No references found for %q", symbol) + skips.footer(), nil
 	}
-	return "References for " + symbol + " (text search):\n" + textOut, nil
+	return "References for " + symbol + " (text search):\n" + textOut + skips.footer(), nil
 }

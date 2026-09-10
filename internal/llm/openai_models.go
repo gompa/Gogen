@@ -10,7 +10,7 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/modelinfo"
 
-	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/v3"
 )
 
 func (p *OpenAIProvider) listModels(ctx context.Context) ([]openai.Model, error) {

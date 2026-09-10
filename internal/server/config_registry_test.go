@@ -97,6 +97,8 @@ func TestRuntimeConfigFieldErrors(t *testing.T) {
 			"Error: webMaxActiveSessions must be >= 0"},
 		{"webFetch", WSMessage{Type: "config", ConfigFields: []string{"webFetch"}, WebFetch: "sometimes"},
 			`Error: invalid webFetch "sometimes" (want on or off)`},
+		{"outputSpill", WSMessage{Type: "config", ConfigFields: []string{"outputSpill"}, OutputSpill: "sometimes"},
+			`Error: invalid outputSpill "sometimes" (want on or off)`},
 		{"webSearch", WSMessage{Type: "config", ConfigFields: []string{"webSearch"}, WebSearch: "sometimes"},
 			`Error: invalid webSearch "sometimes" (want on or off)`},
 		{"treesitter", WSMessage{Type: "config", ConfigFields: []string{"treesitter"}, TreeSitter: "sometimes"},

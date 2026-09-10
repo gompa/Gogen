@@ -46,6 +46,7 @@ const (
 	ModalSubagents
 	ModalLiveSessions
 	ModalConfirm // generic yes/no confirmation (sidebar session delete)
+	ModalQueue   // queued steering messages (/queue — steering.go)
 )
 
 // modelChangedMsg is sent by the TUI runner when a background agent state
@@ -169,6 +170,13 @@ type Model struct {
 	spinner       spinner.Model
 	progressPhase progressPhase
 	progressLabel string
+	// progressRetry marks the label as a stream-recovery reason ("retrying
+	// stream (…)"): the regeneration is silent, so the stall signal must not
+	// overwrite it with the generic "still waiting" label — the retry reason
+	// IS the explanation for that silence. Cleared by every other progress
+	// update (setProgress) and with the progress itself; mirrored onto the
+	// focused session like the phase/label pair.
+	progressRetry bool
 	// streamSpeedLine is the FOCUSED session's rendered token rate
 	// ("42 tok/s") for the progress line — mirror of
 	// liveSession.streamSpeedLine, updated by handleStreamStatsMsg from
@@ -265,12 +273,9 @@ type Model struct {
 	// when the approval queue drains.
 	modalBeforeApproval ModalKind
 
-	// System message deliveries (job notices, subagent reports) queued by
-	// program.Send(deliveryRequestMsg) from background goroutines; drained
-	// on the Update thread only when no turn is streaming.
-	pendingDeliveries []string
-	// deliveryDrops counts deliveries dropped on queue overflow; rendered
-	// as a system line at the next drain (never mid-stream).
+	// deliveryDrops counts system deliveries dropped on queue overflow
+	// (the per-session steering queue, steering.go); rendered as a system
+	// line at the next drain (never mid-stream).
 	deliveryDrops int
 
 	// Modal data
@@ -279,6 +284,8 @@ type Model struct {
 	sessionCursor int
 	modelCursor   int
 	liveCursor    int // ModalLiveSessions selection over m.lives.sessions
+	// queueCursor is the /queue modal's selected row (steering.go).
+	queueCursor int
 	// thinkingSel is the models modal's staged thinking level (web
 	// subagent-picker parity): moved with ←/→ or a chip click, applied
 	// together with the model on enter. Off = "no reasoning_effort sent".
@@ -451,21 +458,47 @@ func (m *Model) SetSize(width, height int) {
 	if inputLines < 1 {
 		inputLines = 1
 	}
+	// Busy band: while a turn (or compaction) runs, the progress strip
+	// renders as one row INSIDE the input band and the composer gives it a
+	// row (busyStripRows) — the band's total height is unchanged, so a turn
+	// boundary never shifts the viewport (the zero-layout-jump invariant
+	// padInputBand served). The composer stays visible and editable: Enter
+	// queues (steering), ctrl+c interrupts. bandLines is the band's TOTAL
+	// height and what the viewport budget is computed from; the textarea
+	// gets the band minus the strip's row. (Budgeting the viewport from the
+	// textarea height instead would hand the strip's row back to the
+	// viewport, growing the frame one row past the terminal at every turn
+	// start — the inline renderer would scroll and desync.)
+	stripRows := m.busyStripRows()
+	bandLines := inputLines
+	textareaHeight := inputLines - stripRows
+	if textareaHeight < 1 {
+		// A one-row composer cannot give up its row: the strip adds a band
+		// row instead (the viewport budget absorbs it; the frame stays
+		// exact).
+		textareaHeight = 1
+		bandLines++
+	}
 
-	vpHeight := height - statusBarHeight - inputLines - 1 // -1 for divider
+	vpHeight := height - statusBarHeight - bandLines - 1 // -1 for divider
 	if vpHeight < 3 {
 		// Short terminal: shrink the input band before taking rows from
-		// the chat viewport, then floor the viewport at a single row.
-		inputLines -= 3 - vpHeight
-		if inputLines < 1 {
-			inputLines = 1
+		// the chat viewport, then floor the viewport at a single row. The
+		// band floors at strip+composer while busy (2) and at the composer
+		// alone when idle (1).
+		bandLines -= 3 - vpHeight
+		if minBand := 1 + stripRows; bandLines < minBand {
+			bandLines = minBand
 		}
-		vpHeight = height - statusBarHeight - inputLines - 1
+		vpHeight = height - statusBarHeight - bandLines - 1
 		if vpHeight < 1 {
 			vpHeight = 1 // under ~4 rows nothing fits; best effort
 		}
+		textareaHeight = bandLines - stripRows
+		if textareaHeight < 1 {
+			textareaHeight = 1
+		}
 	}
-	textareaHeight := inputLines
 
 	main := m.mainWidth()
 	m.viewport.Width = main - 2 // padding
@@ -475,4 +508,23 @@ func (m *Model) SetSize(width, height int) {
 
 	m.setViewportContent()
 	m.viewport.GotoBottom()
+}
+
+// busyStripRows reports how many rows the busy progress strip contributes
+// to the input band: 1 while a turn (or compaction) runs and the terminal
+// is tall enough to hold the strip NEXT TO the composer (status bar +
+// divider + strip + one-row composer + one-row viewport = 5), 0 otherwise.
+// A terminal shorter than that keeps the pre-steering composer-only band —
+// the alternative (rendering the strip anyway) would grow the frame past
+// the terminal and desync the inline renderer. SetSize budgets the band
+// from this and renderMainColumn renders from it: one predicate, so the
+// rendered band can never disagree with the budgeted one and overflow.
+func (m *Model) busyStripRows() int {
+	if m.height < 5 {
+		return 0
+	}
+	if m.streaming || m.compacting {
+		return 1
+	}
+	return 0
 }

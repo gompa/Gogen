@@ -1,7 +1,6 @@
 package automation
 
 import (
-	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -209,38 +208,39 @@ func readSessionIDFile(path string) string {
 }
 
 // cappedTail is an io.Writer keeping the LAST cap bytes of what was written
-// (the most recent stderr output is the useful failure detail).
+// (the most recent stderr output is the useful failure detail): once the
+// window is full, older bytes are evicted from the FRONT and counted in
+// dropped, which String reports ahead of the retained tail.
 type cappedTail struct {
-	buf     bytes.Buffer
+	mu      sync.Mutex
+	tail    []byte
 	cap     int
 	dropped int64
-	mu      sync.Mutex
 }
 
 func (t *cappedTail) Write(p []byte) (int, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.buf.Len() >= t.cap {
-		t.dropped += int64(len(p))
-		return len(p), nil
+	t.tail = append(t.tail, p...)
+	if len(t.tail) > t.cap {
+		// Evict from the front, keeping only the newest cap bytes. copy (not
+		// re-slicing) leaves the retained window at the head of the backing
+		// array, so repeated overflow doesn't grow it without bound.
+		n := len(t.tail) - t.cap
+		t.dropped += int64(n)
+		copy(t.tail, t.tail[n:])
+		t.tail = t.tail[:t.cap]
 	}
-	if n := t.cap - t.buf.Len(); n < len(p) {
-		t.buf.Write(p[:n])
-		t.dropped += int64(len(p) - n)
-		return len(p), nil
-	}
-	t.buf.Write(p)
 	return len(p), nil
 }
 
-// String returns the retained tail, plus an ellipsis marker when older
-// output was dropped.
+// String returns the retained tail, plus an ellipsis marker announcing how
+// many older bytes were dropped.
 func (t *cappedTail) String() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	var out string
 	if t.dropped > 0 {
-		out = fmt.Sprintf("… (%d more bytes) ", t.dropped)
+		return fmt.Sprintf("… (%d more bytes) ", t.dropped) + string(t.tail)
 	}
-	return out + t.buf.String()
+	return string(t.tail)
 }

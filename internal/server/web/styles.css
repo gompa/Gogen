@@ -362,6 +362,31 @@
             background: var(--bg-elevated);
             position: relative;
         }
+        /* Drop-zone affordance (components/composer.js): covers the whole
+           composer row while a file drag hovers it. pointer-events:none is
+           required — the dragenter/leave depth counter counts events
+           bubbling from the real children underneath. */
+        #composer-drop-overlay {
+            position: absolute;
+            inset: 0;
+            z-index: 30;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 2px;
+            pointer-events: none;
+            background: var(--accent-soft);
+            border: 1.5px dashed var(--accent);
+            border-radius: var(--radius-md);
+            color: var(--accent);
+            font-size: 0.9em;
+            text-align: center;
+        }
+        #composer-drop-overlay span {
+            color: var(--fg-muted);
+            font-size: 0.92em;
+        }
         #slash-suggest {
             display: none;
             position: absolute;
@@ -404,7 +429,19 @@
             flex: 1;
             position: relative;
             display: flex;
+            /* Steering: the progress row COEXISTS with the composer — while
+               a turn runs the textarea stays visible and editable (sending
+               queues; interrupt is the Cancel control). flex-wrap + the
+               progress row's 100% basis stack the status strip under the
+               composer inside the same bordered container. */
+            flex-wrap: wrap;
             min-width: 0;
+            /* Height of the status strip's row (38px strip + 1px separator).
+               Single source of truth for both owners of that space — the
+               strip (below) and the textarea's reserved idle height — so
+               showing/hiding the strip moves the space between them instead
+               of growing the input bar. */
+            --progress-row-h: 39px;
             /* Floating composer container: owns the border/background and
                focus ring; the inner textarea/progress bar are chrome-less. */
             border: 1px solid var(--border);
@@ -417,18 +454,25 @@
             border-color: var(--accent);
             box-shadow: 0 0 0 3px var(--accent-soft);
         }
-        /* ===== Input-area progress indicator (replaces textarea during streaming) ===== */
+        /* ===== Input-area progress indicator (status strip under the composer) ===== */
+        /* The strip's row height is pre-paid at idle by the textarea (its
+           min-height includes --progress-row-h), so the strip appearing —
+           with the live tok/s rate — swaps the space from the textarea to
+           the strip instead of growing the input bar (no layout jump).
+           app.js keeps #input-wrap's .progress-active in lockstep with
+           .active here. */
         #input-progress {
             display: none;
-            flex: 1;
+            flex: 1 0 100%;
             min-width: 0;
             align-items: center;
             gap: 10px;
             padding: 9px 12px;
             font-size: 0.92em;
             color: var(--fg-muted);
-            min-height: 38px;
+            min-height: calc(var(--progress-row-h, 39px) - 1px);
             box-sizing: border-box;
+            border-top: 1px solid var(--border);
         }
         #input-progress.active { display: flex; }
         #input-progress .progress-spinner {
@@ -470,10 +514,11 @@
             border-color: var(--error-border);
             color: var(--error-fg);
         }
-        /* Swap Send/Cancel: only one shown at a time. */
-        #input-area.turn-active #send-btn {
-            display: none;
-        }
+        /* Send and Cancel coexist while a turn is active: Send QUEUES the
+           message (steering — it runs after the current turn), Cancel is
+           the explicit interrupt. The old swap hid Send while busy and made
+           "send while busy" mean cancel-then-send; steering replaces that
+           overload. */
         #input-area:not(.turn-active) #cancel-btn {
             display: none;
         }
@@ -531,6 +576,37 @@
             padding: 8px;
         }
         .tb-popover.open { display: block; }
+        /* The model popover pins the thinking-level chips at the top of
+           its scroll area: the popover stays the single scroll container
+           (max-height) and the thinking section is sticky, so the effort
+           chips stay selectable even when the model list is scrolled far
+           down. (Scrolling the list alone inside a flex column does not
+           work in Firefox: an auto-height flex container clamped by
+           max-height does not shrink its items there.) The mode popover
+           keeps the plain layout (its list is short). */
+        #tb-model-popover #tb-thinking-section {
+            position: sticky;
+            /* top: 0 pins the section at its NATURAL position (the sticky
+               inset is measured from the scrollport's content edge in
+               Firefox), so the header never shifts when scrolling starts.
+               The popover's 8px top padding would otherwise leave a strip
+               where rows show above the section; the upward box-shadow
+               (same background, painted with the section's stacking
+               context) extends the cover into that strip. */
+            top: 0;
+            z-index: 1;
+            background: var(--bg-elevated);
+            box-shadow: 0 -8px 0 0 var(--bg-elevated);
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 6px;
+        }
+        /* The sticky section's border-bottom replaces this section's
+           border-top separator; the 6px padding-top below it is kept
+           from the .tb-popover-section + .tb-popover-section rule. */
+        #tb-model-popover #tb-model-section {
+            border-top: none;
+            margin-top: 0;
+        }
         .tb-popover-section + .tb-popover-section {
             border-top: 1px solid var(--border);
             margin-top: 6px;
@@ -787,6 +863,27 @@
             color: #fff;
             cursor: pointer;
             font-size: 0.7em;
+        }
+        /* Dropped text/code files: icon + name chip instead of a thumbnail. */
+        .attachment-chip.text {
+            align-items: center;
+            gap: 6px;
+            height: 56px;
+            max-width: 200px;
+            padding: 0 10px 0 8px;
+            background: var(--bg);
+        }
+        .attachment-chip .attachment-file-icon {
+            display: inline-flex;
+            color: var(--accent);
+            flex-shrink: 0;
+        }
+        .attachment-chip .attachment-file-name {
+            font-family: var(--mono);
+            font-size: 0.78em;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
         .assistant {
             background: var(--bg-elevated);
@@ -2116,10 +2213,10 @@
 
         /* ===== Textarea auto-resize (native) =====
            field-sizing: content makes the textarea grow/shrink with its text
-           — no JS size tracking needed. min-height calc(1.4em + 16px) is the
-           natural single-line height (line-height 1.4em + padding 16px), so
-           the empty box is exactly one line tall and typing the first
-           character doesn't change the size. Requires Firefox 152+ /
+           — no JS size tracking needed. The base min-height calc(1.4em +
+           16px) is the natural single-line height (line-height 1.4em +
+           padding 16px) — the box the strip hands back when it activates —
+           and typing past it grows the box. Requires Firefox 152+ /
            Chrome 123+ / Safari 26.2+; older engines keep the min-height box.
            The textarea is deliberately chrome-less: the surrounding
            #input-wrap carries the border/background/focus ring now. */
@@ -2136,6 +2233,14 @@
             border: none;
             background: transparent;
             color: var(--fg);
+        }
+        /* Idle composer: the textarea pre-pays the status strip's row height
+           (--progress-row-h on #input-wrap), so at rest the typing box
+           includes the strip's row and the strip's appearance (with the live
+           tok/s rate) swaps the space's owner instead of changing the input
+           bar's height. */
+        #input-wrap:not(.progress-active) textarea#message-input {
+            min-height: calc(1.4em + 16px + var(--progress-row-h, 39px));
         }
         textarea#message-input::placeholder { color: var(--fg-dim); }
         textarea#message-input:focus {
@@ -2698,6 +2803,26 @@
             user-select: none;
         }
 
+        /* ===== Waiting placeholder (silent pre-first-token window) ===== */
+        .message.waiting-placeholder {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--fg-muted);
+            font-size: 0.88em;
+            font-style: italic;
+            opacity: 0.85;
+        }
+        .message.waiting-placeholder .waiting-spinner {
+            width: 14px;
+            height: 14px;
+            border: 2px solid var(--border);
+            border-top-color: var(--fg-muted);
+            border-radius: 50%;
+            flex-shrink: 0;
+            animation: input-spin 1.2s linear infinite;
+        }
+
         /* ===== Fork button on assistant messages ===== */
         .message.assistant {
             position: relative;
@@ -2756,6 +2881,57 @@
         .message.user:hover .resend-btn,
         .message.user:hover .edit-btn {
             display: inline-block;
+        }
+        /* ===== Queued (steering) message bubble ===== */
+        /* A send while the pane's turn is active is queued server-side and
+           delivered as the next user turn. The bubble carries a queued chip
+           (always visible — this is the queue's display) and a hover ✕ that
+           removes the item from the queue; the chip clears when the turn
+           actually starts (user_acked), and a removed item's bubble reads
+           "cancelled before running". */
+        .queued-chip {
+            display: inline-block;
+            margin-left: 8px;
+            padding: 1px 7px;
+            font-size: 0.78em;
+            line-height: 1.5;
+            border-radius: 999px;
+            border: 1px solid var(--warn);
+            color: var(--warn);
+            background: transparent;
+            vertical-align: middle;
+            user-select: none;
+        }
+        .queue-remove-btn {
+            display: none;
+            position: absolute;
+            top: -12px;
+            right: 4px;
+            font-size: 0.85em;
+            cursor: pointer;
+            background: var(--bg-elevated);
+            color: var(--fg-muted);
+            border: 1px solid var(--border);
+            padding: 1px 7px;
+            border-radius: var(--radius-sm);
+            line-height: 1.3;
+            user-select: none;
+            z-index: 6;
+        }
+        .queue-remove-btn:hover {
+            color: var(--error-fg);
+            border-color: var(--error-border);
+            background: var(--error-bg);
+        }
+        .message.user.queued:hover .queue-remove-btn {
+            display: inline-block;
+        }
+        .message.user.queue-cancelled .msg-text {
+            opacity: 0.55;
+            text-decoration: line-through;
+        }
+        @media (hover: none) {
+            .queue-remove-btn { display: inline-block; }
         }
         /* ===== Inline edit (plain text) for edit-resend ===== */
         .msg-text.editing {
@@ -3074,6 +3250,7 @@
                cursor blink, toast slide-in; TOC fades become instant. */
             #conn-indicator.reconnecting { animation: none; }
             .progress-spinner { animation: none; }
+            .waiting-spinner { animation: none; }
             .cursor::after { animation: none; }
             .toast { animation: none; }
             #toc-rail { transition: none; }

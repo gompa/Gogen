@@ -460,6 +460,17 @@ func (a *Agent) doPersist(skipTokenCounts bool) {
 		ok = a.persistDeltaSnapshot(st, count, skipTokenCounts)
 	}
 	if !ok {
+		// The write failed; the in-memory state is still unsaved. Restore
+		// the dirty flag so the next flush retries — a later turn boundary,
+		// a registry eviction, or the exit sweep (ShutdownSessions /
+		// flushAndQuit / the ctx-cancel sweep). Consuming the flag up front
+		// is required to avoid the lost-update race documented above; the
+		// bug was leaving it consumed on FAILURE, which made the failed
+		// state look clean, so every later flush — including the exit sweep
+		// — skipped it and the data was silently dropped. The helpers leave
+		// lastSavedMsgCount/lastMeta/lastPersistTime unchanged, so the retry
+		// re-attempts exactly the content that failed.
+		a.sessionDirty.Store(true)
 		return // the helper recorded the error; lastPersistTime stays stale
 	}
 	a.lastPersistErr = nil

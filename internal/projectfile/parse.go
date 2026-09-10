@@ -155,10 +155,17 @@ func splitFrontMatter(content string) (yamlText, body string, hasFM bool, err er
 }
 
 func findClosingDelimiter(s string) (index int, length int, err error) {
+	// Take the earliest delimiter, not the first pattern that matches: with
+	// mixed line endings several patterns can be present and a later match of
+	// an earlier-tried pattern must not win over an earlier one.
+	best, bestLen := -1, 0
 	for _, sep := range []string{"\n---\n", "\n---\r\n", "\r\n---\r\n", "\r\n---\n"} {
-		if idx := strings.Index(s, sep); idx >= 0 {
-			return idx, len(sep), nil
+		if idx := strings.Index(s, sep); idx >= 0 && (best < 0 || idx < best) {
+			best, bestLen = idx, len(sep)
 		}
+	}
+	if best >= 0 {
+		return best, bestLen, nil
 	}
 	if idx := strings.LastIndex(s, "\n---"); idx >= 0 && strings.TrimSpace(s[idx:]) == "---" {
 		return idx, len(s) - idx, nil

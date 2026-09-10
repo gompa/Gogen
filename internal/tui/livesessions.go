@@ -15,6 +15,7 @@ import (
 	"charm.land/bubbletea/v2"
 
 	"gogen/internal/agent"
+	"gogen/internal/ioutil"
 	"gogen/internal/streambuf"
 )
 
@@ -102,6 +103,10 @@ type liveSession struct {
 	// Mutated only on the Update thread.
 	progressPhase progressPhase
 	progressLabel string
+	// progressRetry records that the label explains a stream recovery (see
+	// Model.progressRetry): restored on a focus switch like the phase, and
+	// cleared with the rest of the progress state.
+	progressRetry bool
 	activeTool    string
 	// streamSpeedLine is this session's rendered token rate ("42 tok/s")
 	// for the progress line, updated by handleStreamStatsMsg (the shared
@@ -134,6 +139,19 @@ type liveSession struct {
 	// streambuf.RoundBuffer): self-synchronizing leaf state — the stream
 	// goroutine appends, the Update thread snapshots on join.
 	round streambuf.RoundBuffer
+
+	// steerQueue is this session's FIFO of turns waiting for the session
+	// to go idle (steering.go): system deliveries (job notices, scheduled
+	// reminders, subagent reports — the TUI counterpart of the web
+	// server's delivery queue) and user steering messages typed while a
+	// turn runs. Drained ONE item per turn at every terminal boundary
+	// (handleTurnFinishedMsg, handleCompactResultMsg, drainDeliveries), in
+	// strict arrival order across both kinds. Per-session — following the
+	// session on focus switches — so a queued message runs on the session
+	// it was typed into, never on whichever session happens to be focused
+	// at drain time. Update-thread-only state, like streaming/turnSeq —
+	// no lock.
+	steerQueue []steerItem
 }
 
 // The session's round buffer (s.round, streambuf.RoundBuffer) accumulates
@@ -161,6 +179,7 @@ type liveSession struct {
 func (s *liveSession) resetProgress() {
 	s.progressPhase = progressHidden
 	s.progressLabel = ""
+	s.progressRetry = false
 	s.activeTool = ""
 	s.streamSpeedLine = ""
 }
@@ -372,9 +391,13 @@ func (m *Model) switchToLive(i int) tea.Cmd {
 	// Sync the focused-session mirrors + progress UI to the target:
 	// m.streaming/m.compacting describe the FOCUSED session, so leaving a
 	// busy session unlocks input on the newly focused one, and joining a
-	// busy one locks it again.
+	// busy one locks it again. The queued-messages count in the progress
+	// strip is a focused-session mirror too, and the band height depends
+	// on the busy state — re-derive both.
 	m.streaming = target.streaming
 	m.compacting = target.compacting
+	m.applyComposerPlaceholder()
+	m.relayout()
 	if target.streaming {
 		if m.progressAnimating() && !wasAnimating {
 			cmds = append(cmds, m.spinner.Tick)
@@ -463,6 +486,7 @@ func (m *Model) joinStreamingSession(target *liveSession, pending []tea.Msg) {
 	target.transcriptStale = true
 	m.progressPhase = phase
 	m.progressLabel = label
+	m.progressRetry = target.progressRetry
 	m.activeToolName = tool
 	m.streamSpeedLine = target.streamSpeedLine
 	if phase == progressHidden {
@@ -470,6 +494,7 @@ func (m *Model) joinStreamingSession(target *liveSession, pending []tea.Msg) {
 		// the turn was just cancelled and its terminal has not landed yet
 		// — show the default wait (the old hardcoded behavior).
 		m.progressPhase, m.progressLabel = progressThinking, "thinking"
+		m.progressRetry = false
 	}
 	// Discard the drained STREAM events (their committed content is in the
 	// snapshot above). Display-only notes are not part of Messages and
@@ -554,7 +579,15 @@ func (ls *liveSessions) Close(i int) error {
 		return fmt.Errorf("session %q is streaming — cancel its turn first", s.label)
 	}
 	if s.agent != nil {
-		s.agent.FlushSession()
+		// FlushPending, not FlushSession: a clean session must not be
+		// re-stamped. FlushSession forces a full write even when nothing
+		// changed, and every save stamps Updated=now — that pushed the
+		// just-closed session to the top of the saved-session list
+		// (recency is interaction-based: the session that received the
+		// last message is the newest). A dirty session (unsaved turn tail)
+		// still writes, so no state is lost. Mirrors the web registry's
+		// evictRuntime and the shutdown sweep.
+		s.agent.FlushPending()
 	}
 	ls.sessions = append(ls.sessions[:i], ls.sessions[i+1:]...)
 	if ls.active > i {
@@ -611,17 +644,18 @@ func resolveSidebarStart(workingDir string) uiPrefs {
 }
 
 // saveUIPrefs writes panel state. Errors are silently ignored — losing a
-// width preference must never surface as a user-facing failure.
+// width preference must never surface as a user-facing failure. The write
+// is atomic (a torn file would silently revert to defaults on next start,
+// which is the one outcome a plain os.WriteFile could produce) and
+// fsync-free: the file is tiny and written on every panel toggle and
+// resize, where fsync would add SSD wear for no user-visible benefit.
 func saveUIPrefs(workingDir string, p uiPrefs) {
 	path := uiPrefsPath(workingDir)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return
-	}
 	data, err := json.Marshal(p)
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(path, data, 0o600)
+	_ = ioutil.WriteFileAtomicNoSync(path, data, 0o600)
 }
 
 // persistSidebarPrefs saves current panel state for the active session's
@@ -649,6 +683,12 @@ func streamEventSid(msg tea.Msg) (string, bool) {
 	case streamThinkingMsg:
 		return v.sid, true
 	case streamStatsMsg:
+		return v.sid, true
+	case streamCompactingMsg:
+		return v.sid, true
+	case streamStallMsg:
+		return v.sid, true
+	case streamRetryMsg:
 		return v.sid, true
 	case streamToolCallMsg:
 		return v.sid, true
@@ -697,6 +737,12 @@ func streamEventAttribution(msg tea.Msg) (sid string, seq uint64, ok bool) {
 	case streamThinkingMsg:
 		return v.sid, v.seq, true
 	case streamStatsMsg:
+		return v.sid, v.seq, true
+	case streamCompactingMsg:
+		return v.sid, v.seq, true
+	case streamStallMsg:
+		return v.sid, v.seq, true
+	case streamRetryMsg:
 		return v.sid, v.seq, true
 	case streamToolCallMsg:
 		return v.sid, v.seq, true
@@ -992,7 +1038,11 @@ func (m *Model) handleTurnFinishedMsg(sid string, seq uint64, err error) (tea.Mo
 			m.statusMsg = "✓ " + s.label + " finished"
 		}
 		m.bellIfBlurred() // web parity: background pane finished/failed
-		return m, refresh
+		// A BACKGROUND session's steering queue drains on its OWN turn
+		// boundaries: the next queued item starts its turn right here (its
+		// events buffer in the replay queue; its terminal routes back
+		// through this handler for the next item).
+		return m, tea.Batch(refresh, m.drainSessionQueue(s))
 	}
 	// Turn-end convergence (web attach parity): a transcript rebuilt from a
 	// mid-turn join (transcriptStale) lags the stream — the in-flight
@@ -1025,8 +1075,24 @@ func (m *Model) handleTurnFinishedMsg(sid string, seq uint64, err error) (tea.Mo
 // from the wire go through handleTurnFinishedMsg; this skips the envelope.
 func (m *Model) finishFocusedTurn(err error) (tea.Model, tea.Cmd) {
 	if err != nil {
+		// handleStreamError clears m.streaming; the placeholder swap and
+		// relayout must run AFTER it so the busy band's reserved
+		// progress-strip row returns to the composer and the placeholder
+		// reads the CLEARED state (SetSize reserves the row only while
+		// streaming/compacting).
 		m.handleStreamError(err)
+		m.applyComposerPlaceholder()
+		m.relayout()
 		return m, tea.Batch(m.refocusInput(), m.drainDeliveries())
 	}
-	return m.handleStreamEndMsg()
+	// Success: handleStreamEndMsg owns the end-of-turn pipeline (it clears
+	// m.streaming, then the relayout hands the strip's row back to the
+	// composer) AND the queue drain (one item per terminal — multiple
+	// queued items drain across consecutive turns). The placeholder swap
+	// runs after both: a drain re-enters busy via startTurn (which applies
+	// the queued placeholder itself); an empty queue restores the idle one.
+	finished, cmd := m.handleStreamEndMsg()
+	m.applyComposerPlaceholder()
+	m.relayout()
+	return finished, cmd
 }

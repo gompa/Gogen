@@ -597,19 +597,27 @@ func (m *Model) sidebarFooterAt(x, y int) (button int, ok bool) {
 // style — the web "current" row's emphasis) with the right-aligned ✕
 // action. The state dot lives on the meta line (web parity — see
 // sidebarMeta). The ✕ sits two cells inside the drag handle so click zones
-// never overlap (see sidebarRowAt).
+// never overlap (see sidebarRowAt). The label is truncated to the row's
+// visible-cell budget (ansi.Cut), so wide-rune labels cannot widen the
+// panel past its column budget.
 func (m *Model) renderSidebarTitle(r sidebarRow, cursor bool, inner int) string {
 	prefix := "  "
 	if cursor {
 		prefix = "▸ "
 	}
-	// Content cells: prefix(2) + label + pad + "✕ "(2).
+	// Content cells: prefix(2) + label + pad + "✕ "(2). The label is
+	// truncated and the pad computed in VISIBLE cells (ansi.Cut /
+	// ansi.StringWidth), like the panel's other rows: rune counting
+	// under-pads wide runes (CJK, emoji) by half their width, which pushed
+	// the ✕ — and the right border — past the panel edge and widened the
+	// whole joined frame past the terminal (the inline renderer would
+	// soft-wrap and desync).
 	labelMax := inner - 5
 	if labelMax < 2 {
 		labelMax = 2
 	}
-	label := sliceByRuneCount(r.label, labelMax)
-	pad := inner - 4 - sliceRuneLen(label)
+	label := ansi.Cut(r.label, 0, labelMax)
+	pad := inner - 4 - ansi.StringWidth(label)
 	if pad < 1 {
 		pad = 1
 	}
@@ -1172,7 +1180,10 @@ func (m *Model) spawnLiveSession(a *agent.Agent) *liveSession {
 		sender := m.program
 		a.SetJobNoticeHook(jobNoticeHookFor(s, func(summary string) {
 			if sender != nil {
-				sender.Send(deliveryRequestMsg{text: summary})
+				// The notice belongs to THIS slot: name it, so a focus
+				// switch before tea delivers the message cannot re-attribute
+				// the notice to whichever session is focused by then.
+				sender.Send(deliveryRequestMsg{sid: s.id, text: summary})
 			}
 		}))
 	}

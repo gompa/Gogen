@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"gogen/internal/llm"
+	"gogen/internal/spill"
 )
 
 // MCPToolRegistry exposes MCP tools to the agent.
@@ -265,6 +266,14 @@ func handleExecuteCommand(ctx context.Context, a *Agent, args map[string]any) (s
 			return "", err
 		}
 		return fmt.Sprintf("Started background job %s.\nCommand: %s\nPoll with background_job (action=status, job_id: %q) or cancel with action=cancel.", id, command, id), nil
+	}
+	// Spill target: the executor tees any output past the in-memory cap to
+	// the session's spill dir and reports a head/tail preview + locator
+	// instead of silently dropping the tail (best-effort; nil when this
+	// session has no spill store). Background jobs are not spilled: their
+	// bounded-tail buffers are the documented contract there.
+	if t := a.commandSpillTarget("execute_command"); t != nil {
+		ctx = spill.ContextWithTarget(ctx, t)
 	}
 	return a.Executor.ExecuteCommand(ctx, command)
 }

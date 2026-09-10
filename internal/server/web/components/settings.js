@@ -30,6 +30,13 @@ import { openModal, closeModal, setMonacoTheme, applyEditorPrefs } from '/editor
 import { requestBoardState, setBoardStartPrompt } from '/components/board.js';
 import { requestAutomationsState, automationsPaneVisible } from '/components/automations.js';
 import { icon } from '/components/icons.js';
+import { SETTINGS_SCHEMA } from '/components/settings-schema.js';
+import { renderSettings } from '/components/settings-render.js';
+
+// Build the modal body (sidebar + panels + rows) from the schema
+// (components/settings-schema.js) before any control is looked up by id
+// below.
+renderSettings();
 
 let deps = null;
 
@@ -48,7 +55,7 @@ const themeSelect = document.getElementById('theme-select');
 // a natural settings home (chat/editor/board) auto-selects that tab
 // instead — the screen the user is on wins on open.
 const SETTINGS_TAB_STORAGE = 'gogen-settings-tab';
-const SCREEN_TO_SETTINGS_TAB = { chat: 'chat', editor: 'editor', board: 'agent' };
+const SCREEN_TO_SETTINGS_TAB = { chat: 'chat', editor: 'editor', board: 'agent', automations: 'automations' };
 let settingsTab = localStorage.getItem(SETTINGS_TAB_STORAGE) || 'chat';
 
 export function showSettingsTab(tab) {
@@ -252,48 +259,12 @@ export function sendFeatureConfig(fields) {
 // or restart-staged) and pushes the current values back, which keeps
 // every tab in sync. prop overrides the WSMessage property when it
 // differs from the ConfigFields name (contextLimitConfig).
-const RUNTIME_CONTROLS = [
-    // Security
-    { id: 'command-safety-select', field: 'commandSafety' },
-    { id: 'command-allowlist-input', field: 'commandAllowlist' },
-    { id: 'delete-approval-select', field: 'deleteApproval' },
-    { id: 'command-sandbox-select', field: 'commandSandbox' },
-    { id: 'command-idle-timeout-input', field: 'commandIdleTimeoutSecs' },
-    // Context
-    { id: 'context-limit-input', field: 'contextLimit', prop: 'contextLimitConfig' },
-    { id: 'compact-threshold-input', field: 'compactThreshold' },
-    { id: 'compact-keep-input', field: 'compactKeepRecentMessages' },
-    { id: 'max-tool-bytes-input', field: 'maxToolResultBytes' },
-    { id: 'compact-reserve-input', field: 'compactReserveTokens' },
-    { id: 'compact-last-resort-select', field: 'compactLastResort' },
-    { id: 'preserve-reasoning-select', field: 'preserveReasoning' },
-    // Tools
-    { id: 'web-fetch-select', field: 'webFetch' },
-    { id: 'web-search-select', field: 'webSearch' },
-    { id: 'web-search-backend-select', field: 'webSearchBackend' },
-    { id: 'web-search-api-key-input', field: 'webSearchApiKey' },
-    { id: 'web-allowed-domains-input', field: 'webAllowedDomains' },
-    { id: 'web-fetch-mode-select', field: 'webFetchMode' },
-    { id: 'treesitter-select', field: 'treesitter' },
-    { id: 'treesitter-langs-input', field: 'treesitterLangs' },
-    // Sessions
-    { id: 'session-max-count-input', field: 'sessionMaxCount' },
-    { id: 'session-max-age-input', field: 'sessionMaxAgeDays' },
-    { id: 'approval-hold-input', field: 'webApprovalHoldSecs' },
-    // Server (restart-staged)
-    { id: 'web-bind-input', field: 'webBind' },
-    { id: 'web-allowed-origins-input', field: 'webAllowedOrigins' },
-    { id: 'web-auth-token-input', field: 'webAuthToken' },
-    { id: 'web-tls-cert-input', field: 'webTLSCertFile' },
-    { id: 'web-tls-key-input', field: 'webTLSKeyFile' },
-    { id: 'web-max-active-input', field: 'webMaxActiveSessions' },
-    { id: 'mcp-select', field: 'mcp' },
-    // Prompts (configurable templates; settings Agent group)
-    { id: 'board-start-prompt-input', field: 'boardStartPrompt' },
-    { id: 'board-review-prompt-input', field: 'boardReviewPrompt' },
-    { id: 'system-prompt-input', field: 'systemPrompt' },
-    { id: 'subagent-prompt-input', field: 'subagentPrompt' },
-];
+// Derived from the schema (components/settings-schema.js): every
+// server-backed runtime control, in schema order. Adding a runtime setting
+// is one schema entry — no second id/field list to keep in sync here.
+const RUNTIME_CONTROLS = SETTINGS_SCHEMA
+    .filter((e) => e.storage === 'server' && e.channel === 'runtime')
+    .map((e) => ({ id: e.id, field: e.field, prop: e.prop }));
 
 // Sends one or more runtime-config changes: { field: {prop, value} }.
 export function sendRuntimeConfig(changes) {
@@ -331,12 +302,9 @@ RUNTIME_CONTROLS.forEach(wireRuntimeControl);
 // "Reset to default" for the prompt templates: send the explicit
 // empty value; the server resolves it back to the built-in default
 // and the next push re-populates the textarea with it.
-const PROMPT_RESET_BUTTONS = [
-    { id: 'board-prompt-reset-btn', field: 'boardStartPrompt' },
-    { id: 'board-review-prompt-reset-btn', field: 'boardReviewPrompt' },
-    { id: 'system-prompt-reset-btn', field: 'systemPrompt' },
-    { id: 'subagent-prompt-reset-btn', field: 'subagentPrompt' },
-];
+const PROMPT_RESET_BUTTONS = SETTINGS_SCHEMA
+    .filter((e) => e.resetToDefault)
+    .map((e) => ({ id: e.resetId, field: e.field }));
 for (const b of PROMPT_RESET_BUTTONS) {
     const el = document.getElementById(b.id);
     if (!el) continue;

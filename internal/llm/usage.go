@@ -1,6 +1,6 @@
 package llm
 
-import "github.com/openai/openai-go"
+import "github.com/openai/openai-go/v3"
 
 func usageFromOpenAI(u openai.CompletionUsage) *Usage {
 	cached := int(u.PromptTokensDetails.CachedTokens)

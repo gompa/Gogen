@@ -202,6 +202,43 @@ async function main() {
   limitInput.dispatchEvent(new window.Event('change', { bubbles: true }));
   check('below-range limit reset to 1', limitInput.value === '1');
 
+  // ── Schema-driven tab order + grouping ──
+  // The sidebar/panels come from components/settings-schema.js (evaluated
+  // by the harness as a global), so these invariants fail loudly if the
+  // grouping drifts.
+  const tabOrder = tabBtns().map((b) => b.dataset.tab);
+  const expectedTabs = window.SETTINGS_TABS.map((t) => t.id);
+  check('sidebar order matches SETTINGS_TABS', JSON.stringify(tabOrder) === JSON.stringify(expectedTabs));
+  check('Appearance tab replaces the old Global tab', tabOrder.includes('appearance') && !tabOrder.includes('global'));
+  check('Subagents tab exists (split out of Agent)', tabOrder.includes('subagents'));
+  check('Agent tab keeps the board settings', !!document.querySelector('#settings-tab-agent #board-enabled-select'));
+  check('subagent model picker lives in the Subagents tab', !!document.querySelector('#settings-tab-subagents #subagent-model-picker'));
+  check('subagent model picker no longer in the Agent tab', !document.querySelector('#settings-tab-agent #subagent-model-picker'));
+  check('Approval hold moved to Security', !!document.querySelector('#settings-tab-security #approval-hold-input'));
+  check('Approval hold no longer in Sessions', !document.querySelector('#settings-tab-sessions #approval-hold-input'));
+  check('Automations is its own tab', tabOrder.includes('automations'));
+  check('Server is last (restart-only tab after the live tabs)', tabOrder[tabOrder.length - 1] === 'server');
+  check('Providers precede MCP precede Server',
+    tabOrder.indexOf('providers') < tabOrder.indexOf('mcp') && tabOrder.indexOf('mcp') < tabOrder.indexOf('server'));
+
+  // ── Schema coverage: every entry rendered into its declared tab ──
+  // A new schema entry that forgets its DOM (or points at the wrong tab)
+  // is caught here rather than by eye.
+  const schema = window.SETTINGS_SCHEMA;
+  check('SETTINGS_SCHEMA is exposed to the harness', Array.isArray(schema) && schema.length > 0);
+  const missing = schema.filter((e) => {
+    const panel = document.getElementById('settings-tab-' + e.tab);
+    if (!panel) return true;
+    if (e.custom) {
+      const node = document.getElementById(e.custom);
+      return !node || !panel.contains(node);
+    }
+    const el = document.getElementById(e.id);
+    return !el || !panel.contains(el);
+  });
+  check('every schema entry renders into its declared tab', missing.length === 0);
+  if (missing.length > 0) console.warn('  missing:', missing.map((e) => e.id || e.custom).join(', '));
+
   if (failures > 0) {
     console.error(`test_settings_tabs: ${failures} FAILURE(S)`);
     process.exit(1);

@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/v3"
 )
 
 // openAIContextError builds an openai.Error carrying the OpenAI

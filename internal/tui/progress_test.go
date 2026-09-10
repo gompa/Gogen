@@ -86,8 +86,11 @@ func TestRenderProgressInput(t *testing.T) {
 	if !strings.Contains(got, "streaming") {
 		t.Fatalf("active render=%q", got)
 	}
-	if h := lipgloss.Height(got); h != 3 {
-		t.Fatalf("progress input height=%d, want 3 (match textarea)", h)
+	// Steering: the strip is ONE row — the composer renders below it
+	// (renderMainColumn combines them; SetSize reserves the strip's row
+	// out of the textarea's, so the band height never changes).
+	if h := lipgloss.Height(got); h != 1 {
+		t.Fatalf("progress input height=%d, want 1 (single strip row)", h)
 	}
 	// A tool whose arguments are streaming in should be named, not generic.
 	m.progressPhase = progressActive
@@ -102,9 +105,37 @@ func TestRenderProgressInput(t *testing.T) {
 	if !strings.Contains(got, "read_file") {
 		t.Fatalf("tool render=%q", got)
 	}
-	if h := lipgloss.Height(got); h != 3 {
-		t.Fatalf("tool progress height=%d, want 3", h)
+	if h := lipgloss.Height(got); h != 1 {
+		t.Fatalf("tool progress height=%d, want 1", h)
 	}
+}
+
+// TestRenderProgressInputThinking pins the WAITING-for-the-model
+// indicator: right after a submit (or a queued item's drain, or a
+// tool-round boundary) the phase is progressThinking with no speed line
+// yet — the strip must still render the spinner + label, or the busy
+// indicator shows nothing at all (an empty row above the composer) until
+// the first stats message arrives.
+func TestRenderProgressInputThinking(t *testing.T) {
+	m := Model{
+		streaming:     true,
+		progressPhase: progressThinking,
+		spinner:       newProgressSpinner(),
+		textarea:      textarea.New(),
+	}
+	got := m.renderProgressInput()
+	if !strings.Contains(got, "thinking") {
+		t.Fatalf("thinking render=%q, want spinner + label", stripANSI(got))
+	}
+	if h := lipgloss.Height(got); h != 1 {
+		t.Fatalf("thinking strip height=%d, want 1", h)
+	}
+	// A custom label (the "resuming"/compaction variants) renders too.
+	m.progressLabel = "resuming"
+	if got := m.renderProgressInput(); !strings.Contains(got, "resuming") {
+		t.Fatalf("custom label render=%q", stripANSI(got))
+	}
+	m.progressLabel = ""
 }
 
 func TestStreamStatsProgressLine(t *testing.T) {
@@ -150,14 +181,93 @@ func TestStreamStatsProgressLine(t *testing.T) {
 	}
 }
 
-func TestPadInputBand(t *testing.T) {
-	if got := padInputBand("hi", 1); got != "hi" {
-		t.Fatalf("height 1: %q", got)
+// TestStreamSignalProgressTransitions pins the progress-strip surfaces for
+// the silent streaming windows (added after the "thinking spinner with no
+// feedback" reports): mid-turn compaction flips the strip to a compacting
+// indicator, a stream stall relabels the spinner only while nothing flows,
+// and a stream retry labels the muted regeneration. Every later progress
+// event restores the normal label, and idle turns drop all three signals.
+func TestStreamSignalProgressTransitions(t *testing.T) {
+	newBusy := func() *Model {
+		return &Model{streaming: true, progressPhase: progressThinking, spinner: newProgressSpinner()}
 	}
-	if got := padInputBand("hi", 3); got != "hi\n\n" {
-		t.Fatalf("height 3: %q", got)
-	}
-	if got := padInputBand("hi", 0); got != "hi" {
-		t.Fatalf("height 0 clamps to 1: %q", got)
-	}
+
+	t.Run("mid-turn compaction shows the compacting indicator", func(t *testing.T) {
+		m := newBusy()
+		m.handleStreamCompactingMsg()
+		if m.progressPhase != progressCompacting {
+			t.Fatalf("phase = %v, want progressCompacting", m.progressPhase)
+		}
+		if m.progressLabel != "compacting history" {
+			t.Fatalf("label = %q", m.progressLabel)
+		}
+		if !m.progressAnimating() {
+			t.Fatal("compacting must animate the spinner")
+		}
+		if got := m.renderProgressInput(); !strings.Contains(got, "compacting history") {
+			t.Fatalf("strip missing the compacting label: %q", got)
+		}
+		// The round boundary after the compaction restores the normal
+		// thinking label.
+		m.handleStreamRoundEndMsg()
+		if m.progressPhase != progressThinking || m.progressLabel != "thinking" {
+			t.Fatalf("after round end: phase=%v label=%q", m.progressPhase, m.progressLabel)
+		}
+	})
+
+	t.Run("stall relabels thinking only while nothing flows", func(t *testing.T) {
+		m := newBusy()
+		m.handleStreamStallMsg()
+		if m.progressPhase != progressThinking || m.progressLabel != "still waiting on model" {
+			t.Fatalf("phase=%v label=%q", m.progressPhase, m.progressLabel)
+		}
+		// A token resumes streaming: active phase, label cleared.
+		m.handleStreamTokenMsg(streamTokenMsg{token: "x"})
+		if m.progressPhase != progressActive {
+			t.Fatalf("phase after token = %v, want progressActive", m.progressPhase)
+		}
+		// A stall while tokens flow is moot — it must not touch the
+		// active phase.
+		m.handleStreamStallMsg()
+		if m.progressPhase != progressActive {
+			t.Fatalf("stall during active phase = %v, want untouched", m.progressPhase)
+		}
+	})
+
+	t.Run("retry relabels for the muted regeneration", func(t *testing.T) {
+		m := newBusy()
+		m.handleStreamRetryMsg(streamRetryMsg{reason: "stream interrupted"})
+		if m.progressPhase != progressThinking || m.progressLabel != "retrying stream (stream interrupted)" {
+			t.Fatalf("phase=%v label=%q", m.progressPhase, m.progressLabel)
+		}
+		if got := m.renderProgressInput(); !strings.Contains(got, "retrying stream") {
+			t.Fatalf("strip missing the retry label: %q", got)
+		}
+		// The retry's regeneration is silent: the stall signal fires during
+		// it and must NOT replace the reason with the generic wait label —
+		// the reason is the explanation for exactly that silence.
+		m.handleStreamStallMsg()
+		if m.progressLabel != "retrying stream (stream interrupted)" {
+			t.Fatalf("stall clobbered the retry label: %q", m.progressLabel)
+		}
+		// A token from the retry clears the retry state: a later stall
+		// relabels normally.
+		m.handleStreamTokenMsg(streamTokenMsg{token: "x"})
+		m.handleStreamRoundStartMsg()
+		m.handleStreamStallMsg()
+		if m.progressLabel != "still waiting on model" {
+			t.Fatalf("stall after resumed output = %q, want the wait label", m.progressLabel)
+		}
+	})
+
+	t.Run("idle turns drop the signals", func(t *testing.T) {
+		m := newBusy()
+		m.streaming = false
+		m.handleStreamCompactingMsg()
+		m.handleStreamStallMsg()
+		m.handleStreamRetryMsg(streamRetryMsg{reason: "stream interrupted"})
+		if m.progressPhase != progressThinking || m.progressLabel != "" {
+			t.Fatalf("idle turn mutated the strip: phase=%v label=%q", m.progressPhase, m.progressLabel)
+		}
+	})
 }

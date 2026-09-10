@@ -44,6 +44,10 @@ const COMPONENT_MODULES = [
   // global scope before any of them eval.
   'internal/server/web/components/icons.js',
   'internal/server/web/components/popover.js',
+  // Shared decision-dialog plumbing (openDialog); imports editor.js
+  // (openModal / closeModal, stubbed above). sessions.js and
+  // delete-approval.js reference openDialog, so it must eval before them.
+  'internal/server/web/components/dialog.js',
   // Markdown rendering pipeline; imports editor.js (colorizeNode /
   // openFileAtLine, stubbed) and the marked / DOMPurify vendor stubs.
   'internal/server/web/components/markdown.js',
@@ -62,6 +66,10 @@ const COMPONENT_MODULES = [
   'internal/server/web/components/palette.js',
   'internal/server/web/components/terminal.js',
   'internal/server/web/components/sessions.js',
+  // Declarative settings schema + renderer; settings.js imports both and
+  // calls renderSettings() at eval time, so they must land first.
+  'internal/server/web/components/settings-schema.js',
+  'internal/server/web/components/settings-render.js',
   'internal/server/web/components/settings.js',
   // Delete-approval modal; imports editor.js (openModal / closeModal,
   // stubbed) and settings.js (sendNotification) — last, after both.

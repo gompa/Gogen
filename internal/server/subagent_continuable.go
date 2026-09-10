@@ -670,6 +670,10 @@ func (sp *subagentSpawner) Fork(ctx context.Context, parent *agent.Agent, job st
 		job = "Continue this session from the fork point."
 	}
 	newID := sesspkg.NewID()
+	// Re-point the forked transcript's spill locators at the child's spill
+	// dir (hardlinks) so retrieval keeps working after the parent session
+	// is deleted (delete cascade removes the parent's spill files).
+	parent.RepointSpillLocators(forkedMsgs, newID)
 	snap := &agent.SessionSnapshot{
 		WorkingDir:    parent.WorkingDir,
 		Model:         parent.CurrentModel(),

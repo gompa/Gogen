@@ -57,6 +57,7 @@ func Merge(pf *ProjectFile, flags FlagOverrides) *config.Config {
 		WebApprovalHoldSecs:       mergeInt("GOGEN_WEB_APPROVAL_HOLD_SECS", file.WebApprovalHoldSecs, def.WebApprovalHoldSecs),
 		WebFetch:                  mergeString("GOGEN_WEB_FETCH", file.WebFetch, def.WebFetch),
 		WebSearch:                 mergeString("GOGEN_WEB_SEARCH", file.WebSearch, def.WebSearch),
+		OutputSpill:               mergeString("GOGEN_OUTPUT_SPILL", file.OutputSpill, def.OutputSpill),
 		WebSearchBackend:          mergeString("GOGEN_WEB_SEARCH_BACKEND", file.WebSearchBackend, def.WebSearchBackend),
 		WebSearchAPIKey:           mergeString("GOGEN_WEB_SEARCH_API_KEY", file.WebSearchAPIKey, def.WebSearchAPIKey),
 		WebAllowedDomains:         mergeString("GOGEN_WEB_ALLOWED_DOMAINS", file.WebAllowedDomains, def.WebAllowedDomains),

@@ -86,6 +86,15 @@ func (m *Model) handleMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case streamStatsMsg:
 		return m.handleStreamStatsMsg(msg)
 
+	case streamCompactingMsg:
+		return m.handleStreamCompactingMsg()
+
+	case streamStallMsg:
+		return m.handleStreamStallMsg()
+
+	case streamRetryMsg:
+		return m.handleStreamRetryMsg(msg)
+
 	case streamToolCallMsg:
 		return m.handleStreamToolCallMsg(msg)
 
@@ -147,23 +156,51 @@ func (m *Model) handleMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// System message delivery (queue + drain when idle)
 	case deliveryRequestMsg:
-		if len(m.pendingDeliveries) >= maxPendingDeliveries {
-			// Overflow: drop the OLDEST queued delivery (freshness wins —
-			// a stale job notice is worse than none), mirroring the web
-			// delivery queue. The drop is reported at the next drain.
-			m.pendingDeliveries = m.pendingDeliveries[1:]
-			m.deliveryDrops++
+		// Deliveries are per-session steering-queue items (steering.go) and
+		// the notice names its session, so it is queued THERE: a job notice
+		// fired from a background goroutine must not be re-attributed to
+		// whichever session happens to be focused when the message reaches
+		// the Update thread. Overflow drops the OLDEST SYSTEM delivery
+		// (freshness wins — a stale job notice is worse than none), reported
+		// at the next drain; user steering items are never dropped here.
+		s := m.noticeTarget(msg.sid)
+		if s == nil {
+			return m, nil
 		}
-		m.pendingDeliveries = append(m.pendingDeliveries, msg.text)
-		return m, m.drainDeliveries()
+		sys := 0
+		for _, it := range s.steerQueue {
+			if it.system {
+				sys++
+			}
+		}
+		if sys >= maxPendingDeliveries {
+			for i, it := range s.steerQueue {
+				if it.system {
+					s.steerQueue = append(s.steerQueue[:i], s.steerQueue[i+1:]...)
+					m.deliveryDrops++
+					break
+				}
+			}
+		}
+		s.steerQueue = append(s.steerQueue, steerItem{id: newSteerItemID(), text: msg.text, system: true})
+		if m.lives != nil && m.lives.Active() == s {
+			return m, m.drainDeliveries()
+		}
+		// A background session's notice drains on ITS idle boundary — now,
+		// if it is idle (startTurnOn buffers the events for replay), or at
+		// its next turn end (handleTurnFinishedMsg).
+		return m, m.drainSessionQueue(s)
 
 	// Pass mouse events to the viewport for wheel scrolling
 	case tea.MouseMsg:
 		return m.handleMouseMsg(msg)
 	}
 
-	// Update textarea for cursor blink and normal input
-	if m.focus == FocusInput && m.modal == ModalNone && !m.streaming {
+	// Update textarea for cursor blink and normal input. The composer is
+	// editable while a turn (or compaction) runs — steering: Enter queues
+	// the message, ctrl+c interrupts (handleInputKey intercepts both
+	// before this gate matters).
+	if m.focus == FocusInput && m.modal == ModalNone && !(m.streaming || m.compacting) {
 		var cmd tea.Cmd
 		m.textarea, cmd = m.textarea.Update(msg)
 		cmds = append(cmds, cmd)
@@ -232,6 +269,10 @@ func (m *Model) handleCompactResultMsg(msg compactResultMsg) (tea.Model, tea.Cmd
 			}
 		}
 	}
+	// Compaction boundary: the compacting strip row returns to the composer
+	// (SetSize reserves it while compacting) and the placeholder flips back.
+	m.applyComposerPlaceholder()
+	m.relayout()
 	if msg.agent == nil {
 		return m, m.drainDeliveries()
 	}
@@ -434,6 +475,48 @@ func (m *Model) handleStreamStatsMsg(msg streamStatsMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// handleStreamCompactingMsg flips the strip to a compacting indicator while
+// the mid-turn summarization runs (a full non-streaming LLM call with no
+// stream callbacks). The next progress event — token, stats, round
+// boundary, or turn end — replaces the label.
+func (m *Model) handleStreamCompactingMsg() (tea.Model, tea.Cmd) {
+	if !m.streaming {
+		return m, nil
+	}
+	return m, m.setProgress(progressCompacting, "compacting history")
+}
+
+// handleStreamStallMsg swaps the bare "thinking" spinner for a "still
+// waiting" label after a silent stretch (long prefill or a stalled
+// upstream). Only meaningful while nothing is flowing: once tokens or tool
+// args stream, the phase is active and the stall signal is moot — and while
+// a recovery is running (progressRetry) the retry reason already explains the
+// silence, so the generic wait must not replace it.
+func (m *Model) handleStreamStallMsg() (tea.Model, tea.Cmd) {
+	if !m.streaming || m.progressPhase != progressThinking || m.progressRetry {
+		return m, nil
+	}
+	return m, m.setProgress(progressThinking, "still waiting on model")
+}
+
+// handleStreamRetryMsg relabels the spinner for a muted regeneration
+// (streaming retry or the non-streaming fallback): the silent stretch that
+// follows is the retry's whole generation, not a hang. Any later progress
+// event restores the normal label (setProgress clears the retry mark).
+func (m *Model) handleStreamRetryMsg(msg streamRetryMsg) (tea.Model, tea.Cmd) {
+	if !m.streaming {
+		return m, nil
+	}
+	cmd := m.setProgress(progressThinking, "retrying stream ("+msg.reason+")")
+	// setProgress cleared the mark for the normal updates; this label IS the
+	// retry state, so re-mark it (mirrored for a focus switch).
+	m.progressRetry = true
+	if s := m.focusedSession(); s != nil {
+		s.progressRetry = true
+	}
+	return m, cmd
+}
+
 func (m *Model) handleStreamToolCallMsg(msg streamToolCallMsg) (tea.Model, tea.Cmd) {
 	if !m.streaming {
 		return m, nil
@@ -551,13 +634,27 @@ func (m *Model) handleMouseMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// precedence over text selection; wheel events over the chat fall
 	// through to the viewport.
 	if ev, ok := normalizeMouseEvent(msg); ok {
-		if m.handleSidebarResizeMouse(ev) {
-			return m, nil
-		}
 		// The models modal's chips/rows are clickable; consume before the
 		// panel and selection handlers (a click over the overlay must not
-		// start a text selection under it).
+		// start a text selection under it). No-op for every other modal.
 		if m.handleModelsModalMouse(ev) {
+			return m, nil
+		}
+		// Any other modal paints an opaque overlay over the whole frame:
+		// pointer events must not act underneath it (presses used to start
+		// text selections under the overlay, wheel events scrolled the
+		// covered chat invisibly, and a border press started a panel
+		// drag). Releases still reach the selection handler so an
+		// in-flight drag finalizes and scrolling is not left locked after
+		// the modal closes.
+		if m.modal != ModalNone {
+			m.sidebarHovering = false
+			if ev.kind == mouseRelease {
+				m.handleMouseSelection(ev)
+			}
+			return m, nil
+		}
+		if m.handleSidebarResizeMouse(ev) {
 			return m, nil
 		}
 		if consumed, cmd := m.handleSidebarMouse(ev); consumed {

@@ -146,6 +146,38 @@ func TestTruncateToolResult(t *testing.T) {
 	}
 }
 
+// TestHasTruncatedTail pins the precise companion of HasTruncationMarker:
+// only a marker that TERMINATES the body counts as a producer's cap. A body
+// that merely quotes the marker (a file being read, a log line, a preview's
+// mid-body locator) is not truncated — the distinction the spill salvage
+// path depends on.
+func TestHasTruncatedTail(t *testing.T) {
+	marker := "\n… truncated ("
+	for _, tc := range []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{"producer cap", strings.Repeat("x", 100) + marker + "4321 bytes total)", true},
+		{"producer footer", "results:\n" + strings.Repeat("y", 50) + marker + "showing first 10 matches)", true},
+		{"marker mid-body", "head" + marker + "quoted)\nmiddle\ntail", false},
+		{"marker then trailing newline", "body" + marker + "1 bytes total)\n", false},
+		{"no marker", "plain body", false},
+		{"empty", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := HasTruncatedTail(tc.in); got != tc.want {
+				t.Fatalf("HasTruncatedTail = %v, want %v for %q", got, tc.want, tc.in)
+			}
+			// The broad form is a superset: every terminal marker carries
+			// the marker text (the two predicates are deliberately not equal).
+			if got := HasTruncationMarker(tc.in); tc.want && !got {
+				t.Fatalf("HasTruncationMarker = false for a terminal marker: %q", tc.in)
+			}
+		})
+	}
+}
+
 func TestShouldCompactRequiresEnoughMessages(t *testing.T) {
 	m := NewManager(&stubProvider{}, Settings{
 		ContextLimit:              1000,

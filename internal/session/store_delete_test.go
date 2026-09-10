@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"gogen/internal/llm"
+	"gogen/internal/spill"
 )
 
 func TestDeleteSession(t *testing.T) {
@@ -55,6 +56,107 @@ func TestDeleteDeltaOnlySession(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, ".gogen", "sessions", id+".delta")); !os.IsNotExist(err) {
 		t.Fatalf("expected delta removed, err=%v", err)
+	}
+}
+
+// TestDeleteRemovesSpillDir verifies the spill lifecycle contract: a
+// session's spill directory (.gogen/spill/session-<id>, written by the
+// spill package for oversized tool output) is removed with the session,
+// while other sessions' spill dirs survive.
+func TestDeleteRemovesSpillDir(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStoreWithOptions(true, StoreOptions{})
+	id, other := "sess-spill", "sess-keeper"
+	for _, sid := range []string{id, other} {
+		if err := store.Save(sid, SessionSnapshot{
+			WorkingDir: dir,
+			Messages:   []llm.Message{{Role: "user", Content: "x"}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := spill.NewStore(dir).Save(sid, "execute_command", []byte("output of "+sid)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Delete(dir, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(spill.NewStore(dir).Dir(id)); !os.IsNotExist(err) {
+		t.Fatalf("spill dir survived Delete (stat err = %v)", err)
+	}
+	if _, err := os.Stat(spill.NewStore(dir).Dir(other)); err != nil {
+		t.Fatalf("unrelated session's spill dir was removed: %v", err)
+	}
+}
+
+// TestDeleteRemovesGlobalSpillDir pins the global-mode alignment: sessions
+// live in the global data dir there, so their spill trees must too — deleting
+// the session removes the global spill dir and never touches the project.
+func TestDeleteRemovesGlobalSpillDir(t *testing.T) {
+	global := t.TempDir()
+	t.Cleanup(func() { spill.SetGlobalRoot("") })
+	spill.SetGlobalRoot(global)
+
+	dir := t.TempDir()
+	store := NewStoreWithOptions(true, StoreOptions{})
+	store.SetGlobalDir(filepath.Join(global, "sessions"))
+	id := "sess-global-spill"
+	if err := store.Save(id, SessionSnapshot{
+		WorkingDir: dir,
+		Messages:   []llm.Message{{Role: "user", Content: "x"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := spill.NewStore(dir).Save(id, "execute_command", []byte("output")); err != nil {
+		t.Fatal(err)
+	}
+	spillDir := spill.NewStore(dir).Dir(id)
+	if filepath.Dir(spillDir) != global {
+		t.Fatalf("spill dir %q is not directly under the global root %q", spillDir, global)
+	}
+	if err := store.Delete(dir, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(spillDir); !os.IsNotExist(err) {
+		t.Fatalf("global spill dir survived Delete (stat err = %v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".gogen")); !os.IsNotExist(err) {
+		t.Fatalf("global mode wrote into the project dir (stat err = %v)", err)
+	}
+}
+
+// TestDeleteCascadesSpillToNestedChildren verifies the cascade: deleting a
+// parent session deletes its nested (subagent) children's spill dirs too —
+// children are never listed or deletable on their own, so leaving their
+// spill behind would orphan it permanently.
+func TestDeleteCascadesSpillToNestedChildren(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStoreWithOptions(true, StoreOptions{})
+	if err := store.Save("parent", SessionSnapshot{
+		WorkingDir: dir,
+		Messages:   []llm.Message{{Role: "user", Content: "p"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save("child", SessionSnapshot{
+		WorkingDir: dir,
+		ParentID:   "parent",
+		Messages:   []llm.Message{{Role: "user", Content: "c"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, sid := range []string{"parent", "child"} {
+		if _, err := spill.NewStore(dir).Save(sid, "execute_command", []byte("out")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Delete(dir, "parent"); err != nil {
+		t.Fatal(err)
+	}
+	for _, sid := range []string{"parent", "child"} {
+		if _, err := os.Stat(spill.NewStore(dir).Dir(sid)); !os.IsNotExist(err) {
+			t.Fatalf("session %s spill dir survived the cascade (stat err = %v)", sid, err)
+		}
 	}
 }
 

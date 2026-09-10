@@ -193,3 +193,156 @@ func TestTruncateVariants(t *testing.T) {
 		}
 	})
 }
+
+// TestTruncateHeadTail verifies the head+tail cut: the no-overlap rule
+// (input within head+tail passes through unchanged), rune-safe cuts at
+// BOTH boundaries, and the marker contract (%d = dropped bytes under the
+// opt-in FormatDropped, plain markers — a literal % included — pass
+// through verbatim, ForceMarker appends even when fitting).
+func TestTruncateHeadTail(t *testing.T) {
+	const s = "日本語テキスト" // 7 runes × 3 bytes = 21 bytes
+	tests := []struct {
+		name string
+		in   string
+		opts TruncateHeadTailOptions
+		want string
+	}{
+		{
+			name: "smaller than budget: no-op, no marker",
+			in:   "abc",
+			opts: TruncateHeadTailOptions{HeadBytes: 2, TailBytes: 2, Marker: "[...]"},
+			want: "abc",
+		},
+		{
+			name: "exactly at budget: no overlap, no cut",
+			in:   "abcde",
+			opts: TruncateHeadTailOptions{HeadBytes: 3, TailBytes: 2, Marker: "[...]"},
+			want: "abcde",
+		},
+		{
+			name: "ascii: head + marker + tail",
+			in:   "0123456789",
+			opts: TruncateHeadTailOptions{HeadBytes: 3, TailBytes: 3, Marker: "[... %d dropped ...]", FormatDropped: true},
+			want: "012" + "[... 4 dropped ...]" + "789",
+		},
+		{
+			name: "marker without % passes through verbatim",
+			in:   "0123456789",
+			opts: TruncateHeadTailOptions{HeadBytes: 3, TailBytes: 3, Marker: "\n...<output truncated>...\n"},
+			want: "012" + "\n...<output truncated>...\n" + "789",
+		},
+		{
+			name: "literal % without opt-in passes through verbatim",
+			in:   "0123456789",
+			opts: TruncateHeadTailOptions{HeadBytes: 3, TailBytes: 3, Marker: "[50% saved /a%b/c]"},
+			want: "012" + "[50% saved /a%b/c]" + "789",
+		},
+		{
+			name: "format opt-in without a %d verb: verbatim (no EXTRA tail)",
+			in:   "0123456789",
+			opts: TruncateHeadTailOptions{HeadBytes: 3, TailBytes: 3, Marker: "[50% saved]", FormatDropped: true},
+			want: "012" + "[50% saved]" + "789",
+		},
+		{
+			name: "head cut backs off over a split rune",
+			in:   s, // head 5 bytes lands inside 本 → back off to 3
+			opts: TruncateHeadTailOptions{HeadBytes: 5, TailBytes: 6, Marker: "|"},
+			want: "日" + "|" + "スト",
+		},
+		{
+			name: "tail cut advances over a split rune",
+			in:   s, // tail start 21-5=16 lands inside ス → advance to 18
+			opts: TruncateHeadTailOptions{HeadBytes: 6, TailBytes: 5, Marker: "|"},
+			want: "日本" + "|" + "ト",
+		},
+		{
+			name: "dropped count includes rune back-off",
+			in:   s, // head 5→3 bytes, tail 5→3 bytes: 21-3-3 = 15 dropped
+			opts: TruncateHeadTailOptions{HeadBytes: 5, TailBytes: 5, Marker: "[%d]", FormatDropped: true},
+			want: "日" + "[15]" + "ト",
+		},
+		{
+			name: "force marker when fitting",
+			in:   "abc",
+			opts: TruncateHeadTailOptions{HeadBytes: 5, TailBytes: 5, Marker: "[saved]", ForceMarker: true},
+			want: "abc[saved]",
+		},
+		{
+			name: "force marker when fitting: %d is zero",
+			in:   "abc",
+			opts: TruncateHeadTailOptions{HeadBytes: 5, TailBytes: 5, Marker: "[%d dropped]", ForceMarker: true, FormatDropped: true},
+			want: "abc[0 dropped]",
+		},
+		{
+			name: "force marker without cut: empty marker is a no-op",
+			in:   "abc",
+			opts: TruncateHeadTailOptions{HeadBytes: 5, TailBytes: 5, ForceMarker: true},
+			want: "abc",
+		},
+		{
+			name: "tail budget zero: head only",
+			in:   "0123456789",
+			opts: TruncateHeadTailOptions{HeadBytes: 3, TailBytes: 0, Marker: "|"},
+			want: "012|",
+		},
+		{
+			name: "head budget zero: tail only",
+			in:   "0123456789",
+			opts: TruncateHeadTailOptions{HeadBytes: 0, TailBytes: 3, Marker: "|"},
+			want: "|789",
+		},
+		{
+			name: "both budgets zero: just the marker",
+			in:   "0123456789",
+			opts: TruncateHeadTailOptions{Marker: "[%d dropped]", FormatDropped: true},
+			want: "[10 dropped]",
+		},
+		{
+			name: "empty input: no-op",
+			in:   "",
+			opts: TruncateHeadTailOptions{HeadBytes: 3, TailBytes: 3, Marker: "[...]"},
+			want: "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := TruncateHeadTail(tc.in, tc.opts); got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTruncateHeadTailRuneSafeProperty pins the guarantees over a sweep of
+// budgets on multi-byte input: the result is always valid UTF-8, the head
+// part is a prefix of the input, the tail part a suffix, and the two kept
+// parts never overlap (their combined length never exceeds the input).
+func TestTruncateHeadTailRuneSafeProperty(t *testing.T) {
+	s := strings.Repeat("日本語のテキスト結果", 10) // 300 bytes
+	const marker = "…"
+	for head := 0; head <= 60; head++ {
+		for tail := 0; tail <= 60; tail++ {
+			got := TruncateHeadTail(s, TruncateHeadTailOptions{HeadBytes: head, TailBytes: tail, Marker: marker})
+			if !utf8.ValidString(got) {
+				t.Fatalf("head %d tail %d: result is not valid UTF-8", head, tail)
+			}
+			if head+tail >= len(s) {
+				if got != s {
+					t.Fatalf("head %d tail %d: fitting input changed: %q", head, tail, got)
+				}
+				continue
+			}
+			idx := strings.Index(got, marker)
+			h, tl := got[:idx], got[idx+len(marker):]
+			if !strings.HasPrefix(s, h) {
+				t.Fatalf("head %d tail %d: head part %q is not a prefix of the input", head, tail, h)
+			}
+			if !strings.HasSuffix(s, tl) {
+				t.Fatalf("head %d tail %d: tail part %q is not a suffix of the input", head, tail, tl)
+			}
+			if len(h)+len(tl) > len(s) {
+				t.Fatalf("head %d tail %d: kept parts overlap (%d+%d > %d)", head, tail, len(h), len(tl), len(s))
+			}
+		}
+	}
+}
