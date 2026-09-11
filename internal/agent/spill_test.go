@@ -454,7 +454,11 @@ func TestCommandOutputWriterSpillFailureDisablesSpilling(t *testing.T) {
 // body becomes a head+locator+tail preview — and the pass is sticky (a second
 // pass rewrites nothing, so the prompt prefix stays stable).
 func TestCapToolResultsForTurnSpillsHistoricalBody(t *testing.T) {
-	a := newSpillTestAgent(t, "cap-turn-spill", 300)
+	// 512 bytes (not 300): the cap must comfortably clear the locator
+	// (path + retrieval hint) so the preview keeps a head and tail — on
+	// macOS t.TempDir() lives behind /var -> /private/var, making the
+	// spill path far longer than on Linux.
+	a := newSpillTestAgent(t, "cap-turn-spill", 512)
 	// A realistic pair: the assistant tool call (which labels the spill file)
 	// and the oversized result it produced, appended straight to history so
 	// the append-time cap does not touch it.
@@ -466,8 +470,8 @@ func TestCapToolResultsForTurnSpillsHistoricalBody(t *testing.T) {
 		t.Fatal("expected the oversized historical body to be rewritten")
 	}
 	got := a.Messages[1].Content
-	if len(got) > 300 {
-		t.Fatalf("stored result is %d bytes, exceeds cap 300", len(got))
+	if len(got) > 512 {
+		t.Fatalf("stored result is %d bytes, exceeds cap 512", len(got))
 	}
 	if !strings.Contains(got, "full output saved to") {
 		t.Fatalf("historical body was not spilled: %q", headStr(got, 200))

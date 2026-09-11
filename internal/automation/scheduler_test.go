@@ -406,8 +406,28 @@ func TestProcessFireSuccess(t *testing.T) {
 		t.Fatalf("helper report missing: %v", err)
 	}
 	body := string(data)
-	if !strings.Contains(body, "wd="+a.WorkingDir) {
-		t.Fatalf("child cwd mismatch: %q", body)
+	// The child reports os.Getwd(), which resolves symlinks; the automation's
+	// WorkingDir comes from t.TempDir() and on macOS lives behind
+	// /var -> /private/var, so compare the resolved forms. The args keep the
+	// literal path (checked below), since they are passed through verbatim.
+	gotWD := ""
+	for _, line := range strings.Split(body, "\n") {
+		if v, ok := strings.CutPrefix(line, "wd="); ok {
+			gotWD = v
+			break
+		}
+	}
+	wantWD, err := filepath.EvalSymlinks(a.WorkingDir)
+	if err != nil {
+		t.Fatalf("resolve working dir %q: %v", a.WorkingDir, err)
+	}
+	rawWD := gotWD
+	gotWD, err = filepath.EvalSymlinks(gotWD)
+	if err != nil {
+		t.Fatalf("resolve child cwd %q: %v", rawWD, err)
+	}
+	if gotWD != wantWD {
+		t.Fatalf("child cwd = %q (resolved %q), want %q (resolved %q)", rawWD, gotWD, a.WorkingDir, wantWD)
 	}
 	if !strings.Contains(body, "--dir "+a.WorkingDir) || !strings.Contains(body, "-p hello world") {
 		t.Fatalf("child args missing the built payload: %q", body)

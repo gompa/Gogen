@@ -125,8 +125,13 @@ func TestListModelsHangingProfileCostsOnlyItsOwnBudget(t *testing.T) {
 		{Name: "hung", BaseURL: hung.URL, APIKey: "k2"},
 	}, "", t.TempDir(), nil)
 
+	// The live profile's localhost request must win the race against its
+	// per-profile window even on a loaded -race CI runner (macOS has flaked
+	// at 300ms); the window still bounds the hung profile well below the
+	// full modelsCatalogTimeout budget.
+	const window = time.Second
 	old := profileCatalogTimeout
-	profileCatalogTimeout = 300 * time.Millisecond
+	profileCatalogTimeout = window
 	defer func() { profileCatalogTimeout = old }()
 
 	start := time.Now()
@@ -135,7 +140,7 @@ func TestListModelsHangingProfileCostsOnlyItsOwnBudget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListModels: %v", err)
 	}
-	if elapsed > 2*time.Second {
+	if elapsed > 3*window {
 		t.Fatalf("fetch took %s with a hanging profile; the per-profile budget must bound it", elapsed)
 	}
 	if len(models) != 1 || models[0].ID != "live-model" || models[0].Provider != "live" {

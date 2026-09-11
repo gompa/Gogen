@@ -320,10 +320,26 @@ func TestGenerateResponseStreamUsageArrivingBeatsDrainGrace(t *testing.T) {
 // either way and content is unaffected. NOT parallel: it sets
 // GOGEN_STREAM_STALL.
 func TestGenerateResponseStreamStallSignal(t *testing.T) {
-	t.Setenv("GOGEN_STREAM_STALL", "80ms")
+	// A generous threshold keeps the "continuous chunks" phase deterministic
+	// on a loaded CI runner (it shares cores across every package's -race
+	// test binary): the chunk cadence sits 50x below the window and the
+	// stream outlasts it, so a watchdog tick must land mid-stream and still
+	// find the clock freshly reset. A tight window flakes when a 10ms sleep
+	// stretches under CPU contention. The silent gap is a real Sleep (it
+	// never returns early), so it still fires deterministically.
+	const (
+		stallAfter = 500 * time.Millisecond
+		chunkGap   = stallAfter / 50 // 10ms between chunks
+		chunkCount = 60              // ~600ms of streaming, past the threshold
+	)
+	t.Setenv("GOGEN_STREAM_STALL", stallAfter.String())
 
 	var phase atomic.Int32 // 0 = silent-gap phase, 1 = continuous phase
-	var stalls atomic.Int32
+	// One counter per phase: the silent phase's watchdog goroutine may still
+	// be winding down when the continuous phase starts (its select can pick a
+	// pending ticker tick while racing the closed stop channel), and a
+	// straggler must not be read as a continuous-phase fire.
+	var silentStalls, continuousStalls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fl, _ := w.(http.Flusher)
@@ -334,7 +350,7 @@ func TestGenerateResponseStreamStallSignal(t *testing.T) {
 			if fl != nil {
 				fl.Flush()
 			}
-			time.Sleep(250 * time.Millisecond)
+			time.Sleep(2 * stallAfter)
 			_, _ = io.WriteString(w, `data: {"choices":[{"delta":{"content":"two"}}]}`+"\n\n"+
 				`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`+"\n\n"+"data: [DONE]\n\n")
 			if fl != nil {
@@ -342,14 +358,15 @@ func TestGenerateResponseStreamStallSignal(t *testing.T) {
 			}
 			return
 		}
-		// Continuous chunks: each gap is a fraction of the threshold, so
-		// the watchdog must stay quiet (even with scheduler jitter).
-		for i := 0; i < 12; i++ {
+		// Continuous chunks: each gap is a fraction of the threshold and the
+		// total outlasts it, so at least one watchdog tick lands mid-stream
+		// and must find the clock reset.
+		for i := 0; i < chunkCount; i++ {
 			_, _ = io.WriteString(w, `data: {"choices":[{"delta":{"content":"x"}}]}`+"\n\n")
 			if fl != nil {
 				fl.Flush()
 			}
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(chunkGap)
 		}
 		_, _ = io.WriteString(w, `data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`+"\n\n"+"data: [DONE]\n\n")
 		if fl != nil {
@@ -363,26 +380,25 @@ func TestGenerateResponseStreamStallSignal(t *testing.T) {
 	// Phase A: the silent gap must produce at least one stall signal and a
 	// complete stream (the signal never interrupts).
 	res, err := p.GenerateResponseStream(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, nil,
-		&StreamHandlers{OnStreamStall: func() { stalls.Add(1) }})
+		&StreamHandlers{OnStreamStall: func() { silentStalls.Add(1) }})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.Content != "one two" {
 		t.Fatalf("content = %q, want %q", res.Content, "one two")
 	}
-	if n := stalls.Load(); n < 1 {
-		t.Fatalf("OnStreamStall fired %d times during a 250ms gap (threshold 80ms), want >= 1", n)
+	if n := silentStalls.Load(); n < 1 {
+		t.Fatalf("OnStreamStall fired %d times during a %v gap (threshold %v), want >= 1", n, 2*stallAfter, stallAfter)
 	}
 
 	// Phase B: continuous chunks — no stall signal.
 	phase.Store(1)
-	stalls.Store(0)
 	if _, err := p.GenerateResponseStream(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, nil,
-		&StreamHandlers{OnStreamStall: func() { stalls.Add(1) }}); err != nil {
+		&StreamHandlers{OnStreamStall: func() { continuousStalls.Add(1) }}); err != nil {
 		t.Fatal(err)
 	}
-	if n := stalls.Load(); n != 0 {
-		t.Fatalf("OnStreamStall fired %d times with continuous chunks, want 0", n)
+	if n := continuousStalls.Load(); n != 0 {
+		t.Fatalf("OnStreamStall fired %d times over %v of continuous chunks (threshold %v), want 0", n, chunkCount*chunkGap, stallAfter)
 	}
 }
 

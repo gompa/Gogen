@@ -366,8 +366,15 @@ func TestFetchModelsOpenCodeKeepsSurvivingTwinWhenPeerHangs(t *testing.T) {
 	zenClient := newTestOpenAIClient(zenSrv)
 	goClient := newTestOpenAIClient(hungSrv)
 
+	// A per-profile window generous enough that the live Zen round trip
+	// always wins the race against it: a localhost catalog request costs
+	// microseconds, but a loaded -race CI runner (macOS has flaked at a
+	// 300ms window) can delay the response well past a tight budget and
+	// wrongly report the survivor as a failure too. The window still bounds
+	// the hung twin far below the full modelsCatalogTimeout budget.
+	const window = time.Second
 	old := profileCatalogTimeout
-	profileCatalogTimeout = 300 * time.Millisecond
+	profileCatalogTimeout = window
 	defer func() { profileCatalogTimeout = old }()
 
 	p := &OpenAIProvider{
@@ -386,8 +393,8 @@ func TestFetchModelsOpenCodeKeepsSurvivingTwinWhenPeerHangs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetchModelsWithProfiles: %v", err)
 	}
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Fatalf("fetch took %s; the hanging twin must be bounded by profileCatalogTimeout", elapsed)
+	if elapsed := time.Since(start); elapsed > 3*window {
+		t.Fatalf("fetch took %s; the hanging twin must be bounded by profileCatalogTimeout (%s), not the %s budget", elapsed, window, modelsCatalogTimeout)
 	}
 	if len(models) != 1 || models[0].ID != "zen-only" {
 		t.Fatalf("models = %+v, want the surviving zen catalog", models)
