@@ -1,6 +1,7 @@
 package automation
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -177,7 +178,7 @@ func TestUpdateRelativeWorkingDirAbsolutized(t *testing.T) {
 }
 
 func absPath(p string) bool {
-	return len(p) > 0 && p[0] == '/'
+	return filepath.IsAbs(p)
 }
 
 // TestUpdatePersistsAcrossReopen covers the file round-trip.

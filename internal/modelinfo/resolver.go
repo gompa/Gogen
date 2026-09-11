@@ -232,8 +232,8 @@ func (r *Resolver) refreshAsync() {
 		data, err := r.fetchRemote()
 
 		r.mu.Lock()
-		r.refreshing = false
 		if err != nil {
+			r.refreshing = false
 			r.lastFail = time.Now()
 			r.mu.Unlock()
 			return
@@ -241,7 +241,14 @@ func (r *Resolver) refreshAsync() {
 		r.setDataLocked(data)
 		cachePath := r.cachePath
 		r.mu.Unlock()
+		// Persist outside the lock and clear the flag only AFTER the write:
+		// refreshing is the completion signal callers (and tests) poll, so it
+		// must not report the refresh done while its disk write is still in
+		// flight.
 		r.writeDiskCache(cachePath, data)
+		r.mu.Lock()
+		r.refreshing = false
+		r.mu.Unlock()
 	}()
 }
 

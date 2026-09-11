@@ -419,6 +419,22 @@ func TestSetCachePathConcurrentWithRefresh(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
+
+	// Let the last refresh finish fetching AND persisting (refreshing clears
+	// only after writeDiskCache) so the temp cache dirs are quiescent before
+	// t.TempDir's RemoveAll — otherwise the writer races the cleanup with
+	// "directory not empty".
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		r.mu.RLock()
+		done := !r.refreshing
+		r.mu.RUnlock()
+		if done {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("background refresh did not quiesce")
 }
 
 // ResolveContextLimit and ProviderID are the test-only read surface, moved

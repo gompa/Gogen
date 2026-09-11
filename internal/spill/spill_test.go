@@ -103,20 +103,23 @@ func TestSaveWritesFullContentWithPrivatePerms(t *testing.T) {
 		t.Fatalf("spilled content differs: got %d bytes, want %d", len(data), len(want))
 	}
 	// 0600 file / 0700 dir: no group or other access can ever be granted
-	// (the modes carry no bits for umask to clear either).
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Fatalf("file perm = %o, want 600", perm)
-	}
-	dirInfo, err := os.Stat(filepath.Dir(path))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if perm := dirInfo.Mode().Perm(); perm != 0o700 {
-		t.Fatalf("session dir perm = %o, want 700", perm)
+	// (the modes carry no bits for umask to clear either). Windows does not
+	// honor POSIX mode bits (Stat reports 0666/0777), so this is POSIX-only.
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Fatalf("file perm = %o, want 600", perm)
+		}
+		dirInfo, err := os.Stat(filepath.Dir(path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := dirInfo.Mode().Perm(); perm != 0o700 {
+			t.Fatalf("session dir perm = %o, want 700", perm)
+		}
 	}
 }
 
@@ -600,8 +603,10 @@ func TestRepointFile(t *testing.T) {
 	if err != nil || string(data) != "shared output" {
 		t.Fatalf("dst content = %q err %v", data, err)
 	}
-	if info, err := os.Stat(dst); err != nil || info.Mode().Perm() != 0o600 {
-		t.Fatalf("dst perm = %v, want 600", info)
+	if runtime.GOOS != "windows" { // Windows does not honor POSIX mode bits
+		if info, err := os.Stat(dst); err != nil || info.Mode().Perm() != 0o600 {
+			t.Fatalf("dst perm = %v, want 600", info)
+		}
 	}
 	// Idempotent: repointing again returns the same path.
 	again, err := RepointFile(dir, src, "sess-b")

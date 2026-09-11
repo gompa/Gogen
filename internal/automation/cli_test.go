@@ -3,6 +3,7 @@ package automation
 import (
 	"bytes"
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -249,7 +250,13 @@ func TestCLIUpdatePatchSemantics(t *testing.T) {
 			name: "title and dir",
 			args: []string{"update", "PLACEHOLDER", "--title", "Renamed", "--dir", "/elsewhere"},
 			want: func(t *testing.T, got Automation) {
-				if got.Title != "Renamed" || got.WorkingDir != "/elsewhere" {
+				// The store absolutizes the working dir: "/elsewhere" stays
+				// itself on POSIX but becomes the drive-rooted path on Windows.
+				wantDir, err := filepath.Abs("/elsewhere")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got.Title != "Renamed" || got.WorkingDir != wantDir {
 					t.Fatalf("patch drifted: %+v", got)
 				}
 			},
