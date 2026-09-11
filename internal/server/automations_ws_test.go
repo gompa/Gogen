@@ -375,4 +375,26 @@ func TestAutomationsWebCreateVisibleToScheduler(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("scheduler never fired the web-created automation (ops and sweep must share one store)")
 	}
+
+	// The fire goroutine records the run asynchronously (RecordFire → … →
+	// RecordFinish), each an atomic store write under the temp XDG dir. The
+	// handle's result is already buffered, so the fired signal above can
+	// precede RecordFinish; wait for the terminal row so that last write
+	// lands before t.TempDir's RemoveAll (otherwise the cleanup races the
+	// writer and fails with "directory not empty", the flake class the
+	// ShutdownSessions cleanup above already covers for session writers).
+	// RecordFinish holds the store lock across the save, so observing a
+	// terminal row means the write is on disk.
+	st, err := s.automationStore()
+	if err != nil {
+		t.Fatalf("automation store: %v", err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		for _, r := range st.Runs(created.Automations[0].ID) {
+			if r.Status != automation.RunRunning {
+				return true
+			}
+		}
+		return false
+	})
 }

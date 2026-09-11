@@ -134,6 +134,10 @@ func newContinuationServer(t *testing.T, stub *blockingStub, dir string) (*Serve
 	// the same flake class 861a5c1 fixed for the spawn sweep; seen on
 	// TestBackgroundChildBusy and TestReviewAgentGuards).
 	t.Cleanup(func() {
+		// Stop the automation sweep too: tests that toggled automations on
+		// leave it sweeping every few ms, and a sweep/run-record write must
+		// not race the caller's t.TempDir() removal.
+		s.stopAutomations()
 		s.ShutdownSessions()
 		for _, id := range s.registry.activeIDs() {
 			if rt, ok := s.registry.get(id); ok {
