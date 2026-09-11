@@ -50,8 +50,9 @@ func (a *Agent) snapshotBaselineState() baselineState {
 // summing the cached per-message token counts when they are complete to avoid
 // re-tokenizing the whole conversation on every turn. Falls back to
 // Manager.ShouldCompactWithOverhead (a full EstimateTokens pass) when the
-// cache is empty or incomplete (e.g. after capToolResultsForCompact drops it;
-// compaction and session restore publish fresh counts).
+// cache is empty or incomplete (e.g. after a cap pass — capToolResultsForTurn
+// or capToolResultsForCompact — drops it; compaction and session restore
+// publish fresh counts).
 //
 // Wire overhead accounting: the per-message counts cover the canonical
 // messages only — the system prompt and tool definitions (10-30k tokens)
@@ -87,8 +88,8 @@ func (a *Agent) shouldCompactUsingCounts() bool {
 // using the same accounting as shouldCompactUsingCounts: the provider's
 // exact prompt_tokens baseline when fresh, otherwise the cached per-message
 // counts plus the wire overhead. Returns -1 when the per-message count
-// cache is incomplete (e.g. after capToolResultsForCompact drops it) so
-// callers can fall back to the full-estimate path.
+// cache is incomplete (e.g. after a cap pass drops it) so callers can fall
+// back to the full-estimate path.
 func (a *Agent) compactionTokenTotal() int {
 	snap := a.snapshotBaselineState()
 	if !snap.complete {

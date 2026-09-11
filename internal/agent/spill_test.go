@@ -225,8 +225,9 @@ func TestAppendToolResultSmallResultUntouched(t *testing.T) {
 // re-enabling restores the spill behavior (the gate is read per call, so a
 // live config change needs no agent rebuild).
 func TestSpillGateOffFallsBackToLegacyCap(t *testing.T) {
+	prev := OutputSpillEnabled()
 	ConfigureOutputSpill(false)
-	t.Cleanup(func() { ConfigureOutputSpill(true) })
+	t.Cleanup(func() { ConfigureOutputSpill(prev) })
 
 	a := newSpillTestAgent(t, "spill-gate-off", 300)
 	big := strings.Repeat("z", 1000)
@@ -444,4 +445,156 @@ func TestCommandOutputWriterSpillFailureDisablesSpilling(t *testing.T) {
 		t.Fatalf("capped head = %q overflowed=%v, want %q true", w.String(), w.overflowed, "01234567")
 	}
 	w.discardSpill() // no-op: the target is gone
+}
+
+// TestCapToolResultsForTurnSpillsHistoricalBody covers the normal-turn
+// re-cap: a tool body that entered history oversized (e.g. a session saved
+// under a larger/disabled cap, or the cap lowered live) is spilled exactly
+// like a result arriving now — the full output is persisted and the inline
+// body becomes a head+locator+tail preview — and the pass is sticky (a second
+// pass rewrites nothing, so the prompt prefix stays stable).
+func TestCapToolResultsForTurnSpillsHistoricalBody(t *testing.T) {
+	a := newSpillTestAgent(t, "cap-turn-spill", 300)
+	// A realistic pair: the assistant tool call (which labels the spill file)
+	// and the oversized result it produced, appended straight to history so
+	// the append-time cap does not touch it.
+	big := strings.Repeat("historical-output\n", 100) // 1800 bytes
+	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "read_files"}}})
+	a.appendMessage(llm.Message{Role: "tool", Content: big, ToolCallID: "call_1"})
+
+	if !a.capToolResultsForTurn() {
+		t.Fatal("expected the oversized historical body to be rewritten")
+	}
+	got := a.Messages[1].Content
+	if len(got) > 300 {
+		t.Fatalf("stored result is %d bytes, exceeds cap 300", len(got))
+	}
+	if !strings.Contains(got, "full output saved to") {
+		t.Fatalf("historical body was not spilled: %q", headStr(got, 200))
+	}
+	if !strings.Contains(got, "historical-output") {
+		t.Fatalf("preview lost the head: %q", headStr(got, 200))
+	}
+	path := extractSpillPath(t, got)
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != big {
+		t.Fatalf("spilled content = %d bytes err %v, want the full %d", len(data), err, len(big))
+	}
+	// The file is labeled with the tool name from the matching call.
+	if !strings.Contains(filepath.Base(path), "read_files") {
+		t.Fatalf("spill file %q not labeled with the tool name", filepath.Base(path))
+	}
+	// Sticky: a second pass must be a no-op for a stable prompt prefix.
+	before := a.Messages[1].Content
+	if a.capToolResultsForTurn() {
+		t.Fatal("second pass rewrote a body: the cap is not sticky")
+	}
+	if a.Messages[1].Content != before {
+		t.Fatal("second pass mutated the preview")
+	}
+}
+
+// TestCapToolResultsForTurnSpillsMarkerQuotingBody pins the precise
+// idempotency predicate: a body that merely CONTAINS the truncation marker
+// (a file quoting it, a log line) was not truncated, so the turn pass must
+// spill it exactly like a result arriving now — the coarse marker-anywhere
+// check would skip it and leave it oversized. The arrival path
+// (capToolResult → alreadyPartial) has always treated such a body this way;
+// this keeps the historical path in agreement.
+func TestCapToolResultsForTurnSpillsMarkerQuotingBody(t *testing.T) {
+	a := newSpillTestAgent(t, "cap-turn-quote", 300)
+	// The marker sits mid-body with content after it (so HasTruncatedTail is
+	// false) and there is no locator: alreadyPartial reads "not truncated".
+	big := "prefix\n… truncated (123 bytes total)\n" + strings.Repeat("quoted\n", 400)
+	if alreadyPartial(big) {
+		t.Fatal("premise: the marker-quoting body must not read as partial")
+	}
+	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "read_files"}}})
+	a.appendMessage(llm.Message{Role: "tool", Content: big, ToolCallID: "call_1"})
+
+	if !a.capToolResultsForTurn() {
+		t.Fatal("marker-quoting body was skipped instead of spilled")
+	}
+	got := a.Messages[1].Content
+	if !strings.Contains(got, "full output saved to") {
+		t.Fatalf("marker-quoting body was not spilled: %q", headStr(got, 200))
+	}
+	path := extractSpillPath(t, got)
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != big {
+		t.Fatalf("spilled content = %d bytes err %v, want the full %d", len(data), err, len(big))
+	}
+	// Sticky: the preview carries an intact locator, so the next pass is a
+	// no-op and the prompt prefix stays stable.
+	if a.capToolResultsForTurn() {
+		t.Fatal("second pass rewrote the preview: the cap is not sticky")
+	}
+}
+
+// TestCapToolResultsForTurnGateOffFallsBackToPlainCap pins the fallback: with
+// the spill gate off, the normal-turn re-cap takes the plain, lossy cap
+// (marker, no locator, nothing written to disk) — the pre-spill behavior.
+func TestCapToolResultsForTurnGateOffFallsBackToPlainCap(t *testing.T) {
+	prev := OutputSpillEnabled()
+	ConfigureOutputSpill(false)
+	t.Cleanup(func() { ConfigureOutputSpill(prev) })
+
+	a := newSpillTestAgent(t, "cap-turn-gate-off", 300)
+	big := strings.Repeat("z", 1000)
+	a.appendMessage(llm.Message{Role: "tool", Content: big, ToolCallID: "call_1"})
+
+	if !a.capToolResultsForTurn() {
+		t.Fatal("expected the oversized body to be rewritten")
+	}
+	got := a.Messages[0].Content
+	if len(got) > 300 {
+		t.Fatalf("stored result is %d bytes, exceeds cap 300", len(got))
+	}
+	if !contextmgr.HasTruncationMarker(got) || strings.Contains(got, "saved to") {
+		t.Fatalf("gate off must use the plain cap (no locator): %q", headStr(got, 200))
+	}
+	if _, err := os.Stat(filepath.Join(a.WorkingDir, ".gogen", "spill")); !os.IsNotExist(err) {
+		t.Fatal("gate off must not create a spill dir")
+	}
+}
+
+// TestCapToolResultsForCompactStaysPlainCap pins the deliberate split: the
+// forced-compaction stage-1 pass keeps the model-free, no-I/O plain cap even
+// with spilling enabled (the bodies it rewrites are frequently summarized out
+// on the same pass).
+func TestCapToolResultsForCompactStaysPlainCap(t *testing.T) {
+	a := newSpillTestAgent(t, "cap-compact-plain", 300)
+	big := strings.Repeat("z", 1000)
+	a.appendMessage(llm.Message{Role: "tool", Content: big, ToolCallID: "call_1"})
+
+	if !a.capToolResultsForCompact() {
+		t.Fatal("expected the oversized body to be rewritten")
+	}
+	got := a.Messages[0].Content
+	if !contextmgr.HasTruncationMarker(got) || strings.Contains(got, "saved to") {
+		t.Fatalf("compaction stage-1 must stay a plain cap: %q", headStr(got, 200))
+	}
+	if _, err := os.Stat(filepath.Join(a.WorkingDir, ".gogen", "spill")); !os.IsNotExist(err) {
+		t.Fatal("compaction stage-1 must not write spill files")
+	}
+}
+
+// TestRemoveStaleSpillsDropsUnpublishedPreview pins the cleanup for a cap
+// pass the countsEpoch guard discards: a preview capToolResult just spilled
+// (a fresh O_EXCL file with a random name) is removed when the rewrite is not
+// published, while a plain-cap preview (no locator) is a harmless no-op.
+func TestRemoveStaleSpillsDropsUnpublishedPreview(t *testing.T) {
+	a := newSpillTestAgent(t, "stale-spill-test", 300)
+	big := strings.Repeat("payload\n", 200) // 1600 bytes
+	preview := a.capToolResult("read_files", big)
+	path := extractSpillPath(t, preview)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("spill file was not created: %v", err)
+	}
+	removeStaleSpills([]string{preview})
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("unpublished spill file %q was not removed (err %v)", path, err)
+	}
+	// A plain-cap preview carries no locator: nothing to remove, no panic.
+	removeStaleSpills([]string{a.Context.TruncateToolResult(big)})
 }

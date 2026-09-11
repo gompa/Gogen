@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"os"
 	"strings"
 	"sync/atomic"
 
@@ -158,4 +159,20 @@ func (a *Agent) capToolResult(tool, result string) string {
 // deliver.
 func alreadyPartial(result string) bool {
 	return contextmgr.HasTruncatedTail(result) || len(spill.LocatorPaths(result)) > 0
+}
+
+// removeStaleSpills deletes the spill files a cap pass created but never
+// published — the case where the agent's countsEpoch guard discards a
+// rewrite computed across a concurrent reshape (see capToolResultsForTurn).
+// Only files the pass itself just wrote are removed: spill.LocatorPaths
+// performs the strict locator parse, and every Save opens a fresh random
+// name with O_EXCL, so a parsed path can only name a file this pass created.
+// Best-effort — anything left behind is removed with the session's spill
+// dir (spill.RemoveSessionDir).
+func removeStaleSpills(previews []string) {
+	for _, p := range previews {
+		for _, path := range spill.LocatorPaths(p) {
+			_ = os.Remove(path)
+		}
+	}
 }

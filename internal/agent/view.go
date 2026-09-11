@@ -106,15 +106,16 @@ func (a *Agent) prepareMessages(ctx context.Context, h *llm.StreamHandlers) ([]l
 				a.compactToFit(ctx, pinned, counts, keep, emergency)
 			}
 		}
-		// Cap oversized tool bodies in place on the live message array (a
-		// model-free win; the cached counts are dropped when a body is
-		// rewritten) — the same stage-1 call the forced compaction makes.
-		// Runs BEFORE the count backfill below: capping drops the cached
-		// counts, so backfilling first would be discarded and the pre-flight
-		// would re-tokenize the whole view anyway.
-		a.capToolResultsForCompact()
+		// Cap oversized tool bodies in place on the live message array,
+		// spilling the full output exactly like a result arriving now (the
+		// forced-compaction stage-1 pass keeps the model-free plain cap). The
+		// cached counts are dropped when a body is rewritten. Runs BEFORE the
+		// count backfill below: capping drops the cached counts, so backfilling
+		// first would be discarded and the pre-flight would re-tokenize the
+		// whole view anyway.
+		a.capToolResultsForTurn()
 		// Backfill a cold per-message count cache (a restored session, or the
-		// cache capToolResultsForCompact just dropped) once, after the
+		// cache capToolResultsForTurn just dropped) once, after the
 		// boundary decision but before the pre-flight measurement, so the
 		// pre-flight does not re-tokenize the whole view on every round
 		// while the cache stays incomplete. The boundary decision above
@@ -283,6 +284,11 @@ func (a *Agent) preflightForcedCompact(ctx context.Context, h *llm.StreamHandler
 // oversized tool bodies in place (a model-free win). It returns true when
 // a body was rewritten; the cached per-message counts are dropped in that
 // case (they are rebuilt on the next ContextStats).
+//
+// It deliberately uses the plain, no-I/O cap (EnsureToolResultsCapped): the
+// forced-compaction path may run in a tight retry loop, and the bodies it
+// rewrites are frequently summarized out on the next pass anyway. The
+// normal-turn pass that preserves the data is capToolResultsForTurn.
 func (a *Agent) capToolResultsForCompact() bool {
 	a.statsMu.Lock()
 	capped := a.Context.EnsureToolResultsCapped(a.Messages)
@@ -293,6 +299,122 @@ func (a *Agent) capToolResultsForCompact() bool {
 	}
 	a.statsMu.Unlock()
 	return capped
+}
+
+// capToolResultsForTurn runs the per-turn cap pass with the spill path:
+// oversized tool bodies already in history are handled exactly like a result
+// arriving now (capToolResult) — the full output is spilled to the session's
+// spill dir and the inline body becomes a head+locator+tail preview — with
+// the plain cap as the fallback when spilling is unavailable. This is the
+// normal-turn counterpart of capToolResultsForCompact, which keeps the
+// model-free, no-I/O cap for the forced-compaction stage-1 path.
+//
+// Spilling writes files, so the pass must NOT run under statsMu (a hot lock
+// for ContextStats / history snapshots). It snapshots the candidates under
+// the read lock, spills unlocked, then publishes under the write lock guarded
+// by countsEpoch: a concurrent reshape (which bumps the epoch) discards the
+// pending rewrite instead of applying previews at stale indices, and a
+// discarded pass removes the spill files it wrote (they were never published).
+// Appends do not shift existing indices, so they do not invalidate the
+// candidates.
+//
+// Returns true when a body was rewritten; the cached per-message counts are
+// dropped in that case (they are rebuilt on the next ContextStats).
+func (a *Agent) capToolResultsForTurn() bool {
+	if a.Context == nil {
+		return false
+	}
+	max := a.Context.SettingsSnapshot().MaxToolResultBytes
+	if max <= 0 {
+		return false
+	}
+
+	type candidate struct {
+		idx   int
+		orig  string
+		label string
+	}
+	var cands []candidate
+	a.statsMu.RLock()
+	// The tool-name lookup is built lazily: a turn with no oversized body
+	// (the common case) pays only the length scan below. The label only names
+	// the spill file, so a missing call falls back to a generic name.
+	var names map[string]string
+	for i := range a.Messages {
+		m := &a.Messages[i]
+		if m.Role != "tool" || m.Content == "" || len(m.Content) <= max {
+			continue
+		}
+		// The precise idempotency predicate the arriving-result path uses
+		// (alreadyPartial): a spill preview (an intact locator) or a plain cap
+		// (the marker terminating the body) is left alone so repeated passes
+		// stay no-ops and the prompt prefix stays stable — while a body that
+		// merely CONTAINS the marker text (a file quoting it, a log line) is
+		// still spilled, exactly like a result arriving now. The coarse
+		// HasTruncationMarker the compaction path uses would skip such a body
+		// and leave it oversized.
+		if alreadyPartial(m.Content) {
+			continue
+		}
+		if names == nil {
+			names = make(map[string]string)
+			for j := range a.Messages {
+				for k := range a.Messages[j].ToolCalls {
+					tc := &a.Messages[j].ToolCalls[k]
+					if tc.ID != "" && tc.Name != "" {
+						names[tc.ID] = tc.Name
+					}
+				}
+			}
+		}
+		label := names[m.ToolCallID]
+		if label == "" {
+			label = "tool"
+		}
+		cands = append(cands, candidate{idx: i, orig: m.Content, label: label})
+	}
+	epoch := a.countsEpoch
+	a.statsMu.RUnlock()
+
+	if len(cands) == 0 {
+		return false
+	}
+
+	// Spill outside the lock — this is the disk I/O the compaction path
+	// deliberately avoids.
+	previews := make([]string, len(cands))
+	for i := range cands {
+		previews[i] = a.capToolResult(cands[i].label, cands[i].orig)
+	}
+
+	a.statsMu.Lock()
+	applied := a.countsEpoch == epoch
+	changed := false
+	if applied {
+		for i := range cands {
+			c := &cands[i]
+			p := previews[i]
+			if c.idx >= len(a.Messages) || a.Messages[c.idx].Content != c.orig || p == c.orig {
+				continue
+			}
+			a.Messages[c.idx].Content = p
+			changed = true
+		}
+		if changed {
+			// Tool bodies were rewritten in place, so the cached counts are
+			// stale; drop the cache (it is rebuilt on the next ContextStats).
+			a.tokenCounts = nil
+		}
+	}
+	a.statsMu.Unlock()
+	if !applied {
+		// A reshape bumped the epoch while the spill I/O ran unlocked: the
+		// previews are stale and were never published, so remove the files
+		// this pass wrote instead of leaking them until session deletion.
+		// Outside statsMu — this is disk I/O.
+		removeStaleSpills(previews)
+	}
+	return changed
 }
 
 // runForcedSummarization runs stage 2 of the forced compaction: the forced

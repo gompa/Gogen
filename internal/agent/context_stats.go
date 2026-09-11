@@ -182,7 +182,7 @@ func (a *Agent) publishTokenCounts(counts []int, msgCount int, countsEpoch uint6
 // ensureTokenCounts backfills the per-message token-count cache when it does
 // not cover every message, using one batched pass with a shared memo. A cold
 // cache — a restored session whose snapshot carried no counts, or a cache
-// dropped by capToolResultsForCompact — would otherwise make every round
+// dropped by a cap pass — would otherwise make every round
 // re-tokenize the whole view in outgoingViewEstimate and
 // shouldCompactUsingCounts; backfilling once restores the cached fast paths.
 //
