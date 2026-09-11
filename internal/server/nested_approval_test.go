@@ -217,8 +217,15 @@ func TestSubagentApprovalRoutesToReopenedParent(t *testing.T) {
 	}
 	sp := continuableSpawner(t, s)
 	sp.retain = time.Hour // keep the finished child registered for the assertions
-	t.Cleanup(func() { waitForChildSpawnsSettled(t, s) })
+	// Cleanups run LIFO, and the spawn goroutine is what ENQUEUES the
+	// completion notice: wait for the spawns to settle first, THEN for the
+	// delivery turn it queued. Registering the parent-delivery wait last
+	// (so it runs first) let the notice be enqueued after that wait had
+	// already observed an idle parent — the delivery turn then wrote the
+	// session concurrently with t.TempDir's RemoveAll ("directory not
+	// empty", Windows). This mirrors newContinuableServer's ordering.
 	t.Cleanup(func() { waitForParentDeliveriesSettled(t, s, a) })
+	t.Cleanup(func() { waitForChildSpawnsSettled(t, s) })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
