@@ -1177,6 +1177,14 @@ func TestSidebarCloseFocusedRow(t *testing.T) {
 	bg.WorkingDir = m.agent.WorkingDir
 	bg.SessionStore = m.agent.SessionStore
 	m.lives.Add(bg, "bg")
+	// Deterministic order: pin the focused session's output stamp into the
+	// past. Relying on "bg was just spawned (newest)" makes the
+	// newest-first sort a clock-granularity question — on Windows, where
+	// time.Now reads the coarse system tick, the two spawns compare EQUAL
+	// and the first-seen tie-break (cur, live index 0) puts the FOCUSED
+	// session at row 0, so the cursor below would land on bg and x would
+	// close the wrong pane.
+	m.lives.sessions[0].lastActive = time.Now().Add(-time.Minute)
 	// Give the focused session content: empty (0-message, unlabeled)
 	// sessions are deliberately not persisted (skipEmptySave).
 	m.agent.Messages = append(m.agent.Messages, llm.Message{Role: "user", Content: "hi"})
@@ -1186,7 +1194,7 @@ func TestSidebarCloseFocusedRow(t *testing.T) {
 	// the saved-session list (close must keep the earned recency); it
 	// flushes only dirty state now.
 	m.agent.FlushSession()
-	// bg was just spawned (newest) → row 0; the focused "cur" is row 1.
+	// bg is newest → row 0; the focused "cur" is row 1.
 	m.sidebarCursor = 1
 	m.handleSidebarKey(keyMsg("x"))
 	if len(m.lives.sessions) != 1 {

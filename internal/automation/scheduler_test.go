@@ -46,12 +46,39 @@ func (f *recordingFire) count() int {
 	return len(f.fired)
 }
 
+// schedulerTestLogger returns a scheduler logger that stays safe after the
+// test body has returned. The scheduler's fire goroutines outlive the test
+// — Stop deliberately does not wait for in-flight fires — and t.Logf
+// PANICS once testing has completed ("Log in goroutine after ... has
+// completed"), so a straggler's completion log aborts the whole package.
+// The gate serializes with t.Cleanup: a log already inside the critical
+// section flushes while logging is still allowed, and anything after the
+// gate closes is dropped.
+func schedulerTestLogger(t *testing.T) func(format string, args ...any) {
+	t.Helper()
+	var mu sync.Mutex
+	done := false
+	t.Cleanup(func() {
+		mu.Lock()
+		done = true
+		mu.Unlock()
+	})
+	return func(format string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		if done {
+			return
+		}
+		t.Logf(format, args...)
+	}
+}
+
 // newSchedulerTest builds a store + scheduler with millisecond sweeps and a
 // controllable clock.
 func newSchedulerTest(t *testing.T, fire FireFunc) (*Scheduler, *Store, *timeCursor) {
 	t.Helper()
 	st, cursor := newTestStore(t)
-	s := NewScheduler(st, fire, WithInterval(10*time.Millisecond), WithLogger(t.Logf))
+	s := NewScheduler(st, fire, WithInterval(10*time.Millisecond), WithLogger(schedulerTestLogger(t)))
 	return s, st, cursor
 }
 
@@ -200,6 +227,14 @@ func TestSchedulerInterruptedRunsMarked(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = runID
+	// Not due: this test covers only the startup sweep's reconciliation of
+	// runs left "running" by a previous host. Leaving the row due (as
+	// dueAutomation does) let that SAME startup sweep claim and fire it, and
+	// the fire goroutine outlives the test — Stop deliberately does not wait
+	// for in-flight fires — so its RecordFire/RecordFinish writes landed in
+	// t.TempDir's RemoveAll window ("directory not empty" on macOS) and its
+	// completion log hit t.Logf after the test ended.
+	st.autos[a.ID].NextRunAt = ptrTime(cursor.t.Add(time.Hour))
 
 	s.Start(context.Background())
 	defer s.Stop()
@@ -212,6 +247,9 @@ func TestSchedulerInterruptedRunsMarked(t *testing.T) {
 		}
 		return false
 	})
+	if n := fire.count(); n != 0 {
+		t.Fatalf("interrupted-run sweep fired %d automation(s), want 0", n)
+	}
 }
 
 // TestSchedulerStopPreventsFiring verifies Stop() quiesces the sweep.
@@ -550,7 +588,7 @@ func TestSchedulerPollerDoesNotBlockRunFinalization(t *testing.T) {
 				Done:          done,
 				Result:        result,
 			}, nil
-		}, WithLogger(t.Logf))
+		}, WithLogger(schedulerTestLogger(t)))
 		s.fireOne(Claim{Automation: a, PlannedAt: time.Now()})
 		awaitRunTerminal(t, st, a.ID)
 	}
