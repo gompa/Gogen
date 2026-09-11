@@ -223,7 +223,7 @@ func (s *Store) recoverCreated(id, path, workingDir string) time.Time {
 		}
 	}
 	if !found {
-		if data, err := os.ReadFile(path); err == nil {
+		if data, err := ioutil.ReadFileRetry(path); err == nil {
 			var prevMeta struct {
 				Created time.Time `json:"created"`
 			}
@@ -281,7 +281,7 @@ func (s *Store) UpdatedAt(workingDir, id string) time.Time {
 	if err := ensureUnderSessionsDir(workingDir, path, s.globalDir); err != nil {
 		return time.Time{}
 	}
-	if data, err := os.ReadFile(path); err == nil {
+	if data, err := ioutil.ReadFileRetry(path); err == nil {
 		var f file
 		if json.Unmarshal(data, &f) == nil {
 			// Delta-aware fallback (see sessionUpdatedAt): a delta written
@@ -324,7 +324,7 @@ func (s *Store) LoadInWorkingDir(workingDir, id string) (SessionSnapshot, error)
 	if err := ensureUnderSessionsDir(workingDir, path, s.globalDir); err != nil {
 		return SessionSnapshot{}, err
 	}
-	data, err := os.ReadFile(path)
+	data, err := ioutil.ReadFileRetry(path)
 	if err != nil {
 		return SessionSnapshot{}, err
 	}
@@ -553,7 +553,7 @@ func (s *Store) nestedChildrenLocked(workingDir, parentID string) []string {
 	var ids []string
 	for _, name := range names {
 		id := strings.TrimSuffix(name, ".json")
-		data, err := os.ReadFile(s.path(workingDir, id))
+		data, err := ioutil.ReadFileRetry(s.path(workingDir, id))
 		if err != nil {
 			continue
 		}

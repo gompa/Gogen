@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"gogen/internal/ioutil"
 	"gogen/internal/projectfile"
 )
 
@@ -74,7 +75,11 @@ func (s *Store) load() error {
 		Runs []Run `json:"runs"`
 	}
 	path := filepath.Join(s.dir, RunsFile)
-	data, err := os.ReadFile(path)
+	// ReadFileRetry: the store is published by temp-file rename, so on Windows
+	// a reader can be refused with a sharing violation while a writer replaces
+	// the file. A plain read turns that momentary window into a hard failure for
+	// the CLI, a second host, or the polling regression test.
+	data, err := ioutil.ReadFileRetry(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return fmt.Errorf("read %s: %w", path, err)
@@ -93,7 +98,7 @@ func loadInto(path string, into *map[string]*Automation) error {
 	var wrapper struct {
 		Automations []Automation `json:"automations"`
 	}
-	data, err := os.ReadFile(path)
+	data, err := ioutil.ReadFileRetry(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			*into = map[string]*Automation{}

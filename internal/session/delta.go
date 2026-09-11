@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"time"
 
+	"gogen/internal/ioutil"
 	"gogen/internal/llm"
 )
 
@@ -33,7 +34,10 @@ func (s *Store) deltaPath(workingDir, id string) string {
 // loadDelta reads and returns the delta file for a session, if it exists.
 func (s *Store) loadDelta(workingDir, id string) (deltaFile, error) {
 	path := s.deltaPath(workingDir, id)
-	data, err := os.ReadFile(path)
+	// ReadFileRetry: this read must not lose a Windows replace window — a
+	// transient sharing violation here reads as "no delta" and silently drops
+	// the messages that exist only in the delta file.
+	data, err := ioutil.ReadFileRetry(path)
 	if err != nil {
 		return deltaFile{}, err
 	}

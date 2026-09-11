@@ -131,7 +131,7 @@ func (s *Store) legacySessionUpdated(workingDir string) ([]legacySession, error)
 	out := make([]legacySession, 0, len(names))
 	for _, name := range names {
 		id := strings.TrimSuffix(name, ".json")
-		data, err := os.ReadFile(s.path(workingDir, id))
+		data, err := ioutil.ReadFileRetry(s.path(workingDir, id))
 		if err != nil {
 			continue
 		}
@@ -242,7 +242,7 @@ func (s *Store) List(workingDir string) ([]SessionInfo, error) {
 	var items []item
 	for _, name := range names {
 		id := strings.TrimSuffix(name, ".json")
-		data, err := os.ReadFile(s.path(workingDir, id))
+		data, err := ioutil.ReadFileRetry(s.path(workingDir, id))
 		if err != nil {
 			continue
 		}
@@ -349,7 +349,7 @@ func (s *Store) indexFile(workingDir string) string {
 // readIndex loads the session metadata index from disk. Returns nil if the
 // file does not exist or is corrupt.
 func (s *Store) readIndex(workingDir string) *sessionIndex {
-	data, err := os.ReadFile(s.indexFile(workingDir))
+	data, err := ioutil.ReadFileRetry(s.indexFile(workingDir))
 	if err != nil {
 		return nil
 	}
@@ -397,7 +397,7 @@ func (s *Store) Info(workingDir, id string) *SessionInfo {
 
 // loadRawLabel loads a session file and returns the full first user message.
 func (s *Store) loadRawLabel(workingDir, id string) string {
-	data, err := os.ReadFile(s.path(workingDir, id))
+	data, err := ioutil.ReadFileRetry(s.path(workingDir, id))
 	if err != nil {
 		return ""
 	}
