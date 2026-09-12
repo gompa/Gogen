@@ -54,6 +54,7 @@ export function enableFollow() {
 export function disableFollow() {
     stickToBottom = false;
     messagesDiv.classList.remove('no-anchor');
+    markDetached();
     updateScrollBottomBtn();
 }
 
@@ -63,6 +64,22 @@ export function isPinned() {
 
 // === Scroll-to-bottom button ===
 const scrollBottomBtn = document.getElementById('scroll-bottom-btn');
+const scrollBottomBtnLabel = document.getElementById('scroll-bottom-btn-label');
+// The button's label is state-dependent: a neutral "Jump to latest" while
+// the user is only reading scrolled-up history, and "New messages" once
+// content actually arrived below the fold while they were detached (the old
+// static "New messages" read wrong for a plain scroll-up).
+const LABEL_JUMP = 'Jump to latest';
+const LABEL_NEW = 'New messages';
+// #messages' scrollHeight snapshot taken as follow is dropped (markDetached).
+// Appending content grows it; scrolling alone never touches it — so a live
+// scrollHeight above this baseline is exactly "new content landed below".
+let contentHeightAtDetach = 0;
+// Latched by refreshNewMessages in the content-change funnels. Kept as a
+// flag (not recomputed in updateScrollBottomBtn) so a user scroll — which
+// runs after style writes and would therefore force a fresh layout — can
+// refresh the button without re-reading #messages' geometry.
+let hasNewMessages = false;
 const NEAR_BOTTOM_PX = 32;
 // Shared with app.js's initToc deps as a function (the web test harness
 // evals each module in its own scope, so only function declarations are
@@ -100,17 +117,42 @@ export function distanceFromBottom() {
     return messagesDiv.scrollHeight - messagesDiv.scrollTop - messagesDiv.clientHeight;
 }
 
+// Snapshot the content height as follow is dropped, so the jump button can
+// tell later growth below the fold ("New messages") from pure scrolling.
+// Called at every true→false transition of stickToBottom; also clears the
+// latched flag so a fresh detach starts as a plain "Jump to latest".
+function markDetached() {
+    contentHeightAtDetach = messagesDiv.scrollHeight;
+    hasNewMessages = false;
+}
+
+// Re-evaluate whether content landed below the fold since detach. Called
+// from the content-change funnels (smartScroll for appends / streaming
+// tokens, scheduleRepinIfPinned for colorize / image / font / resize) right
+// after they have already read #messages' geometry, so the scrollHeight
+// probe is served from the layout computed this frame. Not called on user
+// scroll: that path must stay layout-free (see hasNewMessages).
+function refreshNewMessages() {
+    if (stickToBottom) { hasNewMessages = false; return; }
+    hasNewMessages = messagesDiv.scrollHeight > contentHeightAtDetach;
+}
+
 // d: optional pre-computed distance from bottom (callers that already
 // measured it in this frame pass it in to avoid a second forced
 // layout on #messages).
 export function updateScrollBottomBtn(d) {
     if (d === undefined) d = distanceFromBottom();
     scrollBottomBtn.classList.toggle('visible', !stickToBottom || d > NEAR_BOTTOM_PX);
+    // Read the latched flag only: recomputing here would force a layout
+    // after the scroll handler's classList writes (see hasNewMessages).
+    const showNew = !stickToBottom && hasNewMessages;
+    scrollBottomBtnLabel.textContent = showNew ? LABEL_NEW : LABEL_JUMP;
 }
 
 export function unpinFromBottom() {
     if (!stickToBottom) return;
     stickToBottom = false;
+    markDetached();
     lastUnpinAt = performance.now();
     updateScrollBottomBtn();
     // Re-enable browser scroll anchoring now that the user is reading
@@ -256,7 +298,11 @@ messagesDiv.addEventListener('scroll', (e) => {
         hideTocTooltip();
         const d = distanceFromBottom();
         if (d > NEAR_BOTTOM_PX) {
-            // Clearly away from bottom (scrollbar drag, etc.)
+            // Clearly away from bottom (scrollbar drag, etc.). Only a true
+            // transition re-baselines: a continuous scroll-up re-enters
+            // this branch every frame but must not keep resetting the
+            // content baseline (that would mask growth below the fold).
+            if (stickToBottom) markDetached();
             stickToBottom = false;
             messagesDiv.classList.remove('no-anchor');
         } else if (d <= 8 && performance.now() - lastUnpinAt > UNPIN_REPIN_GRACE_MS) {
@@ -322,7 +368,14 @@ export function scheduleRepinIfPinned() {
         _repinRafPending = false;
         let d;
         if (stickToBottom) smartScroll();
-        else d = maybeRepinNearBottom();
+        else {
+            d = maybeRepinNearBottom();
+            // Colorize / image / font / resize growth reaches here (not via
+            // smartScroll); refresh the "New messages" latch so the label
+            // tracks content that landed below the fold.
+            refreshNewMessages();
+            updateScrollBottomBtn();
+        }
         // During a sidebar drag this per-frame probe is deferred to
         // the single sidebarDragEnd pass on release (see the
         // sidebarDragActive note above the ResizeObserver).
@@ -383,6 +436,11 @@ export function smartScroll() {
     if (deps.isReplaying()) return;
     if (!stickToBottom) {
         maybeRepinNearBottom();
+        // Appends (new message, streamed token) drive smartScroll; latch
+        // any growth below the fold and refresh the button so "New
+        // messages" appears without waiting for the user's next scroll.
+        refreshNewMessages();
+        updateScrollBottomBtn();
         return;
     }
     // Suppress the scroll event generated by this programmatic scroll.

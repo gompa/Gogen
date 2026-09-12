@@ -1198,7 +1198,37 @@ func (m *Model) openNewLiveSession(label string) tea.Cmd {
 		m.appendChatLine(ErrorStyle.Render("Open: no workspace attached (single-session host)."))
 		return nil
 	}
+	// Inherit the FOCUSED session's model + thinking level (web
+	// createNewSession parity). The workspace default is the startup-era
+	// seed and set_model never advances it (model state is per-session, D1),
+	// so without this every spawned session would start on whatever model
+	// the workspace was built with instead of the one the user last picked.
+	// The typed /new inherits implicitly (it reuses the same provider); the
+	// spawned session must do it explicitly.
+	var inheritModel string
+	var inheritLevel agent.ThinkingLevel
+	if m.agent != nil {
+		inheritModel = m.agent.CurrentModel()
+		_, inheritLevel = m.agent.ModeAndThinkingLevel()
+	}
 	a := m.workspace.NewSessionAgent(nil, session.NewID())
+	// Adopt only when it differs from the fresh provider's seed (the
+	// workspace default — verified by construction). An equal model needs no
+	// adoption; the shared-provider path (single-session test/embed hosts)
+	// has a.CurrentModel() == the focused model, so it is a no-op and the
+	// shared provider is never mutated. An adopted model is marked
+	// unverified and re-checked against the provider on the first turn
+	// (requireModelSelected), the same safety net a restored model gets.
+	if inheritModel != "" && inheritModel != a.CurrentModel() {
+		a.AdoptModel(inheritModel)
+	}
+	if inheritLevel != "" {
+		// Seeds the fresh session's agent + provider and persists the level
+		// into the new session file. Runs AFTER the model adoption: the
+		// setter flushes, and the flush must persist the inherited model,
+		// not the pre-adoption default seed.
+		a.SetThinkingLevel(inheritLevel)
+	}
 	s := m.spawnLiveSession(a)
 	// Creation is the fresh session's first recency event (web: makePane
 	// without initialActivity) — it starts at the top of the list.

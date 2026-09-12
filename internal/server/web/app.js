@@ -260,22 +260,92 @@
         // flips) must not pile an unbounded column over the composer. When
         // the cap is hit the oldest toast is removed first.
         const MAX_TOASTS = 8;
+        // Errors need more reading time than info pings.
+        const TOAST_TTL = { error: 8000, info: 3000, success: 3000 };
+
+        // Dismiss one toast with a short slide-out. `immediate` skips the
+        // exit animation and always removes the node (bounded-stack
+        // eviction: the loop must be able to shed a node even if it is
+        // already mid-exit). Animated dismissal is idempotent — the
+        // animationend handler and the fallback timer may both fire.
+        function dismissToast(el, immediate) {
+            if (!el) return;
+            if (immediate) {
+                el.dataset.dismissing = '1';
+                clearTimeout(el._toastTimer);
+                el.remove();
+                return;
+            }
+            if (el.dataset.dismissing) return;
+            el.dataset.dismissing = '1';
+            clearTimeout(el._toastTimer);
+            el.classList.add('toast-out');
+            const done = () => el.remove();
+            el.addEventListener('animationend', done, { once: true });
+            // Fallback in case the animation never fires.
+            setTimeout(done, 400);
+        }
+
+        // (Re)start a toast's auto-dismiss countdown, remembering the
+        // remaining time so a hover/focus pause resumes where it left off.
+        function scheduleToastDismiss(el, remaining) {
+            clearTimeout(el._toastTimer);
+            el._toastRemaining = remaining;
+            el._toastDeadline = performance.now() + remaining;
+            el._toastTimer = setTimeout(() => dismissToast(el), remaining);
+        }
 
         function showToast(message, kind = 'info') {
             if (!toastHost || !message) return;
+            const ttl = TOAST_TTL[kind] || 3000;
+            // De-dupe: a repeated identical toast (copy feedback, a burst of
+            // connection flips) refreshes the visible one's timer instead of
+            // stacking another copy.
+            for (const existing of toastHost.children) {
+                if (existing.dataset.message === message && existing.dataset.kind === kind
+                    && !existing.dataset.dismissing) {
+                    scheduleToastDismiss(existing, ttl);
+                    return;
+                }
+            }
             while (toastHost.childElementCount >= MAX_TOASTS) {
-                toastHost.firstElementChild?.remove();
+                dismissToast(toastHost.firstElementChild, true);
             }
             const el = document.createElement('div');
             el.className = `toast ${kind}`;
-            el.textContent = message;
-            el.addEventListener('click', () => el.remove());
+            el.dataset.message = message;
+            el.dataset.kind = kind;
+            const text = document.createElement('span');
+            text.className = 'toast-text';
+            text.textContent = message;
+            el.appendChild(text);
+            const close = document.createElement('button');
+            close.type = 'button';
+            close.className = 'toast-close';
+            close.setAttribute('aria-label', 'Dismiss');
+            close.innerHTML = icon('x');
+            close.addEventListener('click', (e) => { e.stopPropagation(); dismissToast(el); });
+            el.appendChild(close);
+            // Click anywhere on the toast still dismisses (unchanged affordance).
+            el.addEventListener('click', () => dismissToast(el));
+            // Pause the countdown while the user is reading or interacting
+            // (hover, or keyboard focus inside), so a toast cannot vanish
+            // mid-read or mid-tab; resume with the remaining time.
+            const pause = () => {
+                if (el.dataset.dismissing) return;
+                clearTimeout(el._toastTimer);
+                el._toastRemaining = Math.max(0, el._toastDeadline - performance.now());
+            };
+            const resume = () => {
+                if (el.dataset.dismissing) return;
+                scheduleToastDismiss(el, el._toastRemaining || ttl);
+            };
+            el.addEventListener('mouseenter', pause);
+            el.addEventListener('mouseleave', resume);
+            el.addEventListener('focusin', pause);
+            el.addEventListener('focusout', resume);
             toastHost.appendChild(el);
-            // Errors need more reading time than info pings.
-            const ttl = kind === 'error' ? 8000 : 3000;
-            setTimeout(() => {
-                el.remove();
-            }, ttl);
+            scheduleToastDismiss(el, ttl);
         }
         setToastHandler(showToast);
 
@@ -520,7 +590,7 @@
         // nodes each time.
         let tbBadgeRing = null;
         let tbBadgeLabel = null;
-        let tbBadgeTitle = null;
+        let tbBadgeAria = null;
         let tbBadgeTone = null;
         function ensureToolbarBadgeNodes() {
             if (tbBadgeRing) return true;
@@ -542,8 +612,12 @@
                 // No window size known at all — nothing to render.
                 tbBadgeRing.style.setProperty('--ctx-pct', '0%');
                 if (tbBadgeLabel.nodeValue !== ' —') tbBadgeLabel.nodeValue = ' —';
-                const title = 'Context usage unknown';
-                if (tbBadgeTitle !== title) { tbContextBadge.title = title; tbBadgeTitle = title; }
+                // aria-label carries the descriptive text for assistive tech.
+                // The native `title` bubble is intentionally left unset: the
+                // custom #context-tooltip already renders on hover/focus, and
+                // a title would pop a second, overlapping bubble ~1s later.
+                const aria = 'Context usage unknown';
+                if (tbBadgeAria !== aria) { tbContextBadge.setAttribute('aria-label', aria); tbBadgeAria = aria; }
                 const tone = '';
                 if (tbBadgeTone !== tone) {
                     tbContextBadge.removeAttribute('data-tone');
@@ -558,8 +632,8 @@
                 tbBadgeRing.style.setProperty('--ctx-pct', '0%');
                 const label = ` —/${formatTokenCount(limit)}`;
                 if (tbBadgeLabel.nodeValue !== label) tbBadgeLabel.nodeValue = label;
-                const title = `Context: not yet used / ${limit.toLocaleString()} tokens`;
-                if (tbBadgeTitle !== title) { tbContextBadge.title = title; tbBadgeTitle = title; }
+                const aria = `Context usage: nothing counted yet, limit ${limit.toLocaleString()} tokens`;
+                if (tbBadgeAria !== aria) { tbContextBadge.setAttribute('aria-label', aria); tbBadgeAria = aria; }
                 const tone = '';
                 if (tbBadgeTone !== tone) {
                     tbContextBadge.removeAttribute('data-tone');
@@ -571,8 +645,8 @@
             tbBadgeRing.style.setProperty('--ctx-pct', pct + '%');
             const label = ` ${pct}% ${formatTokenCount(used)}/${formatTokenCount(limit)}`;
             if (tbBadgeLabel.nodeValue !== label) tbBadgeLabel.nodeValue = label;
-            const title = `Context: ${used.toLocaleString()} / ${limit.toLocaleString()} tokens`;
-            if (tbBadgeTitle !== title) { tbContextBadge.title = title; tbBadgeTitle = title; }
+            const aria = `Context usage: ${pct}% of ${limit.toLocaleString()} tokens (${used.toLocaleString()} used)`;
+            if (tbBadgeAria !== aria) { tbContextBadge.setAttribute('aria-label', aria); tbBadgeAria = aria; }
             const tone = pct >= 90 ? 'danger' : pct >= 75 ? 'warning' : '';
             if (tbBadgeTone !== tone) {
                 if (tone) tbContextBadge.setAttribute('data-tone', tone);
@@ -582,7 +656,11 @@
         }
 
         // ── Context tooltip on toolbar badge (reuses sidebar tooltip element) ──
-        tbContextBadge.addEventListener('mouseenter', () => {
+        // Shown on hover AND focus: the badge is tabbable, so keyboard and
+        // touch users reach the same detailed breakdown. The native `title`
+        // bubble is never set on the badge (updateToolbarContext writes
+        // aria-label instead), so nothing overlaps this custom tooltip.
+        function showContextTooltip() {
             const d = lastContextData || {};
             if (!d.contextLimit && !d.usedTokens) return;
             const lines = [];
@@ -623,10 +701,14 @@
             }
             contextTooltip.textContent = lines.join('\n');
             contextTooltip.style.display = 'block';
-        });
-        tbContextBadge.addEventListener('mouseleave', () => {
+        }
+        function hideContextTooltip() {
             contextTooltip.style.display = 'none';
-        });
+        }
+        tbContextBadge.addEventListener('mouseenter', showContextTooltip);
+        tbContextBadge.addEventListener('focus', showContextTooltip);
+        tbContextBadge.addEventListener('mouseleave', hideContextTooltip);
+        tbContextBadge.addEventListener('blur', hideContextTooltip);
 
         // ── Command mode indicator ──
         // inputAreaWrap is declared here; the command-mode class toggle runs
@@ -1965,7 +2047,19 @@
         // pane) and re-attached so the server resends the pane's state —
         // with the pane's history fingerprint, so an unchanged session
         // skips the history snapshot entirely (conditional attach).
+        // On phones the chat sidebar is an overlay drawer (styles.css
+        // <=768px). Any in-sidebar action that switches the chat — selecting
+        // a session, focusing a pane, starting a new one — must dismiss it:
+        // the tap lands INSIDE #sidebar, so the outside-click closer never
+        // fires and the drawer would otherwise stay over the transcript (and
+        // focusPane's inputArea.focus() would raise the keyboard under it).
+        function closeMobileSidebar() {
+            if (window.innerWidth > 768) return;
+            document.getElementById('sidebar')?.classList.remove('open');
+        }
+
         function focusPane(key) {
+            closeMobileSidebar();
             if (key === activePaneKey) return;
             const pane = panes.get(key);
             if (!pane) return;
@@ -2068,6 +2162,7 @@
         // when not currently active) and the transcript re-derives from the
         // server's attach response.
         function openSessionPane(id) {
+            closeMobileSidebar();
             if (!ensureConnected()) return;
             if (!id) return;
             if (resendAwaitingHistory) {
@@ -5419,6 +5514,7 @@
         };
 
         function newSession() {
+            closeMobileSidebar();
             if (!ensureConnected()) return;
             if (resendAwaitingHistory) {
                 showToast('Resend already in progress', 'info');
@@ -5453,7 +5549,12 @@
             // full-screen terminal overlay so it can't cover the chat.
             if (pane !== 'terminal') terminalDismissMobile();
             document.querySelectorAll('.main-tab').forEach((t) => {
-                t.classList.toggle('active', t.dataset.pane === pane);
+                const on = t.dataset.pane === pane;
+                t.classList.toggle('active', on);
+                // Expose the active view to assistive tech (the tabs are
+                // plain buttons; the visual state is the .active class).
+                if (on) t.setAttribute('aria-current', 'true');
+                else t.removeAttribute('aria-current');
             });
             document.querySelectorAll('.pane').forEach((p) => {
                 p.classList.toggle('active', p.id === `${pane}-pane`);

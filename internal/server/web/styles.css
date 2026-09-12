@@ -13,7 +13,10 @@
             /* Both pass WCAG AA on --bg; muted stays a step above dim so the
                fg > muted > dim ladder survives. */
             --fg-muted: #9aa0aa;
-            --fg-dim: #71767f;
+            /* Lightened from #71767f so the dim tier clears WCAG AA (4.5:1)
+               on --bg (4.0:1 → 4.8:1); it is used for real text (timestamps,
+               hints, .code-lang), not just placeholders. */
+            --fg-dim: #7d838d;
             --accent: var(--user-accent, #7aa2f7);
             /* Soft accent derived from the accent via color-mix — no JS needed */
             --accent-soft: color-mix(in srgb, var(--accent) 18%, transparent);
@@ -959,17 +962,9 @@
             margin: 0.5em 0;
         }
         .code-block-wrap > pre { margin: 0; }
-        .code-copy-btn {
-            position: absolute;
-            top: 6px;
-            right: 6px;
-            z-index: 2;
-            padding: 3px 8px;
-            font-size: 0.7em;
-            opacity: 0.7;
-        }
-        .code-block-wrap:hover .code-copy-btn,
-        .code-copy-btn:focus { opacity: 1; }
+        /* .code-copy-btn is defined once, in the Phase-2 code-block-header
+           section further down (it lives in .code-block-head, not absolutely
+           positioned over the <pre>). */
         .message.md pre code, .thought-card .md pre code {
             padding: 0;
             border: none;
@@ -1064,9 +1059,19 @@
             font-family: inherit;
         }
         input::placeholder { color: var(--fg-dim); }
-        input:focus, button:focus, select:focus, textarea:focus {
+        /* Keyboard-only accent ring for form controls (was :focus, which also
+           painted on a mouse click). Drawn INSET so it cannot be clipped
+           inside the popovers / overflow-hidden cards that host controls
+           (attachment remove, code copy). */
+        input:focus-visible, button:focus-visible, select:focus-visible, textarea:focus-visible {
             outline: 1px solid var(--accent);
             outline-offset: -1px;
+        }
+        /* Filled-accent buttons: the inset accent ring is invisible on the
+           accent fill, so give them the shared OUTER ring instead. */
+        #send-btn:focus-visible, button.primary:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
         }
         button {
             cursor: pointer;
@@ -1452,6 +1457,9 @@
         }
         .toast {
             pointer-events: auto;
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
             padding: 10px 14px;
             border-radius: var(--radius-md);
             border: 1px solid var(--border);
@@ -1465,9 +1473,30 @@
         .toast.success { border-color: var(--success-border); background: var(--success-bg); color: var(--success); }
         .toast.error { border-color: var(--error-border); background: var(--error-bg); color: var(--error-fg); }
         .toast.info { border-color: var(--border); }
+        .toast-text { flex: 1; min-width: 0; }
+        /* Explicit close affordance; the whole toast also dismisses on click. */
+        .toast-close {
+            flex-shrink: 0;
+            padding: 0;
+            margin: -2px -4px -2px 0;
+            border: none;
+            background: transparent;
+            color: inherit;
+            opacity: 0.6;
+            line-height: 1;
+            cursor: pointer;
+        }
+        .toast-close:hover { opacity: 1; background: transparent; }
+        .toast-close .icon { width: 0.85em; height: 0.85em; }
+        /* Exit animation (mirror of toast-in) before the node is removed. */
+        .toast-out { animation: toast-out 0.15s ease-in forwards; }
         @keyframes toast-in {
             from { opacity: 0; transform: translateY(6px); }
             to { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes toast-out {
+            from { opacity: 1; transform: translateY(0); }
+            to { opacity: 0; transform: translateY(6px); }
         }
 
         #command-palette-overlay {
@@ -2323,6 +2352,9 @@
                 box-shadow: var(--shadow-md);
             }
             #sidebar-toggle { display: block; }
+            /* Reserve room at the top of the transcript for the floating
+               #sidebar-toggle so it never sits over the first message. */
+            #messages { padding-top: 44px; }
         }
 
         /* ===== Custom close-tab modal ===== */
@@ -2724,7 +2756,9 @@
             --border-subtle: #e8eaee;
             --fg: #191b1f;
             --fg-muted: #5b6069;
-            --fg-dim: #787d86;
+            /* Darkened from #787d86 for the same AA reason on the light
+               surface (#f7f8fa): 3.9:1 → 4.7:1. */
+            --fg-dim: #6b7078;
             --accent: var(--user-accent, #2563eb);
             --accent-soft: color-mix(in srgb, var(--accent) 12%, transparent);
             /* Custom-accent override shared with the dark theme: the computed
@@ -3352,7 +3386,9 @@
         }
 
         @media (max-width: 480px) {
-            #messages { padding: 12px 10px; }
+            /* 44px top keeps the #sidebar-toggle clear of the transcript
+               (mirrors the <=768px rule; the shorthand would reset it). */
+            #messages { padding: 44px 10px 12px; }
             #settings-dialog { padding: 12px; }
             #input-area { padding: 8px 10px; }
             #composer-toolbar { padding: 4px 10px 0; }

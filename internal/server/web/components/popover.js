@@ -58,12 +58,25 @@ export function createPopover({ el, getAnchor, fixed = false, onOpen, onClose })
         el.style.top = top + 'px';
     }
 
+    // Expose the disclosure state on the trigger: the popover is a
+    // button-triggered disclosure, so a screen reader needs aria-expanded
+    // (and the controlled panel id) to announce open/closed.
+    function syncExpanded(open) {
+        const anchor = getAnchor();
+        if (!anchor) return;
+        anchor.setAttribute('aria-expanded', open ? 'true' : 'false');
+        if (el.id && !anchor.hasAttribute('aria-controls')) {
+            anchor.setAttribute('aria-controls', el.id);
+        }
+    }
+
     function open() {
         if (isOpen) return;
         isOpen = true;
         // Show first, then position: fixed popovers size themselves via
         // CSS, so the clamp math measures the rendered width.
         el.classList.add('open');
+        syncExpanded(true);
         if (fixed) position();
         if (onOpen) onOpen();
     }
@@ -72,6 +85,7 @@ export function createPopover({ el, getAnchor, fixed = false, onOpen, onClose })
         if (!isOpen) return;
         isOpen = false;
         el.classList.remove('open');
+        syncExpanded(false);
         if (fixed) {
             el.style.left = '';
             el.style.top = '';

@@ -77,6 +77,36 @@ function toast(message, kind = 'info') {
 // adds its own Esc handling on top (dismiss = non-destructive action).
 let modalLastFocus = null;
 
+// While any modal is open the app surface behind it (the tab bar and the
+// panes) is made inert, so Tab and assistive tech cannot reach content a
+// modal is logically covering. The overlays are siblings of these two
+// containers, so they stay interactive. A Set (not a count/boolean) so
+// stacked modals — a delete approval popping over the settings overlay —
+// only restore the background when the LAST one closes, and re-opening an
+// already-open overlay never double-counts.
+const openModals = new Set();
+const MODAL_BACKGROUND_SELECTORS = ['#top-tabs', '#main-panes'];
+
+function setBackgroundInert(inert) {
+  for (const sel of MODAL_BACKGROUND_SELECTORS) {
+    const el = document.querySelector(sel);
+    if (!el) continue;
+    if (inert) el.setAttribute('inert', '');
+    else el.removeAttribute('inert');
+  }
+}
+
+function markModalOpen(overlay) {
+  if (openModals.has(overlay)) return;
+  openModals.add(overlay);
+  if (openModals.size === 1) setBackgroundInert(true);
+}
+
+function markModalClosed(overlay) {
+  if (!openModals.delete(overlay)) return;
+  if (openModals.size === 0) setBackgroundInert(false);
+}
+
 function focusablesOf(container) {
   if (!container) return [];
   const sel = 'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])';
@@ -107,6 +137,11 @@ export function openModal(overlay, opts = {}) {
   if (modalLastFocus === null) modalLastFocus = document.activeElement;
   overlay.classList.add(opts.className || 'active');
   overlay.setAttribute('aria-hidden', 'false');
+  // Mark the overlay as a modal and inert the app surface behind it (see
+  // openModals above). aria-modal tells assistive tech the rest of the page
+  // is off-limits; inert enforces the same for the keyboard.
+  overlay.setAttribute('aria-modal', 'true');
+  markModalOpen(overlay);
   if (overlay.__gogenTrap) overlay.__gogenTrap();
   overlay.__gogenTrap = trapFocusIn(overlay);
   const target = opts.focusSelector ? overlay.querySelector(opts.focusSelector) : null;
@@ -119,6 +154,8 @@ export function closeModal(overlay, opts = {}) {
   if (!overlay) return;
   overlay.classList.remove(opts.className || 'active');
   overlay.setAttribute('aria-hidden', 'true');
+  overlay.removeAttribute('aria-modal');
+  markModalClosed(overlay);
   if (overlay.__gogenTrap) {
     overlay.__gogenTrap();
     overlay.__gogenTrap = null;
@@ -1803,7 +1840,11 @@ function switchToEditorPane() {
   const editorPane = $('editor-pane');
   const alreadyActive = !!editorPane && editorPane.classList.contains('active');
   document.querySelectorAll('.main-tab').forEach((t) => {
-    t.classList.toggle('active', t.dataset.pane === 'editor');
+    const on = t.dataset.pane === 'editor';
+    t.classList.toggle('active', on);
+    // Keep the tab's assistive-tech state in sync (app.js switchMainPane).
+    if (on) t.setAttribute('aria-current', 'true');
+    else t.removeAttribute('aria-current');
   });
   document.querySelectorAll('.pane').forEach((p) => {
     p.classList.toggle('active', p.id === 'editor-pane');

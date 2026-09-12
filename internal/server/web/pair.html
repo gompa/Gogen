@@ -44,14 +44,34 @@
   }
   button:hover { background: #3d7bea; }
   p.hint { margin: 14px 0 0; font-size: 12px; color: #71767f; line-height: 1.5; }
+  /* Mirrors styles.css .sr-only; the pairing input gets a real label so it
+     is not placeholder-only for assistive tech. */
+  .visually-hidden {
+    position: absolute; width: 1px; height: 1px;
+    padding: 0; margin: -1px; overflow: hidden;
+    clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+  /* Light theme: this page is self-contained (every other asset is
+     auth-gated), so the palette is inlined. Mirrors styles.css :root.light. */
+  @media (prefers-color-scheme: light) {
+    :root { color-scheme: light; }
+    body { background: #f7f8fa; color: #191b1f; }
+    .card {
+      background: #ffffff; border-color: #dcdfe4;
+      box-shadow: 0 12px 40px rgba(16, 24, 40, 0.18);
+    }
+    input[type="text"] { background: #ffffff; border-color: #dcdfe4; color: #191b1f; }
+    p.hint { color: #6b7078; }
+  }
 </style>
 </head>
 <body>
   <div class="card">
     <h1>GoGen</h1>
-    <p class="msg">{{MESSAGE}}</p>
+    <p class="msg" aria-live="polite">{{MESSAGE}}</p>
     <form method="get" action="/">
-      <input type="text" name="pair" placeholder="Pairing code"
+      <label class="visually-hidden" for="pair-code">Pairing code</label>
+      <input type="text" id="pair-code" name="pair" placeholder="Pairing code"
              autocomplete="off" autocapitalize="off" spellcheck="false"
              maxlength="64" autofocus>
       <button type="submit">Sign in</button>

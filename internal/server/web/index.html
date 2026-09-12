@@ -63,16 +63,16 @@
         <!-- Brand mark doubles as the connection indicator: one dot,
              semantic color (green/red/amber) driven by app.js by id. -->
         <div id="brand" title="GoGen"><span id="conn-indicator" class="disconnected" title="Disconnected" role="status" aria-live="polite" aria-label="Disconnected"></span><span class="brand-text">GoGen</span></div>
-        <button type="button" class="main-tab active" data-pane="chat"><svg class="icon"><use href="#i-chat"></use></svg><span>Chat</span></button>
-        <button type="button" class="main-tab" data-pane="editor"><svg class="icon"><use href="#i-code"></use></svg><span>Editor</span></button>
+        <button type="button" class="main-tab active" data-pane="chat" aria-controls="chat-pane" aria-current="true"><svg class="icon"><use href="#i-chat"></use></svg><span>Chat</span></button>
+        <button type="button" class="main-tab" data-pane="editor" aria-controls="editor-pane"><svg class="icon"><use href="#i-code"></use></svg><span>Editor</span></button>
         <!-- Board tab: hidden until the server's config push reports the
              board feature enabled (app.js applyFeatureSettings). -->
-        <button type="button" class="main-tab" id="board-tab" data-pane="board" title="Kanban board" hidden><svg class="icon"><use href="#i-board"></use></svg><span>Board</span></button>
+        <button type="button" class="main-tab" id="board-tab" data-pane="board" aria-controls="board-pane" title="Kanban board" hidden><svg class="icon"><use href="#i-board"></use></svg><span>Board</span></button>
         <!-- Automations tab: hidden until the server's config push reports
              the automations feature enabled (applyFeatureSettings), same
              contract as the board tab. -->
-        <button type="button" class="main-tab" id="automations-tab" data-pane="automations" title="Automations (scheduled jobs)" hidden><svg class="icon"><use href="#i-clock"></use></svg><span>Automations</span></button>
-        <button type="button" class="main-tab" id="terminal-tab" data-pane="terminal" title="Terminal"><svg class="icon"><use href="#i-terminal"></use></svg><span>Terminal</span><span id="terminal-tab-badge" hidden></span></button>
+        <button type="button" class="main-tab" id="automations-tab" data-pane="automations" aria-controls="automations-pane" title="Automations (scheduled jobs)" hidden><svg class="icon"><use href="#i-clock"></use></svg><span>Automations</span></button>
+        <button type="button" class="main-tab" id="terminal-tab" data-pane="terminal" aria-controls="terminal-panel" title="Terminal"><svg class="icon"><use href="#i-terminal"></use></svg><span>Terminal</span><span id="terminal-tab-badge" hidden></span></button>
         <span id="global-mode-badge" title="Global mode active — agent is not scoped to working directory"><svg class="icon"><use href="#i-globe"></use></svg> Global</span>
         <button type="button" id="settings-btn" title="Settings" aria-label="Settings"><svg class="icon"><use href="#i-sliders"></use></svg></button>
     </div>
@@ -82,7 +82,7 @@
                 <!-- Working directory: read-only display in project mode,
                      editable input + button only in global mode (app.js
                      toggles the two blocks on the server's globalMode). -->
-                <label>Working Directory:</label>
+                <label for="working-dir-input">Working Directory:</label>
                 <div id="working-dir-display">
                     <div id="working-dir-path" class="wd-path" title="Current working directory (read-only in project mode)"></div>
                 </div>
@@ -103,7 +103,7 @@
             <div id="chat-container">
                 <button type="button" id="sidebar-toggle" title="Toggle sidebar" aria-label="Toggle sidebar"><svg class="icon"><use href="#i-menu"></use></svg></button>
                 <div id="messages" tabindex="-1"></div>
-                <button type="button" id="scroll-bottom-btn"><svg class="icon"><use href="#i-arrow-down"></use></svg> New messages</button>
+                <button type="button" id="scroll-bottom-btn"><svg class="icon"><use href="#i-arrow-down"></use></svg> <span id="scroll-bottom-btn-label">Jump to latest</span></button>
                 <!-- Conversation TOC rail: one dot per user prompt (built by
                      app.js appendTocDot/rebuildToc). Overlay on the right
                      edge of the chat, revealed on hover (app.js toggles
@@ -140,7 +140,13 @@
                         </div>
                     </div>
                     <div id="tb-context-group" class="tb-group">
-                        <span id="tb-context-badge" class="tb-context-badge" role="status">—</span>
+                        <!-- Focusable so the detailed breakdown (shown by app.js on
+                             hover/focus) is reachable by keyboard and touch too. It is
+                             deliberately NOT a live region: the label is rewritten on
+                             every streaming context frame, and role="status" would make
+                             a screen reader announce that value repeatedly. app.js sets
+                             aria-label instead (updated only when it actually changes). -->
+                        <span id="tb-context-badge" class="tb-context-badge" tabindex="0" aria-label="Context usage">—</span>
                         <div id="context-tooltip"></div>
                     </div>
                 </div>

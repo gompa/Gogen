@@ -35,15 +35,29 @@ func TestSSEHTTPClientInheritsDefaultTransport(t *testing.T) {
 // inheritance for the non-streaming catalog client.
 func TestCatalogHTTPClientInheritsDefaultTransport(t *testing.T) {
 	t.Parallel()
-	tr, ok := newCatalogHTTPClient().Transport.(*http.Transport)
+	tr, ok := catalogBaseHTTPTransport(newCatalogHTTPClient())
 	if !ok {
-		t.Fatalf("Transport type = %T, want *http.Transport", newCatalogHTTPClient().Transport)
+		t.Fatalf("Transport type = %T, want *jsonSniffTransport around *http.Transport",
+			newCatalogHTTPClient().Transport)
 	}
 	assertDefaultTransportInherited(t, tr)
 }
 
+// catalogBaseHTTPTransport unwraps the catalog client's content-type sniffer
+// to the concrete *http.Transport underneath.
+func catalogBaseHTTPTransport(c *http.Client) (*http.Transport, bool) {
+	st, ok := c.Transport.(*jsonSniffTransport)
+	if !ok {
+		return nil, false
+	}
+	tr, ok := st.base.(*http.Transport)
+	return tr, ok
+}
+
 // assertDefaultTransportInherited checks the proxy/TLS knobs a bare
-// &http.Transport{} would leave unset while still disabling compression.
+// &http.Transport{} would leave unset. Compression is asserted per client:
+// the SSE client disables it, the catalog client must not (see
+// TestCatalogHTTPClientKeepsTransparentGzip).
 func assertDefaultTransportInherited(t *testing.T, tr *http.Transport) {
 	t.Helper()
 	if tr.Proxy == nil {
@@ -53,8 +67,37 @@ func assertDefaultTransportInherited(t *testing.T, tr *http.Transport) {
 	if tr.TLSHandshakeTimeout != def.TLSHandshakeTimeout {
 		t.Errorf("TLSHandshakeTimeout = %v, want %v", tr.TLSHandshakeTimeout, def.TLSHandshakeTimeout)
 	}
+}
+
+// TestSSEHTTPClientKeepsCompressionDisabled pins that the SSE client still
+// refuses compressed streams (gzip would make token delivery bursty).
+func TestSSEHTTPClientKeepsCompressionDisabled(t *testing.T) {
+	t.Parallel()
+	tr, ok := baseHTTPTransport(newSSEHTTPClient())
+	if !ok {
+		t.Fatal("expected *http.Transport under the SSE filter transport")
+	}
 	if !tr.DisableCompression {
 		t.Error("DisableCompression = false, want true")
+	}
+}
+
+// TestCatalogHTTPClientKeepsTransparentGzip pins that the catalog client
+// leaves compression ENABLED, unlike the SSE client: Go then advertises
+// Accept-Encoding and transparently decompresses, which is the only way to
+// read a catalog from a server that gzips the /models body unconditionally
+// (ai.h-bomb.nl does, even when Accept-Encoding is absent) — the
+// DisableCompression=true the catalog client used to inherit from the SSE
+// setup left the body as raw gzip, so the fetch failed regardless of the
+// Content-Type.
+func TestCatalogHTTPClientKeepsTransparentGzip(t *testing.T) {
+	t.Parallel()
+	tr, ok := catalogBaseHTTPTransport(newCatalogHTTPClient())
+	if !ok {
+		t.Fatal("expected *http.Transport under the catalog sniffer")
+	}
+	if tr.DisableCompression {
+		t.Error("DisableCompression = true, want false: the catalog client must decode a gzipped /models body")
 	}
 }
 

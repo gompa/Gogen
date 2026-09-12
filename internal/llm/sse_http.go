@@ -159,16 +159,26 @@ func newSSEHTTPClient() *http.Client {
 // newCatalogHTTPClient is for /v1/models and similar non-stream calls.
 // A hard client Timeout prevents startup/ListModels from sitting on the SSE
 // idle read deadline (default 30m) when a provider stalls after headers.
+// The transport normalizes a JSON body served under the wrong Content-Type
+// (see jsonSniffTransport), so a server that answers /models with
+// "text/plain; charset=utf-8" still yields a model list instead of
+// openai-go's opaque content-type error.
+//
+// Unlike the SSE client, compression stays ENABLED: some catalogs gzip the
+// /models body unconditionally, and the standard library only decodes a
+// gzipped response when the transport itself advertised Accept-Encoding
+// (which DisableCompression suppresses) — otherwise the body stays raw gzip
+// and fails to parse. Catalog responses never stream, so there is no
+// token-batching cost here.
 func newCatalogHTTPClient() *http.Client {
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	// Clone DefaultTransport (as propsHTTPClient does) so HTTPS_PROXY and
 	// TLSHandshakeTimeout apply; a bare &http.Transport{} bypasses the
 	// environment proxy and leaves the handshake unbounded.
 	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.DisableCompression = true
 	tr.DialContext = dialer.DialContext
 	return &http.Client{
 		Timeout:   modelsCatalogTimeout,
-		Transport: tr,
+		Transport: &jsonSniffTransport{base: tr},
 	}
 }
