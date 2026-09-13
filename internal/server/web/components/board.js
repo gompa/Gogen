@@ -23,6 +23,7 @@
 import { createPopover } from '/components/popover.js';
 import { icon } from '/components/icons.js';
 import { createModelThinkingPicker } from '/components/model-picker.js';
+import { storageGet, storageSet } from '/components/storage.js';
 
 let deps = null;
 
@@ -41,6 +42,19 @@ let boardDragId = null;
 // clears the mode (also called on every re-render, like the start
 // popover).
 let boardMoveId = null;
+// Per-column widths from the drag handle on each column's right edge,
+// persisted in localStorage so the layout survives reloads. Keyed by
+// column name; a missing entry keeps the responsive CSS default.
+let boardColumnWidths = {};
+try {
+    boardColumnWidths = JSON.parse(storageGet('board-col-widths') || '{}') || {};
+} catch (_) {
+    boardColumnWidths = {};
+}
+
+function saveBoardColumnWidths() {
+    storageSet('board-col-widths', JSON.stringify(boardColumnWidths));
+}
 
 function boardMoveCancel() {
     boardMoveId = null;
@@ -147,8 +161,12 @@ export function renderBoard() {
     const colsDiv = document.getElementById('board-columns');
     if (!colsDiv) return;
     colsDiv.innerHTML = '';
+    const emptyHint = document.getElementById('board-empty');
     const snap = lastBoardState;
-    if (!snap) return;
+    if (!snap) {
+        if (emptyHint) emptyHint.hidden = true;
+        return;
+    }
     const byColumn = new Map();
     for (const col of snap.columns) byColumn.set(col, []);
     for (const item of snap.items || []) {
@@ -158,12 +176,21 @@ export function renderBoard() {
     for (const col of snap.columns) {
         colsDiv.appendChild(buildBoardColumn(col, byColumn.get(col) || []));
     }
+    if (emptyHint) emptyHint.hidden = (snap.items || []).length !== 0;
 }
 
 function buildBoardColumn(name, items) {
     const col = document.createElement('div');
     col.className = 'board-column';
     col.dataset.column = name;
+    // A persisted width overrides the responsive CSS default; resizeColumn
+    // writes it back on drag.
+    const storedWidth = boardColumnWidths[name];
+    if (storedWidth) {
+        col.style.flex = `0 0 ${storedWidth}px`;
+        col.style.width = `${storedWidth}px`;
+        col.style.maxWidth = 'none';
+    }
     const header = document.createElement('div');
     header.className = 'board-column-header';
     const title = document.createElement('span');
@@ -203,6 +230,7 @@ function buildBoardColumn(name, items) {
         boardDragId = null;
     });
     col.appendChild(body);
+    attachColumnResize(col, name);
     return col;
 }
 
@@ -216,6 +244,7 @@ function currentCardColumn(id) {
 function buildBoardCard(item) {
     const card = document.createElement('div');
     card.className = 'board-card';
+    if (item.status === 'done') card.classList.add('board-card-done');
     card.draggable = true;
     card.dataset.itemId = item.id;
     card.addEventListener('dragstart', (e) => {
@@ -284,6 +313,13 @@ function buildBoardCard(item) {
         who.textContent = item.assignee;
         frags.push(who);
     }
+    if (item.status === 'in_review' && item.reviewSession) {
+        const badge = document.createElement('span');
+        badge.className = 'board-review-badge';
+        badge.textContent = item.reviewRounds > 1 ? `review ×${item.reviewRounds}` : 'review';
+        badge.title = 'A review agent is running for this ticket';
+        frags.push(badge);
+    }
     for (const f of frags) meta.appendChild(f);
     // Touch-only move button (shown via @media (hover: none)):
     // enters move mode for this card; the mode is cancelled by
@@ -310,6 +346,14 @@ function buildBoardCard(item) {
     });
     meta.appendChild(moveBtn);
     card.appendChild(meta);
+    // Blocked cards surface the most recent block reason under the meta row.
+    const blockReason = boardBlockReason(item);
+    if (blockReason) {
+        const reason = document.createElement('div');
+        reason.className = 'board-card-block-reason';
+        reason.textContent = blockReason;
+        card.appendChild(reason);
+    }
     // Start / open agent button: the first click opens the per-ticket
     // "Start agent" popover (model picker + pen-icon prompt editor)
     // instead of starting immediately; once the ticket's board_state
@@ -343,29 +387,347 @@ function buildBoardCard(item) {
         }
     }
     card.appendChild(startBtn);
-    // Click expands the detail (description + activity) inline.
+    // Click expands the detail (description + activity + inline actions).
+    const detail = buildBoardCardDetail(item);
+    card.appendChild(detail);
+    return card;
+}
+
+// buildBoardCardDetail builds a card's expanded panel: the description, the
+// activity tail, the inline comment box, and the edit/block/done actions
+// (the forms hidden until their button is clicked).
+function buildBoardCardDetail(item) {
     const detail = document.createElement('div');
     detail.className = 'board-card-detail';
     detail.hidden = true;
+    // Read-only description and context, swapped out for the edit form's
+    // fields while editing so the text is never shown twice.
+    const descEl = document.createElement('div');
+    descEl.className = 'board-card-desc';
     if (item.description) {
-        const d = document.createElement('div');
-        d.className = 'board-card-desc';
-        d.textContent = item.description;
-        detail.appendChild(d);
+        descEl.textContent = item.description;
+    } else {
+        descEl.classList.add('board-card-desc-empty');
+        descEl.textContent = 'No description';
     }
+    detail.appendChild(descEl);
+
+    let contextEl = null;
+    if (item.context) {
+        contextEl = document.createElement('div');
+        contextEl.className = 'board-card-context';
+        const label = document.createElement('span');
+        label.className = 'board-card-context-label';
+        label.textContent = 'Context';
+        const body = document.createElement('div');
+        body.className = 'board-card-context-body';
+        body.textContent = item.context;
+        contextEl.append(label, body);
+        detail.appendChild(contextEl);
+    }
+
+    // Inline edit form: it REPLACES the read-only fields in place (and hides
+    // the priority chip) rather than stacking a second copy below them.
+    let editForm;
+    let openEditForm;
+    const setEditing = (editing) => {
+        editForm.hidden = !editing;
+        descEl.hidden = editing;
+        if (contextEl) contextEl.hidden = editing;
+        editBtn.classList.toggle('active', editing);
+        const card = editBtn.closest('.board-card');
+        if (card) card.classList.toggle('board-editing', editing);
+    };
+    const closeEdit = () => setEditing(false);
+    const built = buildBoardEditForm(item, closeEdit);
+    editForm = built.el;
+    openEditForm = built.open;
+    editForm.hidden = true;
+    detail.appendChild(editForm);
+
     if (item.activity && item.activity.length) {
-        const acts = document.createElement('div');
-        acts.className = 'board-card-activity';
-        for (const act of item.activity.slice(-10)) {
-            const row = document.createElement('div');
-            row.className = 'board-activity-row';
-            row.textContent = `${act.at ? new Date(act.at).toLocaleString() : ''} ${act.by}: ${act.text}`;
-            acts.appendChild(row);
-        }
-        detail.appendChild(acts);
+        detail.appendChild(buildBoardActivity(item.activity));
     }
-    card.appendChild(detail);
-    return card;
+
+    // Comment box: a note on the ticket (the server's comment op).
+    const commentRow = document.createElement('div');
+    commentRow.className = 'board-card-comment';
+    const commentInput = document.createElement('textarea');
+    commentInput.className = 'board-card-input';
+    commentInput.rows = 2;
+    commentInput.placeholder = 'Add a comment…';
+    const commentBtn = boardDetailButton('Comment', () => {
+        const text = commentInput.value.trim();
+        if (!text) {
+            commentInput.focus();
+            return;
+        }
+        sendBoardOp({ action: 'comment', id: item.id, text });
+        commentInput.value = '';
+    });
+    commentRow.append(commentInput, commentBtn);
+    detail.appendChild(commentRow);
+
+    // Action row: Edit / Block / Done (Done hidden on done cards).
+    const actions = document.createElement('div');
+    actions.className = 'board-card-actions';
+    const editBtn = boardDetailButton('Edit', () => {
+        if (editForm.hidden) {
+            setEditing(true);
+            openEditForm();
+        } else {
+            closeEdit();
+        }
+    });
+    actions.appendChild(editBtn);
+    const blockForm = buildBoardBlockForm(item);
+    blockForm.hidden = true;
+    const blockBtn = boardDetailButton('Block', () => {
+        blockForm.hidden = !blockForm.hidden;
+        blockBtn.classList.toggle('active', !blockForm.hidden);
+    });
+    actions.appendChild(blockBtn);
+    if (item.status !== 'done') {
+        actions.appendChild(boardDetailButton('Done', () => {
+            sendBoardOp({ action: 'done', id: item.id });
+        }));
+    }
+    detail.appendChild(actions);
+    detail.appendChild(blockForm);
+    return detail;
+}
+
+// boardDetailButton builds a small action button for a card's detail panel.
+// It stops propagation so a click never toggles the card's expanded state.
+function boardDetailButton(label, onClick) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'board-card-action';
+    btn.textContent = label;
+    btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        onClick();
+    });
+    return btn;
+}
+
+// autoSizeTextarea grows a textarea to exactly fit its content (border-box),
+// so an editing field matches the height of the text it replaces instead of
+// showing its own scrollbar.
+function autoSizeTextarea(el) {
+    el.style.height = 'auto';
+    const style = window.getComputedStyle(el);
+    const border = (parseFloat(style.borderTopWidth) || 0) + (parseFloat(style.borderBottomWidth) || 0);
+    el.style.height = (el.scrollHeight + border) + 'px';
+}
+
+// buildBoardEditForm builds the inline edit form (title required; description,
+// context, priority) that stands in for the read-only fields while editing.
+// It returns the element plus an open() hook that re-fits the growing
+// textareas to their text (a hidden textarea reports no height, so the fit
+// must run after the form is shown). Save sends a full-replace update op;
+// both Save and Cancel hand the view back via close (Cancel restores the
+// original values first). Escape anywhere in the form cancels.
+function buildBoardEditForm(item, close) {
+    const form = document.createElement('div');
+    form.className = 'board-card-edit';
+    const title = document.createElement('input');
+    title.type = 'text';
+    title.className = 'board-card-input';
+    title.value = item.title || '';
+    title.placeholder = 'Title (required)';
+    title.autocomplete = 'off';
+    const desc = document.createElement('textarea');
+    desc.className = 'board-card-input board-card-edit-auto';
+    desc.rows = 1;
+    desc.value = item.description || '';
+    desc.placeholder = 'Description / acceptance criteria';
+    desc.addEventListener('input', () => autoSizeTextarea(desc));
+    // The {context} the started agent receives (merged ahead of the ticket's
+    // activity log).
+    const ctx = document.createElement('textarea');
+    ctx.className = 'board-card-input board-card-edit-auto';
+    ctx.rows = 1;
+    ctx.value = item.context || '';
+    ctx.placeholder = 'Context for the agent (optional)';
+    ctx.addEventListener('input', () => autoSizeTextarea(ctx));
+    const prio = document.createElement('select');
+    prio.className = 'board-card-input';
+    for (const [value, label] of [['', 'priority…'], ['low', 'low'], ['medium', 'medium'], ['high', 'high'], ['urgent', 'urgent']]) {
+        const opt = document.createElement('option');
+        opt.value = value;
+        opt.textContent = label;
+        prio.appendChild(opt);
+    }
+    prio.value = item.priority || '';
+    const save = boardDetailButton('Save', () => {
+        const trimmed = title.value.trim();
+        if (!trimmed) {
+            title.focus();
+            return;
+        }
+        sendBoardOp({
+            action: 'update',
+            id: item.id,
+            title: trimmed,
+            description: desc.value.trim(),
+            priority: prio.value,
+            context: ctx.value.trim(),
+        });
+        close();
+    });
+    save.classList.add('primary');
+    const cancel = boardDetailButton('Cancel', () => {
+        title.value = item.title || '';
+        desc.value = item.description || '';
+        ctx.value = item.context || '';
+        prio.value = item.priority || '';
+        close();
+    });
+    form.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+            e.stopPropagation();
+            cancel.click();
+        }
+    });
+    const row = document.createElement('div');
+    row.className = 'board-card-actions';
+    row.append(save, cancel);
+    form.append(title, desc, ctx, prio, row);
+    return { el: form, open: () => { autoSizeTextarea(desc); autoSizeTextarea(ctx); } };
+}
+
+// buildBoardBlockForm builds the inline block-reason form (Confirm sends a
+// block op; a reason is required).
+function buildBoardBlockForm(item) {
+    const form = document.createElement('div');
+    form.className = 'board-card-block';
+    const reason = document.createElement('textarea');
+    reason.className = 'board-card-input';
+    reason.rows = 2;
+    reason.placeholder = 'Why is this blocked?';
+    const go = boardDetailButton('Confirm block', () => {
+        const text = reason.value.trim();
+        if (!text) {
+            reason.focus();
+            return;
+        }
+        sendBoardOp({ action: 'block', id: item.id, reason: text });
+        reason.value = '';
+    });
+    go.classList.add('primary');
+    form.append(reason, go);
+    return form;
+}
+
+// buildBoardActivity renders the tail of a ticket's activity log (last 10
+// entries) with a relative timestamp and per-kind styling.
+function buildBoardActivity(activity) {
+    const box = document.createElement('div');
+    box.className = 'board-card-activity';
+    for (const act of activity.slice(-10)) {
+        const row = document.createElement('div');
+        row.className = 'board-activity-row kind-' + boardActivityKind(String(act.text || ''));
+        const time = document.createElement('span');
+        time.className = 'board-activity-time';
+        time.textContent = boardRelTime(act.at);
+        time.title = act.at ? new Date(act.at).toLocaleString() : '';
+        const who = document.createElement('span');
+        who.className = 'board-activity-who';
+        who.textContent = (act.by || '?') + ':';
+        const text = document.createElement('span');
+        text.className = 'board-activity-text';
+        text.textContent = ' ' + (act.text || '');
+        row.append(time, who, text);
+        box.appendChild(row);
+    }
+    return box;
+}
+
+// boardActivityKind classifies an activity entry for styling: block reasons,
+// column moves, review/agent-session events, generated transitions, and
+// everything else (comments).
+function boardActivityKind(text) {
+    const t = text.trim();
+    if (t.startsWith('blocked:')) return 'block';
+    if (t.startsWith('moved to ')) return 'move';
+    if (t.startsWith('review ') || t.startsWith('auto-review')) return 'review';
+    if (t.startsWith('agent session')) return 'agent';
+    if (t === 'created' || t === 'claimed' || t === 'marked done' || t.startsWith('edited')) return 'system';
+    return 'comment';
+}
+
+// boardRelTime formats an ISO timestamp as a short relative age ("5m ago"),
+// falling back to the locale date for anything older than a week.
+function boardRelTime(iso) {
+    if (!iso) return '';
+    const then = new Date(iso).getTime();
+    if (Number.isNaN(then)) return '';
+    const secs = Math.max(0, Math.round((Date.now() - then) / 1000));
+    if (secs < 45) return 'just now';
+    const mins = Math.round(secs / 60);
+    if (mins < 60) return mins + 'm ago';
+    const hours = Math.round(mins / 60);
+    if (hours < 24) return hours + 'h ago';
+    const days = Math.round(hours / 24);
+    if (days < 7) return days + 'd ago';
+    return new Date(iso).toLocaleDateString();
+}
+
+// boardBlockReason returns the most recent block reason for a blocked
+// ticket ("" when the card is not blocked or no reason is logged).
+function boardBlockReason(item) {
+    if (item.status !== 'blocked') return '';
+    const acts = item.activity || [];
+    for (let i = acts.length - 1; i >= 0; i--) {
+        const text = String(acts[i].text || '');
+        if (text.startsWith('blocked: ')) return text.slice('blocked: '.length);
+    }
+    return '';
+}
+
+// attachColumnResize adds the drag handle on a column's right edge. Widths
+// are clamped, persisted in localStorage (boardColumnWidths), and reset per
+// column by double-clicking the handle.
+function attachColumnResize(col, name) {
+    const handle = document.createElement('div');
+    handle.className = 'board-col-resize';
+    handle.title = 'Drag to resize — double-click to reset';
+    handle.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const startX = e.clientX;
+        const startWidth = col.getBoundingClientRect().width;
+        try { handle.setPointerCapture(e.pointerId); } catch (_) { /* unsupported */ }
+        document.body.classList.add('board-resizing');
+        const onMove = (ev) => {
+            const width = Math.max(160, Math.min(560, Math.round(startWidth + (ev.clientX - startX))));
+            col.style.flex = `0 0 ${width}px`;
+            col.style.width = `${width}px`;
+            col.style.maxWidth = 'none';
+        };
+        const onUp = () => {
+            handle.removeEventListener('pointermove', onMove);
+            handle.removeEventListener('pointerup', onUp);
+            handle.removeEventListener('pointercancel', onUp);
+            document.body.classList.remove('board-resizing');
+            boardColumnWidths[name] = Math.round(col.getBoundingClientRect().width);
+            saveBoardColumnWidths();
+        };
+        handle.addEventListener('pointermove', onMove);
+        handle.addEventListener('pointerup', onUp);
+        handle.addEventListener('pointercancel', onUp);
+    });
+    handle.addEventListener('dblclick', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        delete boardColumnWidths[name];
+        saveBoardColumnWidths();
+        col.style.flex = '';
+        col.style.width = '';
+        col.style.maxWidth = '';
+    });
+    col.appendChild(handle);
 }
 
 function initBoardTab() {
@@ -740,7 +1102,18 @@ function renderBoardStartPreview(item, template) {
         .replaceAll('{title}', item.title || '')
         .replaceAll('{description}', item.description || '')
         .replaceAll('{priority}', priority)
-        .replaceAll('{context}', boardStartContext(item.activity || []));
+        .replaceAll('{context}', boardStartCombinedContext(item));
+}
+
+// Mirrors the server's ticketContextBlock: the ticket's explicit context
+// followed by the activity-derived block (cosmetic preview only).
+function boardStartCombinedContext(item) {
+    const parts = [];
+    const explicit = String(item.context || '').trim();
+    if (explicit) parts.push(explicit);
+    const log = boardStartContext(item.activity || []);
+    if (log) parts.push(log);
+    return parts.join('\n\n');
 }
 
 // Mirrors the server's activityContext: the content-bearing

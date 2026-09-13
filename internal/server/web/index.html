@@ -13,7 +13,11 @@
          colors mirror --bg in styles.css (#131418 / #f7f8fa). -->
     <script>
         (function () {
-            var pref = localStorage.getItem('gogen-theme') || 'auto';
+            // Storage-blocked browsers (some in-app WebViews, hardened
+            // privacy modes) throw on localStorage access; fall back to the
+            // default theme rather than letting the bootstrap script error.
+            var pref = 'auto';
+            try { pref = localStorage.getItem('gogen-theme') || 'auto'; } catch (e) { /* storage blocked */ }
             var light = pref === 'light' || (pref === 'auto' && !!window.matchMedia && !window.matchMedia('(prefers-color-scheme: dark)').matches);
             if (light) document.documentElement.classList.add('light');
             var meta = document.querySelector('meta[name="theme-color"]');
@@ -23,6 +27,39 @@
     <title>GoGen AI Agent</title>
     <link rel="stylesheet" href="/styles.css">
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤖</text></svg>">
+    <!-- Module preload hints: app.js statically imports the modules below, so
+         without these the browser only discovers each one AFTER fetching and
+         parsing the importer — a request waterfall over the whole graph.
+         Preloading lets the browser fetch the entire static graph in parallel
+         before it runs app.js. Monaco and xterm are deliberately absent: they
+         are dynamically imported on demand (editor/terminal tabs), not part of
+         the static graph. Keep this list identical to the imports in
+         app.js / editor.js / components/*.js — scripts/test_modulepreload.js
+         fails if a statically imported module is missing here or a hint points
+         at a file that does not exist. -->
+    <link rel="modulepreload" href="/editor.js">
+    <link rel="modulepreload" href="/vendor/marked.esm.js">
+    <link rel="modulepreload" href="/vendor/dompurify.esm.js">
+    <link rel="modulepreload" href="/components/automations.js">
+    <link rel="modulepreload" href="/components/board.js">
+    <link rel="modulepreload" href="/components/composer.js">
+    <link rel="modulepreload" href="/components/delete-approval.js">
+    <link rel="modulepreload" href="/components/dialog.js">
+    <link rel="modulepreload" href="/components/icons.js">
+    <link rel="modulepreload" href="/components/markdown.js">
+    <link rel="modulepreload" href="/components/model-picker.js">
+    <link rel="modulepreload" href="/components/paint-skip.js">
+    <link rel="modulepreload" href="/components/palette.js">
+    <link rel="modulepreload" href="/components/popover.js">
+    <link rel="modulepreload" href="/components/scroll.js">
+    <link rel="modulepreload" href="/components/sessions.js">
+    <link rel="modulepreload" href="/components/settings-render.js">
+    <link rel="modulepreload" href="/components/settings-schema.js">
+    <link rel="modulepreload" href="/components/settings.js">
+    <link rel="modulepreload" href="/components/storage.js">
+    <link rel="modulepreload" href="/components/terminal.js">
+    <link rel="modulepreload" href="/components/toc.js">
+    <link rel="modulepreload" href="/components/tool-result.js">
 </head>
 <body>
     <!-- Icon sprite: referenced app-wide via <use href="#i-…"> (see
@@ -57,6 +94,10 @@
             <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></symbol>
             <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></symbol>
             <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13a1 1 0 0 0 1 .9h8a1 1 0 0 0 1-.9l1-13M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></symbol>
+            <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></symbol>
+            <symbol id="i-file" viewBox="0 0 24 24"><path d="M13 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z"/><path d="M13 3v6h6"/></symbol>
+            <symbol id="i-undo" viewBox="0 0 24 24"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></symbol>
+            <symbol id="i-redo" viewBox="0 0 24 24"><polyline points="15 14 20 9 15 4"/><path d="M4 20v-7a4 4 0 0 1 4-4h12"/></symbol>
         </defs>
     </svg>
     <div id="top-tabs">
@@ -206,6 +247,12 @@
                         <button type="button" id="btn-toggle-replace" title="Toggle replace (Ctrl+Shift+H)">Replace <svg class="icon"><use href="#i-chevron-down"></use></svg></button>
                     </div>
                     <input type="search" id="find-in-files-input" placeholder="Search codebase…" autocomplete="off">
+                    <!-- Search options: case-sensitivity toggle (default ON =
+                         match case, the server default) + include-glob filter. -->
+                    <div id="find-in-files-options">
+                        <button type="button" id="find-in-files-case" class="find-opt-toggle" aria-pressed="true" title="Match case (on) — click to ignore case" aria-label="Toggle case sensitivity">Aa</button>
+                        <input type="search" id="find-in-files-glob" placeholder="files to include (e.g. *.go)" autocomplete="off" aria-label="Include files matching glob">
+                    </div>
                     <div id="find-in-files-replace-row">
                         <input type="text" id="find-in-files-replace-input" placeholder="Replace…" autocomplete="off">
                         <div id="replace-buttons-row">
@@ -215,52 +262,93 @@
                     </div>
                     <div id="find-in-files-results"></div>
                 </div>
-                <h4>Files <button type="button" id="btn-refresh-explorer">Refresh</button></h4>
-                <div id="file-tree"></div>
+                <h4>Files
+                    <span class="tree-actions">
+                        <button type="button" id="btn-new-file" title="New file" aria-label="New file"><svg class="icon"><use href="#i-file"></use></svg></button>
+                        <button type="button" id="btn-collapse-tree" title="Collapse all folders" aria-label="Collapse all folders"><svg class="icon"><use href="#i-chevron-up"></use></svg></button>
+                        <button type="button" id="btn-refresh-explorer" title="Refresh" aria-label="Refresh file tree"><svg class="icon"><use href="#i-rotate"></use></svg></button>
+                    </span>
+                </h4>
+                <!-- Inline "new file" composer: revealed by #btn-new-file, a
+                     relative path (parent dirs are created server-side by
+                     fs_write → WriteFileAtomic). -->
+                <div id="new-file-row" hidden>
+                    <input type="text" id="new-file-input" placeholder="path/to/new-file.go" autocomplete="off" spellcheck="false" aria-label="New file path">
+                    <button type="button" id="new-file-create">Create</button>
+                    <button type="button" id="new-file-cancel" title="Cancel" aria-label="Cancel new file"><svg class="icon"><use href="#i-x"></use></svg></button>
+                </div>
+                <div id="file-tree" role="tree" aria-label="Workspace files"></div>
                 <div id="changes-wrap">
-                    <h4>Changes</h4>
+                    <h4>Changes <span id="changes-count" class="changes-count" hidden></span></h4>
                     <div id="changes-list"></div>
                 </div>
                 <div id="commit-composer">
-                    <h4>Commit</h4>
-                    <textarea id="commit-message" rows="3" placeholder="Commit message…"></textarea>
-                    <label id="stage-all-row" title="Stage all changes (including untracked files) before committing">
-                        <input type="checkbox" id="stage-all"> Stage all before commit
-                    </label>
-                    <div id="commit-buttons-row">
-                        <button type="button" id="btn-commit-ai" title="Generate a commit message from the staged diff with AI"><svg class="icon"><use href="#i-sparkle"></use></svg> AI</button>
-                        <button type="button" id="btn-commit" class="primary" title="Commit the staged changes">Commit</button>
-                        <button type="button" id="btn-push" title="Push the current branch to origin">Push</button>
+                    <h4>Commit
+                        <button type="button" id="commit-toggle" title="Collapse or expand the commit box" aria-label="Collapse or expand the commit box" aria-expanded="true" aria-controls="commit-body"><svg class="icon"><use href="#i-chevron-down"></use></svg></button>
+                    </h4>
+                    <!-- Body is hidden when #commit-composer carries .collapsed
+                         (editor.js, persisted in localStorage). -->
+                    <div id="commit-body">
+                        <textarea id="commit-message" rows="3" placeholder="Commit message…"></textarea>
+                        <label id="stage-all-row" title="Stage all changes (including untracked files) before committing">
+                            <input type="checkbox" id="stage-all"> Stage all before commit
+                        </label>
+                        <div id="commit-buttons-row">
+                            <button type="button" id="btn-commit-ai" title="Generate a commit message from the staged diff with AI"><svg class="icon"><use href="#i-sparkle"></use></svg> AI</button>
+                            <button type="button" id="btn-commit" class="primary" title="Commit the staged changes">Commit</button>
+                            <button type="button" id="btn-push" title="Push the current branch to origin">Push</button>
+                        </div>
                     </div>
                 </div>
             </div>
             <div class="sidebar-resize-handle" data-target="editor-sidebar" title="Drag to resize sidebar"></div>
             <div id="editor-main">
+                <!-- Two groups: the path (left, truncating) and the document
+                     actions (right). Diff-only controls live in the separate
+                     #editor-diff-toolbar below, so this row never reflows. -->
                 <div id="editor-toolbar">
-                    <!-- Mobile-only: opens the file explorer sidebar as an
-                         overlay drawer (styles.css / editor.js). -->
-                    <button type="button" id="editor-sidebar-toggle" title="Toggle file explorer" aria-label="Toggle file explorer"><svg class="icon"><use href="#i-menu"></use></svg></button>
-                    <span id="editor-path-label">No file open</span>
-                    <button type="button" id="btn-undo" title="Undo (Ctrl+Z)" disabled>Undo</button>
-                    <button type="button" id="btn-redo" title="Redo (Ctrl+Shift+Z)" disabled>Redo</button>
+                    <div class="toolbar-left">
+                        <!-- Mobile-only: opens the file explorer sidebar as an
+                             overlay drawer (styles.css / editor.js). -->
+                        <button type="button" id="editor-sidebar-toggle" title="Toggle file explorer" aria-label="Toggle file explorer"><svg class="icon"><use href="#i-menu"></use></svg></button>
+                        <span id="editor-path-label">No file open</span>
+                    </div>
+                    <div class="toolbar-right">
+                        <button type="button" id="btn-undo" class="toolbar-icon-btn" title="Undo (Ctrl+Z)" aria-label="Undo" disabled><svg class="icon"><use href="#i-undo"></use></svg></button>
+                        <button type="button" id="btn-redo" class="toolbar-icon-btn" title="Redo (Ctrl+Shift+Z)" aria-label="Redo" disabled><svg class="icon"><use href="#i-redo"></use></svg></button>
+                        <button type="button" id="btn-format" title="Format document (Shift+Alt+F)" disabled>Format</button>
+                        <button type="button" id="btn-save-file">Save</button>
+                        <button type="button" id="btn-save-all">Save all</button>
+                        <button type="button" id="btn-keys-help" class="toolbar-icon-btn" title="Keyboard shortcuts" aria-label="Keyboard shortcuts">?</button>
+                        <span id="save-all-loading">Saving…</span>
+                    </div>
+                </div>
+                <div id="editor-tabs"></div>
+                <!-- Diff-view controls, shown only while the diff pane is up
+                     (editor.js showDiffPane/showEditPane toggles hidden). -->
+                <div id="editor-diff-toolbar" hidden>
                     <button type="button" id="btn-diff-layout" title="Toggle DiffEditor side-by-side vs inline">Side-by-side</button>
                     <button type="button" id="btn-diff-prev" class="toolbar-icon-btn" title="Previous change" aria-label="Previous change" disabled><svg class="icon"><use href="#i-chevron-left"></use></svg></button>
                     <button type="button" id="btn-diff-next" class="toolbar-icon-btn" title="Next change" aria-label="Next change" disabled><svg class="icon"><use href="#i-chevron-right"></use></svg></button>
-                    <button type="button" id="btn-format" title="Format document (Shift+Alt+F)" disabled>Format</button>
-                    <button type="button" id="btn-save-file">Save</button>
-                    <button type="button" id="btn-save-all">Save all</button>
-                    <button type="button" id="btn-keys-help" class="toolbar-icon-btn" title="Keyboard shortcuts">?</button>
-                    <span id="save-all-loading">Saving…</span>
                 </div>
-                <div id="editor-tabs"></div>
                 <div id="monaco-wrap">
                     <div id="monaco-host"></div>
                     <div id="monaco-diff-host"></div>
                 </div>
+                <!-- Status bar: repo info on the left, cursor/document state on
+                     the right (the .status-spacer flexes between them). The
+                     branch span is filled from the last git_status reply; the
+                     document-state spans are hidden in diff mode / with no
+                     file open. -->
                 <div id="editor-statusbar">
-                    <span id="editor-status-lncol"></span>
-                    <span id="editor-status-lang"></span>
+                    <span id="editor-status-branch" hidden><svg class="icon"><use href="#i-fork"></use></svg><span id="editor-status-branch-name"></span></span>
                     <span id="editor-status-problems"></span>
+                    <span class="status-spacer"></span>
+                    <span id="editor-status-selection" hidden></span>
+                    <span id="editor-status-indent" hidden></span>
+                    <span id="editor-status-eol" hidden></span>
+                    <span id="editor-status-lang"></span>
+                    <span id="editor-status-lncol"></span>
                 </div>
             </div>
         </div>
@@ -274,7 +362,7 @@
                 </div>
                 <form id="board-add-form" hidden>
                     <input type="text" id="board-add-title" placeholder="Title (required)" autocomplete="off">
-                    <input type="text" id="board-add-desc" placeholder="Acceptance criteria / details" autocomplete="off">
+                    <textarea id="board-add-desc" placeholder="Acceptance criteria / details" rows="2"></textarea>
                     <select id="board-add-prio" aria-label="Priority">
                         <option value="">priority…</option>
                         <option value="low">low</option>
@@ -284,6 +372,7 @@
                     </select>
                     <button type="submit">Add</button>
                 </form>
+                <p id="board-empty" class="board-empty" hidden>No cards yet — use “+ New card” to add one.</p>
                 <div id="board-columns" class="board-columns"></div>
             </div>
         </div>
@@ -517,6 +606,8 @@
                     <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>O</kbd></td><td>Go to symbol in file (TS/JS/JSON/CSS/HTML)</td></tr>
                     <tr><td><kbd>Alt</kbd>+<kbd>Click</kbd></td><td>Multiple cursors</td></tr>
                     <tr><td><kbd>Ctrl</kbd>+<kbd>`</kbd></td><td>Toggle terminal</td></tr>
+                    <tr><td><kbd>Ctrl</kbd>+<kbd>PageDown</kbd> / <kbd>PageUp</kbd></td><td>Next / previous editor tab</td></tr>
+                    <tr><td><kbd>←</kbd> / <kbd>→</kbd> (tab focused)</td><td>Move between open file tabs</td></tr>
                     <tr><td>Hover</td><td>View type info / errors</td></tr>
                     <tr><td>Right-click</td><td>Context menu (go to def, rename, add reference to chat…)</td></tr>
                 </tbody>
@@ -535,6 +626,18 @@
     <div id="toc-tooltip" aria-hidden="true">
         <div id="toc-tooltip-label"></div>
         <div id="toc-tooltip-body"></div>
+    </div>
+    <!-- Editor tab context menu: opened by right-clicking a file tab
+         (editor.js openTabMenu), positioned fixed at the pointer and clamped
+         to the viewport. Rows carry a data-action the delegated listener
+         dispatches; bulk actions keep dirty tabs (or confirm once). -->
+    <div id="tab-context-menu" role="menu" aria-label="File tab actions" hidden>
+        <button type="button" class="tab-menu-row" role="menuitem" data-action="close">Close</button>
+        <button type="button" class="tab-menu-row" role="menuitem" data-action="close-others">Close others</button>
+        <button type="button" class="tab-menu-row" role="menuitem" data-action="close-saved">Close saved</button>
+        <button type="button" class="tab-menu-row" role="menuitem" data-action="close-all">Close all</button>
+        <div class="tab-menu-sep" role="separator"></div>
+        <button type="button" class="tab-menu-row" role="menuitem" data-action="copy-path">Copy path</button>
     </div>
     <div id="toast-host" aria-live="polite"></div>
     <!-- Screen-reader announcements: turn lifecycle is announced here

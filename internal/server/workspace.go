@@ -85,6 +85,11 @@ type Workspace struct {
 	jobNotices         bool
 	jobNoticeDeliverer func(agentID, summary string)
 
+	// terminalEnabled mirrors the config terminal flag (config-only, set at
+	// construction). Every session agent spawned by NewSessionAgent is seeded
+	// with it, so the persistent-terminal feature tools are on/off uniformly.
+	terminalEnabled bool
+
 	// BoardChangedHook is invoked after any board mutation made through a
 	// session agent's board tool, with the mutation's output message; the
 	// web server sets it to broadcast a fresh board_state and a success
@@ -515,6 +520,7 @@ func (ws *Workspace) NewSessionAgent(snap *agent.SessionSnapshot, id string) *ag
 		SkillsManager:        ws.skillsManager,
 		InstructionsEnabled:  runtimeCfg.AgentInstructionsEnabled(),
 		SubagentSpawner:      ws.SubagentSpawner,
+		TerminalEnabled:      ws.terminalEnabled,
 	}
 	a := agent.NewSessionAgent(opts, snap, id)
 	a.SetOnBoardChanged(ws.BoardChangedHook)
@@ -562,6 +568,7 @@ func newWorkspaceFromAgent(a *agent.Agent, cfg *config.Config) *Workspace {
 		ThinkingLevel:        string(a.ThinkingLevel),
 		WorkingDir:           a.Executor.GetWorkingDir(),
 		jobNotices:           cfg != nil && cfg.JobNoticesEnabled(),
+		terminalEnabled:      cfg != nil && cfg.TerminalEnabled(),
 		OpenAIProviders:      providerListFromConfig(cfg),
 		runtime:              runtimeSeed(cfg),
 	}

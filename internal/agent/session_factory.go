@@ -63,6 +63,10 @@ type SessionAgentOptions struct {
 	// disabled). Skills is config-only in v1: the flag and manager are set
 	// once at construction, never toggled live.
 	SkillsManager *skills.Manager
+	// TerminalEnabled enables the persistent-terminal feature tools
+	// (the terminal tool's open/send/read/signal/list/close actions and
+	// bash_persistent). Config-only in v1, seeded at construction.
+	TerminalEnabled bool
 	// SubagentSpawner runs nested sessions (nil when unavailable; the
 	// subagent tool additionally requires the feature flag).
 	SubagentSpawner SubagentSpawner
@@ -124,6 +128,7 @@ func NewSessionAgent(opts SessionAgentOptions, snap *SessionSnapshot, id string)
 	if opts.SkillsManager != nil {
 		a.SetSkillsEnabled(true)
 	}
+	a.SetTerminalEnabled(opts.TerminalEnabled)
 	a.SetSubagentSpawner(opts.SubagentSpawner)
 	if snap != nil {
 		a.RestoreSession(*snap, id)

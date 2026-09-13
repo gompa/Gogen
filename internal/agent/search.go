@@ -63,9 +63,11 @@ func shouldSkipSearchEntry(name string, isDir bool) bool {
 	return strings.HasPrefix(name, ".") && name != "."
 }
 
-// SearchCodeMatches returns structured matches (context_lines=0) for UI find-in-files.
+// SearchCodeMatches returns structured matches (context_lines=0) for UI
+// find-in-files. When ignoreCase is true, matching ignores letter case (rg -i
+// / a (?i)-prefixed regex), the same semantics SearchCode uses.
 // truncated is true when the result set hit search caps.
-func (e *Executor) SearchCodeMatches(ctx context.Context, pattern, subpath, glob string) (matches []SearchMatch, truncated bool, err error) {
+func (e *Executor) SearchCodeMatches(ctx context.Context, pattern, subpath, glob string, ignoreCase bool) (matches []SearchMatch, truncated bool, err error) {
 	if err := validateSearchArgs(pattern, glob); err != nil {
 		return nil, false, err
 	}
@@ -81,7 +83,7 @@ func (e *Executor) SearchCodeMatches(ctx context.Context, pattern, subpath, glob
 	}
 	// Structured results for the UI: skipped subtrees are not surfaced here
 	// (nil skips); SearchCode carries the footer for the model.
-	matches, truncated, _, err = e.searchStructured(ctx, searchRoot, relPrefix, pattern, glob, false, nil)
+	matches, truncated, _, err = e.searchStructured(ctx, searchRoot, relPrefix, pattern, glob, ignoreCase, nil)
 	return matches, truncated, err
 }
 

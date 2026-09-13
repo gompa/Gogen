@@ -42,6 +42,16 @@ func (a *Agent) SetToolHandlers(handlers map[string]ToolHandler) {
 	a.toolMu.Unlock()
 }
 
+// mcpToolsPresent reports whether an MCP tool registry is attached. It is
+// the predicate behind the system-prompt MCP hint (buildSystemSuffix), so the
+// prompt and the model-facing MCP tool set (llmTools / AllowedToolNames, both
+// of which read MCPRegistry directly) agree: no registry → neither tools nor
+// hint. The registry is attached only once MCP init succeeds (mcp: on plus at
+// least one valid server), and that can land after the first turn.
+func (a *Agent) mcpToolsPresent() bool {
+	return a.MCPRegistry != nil
+}
+
 // mcpRegistryHas reports whether the attached MCP registry exposes a tool
 // with the given name (nil-safe). Distinct from isMCPTool, which detects
 // the "mcp_" name prefix; this checks the actual registered tool set, so a
@@ -112,6 +122,17 @@ func (a *Agent) featureTools() []featureTool {
 		// plan-mode allowed like the board (the model can consult skills
 		// while planning).
 		out = append(out, featureTool{Name: "skill", Definition: skillsToolDef(), Handler: handleSkill, PlanAllowed: true})
+	}
+	if a.TerminalEnabled() {
+		// Persistent terminal: one owner-scoped PTY tool with an action enum
+		// (open/send/read/signal/list/close) plus the opt-in persistent
+		// shell. Both are act-mode only (they run commands / mutate session
+		// state), so neither sets PlanAllowed. Ordered so the model-facing
+		// definition list is deterministic.
+		out = append(out,
+			featureTool{Name: "terminal", Definition: terminalToolDef(), Handler: handleTerminal},
+			featureTool{Name: "bash_persistent", Definition: bashPersistentToolDef(), Handler: handleBashPersistent},
+		)
 	}
 	return out
 }

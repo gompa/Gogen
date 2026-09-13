@@ -24,7 +24,7 @@
 const fs = require('fs');
 const path = require('path');
 const { JSDOM } = require('/tmp/gogen-jsdom/node_modules/jsdom');
-const { ROOT, stripModuleSyntax } = require('./web-harness');
+const { ROOT, stripModuleSyntax, installStorage } = require('./web-harness');
 
 let failures = 0;
 function check(cond, msg) {
@@ -66,6 +66,7 @@ let src = fs.readFileSync(path.join(ROOT, 'internal/server/web/editor.js'), 'utf
 const MODULE_LINE = 'let monaco = null;';
 check(src.includes(MODULE_LINE), 'editor.js still initializes the module-local monaco');
 src = src.replace(MODULE_LINE, 'let monaco = window.__fakeMonaco || null;');
+installStorage(window); // editor.js reads persisted prefs at top level
 window.eval(stripModuleSyntax(src));
 const { updateDiffEditor, diffLineNumbers, makeDiffNumsCache } = window;
 check(typeof updateDiffEditor === 'function', 'updateDiffEditor loaded from real editor.js');

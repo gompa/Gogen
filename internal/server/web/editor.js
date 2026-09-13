@@ -1,8 +1,20 @@
 // Monaco editor workspace for GoGen web UI.
+// DOMPurify here is the SAME module instance components/markdown.js imports:
+// both use this identical root-absolute specifier, and the ESM module map is
+// keyed by resolved URL, so the editor path adds no second fetch/evaluation
+// of the 28.8 KB (≈11 KB gzip) vendor file. It is needed for the sanitized
+// Monaco colorize output (cachedColorize / enqueueColorize), and the chat
+// path needs it anyway (markdown.js sanitizes every message body), so it
+// stays a static import rather than a lazy one. See index.html's
+// modulepreload hint and scripts/test_modulepreload.js (board #101).
 import DOMPurify from '/vendor/dompurify.esm.js';
 // Shared decision-dialog plumbing (components/dialog.js). It imports this
 // module's openModal/closeModal — a safe ESM cycle, see dialog.js's header.
 import { openDialog } from '/components/dialog.js';
+// Safe localStorage access (see storage.js): reads of persisted prefs below
+// run at module top level, where an unguarded access would throw in a
+// storage-blocked browser and abort the import graph.
+import { storageGet, storageSet } from '/components/storage.js';
 
 let monaco = null;
 
@@ -30,7 +42,7 @@ export const GOGEN_UI = {
   // to the EDITOR pane's git-diff view only — chat tool-card diffs are
   // always unified and use the separate "Chat diff viewer" setting.
   // Persisted so the choice survives reloads.
-  diffRenderSideBySide: localStorage.getItem('gogen_diff_layout') !== 'inline',
+  diffRenderSideBySide: storageGet('gogen_diff_layout') !== 'inline',
   maxOpenTabs: 20,
 };
 
@@ -49,10 +61,22 @@ const chatEditors = new Set(); // disposable Monaco editors in chat tool cards
 let toastFn = null;
 let searchDebounceTimer = null;
 let searchGen = 0;
+// Find-in-files options (persisted): findCaseSensitive is the "Match case"
+// toggle (default ON, matching the server's default case-sensitive search);
+// findGlob is the include-files filter sent as the fs_search glob.
+let findCaseSensitive = storageGet('gogen_find_case') !== '0';
+let findGlob = storageGet('gogen_find_glob') || '';
 let diffStatText = ''; // "+N −M" summary for the unstaged-diff pane
 let diffChangeCount = 0; // number of hunks in the unstaged-diff pane (nav buttons)
 let refDecorationIds = []; // range-highlight decorations from chat references
 const markerCounts = new Map(); // path -> { errors, warnings }
+// Branch/upstream/ahead/behind from the last git_status reply, shown in the
+// status bar. refreshGitStatus fills it; null when there is no repo or the
+// last status call failed.
+let gitBranch = null;
+// The path the currently-open tab context menu was opened on (null while the
+// menu is closed). Set by openTabMenu; consumed by runTabMenuAction.
+let tabMenuPath = null;
 // Paths of folders currently expanded in the editor's file tree. The tree is
 // rebuilt from scratch by refreshExplorer (socket reconnect, pane switch,
 // refresh button); only this set survives a rebuild — loadTree restores
@@ -806,7 +830,7 @@ function appendUnifiedDiffDecorations(ed, fromLine, regrowLine) {
 
 // ── Editor preferences (settings modal ↔ Monaco options) ──
 function getEditorPrefs() {
-  const ls = (key, dflt) => localStorage.getItem(key) || dflt;
+  const ls = (key, dflt) => storageGet(key) || dflt;
   let fontSize = parseInt(ls('gogen_editor_fontsize', ''), 10);
   if (!Number.isFinite(fontSize) || fontSize < 8 || fontSize > 32) fontSize = 13;
   return {
@@ -861,7 +885,13 @@ function ensureEditors() {
         refDecorationIds = editor.deltaDecorations(refDecorationIds, []);
       }
     });
-    editor.onDidChangeCursorPosition(() => updateStatusBar());
+    // onDidChangeCursorSelection fires for both cursor moves and selection
+    // changes, so it drives the Ln/Col and "N selected" readouts together.
+    editor.onDidChangeCursorSelection(() => updateStatusBar());
+    // detectIndentation can change tabSize/insertSpaces after the first edit;
+    // reflect that in the indent readout. Guarded because the standalone
+    // editor API does not document this event on every build.
+    if (editor.onDidChangeModelOptions) editor.onDidChangeModelOptions(() => updateStatusBar());
     editor.onDidChangeModel(() => {
       // Model switch invalidates any reference-highlight decoration ids.
       refDecorationIds = [];
@@ -971,6 +1001,8 @@ function showEditPane() {
   const diffHost = $('monaco-diff-host');
   if (host) host.style.display = 'block';
   if (diffHost) diffHost.style.display = 'none';
+  const diffBar = $('editor-diff-toolbar');
+  if (diffBar) diffBar.hidden = true;
   if (diffEditor) {
     // Keep models; just hide
   }
@@ -983,6 +1015,8 @@ function showDiffPane() {
   const diffHost = $('monaco-diff-host');
   if (host) host.style.display = 'none';
   if (diffHost) diffHost.style.display = 'block';
+  const diffBar = $('editor-diff-toolbar');
+  if (diffBar) diffBar.hidden = false;
   if (!diffEditor) {
     diffEditor = monaco.editor.createDiffEditor(diffHost, {
       automaticLayout: true,
@@ -1047,15 +1081,14 @@ function updatePathLabel() {
   }
 }
 
-// Cheap per-keystroke path: mutate only the active tab's dirty marker and
-// the path label instead of rebuilding the whole tab strip (renderTabs).
+// Cheap per-keystroke path: mutate only the active tab's dirty dot and the
+// path label instead of rebuilding the whole tab strip (renderTabs).
 function updateDirtyState() {
   if (mode === 'edit' && activePath) {
     const strip = $('editor-tabs');
-    const name = strip && strip.querySelector('.file-tab.active .file-tab-name');
-    if (name) {
-      const text = (isDirty(activePath) ? '* ' : '') + basename(activePath);
-      if (name.textContent !== text) name.textContent = text;
+    const active = strip && strip.querySelector('.file-tab.active');
+    if (active) {
+      active.classList.toggle('dirty', isDirty(activePath));
     }
   }
   updatePathLabel();
@@ -1066,6 +1099,8 @@ function updateDirtyIndicators() {
   renderTabs();
   updatePathLabel();
   updateUndoRedoButtons();
+  // Keep the tree's active-file highlight in step with the active path.
+  highlightActiveTreeRow();
 }
 
 function updateUndoRedoButtons() {
@@ -1122,28 +1157,66 @@ function renderTabs() {
   const strip = $('editor-tabs');
   if (!strip) return;
   strip.innerHTML = '';
+  strip.setAttribute('role', 'tablist');
   for (const path of openOrder) {
+    // The active tab stays highlighted in diff mode too, with an accent
+    // underline (.diffing) so it reads as "viewing diff", not "editing".
+    const isActive = path === activePath;
     const tab = document.createElement('div');
-    tab.className = 'file-tab' + (path === activePath && mode === 'edit' ? ' active' : '');
+    tab.className = 'file-tab'
+      + (isActive ? ' active' : '')
+      + (isActive && mode === 'diff' ? ' diffing' : '');
     tab.title = path;
+    tab.dataset.path = path;
+    // Roving-tabindex tablist: only the active tab is in the Tab order;
+    // Left/Right arrows move between tabs (setupEditorUI).
+    tab.setAttribute('role', 'tab');
+    tab.tabIndex = isActive ? 0 : -1;
+    tab.setAttribute('aria-selected', isActive ? 'true' : 'false');
+    tab.classList.toggle('dirty', isDirty(path));
     const name = document.createElement('span');
     name.className = 'file-tab-name';
-    name.textContent = (isDirty(path) ? '* ' : '') + basename(path);
+    name.textContent = basename(path);
+    const dot = document.createElement('span');
+    dot.className = 'file-tab-dot';
+    dot.setAttribute('aria-hidden', 'true');
     const close = document.createElement('button');
     close.className = 'file-tab-close';
     close.type = 'button';
     close.textContent = '×';
     close.title = 'Close';
+    close.tabIndex = -1;
+    close.setAttribute('aria-label', `Close ${basename(path)}`);
     close.onclick = (e) => {
       e.stopPropagation();
       closeTab(path);
     };
     tab.appendChild(name);
+    tab.appendChild(dot);
     const badge = bufferBadge(path);
     if (badge) tab.appendChild(badge);
     tab.appendChild(close);
     tab.onclick = () => activatePath(path);
+    // Middle-click closes (desktop-editor convention). The mousedown
+    // preventDefault suppresses the middle-click autoscroll.
+    tab.addEventListener('mousedown', (e) => {
+      if (e.button === 1) e.preventDefault();
+    });
+    tab.addEventListener('auxclick', (e) => {
+      if (e.button !== 1) return;
+      e.preventDefault();
+      closeTab(path);
+    });
+    tab.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      openTabMenu(path, e.clientX, e.clientY);
+    });
     strip.appendChild(tab);
+  }
+  // Keep the active tab visible when the strip overflows horizontally.
+  const active = strip.querySelector('.file-tab.active');
+  if (active && typeof active.scrollIntoView === 'function') {
+    try { active.scrollIntoView({ inline: 'nearest', block: 'nearest' }); } catch (_) { /* jsdom */ }
   }
 }
 
@@ -1235,28 +1308,83 @@ function renderProblemsText(probs) {
   }
 }
 
-/** Update the Ln/Col, language and problems readout in the status bar. */
+/**
+ * Render the branch/ahead/behind readout from the last git_status reply.
+ * Hidden when there is no repo, no branch, or the last status call failed.
+ */
+function renderStatusBranch() {
+  const wrap = $('editor-status-branch');
+  const name = $('editor-status-branch-name');
+  if (!wrap || !name) return;
+  const info = gitBranch;
+  if (!info || !info.branch) {
+    wrap.hidden = true;
+    wrap.title = '';
+    name.textContent = '';
+    return;
+  }
+  let text = info.branch;
+  const ab = [];
+  if (info.ahead > 0) ab.push(`↑${info.ahead}`);
+  if (info.behind > 0) ab.push(`↓${info.behind}`);
+  if (ab.length) text += ' ' + ab.join(' ');
+  name.textContent = text;
+  wrap.hidden = false;
+  wrap.title = info.upstream ? `${info.branch} → ${info.upstream}` : info.branch;
+}
+
+/** Update the branch, cursor, selection, document and problems readout. */
 function updateStatusBar() {
+  renderStatusBranch();
   const lncol = $('editor-status-lncol');
   const lang = $('editor-status-lang');
   const probs = $('editor-status-problems');
-  if (mode === 'diff') {
-    // The edit editor is hidden while viewing a diff; its cursor position and
-    // language would be misleading. Show the diff file's problems only.
-    if (lncol) lncol.textContent = '';
-    if (lang) lang.textContent = 'diff';
-    if (probs) renderProblemsText(probs);
-    return;
-  }
+  const sel = $('editor-status-selection');
+  const indent = $('editor-status-indent');
+  const eol = $('editor-status-eol');
+
+  // In diff mode the edit editor is hidden: its cursor, selection, indent and
+  // EOL would describe a different document than the diff on screen. Show the
+  // diff file's language and problems only.
+  const model = mode === 'diff' || !editor ? null : editor.getModel();
+
   if (lncol) {
-    const pos = editor && editor.getModel() ? editor.getPosition() : null;
+    const pos = model ? editor.getPosition() : null;
     lncol.textContent = pos ? `Ln ${pos.lineNumber}, Col ${pos.column}` : '';
   }
   if (lang) {
-    const model = editor && editor.getModel();
-    lang.textContent = model ? model.getLanguageId() : '';
+    lang.textContent = mode === 'diff' ? 'diff' : (model ? model.getLanguageId() : '');
   }
   if (probs) renderProblemsText(probs);
+
+  // Selection: a single-line selection shows its character count; a
+  // multi-line one shows its line count. Neither materializes the selected
+  // text, so selecting a whole large file stays cheap.
+  if (sel) {
+    const s = model ? editor.getSelection() : null;
+    let text = '';
+    if (s && !s.isEmpty()) {
+      text = s.startLineNumber === s.endLineNumber
+        ? `${s.endColumn - s.startColumn} selected`
+        : `${s.endLineNumber - s.startLineNumber + 1} lines selected`;
+    }
+    sel.textContent = text;
+    sel.hidden = !text;
+  }
+  if (indent) {
+    let text = '';
+    if (model) {
+      const opts = model.getOptions();
+      text = opts.insertSpaces ? `Spaces: ${opts.tabSize}` : `Tab Size: ${opts.tabSize}`;
+    }
+    indent.textContent = text;
+    indent.hidden = !text;
+  }
+  if (eol) {
+    const text = model ? (model.getEOL() === '\r\n' ? 'CRLF' : 'LF') : '';
+    eol.textContent = text;
+    eol.hidden = !text;
+  }
 }
 
 // Monaco standalone only ships formatting providers for the four language
@@ -1381,6 +1509,124 @@ function showCloseTabModal(filename) {
   });
 }
 
+// ── Tab context menu ──
+// Right-clicking a tab (renderTabs attaches the handler) opens a small
+// floating menu at the pointer. The bulk "close" actions only ever close
+// CLEAN tabs — a dirty tab is kept and reported, never silently discarded
+// (except "Close all", which asks once before discarding).
+
+/** Whether a tab-menu action would do anything for `path` (grey it out if not). */
+function tabMenuActionEnabled(action, path) {
+  switch (action) {
+    case 'close':
+    case 'copy-path':
+      return true;
+    case 'close-others':
+      return openOrder.length > 1;
+    case 'close-saved':
+      return openOrder.some((p) => !isDirty(p));
+    case 'close-all':
+      return openOrder.length > 0;
+    default:
+      return false;
+  }
+}
+
+/** Position and show the tab context menu for `path` at viewport (x, y). */
+function openTabMenu(path, x, y) {
+  const menu = $('tab-context-menu');
+  if (!menu) return;
+  tabMenuPath = path;
+  for (const row of menu.querySelectorAll('.tab-menu-row')) {
+    row.disabled = !tabMenuActionEnabled(row.dataset.action, path);
+  }
+  menu.hidden = false;
+  // Measure after showing, then clamp into the viewport so a tab near the
+  // right/bottom edge never pushes the menu off-screen.
+  const rect = menu.getBoundingClientRect();
+  const left = Math.max(8, Math.min(x, window.innerWidth - rect.width - 8));
+  const top = Math.max(8, Math.min(y, window.innerHeight - rect.height - 8));
+  menu.style.left = left + 'px';
+  menu.style.top = top + 'px';
+}
+
+function closeTabMenu() {
+  const menu = $('tab-context-menu');
+  if (menu) menu.hidden = true;
+  tabMenuPath = null;
+}
+
+// Close every clean tab matching `match`; dirty matching tabs are kept and
+// the count reported, so a bulk action can never discard unsaved edits.
+function closeCleanTabs(match) {
+  let kept = 0;
+  for (const p of [...openOrder]) {
+    if (!match(p)) continue;
+    if (isDirty(p)) { kept++; continue; }
+    disposeBuffer(p);
+  }
+  if (kept) toast(`Kept ${kept} tab(s) with unsaved changes`, 'info');
+}
+
+/** Copy a tab's full path, mirroring the Monaco "Copy Path" action. */
+function copyTabPath(path) {
+  if (!navigator.clipboard) {
+    toast('Clipboard unavailable', 'error');
+    return;
+  }
+  navigator.clipboard.writeText(path).then(
+    () => toast(`Copied ${basename(path)} path`, 'success'),
+    () => toast('Copy failed', 'error'),
+  );
+}
+
+/**
+ * One "discard N unsaved files?" confirmation for the Close all action,
+ * reusing the close-tab modal (only one modal is open at a time, so sharing
+ * its message element is safe).
+ */
+function confirmDiscardAll(n) {
+  return new Promise((resolve) => {
+    const overlay = document.getElementById('close-tab-overlay');
+    const filenameEl = document.getElementById('close-tab-filename');
+    if (!overlay) { resolve(window.confirm(`${n} files have unsaved changes. Discard and close all tabs?`)); return; }
+    filenameEl.textContent = `${n} open file(s) have unsaved changes that will be lost.`;
+    openDialog(overlay, {
+      confirm: 'close-tab-discard-btn',
+      cancel: 'close-tab-keep-btn',
+      onConfirm: () => resolve(true),
+      onCancel: () => resolve(false),
+    });
+  });
+}
+
+/** Run a tab-menu action against the tab the menu was opened on. */
+async function runTabMenuAction(action) {
+  const path = tabMenuPath;
+  closeTabMenu();
+  if (!path) return;
+  switch (action) {
+    case 'close':
+      closeTab(path);
+      return;
+    case 'close-others':
+      closeCleanTabs((p) => p !== path);
+      return;
+    case 'close-saved':
+      closeCleanTabs(() => true);
+      return;
+    case 'close-all': {
+      const dirty = openOrder.filter((p) => isDirty(p)).length;
+      if (dirty && !(await confirmDiscardAll(dirty))) return;
+      for (const p of [...openOrder]) disposeBuffer(p);
+      return;
+    }
+    case 'copy-path':
+      copyTabPath(path);
+      return;
+  }
+}
+
 function activatePath(path) {
   if (!buffers.has(path)) return;
   if (activePath && editor && mode === 'edit') {
@@ -1462,7 +1708,7 @@ export async function openFileAtLine(path, line, endLine) {
   // "Open & switch to editor" applies to file references opened from chat
   // (this is the chat entry point). Tree and find-in-files clicks call
   // openFile directly and must never switch panes or re-render the tree.
-  if (ok && localStorage.getItem('gogen_file_click_behavior') === 'open-switch') {
+  if (ok && storageGet('gogen_file_click_behavior') === 'open-switch') {
     switchToEditorPane();
   }
 }
@@ -1566,6 +1812,110 @@ async function openUnstagedDiff(path) {
   updateDirtyIndicators();
 }
 
+/** Icon markup from the index.html sprite (names here are static literals). */
+function iconSvg(name) {
+  return `<svg class="icon" aria-hidden="true"><use href="#i-${name}"></use></svg>`;
+}
+
+/** Visible tree rows (offsetParent is null while an ancestor folder is collapsed). */
+function visibleTreeRows() {
+  const tree = $('file-tree');
+  if (!tree) return [];
+  return [...tree.querySelectorAll('.tree-item')].filter((el) => el.offsetParent !== null);
+}
+
+/** Move the tree's roving tabindex + focus onto `row`. */
+function focusTreeRow(row) {
+  if (!row) return;
+  for (const r of visibleTreeRows()) r.tabIndex = -1;
+  row.tabIndex = 0;
+  row.focus();
+}
+
+/** Seed the roving tabindex so at least one row is reachable by Tab. */
+function seedTreeTabindex() {
+  const tree = $('file-tree');
+  if (!tree) return;
+  const rows = tree.querySelectorAll('.tree-item');
+  if (!rows.length || tree.querySelector('.tree-item[tabindex="0"]')) return;
+  rows[0].tabIndex = 0;
+}
+
+// Mirror the active editor file into the tree: tag its row, clear the old
+// one, keep it in view. The row exists only when its folder chain is expanded
+// (lazy tree), so a miss is a no-op.
+function highlightActiveTreeRow() {
+  const tree = $('file-tree');
+  if (!tree) return;
+  for (const el of tree.querySelectorAll('.tree-item')) {
+    const on = !!activePath && el.dataset.path === activePath;
+    el.classList.toggle('active', on);
+    el.setAttribute('aria-selected', on ? 'true' : 'false');
+    if (on && typeof el.scrollIntoView === 'function') {
+      try { el.scrollIntoView({ block: 'nearest' }); } catch (_) { /* jsdom */ }
+    }
+  }
+}
+
+/** Expand/collapse a folder row, updating its chevron and aria-expanded. */
+function setDirExpanded(row, child, chevron, ent, expand) {
+  child.style.display = expand ? 'block' : 'none';
+  row.setAttribute('aria-expanded', expand ? 'true' : 'false');
+  chevron.innerHTML = iconSvg(expand ? 'chevron-down' : 'chevron-right');
+  if (expand) expandedDirs.add(ent.path);
+  else expandedDirs.delete(ent.path);
+}
+
+/** Toggle a folder row, lazily loading its children on first open. */
+async function toggleDir(row, child, chevron, ent) {
+  const open = child.style.display !== 'none';
+  setDirExpanded(row, child, chevron, ent, !open);
+  if (!open && !child.dataset.loaded) {
+    child.dataset.loaded = '1';
+    await loadTree(ent.path, child);
+  }
+}
+
+// appendTreeRow builds one row (role=treeitem) and, for a folder, its lazily
+// loaded children container, appending both to `container`. It does NOT load
+// children itself — loadTree restores expansion so it can await.
+function appendTreeRow(container, ent) {
+  const row = document.createElement('div');
+  row.className = 'tree-item' + (ent.isDir ? ' dir' : ' file');
+  row.dataset.path = ent.path;
+  row.title = ent.path;
+  row.setAttribute('role', 'treeitem');
+  row.tabIndex = -1;
+  row.setAttribute('aria-selected', 'false');
+
+  const chevron = document.createElement('span');
+  chevron.className = 'tree-chevron';
+  const iconEl = document.createElement('span');
+  iconEl.className = 'tree-icon';
+  iconEl.innerHTML = iconSvg(ent.isDir ? 'folder' : 'file');
+  const label = document.createElement('span');
+  label.className = 'tree-label';
+  label.textContent = ent.name;
+  row.append(chevron, iconEl, label);
+
+  if (!ent.isDir) {
+    row.addEventListener('click', () => openFile(ent.path));
+    container.appendChild(row);
+    return { row, child: null };
+  }
+
+  const child = document.createElement('div');
+  child.className = 'tree-children';
+  child.setAttribute('role', 'group');
+  const expanded = expandedDirs.has(ent.path);
+  child.style.display = expanded ? 'block' : 'none';
+  row.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+  chevron.innerHTML = iconSvg(expanded ? 'chevron-down' : 'chevron-right');
+  row.addEventListener('click', () => { toggleDir(row, child, chevron, ent); });
+  container.append(row, child);
+  return { row, child };
+}
+
 async function loadTree(path, container) {
   container.innerHTML = '';
   let entries;
@@ -1581,41 +1931,77 @@ async function loadTree(path, container) {
     return a.name.localeCompare(b.name);
   });
   for (const ent of entries) {
-    const row = document.createElement('div');
-    row.className = 'tree-item' + (ent.isDir ? ' dir' : ' file');
-    row.textContent = (ent.isDir ? '📁 ' : '📄 ') + ent.name;
-    row.title = ent.path;
-    if (ent.isDir) {
-      const child = document.createElement('div');
-      child.className = 'tree-children';
-      child.style.display = 'none';
-      row.onclick = async () => {
-        const open = child.style.display !== 'none';
-        if (open) {
-          child.style.display = 'none';
-          expandedDirs.delete(ent.path);
-          return;
-        }
-        child.style.display = 'block';
-        expandedDirs.add(ent.path);
-        if (!child.dataset.loaded) {
-          child.dataset.loaded = '1';
-          await loadTree(ent.path, child);
-        }
-      };
-      container.appendChild(row);
-      container.appendChild(child);
-      // Rebuilds (refreshExplorer) wipe the DOM, so re-expand folders the
-      // user had open and lazily load their children, same as a click.
-      if (expandedDirs.has(ent.path)) {
-        child.style.display = 'block';
-        child.dataset.loaded = '1';
-        await loadTree(ent.path, child);
-      }
-    } else {
-      row.onclick = () => openFile(ent.path);
-      container.appendChild(row);
+    const { child } = appendTreeRow(container, ent);
+    // A rebuild (refreshExplorer) wipes the DOM; re-expand folders the user
+    // had open and lazily load their children, same as a click.
+    if (child && expandedDirs.has(ent.path) && !child.dataset.loaded) {
+      child.dataset.loaded = '1';
+      await loadTree(ent.path, child);
     }
+  }
+  seedTreeTabindex();
+  highlightActiveTreeRow();
+}
+
+/**
+ * Create an empty file at the path typed in the new-file row, then reveal and
+ * open it. Parent directories are created server-side (fs_write →
+ * WriteFileAtomic).
+ */
+async function createNewFile() {
+  const row = $('new-file-row');
+  const input = $('new-file-input');
+  if (!input) return;
+  const path = input.value.trim();
+  if (!path) {
+    input.focus();
+    return;
+  }
+  try {
+    await wsRequest('fs_write', { path, content: '' }, WS_REQUEST_SLOW_TIMEOUT_MS);
+  } catch (err) {
+    toast(`Create failed: ${err.message || 'write failed'}`, 'error');
+    return;
+  }
+  if (row) row.hidden = true;
+  input.value = '';
+  await refreshExplorer();
+  await openFile(path);
+  toast(`Created ${basename(path)}`, 'success');
+}
+
+/** Collapse every folder and rebuild the tree. */
+function collapseTree() {
+  expandedDirs.clear();
+  refreshExplorer().catch((e) => toast(e.message, 'error'));
+}
+
+/**
+ * changesBadge builds the colored status letter for a Changes row. `status` is the
+ * porcelain-v2 column code (M/A/D/R/C/T, or U for untracked/unmerged);
+ * `secCls` is the section class, so a conflict row's letter reads red.
+ */
+function changesBadge(status, secCls) {
+  const code = (status || '?').charAt(0);
+  const badge = document.createElement('span');
+  badge.className = 'changes-badge changes-badge-' + code.toLowerCase();
+  if (secCls === 'conflict') badge.classList.add('changes-badge-conflict');
+  badge.textContent = code;
+  badge.title = changesStatusTitle(code);
+  return badge;
+}
+
+/** Human-readable label for a porcelain status code (tooltip). */
+function changesStatusTitle(code) {
+  switch (code) {
+    case 'M': return 'Modified';
+    case 'A': return 'Added';
+    case 'D': return 'Deleted';
+    case 'R': return 'Renamed';
+    case 'C': return 'Copied';
+    case 'T': return 'Type changed';
+    case 'U': return 'Untracked / unmerged';
+    default: return 'Changed';
   }
 }
 
@@ -1625,6 +2011,17 @@ async function refreshGitStatus() {
   list.innerHTML = '';
   try {
     const data = await wsRequest('git_status', {}, WS_REQUEST_SLOW_TIMEOUT_MS);
+    // Capture the branch readout for the status bar (present only in the v2
+    // payload). The clean-tree early return below must still publish it.
+    gitBranch = data.gitStatus
+      ? {
+          branch: data.gitStatus.branch,
+          upstream: data.gitStatus.upstream,
+          ahead: data.gitStatus.ahead,
+          behind: data.gitStatus.behind,
+        }
+      : null;
+    renderStatusBranch();
     // v2 payload: pre-bucketed lists (the client never sees the XY matrix).
     // Fall back to the legacy flat list (Unstaged+Untracked) if a stale
     // server predates gitStatus.
@@ -1639,6 +2036,15 @@ async function refreshGitStatus() {
       ];
     } else {
       sections = [{ title: 'Changes', entries: data.gitEntries || [] }];
+    }
+    // Header count: unique paths (a partially staged file appears in both
+    // Staged and Unstaged but counts once).
+    const uniquePaths = new Set();
+    for (const sec of sections) for (const ent of sec.entries) uniquePaths.add(ent.path);
+    const countEl = $('changes-count');
+    if (countEl) {
+      countEl.textContent = uniquePaths.size ? String(uniquePaths.size) : '';
+      countEl.hidden = uniquePaths.size === 0;
     }
     if (!sections.some((s) => s.entries.length)) {
       list.textContent = 'Working tree clean';
@@ -1657,9 +2063,24 @@ async function refreshGitStatus() {
         row.className = 'changes-item';
         const label = document.createElement('span');
         label.className = 'changes-item-label';
-        label.textContent = `${ent.status}  ${ent.path}`;
         label.title = ent.path;
         label.onclick = () => openUnstagedDiff(ent.path);
+        label.appendChild(changesBadge(ent.status, sec.cls));
+        // Directory dimmed, basename bright — the path truncates as a unit.
+        const pathEl = document.createElement('span');
+        pathEl.className = 'changes-path';
+        const slash = ent.path.lastIndexOf('/');
+        if (slash >= 0) {
+          const dirEl = document.createElement('span');
+          dirEl.className = 'changes-path-dir';
+          dirEl.textContent = ent.path.slice(0, slash + 1);
+          pathEl.appendChild(dirEl);
+        }
+        const baseEl = document.createElement('span');
+        baseEl.className = 'changes-path-base';
+        baseEl.textContent = slash >= 0 ? ent.path.slice(slash + 1) : ent.path;
+        pathEl.appendChild(baseEl);
+        label.appendChild(pathEl);
         row.appendChild(label);
         const btn = document.createElement('button');
         btn.type = 'button';
@@ -1687,6 +2108,14 @@ async function refreshGitStatus() {
       list.appendChild(wrap);
     }
   } catch (err) {
+    // A failed status call (no repo, git error) has no reliable branch.
+    gitBranch = null;
+    renderStatusBranch();
+    const countEl = $('changes-count');
+    if (countEl) {
+      countEl.textContent = '';
+      countEl.hidden = true;
+    }
     list.textContent = err.message;
   }
 }
@@ -1858,6 +2287,15 @@ function switchToEditorPane() {
   }
 }
 
+/** Reflect the current find-in-files case mode on the toggle button. */
+function syncFindCaseButton() {
+  const btn = $('find-in-files-case');
+  if (!btn) return;
+  btn.setAttribute('aria-pressed', findCaseSensitive ? 'true' : 'false');
+  btn.classList.toggle('active', findCaseSensitive);
+  btn.title = findCaseSensitive ? 'Match case (on) — click to ignore case' : 'Ignore case — click to match case';
+}
+
 async function runFindInFiles(pattern) {
   const results = $('find-in-files-results');
   if (!results) return;
@@ -1868,42 +2306,128 @@ async function runFindInFiles(pattern) {
   }
   const gen = ++searchGen;
   results.textContent = 'Searching…';
+  const globInput = $('find-in-files-glob');
+  const glob = globInput ? globInput.value.trim() : '';
+  const ignoreCase = !findCaseSensitive;
   try {
-    const data = await wsRequest('fs_search', { pattern: q }, WS_REQUEST_SLOW_TIMEOUT_MS);
+    const data = await wsRequest('fs_search', { pattern: q, glob, ignoreCase }, WS_REQUEST_SLOW_TIMEOUT_MS);
     if (gen !== searchGen) return;
-    const matches = data.matches || [];
-    results.innerHTML = '';
-    if (!matches.length) {
-      results.textContent = 'No matches';
-      return;
-    }
-    if (data.truncated) {
-      const note = document.createElement('div');
-      note.className = 'search-note';
-      note.textContent = 'Results truncated';
-      results.appendChild(note);
-    }
-    for (const m of matches) {
-      const row = document.createElement('div');
-      row.className = 'search-result';
-      row.title = `${m.path}:${m.line}`;
-      const loc = document.createElement('div');
-      loc.className = 'search-result-loc';
-      loc.textContent = `${m.path}:${m.line}`;
-      const text = document.createElement('div');
-      text.className = 'search-result-text';
-      text.textContent = m.text || '';
-      row.appendChild(loc);
-      row.appendChild(text);
-      row.onclick = () => {
-        openFile(m.path, m.line).catch((e) => toast(e.message, 'error'));
-      };
-      results.appendChild(row);
-    }
+    renderSearchResults(results, data.matches || [], data.truncated, q, ignoreCase);
   } catch (err) {
     if (gen !== searchGen) return;
     results.textContent = err.message;
     toast(`Search failed: ${err.message}`, 'error');
+  }
+}
+
+/** Render the summary + per-file collapsible groups for a search result set. */
+function renderSearchResults(container, matches, truncated, pattern, ignoreCase) {
+  container.innerHTML = '';
+  const byFile = new Map();
+  for (const m of matches) {
+    if (!byFile.has(m.path)) byFile.set(m.path, []);
+    byFile.get(m.path).push(m);
+  }
+  const summary = document.createElement('div');
+  summary.className = 'search-summary';
+  summary.textContent = matches.length
+    ? `${matches.length} match${matches.length === 1 ? '' : 'es'} in ${byFile.size} file${byFile.size === 1 ? '' : 's'}`
+    : 'No matches';
+  container.appendChild(summary);
+  if (truncated) {
+    const note = document.createElement('div');
+    note.className = 'search-note';
+    note.textContent = 'Results truncated';
+    container.appendChild(note);
+  }
+  for (const [path, fileMatches] of byFile) {
+    container.appendChild(buildSearchFileGroup(path, fileMatches, pattern, ignoreCase));
+  }
+}
+
+/** One collapsible per-file group of matches. */
+function buildSearchFileGroup(path, matches, pattern, ignoreCase) {
+  const group = document.createElement('div');
+  group.className = 'search-file';
+  const head = document.createElement('button');
+  head.type = 'button';
+  head.className = 'search-file-head';
+  head.setAttribute('aria-expanded', 'true');
+  head.title = path;
+  const chevron = document.createElement('span');
+  chevron.className = 'search-file-chevron';
+  chevron.innerHTML = iconSvg('chevron-down');
+  const name = document.createElement('span');
+  name.className = 'search-file-name';
+  name.textContent = basename(path);
+  const count = document.createElement('span');
+  count.className = 'search-file-count';
+  count.textContent = String(matches.length);
+  head.append(chevron, name, count);
+
+  const body = document.createElement('div');
+  body.className = 'search-file-matches';
+  for (const m of matches) body.appendChild(buildSearchMatchRow(m, pattern, ignoreCase));
+
+  head.addEventListener('click', () => {
+    const open = body.hidden;
+    body.hidden = !open;
+    head.setAttribute('aria-expanded', open ? 'true' : 'false');
+    chevron.innerHTML = iconSvg(open ? 'chevron-down' : 'chevron-right');
+  });
+  group.append(head, body);
+  return group;
+}
+
+/** One match row: line number + highlighted source text; click opens the file. */
+function buildSearchMatchRow(m, pattern, ignoreCase) {
+  const row = document.createElement('div');
+  row.className = 'search-result';
+  row.title = `${m.path}:${m.line}`;
+  row.onclick = () => { openFile(m.path, m.line).catch((e) => toast(e.message, 'error')); };
+  const line = document.createElement('span');
+  line.className = 'search-result-line';
+  line.textContent = String(m.line);
+  const text = document.createElement('span');
+  text.className = 'search-result-text';
+  appendHighlighted(text, m.text || '', pattern, ignoreCase);
+  row.append(line, text);
+  return row;
+}
+
+// appendHighlighted appends `text` to `parent`, wrapping pattern matches in
+// <mark> nodes. Mirrors the server's pattern handling: regex with a literal
+// fallback, case-insensitive when ignoreCase. Builds DOM nodes, never HTML.
+function appendHighlighted(parent, text, pattern, ignoreCase) {
+  const re = searchHighlightRegex(pattern, ignoreCase);
+  if (!re || !text) {
+    parent.textContent = text;
+    return;
+  }
+  let last = 0;
+  let match;
+  while ((match = re.exec(text)) !== null) {
+    if (match.index > last) parent.appendChild(document.createTextNode(text.slice(last, match.index)));
+    const mark = document.createElement('mark');
+    mark.className = 'search-hit';
+    mark.textContent = match[0];
+    parent.appendChild(mark);
+    last = match.index + match[0].length;
+    if (match[0] === '') re.lastIndex++; // zero-length match: advance
+  }
+  if (last < text.length) parent.appendChild(document.createTextNode(text.slice(last)));
+}
+
+/** Compile the search pattern for client-side highlighting (regex with a
+ *  literal fallback), or null when there is no usable pattern. */
+function searchHighlightRegex(pattern, ignoreCase) {
+  const src = (pattern || '').trim();
+  if (!src) return null;
+  const flags = ignoreCase ? 'gi' : 'g';
+  try {
+    return new RegExp(src, flags);
+  } catch (_) {
+    return new RegExp(src.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
   }
 }
 
@@ -2027,6 +2551,84 @@ export function setupEditorUI() {
   $('btn-refresh-explorer')?.addEventListener('click', () => {
     refreshExplorer().catch((e) => toast(e.message, 'error'));
   });
+  // File-tree header actions: new file / collapse all.
+  $('btn-collapse-tree')?.addEventListener('click', collapseTree);
+  $('btn-new-file')?.addEventListener('click', () => {
+    const row = $('new-file-row');
+    const input = $('new-file-input');
+    if (!row || !input) return;
+    row.hidden = false;
+    input.value = '';
+    input.focus();
+  });
+  $('new-file-create')?.addEventListener('click', () => {
+    createNewFile().catch((e) => toast(e.message, 'error'));
+  });
+  $('new-file-cancel')?.addEventListener('click', () => {
+    const row = $('new-file-row');
+    if (row) row.hidden = true;
+  });
+  $('new-file-input')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      createNewFile().catch((err) => toast(err.message, 'error'));
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      const row = $('new-file-row');
+      if (row) row.hidden = true;
+    }
+  });
+  // File-tree keyboard navigation (role=tree): arrows move/expand, Enter
+  // opens, Home/End jump. Focus is roving — one row is tabbable at a time.
+  const fileTree = $('file-tree');
+  if (fileTree) {
+    fileTree.addEventListener('keydown', (e) => {
+      const row = e.target.closest('.tree-item');
+      if (!row) return;
+      const rows = visibleTreeRows();
+      const idx = rows.indexOf(row);
+      if (idx < 0) return;
+      switch (e.key) {
+        case 'ArrowDown':
+          e.preventDefault();
+          focusTreeRow(rows[Math.min(idx + 1, rows.length - 1)]);
+          return;
+        case 'ArrowUp':
+          e.preventDefault();
+          focusTreeRow(rows[Math.max(idx - 1, 0)]);
+          return;
+        case 'Home':
+          e.preventDefault();
+          focusTreeRow(rows[0]);
+          return;
+        case 'End':
+          e.preventDefault();
+          focusTreeRow(rows[rows.length - 1]);
+          return;
+        case 'Enter':
+        case ' ':
+          e.preventDefault();
+          row.click();
+          return;
+        case 'ArrowRight':
+          e.preventDefault();
+          if (row.getAttribute('aria-expanded') === 'false') row.click();
+          else if (row.classList.contains('dir') && rows[idx + 1]) focusTreeRow(rows[idx + 1]);
+          return;
+        case 'ArrowLeft': {
+          e.preventDefault();
+          if (row.getAttribute('aria-expanded') === 'true') {
+            row.click();
+            return;
+          }
+          const group = row.parentElement && row.parentElement.closest('.tree-children');
+          const parentRow = group && group.previousElementSibling;
+          if (parentRow && parentRow.classList.contains('tree-item')) focusTreeRow(parentRow);
+          return;
+        }
+      }
+    });
+  }
   $('btn-commit-ai')?.addEventListener('click', () => {
     generateCommitMessage().catch((e) => toast(e.message, 'error'));
   });
@@ -2036,6 +2638,26 @@ export function setupEditorUI() {
   $('btn-push')?.addEventListener('click', () => {
     pushBranch().catch((e) => toast(e.message, 'error'));
   });
+  // Commit composer collapse (persisted; default expanded).
+  {
+    const composer = $('commit-composer');
+    const toggle = $('commit-toggle');
+    const COLLAPSE_KEY = 'gogen_commit_collapsed';
+    const applyCommitCollapsed = (collapsed) => {
+      if (composer) composer.classList.toggle('collapsed', collapsed);
+      if (toggle) {
+        toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+        toggle.innerHTML = iconSvg(collapsed ? 'chevron-up' : 'chevron-down');
+      }
+    };
+    let collapsed = storageGet(COLLAPSE_KEY) === '1';
+    applyCommitCollapsed(collapsed);
+    toggle?.addEventListener('click', () => {
+      collapsed = !collapsed;
+      applyCommitCollapsed(collapsed);
+      storageSet(COLLAPSE_KEY, collapsed ? '1' : '0');
+    });
+  }
   // Ctrl/Cmd+Enter in the message textarea commits (mirrors the chat input).
   $('commit-message')?.addEventListener('keydown', (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
@@ -2072,7 +2694,7 @@ export function setupEditorUI() {
   }
   $('btn-diff-layout')?.addEventListener('click', () => {
     GOGEN_UI.diffRenderSideBySide = !GOGEN_UI.diffRenderSideBySide;
-    localStorage.setItem('gogen_diff_layout', GOGEN_UI.diffRenderSideBySide ? 'side-by-side' : 'inline');
+    storageSet('gogen_diff_layout', GOGEN_UI.diffRenderSideBySide ? 'side-by-side' : 'inline');
     if (diffEditor) {
       diffEditor.updateOptions({ renderSideBySide: GOGEN_UI.diffRenderSideBySide });
     }
@@ -2095,6 +2717,32 @@ export function setupEditorUI() {
       }
     });
   }
+  // Find-in-files options: "Match case" toggle + include-glob filter.
+  syncFindCaseButton();
+  const globInput = $('find-in-files-glob');
+  if (globInput) {
+    globInput.value = findGlob;
+    globInput.addEventListener('input', () => {
+      findGlob = globInput.value;
+      storageSet('gogen_find_glob', findGlob);
+      clearTimeout(searchDebounceTimer);
+      searchDebounceTimer = setTimeout(() => {
+        if (searchInput) runFindInFiles(searchInput.value);
+      }, 250);
+    });
+    globInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        if (searchInput) runFindInFiles(searchInput.value);
+      }
+    });
+  }
+  $('find-in-files-case')?.addEventListener('click', () => {
+    findCaseSensitive = !findCaseSensitive;
+    storageSet('gogen_find_case', findCaseSensitive ? '1' : '0');
+    syncFindCaseButton();
+    if (searchInput && searchInput.value.trim()) runFindInFiles(searchInput.value);
+  });
   // Keyboard shortcut: Ctrl+H opens the replace field
   document.addEventListener('keydown', (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === 'h') {
@@ -2117,6 +2765,74 @@ export function setupEditorUI() {
         }
       }
     }
+  });
+
+  // --- Editor tabs: context menu, keyboard navigation, cycling ---
+
+  // Delegate menu-row clicks: the menu is static markup; rows carry a
+  // data-action the dispatcher maps to a close/copy operation.
+  const tabMenu = $('tab-context-menu');
+  if (tabMenu) {
+    tabMenu.addEventListener('click', (e) => {
+      const row = e.target.closest('.tab-menu-row');
+      if (!row || row.disabled) return;
+      runTabMenuAction(row.dataset.action);
+    });
+    // Dismiss on any interaction outside the menu (Escape, scroll, resize).
+    document.addEventListener('click', (e) => {
+      if (!tabMenu.hidden && !tabMenu.contains(e.target)) closeTabMenu();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') closeTabMenu();
+    });
+    document.addEventListener('scroll', () => closeTabMenu(), true);
+    window.addEventListener('resize', () => closeTabMenu());
+  }
+
+  // Roving keyboard navigation for the tab strip (role=tablist): Left/Right
+  // move between tabs, Enter/Space activates, Delete closes. The close
+  // button keeps its own native click/Enter handling.
+  const tabStrip = $('editor-tabs');
+  if (tabStrip) {
+    tabStrip.addEventListener('keydown', (e) => {
+      const tab = e.target.closest('.file-tab');
+      if (!tab || e.target.closest('.file-tab-close')) return;
+      const path = tab.dataset.path;
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        activatePath(path);
+      } else if (e.key === 'Delete') {
+        e.preventDefault();
+        closeTab(path);
+      } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        e.preventDefault();
+        const idx = openOrder.indexOf(path);
+        if (idx < 0 || openOrder.length < 2) return;
+        const next = e.key === 'ArrowRight'
+          ? (idx + 1) % openOrder.length
+          : (idx - 1 + openOrder.length) % openOrder.length;
+        activatePath(openOrder[next]);
+        // activatePath moves focus into the editor; keep it on the tab that
+        // the arrow key just moved to (the strip re-rendered).
+        const el = tabStrip.querySelector('.file-tab.active');
+        if (el) el.focus();
+      }
+    });
+  }
+
+  // Ctrl/Cmd+PageDown / PageUp cycle tabs (Ctrl+W is browser-reserved, so it
+  // is deliberately not used). Only while the editor pane is showing.
+  document.addEventListener('keydown', (e) => {
+    const mod = e.ctrlKey || e.metaKey;
+    if (!mod || (e.key !== 'PageDown' && e.key !== 'PageUp')) return;
+    const pane = $('editor-pane');
+    if (!pane || !pane.classList.contains('active') || !openOrder.length) return;
+    e.preventDefault();
+    const idx = Math.max(0, openOrder.indexOf(activePath));
+    const next = e.key === 'PageDown'
+      ? (idx + 1) % openOrder.length
+      : (idx - 1 + openOrder.length) % openOrder.length;
+    activatePath(openOrder[next]);
   });
 
   // --- Replace toggle & preview modal ---

@@ -187,6 +187,20 @@ func (a *Agent) SetSkillsEnabled(on bool) {
 	a.noteToolsChanged()
 }
 
+// SetTerminalEnabled toggles the persistent-terminal feature tools for this
+// agent. Config-only in v1: set once at construction from the config flag
+// (there is no live web toggle), so a change here is only expected in tests.
+func (a *Agent) SetTerminalEnabled(on bool) {
+	a.terminalEnabled.Store(on)
+	a.noteToolsChanged()
+}
+
+// TerminalEnabled reports whether the persistent-terminal feature tools are
+// registered for this agent.
+func (a *Agent) TerminalEnabled() bool {
+	return a.terminalEnabled.Load()
+}
+
 // SkillsEnabled reports whether the skill tool is registered for this agent.
 func (a *Agent) SkillsEnabled() bool {
 	return a.skillsEnabled.Load()
@@ -281,6 +295,12 @@ type featureWiring struct {
 	// only when the flag is on AND the manager is installed.
 	skillsEnabled atomic.Bool
 	skillsManager atomic.Pointer[skills.Manager]
+
+	// terminalEnabled mirrors the config terminal flag (config-only in v1,
+	// set at construction). When off, the persistent-terminal feature tools
+	// (the terminal tool and bash_persistent) appear nowhere — llmTools,
+	// AllowedToolNames, and executeTool all derive from featureTools.
+	terminalEnabled atomic.Bool
 
 	// instructionsEnabled mirrors the config agent_instructions flag
 	// (config-only, set at construction). workspaceInstructions is the

@@ -208,6 +208,7 @@ func NewServer(a *agent.Agent, cfg *config.Config) *Server {
 	a.SetFeatureFlags(ws.FeatureFlags())
 	a.SetBoardManager(ws.GetBoardManager())
 	a.SetSkillsManager(ws.skillsManager)
+	a.SetTerminalEnabled(ws.terminalEnabled)
 	// The subagent spawner needs the registry, so it is installed after the
 	// server is constructed; NewSessionAgent seeds it on every later session.
 	ws.SubagentSpawner = &subagentSpawner{s: s, children: newChildRegistry()}
@@ -504,7 +505,21 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 	mux.HandleFunc("/ws", s.HandleWS)
 	mux.HandleFunc("/ws/editor", s.HandleWSEditor)
 	mux.HandleFunc("/", s.HandleStatic)
-	srv := &http.Server{Addr: addr, Handler: mux}
+	// Slowloris hardening for the plain HTTP surface (static assets and the
+	// pairing redirect/page). ReadHeaderTimeout bounds how long a client may
+	// take to send its request headers; IdleTimeout bounds how long an idle
+	// keep-alive connection is held between requests. Neither applies to the
+	// WebSocket endpoints: the upgrade hijacks the connection during the
+	// handshake, after which the http.Server no longer manages its
+	// deadlines (gorilla/websocket sets its own). ReadTimeout/WriteTimeout
+	// are deliberately left unset so no whole-request deadline can interfere
+	// with a hijacked connection's own framing.
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 
 	errCh := make(chan error, 1)
 	go func() {

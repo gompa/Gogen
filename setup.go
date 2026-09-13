@@ -98,6 +98,9 @@ func newAgent(cfg *config.Config, isGlobalMode bool) (*agent.Agent, string, []st
 		a.SetSkillsManager(skills.NewManager(cfg.WorkingDir, isGlobalMode))
 		a.SetSkillsEnabled(true)
 	}
+	// Persistent terminal tools (terminal_* and bash_persistent): config-only,
+	// act-mode feature tools gated through featureTools().
+	a.SetTerminalEnabled(cfg.TerminalEnabled())
 	// Workspace instructions (AGENTS.md/CLAUDE.md): merged below the
 	// project guidelines at view-build time from the CURRENT working dir
 	// (agent.EffectiveGuidelines), so /dir and web workspace changes

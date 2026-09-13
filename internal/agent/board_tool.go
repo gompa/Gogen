@@ -23,15 +23,17 @@ func boardToolDef() llm.Tool {
 	return toolDef("board",
 		"Board tool: project-wide kanban board of items available for agents to fix. "+
 			"Actions: list (all cards), show <id> (card detail), add <title> [description] [priority], "+
+			"update <id> [title] [description] [priority] [context] (edit a card; omitted fields are unchanged), "+
 			"claim <id> (assign to self and move to in_progress), move <id> <column>, "+
 			"block <id> <reason>, comment <id> <text>, done <id>, remove <id> (delete a card entirely).",
 		toolSchema(
 			map[string]any{
-				"action":      toolPropEnum("string", []string{"list", "show", "add", "claim", "move", "block", "comment", "done", "remove"}, "Board action"),
-				"id":          toolProp("integer", "Board item id (show, claim, move, block, comment, done, remove)"),
-				"title":       toolProp("string", "Item title (add)"),
-				"description": toolProp("string", "Acceptance criteria / details (add)"),
-				"priority":    toolProp("string", "Priority: low, medium, high, urgent (add)"),
+				"action":      toolPropEnum("string", []string{"list", "show", "add", "update", "claim", "move", "block", "comment", "done", "remove"}, "Board action"),
+				"id":          toolProp("integer", "Board item id (show, update, claim, move, block, comment, done, remove)"),
+				"title":       toolProp("string", "Item title (add, update)"),
+				"description": toolProp("string", "Acceptance criteria / details (add, update)"),
+				"priority":    toolProp("string", "Priority: low, medium, high, urgent (add, update)"),
+				"context":     toolProp("string", "Free-text context for the started agent, merged into its prompt (update)"),
 				"column":      toolPropEnum("string", BoardColumns, "Target column (move)"),
 				"reason":      toolProp("string", "Block reason (block)"),
 				"text":        toolProp("string", "Comment text (comment)"),
@@ -74,6 +76,25 @@ func handleBoard(_ context.Context, a *Agent, args map[string]any) (string, erro
 		desc, _ := stringArgOptional(args, "description")
 		prio, _ := stringArgOptional(args, "priority")
 		out, opErr = m.Add(title, desc, prio, by)
+	case "update":
+		id, err := intRequiredArg(args, "id")
+		if err != nil {
+			return "", err
+		}
+		upd := BoardUpdate{}
+		if upd.Title, err = optionalStringPtr(args, "title"); err != nil {
+			return "", err
+		}
+		if upd.Description, err = optionalStringPtr(args, "description"); err != nil {
+			return "", err
+		}
+		if upd.Priority, err = optionalStringPtr(args, "priority"); err != nil {
+			return "", err
+		}
+		if upd.Context, err = optionalStringPtr(args, "context"); err != nil {
+			return "", err
+		}
+		out, opErr = m.Update(strconv.Itoa(id), upd, by)
 	case "claim":
 		id, err := intRequiredArg(args, "id")
 		if err != nil {

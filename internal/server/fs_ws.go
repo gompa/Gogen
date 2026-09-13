@@ -56,7 +56,7 @@ var fsReadOps = map[string]fsOp{
 	"fs_search": {resultType: "fs_search_result", run: func(s *Server, ctx context.Context, msg WSMessage, resp *WSMessage) error {
 		resp.Path, resp.Pattern = msg.Path, msg.Pattern
 		var err error
-		resp.Matches, resp.Truncated, err = s.fsSearch(ctx, msg.Pattern, msg.Path, msg.Glob)
+		resp.Matches, resp.Truncated, err = s.fsSearch(ctx, msg.Pattern, msg.Path, msg.Glob, msg.IgnoreCase)
 		return err
 	}},
 	"git_status": {resultType: "git_status_result", run: func(s *Server, ctx context.Context, msg WSMessage, resp *WSMessage) error {

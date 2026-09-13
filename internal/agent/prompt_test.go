@@ -8,13 +8,13 @@ import (
 )
 
 // TestSystemPromptTemplate pins the prompt guidance that models rely on:
-// the MCP hint, the parallel-batching rule, tool-output authority, and the
-// compaction/todo guidance. These are the additions that make the template
-// more powerful without bloating it.
+// the parallel-batching rule, tool-output authority, and the
+// compaction/todo guidance. The MCP hint is deliberately NOT part of the
+// base template — it is appended only when an MCP registry is attached
+// (TestMCPHintGate).
 func TestSystemPromptTemplate(t *testing.T) {
 	p := SystemPrompt("/tmp/project")
 	for _, want := range []string{
-		"mcp_*",            // MCP tools may be present
 		"at most 4",        // parallel read-only cap
 		"ground truth",     // tool output is authoritative
 		"context_pin_last", // survive compaction
@@ -23,6 +23,47 @@ func TestSystemPromptTemplate(t *testing.T) {
 		if !strings.Contains(p, want) {
 			t.Errorf("system prompt missing %q", want)
 		}
+	}
+	if strings.Contains(p, mcpToolsHint) {
+		t.Error("base system prompt advertises MCP tools with no registry attached")
+	}
+}
+
+// TestMCPHintGate pins the gating of the MCP hint: MCP is opt-in, so a
+// session with no registry must not advertise mcp_* tools, and attaching a
+// registry adds the hint to the single leading system message.
+func TestMCPHintGate(t *testing.T) {
+	t.Cleanup(resetPromptConfigForTest)
+	msgs := []llm.Message{{Role: "user", Content: "hi"}}
+
+	for _, mcpTools := range []bool{false, true} {
+		view := buildSystemView(msgs, "/tmp/p", "", "", "", ModeAct, mcpTools)
+		if got := strings.Contains(view[0].Content, mcpToolsHint); got != mcpTools {
+			t.Errorf("buildSystemView mcpTools=%v: hint present = %v, want %v\n%q",
+				mcpTools, got, mcpTools, view[0].Content)
+		}
+	}
+
+	// The hint leads the enrichment suffixes (it qualifies the base prompt).
+	suffix := buildSystemSuffix("gogen.md", "rules text", "profile text", ModeAct, true)
+	hint, profile := strings.Index(suffix, mcpToolsHint), strings.Index(suffix, "profile text")
+	if hint < 0 || profile < 0 || hint > profile {
+		t.Fatalf("suffix = %q, want the MCP hint before the project profile", suffix)
+	}
+
+	// Agent path: the wire prefix flips with the registry, and detaching it
+	// removes the hint again.
+	a := &Agent{WorkingDir: t.TempDir(), Messages: msgs}
+	if p := a.systemPromptPrefix(); p == nil || strings.Contains(p[0].Content, mcpToolsHint) {
+		t.Fatalf("registry-less prefix carries the MCP hint: %+v", p)
+	}
+	a.SetMCPRegistry(&fakeMCPRegistry{names: map[string]struct{}{"mcp_x": {}}})
+	if p := a.systemPromptPrefix(); p == nil || !strings.Contains(p[0].Content, mcpToolsHint) {
+		t.Fatalf("prefix with a registry is missing the MCP hint: %+v", p)
+	}
+	a.SetMCPRegistry(nil)
+	if p := a.systemPromptPrefix(); p == nil || strings.Contains(p[0].Content, mcpToolsHint) {
+		t.Fatalf("detached registry still advertises MCP tools: %+v", p)
 	}
 }
 

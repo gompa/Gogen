@@ -128,7 +128,7 @@ func (a *Agent) prepareMessages(ctx context.Context, h *llm.StreamHandlers) ([]l
 	// ArgsStabilized is persisted and we skip already-stable messages.
 	a.stabilizeToolArgs()
 
-	view = buildSystemView(view, a.WorkingDir, a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode)
+	view = buildSystemView(view, a.WorkingDir, a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode, a.mcpToolsPresent())
 
 	// Pre-flight: verify the actual outgoing request fits the context
 	// window, compacting in place when it would be refused. The boundary
@@ -176,7 +176,7 @@ func (a *Agent) outgoingViewEstimate(view []llm.Message) int {
 // rebuildView builds the LLM view from canonical history (system prompt and
 // enrichment folded in), the same call prepareMessages makes.
 func (a *Agent) rebuildView() []llm.Message {
-	return buildSystemView(a.Messages, a.WorkingDir, a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode)
+	return buildSystemView(a.Messages, a.WorkingDir, a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode, a.mcpToolsPresent())
 }
 
 // preflightForcedCompact verifies that the outgoing view fits the context
@@ -841,6 +841,6 @@ func (a *Agent) systemPromptPrefix() []llm.Message {
 	return []llm.Message{{
 		Role: "system",
 		Content: SystemPrompt(a.WorkingDir) +
-			buildSystemSuffix(a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode),
+			buildSystemSuffix(a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode, a.mcpToolsPresent()),
 	}}
 }

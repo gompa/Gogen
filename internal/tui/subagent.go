@@ -81,6 +81,7 @@ func (sp *tuiSubagentSpawner) Spawn(ctx context.Context, parent *agent.Agent, jo
 		SubagentMaxConcurrent: parent.SubagentMaxConcurrent(),
 		BoardManager:          parent.BoardManager(),
 		SkillsManager:         parent.SkillsManager(),
+		TerminalEnabled:       parent.TerminalEnabled(),
 		InstructionsEnabled:   parent.InstructionsEnabled(),
 		SubagentSpawner:       sp, // nesting allowed up to the configured depth
 	}, nil, session.NewID())

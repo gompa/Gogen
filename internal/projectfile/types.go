@@ -85,6 +85,7 @@ type FileConfig struct {
 	SubagentPrompt            string                `yaml:"subagent_prompt"`
 	AgentInstructions         string                `yaml:"agent_instructions"`
 	Skills                    string                `yaml:"skills"`
+	Terminal                  string                `yaml:"terminal"`
 	JobNotices                string                `yaml:"job_notices"`
 	Automations               string                `yaml:"automations"`
 	// KeepRecentMessages is the pre-rename spelling of

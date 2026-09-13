@@ -29,6 +29,9 @@
         // "Start agent" popover.
         import { createPopover } from '/components/popover.js';
         import { icon } from '/components/icons.js';
+        // Safe localStorage wrappers (see storage.js): sidebar widths are
+        // persisted per target; a storage-blocked browser must not throw.
+        import { storageGet, storageSet } from '/components/storage.js';
         import {
             createModelThinkingPicker,
             createThinkingChips,
@@ -193,7 +196,6 @@
             readFilePathFromArgs,
         } from '/components/tool-result.js';
         import { marked } from '/vendor/marked.esm.js';
-        import DOMPurify from '/vendor/dompurify.esm.js';
 
         marked.use({
             gfm: true,
@@ -5797,7 +5799,7 @@
                 if (!sidebar) return;
 
                 // Restore saved width
-                const saved = localStorage.getItem(targetId + '-width');
+                const saved = storageGet(targetId + '-width');
                 if (saved) {
                     sidebar.style.width = saved;
                     sidebar.style.flexGrow = '0';
@@ -5859,7 +5861,7 @@
                             applyWidth();
                         }
                         // Persist the width
-                        localStorage.setItem(targetId + '-width', sidebar.style.width);
+                        storageSet(targetId + '-width', sidebar.style.width);
                         // One final TOC/rail sync against the settled layout.
                         sidebarDragEnd();
                     }

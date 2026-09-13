@@ -10,6 +10,7 @@
 // user_term_* messages) call the exported terminal* functions.
 
 import { icon } from '/components/icons.js';
+import { storageGet, storageSet } from '/components/storage.js';
 
 let deps = null;
 
@@ -79,7 +80,7 @@ function terminalWhenReady(fn) {
     terminalLoadXterm().then(fn).catch(() => {});
 }
 try {
-    const stored = JSON.parse(localStorage.getItem(TERM_STORE_KEY) || '{}');
+    const stored = JSON.parse(storageGet(TERM_STORE_KEY) || '{}');
     terminalExpanded = !!stored.expanded;
     if (Number.isFinite(stored.height) && stored.height >= TERM_MIN_HEIGHT) {
         // The height is only capped at drag time; a stored height from a
@@ -94,12 +95,10 @@ function terminalMaxHeight() {
 }
 
 function terminalSaveState() {
-    try {
-        localStorage.setItem(TERM_STORE_KEY, JSON.stringify({
-            expanded: terminalExpanded,
-            height: terminalHeight,
-        }));
-    } catch (_) {}
+    storageSet(TERM_STORE_KEY, JSON.stringify({
+        expanded: terminalExpanded,
+        height: terminalHeight,
+    }));
 }
 
 // The strip docks below the chat input bar, so the scroll-to-bottom

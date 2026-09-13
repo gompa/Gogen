@@ -141,6 +141,7 @@ type configYAML struct {
 	SubagentPrompt            string                        `yaml:"subagent_prompt,omitempty"`
 	AgentInstructions         string                        `yaml:"agent_instructions,omitempty"`
 	Skills                    string                        `yaml:"skills,omitempty"`
+	Terminal                  string                        `yaml:"terminal,omitempty"`
 	JobNotices                string                        `yaml:"job_notices,omitempty"`
 	Automations               string                        `yaml:"automations,omitempty"`
 	OutputSpill               string                        `yaml:"output_spill,omitempty"`
@@ -228,6 +229,7 @@ func buildConfigYAML(cfg *config.Config, opts WriteOptions) (string, error) {
 		SubagentPrompt:            cfg.SubagentPrompt,
 		AgentInstructions:         omitDefaultString(cfg.AgentInstructions, def.AgentInstructions),
 		Skills:                    omitDefaultString(cfg.Skills, def.Skills),
+		Terminal:                  omitDefaultString(cfg.Terminal, def.Terminal),
 		JobNotices:                omitDefaultString(cfg.JobNotices, def.JobNotices),
 		Automations:               omitDefaultString(cfg.Automations, def.Automations),
 		OutputSpill:               omitDefaultString(cfg.OutputSpill, def.OutputSpill),

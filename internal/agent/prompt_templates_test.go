@@ -129,6 +129,27 @@ func TestTicketPromptContext(t *testing.T) {
 	}
 }
 
+// TestTicketPromptContextField verifies the explicit Context field feeds the
+// {context} placeholder, merged ahead of the activity-derived block.
+func TestTicketPromptContextField(t *testing.T) {
+	item := &BoardItem{
+		ID: "1", Title: "T",
+		Context:  "deploy notes live in docs/deploy.md",
+		Activity: []BoardActivity{{Text: "confirmed with @jane: use v2"}},
+	}
+	p := TicketPrompt(item, "")
+	ctxIdx := strings.Index(p, "deploy notes live in docs/deploy.md")
+	logIdx := strings.Index(p, "confirmed with @jane: use v2")
+	if ctxIdx < 0 || logIdx < 0 || ctxIdx > logIdx {
+		t.Fatalf("explicit context should precede the activity log:\n%s", p)
+	}
+	// Context alone (no activity) still renders, without the log header.
+	only := TicketPrompt(&BoardItem{ID: "1", Title: "T", Context: "just the context"}, "")
+	if !strings.Contains(only, "just the context") || strings.Contains(only, "Ticket log context") {
+		t.Fatalf("context-only prompt wrong:\n%s", only)
+	}
+}
+
 func TestTicketPromptCustomTemplate(t *testing.T) {
 	item := &BoardItem{ID: "7", Title: "X", Description: "desc"}
 	custom := "Custom: {id} / {title} / {description} / {priority} / {context}"

@@ -203,6 +203,9 @@ const defaultBackgroundUnreadCap = 64 * 1024
 // serialized per job. Input is not a shell command: it goes to the process's
 // stdin, so the command guard deliberately does not apply.
 func (a *Agent) BackgroundJobInput(jobID, input string, appendNewline bool) (string, error) {
+	if a.terminalJob(jobID) != nil {
+		return "", fmt.Errorf("job %s is a background terminal send; send more input with the terminal tool (action=send) or interrupt it with action=signal", jobID)
+	}
 	job := a.backgroundJob(jobID)
 	if job == nil {
 		return "", fmt.Errorf("unknown background job %q (jobs are scoped to this session; the session may have been closed)", jobID)
@@ -272,6 +275,9 @@ func exitCodeOf(err error, fallback int) int {
 // can poll for the result after completion. "Unknown job" only happens for
 // ids that never existed, were already reaped, or whose session was closed.
 func (a *Agent) BackgroundJobStatus(jobID string) (string, error) {
+	if tj := a.terminalJob(jobID); tj != nil {
+		return a.terminalJobStatus(jobID)
+	}
 	job := a.backgroundJob(jobID)
 	if job == nil {
 		return "", fmt.Errorf("unknown background job %q (jobs are scoped to this session; the session may have been closed)", jobID)
@@ -325,6 +331,9 @@ func formatJobOutput(job *BackgroundJob, running bool) string {
 // CancelBackgroundJob cancels a running background job, killing its process
 // group (the same group-kill execute_command cancellation uses).
 func (a *Agent) CancelBackgroundJob(jobID string) (string, error) {
+	if tj := a.terminalJob(jobID); tj != nil {
+		return a.cancelTerminalJob(jobID)
+	}
 	job := a.backgroundJob(jobID)
 	if job == nil {
 		return "", fmt.Errorf("unknown background job %q (it may have finished and been reaped)", jobID)
@@ -346,6 +355,9 @@ func (a *Agent) CancelBackgroundJob(jobID string) (string, error) {
 // Agent alive; the wait goroutine of a cancelled job finds an empty registry
 // afterwards and does not arm a new timer.
 func (a *Agent) Close() {
+	// Close every owner-scoped persistent terminal and its background jobs
+	// alongside the shell jobs: a closed session must not orphan a PTY.
+	a.closeTerminals()
 	a.bgMu.Lock()
 	jobs := a.bgJobs
 	a.bgJobs = nil

@@ -14,7 +14,7 @@
 const fs = require('fs');
 const path = require('path');
 const { JSDOM } = require('/tmp/gogen-jsdom/node_modules/jsdom');
-const { ROOT, stripModuleSyntax } = require('./web-harness');
+const { ROOT, stripModuleSyntax, installStorage } = require('./web-harness');
 
 let failures = 0;
 function check(cond, msg) {
@@ -41,6 +41,7 @@ const dom = new JSDOM(html, { url: 'http://localhost/', runScripts: 'dangerously
 const { window } = dom;
 const doc = window.document;
 window.DOMPurify = { sanitize: (h) => h }; // only used by the colorize paths, not exercised here
+installStorage(window); // editor.js reads persisted prefs at top level
 window.eval(stripModuleSyntax(fs.readFileSync(path.join(ROOT, 'internal/server/web/editor.js'), 'utf8')));
 
 const { openModal, closeModal } = window;

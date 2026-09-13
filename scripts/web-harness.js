@@ -35,10 +35,23 @@ function installEditorStubs(window, names = EDITOR_STUBS) {
   }
 }
 
+// Evals the REAL components/storage.js into the window. Tests that load a
+// single module standalone (editor.js) must call this first: editor.js
+// references storageGet/storageSet at module top level, and its stripped
+// import would otherwise leave those names undefined — the same mechanism
+// installEditorStubs uses for editor.js's other imports.
+function installStorage(window) {
+  window.eval(stripModuleSyntax(fs.readFileSync(path.join(ROOT, 'internal/server/web/components/storage.js'), 'utf8')));
+}
+
 const ROOT = path.join(__dirname, '..');
 
 // Component modules app.js imports, in eval (dependency) order.
 const COMPONENT_MODULES = [
+  // Safe localStorage wrappers (leaf module, no imports). First: board.js,
+  // terminal.js and settings.js call storageGet/storageSet, so the function
+  // declarations must land in the global scope before any of them eval.
+  'internal/server/web/components/storage.js',
   // Leaf module (no imports of its own); first because several components
   // and app.js call icon() — its top-level declaration must land in the
   // global scope before any of them eval.
@@ -123,4 +136,4 @@ function loadAppJs(window) {
   window.eval(stripModuleSyntax(fs.readFileSync(appJs, 'utf8')));
 }
 
-module.exports = { ROOT, COMPONENT_MODULES, stripModuleSyntax, loadAppJs, EDITOR_STUBS, installEditorStubs, installScrollStubs };
+module.exports = { ROOT, COMPONENT_MODULES, stripModuleSyntax, loadAppJs, EDITOR_STUBS, installEditorStubs, installStorage, installScrollStubs };

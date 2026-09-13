@@ -2,17 +2,19 @@ package server
 
 import (
 	"fmt"
+
+	"gogen/internal/agent"
 )
 
 // wsHandleBoardOp handles kanban-tab operations ("board_op"): the client
-// sends list (no mutation) or add/claim/move/comment/done/remove; successful
-// mutations broadcast a fresh board_state to every client so all tabs stay
-// live and toast a success notice to the requesting connection (every
-// mutation gets visible feedback — including agent-triggered ones, which
-// broadcast through the on-board-changed hook instead). Feedback never goes
-// out as "response" (which renders into the chat transcript). The handler is
-// gated on the board feature flag — a stale client's op after a toggle-off
-// is rejected with an error notice.
+// sends list (no mutation) or add/update/claim/move/block/comment/done/
+// start/remove; successful mutations broadcast a fresh board_state to every
+// client so all tabs stay live and toast a success notice to the requesting
+// connection (every mutation gets visible feedback — including
+// agent-triggered ones, which broadcast through the on-board-changed hook
+// instead). Feedback never goes out as "response" (which renders into the
+// chat transcript). The handler is gated on the board feature flag — a stale
+// client's op after a toggle-off is rejected with an error notice.
 func wsHandleBoardOp(req *wsRequest) {
 	s, ws, r, msg := req.server, req.conn, req.request, req.msg
 	pane := &req.pane
@@ -45,10 +47,21 @@ func wsHandleBoardOp(req *wsRequest) {
 	switch op.Action {
 	case "add":
 		out, err = bm.Add(op.Title, op.Description, op.Priority, by)
+	case "update":
+		// The edit form always submits all three editable fields (a full
+		// replace); empty priority/description clear their fields.
+		out, err = bm.Update(op.ID, agent.BoardUpdate{
+			Title:       &op.Title,
+			Description: &op.Description,
+			Priority:    &op.Priority,
+			Context:     &op.Context,
+		}, by)
 	case "claim":
 		out, err = bm.Claim(op.ID, by)
 	case "move":
 		out, err = bm.Move(op.ID, op.Column, by)
+	case "block":
+		out, err = bm.Block(op.ID, op.Reason, by)
 	case "comment":
 		out, err = bm.Comment(op.ID, op.Text, by)
 	case "done":
@@ -62,7 +75,7 @@ func wsHandleBoardOp(req *wsRequest) {
 		s.wsHandleBoardStart(r.Context(), ws, pane, op)
 		return
 	default:
-		err = fmt.Errorf("unknown board op %q (want list, add, claim, move, comment, done, or remove)", op.Action)
+		err = fmt.Errorf("unknown board op %q (want list, add, update, claim, move, block, comment, done, start, or remove)", op.Action)
 	}
 	if err != nil {
 		writeNoticeError(ws, "board", "Error: "+err.Error())

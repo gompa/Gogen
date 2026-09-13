@@ -258,6 +258,11 @@ type Config struct {
 	// disabled the tool is not registered. Config-only in v1 (env/file —
 	// no web settings toggle).
 	Skills string
+	// Terminal enables the persistent-terminal feature tools (the terminal
+	// tool's open/send/read/signal/list/close actions and bash_persistent)
+	// ("on"/"off"; default off). When disabled the tools are not registered.
+	// Config-only in v1 (env/file — no web settings toggle).
+	Terminal string
 	// JobNotices enables background-job completion notices ("on"/"off";
 	// default off): when a background shell job finishes naturally, a
 	// summary is injected into the session as a user message and a turn
@@ -319,6 +324,7 @@ func Defaults() Config {
 		SubagentMaxConcurrent:     DefaultSubagentMaxConcurrent,
 		AgentInstructions:         "off",
 		Skills:                    "off",
+		Terminal:                  "off",
 		JobNotices:                "off",
 		Automations:               "off",
 	}
@@ -383,6 +389,13 @@ func (c *Config) AgentInstructionsEnabled() bool {
 // is not registered unless skills is explicitly enabled.
 func (c *Config) SkillsEnabled() bool {
 	return c != nil && configOn(c.Skills)
+}
+
+// TerminalEnabled reports whether the persistent-terminal feature tools are
+// active. Opt-in: the tools are not registered unless terminal is explicitly
+// enabled.
+func (c *Config) TerminalEnabled() bool {
+	return c != nil && configOn(c.Terminal)
 }
 
 // JobNoticesEnabled reports whether background-job completion notices are

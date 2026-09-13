@@ -237,6 +237,20 @@
             overflow-anchor: none;
         }
         #messages > * { flex-shrink: 0; }
+        /* ===== Chat reading width (Settings → Appearance) =====
+           Full width by default. "Comfortable" (settings.js toggles
+           .chat-column on #messages) caps every transcript item to a centered
+           column so long lines stay readable on wide monitors. The cap is a
+           rem width, so it scales with the user's root font size and simply
+           collapses to full width once the viewport is narrower. Auto margins
+           center the item and win over the .assistant align-self (auto margins
+           override alignment in flexbox). */
+        #messages.chat-column > * {
+            width: 100%;
+            max-width: 52rem;
+            margin-left: auto;
+            margin-right: auto;
+        }
         /* ===== Conversation TOC rail =====
            One dot per user prompt, overlaid on the right edge of the chat
            and revealed on hover (app.js toggles .has-dots for presence and
@@ -1566,6 +1580,29 @@
             color: var(--fg-muted);
         }
         #find-in-files-input { width: 100%; font-size: 0.85em; padding: 6px 8px; }
+        /* Search options row: case toggle + include-glob filter. */
+        #find-in-files-options { display: flex; align-items: center; gap: 6px; }
+        #find-in-files-glob {
+            flex: 1;
+            min-width: 0;
+            font-size: 0.78em;
+            padding: 5px 8px;
+        }
+        .find-opt-toggle {
+            flex-shrink: 0;
+            font-family: var(--mono);
+            font-size: 0.78em;
+            font-weight: 700;
+            line-height: 1.2;
+            padding: 3px 7px;
+            background: var(--bg);
+            color: var(--fg-muted);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+        }
+        .find-opt-toggle:hover { color: var(--fg); background: var(--bg-hover); }
+        .find-opt-toggle.active { color: var(--accent-fg); background: var(--accent-bg); border-color: transparent; }
         #find-in-files-header {
             display: flex;
             align-items: center;
@@ -1698,21 +1735,62 @@
             font-size: 0.8em;
             font-family: var(--mono);
         }
-        .search-result {
-            padding: 6px 4px;
+        /* Grouped results: summary + collapsible per-file sections. */
+        .search-summary {
+            padding: 4px 4px 6px;
+            font-size: 0.9em;
+            color: var(--fg-muted);
+            font-family: var(--sans);
+        }
+        .search-file { margin-bottom: 2px; }
+        .search-file-head {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            width: 100%;
+            padding: 4px;
+            background: none;
+            border: none;
+            color: var(--fg);
+            font-size: 0.92em;
+            font-family: var(--mono);
+            text-align: left;
             cursor: pointer;
             border-radius: var(--radius-xs);
-            border-bottom: 1px solid var(--border-subtle);
+        }
+        .search-file-head:hover { background: var(--bg-hover); }
+        .search-file-chevron { flex-shrink: 0; display: inline-flex; width: 12px; color: var(--fg-muted); }
+        .search-file-chevron .icon { width: 12px; height: 12px; }
+        .search-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .search-file-count {
+            flex-shrink: 0;
+            margin-left: auto;
+            font-size: 0.85em;
+            color: var(--fg-muted);
+            background: var(--bg-active);
+            border-radius: var(--radius-full);
+            padding: 0 6px;
+        }
+        .search-file-matches { padding-left: 14px; }
+        .search-result {
+            display: flex;
+            gap: 8px;
+            padding: 3px 4px;
+            cursor: pointer;
+            border-radius: var(--radius-xs);
+            font-size: 0.85em;
         }
         .search-result:hover { background: var(--bg-hover); }
-        .search-result-loc { color: var(--accent); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .search-result-line { flex-shrink: 0; min-width: 26px; text-align: right; color: var(--fg-dim); }
         .search-result-text {
-            color: var(--fg-muted);
-            white-space: nowrap;
+            flex: 1;
+            min-width: 0;
             overflow: hidden;
             text-overflow: ellipsis;
-            margin-top: 2px;
+            white-space: nowrap;
+            color: var(--fg-muted);
         }
+        .search-hit { background: var(--accent-soft); color: var(--accent); border-radius: 2px; }
         .search-note { color: var(--warn); padding: 4px; font-size: 0.9em; }
 
         /* Nested (subagent) session rows render indented under their parent. */
@@ -1791,14 +1869,30 @@
         .automations-row-actions button, #automations-form button { cursor: pointer; }
         .board-columns { flex: 1; min-height: 0; display: flex; gap: 12px; overflow-x: auto; }
         #board-add-form { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
-        #board-add-form input[type="text"] { flex: 1; min-width: 180px; }
+        #board-add-form input[type="text"], #board-add-form textarea { flex: 1; min-width: 180px; }
+        #board-add-form textarea { font-family: inherit; resize: vertical; }
+        .board-empty { margin: 0 0 12px 2px; color: var(--fg-muted); font-size: 0.9em; }
         .board-column {
-            flex: 1 1 200px; min-width: 200px; max-width: 320px;
+            position: relative;
+            flex: 1 1 200px; min-width: 160px; max-width: 320px;
             display: flex; flex-direction: column;
             background: var(--bg-elevated, var(--bg));
             border: 1px solid var(--border); border-radius: var(--radius-lg);
             max-height: 100%;
         }
+        /* Drag handle on each column's right edge (board.js attachColumnResize);
+           ::after is the thin visible grip, the element itself is the hit area. */
+        .board-col-resize {
+            position: absolute; top: 0; right: -3px; width: 6px; height: 100%;
+            cursor: col-resize; z-index: 6; touch-action: none;
+        }
+        .board-col-resize::after {
+            content: ''; position: absolute; top: 50%; right: 2px; transform: translateY(-50%);
+            width: 2px; height: 28px; border-radius: 1px; background: var(--border);
+        }
+        .board-column:hover .board-col-resize::after { background: var(--accent); }
+        body.board-resizing { cursor: col-resize; user-select: none; }
+        body.board-resizing .board-col-resize::after { background: var(--accent); }
         .board-column.drag-over { outline: 2px dashed var(--accent); outline-offset: -2px; }
         .board-column-header {
             display: flex; align-items: center; justify-content: space-between;
@@ -1869,8 +1963,70 @@
         .board-assignee { font-size: 0.8em; color: var(--fg-muted); }
         .board-card-detail { margin-top: 8px; border-top: 1px solid var(--border); padding-top: 6px; font-size: 0.9em; }
         .board-card-desc { white-space: pre-wrap; margin-bottom: 6px; }
+        .board-card-desc-empty { color: var(--fg-dim); font-style: italic; }
+        .board-card-context { margin-bottom: 6px; }
+        .board-card-context-label {
+            display: block; font-size: 0.72em; text-transform: uppercase;
+            letter-spacing: 0.04em; color: var(--fg-muted); margin-bottom: 2px;
+        }
+        .board-card-context-body { white-space: pre-wrap; color: var(--fg); }
+        .board-card.board-editing .board-prio { display: none; }
+        .board-card-done { opacity: 0.7; }
+        .board-card-done .board-card-title { text-decoration: line-through; }
+        .board-review-badge {
+            font-size: 0.72em; text-transform: uppercase; letter-spacing: 0.03em;
+            padding: 1px 6px; border-radius: var(--radius-lg);
+            background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent);
+        }
+        .board-card-block-reason {
+            margin-top: 6px; padding: 4px 6px;
+            font-size: 0.8em; color: var(--error-fg);
+            background: var(--error-bg); border-left: 3px solid var(--error);
+            border-radius: var(--radius-md);
+        }
         .board-card-activity { color: var(--fg-muted); }
         .board-activity-row { margin: 2px 0; word-break: break-word; }
+        .board-activity-time { color: var(--fg-dim); margin-right: 4px; }
+        .board-activity-who { color: var(--fg-muted); }
+        .board-activity-row.kind-comment .board-activity-text { color: var(--fg); }
+        .board-activity-row.kind-move .board-activity-text { color: var(--accent); }
+        .board-activity-row.kind-block .board-activity-text { color: var(--error-fg); }
+        .board-activity-row.kind-review .board-activity-text { color: var(--violet, var(--accent)); }
+        /* Inline card controls: comment box, edit form, block reason form. */
+        .board-card-input {
+            width: 100%; box-sizing: border-box;
+            padding: 4px 6px; font-size: 0.85em;
+            background: var(--bg-input); color: var(--fg);
+            border: 1px solid var(--border); border-radius: var(--radius-sm);
+            /* The card is user-select:none / cursor:grab (drag affordance);
+               restore normal text behavior inside its form controls. */
+            cursor: text; user-select: text; -webkit-user-select: text;
+        }
+        select.board-card-input { cursor: pointer; }
+        .board-card-input::placeholder { color: var(--fg-dim); }
+        textarea.board-card-input { font-family: inherit; resize: vertical; }
+        /* Edit fields that match the read-only text they replace: content
+           height, no scrollbar (board.js autoSizeTextarea keeps them fitted),
+           same text size as .board-card-desc. */
+        textarea.board-card-edit-auto { resize: none; overflow: hidden; font-size: 0.9em; }
+        .board-card-comment { display: flex; align-items: flex-end; gap: 6px; margin-top: 8px; }
+        .board-card-comment .board-card-input { flex: 1; }
+        .board-card-edit, .board-card-block { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+        .board-card-block { border-top: 1px dashed var(--border); padding-top: 6px; }
+        .board-card-actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+        .board-card-action {
+            background: none; border: 1px solid var(--border); border-radius: var(--radius-md);
+            padding: 2px 10px; font-size: 0.8em; cursor: pointer; color: var(--fg);
+        }
+        .board-card-action:hover:not(:disabled) { background: var(--border); }
+        .board-card-action.active {
+            color: var(--accent); border-color: var(--accent); background: var(--accent-soft);
+        }
+        .board-card-action.primary {
+            background: var(--accent-bg); color: var(--accent-fg); border-color: transparent;
+            align-self: flex-start;
+        }
+        .board-card-action.primary:hover:not(:disabled) { background: color-mix(in srgb, var(--accent-bg) 82%, #fff); }
         .board-card-start {
             margin-top: 8px; background: none;
             border: 1px solid var(--border); border-radius: var(--radius-md);
@@ -2006,7 +2162,27 @@
             color: var(--fg-muted);
             border-bottom: 1px solid var(--border);
             background: var(--bg-elevated);
+            /* Header + its action buttons on one line (Files / Changes h4). */
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
         }
+        .tree-actions { display: inline-flex; align-items: center; gap: 2px; }
+        .tree-actions button {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 2px 5px;
+            font-size: 0.95em;
+            line-height: 1;
+            background: none;
+            border: 1px solid transparent;
+            border-radius: var(--radius-sm);
+            color: var(--fg-muted);
+            cursor: pointer;
+        }
+        .tree-actions button:hover { background: var(--bg-hover); color: var(--fg); border-color: var(--border); }
         #file-tree, #changes-list {
             overflow-y: auto;
             padding: 6px 8px;
@@ -2038,12 +2214,31 @@
         #changes-list .changes-section.conflict .changes-item { color: var(--error); }
         #commit-composer {
             border-top: 1px solid var(--border);
-            padding: 6px 8px;
+            display: flex;
+            flex-direction: column;
+            flex-shrink: 0;
+        }
+        #commit-composer h4 { padding: 8px 12px; }
+        #commit-body {
             display: flex;
             flex-direction: column;
             gap: 6px;
-            flex-shrink: 0;
+            padding: 0 8px 8px;
         }
+        #commit-composer.collapsed #commit-body { display: none; }
+        #commit-toggle {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 2px 5px;
+            line-height: 1;
+            background: none;
+            border: 1px solid transparent;
+            border-radius: var(--radius-sm);
+            color: var(--fg-muted);
+            cursor: pointer;
+        }
+        #commit-toggle:hover { background: var(--bg-hover); color: var(--fg); border-color: var(--border); }
         #commit-message {
             width: 100%;
             box-sizing: border-box;
@@ -2076,14 +2271,32 @@
             white-space: nowrap;
         }
         .tree-item {
+            display: flex;
+            align-items: center;
+            gap: 4px;
             padding: 3px 6px;
             cursor: pointer;
             border-radius: var(--radius-xs);
             white-space: nowrap;
             overflow: hidden;
-            text-overflow: ellipsis;
         }
         .tree-item:hover { background: var(--bg-hover); }
+        /* The currently-open file, mirrored from the editor's active path. */
+        .tree-item.active { background: var(--accent-soft); color: var(--accent); }
+        .tree-item:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+        /* Fixed-width chevron column keeps file and folder names aligned. */
+        .tree-chevron {
+            flex-shrink: 0;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 12px;
+            color: var(--fg-muted);
+        }
+        .tree-chevron .icon { width: 12px; height: 12px; }
+        .tree-icon { flex-shrink: 0; display: inline-flex; color: var(--fg-dim); }
+        .tree-item.dir .tree-icon { color: var(--accent); }
+        .tree-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         /* Changes rows: label (opens the diff) + a Stage/Unstage action
            button; the button stops propagation so it never opens the diff. */
         .changes-item {
@@ -2098,9 +2311,51 @@
         .changes-item-label {
             flex: 1;
             min-width: 0;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+        }
+        /* Colored status letter (porcelain-v2 column code) per row. */
+        .changes-badge {
+            flex-shrink: 0;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 15px;
+            height: 15px;
+            font-size: 0.85em;
+            font-weight: 700;
+            border-radius: var(--radius-xs);
+            background: var(--bg-active);
+            color: var(--fg-muted);
+        }
+        .changes-badge-m { color: var(--amber); }
+        .changes-badge-a { color: var(--success-fg); }
+        .changes-badge-d { color: var(--error-fg); }
+        .changes-badge-r, .changes-badge-c { color: var(--accent); }
+        .changes-badge-t { color: var(--violet); }
+        .changes-badge-u { color: var(--fg-muted); }
+        .changes-badge-conflict { color: var(--error-fg); }
+        /* Path: directory dimmed, basename bright, ellipsised as a unit. */
+        .changes-path {
+            flex: 1;
+            min-width: 0;
             overflow: hidden;
             text-overflow: ellipsis;
-            cursor: pointer;
+            white-space: nowrap;
+        }
+        .changes-path-dir { color: var(--fg-dim); }
+        .changes-path-base { color: var(--fg); }
+        /* Changes header count chip. */
+        .changes-count {
+            font-size: 0.85em;
+            font-weight: 600;
+            letter-spacing: 0;
+            color: var(--fg);
+            background: var(--bg-active);
+            border-radius: var(--radius-full);
+            padding: 1px 7px;
         }
         .changes-item-action {
             flex-shrink: 0;
@@ -2114,6 +2369,14 @@
         }
         .changes-item-action:hover { background: var(--bg-hover); }
         .changes-item-action:disabled { opacity: 0.5; cursor: default; }
+        /* On pointer devices the Stage/Unstage action is revealed on row
+           hover/focus to cut visual noise; touch keeps it always visible
+           (no hover → the default opacity 1 above stands). */
+        @media (hover: hover) {
+            .changes-item .changes-item-action { opacity: 0; transition: opacity var(--dur-fast); }
+            .changes-item:hover .changes-item-action,
+            .changes-item:focus-within .changes-item-action { opacity: 1; }
+        }
         .tree-item.dir { color: var(--accent); }
         .tree-item.file { color: var(--fg); }
         .tree-children { padding-left: 14px; }
@@ -2128,19 +2391,48 @@
             flex-shrink: 0;
         }
         #editor-toolbar button { padding: 5px 10px; font-size: 0.8em; }
+        /* Path group takes the leftover width so the action group never moves
+           as buttons appear/disappear. */
+        .toolbar-left {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex: 1;
+            min-width: 0;
+        }
+        .toolbar-right {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-shrink: 0;
+        }
         #editor-path-label {
             font-family: var(--mono);
             font-size: 0.85em;
             color: var(--fg-muted);
             flex: 1;
+            min-width: 0;
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
         }
-        #editor-toolbar .toolbar-icon-btn {
+        #editor-toolbar .toolbar-icon-btn,
+        #editor-diff-toolbar .toolbar-icon-btn {
             padding: 5px 9px;
             min-width: 28px;
         }
+        /* Diff-only control bar (change nav + layout toggle), shown only
+           while the diff pane is up. */
+        #editor-diff-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 5px 10px;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg-elevated);
+            flex-shrink: 0;
+        }
+        #editor-diff-toolbar button { padding: 4px 10px; font-size: 0.8em; }
         #editor-statusbar {
             display: flex;
             gap: 14px;
@@ -2157,6 +2449,13 @@
         }
         #editor-statusbar .status-problems-error { color: var(--error-fg); }
         #editor-statusbar .status-problems-warn { color: var(--amber); }
+        /* Status bar items never wrap; the spacer pushes the document-state
+           group (selection · indent · EOL · language · Ln,Col) to the right
+           edge, mirroring the branch/problems group on the left. */
+        #editor-statusbar > span { white-space: nowrap; }
+        #editor-statusbar .status-spacer { flex: 1; }
+        #editor-status-branch { display: inline-flex; align-items: center; gap: 4px; }
+        #editor-status-branch .icon { color: var(--fg-dim); }
         #editor-tabs {
             display: flex;
             gap: 1px;
@@ -2188,6 +2487,22 @@
             border-color: var(--border);
             border-bottom-color: var(--bg);
         }
+        /* Dirty marker: a dot in place of the old "* " name prefix.
+           updateDirtyState toggles .dirty on the active tab per keystroke;
+           renderTabs sets it for the rest. */
+        .file-tab-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: currentColor;
+            opacity: 0.75;
+            flex-shrink: 0;
+            display: none;
+        }
+        .file-tab.dirty .file-tab-dot { display: inline-block; }
+        /* The active tab while its git diff is shown: an accent underline
+           distinguishes "viewing diff" from an editable tab. */
+        .file-tab.diffing { border-bottom-color: var(--accent); }
         .file-tab-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .file-tab-close {
             border: none;
@@ -2199,6 +2514,36 @@
             color: var(--fg-dim);
         }
         .file-tab-close:hover { color: var(--fg); }
+        /* ===== Editor tab context menu =====
+           Floating menu opened by right-clicking a tab (editor.js
+           openTabMenu): fixed-positioned at the pointer, viewport-clamped.
+           Styled like the terminal's » dropdown. */
+        #tab-context-menu {
+            position: fixed;
+            z-index: 1600;
+            min-width: 180px;
+            padding: 4px;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            box-shadow: var(--shadow-md);
+        }
+        .tab-menu-row {
+            display: block;
+            width: 100%;
+            text-align: left;
+            padding: 6px 10px;
+            font-size: 0.82em;
+            color: var(--fg);
+            background: none;
+            border: none;
+            border-radius: var(--radius-md);
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        .tab-menu-row:hover:not(:disabled) { background: var(--bg-hover); }
+        .tab-menu-row:disabled { color: var(--fg-dim); cursor: default; }
+        .tab-menu-sep { height: 1px; margin: 4px 6px; background: var(--border); }
         #monaco-wrap { flex: 1; position: relative; min-height: 0; background: var(--bg); }
         .file-tab-badge {
             font-size: 0.7em;
@@ -2250,11 +2595,24 @@
             color: var(--accent);
         }
         .btn-link:hover { background: var(--bg-hover); }
-        #btn-refresh-explorer {
-            float: right;
-            padding: 2px 8px;
-            font-size: 0.75em;
+        /* Inline "new file" composer under the Files header. */
+        #new-file-row {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            padding: 6px 8px;
+            border-bottom: 1px solid var(--border-subtle);
+            background: var(--bg-elevated);
         }
+        #new-file-input {
+            flex: 1;
+            min-width: 0;
+            font-size: 0.82em;
+            font-family: var(--mono);
+            padding: 4px 6px;
+        }
+        #new-file-row button { font-size: 0.75em; padding: 3px 8px; white-space: nowrap; }
+        #new-file-cancel { display: inline-flex; align-items: center; }
 
         /* ===== Textarea auto-resize (native) =====
            field-sizing: content makes the textarea grow/shrink with its text

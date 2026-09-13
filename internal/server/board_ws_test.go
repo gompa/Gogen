@@ -109,3 +109,82 @@ func TestBoardOpViaWS(t *testing.T) {
 		t.Fatalf("board_state after remove = %+v, want 0 items", state.BoardState)
 	}
 }
+
+// TestBoardUpdateAndBlockViaWS covers the two ops backing the card detail's
+// inline actions: update (the edit form's full replace of title/description/
+// priority) and block (with a required reason). Both broadcast a fresh
+// board_state and toast a success notice like every other mutation; a block
+// without a reason is rejected on the notice channel.
+func TestBoardUpdateAndBlockViaWS(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, _, _ := newContinuationServer(t, stub, dir)
+	srv := startWSServer(t, s)
+	defer srv.Close()
+
+	conn := dialWS(t, srv, "/ws")
+	defer conn.Close()
+	readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "session_state" })
+	cfg := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" })
+	sid := cfg.SessionID
+	_ = readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" && m.SessionID == sid })
+
+	if err := conn.WriteJSON(WSMessage{Type: "config", Board: "on", SessionID: sid}); err != nil {
+		t.Fatalf("send board on: %v", err)
+	}
+	_ = readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "config" && m.Board == "on" })
+
+	if err := conn.WriteJSON(WSMessage{Type: "board_op", BoardOp: &BoardOpRequest{Action: "add", Title: "before", Description: "d", Priority: "low"}}); err != nil {
+		t.Fatalf("send add: %v", err)
+	}
+	_ = readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "board_state" })
+	_ = readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "notice" })
+
+	// Update: full replace of the editable fields (title, description,
+	// priority, context).
+	if err := conn.WriteJSON(WSMessage{Type: "board_op", BoardOp: &BoardOpRequest{Action: "update", ID: "1", Title: "after", Description: "new desc", Priority: "urgent", Context: "run go test ./internal/parser"}}); err != nil {
+		t.Fatalf("send update: %v", err)
+	}
+	state := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "board_state" })
+	ack := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "notice" })
+	if !ack.Success || ack.Kind != "board" || !strings.Contains(ack.Content, "Updated board item #1") {
+		t.Fatalf("update ack = %+v", ack)
+	}
+	card := state.BoardState.Items[0]
+	if card.Title != "after" || card.Description != "new desc" || card.Priority != "urgent" || card.Context != "run go test ./internal/parser" {
+		t.Fatalf("updated card = %+v", card)
+	}
+
+	// Block with a reason: the card moves to blocked and the reason lands in
+	// the activity log.
+	if err := conn.WriteJSON(WSMessage{Type: "board_op", BoardOp: &BoardOpRequest{Action: "block", ID: "1", Reason: "waiting on upstream"}}); err != nil {
+		t.Fatalf("send block: %v", err)
+	}
+	state = readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "board_state" })
+	ack = readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "notice" })
+	if !ack.Success || !strings.Contains(ack.Content, "Blocked board item #1") {
+		t.Fatalf("block ack = %+v", ack)
+	}
+	blocked := state.BoardState.Items[0]
+	if blocked.Status != "blocked" {
+		t.Fatalf("card status = %q, want blocked", blocked.Status)
+	}
+	found := false
+	for _, act := range blocked.Activity {
+		if strings.Contains(act.Text, "waiting on upstream") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("block reason missing from activity: %+v", blocked.Activity)
+	}
+
+	// An empty block reason is rejected (no broadcast).
+	if err := conn.WriteJSON(WSMessage{Type: "board_op", BoardOp: &BoardOpRequest{Action: "block", ID: "1", Reason: "  "}}); err != nil {
+		t.Fatalf("send block: %v", err)
+	}
+	resp := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "notice" })
+	if resp.Success || resp.Kind != "board" || !strings.Contains(resp.Content, "block reason is required") {
+		t.Fatalf("empty block reason notice = %+v", resp)
+	}
+}

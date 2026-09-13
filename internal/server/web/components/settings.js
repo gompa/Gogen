@@ -32,6 +32,10 @@ import { requestAutomationsState, automationsPaneVisible } from '/components/aut
 import { icon } from '/components/icons.js';
 import { SETTINGS_SCHEMA } from '/components/settings-schema.js';
 import { renderSettings } from '/components/settings-render.js';
+// Safe localStorage access (see storage.js): several preferences below are
+// read at module top level, where an unguarded access would throw in a
+// storage-blocked browser and abort this module's (and app.js's) evaluation.
+import { storageGet, storageSet, storageRemove } from '/components/storage.js';
 
 // Build the modal body (sidebar + panels + rows) from the schema
 // (components/settings-schema.js) before any control is looked up by id
@@ -56,13 +60,13 @@ const themeSelect = document.getElementById('theme-select');
 // instead — the screen the user is on wins on open.
 const SETTINGS_TAB_STORAGE = 'gogen-settings-tab';
 const SCREEN_TO_SETTINGS_TAB = { chat: 'chat', editor: 'editor', board: 'agent', automations: 'automations' };
-let settingsTab = localStorage.getItem(SETTINGS_TAB_STORAGE) || 'chat';
+let settingsTab = storageGet(SETTINGS_TAB_STORAGE) || 'chat';
 
 export function showSettingsTab(tab) {
     const panel = document.getElementById('settings-tab-' + tab);
     if (!panel) tab = 'chat'; // stale localStorage value — fall back
     settingsTab = tab;
-    try { localStorage.setItem(SETTINGS_TAB_STORAGE, tab); } catch (e) { /* private mode */ }
+    storageSet(SETTINGS_TAB_STORAGE, tab);
     document.querySelectorAll('.settings-tab-btn').forEach((btn) => {
         const on = btn.dataset.tab === tab;
         btn.classList.toggle('active', on);
@@ -606,7 +610,7 @@ if (providerTestBtn) {
 
 // === Theme: detect system preference, allow override ===
 const prefersDark = window.matchMedia('(prefers-color-scheme: dark)');
-const savedTheme = localStorage.getItem('gogen-theme') || 'auto';
+const savedTheme = storageGet('gogen-theme') || 'auto';
 
 function resolveTheme(preference) {
     if (preference === 'auto' || !preference) return prefersDark.matches ? 'dark' : 'light';
@@ -616,7 +620,7 @@ function resolveTheme(preference) {
 function applyTheme(preference) {
     const resolved = resolveTheme(preference);
     document.documentElement.classList.toggle('light', resolved === 'light');
-    localStorage.setItem('gogen-theme', preference);
+    storageSet('gogen-theme', preference);
     // Keep select in sync
     if (themeSelect.value !== preference) themeSelect.value = preference;
     // Address-bar color follows the theme.
@@ -633,7 +637,7 @@ applyTheme(savedTheme);
 
 // Listen for OS theme changes (only affects "auto" mode)
 prefersDark.addEventListener('change', () => {
-    const pref = localStorage.getItem('gogen-theme') || 'auto';
+    const pref = storageGet('gogen-theme') || 'auto';
     if (pref === 'auto') applyTheme('auto');
 });
 
@@ -641,12 +645,42 @@ themeSelect.addEventListener('change', () => {
     applyTheme(themeSelect.value);
 });
 
+// === Chat reading width: full width (default) or a centered column ===
+// Purely presentational and per-browser (localStorage), like the theme
+// above. Toggling a class on #messages lets styles.css cap each transcript
+// item to a readable column; the CSS collapses to full width once the
+// viewport is narrower than the column, so no JS width math is needed.
+const chatWidthSelect = document.getElementById('chat-width-select');
+const savedChatWidth = storageGet('gogen_chat_width') || 'full';
+
+function applyChatWidth(value) {
+    const msgs = document.getElementById('messages');
+    if (msgs) msgs.classList.toggle('chat-column', value === 'comfortable');
+}
+
+if (chatWidthSelect) {
+    chatWidthSelect.value = savedChatWidth;
+    chatWidthSelect.addEventListener('change', () => {
+        storageSet('gogen_chat_width', chatWidthSelect.value);
+        applyChatWidth(chatWidthSelect.value);
+    });
+    applyChatWidth(savedChatWidth);
+}
+// Cross-tab sync (mirrors the other local preferences).
+window.addEventListener('storage', (e) => {
+    if (e.key === 'gogen_chat_width') {
+        const val = e.newValue || 'full';
+        if (chatWidthSelect && chatWidthSelect.value !== val) chatWidthSelect.value = val;
+        applyChatWidth(val);
+    }
+});
+
 // === File-click behavior: persist and apply ===
 const fileClickSelect = document.getElementById('file-click-behavior');
-const savedFileClick = localStorage.getItem('gogen_file_click_behavior') || 'open';
+const savedFileClick = storageGet('gogen_file_click_behavior') || 'open';
 fileClickSelect.value = savedFileClick;
 fileClickSelect.addEventListener('change', () => {
-    localStorage.setItem('gogen_file_click_behavior', fileClickSelect.value);
+    storageSet('gogen_file_click_behavior', fileClickSelect.value);
 });
 // Listen for storage changes from other tabs
 window.addEventListener('storage', (e) => {
@@ -658,10 +692,10 @@ window.addEventListener('storage', (e) => {
 
 // === Chat diff viewer: static tokenizer pre (default) or full Monaco editor ===
 const diffViewerSelect = document.getElementById('chat-diff-viewer');
-const savedDiffViewer = localStorage.getItem('gogen_chat_diff_viewer') || 'tokenizer';
+const savedDiffViewer = storageGet('gogen_chat_diff_viewer') || 'tokenizer';
 diffViewerSelect.value = savedDiffViewer;
 diffViewerSelect.addEventListener('change', () => {
-    localStorage.setItem('gogen_chat_diff_viewer', diffViewerSelect.value);
+    storageSet('gogen_chat_diff_viewer', diffViewerSelect.value);
 });
 window.addEventListener('storage', (e) => {
     if (e.key === 'gogen_chat_diff_viewer') {
@@ -672,10 +706,10 @@ window.addEventListener('storage', (e) => {
 
 // The chat diff viewer is either a static line-numbered <pre>
 // (default) or a full Monaco editor — a user setting
-// (gogen_chat_diff_viewer). Reads localStorage directly so it works
+// (gogen_chat_diff_viewer). Reads storage directly so it works
 // regardless of when the settings UI initializes.
 export function diffViewerMode() {
-    return localStorage.getItem('gogen_chat_diff_viewer') === 'monaco' ? 'monaco' : 'tokenizer';
+    return storageGet('gogen_chat_diff_viewer') === 'monaco' ? 'monaco' : 'tokenizer';
 }
 
 // === Editor preferences: persist and apply to the live Monaco editor ===
@@ -696,7 +730,7 @@ function clampFontSize(v) {
 
 function initEditorPrefControl(control, key, dflt) {
     if (!control) return;
-    const saved = localStorage.getItem(key) || dflt;
+    const saved = storageGet(key) || dflt;
     control.value = saved;
     control.addEventListener('change', () => {
         if (control.type === 'number') {
@@ -704,7 +738,7 @@ function initEditorPrefControl(control, key, dflt) {
             // actually apply (getEditorPrefs clamps to [min, max]).
             control.value = String(clampFontSize(control.value));
         }
-        localStorage.setItem(key, control.value);
+        storageSet(key, control.value);
         applyEditorPrefs();
     });
 }
@@ -733,7 +767,7 @@ window.addEventListener('storage', (e) => {
 
 // === Desktop notifications ===
 const notificationsSelect = document.getElementById('notifications-select');
-const savedNotifications = localStorage.getItem('gogen_notifications') || 'off';
+const savedNotifications = storageGet('gogen_notifications') || 'off';
 notificationsSelect.value = savedNotifications;
 notificationsSelect.addEventListener('change', () => {
     setNotificationPref(notificationsSelect.value);
@@ -747,11 +781,11 @@ window.addEventListener('storage', (e) => {
 
 // === Show reply model (Settings → Chat): per-bubble model chip ===
 const showReplyModelSelect = document.getElementById('show-reply-model');
-const savedShowReplyModel = localStorage.getItem('gogen_show_reply_model') || 'off';
+const savedShowReplyModel = storageGet('gogen_show_reply_model') || 'off';
 if (showReplyModelSelect) {
     showReplyModelSelect.value = savedShowReplyModel;
     showReplyModelSelect.addEventListener('change', () => {
-        localStorage.setItem('gogen_show_reply_model', showReplyModelSelect.value);
+        storageSet('gogen_show_reply_model', showReplyModelSelect.value);
         deps.applyReplyModelChips();
     });
 }
@@ -769,7 +803,7 @@ window.addEventListener('storage', (e) => {
 // model chip preference is on. app.js's per-bubble render hook
 // reads the preference through this (it stays in app.js).
 export function getShowReplyModelPref() {
-    return (localStorage.getItem('gogen_show_reply_model') || 'off') === 'on';
+    return (storageGet('gogen_show_reply_model') || 'off') === 'on';
 }
 
 // === Accent color: persist and apply ===
@@ -853,7 +887,7 @@ function toHex(r, g, b) {
     return '#' + h(r) + h(g) + h(b);
 }
 
-const savedAccent = localStorage.getItem('gogen-accent-color') || '';
+const savedAccent = storageGet('gogen-accent-color') || '';
 if (savedAccent) {
     accentInput.value = savedAccent;
     applyAccentColor(savedAccent);
@@ -862,7 +896,7 @@ if (savedAccent) {
 accentInput.addEventListener('input', function () {
     const hex = accentInput.value;
     applyAccentColor(hex);
-    localStorage.setItem('gogen-accent-color', hex);
+    storageSet('gogen-accent-color', hex);
 });
 
 window.addEventListener('storage', function (e) {
@@ -875,7 +909,7 @@ window.addEventListener('storage', function (e) {
 
 // === Accent color: reset to theme default ===
 document.getElementById('accent-reset-btn').addEventListener('click', function () {
-    localStorage.removeItem('gogen-accent-color');
+    storageRemove('gogen-accent-color');
     document.documentElement.style.removeProperty('--user-accent');
     document.documentElement.style.removeProperty('--user-accent-bg');
     // Reset picker to the current theme's default accent
@@ -886,14 +920,14 @@ document.getElementById('accent-reset-btn').addEventListener('click', function (
 });
 
 export function getNotificationPref() {
-    return localStorage.getItem('gogen_notifications') || 'off';
+    return storageGet('gogen_notifications') || 'off';
 }
 
 // Persists the notification preference, keeps the settings select in
 // sync and requests permission when turning on (the command palette's
 // toggle command goes through this too).
 export function setNotificationPref(value) {
-    localStorage.setItem('gogen_notifications', value);
+    storageSet('gogen_notifications', value);
     if (notificationsSelect.value !== value) notificationsSelect.value = value;
     if (value !== 'off') {
         requestNotificationPermission();

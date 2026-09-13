@@ -82,8 +82,22 @@ func TicketPrompt(item *BoardItem, template string) string {
 		"{title}", item.Title,
 		"{description}", item.Description,
 		"{priority}", priority,
-		"{context}", activityContextBlock(item.Activity),
+		"{context}", ticketContextBlock(item),
 	).Replace(template)
+}
+
+// ticketContextBlock renders the {context} placeholder: the ticket's explicit
+// Context text (if any) followed by the activity-derived log block (if any).
+// A fresh ticket with neither renders "" so the prompt stays lean.
+func ticketContextBlock(item *BoardItem) string {
+	var parts []string
+	if c := strings.TrimSpace(item.Context); c != "" {
+		parts = append(parts, c)
+	}
+	if b := activityContextBlock(item.Activity); b != "" {
+		parts = append(parts, b)
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 // maxActivityContextLines caps the content-bearing entries included in a
@@ -122,9 +136,10 @@ func activityContext(activity []BoardActivity) []string {
 	return out
 }
 
-// activityContextBlock renders the {context} placeholder value: a labeled
-// list of the content-bearing entries, or "" when the log has none (a
-// freshly started ticket keeps the prompt lean).
+// activityContextBlock renders the activity-derived portion of the {context}
+// placeholder: a labeled list of the content-bearing entries, or "" when the
+// log has none (a freshly started ticket keeps the prompt lean). It is
+// combined with the ticket's explicit Context by ticketContextBlock.
 func activityContextBlock(activity []BoardActivity) string {
 	entries := activityContext(activity)
 	if len(entries) == 0 {
@@ -190,7 +205,7 @@ func ReviewPrompt(item *BoardItem, template string) string {
 		"{description}", item.Description,
 		"{priority}", priority,
 		"{assignee}", assignee,
-		"{context}", activityContextBlock(item.Activity),
+		"{context}", ticketContextBlock(item),
 	).Replace(template)
 }
 

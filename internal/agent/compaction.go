@@ -154,7 +154,7 @@ func (a *Agent) wireOverheadTokens() int {
 	} else {
 		// History carries a system message: only the enrichment suffix is
 		// wire overhead (the base content is counted in the messages).
-		sysContent = buildSystemSuffix(a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode)
+		sysContent = buildSystemSuffix(a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode, a.mcpToolsPresent())
 	}
 	h := fnv.New64a()
 	h.Write([]byte(sysContent))

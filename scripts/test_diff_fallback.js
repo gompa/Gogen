@@ -16,7 +16,7 @@
 const fs = require('fs');
 const path = require('path');
 const { JSDOM } = require('/tmp/gogen-jsdom/node_modules/jsdom');
-const { ROOT, stripModuleSyntax } = require('./web-harness');
+const { ROOT, stripModuleSyntax, installStorage } = require('./web-harness');
 
 let failures = 0;
 function check(cond, msg) {
@@ -34,6 +34,7 @@ function check(cond, msg) {
 const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'http://localhost/', runScripts: 'dangerously' });
 const { window } = dom;
 window.DOMPurify = { sanitize: (h) => h }; // only used by colorize paths, not exercised here
+installStorage(window); // editor.js reads persisted prefs at top level
 window.eval(stripModuleSyntax(fs.readFileSync(path.join(ROOT, 'internal/server/web/editor.js'), 'utf8')));
 const { updateDiffFallback, diffLineNumbers } = window;
 check(typeof updateDiffFallback === 'function', 'updateDiffFallback loaded from real editor.js');

@@ -24,6 +24,21 @@ func stringArgOptional(args map[string]any, key string) (string, error) {
 	}
 	return s, nil
 }
+
+// optionalStringPtr reads an optional string tool argument as a *string,
+// returning nil when the key is absent. It lets handlers distinguish "not
+// provided" from "provided empty" — the partial-update contract (an absent
+// field is left unchanged; an empty one clears it).
+func optionalStringPtr(args map[string]any, key string) (*string, error) {
+	if _, ok := args[key]; !ok {
+		return nil, nil
+	}
+	s, err := stringArgOptional(args, key)
+	if err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
 func (a *Agent) toolContext(ctx context.Context) context.Context {
 	if a.Executor != nil && !a.Executor.DeleteApprovalRequired() {
 		ctx = ContextWithDeleteApprovalRequired(ctx, false)

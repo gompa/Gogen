@@ -161,6 +161,145 @@ func TestBoardValidation(t *testing.T) {
 	}
 }
 
+// TestBoardUpdate verifies the partial-edit contract: nil fields are left
+// unchanged, a provided empty title is rejected, description/priority can be
+// cleared, a no-op edit records nothing, and the change persists.
+func TestBoardUpdate(t *testing.T) {
+	m := newTestBoard(t)
+	if _, err := m.Add("Original", "desc", "high", "user"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Partial edit: only the title; description/priority are untouched.
+	title := "Renamed"
+	if _, err := m.Update("1", BoardUpdate{Title: &title}, "user"); err != nil {
+		t.Fatal(err)
+	}
+	item, err := m.Item("1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.Title != "Renamed" || item.Description != "desc" || item.Priority != "high" {
+		t.Fatalf("partial edit = %q / %q / %q, want Renamed / desc / high", item.Title, item.Description, item.Priority)
+	}
+	show, _ := m.Show("1")
+	if !strings.Contains(show, "edited title") {
+		t.Fatalf("activity missing the edited-field entry:\n%s", show)
+	}
+
+	// A provided empty title is rejected.
+	empty := "   "
+	if _, err := m.Update("1", BoardUpdate{Title: &empty}, "user"); err == nil {
+		t.Fatal("empty title should fail")
+	}
+
+	// Description and priority can be cleared with an explicit empty value.
+	blank := ""
+	if _, err := m.Update("1", BoardUpdate{Description: &blank, Priority: &blank}, "user"); err != nil {
+		t.Fatal(err)
+	}
+	item, _ = m.Item("1")
+	if item.Description != "" || item.Priority != "" {
+		t.Fatalf("cleared fields = %q / %q, want empty", item.Description, item.Priority)
+	}
+
+	// Context is a fourth editable field.
+	ctx := "run go test ./internal/parser"
+	if _, err := m.Update("1", BoardUpdate{Context: &ctx}, "user"); err != nil {
+		t.Fatal(err)
+	}
+	item, _ = m.Item("1")
+	if item.Context != ctx {
+		t.Fatalf("context = %q, want %q", item.Context, ctx)
+	}
+	show, _ = m.Show("1")
+	if !strings.Contains(show, "Context:") || !strings.Contains(show, ctx) {
+		t.Fatalf("show missing context:\n%s", show)
+	}
+
+	// A no-op edit records no activity entry.
+	before := len(item.Activity)
+	same := "Renamed"
+	out, err := m.Update("1", BoardUpdate{Title: &same}, "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "unchanged") {
+		t.Fatalf("no-op output = %q, want unchanged", out)
+	}
+	item, _ = m.Item("1")
+	if len(item.Activity) != before {
+		t.Fatalf("no-op edit changed activity: %d -> %d", before, len(item.Activity))
+	}
+
+	// Unknown ticket.
+	if _, err := m.Update("99", BoardUpdate{Title: &same}, "user"); err == nil {
+		t.Fatal("update on unknown ticket should fail")
+	}
+
+	// Persistence: a reloaded manager sees the edit and its activity entry.
+	m2 := NewBoardManager(t.TempDir(), false)
+	m2.dir = m.dir
+	item2, err := m2.Item("1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item2.Title != "Renamed" {
+		t.Fatalf("reloaded title = %q, want Renamed", item2.Title)
+	}
+}
+
+// TestBoardUpdateTool pins the board tool's update action: only the fields
+// present in the call change (so an agent can rename without wiping the
+// description), and an empty title is rejected.
+func TestBoardUpdateTool(t *testing.T) {
+	prov := llmtest.NewMockProvider()
+	exec := NewExecutor(t.TempDir())
+	a := NewAgent(prov, exec, contextmgr.NewManager(prov, contextmgr.Settings{ContextLimit: 128000}))
+	a.SetBoardEnabled(true)
+	bm := NewBoardManager(t.TempDir(), false)
+	a.SetBoardManager(bm)
+	if _, err := bm.Add("original", "keep me", "low", "user"); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]any{
+		"action": "update", "id": 1, "title": "renamed",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "Updated board item #1") {
+		t.Fatalf("update output = %q", out)
+	}
+	item, _ := bm.Item("1")
+	if item.Title != "renamed" || item.Description != "keep me" || item.Priority != "low" {
+		t.Fatalf("tool update = %q / %q / %q, want renamed / keep me / low", item.Title, item.Description, item.Priority)
+	}
+
+	// Context is editable on its own (a partial edit must not clobber the
+	// other fields).
+	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]any{
+		"action": "update", "id": "1", "context": "deploy notes in docs/deploy.md",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	item, _ = bm.Item("1")
+	if item.Context != "deploy notes in docs/deploy.md" {
+		t.Fatalf("context = %q", item.Context)
+	}
+	if item.Title != "renamed" || item.Description != "keep me" || item.Priority != "low" {
+		t.Fatalf("context-only update clobbered other fields: %+v", item)
+	}
+
+	// An empty title is rejected.
+	if _, err := a.executeTool(t.Context(), llm.ToolCall{Name: "board", Args: map[string]any{
+		"action": "update", "id": "1", "title": "  ",
+	}}); err == nil {
+		t.Fatal("empty title should fail")
+	}
+}
+
 // TestBoardClaimConcurrency verifies concurrent claims on the same ticket
 // from different agents serialize: exactly one assignee wins (run under
 // -race).

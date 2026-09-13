@@ -72,17 +72,22 @@ type HistoryToolCall struct {
 }
 
 // BoardOpRequest is one kanban-tab operation sent client→server as a
-// "board_op" message: list (no mutation) or add/claim/move/comment/done/
-// remove. After a successful mutation the server broadcasts a fresh
-// board_state to every client.
+// "board_op" message: list (no mutation) or add/update/claim/move/block/
+// comment/done/start/remove. After a successful mutation the server
+// broadcasts a fresh board_state to every client.
 type BoardOpRequest struct {
 	Action      string `json:"action,omitempty"`
 	ID          string `json:"id,omitempty"`
 	Title       string `json:"title,omitempty"`
 	Description string `json:"description,omitempty"`
 	Priority    string `json:"priority,omitempty"`
-	Column      string `json:"column,omitempty"`
-	Text        string `json:"text,omitempty"`
+	// Context is the free-text context merged into a started agent's prompt
+	// (update only).
+	Context string `json:"context,omitempty"`
+	Column  string `json:"column,omitempty"`
+	Text    string `json:"text,omitempty"`
+	// Reason is the block reason (block only).
+	Reason string `json:"reason,omitempty"`
 	// Model is the per-ticket model chosen in the "Start agent" popover
 	// ("" = workspace default model). start only.
 	Model string `json:"model,omitempty"`
@@ -544,6 +549,7 @@ type WSMessage struct {
 	Path       string           `json:"path,omitempty"`
 	Pattern    string           `json:"pattern,omitempty"`
 	Glob       string           `json:"glob,omitempty"`
+	IgnoreCase bool             `json:"ignoreCase,omitempty"`
 	Language   string           `json:"language,omitempty"`
 	Error      string           `json:"error,omitempty"`
 	Entries    []FSEntry        `json:"entries,omitempty"`

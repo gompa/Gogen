@@ -168,11 +168,11 @@ func (s *Server) fsRead(path string) (content, language string, err error) {
 	return string(data), languageFromPath(path), nil
 }
 
-func (s *Server) fsSearch(ctx context.Context, pattern, path, glob string) ([]agent.SearchMatch, bool, error) {
+func (s *Server) fsSearch(ctx context.Context, pattern, path, glob string, ignoreCase bool) ([]agent.SearchMatch, bool, error) {
 	if s.ws == nil || s.ws.Exec == nil {
 		return nil, false, fmt.Errorf("executor unavailable")
 	}
-	return s.ws.Exec.SearchCodeMatches(ctx, pattern, path, glob)
+	return s.ws.Exec.SearchCodeMatches(ctx, pattern, path, glob, ignoreCase)
 }
 
 func (s *Server) fsWrite(path, content string) error {

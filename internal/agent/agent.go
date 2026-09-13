@@ -95,6 +95,7 @@ type Agent struct {
 	toolRegistry
 	turnCounters
 	sessionMeta
+	terminalState
 }
 
 func NewAgent(provider llm.LLMProvider, executor *Executor, ctxMgr *contextmgr.Manager) *Agent {

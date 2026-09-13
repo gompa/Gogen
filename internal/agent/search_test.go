@@ -35,7 +35,7 @@ func TestSearchCodeMatches(t *testing.T) {
 		t.Fatal(err)
 	}
 	executor := NewExecutor(dir)
-	matches, _, err := executor.SearchCodeMatches(context.Background(), "func hello", "", "*.go")
+	matches, _, err := executor.SearchCodeMatches(context.Background(), "func hello", "", "*.go", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,6 +51,33 @@ func TestSearchCodeMatches(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("unexpected matches: %+v", matches)
+	}
+}
+
+// TestSearchCodeMatchesIgnoreCase pins the case-sensitivity flag plumbed from
+// fs_search: the same pattern must miss when case-sensitive and hit when
+// ignoreCase is set.
+func TestSearchCodeMatchesIgnoreCase(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "mixed.go"), []byte("package main\n\nfunc HelloWorld() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	executor := NewExecutor(dir)
+
+	sensitive, _, err := executor.SearchCodeMatches(context.Background(), "helloworld", "", "*.go", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sensitive) != 0 {
+		t.Fatalf("case-sensitive search matched %d, want 0: %+v", len(sensitive), sensitive)
+	}
+
+	insensitive, _, err := executor.SearchCodeMatches(context.Background(), "helloworld", "", "*.go", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(insensitive) == 0 {
+		t.Fatal("case-insensitive search found no matches for helloworld")
 	}
 }
 

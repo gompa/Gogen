@@ -55,9 +55,12 @@ type BoardItem struct {
 	ID          string `json:"id"`
 	Title       string `json:"title"`
 	Description string `json:"description,omitempty"`
-	Status      string `json:"status"`
-	Priority    string `json:"priority,omitempty"`
-	Assignee    string `json:"assignee,omitempty"`
+	// Context is free-text background for the started agent, merged into the
+	// prompt's {context} placeholder ahead of the activity-derived log.
+	Context  string `json:"context,omitempty"`
+	Status   string `json:"status"`
+	Priority string `json:"priority,omitempty"`
+	Assignee string `json:"assignee,omitempty"`
 	// AgentSessionID is the session started for this ticket by the web
 	// board's "Start agent" button ("" = none). The "Open agent" button
 	// targets it; a stale id (session deleted) is reset by ResetAgent.
@@ -97,6 +100,17 @@ type BoardItem struct {
 	UpdatedAt time.Time       `json:"updated_at"`
 	DoneAt    time.Time       `json:"done_at,omitempty"`
 	Activity  []BoardActivity `json:"activity,omitempty"`
+}
+
+// BoardUpdate is a partial edit of a ticket's human-authored fields: a nil
+// field is left unchanged, so a rename does not wipe the description. The
+// web UI's edit form sends all three fields (full replace); the agent tool
+// sends only what it wants to change.
+type BoardUpdate struct {
+	Title       *string
+	Description *string
+	Priority    *string
+	Context     *string
 }
 
 // BoardSnapshot is the full board state for rendering (web UI / list).
@@ -388,6 +402,9 @@ func (m *BoardManager) Show(id string) (string, error) {
 	if item.Description != "" {
 		b.WriteString("\n\n" + item.Description)
 	}
+	if item.Context != "" {
+		b.WriteString("\n\nContext:\n" + item.Context)
+	}
 	if len(item.Activity) > 0 {
 		b.WriteString("\n\nActivity:")
 		for _, act := range item.Activity {
@@ -603,6 +620,62 @@ func (m *BoardManager) Add(title, description, priority, by string) (string, err
 		return "", err
 	}
 	return fmt.Sprintf("Added board item #%s: %s", item.ID, item.Title), nil
+}
+
+// Update applies a partial edit to a ticket's title, description, and
+// priority (nil fields are left unchanged). A provided title must be
+// non-empty. An edit that changes nothing is a no-op (no activity entry);
+// otherwise an "edited …" entry listing the changed fields is appended.
+func (m *BoardManager) Update(id string, upd BoardUpdate, by string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.loadIndexLocked(); err != nil {
+		return "", err
+	}
+	item, err := m.loadItemLocked(id)
+	if err != nil {
+		return "", err
+	}
+	var changed []string
+	if upd.Title != nil {
+		title := strings.TrimSpace(*upd.Title)
+		if title == "" {
+			return "", fmt.Errorf("board item title is required")
+		}
+		if title != item.Title {
+			item.Title = title
+			changed = append(changed, "title")
+		}
+	}
+	if upd.Description != nil {
+		desc := strings.TrimSpace(*upd.Description)
+		if desc != item.Description {
+			item.Description = desc
+			changed = append(changed, "description")
+		}
+	}
+	if upd.Priority != nil {
+		prio := normalizePriority(*upd.Priority)
+		if prio != item.Priority {
+			item.Priority = prio
+			changed = append(changed, "priority")
+		}
+	}
+	if upd.Context != nil {
+		ctx := strings.TrimSpace(*upd.Context)
+		if ctx != item.Context {
+			item.Context = ctx
+			changed = append(changed, "context")
+		}
+	}
+	if len(changed) == 0 {
+		return fmt.Sprintf("Board item #%s is unchanged", item.ID), nil
+	}
+	m.appendActivityLocked(item, by, "edited "+strings.Join(changed, ", "))
+	if err := m.saveItemLocked(item); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("Updated board item #%s: %s", item.ID, item.Title), nil
 }
 
 // Claim assigns the ticket to by and moves it to in_progress.

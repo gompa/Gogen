@@ -71,6 +71,7 @@ export var SETTINGS_SCHEMA = [
 
     // ── Appearance (local; was the "Global" tab) ───────────────────────
     { id: 'theme-select', tab: 'appearance', type: 'select', label: 'Theme', storage: 'local', channel: 'local', localKey: 'gogen-theme', default: 'auto', options: [['auto', 'Auto (system)'], ['dark', 'Dark'], ['light', 'Light']] },
+    { id: 'chat-width-select', tab: 'appearance', type: 'select', label: 'Chat width', storage: 'local', channel: 'local', localKey: 'gogen_chat_width', default: 'full', options: [['full', 'Full width'], ['comfortable', 'Comfortable (centered)']], note: 'Comfortable caps each message to a centered column for easier reading on wide screens.' },
     { id: 'accent-color-input', tab: 'appearance', type: 'color', label: 'Accent color', storage: 'local', channel: 'local', localKey: 'gogen-accent-color', default: '', value: '#7aa2f7', button: { id: 'accent-reset-btn', label: 'Default' } },
     { id: 'notifications-select', tab: 'appearance', type: 'select', label: 'Desktop notifications', storage: 'local', channel: 'local', localKey: 'gogen_notifications', default: 'off', options: [['off', 'Off'], ['background', 'When tab is hidden'], ['always', 'Always']] },
 

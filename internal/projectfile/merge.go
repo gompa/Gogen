@@ -80,6 +80,7 @@ func Merge(pf *ProjectFile, flags FlagOverrides) *config.Config {
 		SubagentPrompt:            mergeString("GOGEN_SUBAGENT_PROMPT", file.SubagentPrompt, def.SubagentPrompt),
 		AgentInstructions:         mergeString("GOGEN_AGENT_INSTRUCTIONS", file.AgentInstructions, def.AgentInstructions),
 		Skills:                    mergeString("GOGEN_SKILLS", file.Skills, def.Skills),
+		Terminal:                  mergeString("GOGEN_TERMINAL", file.Terminal, def.Terminal),
 		JobNotices:                mergeString("GOGEN_JOB_NOTICES", file.JobNotices, def.JobNotices),
 		Automations:               mergeString("GOGEN_AUTOMATIONS", file.Automations, def.Automations),
 	}

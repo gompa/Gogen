@@ -178,6 +178,7 @@ review_agent_thinking_level: high  # review agent reasoning effort (empty = inhe
 job_notices: off   # notify the session when a background command finishes
 automations: off   # file-based cron scheduler: fire saved prompts as headless runs on a schedule
 skills: off        # skill tool (list/read over .gogen/skills + ~/.config/gogen/skills)
+terminal: off      # persistent terminal tool (open/send/read/signal/list/close actions) + bash_persistent
 agent_instructions: off  # load AGENTS.md / CLAUDE.md workspace instruction files
 web_bind: 0.0.0.0:8080  # web listen address (applies on next start; also GOGEN_WEB_BIND / --host)
 # Configurable prompt templates ("" = the built-in default):
@@ -371,10 +372,11 @@ These can be set in `.gogen/gogen.conf` only — there is no CLI flag or environ
 | `GOGEN_REVIEW_AGENT_MODEL` | *(empty)* | Default model for auto review sessions (empty = the ticket's own review model override, else the workspace default model) |
 | `GOGEN_REVIEW_AGENT_THINKING_LEVEL` | *(empty)* | Reasoning-effort level for auto review sessions (empty = inherit the workspace level; a ticket's own review level override wins; a level the reviewer's final model does not accept is omitted) |
 | `GOGEN_BOARD_REVIEW_PROMPT` | *(empty)* | Template for the auto review agent (`{id}` `{title}` `{description}` `{priority}` `{context}` `{assignee}`; empty = built-in default) |
-| `GOGEN_SYSTEM_PROMPT` | *(empty)* | Custom system prompt template (`{working_dir}`; replaces the built-in base prompt; project rules and plan mode still apply; empty = built-in default) |
+| `GOGEN_SYSTEM_PROMPT` | *(empty)* | Custom system prompt template (`{working_dir}`; replaces the built-in base prompt; the MCP hint when MCP is enabled, the auto-detected project profile, the project rules, and plan mode are still appended; empty = built-in default) |
 | `GOGEN_SUBAGENT_PROMPT` | *(empty)* | Template wrapping subagent jobs (`{job}`; empty = built-in default) |
 | `GOGEN_JOB_NOTICES` | off | Set to `on` to notify the session when a background command finishes (injects a summary + runs a turn) |
 | `GOGEN_SKILLS` | off | Set to `on` to enable the skill tool (`skill` list/read over `.gogen/skills` + `~/.config/gogen/skills`) |
+| `GOGEN_TERMINAL` | off | Set to `on` to enable the persistent-terminal feature tools: `terminal` (actions `open`/`send`/`read`/`signal`/`list`/`close` over session-scoped PTY sessions) and `bash_persistent` (a per-session shell whose cwd/env persist across calls; it bypasses the fresh-process model of `execute_command`). The command guard applies to `bash_persistent`; the PTY `send` action writes raw stdin, so the guard does not apply to it |
 | `GOGEN_AGENT_INSTRUCTIONS` | off | Set to `on` to load `AGENTS.md` / `CLAUDE.md` workspace instruction files (below the project guidelines) |
 
 ### Session persistence
@@ -473,10 +475,18 @@ mode it is fixed to the project directory and the input is hidden.
   config push.
 - With `board: on`, a **Board** tab appears next to Chat/Editor: a kanban
   view (backlog, ready, in_progress, in_review, blocked, done) with
-  drag-and-drop moves, a "New card" form (title, acceptance criteria,
-  priority), and inline card detail with an activity log. Agent board-tool
-  mutations re-render the board live; the tab is hidden while the feature is
-  off. Each card has a **▶ Start** button that opens a small popover with a
+  drag-and-drop moves, column widths you can drag to resize (persisted per
+  browser), a "New card" form (title, acceptance criteria, priority), and
+  inline card detail with an activity log. Clicking a card expands inline
+  actions: **Edit** (turns the title/description/priority/context into
+  fields in place, with Save/Cancel), **Comment**, **Block** (with a
+  required reason), and **Done**. The **Context** field is free-text
+  background for the started agent, merged into the prompt's `{context}`
+  placeholder ahead of the activity log. Blocked cards show their latest
+  reason, done cards are struck through, and a card under review shows a
+  **review** badge. Agent board-tool mutations re-render the board live; the
+  tab is hidden while the feature is off. Each card has a **▶ Start** button
+  that opens a small popover with a
   per-ticket model picker, a model-aware **reasoning effort** picker
   (**Inherit** = the active pane's live level, **Off**, or the model's
   accepted values), and an editable prompt — then claims the ticket and
@@ -709,7 +719,7 @@ The agent has access to the following tools:
 | `rename_symbol` | Rename a symbol across files (AST or text fallback) |
 | `call_graph` | Call relationships / impact analysis for a symbol (`direction=impact`) |
 | `todo` | Manage todo items: add/list/done/remove/clear |
-| `board` | Project kanban board (when `board: on`): list/show/add/claim/move/block/comment/done/remove (remove deletes a card entirely). Available in plan mode too — the board is the coordination exception |
+| `board` | Project kanban board (when `board: on`): list/show/add/update/claim/move/block/comment/done/remove (update edits title/description/priority/context; remove deletes a card entirely). Available in plan mode too — the board is the coordination exception |
 | `subagent` | Spawn a nested agent session for a job (when `subagent: on`); the final report returns as the tool result. Subagents cannot spawn subagents by default (`subagent_max_depth`) |
 | `subagent_fork` | Fork a child session seeded with a deep copy of this session's history and run one turn on it (web only, when `subagent: on`) |
 | `list_agents` | List live nested (subagent) sessions of this session: id, label, status, depth (web only, when `subagent: on`) |
@@ -721,7 +731,7 @@ The agent has access to the following tools:
 | `read_image` | Attach an image to the session context for vision-capable models (png/jpeg/gif/webp up to 3.5 MB; optional `detail=auto|low|high`) |
 | `background_job` | Inspect or feed a background job (`execute_command background=true`): `action=status` (output tail), `action=cancel`, or `action=input` (write to the job's stdin) |
 
-Additional tools arrive at runtime from connected MCP servers as `mcp_<server>_<tool>`.
+Additional tools arrive at runtime from connected MCP servers as `mcp_<server>_<tool>`. The system prompt carries the `Additional mcp_* tools may be available.` line only while such a registry is attached — with MCP off (the default) the session never advertises tools it does not have.
 
 ## Safety
 
