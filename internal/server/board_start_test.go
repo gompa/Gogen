@@ -743,15 +743,42 @@ func TestBoardStartCompletedSessionNotActive(t *testing.T) {
 	enableBoardAndAddCard(t, conn, cfg.SessionID)
 
 	sendBoardStart(t, conn, "1")
-	state := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "board_state" })
-	_ = readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "notice" && m.Kind == "board" })
-	agentSid := state.BoardState.Items[0].AgentSessionID
-	if agentSid == "" {
-		t.Fatal("no agent session id")
+	// The start's own frames and the headless turn race: the handler sends
+	// board_state + the ack notice only after startTicketSession launched the
+	// turn (and after the ticket's start options hit the store), so with a
+	// fast provider the turn's turn_end can be queued FIRST — the slow store
+	// writes on Windows CI lose that race. readUntil drops the frames it does
+	// not match, so reading these one at a time swallows the turn_end and then
+	// sits out the whole deadline ("read: ... i/o timeout"). Collect them in a
+	// single pass, in whatever order they arrive. The sid is only known once
+	// the board_state carrying it shows up, so turn_end frames are recorded
+	// per session and checked afterwards.
+	var (
+		agentSid string
+		sawAck   bool
+		ended    = map[string]bool{}
+	)
+	deadline := time.Now().Add(10 * time.Second)
+	for agentSid == "" || !sawAck || !ended[agentSid] {
+		if time.Now().After(deadline) {
+			t.Fatalf("board start frames incomplete: agent session %q, ack %v, turn ends %v",
+				agentSid, sawAck, ended)
+		}
+		_ = conn.SetReadDeadline(deadline)
+		var m WSMessage
+		if err := conn.ReadJSON(&m); err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		switch {
+		case m.Type == "board_state" && m.BoardState != nil && len(m.BoardState.Items) > 0 &&
+			m.BoardState.Items[0].AgentSessionID != "":
+			agentSid = m.BoardState.Items[0].AgentSessionID
+		case m.Type == "notice" && m.Kind == "board":
+			sawAck = true
+		case m.Type == "turn_end":
+			ended[m.SessionID] = true
+		}
 	}
-
-	// The headless turn completes.
-	_ = readUntil(t, conn, 10*time.Second, func(m WSMessage) bool { return m.Type == "turn_end" && m.SessionID == agentSid })
 
 	// The idle runtime is orphan-evicted even though the initiating tab is
 	// still open (the passive attach is not a viewer).
