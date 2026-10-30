@@ -15,9 +15,8 @@ import (
 // detach that armed the timer.
 func TestApprovalHoldTimerSparesReattachedClient(t *testing.T) {
 	rt := newTestRuntime(t)
-	// The margin must survive a scheduling stall between detach and
-	// re-attach: 50 ms was tight enough that a loaded CI runner (Windows)
-	// lost the race — the timer fired before the client was back.
+	// Any hold works; the no-deny window below is >2x it, so the timer has
+	// certainly fired inside the window.
 	rt.approvalHold = 400 * time.Millisecond
 
 	ws := newFakeWSConn()
@@ -34,11 +33,26 @@ func TestApprovalHoldTimerSparesReattachedClient(t *testing.T) {
 		done <- approved
 	}()
 	id := parkedApprovalID(t, rt)
+	// Wait for the prompt to reach the attached socket, so the scenario reads
+	// as "prompt delivered, then the tab closed and reopened".
+	waitFor(t, 5*time.Second, func() bool { return broadcastApprovalReceived(ws, id) })
 
-	// Last client detaches: arms the auto-deny hold. Then somebody re-attaches
-	// before it expires.
-	rt.detach(ws)
-	addTestClient(rt)
+	// Last client detaches and somebody re-attaches before the hold expires.
+	//
+	// The swap is fused under one clientsMu hold, and the hold is armed with
+	// the call detach makes, because deleteApprover re-checks clientCount
+	// right after its broadcast and DENIES on the spot when it sees nobody
+	// attached (fail-closed for a prompt nobody can answer). A bare
+	// detach-then-attach leaves the set empty for an instant, and a loaded
+	// runner (Windows CI) lands that check in the gap: the recheck denies the
+	// request and the timer this test is about never gets a say. The
+	// detach→arm→expiry half is TestApprovalHoldTimerDeniesWithNobodyAttached,
+	// the end-to-end reattach flow is TestApprovalHoldAllowsReattachToAnswer.
+	rt.clientsMu.Lock()
+	delete(rt.clients, ws)
+	rt.clients[newFakeWSConn()] = struct{}{}
+	rt.clientsMu.Unlock()
+	rt.scheduleAutoDenyAfter(rt.approvalHold)
 
 	select {
 	case approved := <-done:
@@ -78,7 +92,11 @@ func TestApprovalHoldTimerDeniesWithNobodyAttached(t *testing.T) {
 		}
 		done <- approved
 	}()
-	parkedApprovalID(t, rt)
+	id := parkedApprovalID(t, rt)
+	// Detach only once the prompt was delivered: the deny asserted below must
+	// come from the armed hold timer, not from the approver's own
+	// nobody-attached recheck answering a request it caught mid-registration.
+	waitFor(t, 5*time.Second, func() bool { return broadcastApprovalReceived(ws, id) })
 	rt.detach(ws)
 
 	select {
