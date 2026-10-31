@@ -429,7 +429,9 @@ usually together with smart compact:
   is at or above the hard limit. After the provider refused a request, and the
   local estimate is still under the window, deep dive condenses the message
   compaction would have left verbatim when that message is larger than the
-  middle taken together. That is the trailing tool result, or a pin. The request stays.
+  middle taken together. That is the trailing tool result, or a pin. The request
+  stays when the condensed message is not the request; an oversized head request,
+  or a pinned request that is larger than the middle, is condensed itself.
   The layout around the request runs before a single summary. The request
   is summarized only when that result is still at or over the window. The head
   is condensed in that pass when it is larger than the tool result or the pin
