@@ -374,7 +374,15 @@ func TestInterruptKeepsChildContinuable(t *testing.T) {
 // silently), and the deferred release happens once it goes quiet.
 func TestReleaseChildIfQuietDefersWhileBusy(t *testing.T) {
 	host := newStubHost()
-	host.policy = Policy{Retain: 20 * time.Millisecond}
+	// The window has to be long enough that the SPAWN's own retention timer
+	// cannot fire between the child finishing and the capture being armed
+	// below: the test polls for the finish every 5ms and Windows wakes timers
+	// in ~15.6ms steps, so a 20ms window was a coin flip — the timer released
+	// the still-quiet child before the test could pin it, and the assertion
+	// then blamed the armed capture for a release it never caused. The
+	// deferred release is still exercised; it just arrives a second later,
+	// well inside the wait below.
+	host.policy = Policy{Retain: time.Second}
 	sp := New[*stubHandle](host)
 	parent := testAgent("parent", "m")
 	parent.SetSessionID("parent")
@@ -386,8 +394,13 @@ func TestReleaseChildIfQuietDefersWhileBusy(t *testing.T) {
 	child := sp.Get(id)
 	waitFor(t, 5*time.Second, "child finished", func() bool { return child.IsFinished() })
 
-	// An armed exact-reply capture must pin the child.
+	// An armed exact-reply capture must pin the child. (A release observed
+	// BEFORE the call below is not the capture's failure but the retention
+	// timer's: it fired inside the window the comment on Retain explains.)
 	child.SetPendingReply(true)
+	if sp.Get(id) == nil {
+		t.Fatal("the child was released before the reply capture could be armed (the retention window is too short for this test)")
+	}
 	sp.ReleaseChildIfQuiet(child)
 	if sp.Get(id) == nil {
 		t.Fatal("an armed reply capture was released (the reply would be lost)")
