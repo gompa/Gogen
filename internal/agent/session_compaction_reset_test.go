@@ -16,9 +16,14 @@ import (
 func TestResetSessionStateClearsCompactionState(t *testing.T) {
 	a, _, _ := newEmergencyTestAgent(t, true)
 	a.appendMessage(llm.Message{Role: "user", Content: "hello"})
+	a.noteCondensationPublished()
 	a.noteCompactFailure(errors.New("summarization unavailable"))
 	a.noteProgressFailure(&a.compactionGuards.emergency)
 	a.noteProgressFailure(&a.compactionGuards.lastResort)
+	a.noteProgressFailure(&a.compactionGuards.singleSummary)
+	if !a.requestKeptByCondensation() {
+		t.Fatal("setup: condensation did not remember the request")
+	}
 
 	if backoff, e := compactState(a); backoff.IsZero() || e == 0 {
 		t.Fatalf("setup: backoff=%v emergency=%d, want both set", backoff, e)
@@ -35,6 +40,9 @@ func TestResetSessionStateClearsCompactionState(t *testing.T) {
 	if e, lr := guardsState(a); e != 0 || lr != 0 {
 		t.Fatalf("after /new: guards=(%d,%d), want (0,0)", e, lr)
 	}
+	if a.requestKeptByCondensation() || a.singleSummaryFailed() {
+		t.Fatal("after /new: the remembered request or the single summary survived")
+	}
 }
 
 // TestRestoreSessionClearsCompactionState pins the same contract on the
@@ -43,9 +51,11 @@ func TestResetSessionStateClearsCompactionState(t *testing.T) {
 func TestRestoreSessionClearsCompactionState(t *testing.T) {
 	a, _, _ := newEmergencyTestAgent(t, true)
 	a.appendMessage(llm.Message{Role: "user", Content: "hello"})
+	a.noteCondensationPublished()
 	a.noteCompactFailure(errors.New("summarization unavailable"))
 	a.noteProgressFailure(&a.compactionGuards.emergency)
 	a.noteProgressFailure(&a.compactionGuards.lastResort)
+	a.noteProgressFailure(&a.compactionGuards.singleSummary)
 
 	a.RestoreSession(SessionSnapshot{
 		Messages: []llm.Message{{Role: "user", Content: "restored"}},
@@ -56,5 +66,8 @@ func TestRestoreSessionClearsCompactionState(t *testing.T) {
 	}
 	if e, lr := guardsState(a); e != 0 || lr != 0 {
 		t.Fatalf("after restore: guards=(%d,%d), want (0,0)", e, lr)
+	}
+	if a.requestKeptByCondensation() || a.singleSummaryFailed() {
+		t.Fatal("after restore: the remembered request or the single summary survived")
 	}
 }

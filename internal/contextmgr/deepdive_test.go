@@ -119,6 +119,57 @@ func TestDeepDiveCompactionLayout(t *testing.T) {
 	}
 }
 
+// sessionFailProvider fails the session summary and answers the progress summary.
+type sessionFailProvider struct {
+	regionProvider
+}
+
+func (p *sessionFailProvider) GenerateResponse(ctx context.Context, msgs []llm.Message, allowed map[string]struct{}, tools []llm.Tool) (llm.Response, error) {
+	if len(msgs) > 0 && msgs[len(msgs)-1].Content == progressSummaryInstruction {
+		return p.regionProvider.GenerateResponse(ctx, msgs, allowed, tools)
+	}
+	p.requests = append(p.requests, msgs)
+	return llm.Response{}, errors.New("session unavailable")
+}
+
+// TestDeepDiveSessionErrorStillSummarizesProgress pins a summarizer error
+// on the session region. The progress region is still summarized, and the
+// session region stays verbatim. A cancel still drops both.
+func TestDeepDiveSessionErrorStillSummarizesProgress(t *testing.T) {
+	p := &sessionFailProvider{}
+	first := llm.Message{Role: "user", Content: "first request"}
+	current := llm.Message{Role: "user", Content: "current request: refactor the parser"}
+	earlier := bulky("earlier answer")
+	msgs := []llm.Message{first, earlier, current}
+	msgs = append(msgs, rounds("loop", 3)...)
+	out, _, err := newDeepDiveManager(p, true).Compact(context.Background(), msgs, CompactOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kinds := p.kinds()
+	if len(kinds) == 0 || kinds[len(kinds)-1] != "progress" {
+		t.Fatalf("summaries = %s, want the progress instruction last", strings.Join(kinds, ","))
+	}
+	sawSession := false
+	for _, req := range p.requests {
+		if req[len(req)-1].Content == sessionSummaryInstruction {
+			sawSession = true
+		}
+	}
+	if !sawSession {
+		t.Fatal("the session instruction was not sent")
+	}
+	if !strings.Contains(roles(out), "earlier answer") {
+		t.Fatalf("layout dropped the session region: %s", roles(out))
+	}
+	if !strings.Contains(roles(out), "S2") || strings.Contains(roles(out), "S1") {
+		t.Fatalf("layout = %s, want the progress summary and no session summary", roles(out))
+	}
+	if !strings.Contains(roles(out), "current request") {
+		t.Fatalf("layout dropped the request: %s", roles(out))
+	}
+}
+
 // TestDeepDiveRequestSurvivesRepeatedCompactions pins the long-turn path:
 // after the first compaction, later ones in the same turn rewrite only the
 // progress summary. Everything up to the request stays byte-identical, and
@@ -306,34 +357,37 @@ func TestSettingsFromConfig(t *testing.T) {
 	}
 }
 
-// TestDeepDiveForcedFallsBackToSingleSummary pins that a forced compaction
-// in deep dive still drops a message: when the layout around the request
-// would keep the count (or refuse both regions), the single summary is used.
-func TestDeepDiveForcedFallsBackToSingleSummary(t *testing.T) {
+// TestDeepDiveForcedKeepsAOneMessageSummary pins that a forced compaction
+// returns a one-message progress summary. The count stays the same, and
+// the request stays verbatim. The caller measures whether that result fits.
+func TestDeepDiveForcedKeepsAOneMessageSummary(t *testing.T) {
 	oldSummary := llm.Message{Role: "assistant", Content: SummaryPrefix + strings.Repeat("old facts ", 100)}
 	call := llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "c1", Name: "read_file"}}}
 	result := llm.Message{Role: "tool", Content: "file body", ToolCallID: "c1"}
-	tests := []struct {
-		name  string
-		since llm.Message
-	}{
-		{"progress region of one message", bulky("big step")},
-		{"progress summary refused as not smaller", llm.Message{Role: "assistant", Content: "ok"}},
+	msgs := []llm.Message{{Role: "user", Content: "first"}, oldSummary, {Role: "user", Content: "the request"}, bulky("big step"), call, result}
+	out, _, err := newDeepDiveManager(&regionProvider{}, true).Compact(context.Background(), msgs, CompactOptions{Keep: NoTailKeep, Forced: true})
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			msgs := []llm.Message{{Role: "user", Content: "first"}, oldSummary, {Role: "user", Content: "the request"}, tt.since, call, result}
-			out, _, err := newDeepDiveManager(&regionProvider{}, true).Compact(context.Background(), msgs, CompactOptions{Keep: NoTailKeep, Forced: true})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(out) >= len(msgs) {
-				t.Fatalf("forced compaction did not shrink: %s", roles(out))
-			}
-			if !strings.HasPrefix(out[1].Content, SummaryPrefix) || len(out[2].ToolCalls) != 1 || out[3].ToolCallID != "c1" {
-				t.Fatalf("layout: %s", roles(out))
-			}
-		})
+	if len(out) != len(msgs) {
+		t.Fatalf("a one-message summary changed the count: %s", roles(out))
+	}
+	if out[2].Content != "the request" || !strings.HasPrefix(out[3].Content, ProgressSummaryPrefix) || len(out[4].ToolCalls) != 1 || out[5].ToolCallID != "c1" {
+		t.Fatalf("layout: %s", roles(out))
+	}
+}
+
+// TestDeepDiveForcedReturnsANotSmallerRefusal pins that a forced compaction
+// returns the not-smaller refusal instead of summarizing the request.
+// The caller decides whether that request is what does not fit.
+func TestDeepDiveForcedReturnsANotSmallerRefusal(t *testing.T) {
+	oldSummary := llm.Message{Role: "assistant", Content: SummaryPrefix + strings.Repeat("old facts ", 100)}
+	call := llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "c1", Name: "read_file"}}}
+	result := llm.Message{Role: "tool", Content: "file body", ToolCallID: "c1"}
+	msgs := []llm.Message{{Role: "user", Content: "first"}, oldSummary, {Role: "user", Content: "the request"}, {Role: "assistant", Content: "ok"}, call, result}
+	_, _, err := newDeepDiveManager(&regionProvider{}, true).Compact(context.Background(), msgs, CompactOptions{Keep: NoTailKeep, Forced: true})
+	if !errors.Is(err, ErrSummaryNotSmaller) {
+		t.Fatalf("err = %v, want the not-smaller refusal", err)
 	}
 }
 
@@ -375,9 +429,11 @@ func TestProgressSummaryInstructionCut(t *testing.T) {
 }
 
 // TestDeepDiveRefusalByCaller pins who falls back when the layout around the
-// request frees nothing: a normal compaction returns the history unchanged
-// with no error (nothing failed, so the caller does not back off, and the
-// prefix up to the request stays), an emergency one uses the single summary.
+// request frees nothing. Normal and emergency both return the history
+// unchanged with no error. Nothing failed, so the caller does not back
+// off, and it shrinks the tail instead of summarizing the request on
+// this keep. Compact does not summarize the request itself. The caller
+// does that, and only when the result is still over its limit.
 func TestDeepDiveRefusalByCaller(t *testing.T) {
 	msgs := []llm.Message{
 		{Role: "user", Content: "first"},
@@ -387,29 +443,17 @@ func TestDeepDiveRefusalByCaller(t *testing.T) {
 		{Role: "assistant", Content: "ok"},
 		{Role: "assistant", Content: "tail"},
 	}
-	tests := []struct {
-		name      string
-		emergency bool
-		want      string
-	}{
-		{"normal compaction leaves the history unchanged", false, roles(msgs)},
-		{"emergency falls back to the single summary", true, "first | S1 | tail"},
+	p := &regionProvider{}
+	m := NewManager(p, Settings{CompactKeepRecentMessages: 1, ContextLimit: 1000000, CompactThreshold: 0.5, DeepDive: true})
+	out, _, err := m.Compact(context.Background(), msgs, CompactOptions{})
+	if err != nil {
+		t.Fatalf("err = %v, want none", err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			p := &regionProvider{}
-			m := NewManager(p, Settings{CompactKeepRecentMessages: 1, ContextLimit: 1000000, CompactThreshold: 0.5, DeepDive: true})
-			out, _, err := m.Compact(context.Background(), msgs, CompactOptions{Emergency: tt.emergency})
-			if err != nil {
-				t.Fatalf("err = %v, want none", err)
-			}
-			if got := roles(out); got != tt.want {
-				t.Fatalf("layout:\n got %s\nwant %s", got, tt.want)
-			}
-			if !tt.emergency && len(p.requests) != 0 {
-				t.Fatalf("unchanged history made %d summarization calls", len(p.requests))
-			}
-		})
+	if got := roles(out); got != roles(msgs) {
+		t.Fatalf("layout:\n got %s\nwant %s", got, roles(msgs))
+	}
+	if len(p.requests) != 0 {
+		t.Fatalf("unchanged history made %d summarization calls", len(p.requests))
 	}
 }
 
@@ -569,8 +613,9 @@ func TestNoteSummaryIndex(t *testing.T) {
 	}
 }
 
-// TestFirstUserIndexSkipsMachineMessages pins that the head kept verbatim
-// is the first user request, by the same rule as the deep-dive request.
+// TestFirstUserIndexSkipsMachineMessages pins the two head rules. Context
+// mode off keeps the first user-role message that is not a compaction
+// summary. Deep dive skips a machine message, so the request is the head.
 func TestFirstUserIndexSkipsMachineMessages(t *testing.T) {
 	tests := []struct {
 		name string
@@ -585,11 +630,15 @@ func TestFirstUserIndexSkipsMachineMessages(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, ok := firstUserIndex(tt.msgs)
+			got, ok := firstRequestIndex(tt.msgs)
 			if got != tt.want || ok != tt.ok {
-				t.Fatalf("firstUserIndex = %d, %v, want %d, %v", got, ok, tt.want, tt.ok)
+				t.Fatalf("firstRequestIndex = %d, %v, want %d, %v", got, ok, tt.want, tt.ok)
 			}
 		})
+	}
+	notice := []llm.Message{{Role: "user", Content: JobNoticePrefix + "bg-1 exited"}, {Role: "user", Content: "hi"}}
+	if got, ok := firstUserIndex(notice); got != 0 || !ok {
+		t.Fatalf("firstUserIndex = %d, %v, want the notice", got, ok)
 	}
 }
 

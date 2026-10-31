@@ -261,10 +261,12 @@ func (a *Agent) smartCompactHaltMessage() string {
 // smart-compact cut halts the turn with smartCompactAutoOffMessage.
 //
 // Two-tier trigger. The normal tier fires at CompactBudget and honors the
-// failure backoff. The emergency tier fires at the hard window
-// (ContextLimit - CompactReserveTokens, where the provider refuses the
-// request) and bypasses the backoff, so a large message arriving during
-// backoff still gets a compaction attempt before the request is refused.
+// failure backoff. The emergency tier fires at the hard limit
+// (ContextLimit - CompactReserveTokens) and bypasses the backoff, so a
+// large message arriving during backoff still gets a compaction attempt
+// before the request is refused. A provider refusal while the outgoing
+// estimate is still under the context window is the overflow path, not
+// this tier.
 // The progress guard (compactionGuards.emergency) stops a hot loop of
 // repeated failures at an unchanged message count.
 func (a *Agent) compactIfDue(ctx context.Context, h *llm.StreamHandlers) bool {

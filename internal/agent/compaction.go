@@ -201,9 +201,10 @@ func (a *Agent) compactAttemptDue() bool {
 }
 
 // emergencyCompactDue reports whether the EMERGENCY compaction tier should
-// fire: the conversation total has reached the hard window
-// (ContextLimit - CompactReserveTokens, where the provider would refuse the
-// request) and the progress guard allows a new attempt. Unlike the normal
+// fire: the conversation total has reached the hard limit
+// (ContextLimit - CompactReserveTokens) and the progress guard allows a
+// new attempt. A provider refusal while the outgoing estimate is still
+// under the context window is the overflow path, not this tier. Unlike the normal
 // tier it ignores the failure backoff — a provider refusal is worse than a
 // redundant summarization call — but it refuses to retry a compaction that
 // already failed at a message count >= the current one
@@ -212,7 +213,8 @@ func (a *Agent) compactAttemptDue() bool {
 // least 3 messages: with fewer, there is nothing between the starting
 // prompt and the current one to summarize. total < 0 (incomplete count
 // cache) never fires: the normal tier's full-estimate fallback covers that
-// state.
+// state. A request a condensation kept also keeps it from firing while
+// the view is under the window. Over the window it still fires.
 func (a *Agent) emergencyCompactDue(total int) bool {
 	if a.Context == nil || total < 0 {
 		return false
@@ -222,11 +224,27 @@ func (a *Agent) emergencyCompactDue(total int) bool {
 		return false
 	}
 	a.statsMu.RLock()
-	defer a.statsMu.RUnlock()
-	if len(a.Messages) < 3 {
+	blocked := len(a.Messages) < 3 || a.compactionGuards.emergency >= len(a.Messages)
+	a.statsMu.RUnlock()
+	if blocked {
 		return false
 	}
-	return a.compactionGuards.emergency < len(a.Messages)
+	// A condensation that kept the request, while the view is under the
+	// window, closes this tier. The last keep cannot summarize that
+	// request, and the give-up would start a wait the normal tier
+	// honors. A tool result does not clear the mark. Over the window
+	// the layout still runs.
+	return !a.keptRequestUnderWindow()
+}
+
+// keptRequestUnderWindow reports whether a published condensation kept
+// the latest request and the outgoing view is still under the window.
+func (a *Agent) keptRequestUnderWindow() bool {
+	if a == nil || a.Context == nil || !a.requestKeptByCondensation() {
+		return false
+	}
+	limit := a.Context.ContextLimit()
+	return limit > 0 && a.outgoingViewEstimate(a.rebuildView()) < limit
 }
 
 // noteProgressFailure records a failed compaction-tier attempt at the
@@ -241,13 +259,13 @@ func (a *Agent) noteProgressFailure(guard *int) {
 	a.statsMu.Unlock()
 }
 
-// noteProgressSuccess resets one compaction tier's progress guard. The
-// caller passes the specific tier: the reset semantics are per-tier
-// (emergency is reset on any successful compaction, lastResort only on a
-// successful condensation), so this is never a blanket reset.
-func (a *Agent) noteProgressSuccess(guard *int) {
+// noteSingleSummaryFailure records a failed single summary at the current
+// message count, including when that count is lower than the guard. A
+// shrink must not leave the failure stuck at the longer history: the next
+// refusal would skip the summary until the count climbed back past it.
+func (a *Agent) noteSingleSummaryFailure() {
 	a.statsMu.Lock()
-	*guard = 0
+	a.compactionGuards.singleSummary = len(a.Messages)
 	a.statsMu.Unlock()
 }
 
@@ -268,23 +286,72 @@ func (a *Agent) noteCompactFailure(err error) {
 }
 
 // noteCompactSuccess resets the auto-compaction failure backoff and the
-// emergency-tier progress guard (NOT the last-resort guard: a successful
-// compaction says nothing about a previously failed condensation).
+// emergency-tier progress guard. A failed single summary stays failed: a
+// later success does not make that summary worth running again at the
+// same message count. A last-resort failure stays recorded when this
+// publish is the same length. A shorter publish clears it, so the
+// condensation after that summary can run. A condensation's kept request
+// stays remembered when this publish still contains it. The mark is
+// cleared when the publish replaces that request.
 func (a *Agent) noteCompactSuccess() {
 	a.statsMu.Lock()
 	a.compactBackoffUntil = time.Time{}
 	a.compactBackoffDelay = 0
 	a.compactionGuards.emergency = 0
+	// A success does not clear a failed single summary. A shorter history
+	// records that failure at the new count, so the old count does not
+	// keep the summary skipped after the history has grown past this one.
+	if n := len(a.Messages); a.compactionGuards.singleSummary > n {
+		a.compactionGuards.singleSummary = n
+	}
+	// A same-length publish keeps a failed condensation. A shorter one
+	// clears it. Clamping it to the new length would still count as
+	// guarded, and the condensation after the summary would not run.
+	if n := len(a.Messages); a.compactionGuards.lastResort > n {
+		a.compactionGuards.lastResort = 0
+	}
+	if kept := a.compactionGuards.condensationKeptRequest; kept != "" && kept != contextmgr.LatestRequestContent(a.Messages) {
+		a.compactionGuards.condensationKeptRequest = ""
+	}
 	a.statsMu.Unlock()
 }
 
+// noteCondensationPublished records a condensation that was published.
+// The last-resort guard, the emergency guard, and the compaction backoff
+// are cleared: the publish is not a failed attempt, and a wait recorded
+// by an earlier summary would block the normal tier after the view
+// already fits. The latest request is remembered so it is not summarized
+// while the view is under the window and the total is still at the hard
+// limit. A new user request re-arms it. A tool result does not. A failed
+// single summary is left as it is.
+func (a *Agent) noteCondensationPublished() {
+	a.statsMu.Lock()
+	a.compactionGuards.lastResort = 0
+	a.compactionGuards.emergency = 0
+	a.compactBackoffUntil = time.Time{}
+	a.compactBackoffDelay = 0
+	a.compactionGuards.condensationKeptRequest = contextmgr.LatestRequestContent(a.Messages)
+	a.statsMu.Unlock()
+}
+
+// requestKeptByCondensation reports whether the latest real user request
+// is the one a condensation kept verbatim.
+func (a *Agent) requestKeptByCondensation() bool {
+	a.statsMu.RLock()
+	defer a.statsMu.RUnlock()
+	kept := a.compactionGuards.condensationKeptRequest
+	return kept != "" && kept == contextmgr.LatestRequestContent(a.Messages)
+}
+
 // resetCompactionState clears the conversation-scoped compaction bookkeeping:
-// the failure backoff and BOTH per-tier progress guards. Called when the
-// conversation is replaced wholesale (session reset / restore): the guards
-// record a message count from the OLD conversation, and leaving them set
-// would suppress the emergency tier and last-resort condensation on the new
-// one until it grew past that stale count — while the backoff (up to 10 min)
-// would suppress the normal tier. The wire-overhead cache is deliberately
+// the failure backoff, the per-tier progress guards, including a failed
+// single summary, and a published condensation's kept-request mark. Called
+// when the conversation is replaced wholesale
+// (session reset / restore): the guards record a message count from the OLD
+// conversation, and leaving them set would suppress the emergency tier,
+// last-resort condensation, and a later single summary on the new one until
+// it grew past that stale count — while the backoff (up to 10 min) would
+// suppress the normal tier. The wire-overhead cache is deliberately
 // untouched (it tracks the system prompt / tool set, not the conversation).
 func (a *Agent) resetCompactionState() {
 	a.statsMu.Lock()
@@ -292,6 +359,8 @@ func (a *Agent) resetCompactionState() {
 	a.compactBackoffDelay = 0
 	a.compactionGuards.emergency = 0
 	a.compactionGuards.lastResort = 0
+	a.compactionGuards.singleSummary = 0
+	a.compactionGuards.condensationKeptRequest = ""
 	a.statsMu.Unlock()
 }
 
@@ -352,12 +421,20 @@ type compactionState struct {
 	// suppressed while the message count has not grown past the recorded
 	// count (the progress guard against a hot loop of identical failures).
 	// The RESET semantics are per-tier and deliberately asymmetric:
-	// emergency is reset on ANY successful compaction (noteCompactSuccess),
-	// lastResort only on a successful last-resort condensation
-	// (lastResortCondense). Never reset both at once.
+	// emergency is reset on any successful compaction (noteCompactSuccess)
+	// and on a published condensation (noteCondensationPublished).
+	// lastResort is reset only on a published condensation. A failed
+	// single summary is reset only when the conversation is replaced.
+	// condensationKeptRequest is not a failure. It is the text of the
+	// request a condensation kept verbatim, so that request is not
+	// summarized while it is still the latest one. noteCompactSuccess
+	// clears it when a publish replaces the request. Appending a new
+	// user request clears it. A tool result does not.
 	compactionGuards struct {
-		emergency  int
-		lastResort int
+		emergency               int
+		lastResort              int
+		singleSummary           int
+		condensationKeptRequest string
 	}
 
 	// overheadMu guards overheadCacheKey/overheadTokens: the cached wire

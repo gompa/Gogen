@@ -29,7 +29,7 @@ func (r deepDiveRefusal) Unwrap() error { return r.error }
 // real user request at reqIdx stays verbatim, and the two regions around it
 // are summarized separately:
 //
-//	pre-head, first user message, session summary (what came before the
+//	pre-head, first real request, session summary (what came before the
 //	request), the request, progress summary (the work since), tail
 //
 // A region that already is exactly one summary of its kind is left alone, so
@@ -41,23 +41,36 @@ func (r deepDiveRefusal) Unwrap() error { return r.error }
 // Each region keeps the single-summary guards: the minimum size unless
 // forced, the smaller-summary guard, and its own executed-call roster. When
 // neither region produced a summary, the history comes back unchanged, or
-// refused when a summary was not smaller.
+// refused when a summary was not smaller. A session summary that succeeded
+// is kept when the progress call fails: the work since the request stays
+// verbatim and the caller measures the result. A session call that fails
+// for any reason other than cancel still summarizes the progress region.
+// Whichever region succeeded is published. A cancel drops both.
 func (m *Manager) compactAroundRequest(ctx context.Context, messages []llm.Message, headIdx, reqIdx, tailStart int, opts CompactOptions) ([]llm.Message, map[int]struct{}, error) {
-	before, err := m.compactSegment(ctx, messages, headIdx+1, reqIdx, SummaryPrefix, summaryInstruction, opts)
-	if err != nil {
-		return nil, nil, err
+	before, sessionErr := m.compactSegment(ctx, messages, headIdx+1, reqIdx, SummaryPrefix, sessionSummaryInstruction, opts)
+	if sessionErr != nil {
+		if ctx.Err() != nil {
+			return nil, nil, sessionErr
+		}
+		before = segmentResult{msgs: cloneMessages(messages[headIdx+1 : reqIdx])}
 	}
 	since, err := m.compactSegment(ctx, messages, reqIdx+1, tailStart, ProgressSummaryPrefix, progressSummaryInstruction, opts)
 	if err != nil {
-		return nil, nil, err
+		if ctx.Err() != nil || !before.summarized {
+			return nil, nil, err
+		}
+		since = segmentResult{msgs: cloneMessages(messages[reqIdx+1 : tailStart])}
 	}
 	if !before.summarized && !since.summarized {
-		// A summary that came back no smaller cost a summarizer call, so the
-		// caller backs off, as in the single-summary layout. Otherwise
-		// nothing was attempted: the regions are single summaries or under
-		// the minimum size, the normal state shortly after a compaction. The
-		// history then comes back unchanged with no error, so the caller
-		// tries a smaller tail instead of backing off.
+		if sessionErr != nil {
+			return nil, nil, sessionErr
+		}
+		// A summary that came back no smaller is returned as an error, as in
+		// the single-summary layout. The fit loop tries a smaller tail
+		// before it backs off. Otherwise nothing was attempted: the
+		// regions are single summaries or under the minimum size, the
+		// normal state shortly after a compaction. The history then comes
+		// back unchanged with no error, so the caller tries a smaller tail.
 		for _, seg := range []segmentResult{since, before} {
 			if errors.Is(seg.skip, ErrSummaryNotSmaller) {
 				return nil, nil, deepDiveRefusal{seg.skip}
@@ -156,15 +169,17 @@ func isOnlySummary(seg []llm.Message, prefix string) bool {
 // for an emergency compaction in deep dive, sized as compactPinned will run
 // it. The verbatim request, and a region planSegment leaves alone (already
 // one summary of its kind, or under minTokens), free nothing.
-// A split where no region would be summarized or no message would be
-// dropped counts as freeing nothing, so the keep is lowered until the layout
-// around the request frees enough. When no split does, the request is
-// summarized: by compactPinned's fallback to the single summary when the
-// layout refuses or drops nothing, or by the caller when it drops messages
-// and still does not fit. The emergency tier does that at the hard limit,
-// and pre-flight does it when the estimate is still over the window and the
-// request is still verbatim. Overflow recovery skips the layout and
-// summarizes the request in its one pass, because the provider refused. The caller
+// A split where no region would be summarized, or a summarized region
+// would not drop a message, counts as freeing nothing, so the keep is
+// lowered until a split frees enough. The compaction still returns a
+// one-message summary, and the caller measures it. When a split writes
+// nothing, the caller shrinks the tail. The request is summarized on the
+// last keep when the total is still at or above the hard limit, except
+// when the view is also over the window and another message's condensation
+// would fit. Pre-flight summarizes it when the estimate is still over the
+// window, the request is still verbatim, and no such condensation fits. Overflow
+// recovery skips the layout and summarizes the request in its one pass,
+// because the provider refused. The caller
 // budgets one summary (EmergencySummaryAllowance); when both regions are
 // summarized, the second summary's allowance is charged here.
 func (m *Manager) deepDiveFreeable(messages []llm.Message, counts []int, headIdx, tailStart, minTokens int) int {
