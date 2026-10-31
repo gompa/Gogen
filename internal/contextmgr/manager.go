@@ -11,6 +11,7 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/debuglog"
 	"gogen/internal/llm"
+	"gogen/internal/onoff"
 )
 
 // SummaryPrefix marks messages produced by compaction. Summaries are stored
@@ -18,6 +19,11 @@ import (
 // user-role summaries, which must never be treated as real user messages
 // (firstUserIndex, PinManager).
 const SummaryPrefix = "[Session summary — earlier conversation condensed]\n"
+
+// ProgressSummaryPrefix marks the deep-dive progress summary: the work since
+// the latest user request, which sits verbatim right before it.
+const ProgressSummaryPrefix = "[Progress summary — work on the current request so far]\n"
+
 const maxSummarizeDepth = 8
 
 // CondensedMessagePrefix marks a message that the last-resort condensation
@@ -27,6 +33,11 @@ const maxSummarizeDepth = 8
 // idempotency guard that keeps the last-resort path from re-firing on the
 // same message) and identifies it to the UI.
 const CondensedMessagePrefix = "[Message condensed — the original was too large for the context window and was archived]\n"
+
+// ErrNotEnoughHistory is returned when the middle is below the minimum size
+// worth summarizing. It is the split's answer, not a summarizer failure: a
+// shrinking-tail retry includes more of the history in the next middle.
+var ErrNotEnoughHistory = errors.New("not enough history to compact")
 
 // ErrSummaryNotSmaller is returned by CompactPinned/CompactPinnedWithKeep when
 // the framed summary (SummaryPrefix + summary) is not strictly smaller than
@@ -61,11 +72,15 @@ const summaryFraming = "This is a summarization task, not a conversation turn."
 // summarization prompts.
 const summaryPreserveList = `Preserve:
 - The user's original goal and any changes to it
-- Files touched and why they matter
+` + summaryWorkBullets + `
+- Pending work and the current state`
+
+// summaryWorkBullets are the preservation bullets about the work itself,
+// shared by summaryPreserveList and progressSummaryInstruction.
+const summaryWorkBullets = `- Files touched and why they matter
 - Key findings from tool results (errors, line numbers, search hits)
 - Technical decisions made
-- Errors encountered and how they were fixed
-- Pending work and the current state`
+- Errors encountered and how they were fixed`
 
 // summaryInstruction is the trailing USER-role message appended to the
 // summarization request. The request carries the wire prefix (system/
@@ -82,13 +97,52 @@ const summaryPreserveList = `Preserve:
 // summarize only the middle — the first user message (the head) and the tail
 // are preserved verbatim by construction, so they are excluded here and the
 // cut messages are never mentioned.
-const summaryInstruction = summaryFraming + ` Do not reply to any question in the transcript above. Do not continue the conversation. Do not quote or repeat any message verbatim.
+const summaryInstruction = summaryOpening + `
 
 Summarize everything after the first user message in the transcript above. The first user message and any leading context before it are preserved verbatim and excluded from this summary.
 
 ` + summaryPreserveList + `
 
-Be concise but keep the facts the agent needs to continue without re-reading the summarized messages. Write a concise factual recap in the third person covering only what is in the transcript. Do not invent information. The recap will be inserted into the conversation in place of the summarized messages.
+` + summaryClosing
+
+// sessionSummaryInstruction is the deep-dive session summary. The transcript
+// is the pre-head, the preserved head, and the messages between that head
+// and the current request. The head is the first real request. A job
+// notice, a subagent notice, or a read_image caption before it is
+// user-role and stays in the pre-head, so "the first user message" would
+// name that notice and tell the model to summarize the head. Default mode
+// keeps summaryInstruction, where that first user-role message is the head.
+const sessionSummaryInstruction = summaryOpening + `
+
+Summarize the messages after the preserved head in the transcript above. The head is the first real user request. Job notices, subagent notices, and read_image captions before that head are preserved with it and must not become the cut point. The head and everything before it are excluded from this summary.
+
+` + summaryPreserveList + `
+
+` + summaryClosing
+
+// progressSummaryInstruction asks for the deep-dive progress summary: the
+// work after the current request. The request and everything before it are
+// on the wire as context (on the first compaction after a request, the part
+// before it is summarized in the same pass), so only the work since is
+// recapped. The cut is that request, not "the most recent user-role
+// message": job notices, subagent notices, and read_image captions in the
+// progress region are user-role but machine-written, and belong in the
+// recap of the work, not as a new cut point.
+const progressSummaryInstruction = summaryOpening + `
+
+Summarize the work done on the current request so far — the messages after that request in the transcript above. The current request and everything before it are kept as context and excluded from this summary. Job notices, subagent notices, and read_image captions that appear after the request are part of the work to recap; they are not a new request and must not become the cut point.
+
+Preserve:
+` + summaryWorkBullets + `
+- What is done for the current request and what remains
+
+` + summaryClosing
+
+// summaryOpening and summaryClosing frame both continuation-summary
+// instructions.
+const summaryOpening = summaryFraming + ` Do not reply to any question in the transcript above. Do not continue the conversation. Do not quote or repeat any message verbatim.`
+
+const summaryClosing = `Be concise but keep the facts the agent needs to continue without re-reading the summarized messages. Write a concise factual recap in the third person covering only what is in the transcript. Do not invent information. The recap will be inserted into the conversation in place of the summarized messages.
 
 Output only the recap text — no preamble, no markdown headings, no dialogue.`
 
@@ -114,6 +168,11 @@ type Settings struct {
 	// happens, but nothing is summarized and the cut ends the turn with a
 	// note (compact_threshold 0 means "never compact automatically").
 	SmartCompact bool
+	// DeepDive (context_mode: deep_dive) keeps the latest user request
+	// verbatim through compaction: first user message, summary of what came
+	// before the request, the request, a progress summary of the work since,
+	// then the recent tail. Off keeps the single-summary layout.
+	DeepDive bool
 }
 
 // DefaultSettings returns defaults; ContextLimit 0 means resolve from the provider at runtime.
@@ -125,6 +184,24 @@ func DefaultSettings() Settings {
 		MaxToolResultBytes:        config.DefaultMaxToolResultBytes,
 		CompactReserveTokens:      config.DefaultCompactReserveTokens,
 		CompactLastResort:         config.DefaultCompactLastResort,
+	}
+}
+
+// SettingsFromConfig maps the context-management fields of a config onto
+// Settings. A nil config gives DefaultSettings.
+func SettingsFromConfig(c *config.Config) Settings {
+	if c == nil {
+		return DefaultSettings()
+	}
+	return Settings{
+		ContextLimit:              c.ContextLimit,
+		CompactThreshold:          c.CompactThreshold,
+		CompactKeepRecentMessages: c.CompactKeepRecentMessages,
+		MaxToolResultBytes:        c.MaxToolResultBytes,
+		CompactReserveTokens:      c.CompactReserveTokens,
+		CompactLastResort:         c.CompactLastResort,
+		SmartCompact:              onoff.Enabled(c.SmartCompact),
+		DeepDive:                  c.DeepDiveContext(),
 	}
 }
 
@@ -423,6 +500,17 @@ func (m *Manager) SmartCompact() bool {
 	return m.Settings.SmartCompact
 }
 
+// DeepDive reports whether compaction keeps the latest user request
+// verbatim (context_mode: deep_dive).
+func (m *Manager) DeepDive() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.Settings.DeepDive
+}
+
 // SmartCompactStopAt is the in-flight token count at which a thinking
 // stream should stop so a summary still fits. It is the context window
 // minus the reserve and the summary output allowance. 0 means the window
@@ -444,6 +532,14 @@ func (m *Manager) SmartCompactStopAt() int {
 	return stop
 }
 
+// EmergencySummaryAllowance is the token budget assumed for the summary
+// output when sizing the emergency compaction middle: the middle must be
+// large enough to save (total - hardLimit) PLUS this much, so the summary
+// itself still lands the conversation under the window. The deep-dive
+// layout can write a second summary, and its sizing charges that one too
+// (deepDiveFreeable).
+const EmergencySummaryAllowance = 2000
+
 // ChooseCompactKeep returns the number of recent messages to preserve
 // verbatim so that the summarized middle (everything between the first user
 // message and the preserved tail) covers at least needed tokens. It starts
@@ -454,6 +550,8 @@ func (m *Manager) SmartCompactStopAt() int {
 // returns the configured keep unchanged. Returns -1 when no middle exists
 // (too few messages, no user message to anchor the head, or an incomplete
 // count cache) — the caller should then not attempt a compaction at all.
+// In deep dive the middle is sized as the deep-dive layout frees it
+// (deepDiveFreeable).
 func (m *Manager) ChooseCompactKeep(messages []llm.Message, counts []int, needed int, pinned map[int]struct{}) int {
 	m.mu.RLock()
 	keep := m.Settings.CompactKeepRecentMessages
@@ -461,7 +559,7 @@ func (m *Manager) ChooseCompactKeep(messages []llm.Message, counts []int, needed
 	if needed <= 0 {
 		return keep
 	}
-	headIdx, ok := firstUserIndex(messages)
+	headIdx, ok := headIndex(messages, m.DeepDive())
 	if !ok || len(messages) < headIdx+3 {
 		return -1
 	}
@@ -476,11 +574,16 @@ func (m *Manager) ChooseCompactKeep(messages []llm.Message, counts []int, needed
 	// and over pinned messages (extendTailForPins). Sizing it on the naive
 	// len-keep split overestimated the tokens the summary would free, so an
 	// "emergency" keep could still overflow after compaction.
+	deepDive := m.DeepDive()
 	middle := 0
 	prevTail := -1
 	for keep > 1 {
 		tailStart := extendTailForPins(messages, headIdx, adjustCompactTailStart(messages, len(messages)-keep), pinned)
 		switch {
+		case deepDive:
+			// The request and an untouched summary move with the split, so
+			// the freeable weight is not a running sum.
+			middle = m.deepDiveFreeable(messages, counts, headIdx, tailStart, m.minMiddleTokens)
 		case prevTail < 0 || tailStart < prevTail:
 			// First step, or the tail moved EARLIER than last time (a pin/tool
 			// group): the running sum no longer describes this split.
@@ -773,10 +876,20 @@ type CompactOptions struct {
 	// NoTailKeep (-1) means no preserved tail. Positive values are literal.
 	Keep int
 
-	// Forced bypasses the minMiddleTokens guard (emergency compaction).
-	// When forced and the last message is a tool result, the trailing tool
-	// group is preserved verbatim as the tail.
+	// Forced bypasses the minMiddleTokens guard: the forced compaction of
+	// the pre-flight check and the overflow recovery, which must shrink the
+	// history. The emergency tier does not set Forced, so a short middle
+	// is left for a smaller keep. When forced and the last message is a
+	// tool result, the trailing tool group is preserved verbatim as the tail.
 	Forced bool
+
+	// SingleSummary skips the deep-dive layout for this compaction, so the
+	// current request is summarized with the rest. Overflow recovery asks
+	// for it up front, because the provider already refused a request the
+	// estimate may still call under the window. Pre-flight and the
+	// emergency tier ask for it when the layout around the request shrank
+	// the history but left it over the limit.
+	SingleSummary bool
 
 	// Pinned message indices to preserve in the tail.
 	Pinned map[int]struct{}
@@ -810,6 +923,16 @@ type CompactOptions struct {
 // (per opts.Keep or the configured default). Pinned indices are preserved in
 // the tail and remapped for the compacted history.
 //
+// In deep dive (Settings.DeepDive), when the latest user request lies before
+// the tail, the middle is split around it instead: a session summary before
+// the request, the request verbatim, and a progress summary after it (see
+// compactAroundRequest). A summary that was written is returned as it is,
+// including when one message became one shorter summary. A result that
+// wrote nothing, or refused both regions as not smaller, is returned
+// too. The caller shrinks the tail, or, on a forced compaction, decides
+// whether the request itself has to be summarized. A caller whose result
+// still does not fit asks for the single summary with SingleSummary.
+//
 // A deterministic executed-call roster is appended to the summary content:
 // one line per tool call in the summarized middle, carrying the call id, the
 // tool name, and the first line of the matching result (see
@@ -819,8 +942,9 @@ type CompactOptions struct {
 // The smaller-summary guard (ErrSummaryNotSmaller) refuses a compaction whose
 // framed summary is not strictly smaller than the region it replaces. No-op
 // paths (too few messages, no user message, empty middle) return the input
-// unchanged with a nil error; forced callers enforce the strict-shrink
-// requirement (len(result) < len(messages)) externally.
+// unchanged with a nil error. A caller that requires a change compares
+// the result with the input, including a same-count summary whose text
+// changed.
 func (m *Manager) Compact(ctx context.Context, messages []llm.Message, opts CompactOptions) ([]llm.Message, map[int]struct{}, error) {
 	keep := opts.Keep
 	switch {
@@ -834,34 +958,60 @@ func (m *Manager) Compact(ctx context.Context, messages []llm.Message, opts Comp
 	return m.compactPinned(ctx, messages, keep, opts)
 }
 
+// deepDiveWrote reports whether compactAroundRequest replaced part of
+// original. That function returns the input slice when it writes nothing,
+// and a new slice when a summary was written, even if the count is unchanged.
+func deepDiveWrote(original, compact []llm.Message) bool {
+	if len(original) != len(compact) {
+		return true
+	}
+	if len(original) == 0 {
+		return false
+	}
+	return &original[0] != &compact[0]
+}
+
 // compactPinned is the shared implementation of Compact. opts.Forced
-// bypasses the minMiddleTokens guard (emergency compaction).
+// bypasses the minMiddleTokens guard. The emergency tier does not set
+// Forced, so a middle under that minimum returns ErrNotEnoughHistory and
+// the caller tries a smaller tail. Deep dive returns a summary that was
+// written, including a one-message summary, on every tier. The caller
+// measures it and decides whether the request itself has to be summarized.
 func (m *Manager) compactPinned(ctx context.Context, messages []llm.Message, keep int, opts CompactOptions) ([]llm.Message, map[int]struct{}, error) {
 	viewPrefix, counts, pinned, forced := opts.ViewPrefix, opts.Counts, opts.Pinned, opts.Forced
 	if len(messages) <= keep+1 {
 		return messages, copyIntSet(pinned), nil
 	}
 
-	headIdx, ok := firstUserIndex(messages)
+	headIdx, tailStart, ok := compactBounds(messages, keep, forced, pinned, m.DeepDive())
 	if !ok {
 		// No user message to preserve as the head; compacting would drop
 		// messages without anything to anchor the summary.
 		return messages, copyIntSet(pinned), nil
 	}
-	tailStart := adjustCompactTailStart(messages, len(messages)-keep)
-	if forced && keep == 0 && len(messages) > 0 && messages[len(messages)-1].Role == "tool" {
-		// Forced compaction mid-tool-loop: the trailing tool group (the
-		// last assistant tool-call message and its results) is
-		// protocol-required — the model needs the fresh results to
-		// continue the in-flight round, so it survives verbatim. Walking
-		// back over the trailing tool messages makes the tail start at
-		// the calling assistant message; every tool result in the tail
-		// then has its calling assistant message in the tail too.
-		tailStart = adjustCompactTailStart(messages, len(messages)-1)
-	}
-	tailStart = extendTailForPins(messages, headIdx, tailStart, pinned)
 	if tailStart <= headIdx+1 {
 		return messages, copyIntSet(pinned), nil
+	}
+	if m.DeepDive() && !opts.SingleSummary {
+		if reqIdx := deepDiveRequestIndex(messages, headIdx, tailStart); reqIdx >= 0 {
+			compact, pins, err := m.compactAroundRequest(ctx, messages, headIdx, reqIdx, tailStart, opts)
+			// A summary that was written is returned as it is, including
+			// when one message became one shorter summary and the count
+			// did not drop. A result that wrote nothing, or a not-smaller
+			// refusal of both regions, is returned too. The caller
+			// measures it. Forced compaction is already at no tail, and
+			// the preserved tool group can be what does not fit, so the
+			// single summary is the caller's decision, not this one's.
+			// A summarizer failure is returned as it is.
+			var refused deepDiveRefusal
+			if err != nil && !errors.As(err, &refused) {
+				return nil, nil, err
+			}
+			if err == nil && deepDiveWrote(messages, compact) {
+				return compact, pins, nil
+			}
+			return compact, pins, err
+		}
 	}
 
 	oldTailStart := tailStart
@@ -902,7 +1052,7 @@ func (m *Manager) compactPinned(ctx context.Context, messages []llm.Message, kee
 		}
 	}
 	if !forced && middleTokens < m.minMiddleTokens {
-		return nil, nil, fmt.Errorf("not enough history to compact (%d messages in the middle)", len(middle))
+		return nil, nil, fmt.Errorf("%w (%d messages in the middle)", ErrNotEnoughHistory, len(middle))
 	}
 
 	// The summarization request carries the wire prefix (viewPrefix), the
@@ -910,7 +1060,7 @@ func (m *Manager) compactPinned(ctx context.Context, messages []llm.Message, kee
 	// message), and the middle to summarize; the instruction tells the model
 	// to summarize only the middle — head and tail are preserved verbatim by
 	// construction below.
-	summary, err := m.summarizeMiddle(ctx, viewPrefix, messages[:headIdx+1], middle, knownTokens, opts.Tools, opts.AllowedTools)
+	summary, err := m.summarizeMiddle(ctx, viewPrefix, messages[:headIdx+1], middle, knownTokens, opts.Tools, opts.AllowedTools, summaryInstruction)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -960,6 +1110,39 @@ func (m *Manager) compactPinned(ctx context.Context, messages []llm.Message, kee
 	// cache entries. Old entries for summarised-away middle messages are
 	// harmless (bounded by session size and valid for their key).
 	return compact, newPinned, nil
+}
+
+// ForcedPreserveStart is the head and the first message a forced
+// compaction with no keep still leaves verbatim. The tail is the trailing
+// tool group, and a pin pulls it back over the pinned message. ok is
+// false when the history has no head. deepDive selects which message is
+// the head, the same split Compact uses.
+func ForcedPreserveStart(messages []llm.Message, pinned map[int]struct{}, deepDive bool) (head, tail int, ok bool) {
+	return compactBounds(messages, 0, true, pinned, deepDive)
+}
+
+// compactBounds is the head and the first summarized index for a keep that
+// is already normalized (0 means no tail). It is the same split Compact
+// uses, including a forced trailing tool group and pins. ok is false when
+// the conversation has no user message to anchor.
+func compactBounds(messages []llm.Message, keep int, forced bool, pinned map[int]struct{}, deepDive bool) (headIdx, tailStart int, ok bool) {
+	headIdx, ok = headIndex(messages, deepDive)
+	if !ok {
+		return 0, 0, false
+	}
+	tailStart = adjustCompactTailStart(messages, len(messages)-keep)
+	if forced && keep == 0 && len(messages) > 0 && messages[len(messages)-1].Role == "tool" {
+		// Forced compaction mid-tool-loop: the trailing tool group (the
+		// last assistant tool-call message and its results) is
+		// protocol-required — the model needs the fresh results to
+		// continue the in-flight round, so it survives verbatim. Walking
+		// back over the trailing tool messages makes the tail start at
+		// the calling assistant message; every tool result in the tail
+		// then has its calling assistant message in the tail too.
+		tailStart = adjustCompactTailStart(messages, len(messages)-1)
+	}
+	tailStart = extendTailForPins(messages, headIdx, tailStart, pinned)
+	return headIdx, tailStart, true
 }
 
 // extendTailForPins pulls the tail start earlier so every pinned index is preserved.
@@ -1012,11 +1195,107 @@ func copyIntSet(in map[int]struct{}) map[int]struct{} {
 }
 
 // IsCompactionSummary reports whether content is a compaction summary
-// message. Summaries are stored as assistant-role messages today; the check
-// also covers legacy user-role summaries, which must not be treated as real
-// user messages (firstUserIndex, PinManager).
+// message, session or progress. Summaries are stored as assistant-role
+// messages today; the check also covers legacy user-role summaries, which
+// must not be treated as real user messages (firstUserIndex, PinManager).
 func IsCompactionSummary(content string) bool {
-	return strings.HasPrefix(content, SummaryPrefix)
+	return strings.HasPrefix(content, SummaryPrefix) || strings.HasPrefix(content, ProgressSummaryPrefix)
+}
+
+// Prefixes of the user-role messages gogen writes itself. Every producer
+// formats its message with one of these, and IsRequest relies on them to
+// never take such a message for the user's request. A new kind of notice
+// needs its prefix here and in isMachineMessage, and a producer test that
+// IsRequest rejects it.
+const (
+	// JobNoticePrefix starts a background job's exit notice.
+	JobNoticePrefix = "[job] "
+	// SubagentNoticePrefix starts a subagent event delivered to its parent
+	// (a report, a missing reply, a close or delete by the user); the
+	// child's label (its id for the terminal notice) and "]" follow.
+	SubagentNoticePrefix = "[subagent "
+	// ReadImagePrefix starts the caption of the message that carries an
+	// image read_image attached.
+	ReadImagePrefix = "[read_image] "
+)
+
+// isMachineMessage reports whether a user-role message was written by gogen
+// rather than asked for by the user (or a parent's send_message). A batch of
+// notices is joined into one message that starts with the first notice's
+// prefix.
+func isMachineMessage(content string) bool {
+	return strings.HasPrefix(content, JobNoticePrefix) ||
+		strings.HasPrefix(content, SubagentNoticePrefix) ||
+		strings.HasPrefix(content, ReadImagePrefix)
+}
+
+// LatestRequestIndex returns the index of the latest real user request,
+// or -1 when messages has none.
+func LatestRequestIndex(messages []llm.Message) int {
+	return latestRequestIndex(messages, 0, len(messages))
+}
+
+// LatestRequestContent returns the text of the latest real user request,
+// or "" when messages has none. Deep dive uses it to remember a request
+// that condensation kept verbatim.
+func LatestRequestContent(messages []llm.Message) string {
+	i := LatestRequestIndex(messages)
+	if i < 0 {
+		return ""
+	}
+	return messages[i].Content
+}
+
+// latestRequestIndex returns the index of the latest real user request in
+// messages[from:to] (compaction summaries and machine messages are
+// skipped), or -1.
+func latestRequestIndex(messages []llm.Message, from, to int) int {
+	for i := to - 1; i >= from; i-- {
+		if IsRequest(messages[i]) {
+			return i
+		}
+	}
+	return -1
+}
+
+// IsRequest reports whether msg is a real user request: a user-role message
+// that is neither a compaction summary nor a machine message. Deep dive
+// uses it for the head, the kept request, and context_pin_last. Context
+// mode off keeps the earlier rule: the first and latest user-role message
+// that is not a compaction summary, including a job notice, a subagent
+// notice, and a read_image caption.
+func IsRequest(msg llm.Message) bool {
+	return msg.Role == "user" && !IsCompactionSummary(msg.Content) && !isMachineMessage(msg.Content)
+}
+
+// NoteSummaryIndex returns the compaction summary a note about the step in
+// flight belongs on: the latest summary in messages, or -1. In deep dive a
+// summary before the latest request is the session summary of earlier
+// conversation, which stays unchanged for the rest of the turn, so it is
+// not used.
+func NoteSummaryIndex(messages []llm.Message, deepDive bool) int {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if IsCompactionSummary(messages[i].Content) {
+			return i
+		}
+		if deepDive && IsRequest(messages[i]) {
+			return -1
+		}
+	}
+	return -1
+}
+
+// deepDiveRequestIndex returns the request the deep-dive layout keeps
+// verbatim: the latest real user request after the head, when it lies
+// before tailStart. -1 means the normal layout applies, because there is no
+// later request, or the latest one is already in the kept tail and
+// everything before the tail is earlier conversation.
+func deepDiveRequestIndex(messages []llm.Message, headIdx, tailStart int) int {
+	reqIdx := latestRequestIndex(messages, headIdx+1, len(messages))
+	if reqIdx >= tailStart {
+		return -1
+	}
+	return reqIdx
 }
 
 // IsCondensedMessage reports whether content is a last-resort-condensed
@@ -1027,11 +1306,11 @@ func IsCondensedMessage(content string) bool {
 	return strings.HasPrefix(content, CondensedMessagePrefix)
 }
 
-// firstUserIndex returns the index of the first real user message (skipping
-// compaction summaries — stored as assistant-role messages prefixed with
-// SummaryPrefix today, user-role in legacy sessions) and whether one exists.
-// ok is false when the conversation has no user message at all — callers
-// must not compact in that case.
+// firstUserIndex returns the index of the first user-role message that is
+// not a compaction summary, and whether one exists. ok is false when the
+// conversation has no such message — callers must not compact in that
+// case. A job notice, a subagent notice, and a read_image caption count.
+// This is the head in context mode off.
 func firstUserIndex(messages []llm.Message) (int, bool) {
 	for i, msg := range messages {
 		if msg.Role == "user" && !IsCompactionSummary(msg.Content) {
@@ -1041,11 +1320,32 @@ func firstUserIndex(messages []llm.Message) (int, bool) {
 	return 0, false
 }
 
+// firstRequestIndex returns the index of the first real user request.
+// Machine messages are not a request, so a notice before the user's
+// message stays in the pre-head. This is the head in deep dive.
+func firstRequestIndex(messages []llm.Message) (int, bool) {
+	for i, msg := range messages {
+		if IsRequest(msg) {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// headIndex returns the compaction head for the active mode.
+func headIndex(messages []llm.Message, deepDive bool) (int, bool) {
+	if deepDive {
+		return firstRequestIndex(messages)
+	}
+	return firstUserIndex(messages)
+}
+
 // summarizeMiddle produces a summary of the middle of the conversation.
 // viewPrefix is the wire context that precedes canonical history
 // (system/enrichment messages) and prefix is messages[:headIdx+1] (pre-head
 // plus the preserved first user message); the preferred path sends
-// viewPrefix + prefix + middle + summaryInstruction as one request so the
+// viewPrefix + prefix + middle + instructionText (summaryInstruction, or
+// progressSummaryInstruction for a deep-dive progress summary) as one request so the
 // provider prompt cache covers the conversation prefix. When the request
 // would not fit in the context window, it falls back to the legacy
 // flattened-text recursive summarization.
@@ -1057,7 +1357,7 @@ func firstUserIndex(messages []llm.Message) (int, bool) {
 // set (see CompactOptions.Tools): they ride on the request so the rendered
 // prefix matches the last turn, and their token cost is included in the
 // budget check so the request cannot be pushed over the window.
-func (m *Manager) summarizeMiddle(ctx context.Context, viewPrefix, prefix, middle []llm.Message, knownTokens int, tools []llm.Tool, allowedTools map[string]struct{}) (string, error) {
+func (m *Manager) summarizeMiddle(ctx context.Context, viewPrefix, prefix, middle []llm.Message, knownTokens int, tools []llm.Tool, allowedTools map[string]struct{}, instructionText string) (string, error) {
 	if len(middle) == 0 {
 		return "", nil
 	}
@@ -1075,7 +1375,7 @@ func (m *Manager) summarizeMiddle(ctx context.Context, viewPrefix, prefix, middl
 	// tool definitions, which are sent on the request (tools/allowedTools,
 	// see CompactOptions.Tools) — so the provider prompt cache covers the
 	// bulk of the request.
-	instruction := llm.Message{Role: "user", Content: summaryInstruction}
+	instruction := llm.Message{Role: "user", Content: instructionText}
 	req := make([]llm.Message, 0, len(viewPrefix)+len(prefix)+len(middle)+1)
 	// Summarization requests must not carry user images: the summary model
 	// may not support vision, and image bytes are irrelevant to a recap.
@@ -1118,6 +1418,9 @@ func (m *Manager) summarizeMiddle(ctx context.Context, viewPrefix, prefix, middl
 		summary, err := m.summarizeRequest(ctx, req, allowedTools, tools)
 		if err == nil {
 			return summary, nil
+		}
+		if ctx.Err() != nil {
+			return "", ctx.Err()
 		}
 		debuglog.Write("contextmgr/summarize", "continuation-summary request failed; using flattened-text fallback", "", map[string]any{
 			"path":           "fallback-after-error",
@@ -1344,6 +1647,32 @@ func (m *Manager) CondenseMessage(ctx context.Context, msg llm.Message) (string,
 		return m.summarizeText(ctx, text)
 	}
 	return truncateForSummary(text, maxIn), nil
+}
+
+// CondensedReplacementTokens reports the message CondenseMessage publishes
+// when the rendered body does not fit the summary input budget. truncated
+// is false when the body does fit: the published text is a model summary,
+// and tokens is 0 so the caller applies its own allowance. truncated is
+// true when the body is too large to send: tokens is the framed truncation
+// that is published instead of a model summary.
+func (m *Manager) CondensedReplacementTokens(msg llm.Message) (tokens int, truncated bool) {
+	if m == nil {
+		return 0, false
+	}
+	m.mu.RLock()
+	maxTool := m.Settings.MaxToolResultBytes
+	maxIn := m.maxSummaryInputTokensLocked()
+	m.mu.RUnlock()
+	text := renderMessagesForSummary([]llm.Message{msg}, maxTool)
+	if m.EstimateTokens([]llm.Message{{Content: text}}) <= maxIn {
+		return 0, false
+	}
+	framed := llm.Message{
+		Role:       msg.Role,
+		Content:    CondensedMessagePrefix + truncateForSummary(text, maxIn),
+		ToolCallID: msg.ToolCallID,
+	}
+	return ComputeMessageTokens(framed), true
 }
 
 func writeMessageForSummary(b *strings.Builder, msg llm.Message, maxToolBytes int, toolNames map[string]string) {

@@ -17,17 +17,52 @@ import (
 // prepareMessages attempted a compaction and force the failure paths. Note
 // one compaction attempt may make several provider calls (the manager falls
 // back to flattened-text summarization after a primary-path error), so
-// tests assert on "no new calls" / "new calls" deltas, not exact counts.
+// tests assert on "no new calls" / "new calls" deltas, not exact counts,
+// unless the summarized text is small enough for one call.
+// failAfter, when set, fails once calls reaches that count. failCall, when
+// set, fails only that one call, counted from 1. failUnlessContains, when
+// set, fails a call whose messages do not include that text. cancel, when
+// set, cancels
+// that context. cancelAfter 0 cancels on the first call; a positive value
+// waits until the call count reaches it. hugeFirst returns a summary larger
+// than a small region on the first call.
 type countingProvider struct {
-	limit int
-	fail  bool
-	calls int64
+	limit              int
+	fail               bool
+	failAfter          int64
+	failCall           int64
+	failUnlessContains string
+	cancel             context.CancelFunc
+	cancelAfter        int64
+	hugeFirst          bool
+	calls              int64
 }
 
-func (p *countingProvider) GenerateResponse(_ context.Context, _ []llm.Message, _ map[string]struct{}, _ []llm.Tool) (llm.Response, error) {
-	atomic.AddInt64(&p.calls, 1)
-	if p.fail {
+func (p *countingProvider) GenerateResponse(ctx context.Context, msgs []llm.Message, _ map[string]struct{}, _ []llm.Tool) (llm.Response, error) {
+	n := atomic.AddInt64(&p.calls, 1)
+	if p.cancel != nil && (p.cancelAfter == 0 || n >= p.cancelAfter) {
+		p.cancel()
+	}
+	if err := ctx.Err(); err != nil {
+		return llm.Response{}, err
+	}
+	if p.fail || (p.failAfter > 0 && n >= p.failAfter) || (p.failCall > 0 && n == p.failCall) {
 		return llm.Response{}, errors.New("summarization unavailable")
+	}
+	if p.failUnlessContains != "" {
+		kept := false
+		for _, m := range msgs {
+			if strings.Contains(m.Content, p.failUnlessContains) {
+				kept = true
+				break
+			}
+		}
+		if !kept {
+			return llm.Response{}, errors.New("summarization unavailable")
+		}
+	}
+	if p.hugeFirst && n == 1 {
+		return llm.Response{Content: strings.Repeat("z", 80000)}, nil
 	}
 	return llm.Response{Content: "summary"}, nil
 }
@@ -94,17 +129,19 @@ func guardsState(a *Agent) (emergency, lastResort int) {
 }
 
 // TestProgressGuardResetAsymmetry pins the per-tier reset semantics of the
-// compaction progress guards: a successful COMPACTION (published through
-// publishCompaction → noteCompactSuccess) resets the emergency guard only,
-// and a successful last-resort CONDENSATION resets the lastResort guard
-// only. A blanket "reset all guards" success helper would break both
-// assertions.
+// compaction progress guards. A successful compaction resets the emergency
+// guard and does not clear a recorded last-resort failure. It leaves a
+// condensation's kept request in place when that request is still
+// verbatim, and clears the mark when the publish replaces it. A published
+// condensation clears the emergency guard and the last-resort guard,
+// remembers the request, and does not clear a failed single summary.
 func TestProgressGuardResetAsymmetry(t *testing.T) {
 	// 1. A successful compaction must not clear a recorded last-resort
 	// failure.
 	a, _, _ := newEmergencyTestAgent(t, false)
 	a.appendMessage(llm.Message{Role: "user", Content: "hello"})
 	a.noteProgressFailure(&a.compactionGuards.lastResort)
+	a.compactionGuards.condensationKeptRequest = "hello"
 	if _, lr := guardsState(a); lr != 1 {
 		t.Fatalf("setup: lastResort guard = %d, want 1 (message count at failure)", lr)
 	}
@@ -116,16 +153,28 @@ func TestProgressGuardResetAsymmetry(t *testing.T) {
 	} else if e != 0 {
 		t.Fatalf("emergency guard = %d, want 0 (untouched)", e)
 	}
+	if !a.requestKeptByCondensation() {
+		t.Fatal("a publish that kept the request cleared the condensation mark")
+	}
+	a.publishCompaction([]llm.Message{{Role: "user", Content: "other"}}, nil)
+	if _, lr := guardsState(a); lr != 1 {
+		t.Fatalf("replacing the request cleared the lastResort guard: %d, want 1", lr)
+	}
+	if a.requestKeptByCondensation() {
+		t.Fatal("a publish that replaced the request left the condensation mark set")
+	}
 
-	// 2. A successful last-resort condensation must not clear a recorded
-	// emergency failure: a fresh session whose single message is over the
-	// window (no middle to summarize, so forced compaction is a no-op)
+	// 2. A published condensation clears the emergency guard. The count is
+	// remembered so the request is not summarized, and a failed single
+	// summary stays failed. A fresh session whose single message is over
+	// the window (no middle to summarize, so forced compaction is a no-op)
 	// recovers via the condensation.
 	a2, mgr, _, _ := newLastResortTestAgent(t)
 	a2.appendMessage(llm.Message{Role: "user", Content: textOfTokens(t, 2200)})
 	_ = a2.ContextStats(context.Background())
 	setLimitOverBy(t, a2, mgr, 50)
 	a2.noteProgressFailure(&a2.compactionGuards.emergency)
+	a2.noteProgressFailure(&a2.compactionGuards.singleSummary)
 	if e, _ := guardsState(a2); e != 1 {
 		t.Fatalf("setup: emergency guard = %d, want 1 (message count at failure)", e)
 	}
@@ -138,11 +187,40 @@ func TestProgressGuardResetAsymmetry(t *testing.T) {
 	}
 	if e, lr := guardsState(a2); lr != 0 {
 		t.Fatalf("lastResort guard = %d, want 0 (reset by the successful condensation)", lr)
-	} else if e != 1 {
-		t.Fatalf("successful condensation cleared the emergency guard: %d, want 1", e)
+	} else if e != 0 {
+		t.Fatalf("emergency guard = %d, want 0 (cleared by the published condensation)", e)
+	}
+	if !a2.requestKeptByCondensation() {
+		t.Fatal("published condensation did not remember the request")
+	}
+	if !a2.singleSummaryFailed() {
+		t.Fatal("published condensation cleared a failed single summary")
 	}
 	if est := a2.outgoingViewEstimate(view); est >= mgr.ContextLimit() {
 		t.Fatalf("estimate after condensation = %d, want < limit %d", est, mgr.ContextLimit())
+	}
+}
+
+// TestShorterPublishClearsTheLastResortGuard pins a condensation that
+// failed at a longer history. The summary that follows publishes fewer
+// messages, and that publish clears the guard so the condensation can
+// run on the shorter history. A same-length publish keeps the guard,
+// which TestProgressGuardResetAsymmetry pins.
+func TestShorterPublishClearsTheLastResortGuard(t *testing.T) {
+	a, _, _ := newEmergencyTestAgent(t, false)
+	for i := 0; i < 6; i++ {
+		a.appendMessage(llm.Message{Role: "user", Content: string(rune('a' + i))})
+	}
+	a.noteProgressFailure(&a.compactionGuards.lastResort)
+	if _, lr := guardsState(a); lr != 6 {
+		t.Fatalf("setup: lastResort guard = %d, want 6", lr)
+	}
+	a.publishCompaction(a.Messages[:3], nil)
+	if _, lr := guardsState(a); lr != 0 {
+		t.Fatalf("lastResort guard = %d, want 0 after a shorter publish", lr)
+	}
+	if a.lastResortGuarded() {
+		t.Fatal("the shorter history is still guarded")
 	}
 }
 
@@ -429,7 +507,7 @@ func TestEmergencyLowersKeepToCoverDeficit(t *testing.T) {
 	a.recordTurnUsage(&llm.Usage{PromptTokens: ctxMgr.HardLimit() + 1200, CompletionTokens: 10})
 
 	total := a.compactionTokenTotal()
-	needed := total - ctxMgr.HardLimit() + emergencySummaryAllowance
+	needed := total - ctxMgr.HardLimit() + contextmgr.EmergencySummaryAllowance
 	if k := ctxMgr.ChooseCompactKeep(a.Messages, cachedCounts(t, a), needed, nil); k != 1 {
 		t.Fatalf("ChooseCompactKeep = %d, want 1 (deficit %d exceeds the keep-2 middle)", k, needed)
 	}
@@ -472,7 +550,7 @@ func TestEmergencyKeepUnchangedWhenMiddleSufficient(t *testing.T) {
 	a.recordTurnUsage(&llm.Usage{PromptTokens: ctxMgr.HardLimit() + 100, CompletionTokens: 10})
 
 	total := a.compactionTokenTotal()
-	needed := total - ctxMgr.HardLimit() + emergencySummaryAllowance
+	needed := total - ctxMgr.HardLimit() + contextmgr.EmergencySummaryAllowance
 	if k := ctxMgr.ChooseCompactKeep(a.Messages, cachedCounts(t, a), needed, nil); k != ctxMgr.CompactKeepRecentMessages() {
 		t.Fatalf("ChooseCompactKeep = %d, want %d (middle already covers the deficit)",
 			k, ctxMgr.CompactKeepRecentMessages())
