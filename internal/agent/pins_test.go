@@ -23,12 +23,47 @@ func TestPinLastUserSkipsCompactionSummaries(t *testing.T) {
 		{Role: "assistant", Content: "more work"},
 		{Role: "user", Content: contextmgr.SummaryPrefix + "legacy summary"},
 	}
-	p.PinLastUser(msgs)
+	p.PinLastUser(msgs, true)
 	if !p.IsPinned(2) {
 		t.Fatalf("expected the last real user message (index 2) to be pinned, got %v", p.PinnedIndices())
 	}
 	if p.IsPinned(4) {
 		t.Fatalf("summary message (index 4) must not be pinned, got %v", p.PinnedIndices())
+	}
+}
+
+// TestPinLastUserSkipsMachineMessages pins context_pin_last. Context mode
+// off pins the latest user-role message, including a job notice, a
+// subagent notice, or a read_image caption. Deep dive skips those and
+// pins the request.
+func TestPinLastUserSkipsMachineMessages(t *testing.T) {
+	tests := []struct {
+		name  string
+		after llm.Message
+	}{
+		{"job notice", llm.Message{Role: "user", Content: jobExitSummary(&BackgroundJob{ID: "bg-1", Command: "go test ./..."})}},
+		{"subagent notice", llm.Message{Role: "user", Content: contextmgr.SubagentNoticePrefix + "scout] found it"}},
+		{"read_image caption", llm.Message{Role: "user", Content: contextmgr.ReadImagePrefix + "shot.png", Images: []llm.ImageInput{{DataURL: "data:image/png;base64,AAAA"}}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := NewPinManager()
+			msgs := []llm.Message{
+				{Role: "user", Content: "first"},
+				{Role: "user", Content: "the request"},
+				{Role: "assistant", Content: "work"},
+				tt.after,
+			}
+			p.PinLastUser(msgs, false)
+			if !p.IsPinned(3) || len(p.PinnedIndices()) != 1 {
+				t.Fatalf("default pins = %v, want the notice (index 3)", p.PinnedIndices())
+			}
+			p.ClearPins()
+			p.PinLastUser(msgs, true)
+			if !p.IsPinned(1) || len(p.PinnedIndices()) != 1 {
+				t.Fatalf("deep dive pins = %v, want only the request (index 1)", p.PinnedIndices())
+			}
+		})
 	}
 }
 
@@ -39,7 +74,7 @@ func TestPinLastUserNoRealUserMessage(t *testing.T) {
 	msgs := []llm.Message{
 		{Role: "user", Content: contextmgr.SummaryPrefix + "legacy summary"},
 	}
-	p.PinLastUser(msgs)
+	p.PinLastUser(msgs, true)
 	if len(p.PinnedIndices()) != 0 {
 		t.Fatalf("expected no pin, got %v", p.PinnedIndices())
 	}
@@ -56,7 +91,7 @@ func TestListPinsTruncatesRuneSafe(t *testing.T) {
 		content += "é"
 	}
 	msgs := []llm.Message{{Role: "user", Content: content}}
-	p.PinLastUser(msgs)
+	p.PinLastUser(msgs, true)
 
 	out := p.ListPins(msgs)
 	want := string([]rune(content)[:80]) + "…"

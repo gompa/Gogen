@@ -154,6 +154,7 @@ While in the TUI:
 | `dir <path>` | Change working directory |
 | `compact` or `/compact` | Manually compact conversation history |
 | `/smartcompact` | Smart compact for a long tool loop: `on`, `off`, or bare to toggle. Applies to this run; `/save-config` stores it. Default off |
+| `/contextmode` | Context mode: `default` or `deep_dive` (see deep dive below); bare shows the current mode. Applies to this run; `/save-config` stores it |
 | `/models` | List available models |
 | `/models <name>` | Switch to a different model |
 | `/plan` | Enable plan mode (read-only) |
@@ -226,6 +227,7 @@ review_agent_model: gpt-4o-mini  # default review model (empty = ticket override
 review_agent_thinking_level: high  # review agent reasoning effort (empty = inherit the workspace level)
 job_notices: off   # notify the session when a background command finishes
 join_queued: off   # send messages queued during a turn as one message
+context_mode: default  # default | deep_dive (long-running tasks: keep the current request through compaction)
 automations: off   # file-based cron scheduler: fire saved prompts as headless runs on a schedule
 status_display: auto  # off | auto (probe for the screen at startup) | on
 status_display_host: statusscreen.local  # mDNS name, IP, or base URL of the display
@@ -342,6 +344,7 @@ is passed.
 | `GOGEN_COMPACT_RESERVE_TOKENS` | `4000` | Tokens reserved for new messages after compaction |
 | `GOGEN_COMPACT_LAST_RESORT` | `condense` | `condense` or `error`: what happens when a single message cannot fit the context window even after all compaction (e.g. a fresh session whose first message is bigger than the window) |
 | `GOGEN_SMART_COMPACT` | `off` | `on` or `off` (`smart_compact` in `.gogen/gogen.conf`). When on, a tool loop that crosses the compact threshold is compacted before the next tool runs, and a thinking stream stops with room left to summarize. A tool call the model has already written runs once, after the summary. Also on the web Context tab and via `/smartcompact` |
+| `GOGEN_CONTEXT_MODE` | `default` | `default` or `deep_dive` (`context_mode` in `.gogen/gogen.conf`, or **Context mode** on the Context tab in the browser and the VS Code sidebar, or `/contextmode` in the terminal UI). See deep dive below |
 
 When a single message is too large for the window, there is no middle history
 to summarize — the message is the head and every request would be refused.
@@ -353,9 +356,13 @@ announced in-band (TUI system line / web banner: message size vs window,
 original archived). With `compact_last_resort: error` the request is not sent
 at all: a clear diagnostic ("message is ~N tokens vs M window; shorten it or
 start a fresh session (/new)") is returned instead of the raw provider
-refusal. The path is strictly last-resort — it only fires when the request is
-provably over the window after the forced compaction, and only when condensing
-the single largest message would bring it under.
+refusal. It runs when compaction has left the request over the window, and
+only when a published replacement would bring the view under. Deep dive
+condenses a message other than the latest request when that replacement
+fits, including one smaller than the request. The usual mode condenses the
+largest message whose replacement fits. A provider refusal while the
+estimate is still under the window is separate: the message compaction
+would have left verbatim is condensed when it is larger than the middle.
 
 Smart compact stays off unless you turn it on, so the usual path is unchanged:
 auto-compaction runs when the latest message is from you. Turn it on
@@ -372,6 +379,99 @@ closes the budget tier and the window-reserve tier alike. The mid-think stop
 still uses the window, but nothing is summarized, so an unfinished tool call is
 dropped and the turn ends with a note to run `/compact`, raise
 `compact_threshold`, or start a new session. A complete tool call still runs.
+
+`context_mode` chooses how the model is told about context, and how
+compaction treats the request it is working on. `default` keeps the usual
+behavior: compaction keeps the first user message and the most recent
+messages verbatim and summarizes everything in between, and the system prompt
+tells the model to pin facts with `context_pin_last` and summarize its
+progress when context gets tight. A summary that replaces one message is
+kept. A tool result or a pin that was larger than that message is still
+condensed when the summary has already dropped the estimate under the
+window. A failure of that condensation is not recorded, so a later
+refusal can still condense the message. When the provider refuses and the estimate is still under the
+window, a message compaction would have left verbatim is condensed when
+it is larger than the middle the summary would replace, taken together, including a
+trailing tool result. A message only as large as that middle is left,
+and the summary runs. A recorded failure does not block that summary.
+A condensation of that larger message that comes
+back no smaller does not spend the retry on the smaller middle, and the
+miss is not recorded as a failure. A summarizer error on that condensation
+does not spend the retry either. That error is recorded, so it is not
+tried again until the history is shorter. A summary that leaves the estimate at or over the window
+does not spend the overflow retry. Last resort runs on that history, and
+the retry is spent only when the result is under the window. `deep_dive` is for long-running tasks,
+usually together with smart compact:
+
+- Compaction also keeps your latest request verbatim. The head is the
+  first real user request. Job notices, subagent notices, and `read_image`
+  captions before that head stay with it, and the session summary starts
+  after that first request. History becomes: that head, a summary of the
+  session before the current request, the request, a progress summary of
+  the work since, and the recent messages. A
+  later compaction in the same turn rewrites only the progress summary, so
+  everything up to the request stays identical (and stays in the provider's
+  prompt cache). Your next message becomes the new request, and the older
+  parts fold into the first summary. The first compaction after a new
+  request therefore makes two summarizer calls, one after the other; the
+  second reuses the first one's cached history up to the request. Later
+  compactions in the same turn usually make one. When the work since the
+  request is still too small to summarize, compaction moves more of the
+  recent messages into it rather than counting the attempt as failed. Job
+  and subagent notices, and the image messages `read_image` adds, do not
+  count as a request. When your latest
+  request is already among the recent messages, compaction summarizes
+  everything before them as usual. When the conversation no longer fits
+  and this layout cannot shrink it enough (for example, the request itself
+  is most of the window), compaction uses the single summary instead, which
+  summarizes the request with the rest. That happens when the estimate is
+  at or over the context window, and, in the emergency tier, when the total
+  is at or above the hard limit. After the provider refused a request, and the
+  local estimate is still under the window, deep dive condenses the message
+  compaction would have left verbatim when that message is larger than the
+  middle taken together. That is the trailing tool result, or a pin. The request stays.
+  The layout around the request runs before a single summary. The request
+  is summarized only when that result is still at or over the window. The head
+  is condensed in that pass when it is larger than the tool result or the pin
+  and larger than the middle. A condensation that comes back no smaller does
+  not spend the retry on a smaller middle. The large message stays, and that
+  miss is not recorded as a failure. A summarizer error on that condensation
+  does not spend the retry either. That error is recorded, so it is not
+  tried again until the history is shorter. When no preserved message is
+  larger than the middle, a recorded failure does not block the summary.
+  A one-message summary that drops the estimate under the window still
+  leaves room to condense a tool result or a pin that was larger than the
+  summarized middle. A failure of that condensation is not recorded.
+  Publishing a condensation clears the compaction wait.
+  A failed single summary stays failed. Below
+  the limit, a large request stays verbatim. Remembering that request
+  does not keep it once the view is over the window and nothing else
+  fits: it is summarized with the rest. When a different message can
+  be condensed to fit, that message is condensed and the request stays.
+  Publishing that condensation clears the emergency guard and remembers
+  the request. A later summary that leaves the request verbatim does not
+  forget it. A tool result does not re-arm it. A new user request does,
+  including the same text. If the condensed summary comes back too big to
+  publish, the layout around the request still runs, and the request stays
+  verbatim. A compaction that changed the history is sent again when the
+  estimate is under the window. When it is still over, last resort runs on
+  that history before the retry is spent, and the retry is spent only when
+  the result measures under the window. A pin still keeps its message
+  and everything after it through compaction. When nothing outside that
+  stretch can bring the view under the window, last resort condenses the
+  largest message in the stretch whose replacement fits.
+- The system prompt says that history is compacted automatically, that notes
+  worth keeping belong in the todo list (it survives compaction), and that
+  the model should not stop or shorten its work because of context size. It
+  does not suggest `context_pin_last`: a pin keeps everything after the pinned
+  message verbatim, which in a long turn leaves compaction nothing to free.
+  With `compact_threshold: 0` nothing is compacted automatically, so the
+  prompt keeps the default advice. A custom `system_prompt` without the
+  default sentence is sent unchanged.
+
+In the terminal UI, `/contextmode deep_dive` or `/contextmode default`
+switches every live session from the next model call, and `/contextmode`
+alone shows the current mode. `/save-config` stores it.
 
 After each agent turn, GoGen shows context usage in the CLI (dim line) and web UI (sidebar meter). Use `/context` for a detailed breakdown. When the provider returns usage stats (`prompt_tokens` from the API, including streaming with `include_usage`), the display labels this as **last request**; otherwise it falls back to a local token estimate.
 

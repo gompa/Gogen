@@ -795,6 +795,12 @@ func (a *Agent) resetSaveTracking() {
 // case.
 func (a *Agent) appendMessage(m llm.Message) {
 	a.statsMu.Lock()
+	// A new user request replaces the one condensation kept. A tool
+	// result and a machine notice do not, so the emergency tier does
+	// not summarize that request on the tool round that follows.
+	if contextmgr.IsRequest(m) {
+		a.compactionGuards.condensationKeptRequest = ""
+	}
 	a.Messages = append(a.Messages, m)
 	if a.tokenCounts != nil && len(a.tokenCounts) == len(a.Messages)-1 {
 		a.tokenCounts = append(a.tokenCounts,

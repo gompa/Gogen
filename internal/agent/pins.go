@@ -21,17 +21,24 @@ func NewPinManager() *PinManager {
 	return &PinManager{pinned: make(map[int]struct{})}
 }
 
-// PinLastUser pins the most recent real user message so it survives
-// compaction. Compaction summaries are skipped (see
-// contextmgr.IsCompactionSummary): legacy sessions stored them as user-role
-// messages, and pinning one would preserve a recap instead of the actual
-// last user message.
-func (p *PinManager) PinLastUser(messages []llm.Message) {
+// PinLastUser pins the most recent user message so it survives compaction.
+// Compaction summaries are skipped: legacy sessions stored them as
+// user-role messages, and pinning one would preserve a recap instead of
+// the actual last user message. skipMachine is deep dive. It skips a job
+// notice, a subagent notice, and a read_image caption, which would
+// otherwise keep that message (and its image) instead of the request.
+// Context mode off pins the latest user-role message, including those.
+func (p *PinManager) PinLastUser(messages []llm.Message, skipMachine bool) {
 	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" && !contextmgr.IsCompactionSummary(messages[i].Content) {
-			p.pinned[i] = struct{}{}
-			return
+		msg := messages[i]
+		if msg.Role != "user" || contextmgr.IsCompactionSummary(msg.Content) {
+			continue
 		}
+		if skipMachine && !contextmgr.IsRequest(msg) {
+			continue
+		}
+		p.pinned[i] = struct{}{}
+		return
 	}
 }
 
@@ -75,7 +82,7 @@ func (a *Agent) pinLastUser() error {
 	if a.PinManager == nil {
 		return nil
 	}
-	a.PinManager.PinLastUser(a.Messages)
+	a.PinManager.PinLastUser(a.Messages, a.Context != nil && a.Context.DeepDive())
 	return nil
 }
 func pinnedSet(p *PinManager) map[int]struct{} {

@@ -204,14 +204,15 @@ func TestPreflightCappingOnlyNoLLMCall(t *testing.T) {
 	}
 }
 
-// TestPreflightStrictShrinkAbort pins the strict-shrink requirement: a
-// forced compaction whose result is not strictly smaller than the input
-// (a single-message middle compacts to the same length) is aborted — the
-// history is left untouched and the view is handed off as-is.
-func TestPreflightStrictShrinkAbort(t *testing.T) {
+// TestPreflightOneMessageSummaryIsKept pins a middle of one message. The
+// summary does not drop the count, and it is still published: the framed
+// summary is smaller than the message it replaced. The pinned tool result
+// stays.
+func TestPreflightOneMessageSummaryIsKept(t *testing.T) {
 	a, mgr, provider := newPreflightTestAgent(t)
 	a.appendMessage(llm.Message{Role: "user", Content: "hello"})
-	a.appendMessage(llm.Message{Role: "user", Content: textOfTokens(t, 800)})
+	big := textOfTokens(t, 800)
+	a.appendMessage(llm.Message{Role: "user", Content: big})
 	a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "search_code", Args: map[string]any{"pattern": "x"}}}})
 	a.appendMessage(llm.Message{Role: "tool", ToolCallID: "call_1", Content: "3 hits in main.go"})
 	_ = a.ContextStats(context.Background())
@@ -226,13 +227,17 @@ func TestPreflightStrictShrinkAbort(t *testing.T) {
 	if got := atomic.LoadInt64(&provider.calls); got == 0 {
 		t.Fatal("no summarization calls: the forced compaction did not run")
 	}
-	// 4 -> 4: no shrink, so the compaction is aborted and the history is
-	// untouched.
 	if len(a.Messages) != before {
-		t.Fatalf("messages = %d, want %d (strict-shrink abort)", len(a.Messages), before)
+		t.Fatalf("messages = %d, want %d (one message became one summary)", len(a.Messages), before)
 	}
-	if contextmgr.IsCompactionSummary(a.Messages[1].Content) {
-		t.Fatal("a summary was inserted despite the strict-shrink abort")
+	if !contextmgr.IsCompactionSummary(a.Messages[1].Content) {
+		t.Fatal("the one-message summary was discarded")
+	}
+	if a.Messages[0].Content != "hello" || a.Messages[3].Content != "3 hits in main.go" {
+		t.Fatal("the head or the pinned tool result changed")
+	}
+	if a.Messages[1].Content == big {
+		t.Fatal("the big message is still verbatim")
 	}
 }
 

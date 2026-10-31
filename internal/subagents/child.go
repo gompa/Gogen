@@ -94,16 +94,24 @@ func (e Event) ParentMessage() string {
 		return e.Text
 	case EventReply:
 		if e.Text == "" {
-			msg := fmt.Sprintf("[subagent %s] no reply (the turn failed or was interrupted before producing one)", e.Label)
 			if e.Err != nil {
-				msg = fmt.Sprintf("[subagent %s] no reply (the turn failed: %v)", e.Label, e.Err)
+				return Notice(e.Label, fmt.Sprintf("no reply (the turn failed: %v)", e.Err))
 			}
-			return msg
+			return Notice(e.Label, "no reply (the turn failed or was interrupted before producing one)")
 		}
-		return fmt.Sprintf("[subagent %s] %s", e.Label, agent.TruncateSubagentReport(e.Text))
+		return Notice(e.Label, agent.TruncateSubagentReport(e.Text))
 	default:
 		return e.Text
 	}
+}
+
+// Notice is a subagent event as its parent reads it: "[subagent <name>]
+// <text>". name is the child's label, or its id for the terminal notice
+// (the id resolves duplicate or truncated labels; the text names the label).
+// Every subagent notice is built here, so compaction can tell it from a user
+// request by contextmgr.SubagentNoticePrefix.
+func Notice(name, text string) string {
+	return contextmgr.SubagentNoticePrefix + name + "] " + text
 }
 
 // DeliverEvent routes one typed child event to its parent through the host's

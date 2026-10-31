@@ -2,9 +2,12 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
+	"strings"
+	"time"
 
 	"gogen/internal/contextmgr"
 	"gogen/internal/llm"
@@ -127,7 +130,7 @@ func (a *Agent) prepareMessages(ctx context.Context, h *llm.StreamHandlers) ([]l
 	// ArgsStabilized is persisted and we skip already-stable messages.
 	a.stabilizeToolArgs()
 
-	view = buildSystemView(view, a.WorkingDir, a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode, a.mcpToolHint())
+	view = buildSystemView(view, a.systemPromptBase(a.WorkingDir), a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode, a.mcpToolHint())
 
 	// Pre-flight: verify the actual outgoing request fits the context
 	// window, compacting in place when it would be refused. The boundary
@@ -175,7 +178,7 @@ func (a *Agent) outgoingViewEstimate(view []llm.Message) int {
 // rebuildView builds the LLM view from canonical history (system prompt and
 // enrichment folded in), the same call prepareMessages makes.
 func (a *Agent) rebuildView() []llm.Message {
-	return buildSystemView(a.Messages, a.WorkingDir, a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode, a.mcpToolHint())
+	return buildSystemView(a.Messages, a.systemPromptBase(a.WorkingDir), a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode, a.mcpToolHint())
 }
 
 // preflightForcedCompact verifies that the outgoing view fits the context
@@ -188,9 +191,11 @@ func (a *Agent) rebuildView() []llm.Message {
 // recovers from a refusal that slips through.
 //
 // When the request is still over the window after the forced compaction
-// (or the attempt was suppressed/aborted), it hands off to Phase 0e —
-// last-resort condensation of the single message that cannot fit. In error
-// mode (compact_last_resort=error) the hand-off returns the actionable
+// (or the attempt was suppressed or aborted), it hands off to last-resort
+// condensation. In deep dive that pass can also summarize the request,
+// when no other message's replacement fits. In the usual mode it condenses
+// the largest message, and only when that replacement fits. In error mode
+// (compact_last_resort=error) the hand-off returns the actionable
 // diagnostic as the error instead of letting the provider refuse the
 // request; in condense mode a failed condensation leaves the view as-is
 // (the provider refusal remains the diagnostic, wrapped by Phase 3).
@@ -203,9 +208,9 @@ func (a *Agent) rebuildView() []llm.Message {
 //     guard bypassed: mid-loop there may be only a few messages since the
 //     last compaction. The smaller-summary guard still applies.
 //
-// Strict-shrink requirement: a compaction that does not remove at least
-// one message (len(compacted) < len(messages)) is aborted — it saves
-// nothing, and a non-shrinking iteration would never converge.
+// A result whose summary text is unchanged is aborted. Replacing one
+// message with a shorter summary keeps the count and still saves tokens.
+// The smaller-summary guard is what keeps that from repeating.
 //
 // Two guards keep the check from hot-looping: a degenerate window (the
 // limit does not exceed the wire overhead alone) can never fit any
@@ -251,32 +256,199 @@ func (a *Agent) preflightForcedCompact(ctx context.Context, h *llm.StreamHandler
 	// Stage 2: forced summarization (keep=0, minMiddleTokens bypassed).
 	// The emergency progress guard suppresses a retry at an unchanged
 	// message count after a failed or aborted attempt (a retry would hit
-	// the same failure); growth past that count re-arms it.
+	// the same failure); growth past that count re-arms it. A request
+	// that condensation kept is not this skip: the layout still runs,
+	// and the fallback below refuses to summarize that request.
 	a.statsMu.RLock()
 	guarded := a.compactionGuards.emergency >= len(a.Messages)
 	a.statsMu.RUnlock()
+	// A message the forced split will leave verbatim, measured before the
+	// summary replaces the middle. A same-count summary can drop the
+	// estimate under the window and skip last resort. The preserved
+	// message is still condensed when it was larger than that middle.
+	preservedLarger := a.preservedLargerThanMiddle()
 	if !guarded {
-		if a.runForcedSummarization(ctx, h) {
+		if a.runForcedSummarization(ctx, h, false) {
 			view = a.rebuildView()
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		// Cancelled during the forced pass. Last resort would record a
+		// failure on the cancelled context and the next turn would stay
+		// backed off.
+		return view, err
+	}
 	if a.outgoingViewEstimate(view) < limit {
+		if preservedLarger > 0 {
+			outcome, condErr := a.condenseLargerPreserved(ctx, h, preservedLarger)
+			if condErr != nil {
+				return view, condErr
+			}
+			if outcome == condensePublished {
+				view = a.rebuildView()
+			}
+		}
 		return view, nil
 	}
 	// Still over after forced compaction (or a suppressed/aborted
-	// attempt): Phase 0e — last-resort condensation of the single message
-	// that cannot fit the window. In error mode it returns the actionable
-	// diagnostic; in condense mode a failed condensation leaves the view
-	// as-is (the provider refusal remains the diagnostic, wrapped by
-	// Phase 3).
-	condensed, err := a.lastResortCondense(ctx, h, view)
+	// attempt). Last resort reports why it did not publish, and the
+	// request is summarized only when that reason says condensation
+	// cannot fit. A view that is still over the window arms the
+	// emergency guard on the way out.
+	return a.settleOverWindow(ctx, h, view, limit)
+}
+
+// settleOverWindow runs last resort and, when condensation cannot fit,
+// the single summary. A model summary that comes back too big leaves the
+// request verbatim so a later condensation can be smaller. A cancel is
+// returned without a guard.
+func (a *Agent) settleOverWindow(ctx context.Context, h *llm.StreamHandlers, view []llm.Message, limit int) ([]llm.Message, error) {
+	outcome, err := a.lastResortCondense(ctx, h, view)
 	if err != nil {
+		if ctx.Err() != nil {
+			return view, ctx.Err()
+		}
+		a.finishStillOver(err)
 		return view, err
 	}
-	if condensed {
+	if outcome == condensePublished {
+		view = a.rebuildView()
+		if a.outgoingViewEstimate(view) < limit {
+			return view, nil
+		}
+	}
+	// A summary that came back too big is not a reason to summarize the
+	// request. The allowance still fits, so the ordinary layout returns
+	// before it runs. Run it now: it keeps the request and summarizes
+	// the regions around it. A later turn does not repeat it while the
+	// emergency guard still records this count.
+	if outcome == condenseAttemptMissed {
+		changed, err := a.layoutAfterMissedCondensation(ctx, h)
+		if err != nil {
+			if ctx.Err() != nil {
+				return view, ctx.Err()
+			}
+			return view, nil
+		}
+		if changed {
+			view = a.rebuildView()
+			if a.outgoingViewEstimate(view) < limit {
+				return view, nil
+			}
+		}
+		a.finishStillOver(fmt.Errorf("still over the context window after condensation"))
+		return view, nil
+	}
+	// Nothing-fits and an already-guarded condensation are the reasons
+	// that summarize the request, and only in deep dive. A remembered
+	// request and a single summary that already failed at this message
+	// count are not: repeating the summary doubles the backoff.
+	if !a.summarizeRequestAllowed() {
+		a.finishStillOver(fmt.Errorf("still over the context window after condensation"))
+		return view, nil
+	}
+	if err := a.summarizeKeptRequestNow(ctx, h); err != nil {
+		if ctx.Err() != nil {
+			return view, ctx.Err()
+		}
+		log.Printf("forced compaction: single-summary fallback failed: %v", err)
+		a.noteCompactFailure(err)
+		a.noteProgressFailure(&a.compactionGuards.emergency)
+		return view, nil
+	}
+	view = a.rebuildView()
+	if a.outgoingViewEstimate(view) < limit {
+		return view, nil
+	}
+	outcome, err = a.lastResortCondense(ctx, h, view)
+	if err != nil {
+		if ctx.Err() != nil {
+			return view, ctx.Err()
+		}
+		a.finishStillOver(err)
+		return view, err
+	}
+	if outcome == condensePublished {
 		view = a.rebuildView()
 	}
+	if a.outgoingViewEstimate(view) >= limit {
+		a.finishStillOver(fmt.Errorf("still over the context window after summarizing the request"))
+	}
 	return view, nil
+}
+
+// summarizeRequestAllowed reports whether the verbatim request should be
+// summarized. A different message whose published replacement fits is
+// condensed instead, unless that condensation is already guarded at this
+// message count. A request a condensation kept is summarized once the
+// view is over the window and nothing else fits. Under the window this
+// is false, and the emergency tier returns through keptRequestUnderWindow.
+func (a *Agent) summarizeRequestAllowed() bool {
+	if a.singleSummaryFailed() {
+		return false
+	}
+	if !a.keptRequestStillOver() {
+		return false
+	}
+	return !a.leaveForCondensation()
+}
+
+// leaveForCondensation reports whether deep dive should condense a message
+// other than the request instead of summarizing the request. The view is
+// over the window, last resort is condense, that message's replacement
+// would bring the view under, and condensation is not already guarded.
+// Error mode still summarizes: the diagnostic is what remains after that
+// summary. Under the window this is false, because last resort does not
+// run there.
+func (a *Agent) leaveForCondensation() bool {
+	if a == nil || a.Context == nil || !a.Context.DeepDive() {
+		return false
+	}
+	if a.Context.CompactLastResort() != "condense" {
+		return false
+	}
+	limit := a.Context.ContextLimit()
+	if limit <= 0 || a.outgoingViewEstimate(a.rebuildView()) < limit {
+		return false
+	}
+	return condensableTailFits(a, limit) && !a.lastResortGuarded()
+}
+
+// lastResortGuarded reports whether condensation already failed at this
+// message count.
+func (a *Agent) lastResortGuarded() bool {
+	a.statsMu.RLock()
+	defer a.statsMu.RUnlock()
+	return a.compactionGuards.lastResort >= len(a.Messages)
+}
+
+// finishStillOver arms the emergency guard when the rebuilt view is still
+// at or over the context window. A publish clears that guard, so a give-up
+// after a summary that missed the window has to put it back, or the next
+// round pays for another summarizer call. A backoff that is still running
+// is left as it is, so one give-up does not stack two waits. A deadline
+// that has already passed is not a running backoff: this give-up records
+// it again with the doubled delay, the same comparison compactAttemptDue
+// uses. A view under the window is left alone.
+func (a *Agent) finishStillOver(err error) {
+	if a == nil || a.Context == nil {
+		return
+	}
+	limit := a.Context.ContextLimit()
+	if limit <= 0 || a.outgoingViewEstimate(a.rebuildView()) < limit {
+		return
+	}
+	a.statsMu.RLock()
+	guard := a.compactionGuards.emergency
+	backoffActive := !time.Now().After(a.compactBackoffUntil)
+	n := len(a.Messages)
+	a.statsMu.RUnlock()
+	if !backoffActive {
+		a.noteCompactFailure(err)
+	}
+	if guard < n {
+		a.noteProgressFailure(&a.compactionGuards.emergency)
+	}
 }
 
 // capToolResultsForCompact runs stage 1 of the forced compaction: cap
@@ -417,48 +589,413 @@ func (a *Agent) capToolResultsForTurn() bool {
 }
 
 // runForcedSummarization runs stage 2 of the forced compaction: the forced
-// summarization (keep=0, minMiddleTokens bypassed) with the strict-shrink
-// requirement and the post-success bookkeeping (republish with fresh
-// counts, pin remap, clear turn usage, reset save tracking) — the same
-// bookkeeping the auto-compaction path applies. It fires h.OnCompacting
+// summarization (keep=0, minMiddleTokens bypassed). A result that did not
+// change the history is aborted. A shorter count, or a summary that
+// replaced one message, is published with the post-success bookkeeping
+// (fresh counts, pin remap, clear turn usage, reset save tracking) — the
+// same bookkeeping the auto-compaction path applies. It fires h.OnCompacting
 // before the summarization call so the UI can show compaction progress.
-// It returns true when the history was strictly shrunk and republished.
-func (a *Agent) runForcedSummarization(ctx context.Context, h *llm.StreamHandlers) bool {
+// singleSummary skips the deep-dive layout, so the current request is
+// summarized in this pass. Callers pass false. When that layout keeps the
+// request verbatim and the rebuilt view is still over the window, one
+// more pass summarizes the request and fires OnCompacting again, unless
+// another message's condensation would fit. A failure of that pass is
+// recorded like this path's own failures, including the single-summary
+// guard the next refusal reads. It returns true when the history changed
+// and was republished.
+func (a *Agent) runForcedSummarization(ctx context.Context, h *llm.StreamHandlers, singleSummary bool) bool {
+	// A tool round does not reach compactToFit when smart compact is off,
+	// so this is the first summarizer. Publishing here can drop the view
+	// under the window while it stays over the hard limit, and the next
+	// emergency last keep would summarize the request. Condense instead.
+	if a.leaveForCondensation() {
+		return false
+	}
 	if h != nil && h.OnCompacting != nil {
 		h.OnCompacting()
 	}
-	var pinned map[int]struct{}
-	if a.PinManager != nil {
-		pinned = a.PinManager.PinnedSet()
+	before := len(a.Messages)
+	beforeBlob := summaryBlob(a.Messages)
+	shrunk, err := a.compactNoTail(ctx, contextmgr.CompactOptions{Forced: true, SingleSummary: singleSummary})
+	if err != nil {
+		if ctx.Err() != nil {
+			return false
+		}
+		// A deep-dive refusal means both regions came back no smaller.
+		// The request may still be verbatim. Default mode records the
+		// refusal, as it did before deep dive: a backoff and the
+		// emergency guard. A later turn does not repeat it.
+		if singleSummary || !a.Context.DeepDive() || !errors.Is(err, contextmgr.ErrSummaryNotSmaller) {
+			a.noteCompactFailure(err)
+			a.noteProgressFailure(&a.compactionGuards.emergency)
+			if singleSummary {
+				a.noteSingleSummaryFailure()
+			}
+			return false
+		}
+	}
+	if !shrunk && !singleSummary {
+		if err := a.summarizeKeptRequest(ctx, h); err != nil {
+			if ctx.Err() != nil {
+				return false
+			}
+			log.Printf("forced compaction: single-summary fallback failed: %v", err)
+			a.noteCompactFailure(err)
+			a.noteProgressFailure(&a.compactionGuards.emergency)
+			return false
+		}
+		if len(a.Messages) != before || summaryBlob(a.Messages) != beforeBlob {
+			return true
+		}
+		// The same pass reaches last resort and can condense the other
+		// message. That is not a failed compaction. When condensation
+		// is already guarded, or the estimate is under the window, or
+		// this is default mode, fall through and arm the guard.
+		if a.leaveForCondensation() {
+			return false
+		}
+	}
+	if !shrunk {
+		// The history did not change. Publishing it would drop the
+		// provider's token count and the next attempt would repeat it.
+		log.Printf("forced compaction aborted: no shrink (%d -> %d messages)", before, len(a.Messages))
+		a.noteProgressFailure(&a.compactionGuards.emergency)
+		if singleSummary {
+			a.noteSingleSummaryFailure()
+		}
+		return false
+	}
+	if !singleSummary {
+		if err := a.summarizeKeptRequest(ctx, h); err != nil {
+			if ctx.Err() != nil {
+				return shrunk
+			}
+			log.Printf("forced compaction: single-summary fallback failed: %v", err)
+			a.noteCompactFailure(err)
+			a.noteProgressFailure(&a.compactionGuards.emergency)
+		}
+	}
+	return true
+}
+
+// summarizeKeptRequest is the pre-flight fit fallback. When a later
+// request is still verbatim and the rebuilt view is still over the
+// window, one single-summary pass summarizes that request with the rest.
+// The request may be verbatim because the layout kept it, or because the
+// regions around it were empty. A history whose only request is the head
+// is already the single summary and is left alone. It fires
+// h.OnCompacting again, because this pass is a second summarizer call. A
+// summarizer failure is returned for the caller to record.
+func (a *Agent) summarizeKeptRequest(ctx context.Context, h *llm.StreamHandlers) error {
+	// The same decision as the emergency tier and overflow. A message
+	// whose condensation would fit is not summarized away, unless that
+	// condensation is already guarded.
+	if !a.summarizeRequestAllowed() {
+		return nil
+	}
+	return a.summarizeKeptRequestNow(ctx, h)
+}
+
+// keptRequestStillOver reports whether a later request is still verbatim
+// and the rebuilt view is still over the window. The request may be
+// verbatim because the layout kept it, or because the regions around it
+// were empty. A history whose only request is the head is already the
+// single summary.
+func (a *Agent) keptRequestStillOver() bool {
+	if a.Context == nil || !a.Context.DeepDive() {
+		return false
+	}
+	limit := a.Context.ContextLimit()
+	if limit <= 0 || a.outgoingViewEstimate(a.rebuildView()) < limit {
+		return false
+	}
+	return layoutKeptRequest(a.Messages) || requestAfterHead(a.Messages)
+}
+
+// summarizeKeptRequestNow summarizes the verbatim request. It does not
+// ask whether a tail message would condense: the caller has already
+// decided that condensation will not fit.
+func (a *Agent) summarizeKeptRequestNow(ctx context.Context, h *llm.StreamHandlers) error {
+	if h != nil && h.OnCompacting != nil {
+		h.OnCompacting()
+	}
+	changed, err := a.compactSingleSummary(ctx, true)
+	if ctx.Err() == nil && (err != nil || !changed) {
+		// The same summary is not tried again at this message count.
+		// Repeating it doubles the backoff and cannot succeed when the
+		// summary was not smaller or changed nothing. A new message
+		// re-arms it. The emergency guard is not this signal: that
+		// guard is also set when condensation should still run.
+		a.noteSingleSummaryFailure()
+	}
+	return err
+}
+
+// singleSummaryFailed reports whether the single summary already failed
+// at this message count.
+func (a *Agent) singleSummaryFailed() bool {
+	if a == nil {
+		return false
 	}
 	a.statsMu.RLock()
-	counts := append([]int(nil), a.tokenCounts...)
+	defer a.statsMu.RUnlock()
+	return a.compactionGuards.singleSummary > 0 && a.compactionGuards.singleSummary >= len(a.Messages)
+}
+
+// condensableChoice is the message last resort replaces. Deep dive prefers
+// a message other than the latest request when that replacement fits, so
+// the request can stay verbatim. Context mode off keeps the rule from
+// before this feature: the largest condensable message, and only when its
+// own replacement fits. A smaller message is not a fallback in that mode.
+func (a *Agent) condensableChoice(total int, msgs []llm.Message, counts []int, limit int) (int, bool) {
+	if a.Context != nil && a.Context.DeepDive() {
+		return condensableIndex(a, total, msgs, counts, limit)
+	}
+	idx, c := largestCondensableMessage(msgs, counts)
+	if idx < 0 || total-c+condensedReplacementTokens(a, msgs[idx]) >= limit {
+		return -1, false
+	}
+	return idx, true
+}
+
+// condensableTailFits reports whether last resort would condense a message
+// other than the latest request, and that condensation would bring the
+// view under the window. The latest request is left to the single summary.
+func condensableTailFits(a *Agent, limit int) bool {
+	total := a.outgoingViewEstimate(a.rebuildView())
+	msgs, counts := a.messageCounts()
+	idx, ok := condensableIndex(a, total, msgs, counts, limit)
+	return ok && idx != latestRequestIndex(msgs)
+}
+
+// condensedReplacementTokens is the size last resort will publish for msg.
+// A message the summarizer can accept uses the allowance. A message over
+// that budget uses the truncation CondenseMessage publishes.
+func condensedReplacementTokens(a *Agent, msg llm.Message) int {
+	if a.Context != nil {
+		if tokens, truncated := a.Context.CondensedReplacementTokens(msg); truncated {
+			return tokens
+		}
+	}
+	return lastResortCondenseAllowance
+}
+
+// condensableIndex is the message deep dive's last resort condenses. A
+// message other than the latest request is preferred when replacing it with what
+// condensation publishes brings the view under the window. Several such
+// messages take the one that leaves the smallest view. A pin is skipped
+// there. When none of those fits, the largest unprotected message is
+// used if its own replacement fits, which is how a request that is the
+// whole window is still condensed. When nothing outside the pin fits,
+// the largest message inside the pin is used on the same terms.
+// Compaction still keeps the pin. ok is false when no replacement fits.
+func condensableIndex(a *Agent, total int, msgs []llm.Message, counts []int, limit int) (idx int, ok bool) {
+	if len(counts) < len(msgs) {
+		return -1, false
+	}
+	lastReq := latestRequestIndex(msgs)
+	var pins map[int]struct{}
+	if a != nil && a.PinManager != nil {
+		pins = a.PinManager.PinnedSet()
+	}
+	best, bestLeft := -1, 0
+	for i, m := range msgs {
+		if i == lastReq || !condensableMessage(m) || protectedByPin(msgs, i, pins) {
+			continue
+		}
+		left := total - counts[i] + condensedReplacementTokens(a, m)
+		if left >= limit {
+			continue
+		}
+		if best < 0 || left < bestLeft {
+			best, bestLeft = i, left
+		}
+	}
+	if best >= 0 {
+		return best, true
+	}
+	// No other message fits. The largest unprotected message, which may
+	// be the request, is condensed when its own replacement fits. A pin
+	// is still skipped: compaction kept that stretch, and an unpinned
+	// message was the first choice.
+	if idx, ok := largestFittingCondensable(a, total, msgs, counts, limit, pins, true); ok {
+		return idx, true
+	}
+	// Nothing outside the pin brings the view under the window. The pin
+	// is what no longer fits. Last resort condenses the largest message
+	// in that stretch. Compaction still keeps the pin.
+	return largestFittingCondensable(a, total, msgs, counts, limit, nil, false)
+}
+
+// largestFittingCondensable is the largest condensable message whose
+// published replacement brings the view under the window. A larger
+// message that would stay over the window does not hide a smaller one
+// that fits. honorPins skips a message the pin covers. ok is false
+// when none fits.
+func largestFittingCondensable(a *Agent, total int, msgs []llm.Message, counts []int, limit int, pins map[int]struct{}, honorPins bool) (int, bool) {
+	best, bestTok := -1, 0
+	for i, m := range msgs {
+		if !condensableMessage(m) {
+			continue
+		}
+		if honorPins && protectedByPin(msgs, i, pins) {
+			continue
+		}
+		if total-counts[i]+condensedReplacementTokens(a, m) >= limit {
+			continue
+		}
+		if counts[i] > bestTok {
+			best, bestTok = i, counts[i]
+		}
+	}
+	if best < 0 {
+		return -1, false
+	}
+	return best, true
+}
+
+// protectedByPin reports whether a pin keeps idx verbatim through
+// compaction. Compaction preserves the pinned message and everything
+// after it, except a pin on the head, which compaction ignores. Last
+// resort skips that stretch until nothing outside it fits.
+func protectedByPin(msgs []llm.Message, idx int, pins map[int]struct{}) bool {
+	if len(pins) == 0 || idx < 0 || idx >= len(msgs) {
+		return false
+	}
+	head := -1
+	for i, m := range msgs {
+		if contextmgr.IsRequest(m) {
+			head = i
+			break
+		}
+	}
+	for p := range pins {
+		if p <= head || p >= len(msgs) {
+			continue
+		}
+		if p <= idx {
+			return true
+		}
+	}
+	return false
+}
+
+// latestRequestIndex is the index of the latest user request, or -1.
+// The walk lives in contextmgr so the agent and the compactor share it.
+func latestRequestIndex(msgs []llm.Message) int {
+	return contextmgr.LatestRequestIndex(msgs)
+}
+
+// condensableMessage reports whether last resort may replace msg. Assistant
+// messages are never candidates. A user message with images is not either:
+// the summarizer is text-only.
+func condensableMessage(m llm.Message) bool {
+	switch m.Role {
+	case "user":
+		return !m.HasImages() && m.Content != "" &&
+			!contextmgr.IsCompactionSummary(m.Content) && !contextmgr.IsCondensedMessage(m.Content)
+	case "tool":
+		return m.Content != "" && !contextmgr.IsCondensedMessage(m.Content)
+	default:
+		return false
+	}
+}
+
+// requestAfterHead reports whether a user request sits after the first one.
+// The first request is the head. A later one is what the deep-dive layout
+// keeps, and the last keep summarizes it when the regions around it wrote
+// nothing.
+func requestAfterHead(msgs []llm.Message) bool {
+	first := -1
+	for i, m := range msgs {
+		if !contextmgr.IsRequest(m) {
+			continue
+		}
+		if first < 0 {
+			first = i
+			continue
+		}
+		return i > first
+	}
+	return false
+}
+
+// layoutKeptRequest reports whether a deep-dive compaction kept the latest
+// request verbatim. That result has a progress summary after the request
+// or, when the progress region was empty, one session summary between the
+// head and the request. A tail may follow the request.
+func layoutKeptRequest(msgs []llm.Message) bool {
+	first, last := -1, -1
+	for i, m := range msgs {
+		if contextmgr.IsRequest(m) {
+			if first < 0 {
+				first = i
+			}
+			last = i
+		}
+	}
+	if last < 0 {
+		return false
+	}
+	for _, m := range msgs[last+1:] {
+		if strings.HasPrefix(m.Content, contextmgr.ProgressSummaryPrefix) {
+			return true
+		}
+	}
+	if last == first {
+		return false
+	}
+	between := msgs[first+1 : last]
+	return len(between) == 1 && strings.HasPrefix(between[0].Content, contextmgr.SummaryPrefix)
+}
+
+// compactNoTail runs one compaction with no preserved tail. The caller sets
+// Forced and SingleSummary; the pins, counts, view prefix and
+// tools come from the live session, so every no-tail caller compacts the
+// same way. It publishes the result and reports true when the history
+// changed: a shorter count, or a summary that replaced one message. An
+// unchanged summary text is left unpublished. A summarizer failure is
+// returned for the caller to record.
+func (a *Agent) compactNoTail(ctx context.Context, opts contextmgr.CompactOptions) (bool, error) {
+	if a.PinManager != nil {
+		opts.Pinned = a.PinManager.PinnedSet()
+	}
+	a.statsMu.RLock()
+	opts.Counts = append([]int(nil), a.tokenCounts...)
 	a.statsMu.RUnlock()
-	compacted, newPins, err := a.Context.Compact(ctx, a.Messages, contextmgr.CompactOptions{
-		ViewPrefix:   a.systemPromptPrefix(),
-		Counts:       counts,
-		Pinned:       pinned,
-		Keep:         contextmgr.NoTailKeep,
-		Forced:       true,
-		Tools:        a.llmTools(),
-		AllowedTools: a.AllowedToolNames(),
-	})
+	opts.ViewPrefix = a.systemPromptPrefix()
+	opts.Keep = contextmgr.NoTailKeep
+	opts.Tools = a.llmTools()
+	opts.AllowedTools = a.AllowedToolNames()
+	compacted, newPins, err := a.Context.Compact(ctx, a.Messages, opts)
 	if err != nil {
-		a.noteCompactFailure(err)
-		a.noteProgressFailure(&a.compactionGuards.emergency)
-		return false
+		return false, err
 	}
-	if len(compacted) >= len(a.Messages) {
-		// Strict-shrink requirement: abort a compaction that removed
-		// no message — it saves nothing and would not converge.
-		log.Printf("forced compaction aborted: no shrink (%d -> %d messages)", len(a.Messages), len(compacted))
-		a.noteProgressFailure(&a.compactionGuards.emergency)
-		return false
+	// A one-message region becomes one shorter summary: the count stays
+	// the same and the summary text changes. That result is published.
+	// An unchanged summary text saved nothing.
+	if len(compacted) == len(a.Messages) && summaryBlob(compacted) == summaryBlob(a.Messages) {
+		return false, nil
 	}
-	// Publish the compacted history with the post-compaction bookkeeping
-	// shared with the auto-compaction path (compactToFit).
 	a.publishCompaction(compacted, newPins)
-	return true
+	return true, nil
+}
+
+// compactSingleSummary is deep dive's fit fallback: one compaction with the
+// single-summary layout and no tail, which summarizes the current request
+// with the rest. Pre-flight uses it when the layout around the request left
+// the view over the window. The emergency tier uses it when that layout left
+// the history at or above the hard limit. Overflow recovery runs the
+// layout first. This pass runs only when that result is still over the
+// window.
+// forced selects the forced compaction; otherwise it runs as the emergency
+// tier. It publishes the result and reports true when the history changed.
+// A summarizer failure is returned for the caller to record.
+func (a *Agent) compactSingleSummary(ctx context.Context, forced bool) (bool, error) {
+	return a.compactNoTail(ctx, contextmgr.CompactOptions{
+		Forced:        forced,
+		SingleSummary: true,
+	})
 }
 
 // publishCompaction publishes a compacted history with the post-compaction
@@ -479,13 +1016,14 @@ func (a *Agent) publishCompaction(compacted []llm.Message, newPins map[int]struc
 	return counts
 }
 
-// lastResortCondenseAllowance is the token ceiling assumed for the framed
-// condensed message when the pre-check decides whether a condensation is
-// worth attempting: a summary of one message is small, and the framed
+// lastResortCondenseAllowance is the token ceiling assumed for a model
+// summary of one message that fits the summary input budget. The framed
 // marker adds a fixed prefix. The ceiling is deliberately conservative —
-// after the summary comes back, the ACTUAL framed size is re-measured
+// after the summary comes back, the actual framed size is re-measured
 // before the replacement is published, so an over-long summary is refused
-// instead of shipped.
+// instead of shipped. A message over that budget is not planned with this
+// ceiling: condensation publishes a truncation, and the fit check uses
+// that size.
 const lastResortCondenseAllowance = 2000
 
 // lastResortCondense is Phase 0e — the last-resort condensation for a
@@ -496,68 +1034,238 @@ const lastResortCondenseAllowance = 2000
 // session where the message is the head): firstUserIndex preserves it
 // verbatim, there is no middle to summarize, every request is refused.
 //
-// It finds the single largest condensable message (a text-only user
-// message or tool result — not a compaction summary, not already
-// condensed) and checks that replacing it with a small framed summary
-// would bring the request under the window (the message plus the
+// It finds a condensable message (a text-only user message or tool
+// result — not a compaction summary, not already condensed) whose
+// published replacement brings the view under the window. Deep dive
+// prefers a message other than the latest request. Context mode off
+// uses the largest message, as before. It then checks that
+// replacement against the window (the message plus the
 // irreducible floor — head, minimal tail, wire overhead — fits). When it
 // would, it condenses that message in place via the summarizer, archives
 // the original to the session's archive sidecar (Phase 5), and announces
 // the condensation in-band (h.OnCondensed).
 //
-// Returns (true, nil) when a message was condensed in place and
-// republished (the caller must rebuild the view). Returns (false, nil)
-// when the path does not apply: the request is under the window
-// (defensive), no single message is the cause (the floor itself is over —
-// the provider refusal stays the diagnostic), the condensation failed or
-// produced no shrink, or a failed attempt at this message count is still
-// guarded. Returns (false, err) in error mode (compact_last_resort=error):
-// err is the actionable diagnostic and the history is left untouched.
-func (a *Agent) lastResortCondense(ctx context.Context, h *llm.StreamHandlers, view []llm.Message) (bool, error) {
+// condensePublished means the replacement was published and the caller
+// rebuilds the view. condenseNothingFits and condenseGuarded allow the
+// caller to summarize the request. condenseAttemptMissed does not: the
+// planned replacement still fits, and a later summary can be smaller.
+// Error mode returns an error and leaves the history untouched. A cancel
+// returns ctx.Err() and does not set a guard.
+type condenseOutcome int
+
+const (
+	condenseSkipped condenseOutcome = iota
+	condensePublished
+	condenseNothingFits
+	condenseAttemptMissed
+	condenseGuarded
+)
+
+func (a *Agent) lastResortCondense(ctx context.Context, h *llm.StreamHandlers, view []llm.Message) (condenseOutcome, error) {
 	if a.Context == nil {
-		return false, nil
+		return condenseSkipped, nil
 	}
 	limit := a.Context.ContextLimit()
 	if limit <= 0 {
-		return false, nil
+		return condenseSkipped, nil
 	}
 	total := a.outgoingViewEstimate(view)
 	if total < limit {
-		return false, nil // defensive: strictly last-resort
+		return condenseSkipped, nil // defensive: strictly last-resort
 	}
 	msgs, counts := a.messageCounts()
-	idx, c := largestCondensableMessage(msgs, counts)
-	if idx < 0 {
-		return false, nil
+	idx, ok := a.condensableChoice(total, msgs, counts, limit)
+	if !ok {
+		return condenseNothingFits, nil
 	}
-	// Fit check: replacing the message with a small framed summary must
-	// bring the request under the window.
-	if total-c+lastResortCondenseAllowance >= limit {
-		return false, nil // the floor itself is over: not a single-message case
-	}
+	c := counts[idx]
 	if a.Context.CompactLastResort() != "condense" {
 		// Error mode: the actionable diagnostic replaces the raw provider
 		// refusal. No attempt is made, so no guard is needed.
-		return false, fmt.Errorf("message is ~%d tokens vs a %d-token window; shorten it or start a fresh session (/new)", c, limit)
+		return condenseNothingFits, fmt.Errorf("message is ~%d tokens vs a %d-token window; shorten it or start a fresh session (/new)", c, limit)
 	}
-	// Progress guard: a failed condensation at this message count is not
-	// retried until the conversation grows past that count (a retry would
-	// hit the same failure).
-	a.statsMu.RLock()
-	guarded := a.compactionGuards.lastResort >= len(a.Messages)
-	a.statsMu.RUnlock()
-	if guarded {
-		return false, nil
+	if a.lastResortGuarded() {
+		return condenseGuarded, nil
 	}
+	return a.condenseChosen(ctx, h, msgs, idx, c, total, limit, true)
+}
 
+// condensePreservedTail condenses the largest message a forced compaction
+// would leave verbatim, when the provider has refused and the local
+// estimate is still under the window. That message is the head, the
+// trailing tool group, or the pinned stretch. The head is chosen when
+// it is larger than the tail, because a single summary does not replace
+// it. A tail message is chosen when it is larger than the middle, so
+// a larger request is still summarized and a short or equal tool is
+// left. A same-size message does not spend the retry: the summary of
+// the middle is what shrinks the history. A cancel is returned.
+// Nothing is published when no such message exists.
+func (a *Agent) condensePreservedTail(ctx context.Context, h *llm.StreamHandlers) (condenseOutcome, error) {
+	if a.Context == nil || a.Context.CompactLastResort() != "condense" {
+		return condenseSkipped, nil
+	}
+	var pins map[int]struct{}
+	if a.PinManager != nil {
+		pins = a.PinManager.PinnedSet()
+	}
+	msgs, counts := a.messageCounts()
+	head, tail, ok := contextmgr.ForcedPreserveStart(msgs, pins, a.Context.DeepDive())
+	if !ok || head < 0 || head >= len(msgs) || head >= len(counts) {
+		return condenseSkipped, nil
+	}
+	// An empty tail means compaction would summarize everything after
+	// the head. The head can still be the message the provider refused.
+	if tail < head+1 {
+		tail = head + 1
+	}
+	if tail > len(msgs) {
+		tail = len(msgs)
+	}
+	middle := middleTokenSum(counts, head, tail)
+	best, bestTok := -1, 0
+	for i := tail; i < len(msgs) && i < len(counts); i++ {
+		if !condensableMessage(msgs[i]) {
+			continue
+		}
+		if counts[i] > bestTok {
+			best, bestTok = i, counts[i]
+		}
+	}
+	// The head is not in the tail and a single summary does not replace
+	// it. When it is the largest message, condensing a smaller tool or
+	// summarizing the middle would spend the only retry and send the
+	// head again.
+	headTok := 0
+	if head >= 0 && head < len(counts) && condensableMessage(msgs[head]) {
+		headTok = counts[head]
+	}
+	limit := a.Context.ContextLimit()
+	total := a.outgoingViewEstimate(a.rebuildView())
+	// Choose the preserved message before the guard. When none is larger
+	// than the middle, the middle is the bulk and can still be summarized.
+	// A guard or a summarizer error then applies only to that message.
+	idx, tok := -1, 0
+	if headTok > bestTok && headTok > middle {
+		idx, tok = head, headTok
+	} else if best >= 0 && bestTok > middle {
+		idx, tok = best, bestTok
+	}
+	if idx < 0 {
+		return condenseSkipped, nil
+	}
+	if a.lastResortGuarded() {
+		return condenseGuarded, nil
+	}
+	return a.condenseChosen(ctx, h, msgs, idx, tok, total, limit, true)
+}
+
+// preservedLargerThanMiddle is the token count of the largest message a
+// forced compaction leaves verbatim, when that message is larger than
+// the middle the summary replaces. Zero means there is no such message.
+// Measured before the summary, so a shorter replacement cannot make a
+// small tool look like the bulk.
+func (a *Agent) preservedLargerThanMiddle() int {
+	if a == nil || a.Context == nil || a.Context.CompactLastResort() != "condense" {
+		return 0
+	}
+	var pins map[int]struct{}
+	if a.PinManager != nil {
+		pins = a.PinManager.PinnedSet()
+	}
+	msgs, counts := a.messageCounts()
+	head, tail, ok := contextmgr.ForcedPreserveStart(msgs, pins, a.Context.DeepDive())
+	if !ok || tail >= len(msgs) {
+		return 0
+	}
+	middle := middleTokenSum(counts, head, tail)
+	best := 0
+	for i := tail; i < len(msgs) && i < len(counts); i++ {
+		if !condensableMessage(msgs[i]) {
+			continue
+		}
+		if counts[i] > best {
+			best = counts[i]
+		}
+	}
+	if best <= middle {
+		return 0
+	}
+	return best
+}
+
+// middleTokenSum is the token count of the region a forced summary
+// replaces, messages[head+1:tail]. The preserved message is larger only
+// when it beats that whole region, not the largest message inside it.
+func middleTokenSum(counts []int, head, tail int) int {
+	sum := 0
+	for i := head + 1; i < tail && i < len(counts); i++ {
+		if counts[i] > 0 {
+			sum += counts[i]
+		}
+	}
+	return sum
+}
+
+// condenseLargerPreserved condenses the preserved message measured by
+// preservedLargerThanMiddle. The summary may already have dropped the
+// estimate under the window. The message is found again, because a
+// summary that drops the count moves the tail. A smaller preserved
+// message is left alone.
+func (a *Agent) condenseLargerPreserved(ctx context.Context, h *llm.StreamHandlers, largerThan int) (condenseOutcome, error) {
+	if largerThan <= 0 || a.Context == nil || a.Context.CompactLastResort() != "condense" || a.lastResortGuarded() {
+		return condenseSkipped, nil
+	}
+	var pins map[int]struct{}
+	if a.PinManager != nil {
+		pins = a.PinManager.PinnedSet()
+	}
+	msgs, counts := a.messageCounts()
+	_, tail, ok := contextmgr.ForcedPreserveStart(msgs, pins, a.Context.DeepDive())
+	if !ok || tail >= len(msgs) {
+		return condenseSkipped, nil
+	}
+	best, bestTok := -1, 0
+	for i := tail; i < len(msgs) && i < len(counts); i++ {
+		if !condensableMessage(msgs[i]) {
+			continue
+		}
+		if counts[i] > bestTok {
+			best, bestTok = i, counts[i]
+		}
+	}
+	if best < 0 || bestTok < largerThan {
+		return condenseSkipped, nil
+	}
+	limit := a.Context.ContextLimit()
+	total := a.outgoingViewEstimate(a.rebuildView())
+	// The view already fits. A summarizer error here must not arm the
+	// last-resort guard: the provider has not refused this view, and the
+	// overflow path is what retries the condensation.
+	return a.condenseChosen(ctx, h, msgs, best, bestTok, total, limit, false)
+}
+
+// condenseChosen publishes a condensation of msgs[idx]. total and limit
+// are the view estimate and the window. A summary that is not smaller, or
+// that would leave the view over the window, is not published and is not
+// recorded as a failure. recordGuard arms the last-resort guard on a
+// summarizer error. The overflow attempt does. A condensation after a
+// summary that already fits does not: the view has not been refused, and
+// arming the guard would stop the overflow path from condensing that
+// message. A cancel is returned.
+func (a *Agent) condenseChosen(ctx context.Context, h *llm.StreamHandlers, msgs []llm.Message, idx, c, total, limit int, recordGuard bool) (condenseOutcome, error) {
 	if h != nil && h.OnCompacting != nil {
 		h.OnCompacting()
 	}
 	summary, err := a.Context.CondenseMessage(ctx, msgs[idx])
 	if err != nil {
+		if ctx.Err() != nil {
+			return condenseSkipped, ctx.Err()
+		}
 		log.Printf("last-resort condensation failed: %v", err)
-		a.noteProgressFailure(&a.compactionGuards.lastResort)
-		return false, nil
+		if recordGuard {
+			a.noteProgressFailure(&a.compactionGuards.lastResort)
+		}
+		return condenseGuarded, nil
 	}
 	framed := llm.Message{
 		Role:       msgs[idx].Role,
@@ -570,14 +1278,15 @@ func (a *Agent) lastResortCondense(ctx context.Context, h *llm.StreamHandlers, v
 		// Leave the history untouched (and do not record a failure — a
 		// later attempt may produce a smaller summary).
 		log.Printf("last-resort condensation aborted: framed summary %d tokens not smaller than the message %d", framedTok, c)
-		return false, nil
+		return condenseAttemptMissed, nil
 	}
 	if total-c+framedTok >= limit {
 		// The actual framed summary is bigger than the allowance the
-		// pre-check assumed: condensing would not fit the request. Leave
-		// the history untouched.
+		// pre-check assumed. Leave the message alone so a later summary
+		// can be smaller. The caller must not summarize the request:
+		// the planned replacement still fits.
 		log.Printf("last-resort condensation aborted: request would still be over the window (%d - %d + %d >= %d)", total, c, framedTok, limit)
-		return false, nil
+		return condenseAttemptMissed, nil
 	}
 	// Archive the original (Phase 5 sidecar), condense in place, publish.
 	archived := a.archiveShadowedMessage(idx, msgs[idx], c)
@@ -588,7 +1297,7 @@ func (a *Agent) lastResortCondense(ctx context.Context, h *llm.StreamHandlers, v
 	// in-place content change is invisible to the incremental delta path.
 	a.resetSaveTracking()
 	a.FlushSession()
-	a.noteProgressSuccess(&a.compactionGuards.lastResort)
+	a.noteCondensationPublished()
 	if h != nil && h.OnCondensed != nil {
 		suffix := " The original was archived."
 		if !archived {
@@ -596,7 +1305,7 @@ func (a *Agent) lastResortCondense(ctx context.Context, h *llm.StreamHandlers, v
 		}
 		h.OnCondensed(fmt.Sprintf("A message was ~%d tokens vs a %d-token context window; it was condensed to continue.%s", c, limit, suffix))
 	}
-	return true, nil
+	return condensePublished, nil
 }
 
 // messageCounts returns the live messages and their per-message token
@@ -623,17 +1332,7 @@ func (a *Agent) messageCounts() ([]llm.Message, []int) {
 func largestCondensableMessage(msgs []llm.Message, counts []int) (int, int) {
 	best, bestTok := -1, 0
 	for i, m := range msgs {
-		switch m.Role {
-		case "user":
-			if m.HasImages() || m.Content == "" ||
-				contextmgr.IsCompactionSummary(m.Content) || contextmgr.IsCondensedMessage(m.Content) {
-				continue
-			}
-		case "tool":
-			if m.Content == "" || contextmgr.IsCondensedMessage(m.Content) {
-				continue
-			}
-		default:
+		if !condensableMessage(m) {
 			continue
 		}
 		if counts[i] > bestTok {
@@ -665,25 +1364,33 @@ func (a *Agent) condenseMessageAt(idx int, framed llm.Message) {
 // the provider's real tokenizer), so a request that looked like it would
 // fit can still be refused by the provider. Instead of aborting the turn,
 // it recovers in-loop: run the forced compaction (two-stage cap-first,
-// keep=0, minMiddleTokens bypassed, strict-shrink) and let the caller
-// retry the round once — the next runTurn rebuilds the view from the
-// shrunken history.
+// keep=0, minMiddleTokens bypassed) and let the caller retry the round
+// once — the next runTurn rebuilds the view from the changed history. An
+// unchanged history is not retried.
 //
-// Returns (true, nil) when the history was shrunk and republished and the
-// caller should continue the loop. Returns (false, nil) when the error is
-// NOT a context-window refusal or no context manager is configured: the
-// caller returns the original error untouched. Returns (false, ctx.Err())
-// when the context was cancelled: the user cancelled, and the loop reports
-// the cancellation (as the toolRoundCancelled path does) rather than the
-// refusal that happened to arrive with it. Returns (false, terminal) when
-// recovery is exhausted — a second refusal in the same turn, or a
-// failed/aborted forced compaction: terminal is an actionable error that
-// wraps (never masks) the original refusal.
+// Returns (true, nil) when the result measures under the window and the
+// caller should continue the loop. A shrink that is still over does not
+// spend the retry: last resort runs on that history, and the retry is
+// spent only when the published result is under the window. Last resort
+// also runs when the forced compaction changed nothing. When the estimate
+// is still under the window, a tool result or pin that compaction would
+// leave verbatim is condensed first when it is larger than the middle,
+// in deep dive and in the usual mode, and the retry is that condensation.
+// Returns (false, nil) when the
+// error is NOT a context-window refusal or no context manager is
+// configured: the caller returns the original error untouched. Returns
+// (false, ctx.Err()) when the context was cancelled: the user cancelled,
+// and the loop reports the cancellation (as the toolRoundCancelled path
+// does) rather than the refusal that happened to arrive with it. Returns
+// (false, terminal) when recovery is exhausted — a second refusal in the
+// same turn, or a failed or still-over compaction that condensation did
+// not bring under the window: terminal is an actionable error that wraps
+// (never masks) the original refusal.
 //
 // Guards against infinite loops: the per-turn counter (overflowRetries,
 // reset at Run start) allows at most one recovery per turn, and the
-// strict-shrink requirement in runForcedSummarization makes a non-shrinking
-// compaction a terminal failure instead of a retry.
+// unchanged-history abort in runForcedSummarization makes a compaction
+// that did not change the history a terminal failure instead of a retry.
 func (a *Agent) handleOverflowError(ctx context.Context, h *llm.StreamHandlers, err error) (retry bool, terminal error) {
 	if !llm.IsContextWindowError(err) {
 		// Strict classifier: non-overflow errors take the untouched
@@ -708,30 +1415,137 @@ func (a *Agent) handleOverflowError(ctx context.Context, h *llm.StreamHandlers, 
 	}
 	// Stage 1: cap oversized tool results — a model-free win. The estimate
 	// is wrong here (that is why the provider refused), so capping alone
-	// is never trusted to have fixed the request; stage 2 always runs.
+	// is never trusted to have fixed the request. Stage 2 runs unless
+	// deep dive is about to condense a different message: summarizing
+	// first would delete it.
 	a.capToolResultsForCompact()
 	// Stage 2: forced summarization (keep=0, minMiddleTokens bypassed,
-	// strict-shrink, post-success bookkeeping identical to the pre-flight
-	// path).
-	if a.runForcedSummarization(ctx, h) {
-		a.overflowRetries.Add(1)
-		return true, nil
+	// unchanged history aborted, post-success bookkeeping identical to
+	// the pre-flight path).
+	// In deep dive the request is summarized in this pass when no other
+	// message's condensation would fit. The provider already refused.
+	// When a condensation would fit, or the last one came back too big,
+	// summarizing the request would undo that decision. The usual case
+	// is a local estimate still under the window. A message that
+	// compaction would leave verbatim, the trailing tool group or a pin,
+	// is condensed first when it is larger than the middle, in deep dive
+	// and in the usual mode. The retry is that condensation. A
+	// condensation that comes back no smaller does not summarize the
+	// smaller middle and does not spend the retry: the large message
+	// would be sent again, and the next refusal would end the turn.
+	// The miss is not recorded, so a later summary can be smaller.
+	// The request is summarized only when the layout leaves the view
+	// at or over the window. A fitting layout keeps it.
+	var compacted bool
+	if est, limit := a.outgoingViewEstimate(a.rebuildView()), a.Context.ContextLimit(); a.Context.CompactLastResort() == "condense" && limit > 0 && est < limit {
+		outcome, condErr := a.condensePreservedTail(ctx, h)
+		if condErr != nil {
+			if ctx.Err() != nil {
+				return false, ctx.Err()
+			}
+		}
+		if outcome == condensePublished && a.outgoingViewEstimate(a.rebuildView()) < limit {
+			a.overflowRetries.Add(1)
+			return true, nil
+		}
+		if outcome == condenseAttemptMissed || outcome == condenseGuarded {
+			// The larger preserved message was not published. A miss
+			// is not recorded, so a later summary can be smaller. A
+			// summarizer error is recorded on the overflow attempt.
+			// Either way the smaller middle is not summarized and the
+			// retry is not spent: that would send the large message
+			// again, and the next refusal would end the turn.
+			return false, a.overflowTerminalError(err)
+		}
 	}
-	// Forced compaction could not shrink the history — the classic case is
-	// a fresh session whose single user message is the head (there is no
-	// middle to summarize). Phase 0e: last-resort condensation of the one
-	// message that cannot fit the window.
-	condensed, condErr := a.lastResortCondense(ctx, h, a.rebuildView())
+	if !a.leaveForCondensation() && !a.singleSummaryFailed() {
+		compacted = a.runForcedSummarization(ctx, h, false)
+	}
+	if ctx.Err() != nil {
+		// Cancelled during the forced pass: do not condense on the
+		// cancelled context, and do not spend the retry.
+		return false, ctx.Err()
+	}
+	if compacted {
+		// The history changed and the estimate is under the window.
+		// Send it again. A shrink that is still over does not spend
+		// the only retry: last resort runs on that history below, and
+		// the retry is spent only when the result measures under.
+		if limit := a.Context.ContextLimit(); limit > 0 && a.outgoingViewEstimate(a.rebuildView()) < limit {
+			a.overflowRetries.Add(1)
+			return true, nil
+		}
+	}
+	view := a.rebuildView()
+	// The forced compaction did not change the history. Last resort
+	// condenses the one message whose published replacement fits. The
+	// retry is spent when that replacement was published and measured
+	// under the window. A condensation that publishes nothing ends the
+	// turn.
+	outcome, condErr := a.lastResortCondense(ctx, h, view)
 	if condErr != nil {
-		// Error mode (compact_last_resort=error): the actionable diagnostic
-		// replaces the raw provider refusal.
+		// Error mode returns the actionable diagnostic. A cancel returns
+		// ctx.Err() and does not spend the retry or arm the guard.
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		a.finishStillOver(condErr)
 		return false, condErr
 	}
-	if condensed {
-		a.overflowRetries.Add(1)
-		return true, nil
+	if outcome == condensePublished {
+		view = a.rebuildView()
+		if a.outgoingViewEstimate(view) < a.Context.ContextLimit() {
+			a.overflowRetries.Add(1)
+			return true, nil
+		}
 	}
+	if outcome == condenseAttemptMissed {
+		changed, layErr := a.layoutAfterMissedCondensation(ctx, h)
+		if layErr != nil {
+			if ctx.Err() != nil {
+				return false, ctx.Err()
+			}
+			return false, a.overflowTerminalError(err)
+		}
+		if changed && a.outgoingViewEstimate(a.rebuildView()) < a.Context.ContextLimit() {
+			a.overflowRetries.Add(1)
+			return true, nil
+		}
+	}
+	a.finishStillOver(fmt.Errorf("still over the context window after overflow recovery"))
 	return false, a.overflowTerminalError(err)
+}
+
+// layoutAfterMissedCondensation runs the deep-dive layout after a
+// condensation summary came back too big to publish. leaveForCondensation
+// is still true, so the ordinary forced pass returns before the layout.
+// This pass keeps the request. It does not repeat at a message count the
+// emergency guard already records: that guard is set when this attempt
+// gives up, and a new message re-arms it. A cancel is returned. A
+// summarizer error is recorded here.
+func (a *Agent) layoutAfterMissedCondensation(ctx context.Context, h *llm.StreamHandlers) (bool, error) {
+	if a == nil || a.Context == nil || !a.Context.DeepDive() {
+		return false, nil
+	}
+	a.statsMu.RLock()
+	tried := a.compactionGuards.emergency >= len(a.Messages)
+	a.statsMu.RUnlock()
+	if tried {
+		return false, nil
+	}
+	if h != nil && h.OnCompacting != nil {
+		h.OnCompacting()
+	}
+	changed, err := a.compactNoTail(ctx, contextmgr.CompactOptions{Forced: true, SingleSummary: false})
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		a.noteCompactFailure(err)
+		a.noteProgressFailure(&a.compactionGuards.emergency)
+		return false, nil
+	}
+	return changed, nil
 }
 
 // overflowTerminalError builds the actionable terminal error for an
@@ -752,19 +1566,45 @@ func (a *Agent) overflowTerminalError(cause error) error {
 	return fmt.Errorf("context window exceeded: the outgoing request is ~%s tokens but the model window is %d; forced compaction (cap oversized tool results, then summarize the old history) was tried without success. Try /compact to shrink the history, or /new to start a fresh session: %w", sizeStr, limit, cause)
 }
 
+// historyChanged reports whether compaction replaced part of before.
+// A one-message summary keeps the count and changes the summary text.
+// An unchanged history has the same count and the same summary text.
+func historyChanged(before, after []llm.Message) bool {
+	return len(before) != len(after) || summaryBlob(before) != summaryBlob(after)
+}
+
 // compactToFit runs one auto-compaction pass and, when the post-compaction
 // request is still over the compaction budget, repeats it with a shrinking
 // preserved tail — keep, keep/2, 1, 0 — up to 3 additional summarization
 // calls per turn (port of the harness compactionRetries loop). Each accepted
-// pass strictly shrinks the conversation (the smaller-summary guard), so
-// the loop always terminates. Extra passes happen only when the first pass
-// failed to reach the budget (rare); when the first pass already fits, the
-// behavior is exactly the single pass.
+// pass is a smaller summary (the smaller-summary guard), so the loop always
+// terminates. An unchanged result is not published, and a smaller keep is
+// tried. Extra passes happen only when the first pass failed to reach the
+// budget (rare); when the first pass already fits, the behavior is exactly
+// the single pass.
 //
-// Giving up — a failed pass, or an exhausted sequence still over budget —
-// records a compact failure so the next turn's attempt is backed off
-// instead of immediately repeating the whole sequence.
+// Giving up on a summarizer error records a compact failure so the next
+// turn's attempt is backed off. An exhausted sequence that is still over
+// budget does the same, except a wait that is already running is left as
+// it is. A wait that has already ended is recorded again with the doubled
+// delay. The emergency guard is set on that give-up when the total is
+// still at or above the hard limit, or the view is over the window.
+// Deep dive also sets it, so a miss of the hard limit is not retried at
+// the same count. In deep dive,
+// a middle under the minimum size, a summary that was not smaller, and a
+// result that wrote nothing are not that failure while a smaller keep
+// remains: the next keep takes in what this one left in the tail. Default
+// mode stops on those errors, as it did before deep dive, so the message
+// just sent is not summarized to get past a short middle. A cancel is not
+// a failure.
 func (a *Agent) compactToFit(ctx context.Context, pinned map[int]struct{}, counts []int, keep int, emergency bool) {
+	// The request a condensation kept is still verbatim and the view is
+	// under the window. Summarizing it is refused, and recording a
+	// failure would block the normal tier. A tool result does not
+	// change this. Over the window the tier still runs.
+	if emergency && a.keptRequestUnderWindow() {
+		return
+	}
 	// Shrinking-tail sequence: the chosen keep first, then keep/2, 1, 0.
 	// Duplicates are dropped so every retry preserves strictly fewer recent
 	// messages (a keep of 1 or 0 already leaves at most one / no retries).
@@ -775,7 +1615,32 @@ func (a *Agent) compactToFit(ctx context.Context, pinned map[int]struct{}, count
 		}
 	}
 	budget := a.Context.CompactBudget()
+	// fits is this tier's goal. The normal tier stops at the budget.
+	// Deep dive's emergency tier stops at the hard limit: the budget
+	// belongs to the normal tier, and a failure recorded here would
+	// arm the backoff and suppress that tier. Context mode off stops
+	// at the budget.
+	fits := func(total int) bool {
+		if budget <= 0 || total < budget {
+			return true
+		}
+		// Deep dive stops at the hard limit. The budget belongs to the
+		// normal tier, and a failure recorded here would arm the backoff.
+		// Context mode off keeps shrinking to the budget.
+		return emergency && a.Context.DeepDive() && total < a.Context.HardLimit()
+	}
 	for i, k := range keeps {
+		// Ask before Compact, on the emergency tier and the normal tier.
+		// A cold token cache makes the emergency tier look idle, and the
+		// normal tier would otherwise publish. Publishing any summary can
+		// drop the view under the window while it stays over the hard
+		// limit, and the last keep would then summarize the request. The
+		// message whose condensation would fit is left for preflight.
+		// The emergency guard stays clear: arming it here would make
+		// preflight skip the layout when that summary comes back too big.
+		if a.leaveForCondensation() {
+			return
+		}
 		// k=0 means "no tail" — map to NoTailKeep so the zero-value
 		// CompactOptions.Keep (use default) is not triggered.
 		keepOpt := k
@@ -790,32 +1655,115 @@ func (a *Agent) compactToFit(ctx context.Context, pinned map[int]struct{}, count
 			Tools:        a.llmTools(),
 			AllowedTools: a.AllowedToolNames(),
 		})
+		plain := false
 		if err != nil {
-			// A failing summarization call must not be retried on every turn.
-			a.noteCompactFailure(err)
-			if emergency {
-				a.noteProgressFailure(&a.compactionGuards.emergency)
+			if ctx.Err() != nil {
+				// Cancelled during this keep. Recording it would back
+				// off the next turn and set the emergency guard.
+				return
 			}
-			return
-		}
-		// Publish with the post-compaction bookkeeping. The fresh
-		// counts are carried into the next pass (a nil cache here
-		// would make the next turn's shouldCompactUsingCounts fall
-		// back to a full EstimateTokens pass; the cache is otherwise
-		// only backfilled by ContextStats/doPersist), and the remapped
-		// pins become the next pass's input.
-		counts = a.publishCompaction(compacted, newPins)
-		pinned = newPins
-		// Re-measure: stop as soon as the post-compaction request fits.
-		total := a.compactionTokenTotal()
-		if budget <= 0 || total < budget {
-			return
+			// In deep dive, a middle under the minimum, or a summary
+			// that was not smaller, is this keep's answer. The next
+			// keep puts more of the history into the middle.
+			// Recording it here would block that keep. Default mode
+			// stops, as it did before deep dive: continuing would
+			// summarize the message just sent. A summarizer failure
+			// still stops the sequence in both modes. On the last
+			// keep, deep dive's not-smaller refusal still reaches
+			// the single summary below. Default mode sets the
+			// emergency guard and returns, as it did before.
+			retryable := a.Context.DeepDive() && (errors.Is(err, contextmgr.ErrNotEnoughHistory) || errors.Is(err, contextmgr.ErrSummaryNotSmaller))
+			if retryable && i < len(keeps)-1 {
+				continue
+			}
+			if !(a.Context.DeepDive() && i == len(keeps)-1 && errors.Is(err, contextmgr.ErrSummaryNotSmaller)) {
+				a.noteCompactFailure(err)
+				if emergency {
+					a.noteProgressFailure(&a.compactionGuards.emergency)
+				}
+				return
+			}
+			plain = true
+		} else if historyChanged(a.Messages, compacted) {
+			// Publish with the post-compaction bookkeeping. The fresh
+			// counts are carried into the next pass (a nil cache here
+			// would make the next turn's shouldCompactUsingCounts fall
+			// back to a full EstimateTokens pass; the cache is otherwise
+			// only backfilled by ContextStats/doPersist), and the remapped
+			// pins become the next pass's input. An unchanged result is
+			// not published: publishing would drop the provider token
+			// count, and the local estimate can then look under the
+			// budget while a smaller keep remains.
+			counts = a.publishCompaction(compacted, newPins)
+			pinned = newPins
+			if fits(a.compactionTokenTotal()) {
+				return
+			}
+		} else if i < len(keeps)-1 {
+			continue
+		} else {
+			plain = true
 		}
 		if i == len(keeps)-1 {
-			// Exhausted the shrinking-tail sequence and the request is
-			// still over budget: give up into the failure backoff so the
-			// next turn does not immediately repeat the whole sequence.
-			a.noteCompactFailure(fmt.Errorf("still over budget after %d compaction passes (%d tokens, budget %d)", i+1, total, budget))
+			// In deep dive the layout around the request can shrink the
+			// history and still leave a request verbatim. The emergency
+			// tier summarizes that request on the last keep, including
+			// when this keep wrote nothing: the smaller keeps are
+			// exhausted. It does not, when the view is over the window
+			// and another message's condensation would fit, including
+			// a message this keep does not summarize. That message is
+			// left for preflight. A request a condensation kept is
+			// summarized once the view is over the window: the
+			// under-window case already returned. A history that is
+			// already the single summary is left to the failure below.
+			if emergency && a.leaveForCondensation() {
+				return
+			}
+			if emergency && a.Context.DeepDive() && !a.singleSummaryFailed() && (layoutKeptRequest(a.Messages) || (plain && requestAfterHead(a.Messages))) {
+				// Under the window, last resort does not run, so the
+				// request is summarized.
+				shrank, err := a.compactSingleSummary(ctx, false)
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					a.noteCompactFailure(err)
+					a.noteProgressFailure(&a.compactionGuards.emergency)
+					a.noteSingleSummaryFailure()
+					return
+				}
+				if shrank {
+					if fits(a.compactionTokenTotal()) {
+						return
+					}
+				}
+			}
+			// Exhausted the shrinking-tail sequence and this tier's goal
+			// is still missed. A wait that is still running is left as
+			// it is: nothing published means the earlier wait was not
+			// cleared, and lengthening it would stack two waits. A
+			// deadline that has already passed is recorded again with
+			// the doubled delay. The emergency guard is set when
+			// this tier's trigger is still true: the total is at or
+			// above the hard limit, or the view is over the window.
+			// Deep dive also sets it, so a miss of the hard limit is
+			// not retried at the same count. The emergency tier
+			// ignores the backoff, so a clear guard would call the
+			// summarizer again on the next turn and double the wait.
+			total := a.compactionTokenTotal()
+			a.statsMu.RLock()
+			backoffActive := !time.Now().After(a.compactBackoffUntil)
+			a.statsMu.RUnlock()
+			if !backoffActive {
+				a.noteCompactFailure(fmt.Errorf("still over budget after %d compaction passes (%d tokens, budget %d)", i+1, total, budget))
+			}
+			limit := a.Context.ContextLimit()
+			hard := a.Context.HardLimit()
+			overWindow := limit > 0 && a.outgoingViewEstimate(a.rebuildView()) >= limit
+			overHard := hard > 0 && total >= hard
+			if emergency && (overWindow || overHard || a.Context.DeepDive()) {
+				a.noteProgressFailure(&a.compactionGuards.emergency)
+			}
 			return
 		}
 	}
@@ -839,7 +1787,7 @@ func (a *Agent) systemPromptPrefix() []llm.Message {
 	}
 	return []llm.Message{{
 		Role: "system",
-		Content: SystemPrompt(a.WorkingDir) +
+		Content: a.systemPromptBase(a.WorkingDir) +
 			buildSystemSuffix(a.ProjectFilePath, a.EffectiveGuidelines(), a.ensureProjectProfile(), a.Mode, a.mcpToolHint()),
 	}}
 }

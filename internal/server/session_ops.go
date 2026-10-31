@@ -15,6 +15,7 @@ import (
 	"gogen/internal/llm"
 	"gogen/internal/session"
 	"gogen/internal/steerq"
+	"gogen/internal/subagents"
 )
 
 // runSessionCommand handles the session slash commands (/new, /sessions,
@@ -588,7 +589,7 @@ func (s *Server) sessionDelete(ctx context.Context, ws *wsConn, pane **sessionRu
 		if notifyLabel == "" {
 			notifyLabel = id
 		}
-		s.registry.deliverToParent(notifyParentID, steerq.Notice, fmt.Sprintf("[subagent %s] deleted by the user — its transcript is gone.", notifyLabel))
+		s.registry.deliverToParent(notifyParentID, steerq.Notice, subagents.Notice(notifyLabel, "deleted by the user — its transcript is gone."))
 	}
 	// The file is gone, so the session can never be reopened: drop any
 	// queued deliveries for it (subagent completions/reports) instead of
