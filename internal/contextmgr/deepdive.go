@@ -46,24 +46,26 @@ func (r deepDiveRefusal) Unwrap() error { return r.error }
 // verbatim and the caller measures the result. A session call that fails
 // for any reason other than cancel still summarizes the progress region.
 // Whichever region succeeded is published. A cancel drops both.
-func (m *Manager) compactAroundRequest(ctx context.Context, messages []llm.Message, headIdx, reqIdx, tailStart int, opts CompactOptions) ([]llm.Message, map[int]struct{}, error) {
+// wrote reports whether a summary was written; the input slice is returned
+// when it was not.
+func (m *Manager) compactAroundRequest(ctx context.Context, messages []llm.Message, headIdx, reqIdx, tailStart int, opts CompactOptions) ([]llm.Message, map[int]struct{}, bool, error) {
 	before, sessionErr := m.compactSegment(ctx, messages, headIdx+1, reqIdx, SummaryPrefix, sessionSummaryInstruction, opts)
 	if sessionErr != nil {
 		if ctx.Err() != nil {
-			return nil, nil, sessionErr
+			return nil, nil, false, sessionErr
 		}
 		before = segmentResult{msgs: cloneMessages(messages[headIdx+1 : reqIdx])}
 	}
 	since, err := m.compactSegment(ctx, messages, reqIdx+1, tailStart, ProgressSummaryPrefix, progressSummaryInstruction, opts)
 	if err != nil {
 		if ctx.Err() != nil || !before.summarized {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 		since = segmentResult{msgs: cloneMessages(messages[reqIdx+1 : tailStart])}
 	}
 	if !before.summarized && !since.summarized {
 		if sessionErr != nil {
-			return nil, nil, sessionErr
+			return nil, nil, false, sessionErr
 		}
 		// A summary that came back no smaller is returned as an error, as in
 		// the single-summary layout. The fit loop tries a smaller tail
@@ -73,10 +75,10 @@ func (m *Manager) compactAroundRequest(ctx context.Context, messages []llm.Messa
 		// back unchanged with no error, so the caller tries a smaller tail.
 		for _, seg := range []segmentResult{since, before} {
 			if errors.Is(seg.skip, ErrSummaryNotSmaller) {
-				return nil, nil, deepDiveRefusal{seg.skip}
+				return nil, nil, false, deepDiveRefusal{seg.skip}
 			}
 		}
-		return messages, copyIntSet(opts.Pinned), nil
+		return messages, copyIntSet(opts.Pinned), false, nil
 	}
 
 	tail := cloneMessages(messages[tailStart:])
@@ -86,7 +88,7 @@ func (m *Manager) compactAroundRequest(ctx context.Context, messages []llm.Messa
 	compact = append(compact, cloneMessage(messages[reqIdx]))
 	compact = append(compact, since.msgs...)
 	compact = append(compact, tail...)
-	return compact, remapPinsAfterCompact(opts.Pinned, headIdx, tailStart, len(compact)-len(tail)), nil
+	return compact, remapPinsAfterCompact(opts.Pinned, headIdx, tailStart, len(compact)-len(tail)), true, nil
 }
 
 // compactSegment summarizes messages[start:end] into one message framed with

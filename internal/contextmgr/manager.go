@@ -958,19 +958,6 @@ func (m *Manager) Compact(ctx context.Context, messages []llm.Message, opts Comp
 	return m.compactPinned(ctx, messages, keep, opts)
 }
 
-// deepDiveWrote reports whether compactAroundRequest replaced part of
-// original. That function returns the input slice when it writes nothing,
-// and a new slice when a summary was written, even if the count is unchanged.
-func deepDiveWrote(original, compact []llm.Message) bool {
-	if len(original) != len(compact) {
-		return true
-	}
-	if len(original) == 0 {
-		return false
-	}
-	return &original[0] != &compact[0]
-}
-
 // compactPinned is the shared implementation of Compact. opts.Forced
 // bypasses the minMiddleTokens guard. The emergency tier does not set
 // Forced, so a middle under that minimum returns ErrNotEnoughHistory and
@@ -994,7 +981,7 @@ func (m *Manager) compactPinned(ctx context.Context, messages []llm.Message, kee
 	}
 	if m.DeepDive() && !opts.SingleSummary {
 		if reqIdx := deepDiveRequestIndex(messages, headIdx, tailStart); reqIdx >= 0 {
-			compact, pins, err := m.compactAroundRequest(ctx, messages, headIdx, reqIdx, tailStart, opts)
+			compact, pins, wrote, err := m.compactAroundRequest(ctx, messages, headIdx, reqIdx, tailStart, opts)
 			// A summary that was written is returned as it is, including
 			// when one message became one shorter summary and the count
 			// did not drop. A result that wrote nothing, or a not-smaller
@@ -1007,7 +994,7 @@ func (m *Manager) compactPinned(ctx context.Context, messages []llm.Message, kee
 			if err != nil && !errors.As(err, &refused) {
 				return nil, nil, err
 			}
-			if err == nil && deepDiveWrote(messages, compact) {
+			if err == nil && wrote {
 				return compact, pins, nil
 			}
 			return compact, pins, err

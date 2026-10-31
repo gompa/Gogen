@@ -408,10 +408,14 @@ func (a *Agent) leaveForCondensation() bool {
 		return false
 	}
 	limit := a.Context.ContextLimit()
-	if limit <= 0 || a.outgoingViewEstimate(a.rebuildView()) < limit {
+	if limit <= 0 {
 		return false
 	}
-	return condensableTailFits(a, limit) && !a.lastResortGuarded()
+	total := a.outgoingViewEstimate(a.rebuildView())
+	if total < limit {
+		return false
+	}
+	return condensableTailFits(a, total, limit) && !a.lastResortGuarded()
 }
 
 // lastResortGuarded reports whether condensation already failed at this
@@ -760,9 +764,9 @@ func (a *Agent) condensableChoice(total int, msgs []llm.Message, counts []int, l
 
 // condensableTailFits reports whether last resort would condense a message
 // other than the latest request, and that condensation would bring the
-// view under the window. The latest request is left to the single summary.
-func condensableTailFits(a *Agent, limit int) bool {
-	total := a.outgoingViewEstimate(a.rebuildView())
+// view under the window. total is the outgoing view estimate the caller
+// already measured. The latest request is left to the single summary.
+func condensableTailFits(a *Agent, total, limit int) bool {
 	msgs, counts := a.messageCounts()
 	idx, ok := condensableIndex(a, total, msgs, counts, limit)
 	return ok && idx != latestRequestIndex(msgs)
@@ -798,12 +802,25 @@ func condensableIndex(a *Agent, total int, msgs []llm.Message, counts []int, lim
 	if a != nil && a.PinManager != nil {
 		pins = a.PinManager.PinnedSet()
 	}
+	// One replacement size per message: the first pass and the two
+	// fallbacks can ask for the same message again, and rendering and
+	// tokenizing it is the expensive part of this scan.
+	replacement := make([]int, len(msgs))
+	for i := range replacement {
+		replacement[i] = -1
+	}
+	replacementTokens := func(i int) int {
+		if replacement[i] < 0 {
+			replacement[i] = condensedReplacementTokens(a, msgs[i])
+		}
+		return replacement[i]
+	}
 	best, bestLeft := -1, 0
 	for i, m := range msgs {
 		if i == lastReq || !condensableMessage(m) || protectedByPin(msgs, i, pins) {
 			continue
 		}
-		left := total - counts[i] + condensedReplacementTokens(a, m)
+		left := total - counts[i] + replacementTokens(i)
 		if left >= limit {
 			continue
 		}
@@ -818,21 +835,22 @@ func condensableIndex(a *Agent, total int, msgs []llm.Message, counts []int, lim
 	// be the request, is condensed when its own replacement fits. A pin
 	// is still skipped: compaction kept that stretch, and an unpinned
 	// message was the first choice.
-	if idx, ok := largestFittingCondensable(a, total, msgs, counts, limit, pins, true); ok {
+	if idx, ok := largestFittingCondensable(total, msgs, counts, limit, pins, true, replacementTokens); ok {
 		return idx, true
 	}
 	// Nothing outside the pin brings the view under the window. The pin
 	// is what no longer fits. Last resort condenses the largest message
 	// in that stretch. Compaction still keeps the pin.
-	return largestFittingCondensable(a, total, msgs, counts, limit, nil, false)
+	return largestFittingCondensable(total, msgs, counts, limit, nil, false, replacementTokens)
 }
 
 // largestFittingCondensable is the largest condensable message whose
 // published replacement brings the view under the window. A larger
 // message that would stay over the window does not hide a smaller one
-// that fits. honorPins skips a message the pin covers. ok is false
-// when none fits.
-func largestFittingCondensable(a *Agent, total int, msgs []llm.Message, counts []int, limit int, pins map[int]struct{}, honorPins bool) (int, bool) {
+// that fits. honorPins skips a message the pin covers. replacement
+// returns the published size for a message and is shared with the
+// caller's scan. ok is false when none fits.
+func largestFittingCondensable(total int, msgs []llm.Message, counts []int, limit int, pins map[int]struct{}, honorPins bool, replacement func(int) int) (int, bool) {
 	best, bestTok := -1, 0
 	for i, m := range msgs {
 		if !condensableMessage(m) {
@@ -841,7 +859,7 @@ func largestFittingCondensable(a *Agent, total int, msgs []llm.Message, counts [
 		if honorPins && protectedByPin(msgs, i, pins) {
 			continue
 		}
-		if total-counts[i]+condensedReplacementTokens(a, m) >= limit {
+		if total-counts[i]+replacement(i) >= limit {
 			continue
 		}
 		if counts[i] > bestTok {
@@ -1047,10 +1065,11 @@ const lastResortCondenseAllowance = 2000
 //
 // condensePublished means the replacement was published and the caller
 // rebuilds the view. condenseNothingFits and condenseGuarded allow the
-// caller to summarize the request. condenseAttemptMissed does not: the
-// planned replacement still fits, and a later summary can be smaller.
-// Error mode returns an error and leaves the history untouched. A cancel
-// returns ctx.Err() and does not set a guard.
+// caller to summarize the request. condenseSummarizerError is a failed
+// summarizer call that did not arm the guard. condenseAttemptMissed does
+// not allow the summary: the planned replacement still fits, and a later
+// summary can be smaller. Error mode returns an error and leaves the
+// history untouched. A cancel returns ctx.Err() and does not set a guard.
 type condenseOutcome int
 
 const (
@@ -1059,6 +1078,7 @@ const (
 	condenseNothingFits
 	condenseAttemptMissed
 	condenseGuarded
+	condenseSummarizerError
 )
 
 func (a *Agent) lastResortCondense(ctx context.Context, h *llm.StreamHandlers, view []llm.Message) (condenseOutcome, error) {
@@ -1122,15 +1142,7 @@ func (a *Agent) condensePreservedTail(ctx context.Context, h *llm.StreamHandlers
 		tail = len(msgs)
 	}
 	middle := middleTokenSum(counts, head, tail)
-	best, bestTok := -1, 0
-	for i := tail; i < len(msgs) && i < len(counts); i++ {
-		if !condensableMessage(msgs[i]) {
-			continue
-		}
-		if counts[i] > bestTok {
-			best, bestTok = i, counts[i]
-		}
-	}
+	best, bestTok := largestCondensableFrom(msgs, counts, tail)
 	// The head is not in the tail and a single summary does not replace
 	// it. When it is the largest message, condensing a smaller tool or
 	// summarizing the middle would spend the only retry and send the
@@ -1178,15 +1190,7 @@ func (a *Agent) preservedLargerThanMiddle() int {
 		return 0
 	}
 	middle := middleTokenSum(counts, head, tail)
-	best := 0
-	for i := tail; i < len(msgs) && i < len(counts); i++ {
-		if !condensableMessage(msgs[i]) {
-			continue
-		}
-		if counts[i] > best {
-			best = counts[i]
-		}
-	}
+	_, best := largestCondensableFrom(msgs, counts, tail)
 	if best <= middle {
 		return 0
 	}
@@ -1204,6 +1208,21 @@ func middleTokenSum(counts []int, head, tail int) int {
 		}
 	}
 	return sum
+}
+
+// largestCondensableFrom returns the index and token count of the largest
+// condensable message in msgs[start:], or (-1, 0) when none qualifies.
+func largestCondensableFrom(msgs []llm.Message, counts []int, start int) (idx, tokens int) {
+	best, bestTok := -1, 0
+	for i := start; i < len(msgs) && i < len(counts); i++ {
+		if !condensableMessage(msgs[i]) {
+			continue
+		}
+		if counts[i] > bestTok {
+			best, bestTok = i, counts[i]
+		}
+	}
+	return best, bestTok
 }
 
 // condenseLargerPreserved condenses the preserved message measured by
@@ -1224,15 +1243,7 @@ func (a *Agent) condenseLargerPreserved(ctx context.Context, h *llm.StreamHandle
 	if !ok || tail >= len(msgs) {
 		return condenseSkipped, nil
 	}
-	best, bestTok := -1, 0
-	for i := tail; i < len(msgs) && i < len(counts); i++ {
-		if !condensableMessage(msgs[i]) {
-			continue
-		}
-		if counts[i] > bestTok {
-			best, bestTok = i, counts[i]
-		}
-	}
+	best, bestTok := largestCondensableFrom(msgs, counts, tail)
 	if best < 0 || bestTok < largerThan {
 		return condenseSkipped, nil
 	}
@@ -1264,8 +1275,9 @@ func (a *Agent) condenseChosen(ctx context.Context, h *llm.StreamHandlers, msgs 
 		log.Printf("last-resort condensation failed: %v", err)
 		if recordGuard {
 			a.noteProgressFailure(&a.compactionGuards.lastResort)
+			return condenseGuarded, nil
 		}
-		return condenseGuarded, nil
+		return condenseSummarizerError, nil
 	}
 	framed := llm.Message{
 		Role:       msgs[idx].Role,
