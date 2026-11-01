@@ -4,7 +4,7 @@
 // stripped, editor/marked/dompurify stubbed, no server needed) and asserts:
 //   - the settings modal shows ONE section at a time (sidebar tabs),
 //   - opening settings auto-selects the tab matching the active screen
-//     (chat -> Chat, editor -> Editor, board -> Agent) and falls back to
+//     (chat -> Chat, editor -> Editor, board -> Board) and falls back to
 //     the last-used tab otherwise (terminal/unmatched),
 //   - manual tab switches persist to localStorage,
 //   - the subagent model picker (Agent tab) renders the toolbar-style
@@ -100,8 +100,8 @@ async function main() {
 
   window.closeModal(settingsOverlay);
   openFromPane('board');
-  check('board screen auto-opens the Agent tab (board settings live there)', activeTabBtn() && activeTabBtn().dataset.tab === 'agent');
-  check('Agent panel visible', visiblePanel() && visiblePanel().id === 'settings-tab-agent');
+  check('board screen auto-opens the Board tab (board settings live there)', activeTabBtn() && activeTabBtn().dataset.tab === 'board');
+  check('Board panel visible', visiblePanel() && visiblePanel().id === 'settings-tab-board');
 
   // ── Manual tab switch persists to localStorage ──
   const providersBtn = tabBtns().find((b) => b.dataset.tab === 'providers');
@@ -143,7 +143,8 @@ async function main() {
 
   // ── Subagent model picker ──
   window.closeModal(settingsOverlay);
-  openFromPane('board'); // Agent tab
+  openFromPane('board');
+  tabBtns().find((b) => b.dataset.tab === 'subagents').click();
   // Server push: subagents on, no default model yet.
   window.applyServerConfig({ board: 'off', subagent: 'on', subagentMaxDepth: 1, subagentModel: '' });
   check('picker is visible while subagents are enabled', picker && !picker.hidden);
@@ -246,7 +247,19 @@ async function main() {
   check('sidebar order matches SETTINGS_TABS', JSON.stringify(tabOrder) === JSON.stringify(expectedTabs));
   check('Appearance tab replaces the old Global tab', tabOrder.includes('appearance') && !tabOrder.includes('global'));
   check('Subagents tab exists (split out of Agent)', tabOrder.includes('subagents'));
-  check('Agent tab keeps the board settings', !!document.querySelector('#settings-tab-agent #board-enabled-select'));
+  check('Board tab exists (split out of Agent)', tabOrder.includes('board'));
+  check('Board tab keeps the board settings', !!document.querySelector('#settings-tab-board #board-enabled-select'));
+  check('Board tab keeps the ticket cap', !!document.querySelector('#settings-tab-board #board-max-items-input'));
+  check('Board tab keeps the review-round cap', !!document.querySelector('#settings-tab-board #review-max-rounds-input'));
+  check('Board tab keeps the board review prompt', !!document.querySelector('#settings-tab-board #board-review-prompt-input'));
+  check('Agent tab no longer holds the board toggle', !document.querySelector('#settings-tab-agent #board-enabled-select'));
+  check('Web tab exists (split out of Tools)', tabOrder.includes('web'));
+  check('Web tab holds web fetch + search', !!document.querySelector('#settings-tab-web #web-fetch-select')
+    && !!document.querySelector('#settings-tab-web #web-search-api-key-input'));
+  check('Tools tab no longer holds web fetch', !document.querySelector('#settings-tab-tools #web-fetch-select'));
+  check('Status display tab exists (split out of Tools)', tabOrder.includes('status-display'));
+  check('Status display tab holds the host field', !!document.querySelector('#settings-tab-status-display #status-display-host-input'));
+  check('Tools tab no longer holds the status display', !document.querySelector('#settings-tab-tools #status-display-select'));
   check('subagent model picker lives in the Subagents tab', !!document.querySelector('#settings-tab-subagents #subagent-model-picker'));
   check('subagent model picker no longer in the Agent tab', !document.querySelector('#settings-tab-agent #subagent-model-picker'));
   check('Approval hold moved to Security', !!document.querySelector('#settings-tab-security #approval-hold-input'));

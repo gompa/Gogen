@@ -87,7 +87,7 @@ const themeSelect = document.getElementById('theme-select');
 // a natural settings home (chat/editor/board) auto-selects that tab
 // instead — the screen the user is on wins on open.
 const SETTINGS_TAB_STORAGE = 'gogen-settings-tab';
-const SCREEN_TO_SETTINGS_TAB = { chat: 'chat', editor: 'editor', board: 'agent', automations: 'automations' };
+const SCREEN_TO_SETTINGS_TAB = { chat: 'chat', editor: 'editor', board: 'board', automations: 'automations' };
 let settingsTab = storageGet(SETTINGS_TAB_STORAGE) || 'chat';
 
 export function showSettingsTab(tab) {
@@ -207,10 +207,12 @@ export function applyFeatureSettings(data) {
     const boardTab = document.getElementById('board-tab');
     const wasVisible = boardTab && !boardTab.hidden;
     if (boardTab && boardTab.hidden === boardOn) boardTab.hidden = !boardOn;
-    // The board agent prompt is meaningful only while the board
-    // feature is on (like the subagent model picker).
-    const boardPromptRow = document.getElementById('board-prompt-row');
-    if (boardPromptRow) boardPromptRow.hidden = !boardOn;
+    // The board agent prompt and the ticket cap are meaningful only while
+    // the board feature is on (like the subagent model picker).
+    for (const id of ['board-prompt-row', 'board-max-items-row']) {
+        const row = document.getElementById(id);
+        if (row) row.hidden = !boardOn;
+    }
     // The automations TAB follows the flag exactly like the board tab:
     // shown only while the scheduler may fire. Turning it on requests the
     // snapshot; turning it off falls back to chat when the pane was active.
@@ -256,8 +258,10 @@ export function applyFeatureSettings(data) {
     if (reviewModelPicker) reviewModelPicker.hidden = !reviewAgentRowsVisible;
     const reviewThinkingPicker = document.getElementById('review-agent-thinking-row');
     if (reviewThinkingPicker) reviewThinkingPicker.hidden = !reviewAgentRowsVisible;
-    const reviewPromptRow = document.getElementById('board-review-prompt-row');
-    if (reviewPromptRow) reviewPromptRow.hidden = !reviewAgentRowsVisible;
+    for (const id of ['board-review-prompt-row', 'review-max-rounds-row']) {
+        const row = document.getElementById(id);
+        if (row) row.hidden = !reviewAgentRowsVisible;
+    }
     const ws = deps.getWs();
     const models = deps.getModels();
     const needsModels = isSettingsOpen() && (!models || models.length === 0)

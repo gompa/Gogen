@@ -121,7 +121,7 @@ async function main() {
   skills.blur();
 
   // ── 7. The secret placeholders still refresh while a draft is kept ──
-  const keyInput = focusIn('tools', 'web-search-api-key-input');
+  const keyInput = focusIn('web', 'web-search-api-key-input');
   keyInput.value = 'sk-draft';
   window.applyServerConfig({ webSearchApiKeySet: true, systemPrompt: 'x' });
   check('the draft secret value is kept', keyInput.value === 'sk-draft', keyInput.value);

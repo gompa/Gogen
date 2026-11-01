@@ -724,7 +724,7 @@ default host is the firmware's mDNS name, `statusscreen.local`; set
 running GoGen (for example a `CGO_ENABLED=0` build on a host without a system
 mDNS resolver). Set `status_display_token` when the display has a shared
 secret configured (`/token?set=…` on the device). In web mode all of these
-are live-editable in **Settings → Tools**.
+are live-editable in **Settings → Status display**.
 
 ### Session persistence
 
@@ -828,19 +828,26 @@ mode it is fixed to the project directory and the input is hidden.
   restart button. The editor runs on its own socket, so saving a file is never
   blocked by a streaming turn.
 - The settings modal is organized into sidebar sections (Editor, Chat,
-  Appearance, Agent, Subagents, Project, Automations, Tools, Context,
-  Security, Sessions, Providers, MCP, Server); opening it auto-selects the
+  Appearance, Agent, Board, Subagents, Project, Automations, Tools, Web,
+  Status display, Context, Security, Sessions, Providers, MCP, Server);
+  opening it auto-selects the
   section matching the screen you are on, and manual choices are remembered
   per browser. The **Project** tab holds the `test_command` /
   `lint_command` overrides (they apply to every session on its next turn).
 
 #### Board and subagents
 
-- The settings modal's **Agent** group toggles the **Project board** and
-  **Subagents** features live, no restart. The toggles are server-backed:
+- The settings modal's **Board** group toggles the **Project board** and
+  **Board review agent** features live, no restart, and holds the two board
+  caps: **Max tickets** (`board_max_items`, the total ticket cap — adding
+  past it is refused with an error naming the limit) and **Max review
+  rounds per ticket** (`review_agent_max_rounds`). The toggles are
+  server-backed:
   they persist to `.gogen/gogen.conf` and every tab stays in sync via the
-  config push. The **Tools** group does the same for the optional **Skills**
-  and **Persistent terminal** tools, and the Agent group for
+  config push. The **Subagents** group does the same for **Subagents**, the
+  **Tools** group for the optional **Skills**, **Persistent terminal** and
+  **Tree-sitter** tools, the **Web** group for **Web fetch** / **Web
+  search**, and the Agent group for
   **Workspace instructions** (`AGENTS.md` / `CLAUDE.md`) and **Background job
   notices**.
 - With `board: on`, a **Board** tab appears next to Chat/Editor: a kanban
@@ -871,13 +878,14 @@ mode it is fixed to the project directory and the input is hidden.
   **Review agent** section sets per-ticket review options (model +
   reasoning effort) used by the auto-review agent on this ticket.
 - With `review_agent: on` (web mode; the **Board review agent** toggle in
-  the settings Agent group), a ticket moved into **in_review** — by an
+  the settings Board group), a ticket moved into **in_review** — by an
   agent's board tool or by drag-drop — automatically starts a headless
   review session (`review #N: title` in the sidebar). It verifies the
   work (diff, tests, ticket criteria) and marks the ticket done, or
   comments findings and moves it back to in_progress. One reviewer runs
-  per ticket at a time; auto-review stops after 5 review rounds per
-  ticket (commented on the card). The reviewer's default model and
+  per ticket at a time; auto-review stops after `review_agent_max_rounds`
+  review rounds per ticket (default 5, set in the settings Board group;
+  commented on the card). The reviewer's default model and
   reasoning effort are set in the settings modal
   (`review_agent_model`, `review_agent_thinking_level`), its prompt via
   `board_review_prompt`; a ticket's own **Review agent** popover section
