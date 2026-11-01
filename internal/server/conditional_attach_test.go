@@ -366,6 +366,10 @@ func TestConditionalAttachIdleSkipsLeftoverRewind(t *testing.T) {
 	// idle return anyway. Pin the gating itself: with leftover output
 	// present, an idle current client must still get NOTHING rather than a
 	// rewind-only frame it would merge over content it already shows.
+	//
+	// Deterministic since runTurnBody resets the turn state BEFORE it
+	// broadcasts turn_end: reacting to turn_end can no longer observe a turn
+	// that is still marked active (which used to ship exactly this frame).
 	rt.live.AppendContent("leftover round output")
 	if rt.live.Snapshot() == nil {
 		t.Fatal("precondition: injected round output must be visible to Snapshot")

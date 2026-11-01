@@ -62,12 +62,14 @@ func (s *Server) handleWSCompact(ws *wsConn, _ *http.Request, rt *sessionRuntime
 	compactCtx, compactCancel := context.WithCancel(context.Background())
 	errCh := rt.stream.begin(compactCancel)
 	go func() {
-		// Defers run LIFO, mirroring startTurn's goroutine: turn_end
-		// broadcast + setTurnActive(false) (both while the lock is still
-		// held — turn_end must never interleave after a new turn's first
-		// events, and a new turn must never see a stale turnActive/
-		// turnOwner) → errCh signal → stream.end() → turnMu.Unlock() →
-		// orphan check. The orphan check runs LAST (after turnMu.Unlock):
+		// Defers run LIFO, mirroring startTurn's goroutine: the turn-state
+		// reset + turn_end broadcast (both while the lock is still held — a
+		// new turn must never see a stale turnActive/turnOwner, and turn_end
+		// must never interleave after a new turn's first events) → errCh
+		// signal → stream.end() → turnMu.Unlock() → orphan check. The state
+		// reset runs before the broadcast so a client reacting to turn_end
+		// (a reconnect's conditional attach) never observes a turn still
+		// marked active. The orphan check runs LAST (after turnMu.Unlock):
 		// if the only client left mid-compact, the idle runtime goes back
 		// to the saved list.
 		defer rt.evictOrphanedIfPossible()
@@ -75,8 +77,8 @@ func (s *Server) handleWSCompact(ws *wsConn, _ *http.Request, rt *sessionRuntime
 		defer rt.stream.end()
 		defer func() { errCh <- nil }()
 		defer func() {
-			rt.broadcast(WSMessage{Type: "turn_end", SessionID: rt.agent.SessionID})
 			rt.setTurnActive(false, time.Time{}, nil)
+			rt.broadcast(WSMessage{Type: "turn_end", SessionID: rt.agent.SessionID})
 		}()
 		_ = ws.writeJSON(WSMessage{Type: "compacting", SessionID: rt.agent.SessionID})
 		if err := rt.agent.CompactHistory(compactCtx); err != nil {
@@ -309,14 +311,19 @@ func (rt *sessionRuntime) startTurnWithResult(owner *wsConn, content string, ima
 	streamCtx, streamCancel := context.WithCancel(context.Background())
 	errCh := rt.stream.begin(streamCancel)
 	go func(content string, images []llm.ImageInput, turnCtx context.Context, done chan error, onResult func(string, error)) {
-		// Defers run LIFO, so the cleanup executes in this order: turn_end
-		// broadcast → setTurnActive(false) (both inside runTurnBody, while
-		// the lock is still held) → done → stream.end() → turnMu.Unlock().
+		// Defers run LIFO, so the cleanup executes in this order:
+		// setTurnActive(false) → turn_end broadcast (both inside
+		// runTurnBody, while the lock is still held) → done → stream.end()
+		// → turnMu.Unlock().
 		// The turn state must be cleared BEFORE the lock is released: a new
 		// turn can only start once the lock is free, and it must never see
 		// (or clobber) a stale turnActive/turnOwner from the turn it
-		// replaced. turn_end is broadcast while the lock is still held so a
-		// new turn's first events can never interleave ahead of it.
+		// replaced. It is also cleared BEFORE turn_end is broadcast, so a
+		// client that reacts to turn_end (a reconnect's conditional attach)
+		// never observes a turn still marked active — that would ship it a
+		// rewind-only frame carrying output it already rendered.
+		// turn_end is broadcast while the lock is still held so a new
+		// turn's first events can never interleave ahead of it.
 		// stream.end() must also run before the lock is released: it clears
 		// the runtime's shared stream handles, and the next turn's begin()
 		// runs as soon as the lock is free. If end() ran after unlock, a
@@ -443,11 +450,16 @@ func (rt *sessionRuntime) runTurnBody(ctx context.Context, content string, image
 	// window with turnActive=true but turnMu free would let a
 	// delivery/attach turn start concurrently and clobber the active flag
 	// (or run ahead of the turn's own work). Both defers run while the
-	// lock is still held: turn_end first, so a new turn's first events can
-	// never interleave ahead of it, then the state reset, so the next turn
-	// never sees a stale turnActive/turnOwner.
-	defer rt.setTurnActive(false, time.Time{}, nil)
+	// lock is still held, and the STATE RESET runs first: a client that
+	// reacts to turn_end — a reconnect's conditional attach — must never
+	// observe turnActive still set, because sendAttachHistory would then
+	// take its in-flight branch and ship a rewind-only frame carrying the
+	// finished round's leftover output, which that client already
+	// rendered. A new turn's first events still cannot interleave ahead
+	// of turn_end: the next turn needs the lock, which both defers run
+	// under.
 	defer rt.broadcast(WSMessage{Type: "turn_end", SessionID: rt.agent.SessionID})
+	defer rt.setTurnActive(false, time.Time{}, nil)
 	rt.setTurnActive(true, time.Now(), o.owner)
 	// An installed override (subagent D6 forwarding, board start
 	// deny-when-unattended) replaces the default per-session approver, for

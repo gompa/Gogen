@@ -252,7 +252,7 @@ func TestTurnContinuesAfterDisconnect(t *testing.T) {
 	// Wait for the headless turn to FULLY complete. Persistence alone is not
 	// enough: StreamProcessInput flushes the reply to the store BEFORE the
 	// turn goroutine's deferred cleanup runs, and that cleanup is what
-	// clears turnActive (turn_end broadcast → setTurnActive(false) →
+	// clears turnActive (setTurnActive(false) → turn_end broadcast →
 	// unlock). A fresh attach in the window between the flush and the
 	// cleanup would still see turnActive=true — under -race or a loaded
 	// runner the goroutine can be descheduled there for long enough to hit
