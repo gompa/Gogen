@@ -50,27 +50,28 @@ func exactAny(forms ...string) func(input, trimmed string) bool {
 	}
 }
 
+// commandWithArgs matches a bare command, its slash form, and either form
+// followed by a space and arguments.
+func commandWithArgs(name string) func(input, trimmed string) bool {
+	bare, slash := name, "/"+name
+	return func(_, trimmed string) bool {
+		return trimmed == bare || strings.HasPrefix(trimmed, bare+" ") ||
+			trimmed == slash || strings.HasPrefix(trimmed, slash+" ")
+	}
+}
+
 var tuiCommands = []tuiCommand{
 	{match: exactAny("help", "/help"), run: cmdHelp},
 	{match: exactAny("exit", "/exit", "quit", "/quit"), run: cmdExit},
 	{match: exactAny("compact", "/compact"), run: cmdCompact},
-	{match: func(input, trimmed string) bool {
-		return trimmed == "smartcompact" || trimmed == "/smartcompact" ||
-			strings.HasPrefix(trimmed, "smartcompact ") || strings.HasPrefix(trimmed, "/smartcompact ")
-	}, run: cmdSmartCompact},
-	{match: func(input, trimmed string) bool {
-		return trimmed == "contextmode" || trimmed == "/contextmode" ||
-			strings.HasPrefix(trimmed, "contextmode ") || strings.HasPrefix(trimmed, "/contextmode ")
-	}, run: cmdContextMode},
+	{match: commandWithArgs("smartcompact"), run: cmdSmartCompact},
+	{match: commandWithArgs("contextmode"), run: cmdContextMode},
 	{match: exactAny("verbose", "/verbose"), run: cmdVerbose},
 	{match: exactAny("subagents", "/subagents"), run: cmdSubagents},
 	// Mode commands: mirror HandleModeCommand's accepted forms.
 	{match: exactAny("plan", "/plan", "act", "/act", "mode", "/mode"), run: cmdMode},
 	// Thinking command: mirror HandleThinkingCommand's accepted forms.
-	{match: func(input, trimmed string) bool {
-		return trimmed == "think" || trimmed == "/think" ||
-			strings.HasPrefix(trimmed, "think ") || strings.HasPrefix(trimmed, "/think ")
-	}, run: cmdThinking},
+	{match: commandWithArgs("think"), run: cmdThinking},
 	{match: exactAny("context", "/context"), run: cmdContext},
 	// Session commands: reuse the agent's pure parser, mirroring its cases.
 	{match: func(input, trimmed string) bool {
@@ -94,16 +95,10 @@ var tuiCommands = []tuiCommand{
 	{match: func(input, trimmed string) bool { return strings.HasPrefix(trimmed, "dir ") }, run: cmdDir},
 	// Switch between actively hosted (live) sessions by number — the
 	// engine behind the future sessions-sidebar ACTIVE section.
-	{match: func(input, trimmed string) bool {
-		return trimmed == "switch" || trimmed == "/switch" ||
-			strings.HasPrefix(trimmed, "switch ") || strings.HasPrefix(trimmed, "/switch ")
-	}, run: cmdSwitch},
+	{match: commandWithArgs("switch"), run: cmdSwitch},
 	// Open a NEW live session through the shared web lifecycle core; it
 	// becomes the focused session and appears in /switch's list.
-	{match: func(input, trimmed string) bool {
-		return trimmed == "open" || trimmed == "/open" ||
-			strings.HasPrefix(trimmed, "open ") || strings.HasPrefix(trimmed, "/open ")
-	}, run: cmdOpen},
+	{match: commandWithArgs("open"), run: cmdOpen},
 	// /queue opens the queued-messages modal (per-item cancel). Reachable
 	// mid-turn too — handleSubmitKey intercepts it before the busy
 	// command refusal.

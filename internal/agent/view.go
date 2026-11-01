@@ -755,8 +755,8 @@ func (a *Agent) condensableChoice(total int, msgs []llm.Message, counts []int, l
 	if a.Context != nil && a.Context.DeepDive() {
 		return condensableIndex(a, total, msgs, counts, limit)
 	}
-	idx, c := largestCondensableMessage(msgs, counts)
-	if idx < 0 || total-c+condensedReplacementTokens(a, msgs[idx]) >= limit {
+	idx, c := largestCondensableFrom(msgs, counts, 0)
+	if idx < 0 || condensationLeft(total, c, condensedReplacementTokens(a, msgs[idx])) >= limit {
 		return -1, false
 	}
 	return idx, true
@@ -782,6 +782,13 @@ func condensedReplacementTokens(a *Agent, msg llm.Message) int {
 		}
 	}
 	return lastResortCondenseAllowance
+}
+
+// condensationLeft is the outgoing view estimate after a message's
+// replacement: the view total minus the message's token count plus its
+// published replacement size.
+func condensationLeft(total, c, replacement int) int {
+	return total - c + replacement
 }
 
 // condensableIndex is the message deep dive's last resort condenses. A
@@ -820,7 +827,7 @@ func condensableIndex(a *Agent, total int, msgs []llm.Message, counts []int, lim
 		if i == lastReq || !condensableMessage(m) || protectedByPin(msgs, i, pins) {
 			continue
 		}
-		left := total - counts[i] + replacementTokens(i)
+		left := condensationLeft(total, counts[i], replacementTokens(i))
 		if left >= limit {
 			continue
 		}
@@ -859,7 +866,7 @@ func largestFittingCondensable(total int, msgs []llm.Message, counts []int, limi
 		if honorPins && protectedByPin(msgs, i, pins) {
 			continue
 		}
-		if total-counts[i]+replacement(i) >= limit {
+		if condensationLeft(total, counts[i], replacement(i)) >= limit {
 			continue
 		}
 		if counts[i] > bestTok {
@@ -919,23 +926,29 @@ func condensableMessage(m llm.Message) bool {
 	}
 }
 
-// requestAfterHead reports whether a user request sits after the first one.
-// The first request is the head. A later one is what the deep-dive layout
-// keeps, and the last keep summarizes it when the regions around it wrote
-// nothing.
-func requestAfterHead(msgs []llm.Message) bool {
-	first := -1
+// requestBounds returns the first and last real-user-request index in
+// msgs, or -1, -1 when there is none.
+func requestBounds(msgs []llm.Message) (first, last int) {
+	first, last = -1, -1
 	for i, m := range msgs {
 		if !contextmgr.IsRequest(m) {
 			continue
 		}
 		if first < 0 {
 			first = i
-			continue
 		}
-		return i > first
+		last = i
 	}
-	return false
+	return first, last
+}
+
+// requestAfterHead reports whether a user request sits after the first one.
+// The first request is the head. A later one is what the deep-dive layout
+// keeps, and the last keep summarizes it when the regions around it wrote
+// nothing.
+func requestAfterHead(msgs []llm.Message) bool {
+	first, last := requestBounds(msgs)
+	return first >= 0 && last > first
 }
 
 // layoutKeptRequest reports whether a deep-dive compaction kept the latest
@@ -943,15 +956,7 @@ func requestAfterHead(msgs []llm.Message) bool {
 // or, when the progress region was empty, one session summary between the
 // head and the request. A tail may follow the request.
 func layoutKeptRequest(msgs []llm.Message) bool {
-	first, last := -1, -1
-	for i, m := range msgs {
-		if contextmgr.IsRequest(m) {
-			if first < 0 {
-				first = i
-			}
-			last = i
-		}
-	}
+	first, last := requestBounds(msgs)
 	if last < 0 {
 		return false
 	}
@@ -992,7 +997,7 @@ func (a *Agent) compactNoTail(ctx context.Context, opts contextmgr.CompactOption
 	// A one-message region becomes one shorter summary: the count stays
 	// the same and the summary text changes. That result is published.
 	// An unchanged summary text saved nothing.
-	if len(compacted) == len(a.Messages) && summaryBlob(compacted) == summaryBlob(a.Messages) {
+	if !historyChanged(a.Messages, compacted) {
 		return false, nil
 	}
 	a.publishCompaction(compacted, newPins)
@@ -1110,6 +1115,32 @@ func (a *Agent) lastResortCondense(ctx context.Context, h *llm.StreamHandlers, v
 	return a.condenseChosen(ctx, h, msgs, idx, c, total, limit, true)
 }
 
+// preservedBounds returns the live messages and counts and the head and
+// first preserved-tail index of a forced compaction. ok is false when the
+// session is not in condense mode or the history has no head. The caller
+// still applies its own tail checks.
+func (a *Agent) preservedBounds() (msgs []llm.Message, counts []int, head, tail int, ok bool) {
+	if a == nil || a.Context == nil || a.Context.CompactLastResort() != "condense" {
+		return nil, nil, 0, 0, false
+	}
+	var pins map[int]struct{}
+	if a.PinManager != nil {
+		pins = a.PinManager.PinnedSet()
+	}
+	msgs, counts = a.messageCounts()
+	head, tail, ok = contextmgr.ForcedPreserveStart(msgs, pins, a.Context.DeepDive())
+	return msgs, counts, head, tail, ok
+}
+
+// condensePreserved publishes the condensation of a preserved message.
+// The outgoing view and the window are measured here; recordGuard is
+// passed to condenseChosen.
+func (a *Agent) condensePreserved(ctx context.Context, h *llm.StreamHandlers, msgs []llm.Message, idx, c int, recordGuard bool) (condenseOutcome, error) {
+	limit := a.Context.ContextLimit()
+	total := a.outgoingViewEstimate(a.rebuildView())
+	return a.condenseChosen(ctx, h, msgs, idx, c, total, limit, recordGuard)
+}
+
 // condensePreservedTail condenses the largest message a forced compaction
 // would leave verbatim, when the provider has refused and the local
 // estimate is still under the window. That message is the head, the
@@ -1121,15 +1152,7 @@ func (a *Agent) lastResortCondense(ctx context.Context, h *llm.StreamHandlers, v
 // the middle is what shrinks the history. A cancel is returned.
 // Nothing is published when no such message exists.
 func (a *Agent) condensePreservedTail(ctx context.Context, h *llm.StreamHandlers) (condenseOutcome, error) {
-	if a.Context == nil || a.Context.CompactLastResort() != "condense" {
-		return condenseSkipped, nil
-	}
-	var pins map[int]struct{}
-	if a.PinManager != nil {
-		pins = a.PinManager.PinnedSet()
-	}
-	msgs, counts := a.messageCounts()
-	head, tail, ok := contextmgr.ForcedPreserveStart(msgs, pins, a.Context.DeepDive())
+	msgs, counts, head, tail, ok := a.preservedBounds()
 	if !ok || head < 0 || head >= len(msgs) || head >= len(counts) {
 		return condenseSkipped, nil
 	}
@@ -1151,8 +1174,6 @@ func (a *Agent) condensePreservedTail(ctx context.Context, h *llm.StreamHandlers
 	if head >= 0 && head < len(counts) && condensableMessage(msgs[head]) {
 		headTok = counts[head]
 	}
-	limit := a.Context.ContextLimit()
-	total := a.outgoingViewEstimate(a.rebuildView())
 	// Choose the preserved message before the guard. When none is larger
 	// than the middle, the middle is the bulk and can still be summarized.
 	// A guard or a summarizer error then applies only to that message.
@@ -1168,7 +1189,7 @@ func (a *Agent) condensePreservedTail(ctx context.Context, h *llm.StreamHandlers
 	if a.lastResortGuarded() {
 		return condenseGuarded, nil
 	}
-	return a.condenseChosen(ctx, h, msgs, idx, tok, total, limit, true)
+	return a.condensePreserved(ctx, h, msgs, idx, tok, true)
 }
 
 // preservedLargerThanMiddle is the token count of the largest message a
@@ -1177,15 +1198,7 @@ func (a *Agent) condensePreservedTail(ctx context.Context, h *llm.StreamHandlers
 // Measured before the summary, so a shorter replacement cannot make a
 // small tool look like the bulk.
 func (a *Agent) preservedLargerThanMiddle() int {
-	if a == nil || a.Context == nil || a.Context.CompactLastResort() != "condense" {
-		return 0
-	}
-	var pins map[int]struct{}
-	if a.PinManager != nil {
-		pins = a.PinManager.PinnedSet()
-	}
-	msgs, counts := a.messageCounts()
-	head, tail, ok := contextmgr.ForcedPreserveStart(msgs, pins, a.Context.DeepDive())
+	msgs, counts, head, tail, ok := a.preservedBounds()
 	if !ok || tail >= len(msgs) {
 		return 0
 	}
@@ -1231,15 +1244,10 @@ func largestCondensableFrom(msgs []llm.Message, counts []int, start int) (idx, t
 // summary that drops the count moves the tail. A smaller preserved
 // message is left alone.
 func (a *Agent) condenseLargerPreserved(ctx context.Context, h *llm.StreamHandlers, largerThan int) (condenseOutcome, error) {
-	if largerThan <= 0 || a.Context == nil || a.Context.CompactLastResort() != "condense" || a.lastResortGuarded() {
+	if largerThan <= 0 || a == nil || a.lastResortGuarded() {
 		return condenseSkipped, nil
 	}
-	var pins map[int]struct{}
-	if a.PinManager != nil {
-		pins = a.PinManager.PinnedSet()
-	}
-	msgs, counts := a.messageCounts()
-	_, tail, ok := contextmgr.ForcedPreserveStart(msgs, pins, a.Context.DeepDive())
+	msgs, counts, _, tail, ok := a.preservedBounds()
 	if !ok || tail >= len(msgs) {
 		return condenseSkipped, nil
 	}
@@ -1247,12 +1255,10 @@ func (a *Agent) condenseLargerPreserved(ctx context.Context, h *llm.StreamHandle
 	if best < 0 || bestTok < largerThan {
 		return condenseSkipped, nil
 	}
-	limit := a.Context.ContextLimit()
-	total := a.outgoingViewEstimate(a.rebuildView())
 	// The view already fits. A summarizer error here must not arm the
 	// last-resort guard: the provider has not refused this view, and the
 	// overflow path is what retries the condensation.
-	return a.condenseChosen(ctx, h, msgs, best, bestTok, total, limit, false)
+	return a.condensePreserved(ctx, h, msgs, best, bestTok, false)
 }
 
 // condenseChosen publishes a condensation of msgs[idx]. total and limit
@@ -1292,7 +1298,7 @@ func (a *Agent) condenseChosen(ctx context.Context, h *llm.StreamHandlers, msgs 
 		log.Printf("last-resort condensation aborted: framed summary %d tokens not smaller than the message %d", framedTok, c)
 		return condenseAttemptMissed, nil
 	}
-	if total-c+framedTok >= limit {
+	if condensationLeft(total, c, framedTok) >= limit {
 		// The actual framed summary is bigger than the allowance the
 		// pre-check assumed. Leave the message alone so a later summary
 		// can be smaller. The caller must not summarize the request:
@@ -1332,26 +1338,6 @@ func (a *Agent) messageCounts() ([]llm.Message, []int) {
 	}
 	counts := contextmgr.CountTokens(msgs)
 	return msgs, counts
-}
-
-// largestCondensableMessage returns the index and token count of the
-// largest message eligible for last-resort condensation (Phase 0e): a
-// text-only user message or tool result that is not a compaction summary
-// and not already condensed. Assistant messages are never candidates (their
-// tool-call protocol and model attribution must survive verbatim), and
-// image-bearing user messages are excluded (the summarizer is text-only).
-// Returns (-1, 0) when no message qualifies.
-func largestCondensableMessage(msgs []llm.Message, counts []int) (int, int) {
-	best, bestTok := -1, 0
-	for i, m := range msgs {
-		if !condensableMessage(m) {
-			continue
-		}
-		if counts[i] > bestTok {
-			best, bestTok = i, counts[i]
-		}
-	}
-	return best, bestTok
 }
 
 // condenseMessageAt replaces the message at idx in place with the framed

@@ -338,7 +338,7 @@ func TestPreflightTruncatedToolSummarizesRequest(t *testing.T) {
 		t.Fatal("test setup: estimate under the window")
 	}
 	msgs, counts := a.messageCounts()
-	idx, c := largestCondensableMessage(msgs, counts)
+	idx, c := largestCondensableFrom(msgs, counts, 0)
 	if idx < 0 || msgs[idx].Role != "tool" {
 		t.Fatal("test setup: the tool result is not the largest condensable message")
 	}
@@ -436,7 +436,7 @@ func TestPreflightEmptyRegionsCondenseToolResult(t *testing.T) {
 		t.Fatal("test setup: the regions are not empty")
 	}
 	msgs, counts := a.messageCounts()
-	idx, _ := largestCondensableMessage(msgs, counts)
+	idx, _ := largestCondensableFrom(msgs, counts, 0)
 	if idx < 0 || msgs[idx].Role != "tool" {
 		t.Fatal("test setup: the tool result is not the largest condensable message")
 	}
@@ -492,7 +492,7 @@ func TestPreflightSmallerMessageKeepsRequest(t *testing.T) {
 		t.Fatal("test setup: estimate under the window")
 	}
 	msgs, counts := a.messageCounts()
-	largest, _ := largestCondensableMessage(msgs, counts)
+	largest, _ := largestCondensableFrom(msgs, counts, 0)
 	if largest < 0 || msgs[largest].Content != request {
 		t.Fatal("test setup: the request is not the largest condensable message")
 	}

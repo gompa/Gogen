@@ -558,7 +558,7 @@ func TestDefaultModeKeepsLargestCondensation(t *testing.T) {
 		t.Fatal("test setup: estimate under the window")
 	}
 	msgs, counts := a.messageCounts()
-	largest, largestTok := largestCondensableMessage(msgs, counts)
+	largest, largestTok := largestCondensableFrom(msgs, counts, 0)
 	if largest < 0 || msgs[largest].Content != head {
 		t.Fatal("test setup: the head is not the largest condensable message")
 	}
