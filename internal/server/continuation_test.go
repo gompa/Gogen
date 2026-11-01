@@ -152,6 +152,17 @@ func readUntil(t *testing.T, conn *websocket.Conn, timeout time.Duration, match 
 	}
 }
 
+// queuedItem returns the queued steering item with the given client-supplied
+// id, or nil when the queue does not hold it.
+func queuedItem(queue []QueueItem, id string) *QueueItem {
+	for i := range queue {
+		if queue[i].ID == id {
+			return &queue[i]
+		}
+	}
+	return nil
+}
+
 // readMessagesUntil reads WS messages until pred (over the FULL collected
 // sequence) returns true or the deadline passes, and returns every message
 // read — including the non-matching ones readUntil would discard. Use it when
@@ -448,11 +459,17 @@ func TestFanOutToTwoAttachedConnections(t *testing.T) {
 	}
 	// Both connections learn the queue state (queue_update broadcasts to
 	// every attached client). conn2's own user_acked for "second turn" may
-	// interleave; readUntil skips non-matching frames.
+	// interleave; readUntil skips non-matching frames. So may an EARLIER
+	// queue_update: the previous turn's lock is released just after its
+	// turn_end frame, so a message that lands in that window is briefly
+	// queued under a generated id. Match on the item this step is about
+	// instead of on "the next queue_update".
 	for _, c := range []*websocket.Conn{conn1, conn2} {
-		qu := readUntil(t, c, 5*time.Second, func(m WSMessage) bool { return m.Type == "queue_update" })
-		if len(qu.Queue) != 1 || qu.Queue[0].ID != "q-fanout" || qu.Queue[0].Text != "busy me" {
-			t.Fatalf("queue_update queue = %+v, want one item q-fanout \"busy me\"", qu.Queue)
+		qu := readUntil(t, c, 5*time.Second, func(m WSMessage) bool {
+			return m.Type == "queue_update" && queuedItem(m.Queue, "q-fanout") != nil
+		})
+		if item := queuedItem(qu.Queue, "q-fanout"); item == nil || item.Text != "busy me" {
+			t.Fatalf("queue_update queue = %+v, want an item q-fanout \"busy me\"", qu.Queue)
 		}
 	}
 	// conn1's turn must still be alive (not cancelled by conn2's message):
