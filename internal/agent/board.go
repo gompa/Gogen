@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"gogen/internal/config"
 	"gogen/internal/ioutil"
 	"gogen/internal/projectfile"
 )
@@ -28,16 +29,22 @@ import (
 // be rebuilt from the ticket files (single source of truth).
 
 const (
-	boardVersion     = 1
-	boardMaxItems    = 200 // D4: total ticket cap
-	boardMaxActivity = 50  // D4: activity entries per ticket (oldest dropped)
+	boardVersion = 1
+	// boardMaxItems is the DEFAULT total ticket cap (D4). The live cap is
+	// the board_max_items config option, applied via SetMaxItems; this is
+	// only the fallback when none is configured.
+	boardMaxItems = config.DefaultBoardMaxItems
+	// boardMaxActivity caps the activity entries per ticket (oldest
+	// dropped, D4).
+	boardMaxActivity = 50
 )
 
-// MaxReviewRounds caps auto-review starts per ticket: past it a move into
-// in_review no longer spawns a reviewer (a worker/reviewer ping-pong would
-// otherwise loop forever). The cap is surfaced as a comment on the ticket
-// so the stopped auto-review is visible.
-const MaxReviewRounds = 5
+// MaxReviewRounds is the DEFAULT cap on auto-review starts per ticket: past
+// it a move into in_review no longer spawns a reviewer (a worker/reviewer
+// ping-pong would otherwise loop forever). The cap is surfaced as a comment
+// on the ticket so the stopped auto-review is visible. The live cap is the
+// review_agent_max_rounds config option (see config.ReviewRoundsLimit).
+const MaxReviewRounds = config.DefaultReviewAgentMaxRounds
 
 // BoardColumns is the fixed column set (D10 — column configuration is a
 // follow-up).
@@ -145,6 +152,9 @@ type BoardManager struct {
 	dir        string
 	globalMode bool
 	idx        *boardIndex
+	// maxItems caps the total ticket count (0 = boardMaxItems). Set from
+	// the board_max_items config option; guarded by mu like dir/idx.
+	maxItems int
 
 	// reviewHookMu guards reviewNeeded (its own mutex, NOT m.mu: the
 	// callback fires after m.mu is released, and its handler calls back
@@ -164,6 +174,38 @@ func NewBoardManager(workingDir string, globalMode bool) *BoardManager {
 		globalMode: globalMode,
 		idx:        defaultBoardIndex(),
 	}
+}
+
+// SetMaxItems sets the total ticket cap (<= 0 restores the built-in
+// default, boardMaxItems). Live: the settings modal's board limit applies to
+// the shared manager immediately, and adding past the cap is refused with an
+// error naming the limit.
+func (m *BoardManager) SetMaxItems(n int) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.maxItems = n
+}
+
+// MaxItems returns the effective total ticket cap (the built-in default when
+// unset).
+func (m *BoardManager) MaxItems() int {
+	if m == nil {
+		return boardMaxItems
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.itemLimitLocked()
+}
+
+// itemLimitLocked resolves the effective cap. Callers must hold m.mu.
+func (m *BoardManager) itemLimitLocked() int {
+	if m.maxItems > 0 {
+		return m.maxItems
+	}
+	return boardMaxItems
 }
 
 // SetWorkingDir re-points the manager at the board directory for a new
@@ -608,8 +650,8 @@ func (m *BoardManager) Add(title, description, priority, by string) (string, err
 	if err := m.loadIndexLocked(); err != nil {
 		return "", err
 	}
-	if m.itemCountLocked() >= boardMaxItems {
-		return "", fmt.Errorf("too many board items (max %d); complete or remove some first", boardMaxItems)
+	if limit := m.itemLimitLocked(); m.itemCountLocked() >= limit {
+		return "", fmt.Errorf("too many board items (max %d); complete or remove some first", limit)
 	}
 	item := &BoardItem{
 		ID:          fmt.Sprintf("%d", m.idx.NextID),

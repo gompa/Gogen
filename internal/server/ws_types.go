@@ -531,6 +531,10 @@ type WSMessage struct {
 	SessionMaxCount     int    `json:"sessionMaxCount,omitempty"`
 	SessionMaxAgeDays   int    `json:"sessionMaxAgeDays,omitempty"`
 	WebApprovalHoldSecs int    `json:"webApprovalHoldSecs,omitempty"`
+	// Board caps (server→client pushes the EFFECTIVE value, so the modal
+	// never shows a bare 0 for "use the default").
+	BoardMaxItems        int `json:"boardMaxItems,omitempty"`
+	ReviewAgentMaxRounds int `json:"reviewAgentMaxRounds,omitempty"`
 	// Restart-staged options (A0b): persisted, applied on the next start.
 	WebBind              string `json:"webBind,omitempty"`
 	WebAllowedOrigins    string `json:"webAllowedOrigins,omitempty"`

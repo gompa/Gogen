@@ -121,12 +121,14 @@ type configYAML struct {
 	MCP                       string  `yaml:"mcp"`
 	PreserveReasoning         string  `yaml:"preserve_reasoning,omitempty"`
 	Board                     string  `yaml:"board,omitempty"`
+	BoardMaxItems             int     `yaml:"board_max_items,omitempty"`
 	Subagent                  string  `yaml:"subagent,omitempty"`
 	SubagentMaxDepth          int     `yaml:"subagent_max_depth,omitempty"`
 	SubagentMaxConcurrent     int     `yaml:"subagent_max_concurrent,omitempty"`
 	SubagentModel             string  `yaml:"subagent_model,omitempty"`
 	SubagentThinkingLevel     string  `yaml:"subagent_thinking_level,omitempty"`
 	ReviewAgent               string  `yaml:"review_agent,omitempty"`
+	ReviewAgentMaxRounds      int     `yaml:"review_agent_max_rounds,omitempty"`
 	ReviewAgentModel          string  `yaml:"review_agent_model,omitempty"`
 	ReviewAgentThinkingLevel  string  `yaml:"review_agent_thinking_level,omitempty"`
 	BoardStartPrompt          string  `yaml:"board_start_prompt,omitempty"`

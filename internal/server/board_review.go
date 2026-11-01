@@ -29,7 +29,7 @@ import (
 //   - recursion: a move by the reviewer itself for the same ticket never
 //     retriggers (the label prefix identifies it without bookkeeping; the
 //     prompt forbids the move anyway — this makes a stray move harmless),
-//   - ping-pong cap: MaxReviewRounds started reviews per ticket,
+//   - ping-pong cap: review_agent_max_rounds started reviews per ticket,
 //   - one live reviewer per ticket (ReviewSessionID + registry liveness).
 type boardReviewTrigger struct {
 	s *Server
@@ -76,11 +76,14 @@ func (t *boardReviewTrigger) maybeStartReview(item agent.BoardItem, by string) {
 	if isReviewActor(item.ID, by) {
 		return
 	}
-	// Ping-pong cap: past MaxReviewRounds started reviews the auto-review
-	// stops (the cap is announced once on the ticket so the state is
-	// visible without spamming the activity log on every later move).
-	if item.ReviewRounds >= agent.MaxReviewRounds {
-		t.announceCap(bm, &item)
+	// Ping-pong cap: past the configured review_agent_max_rounds the
+	// auto-review stops (the cap is announced once on the ticket so the
+	// state is visible without spamming the activity log on every later
+	// move). Read from the runtime overlay per move, so a settings-modal
+	// change applies without a restart.
+	runtimeCfg := s.ws.GetRuntimeConfig()
+	if limit := runtimeCfg.ReviewRoundsLimit(); item.ReviewRounds >= limit {
+		t.announceCap(bm, &item, limit)
 		return
 	}
 	// One reviewer per ticket: the linked review session still live in the
@@ -97,7 +100,6 @@ func (t *boardReviewTrigger) maybeStartReview(item agent.BoardItem, by string) {
 	// (the fresh session's provider is seeded with it). An empty cascade
 	// with no workspace default is refused: a headless first turn without
 	// a model would fail silently (nobody is attached).
-	runtimeCfg := s.ws.GetRuntimeConfig()
 	model := strings.TrimSpace(item.ReviewModel)
 	if model == "" {
 		model = strings.TrimSpace(runtimeCfg.ReviewAgentModel)
@@ -142,9 +144,9 @@ func (t *boardReviewTrigger) maybeStartReview(item agent.BoardItem, by string) {
 
 // announceCap comments the cap notice on the ticket (once — see
 // commentOnce).
-func (t *boardReviewTrigger) announceCap(bm *agent.BoardManager, item *agent.BoardItem) {
+func (t *boardReviewTrigger) announceCap(bm *agent.BoardManager, item *agent.BoardItem, limit int) {
 	t.commentOnce(bm, item,
-		fmt.Sprintf("auto-review stopped after %d review rounds; start a reviewer manually", agent.MaxReviewRounds))
+		fmt.Sprintf("auto-review stopped after %d review rounds; start a reviewer manually", limit))
 }
 
 // commentOnce comments a standing state on the ticket unless the activity

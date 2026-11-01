@@ -246,6 +246,89 @@ func TestRuntimeConfigRejectsInvalid(t *testing.T) {
 	}
 }
 
+// TestRuntimeConfigBoardCaps drives the two board caps through a real
+// WebSocket: board_max_items lands on the shared board manager live,
+// review_agent_max_rounds lands in the runtime overlay the review trigger
+// reads per move, both are persisted, and 0 ("use the built-in default") is
+// pushed as the EFFECTIVE value so the modal never shows a bare 0.
+func TestRuntimeConfigBoardCaps(t *testing.T) {
+	dir := t.TempDir()
+	stub := newBlockingStub()
+	s, _, _ := newContinuationServer(t, stub, dir)
+	srv := startWSServer(t, s)
+	defer srv.Close()
+
+	conn := dialWS(t, srv, "/ws")
+	defer conn.Close()
+	drainHandshake(t, conn)
+
+	// The shared board manager exists only once the board feature is on.
+	bm := s.ws.ensureBoardManager()
+	if got := bm.MaxItems(); got != config.DefaultBoardMaxItems {
+		t.Fatalf("initial MaxItems = %d, want %d", got, config.DefaultBoardMaxItems)
+	}
+
+	if err := conn.WriteJSON(WSMessage{
+		Type:                 "config",
+		ConfigFields:         []string{"boardMaxItems", "reviewAgentMaxRounds"},
+		BoardMaxItems:        3,
+		ReviewAgentMaxRounds: 2,
+	}); err != nil {
+		t.Fatalf("send config: %v", err)
+	}
+	cfg := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool {
+		return len(m.ConfigFields) == 0 && m.BoardMaxItems == 3
+	})
+	if cfg.ReviewAgentMaxRounds != 2 {
+		t.Fatalf("config echo reviewAgentMaxRounds = %d, want 2", cfg.ReviewAgentMaxRounds)
+	}
+	if got := bm.MaxItems(); got != 3 {
+		t.Fatalf("live board MaxItems = %d, want 3", got)
+	}
+	live := s.ws.GetRuntimeConfig()
+	if got := live.ReviewRoundsLimit(); got != 2 {
+		t.Fatalf("review rounds limit = %d, want 2", got)
+	}
+
+	// Persisted (the write happens before the broadcast).
+	data, err := os.ReadFile(projectfile.DefaultSavePath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"board_max_items: 3", "review_agent_max_rounds: 2"} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("expected %q in persisted config:\n%s", want, data)
+		}
+	}
+
+	// 0 = "use the built-in default": the push resolves it, so the modal
+	// shows the real cap rather than 0, and the manager falls back.
+	if err := conn.WriteJSON(WSMessage{
+		Type:         "config",
+		ConfigFields: []string{"boardMaxItems", "reviewAgentMaxRounds"},
+	}); err != nil {
+		t.Fatalf("send config reset: %v", err)
+	}
+	cfg = readUntil(t, conn, 5*time.Second, func(m WSMessage) bool {
+		return len(m.ConfigFields) == 0 && m.BoardMaxItems == config.DefaultBoardMaxItems
+	})
+	if cfg.ReviewAgentMaxRounds != config.DefaultReviewAgentMaxRounds {
+		t.Fatalf("reset push reviewAgentMaxRounds = %d, want %d", cfg.ReviewAgentMaxRounds, config.DefaultReviewAgentMaxRounds)
+	}
+	if got := bm.MaxItems(); got != config.DefaultBoardMaxItems {
+		t.Fatalf("MaxItems after reset = %d, want %d", got, config.DefaultBoardMaxItems)
+	}
+
+	// Negative values are rejected like the other int options.
+	if err := conn.WriteJSON(WSMessage{Type: "config", ConfigFields: []string{"boardMaxItems"}, BoardMaxItems: -1}); err != nil {
+		t.Fatalf("send invalid config: %v", err)
+	}
+	resp := readUntil(t, conn, 5*time.Second, func(m WSMessage) bool { return m.Type == "notice" })
+	if resp.Kind != "settings" || resp.Success {
+		t.Fatalf("negative boardMaxItems notice = %+v, want settings error", resp)
+	}
+}
+
 // TestSessionMaxAgeDaysKeepForever pins the -1 "keep sessions forever"
 // sentinel: accepted through the settings modal (unlike other int options,
 // which reject negatives), applied to the store's retention, persisted to

@@ -67,6 +67,13 @@ const (
 	// running subagents per parent session (web host). Spawning beyond it
 	// is refused; values <= 0 fall back to this default.
 	DefaultSubagentMaxConcurrent = 4
+	// DefaultBoardMaxItems is the total ticket cap on the project board.
+	// Adding a ticket past it is refused with an actionable error.
+	DefaultBoardMaxItems = 200
+	// DefaultReviewAgentMaxRounds caps auto-review starts per board ticket.
+	// Past it a move into in_review no longer spawns a reviewer, so a
+	// worker/reviewer ping-pong cannot loop forever.
+	DefaultReviewAgentMaxRounds = 5
 	// DefaultStatusDisplayHost is the mDNS name the ttgo/status firmware
 	// advertises. DefaultStatusDisplaySource is empty = AUTO: the reporter
 	// derives "gogen-<project dir>" so several Gogen instances in different
@@ -274,6 +281,12 @@ type Config struct {
 	// default off). When disabled the board tool is not registered and the
 	// web board tab is hidden.
 	Board string
+	// BoardMaxItems caps the number of tickets on the project board
+	// (0 = DefaultBoardMaxItems). Adding a ticket past the cap is refused
+	// with an error naming the limit, so a runaway agent cannot grow the
+	// board without bound. Live: the settings modal applies it to the
+	// shared board manager immediately.
+	BoardMaxItems int
 	// Subagent enables the subagent tool that spawns nested sessions
 	// ("on"/"off"; default off). When disabled the tool is not registered.
 	Subagent string
@@ -309,6 +322,11 @@ type Config struct {
 	// review session that marks the ticket done or comments findings and
 	// moves it back to in_progress.
 	ReviewAgent string
+	// ReviewAgentMaxRounds caps auto-review starts per board ticket
+	// (0 = DefaultReviewAgentMaxRounds). Past the cap a move into in_review
+	// comments the standing state on the ticket instead of spawning another
+	// reviewer. Live: the trigger reads the runtime overlay on every move.
+	ReviewAgentMaxRounds int
 	// ReviewAgentModel is the default model for auto review sessions.
 	// Empty (the default) resolves the cascade per ticket: the ticket's
 	// own review model override, then the workspace default model.
@@ -441,9 +459,11 @@ func Defaults() Config {
 		CommandIdleTimeoutSecs:    DefaultCommandIdleTimeoutSecs,
 		PreserveReasoning:         "auto",
 		Board:                     "off",
+		BoardMaxItems:             DefaultBoardMaxItems,
 		Subagent:                  "off",
 		SubagentMaxDepth:          DefaultSubagentMaxDepth,
 		SubagentMaxConcurrent:     DefaultSubagentMaxConcurrent,
+		ReviewAgentMaxRounds:      DefaultReviewAgentMaxRounds,
 		AgentInstructions:         "off",
 		Skills:                    "off",
 		Terminal:                  "off",
@@ -687,6 +707,24 @@ func (c *Config) SubagentLimit() int {
 		return DefaultSubagentMaxConcurrent
 	}
 	return c.SubagentMaxConcurrent
+}
+
+// BoardItemLimit returns the effective total ticket cap for the project
+// board. Values <= 0 fall back to DefaultBoardMaxItems.
+func (c *Config) BoardItemLimit() int {
+	if c == nil || c.BoardMaxItems <= 0 {
+		return DefaultBoardMaxItems
+	}
+	return c.BoardMaxItems
+}
+
+// ReviewRoundsLimit returns the effective cap on auto-review starts per
+// board ticket. Values <= 0 fall back to DefaultReviewAgentMaxRounds.
+func (c *Config) ReviewRoundsLimit() int {
+	if c == nil || c.ReviewAgentMaxRounds <= 0 {
+		return DefaultReviewAgentMaxRounds
+	}
+	return c.ReviewAgentMaxRounds
 }
 
 // TreeSitterEnabled reports whether tree-sitter checks are active.

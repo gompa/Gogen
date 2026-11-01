@@ -636,13 +636,15 @@ the server process):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GOGEN_BOARD` | off | Set to `on` to enable the project kanban board (board tool + web board tab; live-toggleable from the web settings modal) |
+| `GOGEN_BOARD_MAX_ITEMS` | `200` | Total ticket cap on the board; adding a ticket past it is refused with an error naming the limit (live-toggleable from the settings Board group) |
 | `GOGEN_SUBAGENT` | off | Set to `on` to enable the subagent tool (nested sessions) |
 | `GOGEN_SUBAGENT_MAX_DEPTH` | `1` | Maximum subagent nesting depth (main agent = depth 0); `1` = subagents cannot spawn subagents; values ≤ 0 fall back to the default |
 | `GOGEN_SUBAGENT_MAX_CONCURRENT` | `4` | Maximum subagents running concurrently per session (web and TUI); spawning beyond it is refused. Interrupted (idle) subagents do not hold a slot; values ≤ 0 fall back to the default |
 | `GOGEN_SUBAGENT_MODEL` | *(empty)* | Default model for spawned subagents (empty = inherit the parent's model; the tool's explicit `model` argument always wins) |
 | `GOGEN_SUBAGENT_THINKING_LEVEL` | *(empty)* | Reasoning-effort level for spawned subagents (empty = inherit the parent session's live level; `off` = never send `reasoning_effort`). A level the subagent's final model does not accept is omitted at spawn time |
 | `GOGEN_BOARD_START_PROMPT` | *(empty)* | Template for the agent started from a board ticket (`{id}` `{title}` `{description}` `{priority}` `{context}`; empty = built-in default) |
-| `GOGEN_REVIEW_AGENT` | off | Set to `on` to enable the board auto-review agent (web mode): a ticket moved into in_review — by an agent's board tool or by the user — automatically starts a headless review session that marks the ticket done or comments findings and moves it back to in_progress. Max 5 review rounds per ticket |
+| `GOGEN_REVIEW_AGENT` | off | Set to `on` to enable the board auto-review agent (web mode): a ticket moved into in_review — by an agent's board tool or by the user — automatically starts a headless review session that marks the ticket done or comments findings and moves it back to in_progress |
+| `GOGEN_REVIEW_AGENT_MAX_ROUNDS` | `5` | Auto-review starts allowed per ticket; past it a move into in_review comments the standing state on the card instead of spawning another reviewer (live-toggleable from the settings Board group) |
 | `GOGEN_REVIEW_AGENT_MODEL` | *(empty)* | Default model for auto review sessions (empty = the ticket's own review model override, else the workspace default model) |
 | `GOGEN_REVIEW_AGENT_THINKING_LEVEL` | *(empty)* | Reasoning-effort level for auto review sessions (empty = inherit the workspace level; a ticket's own review level override wins; a level the reviewer's final model does not accept is omitted) |
 | `GOGEN_BOARD_REVIEW_PROMPT` | *(empty)* | Template for the auto review agent (`{id}` `{title}` `{description}` `{priority}` `{context}` `{assignee}`; empty = built-in default) |

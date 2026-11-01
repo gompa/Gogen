@@ -177,12 +177,14 @@ var settings = []setting{
 
 	// --- features ---------------------------------------------------------
 	{key: "board", env: "GOGEN_BOARD", cfg: "Board", file: "Board", writer: "Board", kind: kString, omitDefault: true},
+	{key: "board_max_items", env: "GOGEN_BOARD_MAX_ITEMS", cfg: "BoardMaxItems", file: "BoardMaxItems", writer: "BoardMaxItems", kind: kInt, omitDefault: true},
 	{key: "subagent", env: "GOGEN_SUBAGENT", cfg: "Subagent", file: "Subagent", writer: "Subagent", kind: kString, omitDefault: true},
 	{key: "subagent_max_depth", env: "GOGEN_SUBAGENT_MAX_DEPTH", cfg: "SubagentMaxDepth", file: "SubagentMaxDepth", writer: "SubagentMaxDepth", kind: kInt, omitDefault: true},
 	{key: "subagent_max_concurrent", env: "GOGEN_SUBAGENT_MAX_CONCURRENT", cfg: "SubagentMaxConcurrent", file: "SubagentMaxConcurrent", writer: "SubagentMaxConcurrent", kind: kInt, omitDefault: true},
 	{key: "subagent_model", env: "GOGEN_SUBAGENT_MODEL", cfg: "SubagentModel", file: "SubagentModel", writer: "SubagentModel", kind: kString},
 	{key: "subagent_thinking_level", env: "GOGEN_SUBAGENT_THINKING_LEVEL", cfg: "SubagentThinkingLevel", file: "SubagentThinkingLevel", writer: "SubagentThinkingLevel", kind: kString},
 	{key: "review_agent", env: "GOGEN_REVIEW_AGENT", cfg: "ReviewAgent", file: "ReviewAgent", writer: "ReviewAgent", kind: kString, omitDefault: true},
+	{key: "review_agent_max_rounds", env: "GOGEN_REVIEW_AGENT_MAX_ROUNDS", cfg: "ReviewAgentMaxRounds", file: "ReviewAgentMaxRounds", writer: "ReviewAgentMaxRounds", kind: kInt, omitDefault: true},
 	{key: "review_agent_model", env: "GOGEN_REVIEW_AGENT_MODEL", cfg: "ReviewAgentModel", file: "ReviewAgentModel", writer: "ReviewAgentModel", kind: kString},
 	{key: "review_agent_thinking_level", env: "GOGEN_REVIEW_AGENT_THINKING_LEVEL", cfg: "ReviewAgentThinkingLevel", file: "ReviewAgentThinkingLevel", writer: "ReviewAgentThinkingLevel", kind: kString},
 	{key: "agent_instructions", env: "GOGEN_AGENT_INSTRUCTIONS", cfg: "AgentInstructions", file: "AgentInstructions", writer: "AgentInstructions", kind: kString, omitDefault: true},

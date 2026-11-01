@@ -79,12 +79,14 @@ type FileConfig struct {
 	CommandIdleTimeoutSecs    int                   `yaml:"command_idle_timeout_secs"`
 	PreserveReasoning         string                `yaml:"preserve_reasoning"`
 	Board                     string                `yaml:"board"`
+	BoardMaxItems             int                   `yaml:"board_max_items"`
 	Subagent                  string                `yaml:"subagent"`
 	SubagentMaxDepth          int                   `yaml:"subagent_max_depth"`
 	SubagentMaxConcurrent     int                   `yaml:"subagent_max_concurrent"`
 	SubagentModel             string                `yaml:"subagent_model"`
 	SubagentThinkingLevel     string                `yaml:"subagent_thinking_level"`
 	ReviewAgent               string                `yaml:"review_agent"`
+	ReviewAgentMaxRounds      int                   `yaml:"review_agent_max_rounds"`
 	ReviewAgentModel          string                `yaml:"review_agent_model"`
 	ReviewAgentThinkingLevel  string                `yaml:"review_agent_thinking_level"`
 	BoardStartPrompt          string                `yaml:"board_start_prompt"`

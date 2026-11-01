@@ -259,6 +259,20 @@ func TestReviewAgentGuards(t *testing.T) {
 	if capComments != 1 {
 		t.Fatalf("cap announced %d times, want 1 (activity %+v)", capComments, item.Activity)
 	}
+
+	// The cap is CONFIGURABLE (review_agent_max_rounds), read from the
+	// runtime overlay on every move: lowering it to 1 stops the auto-review
+	// after a single round, which the built-in default of 5 would not.
+	r := s.ws.GetRuntimeConfig()
+	r.ReviewAgentMaxRounds = 1
+	s.ws.SetRuntimeConfig(r)
+	before := liveSessions()
+	trig.maybeStartReview(agent.BoardItem{ID: "1", Title: "Fix parser crash", Status: "in_review", ReviewRounds: 1}, "user")
+	if got := liveSessions(); got != before {
+		t.Fatalf("configured cap (1) spawned a reviewer (live sessions = %d, want %d)", got, before)
+	}
+	r.ReviewAgentMaxRounds = 0
+	s.ws.SetRuntimeConfig(r)
 }
 
 // TestReviewAgentNoModel pins the no-model guard: with no workspace

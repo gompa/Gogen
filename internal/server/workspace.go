@@ -423,13 +423,28 @@ func (ws *Workspace) GetBoardManager() *agent.BoardManager {
 // ensureBoardManager returns the shared board manager, creating it (rooted
 // at the current working dir / global board dir) on first use. Callers that
 // enable the board feature must call this before seeding session agents.
+// The live board_max_items cap is applied to the (possibly new) manager so a
+// manager created after a settings change starts with the right limit.
 func (ws *Workspace) ensureBoardManager() *agent.BoardManager {
 	ws.boardManagerMu.Lock()
 	defer ws.boardManagerMu.Unlock()
 	if ws.boardManager == nil {
 		ws.boardManager = agent.NewBoardManager(ws.GetWorkingDir(), ws.GlobalMode)
 	}
+	ws.boardManager.SetMaxItems(ws.GetRuntimeConfig().BoardMaxItems)
 	return ws.boardManager
+}
+
+// applyBoardItemLimit pushes the configured board ticket cap onto the shared
+// board manager (no-op when the board feature has never been enabled: the
+// next ensureBoardManager seeds it).
+func (ws *Workspace) applyBoardItemLimit() {
+	ws.boardManagerMu.RLock()
+	bm := ws.boardManager
+	ws.boardManagerMu.RUnlock()
+	if bm != nil {
+		bm.SetMaxItems(ws.GetRuntimeConfig().BoardMaxItems)
+	}
 }
 
 // providerListFromConfig returns a copy of the config's registered provider
@@ -678,8 +693,10 @@ func newWorkspaceFromAgent(a *agent.Agent, cfg *config.Config) *Workspace {
 	}
 	if cfg != nil && cfg.BoardEnabled() {
 		// The workspace owns the single board manager; session agents are
-		// seeded from it in NewSessionAgent.
+		// seeded from it in NewSessionAgent. The ticket cap comes from the
+		// seeded runtime overlay (board_max_items).
 		ws.boardManager = agent.NewBoardManager(ws.WorkingDir, ws.GlobalMode)
+		ws.boardManager.SetMaxItems(ws.GetRuntimeConfig().BoardMaxItems)
 	}
 	if a.SkillsManager() != nil {
 		// The workspace shares the agent's skill manager (setup.go created

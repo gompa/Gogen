@@ -639,6 +639,35 @@ func buildConfigFields() map[string]fieldSpec {
 		add(f)
 	}
 
+	// --- project board ------------------------------------------------------
+	// The two caps are live: the ticket cap is pushed onto the shared board
+	// manager, and the auto-review cap is read from the runtime overlay by
+	// the review trigger on every move (so it needs no sweep). Both push the
+	// EFFECTIVE value — 0 in the overlay means "use the built-in default", so
+	// the modal must show the resolved number rather than a bare 0.
+	{
+		f := intSpec("boardMaxItems",
+			func(r *config.Config) *int { return &r.BoardMaxItems },
+			func(m *WSMessage) *int { return &m.BoardMaxItems })
+		f.normalize = nonNegInt("boardMaxItems")
+		f.project = func(r *config.Config, m *WSMessage) { m.BoardMaxItems = r.BoardItemLimit() }
+		f.msgGet = func(m *WSMessage) any { return m.BoardMaxItems }
+		f.applyLive = func(s *Server, r *config.Config) { s.ws.applyBoardItemLimit() }
+		f.sample = 50
+		add(f)
+	}
+
+	{
+		f := intSpec("reviewAgentMaxRounds",
+			func(r *config.Config) *int { return &r.ReviewAgentMaxRounds },
+			func(m *WSMessage) *int { return &m.ReviewAgentMaxRounds })
+		f.normalize = nonNegInt("reviewAgentMaxRounds")
+		f.project = func(r *config.Config, m *WSMessage) { m.ReviewAgentMaxRounds = r.ReviewRoundsLimit() }
+		f.msgGet = func(m *WSMessage) any { return m.ReviewAgentMaxRounds }
+		f.sample = 3
+		add(f)
+	}
+
 	// --- web server (restart-staged) ---------------------------------------
 	{
 		f := strSpec("webBind",

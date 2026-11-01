@@ -581,6 +581,52 @@ func TestBoardDelete(t *testing.T) {
 	}
 }
 
+// TestBoardMaxItems verifies the configurable ticket cap: the default is
+// boardMaxItems, SetMaxItems narrows it live, an add past the cap is refused
+// with the limit in the message, and a non-positive value restores the
+// default.
+func TestBoardMaxItems(t *testing.T) {
+	m := newTestBoard(t)
+	if got := m.MaxItems(); got != boardMaxItems {
+		t.Fatalf("default MaxItems = %d, want %d", got, boardMaxItems)
+	}
+
+	m.SetMaxItems(2)
+	if got := m.MaxItems(); got != 2 {
+		t.Fatalf("MaxItems after SetMaxItems(2) = %d", got)
+	}
+	for _, title := range []string{"one", "two"} {
+		if _, err := m.Add(title, "", "low", "user"); err != nil {
+			t.Fatalf("add %q: %v", title, err)
+		}
+	}
+	_, err := m.Add("three", "", "low", "user")
+	if err == nil {
+		t.Fatal("adding past the cap should fail")
+	}
+	if !strings.Contains(err.Error(), "max 2") {
+		t.Fatalf("cap error = %q, want it to name the limit", err)
+	}
+
+	// Raising the cap lets the board grow again.
+	m.SetMaxItems(3)
+	if _, err := m.Add("three", "", "low", "user"); err != nil {
+		t.Fatalf("add after raising the cap: %v", err)
+	}
+
+	// A non-positive value restores the built-in default.
+	m.SetMaxItems(0)
+	if got := m.MaxItems(); got != boardMaxItems {
+		t.Fatalf("MaxItems after reset = %d, want %d", got, boardMaxItems)
+	}
+	// A nil manager is safe (the server's accessors can hit it).
+	var nilMgr *BoardManager
+	nilMgr.SetMaxItems(5)
+	if got := nilMgr.MaxItems(); got != boardMaxItems {
+		t.Fatalf("nil manager MaxItems = %d, want %d", got, boardMaxItems)
+	}
+}
+
 // TestBoardToolGating verifies the MCP-style zero-trace gating: with the
 // feature off the board tool is absent from llmTools/AllowedToolNames and
 // executeTool returns "unknown tool"; with it on (and a manager attached) it
