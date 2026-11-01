@@ -126,10 +126,12 @@
         // accent color. The ws dispatch stays here and forwards to the
         // module's apply*Settings functions.
         import {
+            applyCodeIndexFrame,
             applyFeatureSettings,
             applyMCPSettings,
             applyProviderSettings,
             applyRuntimeSettings,
+            refreshEmbeddingModels,
             closeSettings,
             diffViewerMode,
             getNotificationPref,
@@ -4665,6 +4667,7 @@
             hist_index: handleHistIndex,
             tool_call: handleToolCall,
             tool_execute: handleToolExecute,
+            code_index_progress: handleCodeIndexProgress,
             tool_result: handleToolResult,
             term_opened: handleTermOpened,
             term_output: handleTermOutput,
@@ -4919,6 +4922,18 @@
             toolsStartedThisTurn = true;
             finalizeStreamingToolCard(data.index, data.toolCallId, data.tool, data.args || {});
 
+        }
+
+        function handleCodeIndexProgress(data) {
+            const line = data.codeIndexLine || '';
+            if (!applyCodeIndexFrame(data.codeIndexSeq, data.codeIndexPhase || '', line)) return;
+            if (!line) return;
+            for (const id of Object.keys(pendingToolCards)) {
+                const cardInfo = pendingToolCards[id];
+                if (cardInfo && cardInfo.waiting && cardInfo.toolName === 'search_meaning') {
+                    cardInfo.waiting.textContent = line;
+                }
+            }
         }
 
         function handleToolExecute(data) {
@@ -5813,7 +5828,10 @@
                 // same catalog — refresh it when the modal is open (the
                 // effort options come from the catalog's per-model
                 // reasoningEfforts too).
-                if (isSettingsOpen()) subagentPicker.render();
+                if (isSettingsOpen()) {
+                    subagentPicker.render();
+                    refreshEmbeddingModels();
+                }
                 // The catalog loads lazily (idle callback) and can arrive
                 // AFTER the attach context message: re-seed the badge if
                 // the window is still unresolved.
@@ -6015,7 +6033,6 @@
         }
 
         function handleConfig(data) {
-
             // The pane's session identity may have changed (new /
             // resume / fork / attach): adopt the new id and keep the
             // per-session toolbar mirrors current.
