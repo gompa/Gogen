@@ -339,6 +339,12 @@ func TestQueueSendNowDrainsTheWholeQueue(t *testing.T) {
 	if err := conn.WriteJSON(WSMessage{Type: "queue_send_now", QueueID: "q-c"}); err != nil {
 		t.Fatalf("send now: %v", err)
 	}
+	// The WS handler records the yield asynchronously. Wait for it before
+	// releasing the blocked model call: releasing first lets the turn reach
+	// the round boundary without the request and start another model call,
+	// which the single release below would not unblock.
+	gen := a.TurnGeneration()
+	waitFor(t, 5*time.Second, func() bool { return a.YieldRequested(gen) })
 	// Ending each blocked turn is what lets the worker start the next item,
 	// and it announces it first. Call 1 is the yielded round; the deliveries
 	// are calls 2..4.

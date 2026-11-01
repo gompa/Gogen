@@ -429,6 +429,13 @@ func (a *Agent) RequestYieldFor(gen uint64) bool {
 // returns: the next turn resets it.
 func (a *Agent) TurnYielded() bool { return a.yielded.Load() }
 
+// YieldRequested reports whether a host has asked the running turn gen
+// (from TurnGeneration) to stop at its next round boundary. It is false
+// once that turn ends or yields.
+func (a *Agent) YieldRequested(gen uint64) bool {
+	return gen != 0 && a.runningTurn.Load() == gen && a.yieldFor.Load() == gen
+}
+
 // StreamProcessInputWithImages is StreamProcessInput with optional
 // user-attached images (vision input). images is nil for text-only prompts.
 func (a *Agent) StreamProcessInputWithImages(ctx context.Context, input string, images []llm.ImageInput, h *llm.StreamHandlers) (out string, err error) {
