@@ -245,7 +245,9 @@ func (m *Model) savedTime(si agent.SessionInfo) time.Time {
 }
 
 // setSavedCache replaces the persisted-session snapshot and drops memoized
-// timestamps for sessions that are no longer listed (see savedTimes).
+// timestamps for sessions that are no longer listed (see savedTimes). The
+// list is the store's full index — nested (subagent) children included, since
+// they are a row source (nestedRows) even though the flat pass skips them.
 func (m *Model) setSavedCache(list []agent.SessionInfo) {
 	m.savedCache = list
 	if len(m.savedTimes) == 0 {

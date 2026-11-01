@@ -10,6 +10,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"gogen/internal/agent"
+	"gogen/internal/session"
 	"gogen/internal/subagents"
 )
 
@@ -219,6 +220,52 @@ func TestSidebarSettledChildFromStore(t *testing.T) {
 	}
 	if got := rowsFor(rows, "child-1")[0].childStatus; got != "failed" {
 		t.Fatalf("child-1 status = %q, want failed", got)
+	}
+}
+
+// TestSavedRefreshCarriesNestedChildren pins the second nested-row source END
+// TO END: a settled child (released by retention, interrupted, or a foreground
+// child, which never owns a live slot) comes from the persisted-session index
+// the sidebar refreshes from. That refresh used to read the FLAT /resume list,
+// which drops every nested session — so the settled-row branch could only ever
+// be fed by hand in tests, and a real child that lost its live slot vanished
+// from the panel for good.
+func TestSavedRefreshCarriesNestedChildren(t *testing.T) {
+	m := dragModel(t)
+	dir := m.agent.WorkingDir
+	store := session.NewStoreWithOptions(true, session.StoreOptions{})
+	m.agent.SessionStore = store
+	m.agent.SetSessionID("parent-1")
+	for _, snap := range []struct {
+		id string
+		s  session.SessionSnapshot
+	}{
+		{"parent-1", session.SessionSnapshot{WorkingDir: dir, Label: "parent job"}},
+		{"child-1", session.SessionSnapshot{WorkingDir: dir, Label: "subagent: failed job", ParentID: "parent-1", SubagentStatus: "failed", SubagentSummary: "boom"}},
+	} {
+		if err := store.Save(snap.id, snap.s); err != nil {
+			t.Fatalf("save %s: %v", snap.id, err)
+		}
+	}
+	m.refreshSavedSessions()
+
+	rows := m.buildSidebarRows()
+	got := rowsFor(rows, "child-1")
+	if len(got) != 1 {
+		t.Fatalf("settled child rows = %d, want exactly 1 (nested under its parent)", len(got))
+	}
+	if got[0].depth != 1 || got[0].parentID != "parent-1" {
+		t.Fatalf("child row depth/parent = %d/%q, want 1/\"parent-1\"", got[0].depth, got[0].parentID)
+	}
+	if got[0].live {
+		t.Fatal("a child with no live runtime must render settled, not live")
+	}
+	if got[0].childStatus != "failed" {
+		t.Fatalf("child status = %q, want failed (the persisted outcome)", got[0].childStatus)
+	}
+	// The parent stays a flat row (children are never flat rows).
+	if p := rowsFor(rows, "parent-1"); len(p) != 1 || p[0].depth != 0 {
+		t.Fatalf("parent rows = %v, want one flat row", p)
 	}
 }
 

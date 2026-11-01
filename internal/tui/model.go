@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"gogen/internal/agent"
-	"gogen/internal/session"
 	"gogen/internal/textutil"
 
 	tea "charm.land/bubbletea/v2"
@@ -453,15 +452,11 @@ func (m *Model) refreshSavedSessions() {
 	if m.agent == nil {
 		return
 	}
-	ctx := m.ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	result, _, err := m.agent.HandleSessionCommand(ctx, "sessions", session.NewID())
+	list, err := m.agent.SessionListAll()
 	if err != nil {
 		return
 	}
-	m.setSavedCache(result.Sessions)
+	m.setSavedCache(list)
 }
 
 // requestSavedSessions snapshots the persisted-session index off the
@@ -469,23 +464,26 @@ func (m *Model) refreshSavedSessions() {
 // every turn end, switch, and 30 s tick). The result arrives as
 // savedSessionsMsg; a stale response (an older request resolving after a
 // newer one) is dropped via savedReqSeq.
+//
+// The snapshot is the store's FULL list (SessionListAll), not the flat
+// /resume list: nested (subagent) children are a source of sidebar rows
+// (see nestedRows), so a refresh that dropped them left the settled-child
+// branch unreachable — a released child, an interrupted one, or a
+// foreground child (which owns no live slot) never appeared in the panel.
+// The flat-row pass skips children on its own (buildSidebarRows).
 func (m *Model) requestSavedSessions() tea.Cmd {
 	if m.agent == nil {
 		return nil
 	}
 	a := m.agent
-	ctx := m.ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	m.savedReqSeq++
 	seq := m.savedReqSeq
 	return func() tea.Msg {
-		result, _, err := a.HandleSessionCommand(ctx, "sessions", session.NewID())
+		list, err := a.SessionListAll()
 		if err != nil {
 			return savedSessionsMsg{seq: seq, ok: false}
 		}
-		return savedSessionsMsg{seq: seq, sessions: result.Sessions, ok: true}
+		return savedSessionsMsg{seq: seq, sessions: list, ok: true}
 	}
 }
 

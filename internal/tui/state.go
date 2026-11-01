@@ -121,7 +121,9 @@ type Model struct {
 	// savedCache snapshots the persisted-session index; the unified list
 	// overlays live sessions onto it (refreshed on turn end, session
 	// changes, and the 30 s tick). Written only on the Update thread
-	// (savedSessionsMsg).
+	// (savedSessionsMsg). It is the store's FULL list, nested (subagent)
+	// children included: they are the settled-row source for the panel
+	// (nestedRows), while buildSidebarRows skips them in the flat pass.
 	savedCache []agent.SessionInfo
 	// savedTimes memoizes each saved session's parsed UpdatedAt, keyed by
 	// session id (value: the raw string that was parsed, so a refresh that
