@@ -125,6 +125,17 @@ func (s *Scheduler) Start(ctx context.Context) {
 		ticker := time.NewTicker(s.interval)
 		defer ticker.Stop()
 		for {
+			// Stop and cancellation win over a ready ticker: a sweep started
+			// after Stop was signalled is a future sweep, and it can wait on
+			// the store lock (a slow Windows write) after the host asked to
+			// stop. Check the two terminal channels before the blocking select.
+			select {
+			case <-ctx.Done():
+				return
+			case <-stop:
+				return
+			default:
+			}
 			select {
 			case <-ctx.Done():
 				return

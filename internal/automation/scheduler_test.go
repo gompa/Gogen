@@ -362,9 +362,12 @@ func TestSchedulerStartIdempotent(t *testing.T) {
 	s.Start(ctx)
 	s.Start(ctx) // second start is a no-op
 	s.Stop()
+	// The first sweep does the store's initial MarkInterruptedRuns/ClaimDue
+	// file I/O before the loop reaches its select. Windows CI can take more
+	// than a second there; this test pins idempotence, not sweep latency.
 	select {
 	case <-s.Done():
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("scheduler did not stop")
 	}
 	awaitRunTerminal(t, st, a.ID)
@@ -380,7 +383,7 @@ func TestSchedulerContextCancel(t *testing.T) {
 	cancel()
 	select {
 	case <-s.Done():
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("scheduler did not stop on ctx cancel")
 	}
 	awaitRunTerminal(t, st, a.ID)
