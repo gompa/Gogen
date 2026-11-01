@@ -741,10 +741,16 @@ func (rt *sessionRuntime) deleteApprover() agent.DeleteApprover {
 		})
 		// The last client may have detached between the guard above and the
 		// registration: detach auto-denies what is already pending, so an
-		// approval registered after that sweep would wait forever. Deny it
-		// now instead.
+		// approval registered after that sweep would wait forever. With a
+		// hold, arm the hold instead of denying: a client can still reattach
+		// within the window, and the timer answers it otherwise. Without a
+		// hold, deny it now as before.
 		if rt.clientCount() == 0 {
-			rt.completeApproval(id, false)
+			if rt.approvalHold > 0 {
+				rt.scheduleAutoDenyAfter(rt.approvalHold)
+			} else {
+				rt.completeApproval(id, false)
+			}
 		}
 
 		select {
