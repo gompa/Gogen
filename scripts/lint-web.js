@@ -33,7 +33,7 @@ const vscodeFiles = fs.existsSync(vscodeDir)
   : [];
 const FILES = process.argv.slice(2).length > 0
   ? process.argv.slice(2)
-  : [`${WEB}/app.js`, `${WEB}/editor.js`, ...componentFiles, ...vscodeFiles];
+  : [`${WEB}/app.js`, `${WEB}/editor.js`, `${WEB}/ws-bootstrap.js`, ...componentFiles, ...vscodeFiles];
 
 let problems = 0;
 

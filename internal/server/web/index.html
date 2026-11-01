@@ -653,6 +653,11 @@
     <!-- xterm.js/addon-fit.js are loaded on demand by components/terminal.js
          (they were classic scripts here, blocking HTML parsing on every load
          even though the terminal panel is collapsed by default). -->
+    <!-- WebSocket bootstrap: opens the chat socket as soon as the document is
+         parsed, in parallel with app.js's module graph (~940 KB), instead of
+         waiting for app.js's last line. Module scripts run in document order,
+         so this must stay BEFORE app.js; connect() adopts the socket. -->
+    <script type="module" src="/ws-bootstrap.js"></script>
     <script type="module" src="/app.js"></script>
 </body>
 </html>

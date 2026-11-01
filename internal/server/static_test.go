@@ -180,6 +180,10 @@ func TestHandleStaticCacheControlPolicy(t *testing.T) {
 		{"/vendor/dompurify.esm.js", "public, max-age=" + strconv.Itoa(vendorMaxAge)},
 		{"/app.js", "no-cache"},
 		{"/editor.js", "no-cache"},
+		// The early WebSocket bootstrap (index.html loads it before app.js).
+		// no-cache like the rest of the app shell: it ships inside the binary
+		// and changes with every rebuild.
+		{"/ws-bootstrap.js", "no-cache"},
 		{"/styles.css", "no-cache"},
 		{"/components/popover.js", "no-cache"},
 	}

@@ -4446,11 +4446,29 @@
         // command tabs) lives in components/terminal.js.
         initTerminal({ getWs: () => ws });
 
+        // connect() opens the chat socket — or ADOPTS the one ws-bootstrap.js
+        // opened before this module graph finished loading. index.html loads
+        // that tiny module first, so the handshake overlaps the ~940 KB graph
+        // download instead of starting at the last line of this file. Frames
+        // the early socket already received are replayed in arrival order; a
+        // socket that errored/closed before adoption is discarded and a fresh
+        // one opens below, exactly like the pre-bootstrap behavior.
         function connect() {
-            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+            // Ownership marker for ws-bootstrap.js (see its ordering guard):
+            // from here on this module owns the chat socket.
+            window.__gogenWSOwned = true;
+            const early = window.__gogenEarlyWS;
+            window.__gogenEarlyWS = null;
+            const adopted = early && early.sock && !early.closed ? early : null;
+            if (adopted) {
+                ws = adopted.sock;
+                adopted.adopted = true;
+            } else {
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+            }
 
-            ws.onopen = () => {
+            const onOpen = () => {
                 clearTimeout(reconnectTimer);
                 reconnectTimer = null;
                 reconnectDelay = RECONNECT_BASE_MS;
@@ -4523,7 +4541,7 @@
                 }
             };
 
-            ws.onmessage = (event) => {
+            const onMessage = (event) => {
                 let data;
                 try {
                     data = JSON.parse(event.data);
@@ -4603,7 +4621,7 @@
                 handler(data);
             };
 
-            ws.onclose = () => {
+            const onClose = () => {
                 setConnState('disconnected');
                 endStream();
                 streamingToolCards = {};
@@ -4643,6 +4661,25 @@
                 reconnectTimer = setTimeout(connect, reconnectDelay);
                 reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
             };
+
+            ws.onopen = onOpen;
+            ws.onmessage = onMessage;
+            ws.onclose = onClose;
+
+            // The handshake may have finished while this module graph was
+            // still loading: the early socket's open event fired before these
+            // handlers existed, so run the open path now.
+            if (ws.readyState === WebSocket.OPEN) onOpen();
+
+            if (!adopted) return;
+            // Replay the frames received before adoption (session_state /
+            // history / config). Synchronous: events that arrive meanwhile
+            // queue in the task loop, so arrival order is preserved.
+            const buffered = adopted.buffered;
+            adopted.buffered = [];
+            for (const payload of buffered) {
+                onMessage({ data: payload });
+            }
         }
 
         // ── WebSocket message dispatch ──
