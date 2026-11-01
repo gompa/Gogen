@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -149,9 +150,7 @@ func TestWSUserTerminal(t *testing.T) {
 	}
 
 	// 2) Type a command; expect its output to stream back.
-	if err := conn.WriteJSON(WSMessage{Type: "user_term_input", Content: "echo hello\n"}); err != nil {
-		t.Fatalf("send input: %v", err)
-	}
+	sendShellInput(t, conn, "echo hello")
 	var outputs strings.Builder
 	deadline = time.Now().Add(15 * time.Second)
 	for {
@@ -173,9 +172,7 @@ func TestWSUserTerminal(t *testing.T) {
 gotOutput:
 
 	// 3) Exit the shell; expect user_term_exit with code 0.
-	if err := conn.WriteJSON(WSMessage{Type: "user_term_input", Content: "exit\n"}); err != nil {
-		t.Fatalf("send exit: %v", err)
-	}
+	sendShellInput(t, conn, "exit")
 	deadline = time.Now().Add(15 * time.Second)
 	for {
 		_ = conn.SetReadDeadline(deadline)
@@ -202,6 +199,7 @@ gotOutput:
 // own user_term_opened. A silent request here is the "stuck on starting…" bug.
 func TestWSUserTerminalRespawnAfterExit(t *testing.T) {
 	t.Setenv("SHELL", "/bin/sh")
+	seedShellProbe(t)
 	exec := agent.NewExecutor(t.TempDir())
 	a := agent.NewAgent(&termStreamStubProvider{}, exec, nil)
 	s := newTestServer(t, a, &config.Config{})
@@ -222,13 +220,16 @@ func TestWSUserTerminalRespawnAfterExit(t *testing.T) {
 	if _, ok := pump.waitFor("user_term_opened", 15*time.Second); !ok {
 		t.Fatalf("no user_term_opened for the first request; frames: %v", pump.types())
 	}
-	firstPID := shellPID(t, conn, pump, "first")
+	// Mark the first shell, so a reuse of the dead one is distinguishable from
+	// a real respawn below.
+	shellStateSet(t, conn)
+	if got := shellStateProbe(t, conn, pump, "first"); got != "set" {
+		t.Fatalf("first shell does not answer its own state marker (%q): the probe cannot tell shells apart", got)
+	}
 
 	// Kill the first shell; the exit report must arrive (the client keys its
 	// ↻ affordance off it).
-	if err := conn.WriteJSON(WSMessage{Type: "user_term_input", Content: "exit\n"}); err != nil {
-		t.Fatalf("send exit: %v", err)
-	}
+	sendShellInput(t, conn, "exit")
 	if _, ok := pump.waitFor("user_term_exit", 15*time.Second); !ok {
 		t.Fatalf("no user_term_exit after 'exit'; frames: %v", pump.types())
 	}
@@ -244,9 +245,10 @@ func TestWSUserTerminalRespawnAfterExit(t *testing.T) {
 	if n := pump.count("user_term_opened"); n != 2 {
 		t.Fatalf("user_term_opened frames = %d, want 2 (spawn + respawn); frames: %v", n, pump.types())
 	}
-	secondPID := shellPID(t, conn, pump, "second")
-	if secondPID == firstPID {
-		t.Fatalf("respawned shell pid = %s, same as the exited shell — no new shell was started", secondPID)
+	// The respawned shell is a NEW process: the marker the first one held is
+	// gone (a reuse of the exited shell would still answer "set").
+	if got := shellStateProbe(t, conn, pump, "second"); got != "unset" {
+		t.Fatalf("respawned shell still holds the first shell's marker (%q): no new shell was started", got)
 	}
 }
 
@@ -327,22 +329,29 @@ func (p *wsFramePump) waitFor(typ string, timeout time.Duration) (WSMessage, boo
 	}
 }
 
+// output concatenates every user_term_output frame received so far, in arrival
+// order — the shell's own record of what it printed.
+func (p *wsFramePump) output() string {
+	var b strings.Builder
+	for _, m := range p.snapshot() {
+		if m.Type == "user_term_output" {
+			b.WriteString(m.Content)
+		}
+	}
+	return b.String()
+}
+
 // waitForOutput waits until the accumulated user_term_output frames contain
 // substr, returning everything received so far.
 func (p *wsFramePump) waitForOutput(substr string, timeout time.Duration) (string, bool) {
 	deadline := time.Now().Add(timeout)
 	for {
-		var b strings.Builder
-		for _, m := range p.snapshot() {
-			if m.Type == "user_term_output" {
-				b.WriteString(m.Content)
-			}
-		}
-		if strings.Contains(b.String(), substr) {
-			return b.String(), true
+		out := p.output()
+		if strings.Contains(out, substr) {
+			return out, true
 		}
 		if time.Now().After(deadline) {
-			return b.String(), false
+			return out, false
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -356,6 +365,7 @@ func (p *wsFramePump) waitForOutput(substr string, timeout time.Duration) (strin
 // further requests reuse it instead of spawning another.
 func TestWSUserShellLazySpawn(t *testing.T) {
 	t.Setenv("SHELL", "/bin/sh")
+	seedShellProbe(t)
 	exec := agent.NewExecutor(t.TempDir())
 	a := agent.NewAgent(&termStreamStubProvider{}, exec, nil)
 	s := newTestServer(t, a, &config.Config{})
@@ -376,9 +386,7 @@ func TestWSUserShellLazySpawn(t *testing.T) {
 	}
 	// Input/resize before any request are no-ops (empty holder) and must not
 	// spawn a shell behind our back.
-	if err := conn.WriteJSON(WSMessage{Type: "user_term_input", Content: "echo should-not-run\n"}); err != nil {
-		t.Fatalf("send input: %v", err)
-	}
+	sendShellInput(t, conn, "echo should-not-run")
 	if err := conn.WriteJSON(WSMessage{Type: "user_term_resize", Cols: 100, Rows: 30}); err != nil {
 		t.Fatalf("send resize: %v", err)
 	}
@@ -399,14 +407,15 @@ func TestWSUserShellLazySpawn(t *testing.T) {
 		t.Fatalf("user_term_opened = %+v, want shell title and working dir", opened)
 	}
 	// The lazily created shell is live: it answers input.
-	if err := conn.WriteJSON(WSMessage{Type: "user_term_input", Content: "echo lazy-shell-ok\n"}); err != nil {
-		t.Fatalf("send input: %v", err)
-	}
+	sendShellInput(t, conn, "echo lazy-shell-ok")
 	if out, ok := pump.waitForOutput("lazy-shell-ok", 15*time.Second); !ok {
 		t.Fatalf("lazily spawned shell produced no output, got %q", out)
 	}
-	// Identify the shell, so a respawn masquerading as a reuse is caught below.
-	pidBefore := shellPID(t, conn, pump, "pidbefore")
+	// Mark the shell, so a respawn masquerading as a reuse is caught below.
+	shellStateSet(t, conn)
+	if got := shellStateProbe(t, conn, pump, "before"); got != "set" {
+		t.Fatalf("the live shell does not answer its own state marker (%q): the probe cannot tell shells apart", got)
+	}
 
 	// Two rapid requests must reuse the live shell (holder claim), not spawn a
 	// second one — and BOTH must be answered. A repeat request that got no
@@ -435,36 +444,82 @@ func TestWSUserShellLazySpawn(t *testing.T) {
 	if openedFrames != 3 {
 		t.Fatalf("user_term_opened frames = %d, want 3 (one per request); frames: %v", openedFrames, pump.types())
 	}
-	if pidAfter := shellPID(t, conn, pump, "pidafter"); pidAfter != pidBefore {
-		t.Fatalf("shell pid changed across repeat requests (%s → %s): a second shell was spawned", pidBefore, pidAfter)
+	// The same shell answered all three requests: it still holds the marker a
+	// replacement process would have lost.
+	if got := shellStateProbe(t, conn, pump, "after"); got != "set" {
+		t.Fatalf("shell state marker = %q after two repeat requests, want set: a second shell was spawned", got)
 	}
 	if n := pump.count("user_term_exit"); n != 0 {
 		t.Fatalf("unexpected user_term_exit; frames: %v", pump.types())
 	}
 }
 
-// shellPID asks the live shell for its own pid (echo <tag>=$$) and returns the
-// substituted digits. The tag makes each call's answer unambiguous in the
-// accumulated output stream.
-func shellPID(t *testing.T, conn *websocket.Conn, pump *wsFramePump, tag string) string {
+// sendShellInput types one command line into the live shell. The terminator is
+// platform-specific: the Windows user shell is cmd.exe (COMSPEC), which wants
+// CRLF, while a POSIX shell accepts a bare LF.
+func sendShellInput(t *testing.T, conn *websocket.Conn, line string) {
 	t.Helper()
-	if err := conn.WriteJSON(WSMessage{Type: "user_term_input", Content: "echo " + tag + "=$$\n"}); err != nil {
-		t.Fatalf("send pid probe %s: %v", tag, err)
+	eol := "\n"
+	if runtime.GOOS == "windows" {
+		eol = "\r\n"
 	}
-	re := regexp.MustCompile(tag + `=(\d+)`)
+	if err := conn.WriteJSON(WSMessage{Type: "user_term_input", Content: line + eol}); err != nil {
+		t.Fatalf("send input %q: %v", line, err)
+	}
+}
+
+// shellProbeVar is the shell variable shellStateSet re-assigns. seedShellProbe
+// pre-seeds it to "unset" in the server's environment, so a FRESHLY spawned
+// shell (which inherits os.Environ() through the pty) reports "unset" while the
+// live one, whose own assignment shadows the inherited value, reports "set".
+const shellProbeVar = "GOGEN_SHELL_PROBE"
+
+// seedShellProbe seeds the probe variable. It must run before the shell is
+// spawned: the pty inherits the test's environment.
+func seedShellProbe(t *testing.T) {
+	t.Helper()
+	t.Setenv(shellProbeVar, "unset")
+}
+
+// shellStateSet plants the probe value in the live shell (it prints nothing;
+// the pty echo of the command is ignored).
+func shellStateSet(t *testing.T, conn *websocket.Conn) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		// cmd.exe takes the whole rest of the line as the value.
+		sendShellInput(t, conn, "set "+shellProbeVar+"=set")
+		return
+	}
+	sendShellInput(t, conn, shellProbeVar+"=set")
+}
+
+// shellStateProbe asks the live shell for the value of the probe variable and
+// returns "set" or "unset". A pid probe (echo $$) is POSIX-only — cmd.exe
+// prints the literal "$$" — so shell identity comes from state instead: only
+// the SAME shell process holds the value shellStateSet assigned.
+//
+// The marker is EXPANDED by the shell, never literal in the command line: the
+// pty echoes the command back, so a literal marker there would be
+// indistinguishable from the answer.
+func shellStateProbe(t *testing.T, conn *websocket.Conn, pump *wsFramePump, tag string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		// cmd.exe expands %VAR% at parse time; an unset variable expands to
+		// the literal "%VAR%", which keeps the marker from being contiguous.
+		sendShellInput(t, conn, "echo GGPROBE%"+shellProbeVar+"%"+tag)
+	} else {
+		// Braces end the variable name, so the tag can follow it directly.
+		sendShellInput(t, conn, "echo GGPROBE${"+shellProbeVar+"}"+tag)
+	}
+	re := regexp.MustCompile("GGPROBE(set|unset)" + tag)
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		var b strings.Builder
-		for _, m := range pump.snapshot() {
-			if m.Type == "user_term_output" {
-				b.WriteString(m.Content)
-			}
-		}
-		if sub := re.FindStringSubmatch(b.String()); sub != nil {
-			return sub[1]
+		out := pump.output()
+		if sub := re.FindAllStringSubmatch(out, -1); len(sub) > 0 {
+			return sub[len(sub)-1][1]
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("no pid answer for %s; output: %q", tag, b.String())
+			t.Fatalf("no answer to the shell-state probe %s; output: %q", tag, out)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
