@@ -3,6 +3,7 @@ package server
 import (
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -195,6 +196,60 @@ gotOutput:
 	}
 }
 
+// TestWSUserTerminalRespawnAfterExit pins the ↻ flow the web UI offers on a
+// dead shell: after user_term_exit the connection may ask again and must get a
+// FRESH shell (the exited one was cleared from the holder), answered with its
+// own user_term_opened. A silent request here is the "stuck on starting…" bug.
+func TestWSUserTerminalRespawnAfterExit(t *testing.T) {
+	t.Setenv("SHELL", "/bin/sh")
+	exec := agent.NewExecutor(t.TempDir())
+	a := agent.NewAgent(&termStreamStubProvider{}, exec, nil)
+	s := newTestServer(t, a, &config.Config{})
+
+	srv := httptest.NewServer(http.HandlerFunc(s.HandleWS))
+	defer srv.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+srv.URL[4:]+"/ws", nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	pump := startWSFramePump(conn)
+
+	if err := conn.WriteJSON(WSMessage{Type: "user_term_request"}); err != nil {
+		t.Fatalf("send request: %v", err)
+	}
+	if _, ok := pump.waitFor("user_term_opened", 15*time.Second); !ok {
+		t.Fatalf("no user_term_opened for the first request; frames: %v", pump.types())
+	}
+	firstPID := shellPID(t, conn, pump, "first")
+
+	// Kill the first shell; the exit report must arrive (the client keys its
+	// ↻ affordance off it).
+	if err := conn.WriteJSON(WSMessage{Type: "user_term_input", Content: "exit\n"}); err != nil {
+		t.Fatalf("send exit: %v", err)
+	}
+	if _, ok := pump.waitFor("user_term_exit", 15*time.Second); !ok {
+		t.Fatalf("no user_term_exit after 'exit'; frames: %v", pump.types())
+	}
+
+	// Asking again (the ↻ button) must produce a second, new shell.
+	if err := conn.WriteJSON(WSMessage{Type: "user_term_request"}); err != nil {
+		t.Fatalf("send respawn request: %v", err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for pump.count("user_term_opened") < 2 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n := pump.count("user_term_opened"); n != 2 {
+		t.Fatalf("user_term_opened frames = %d, want 2 (spawn + respawn); frames: %v", n, pump.types())
+	}
+	secondPID := shellPID(t, conn, pump, "second")
+	if secondPID == firstPID {
+		t.Fatalf("respawned shell pid = %s, same as the exited shell — no new shell was started", secondPID)
+	}
+}
+
 // wsFramePump buffers every frame a test WebSocket receives in the background.
 // Reading in a goroutine is what makes an ABSENCE assertion possible: a read
 // deadline that expires poisons a gorilla connection ("repeated read on failed
@@ -350,19 +405,68 @@ func TestWSUserShellLazySpawn(t *testing.T) {
 	if out, ok := pump.waitForOutput("lazy-shell-ok", 15*time.Second); !ok {
 		t.Fatalf("lazily spawned shell produced no output, got %q", out)
 	}
+	// Identify the shell, so a respawn masquerading as a reuse is caught below.
+	pidBefore := shellPID(t, conn, pump, "pidbefore")
+
 	// Two rapid requests must reuse the live shell (holder claim), not spawn a
-	// second one.
+	// second one — and BOTH must be answered. A repeat request that got no
+	// reply left the client's tab on "starting…" for good: the client re-asks
+	// whenever it does not believe a shell is up, so silence is not
+	// recoverable (see spawnUserTerminal / terminalUserEnsure).
 	for i := 0; i < 2; i++ {
 		if err := conn.WriteJSON(WSMessage{Type: "user_term_request"}); err != nil {
 			t.Fatalf("send request %d: %v", i, err)
 		}
 	}
-	time.Sleep(750 * time.Millisecond)
-	if n := pump.count("user_term_opened"); n != 1 {
-		t.Fatalf("user_term_opened frames = %d, want 1; frames: %v", n, pump.types())
+	deadline := time.Now().Add(15 * time.Second)
+	for pump.count("user_term_opened") < 3 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	openedFrames := 0
+	for _, m := range pump.snapshot() {
+		if m.Type != "user_term_opened" {
+			continue
+		}
+		openedFrames++
+		if m.Content == "" || m.WorkingDir == "" {
+			t.Fatalf("user_term_opened #%d = %+v, want shell title and working dir", openedFrames, m)
+		}
+	}
+	if openedFrames != 3 {
+		t.Fatalf("user_term_opened frames = %d, want 3 (one per request); frames: %v", openedFrames, pump.types())
+	}
+	if pidAfter := shellPID(t, conn, pump, "pidafter"); pidAfter != pidBefore {
+		t.Fatalf("shell pid changed across repeat requests (%s → %s): a second shell was spawned", pidBefore, pidAfter)
 	}
 	if n := pump.count("user_term_exit"); n != 0 {
 		t.Fatalf("unexpected user_term_exit; frames: %v", pump.types())
+	}
+}
+
+// shellPID asks the live shell for its own pid (echo <tag>=$$) and returns the
+// substituted digits. The tag makes each call's answer unambiguous in the
+// accumulated output stream.
+func shellPID(t *testing.T, conn *websocket.Conn, pump *wsFramePump, tag string) string {
+	t.Helper()
+	if err := conn.WriteJSON(WSMessage{Type: "user_term_input", Content: "echo " + tag + "=$$\n"}); err != nil {
+		t.Fatalf("send pid probe %s: %v", tag, err)
+	}
+	re := regexp.MustCompile(tag + `=(\d+)`)
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		var b strings.Builder
+		for _, m := range pump.snapshot() {
+			if m.Type == "user_term_output" {
+				b.WriteString(m.Content)
+			}
+		}
+		if sub := re.FindStringSubmatch(b.String()); sub != nil {
+			return sub[1]
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no pid answer for %s; output: %q", tag, b.String())
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

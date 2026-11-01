@@ -41,6 +41,17 @@ let terminalHeight = TERM_DEFAULT_HEIGHT;
 // True when xterm.js failed to load/init; the strip then shows the
 // fallback hint instead of looking silently broken.
 let terminalLoadFailed = false;
+// How long the pinned user tab may sit in its "starting…" state before the
+// panel declares the spawn failed. The server starts a pty in milliseconds, so
+// silence means the request never reached it (a dropped frame, a connection the
+// server no longer services) or its reply was lost. Either way the tab must
+// stop claiming it is starting and offer the ↻ restart affordance instead of
+// waiting forever. A var, not a const, so a test can shorten the window instead
+// of waiting it out (the same seam as userTermOutputBatch in userterm.go); it
+// is module-scoped either way and never reassigned by the UI.
+var userTermSpawnTimeoutMs = 10000;
+// Pending spawn-timeout timer for the user shell (0 when none is armed).
+let userTermSpawnTimer = 0;
 
 // xterm.js + addon-fit.js are loaded on demand instead of as classic
 // scripts in index.html (they blocked HTML parsing on every page load
@@ -305,6 +316,14 @@ function terminalCreateTab(id, opts = {}) {
         closable: opts.closable !== false,
         user: !!opts.user,
         done: false,
+        // Set once the server reports this shell as up. While a spawn is
+        // pending the label says "starting…"; a failure must leave that state
+        // behind instead of parking the tab there for good (terminalUserExited).
+        opened: false,
+        // The shell's own name once the server reported it ("fish", "bash").
+        // Empty until then: the tab title falls back to the neutral "shell"
+        // while idle and to "starting…" only once a spawn was requested.
+        name: '',
         success: false,
     };
     terminals.set(id, entry);
@@ -343,7 +362,12 @@ export function terminalEnsureUserTab() {
         return;
     }
     terminalCreateTab(USER_TERM_ID, {
-        title: 'starting…',
+        // NOT "starting…": the shell is spawned lazily, on the first
+        // user_term_request (i.e. when the panel is EXPANDED), so a tab sitting
+        // in the collapsed strip is not starting anything. Claiming otherwise
+        // made the docked strip read "starting…" for the life of the page, no
+        // matter what the server did — see terminalUserRequest.
+        title: 'shell',
         tooltip: 'User shell (interactive)',
         closable: false,
         user: true,
@@ -363,8 +387,12 @@ export function terminalUserOpened(title, wd) {
     const t = terminals.get(USER_TERM_ID);
     if (!t) return;
     userTermState = 'ready';
-    t.titleEl.textContent = title || 'shell';
-    t.tab.title = wd ? (title || 'shell') + ' — ' + wd : (title || 'shell');
+    t.opened = true;
+    t.name = title || 'shell';
+    clearTimeout(userTermSpawnTimer);
+    userTermSpawnTimer = 0;
+    t.titleEl.textContent = t.name;
+    t.tab.title = wd ? t.name + ' — ' + wd : t.name;
     t.restartEl.hidden = true;
     t.done = false;
     t.statusEl.textContent = '';
@@ -374,13 +402,19 @@ export function terminalUserOpened(title, wd) {
     terminalMoreRender();
 }
 
-export function terminalUserExited(code) {
+// The user shell is gone (or never came up). message is the server's own
+// explanation when it sent one (user_term_exit's content: "failed to start
+// shell: …", "shell exited (N)") — the only place the real reason for a failed
+// spawn is reported, so it is shown instead of a generic status.
+export function terminalUserExited(code, message) {
     if (typeof window.Terminal !== 'function') {
-        terminalWhenReady(() => terminalUserExited(code));
+        terminalWhenReady(() => terminalUserExited(code, message));
         return;
     }
     const t = terminals.get(USER_TERM_ID);
     userTermState = 'dead';
+    clearTimeout(userTermSpawnTimer);
+    userTermSpawnTimer = 0;
     if (!t) return;
     t.done = true;
     t.success = code === 0;
@@ -388,8 +422,15 @@ export function terminalUserExited(code) {
     t.statusEl.textContent = t.success ? '✓' : '✗';
     t.statusEl.classList.add(t.success ? 'ok' : 'err');
     t.restartEl.hidden = false;
+    // A shell that never opened must stop advertising "starting…": the tab
+    // label is the strip's only progress indicator, so leaving the placeholder
+    // there made a failed spawn look like a startup that never finishes. The
+    // neutral name is deliberate — the shell never identified itself.
+    if (!t.opened) t.titleEl.textContent = t.name || 'shell';
+    const note = message ? String(message).trim() : '';
+    const reason = note || (t.success ? 'exited' : 'exited (' + code + ')');
     try {
-        t.term.write('\r\n\x1b[90m[' + (t.success ? 'exited' : 'exited (' + code + ')') + ' — click ↻ to restart]\x1b[0m');
+        t.term.write('\r\n\x1b[90m[' + reason + ' — click ↻ to restart]\x1b[0m');
     } catch (_) {}
     terminalUpdateBadge();
     terminalMoreRender();
@@ -409,11 +450,25 @@ function terminalUserRequest() {
     const t = terminals.get(USER_TERM_ID);
     if (t) {
         t.done = false;
+        t.opened = false;
         t.tab.classList.remove('done');
         t.statusEl.textContent = '…';
         t.statusEl.className = 'term-tab-status';
         t.restartEl.hidden = true;
+        // Now something IS starting: only a real request earns the label. A
+        // shell that already reported its name keeps it (a respawn must not
+        // relabel the tab from "fish" back to a placeholder).
+        t.titleEl.textContent = t.name || 'starting…';
     }
+    // Arm the spawn watchdog before the send: the send is skipped when the
+    // socket is not OPEN yet, and that case must recover too (the socket's open
+    // path re-asks, and whichever request lands first settles the state).
+    clearTimeout(userTermSpawnTimer);
+    userTermSpawnTimer = setTimeout(() => {
+        userTermSpawnTimer = 0;
+        if (userTermState !== 'spawning') return;
+        terminalUserExited(-1, 'no response from the server');
+    }, userTermSpawnTimeoutMs);
     const s = deps.getWs();
     if (s && s.readyState === WebSocket.OPEN) {
         s.send(JSON.stringify({ type: 'user_term_request' }));
@@ -509,6 +564,15 @@ function terminalSelect(id) {
 }
 
 function terminalSelectAndFocus(id) {
+    // Clicking the terminal strip is a request to SEE the terminal. While the
+    // docked panel is collapsed the tab bar is the only target (clicking a
+    // hidden terminal looked like a dead click and left the tab on its
+    // placeholder), so expand first — terminalSetExpanded also asks the server
+    // for the user shell, which is what the tab is advertising.
+    if (!terminalExpanded) {
+        if (terminalIsMobile()) terminalOpenMobile();
+        else terminalSetExpanded(true);
+    }
     terminalSelect(id);
     const t = terminals.get(id);
     if (t && t.user && userTermState === 'ready' && t.term) {

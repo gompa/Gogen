@@ -69,6 +69,7 @@ type UserTerminal struct {
 	readDone chan struct{}
 	done     chan struct{}
 	code     int
+	dir      string
 	title    string
 	closed   bool
 }
@@ -92,6 +93,15 @@ func (u *UserTerminal) Title() string {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.title
+}
+
+// WorkingDir returns the directory the shell was spawned in. It is the value
+// reported in user_term_opened, so a repeated request answers with the live
+// shell's own directory instead of whatever the workspace points at later.
+func (u *UserTerminal) WorkingDir() string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.dir
 }
 
 // Done is closed when the shell process exits.
@@ -162,6 +172,7 @@ func startUserTerminal(dir string, output func(string)) (*UserTerminal, error) {
 		cmd:      cmd,
 		readDone: make(chan struct{}),
 		done:     make(chan struct{}),
+		dir:      dir,
 		title:    title,
 	}
 	if output != nil {

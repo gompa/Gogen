@@ -21,17 +21,51 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// writeUserTermOpened reports a live user terminal to the client. It answers
+// BOTH a fresh spawn and a repeat user_term_request for the shell this
+// connection already holds, so a request always resolves the client's
+// "starting…" state (see terminalUserEnsure in components/terminal.js).
+func writeUserTermOpened(ws *wsConn, ut *UserTerminal) {
+	_ = ws.writeJSON(WSMessage{
+		Type:       "user_term_opened",
+		Content:    ut.Title(),
+		WorkingDir: ut.WorkingDir(),
+	})
+}
+
 // spawnUserTerminal starts the interactive user shell for a WebSocket
 // connection (if none is alive) and reports its lifecycle over the socket:
-// user_term_opened once the shell is up, user_term_exit when it exits. Output
+// user_term_opened once the shell is up (and again for every later request
+// that finds it alive), user_term_exit when it exits or fails to start. Output
 // is streamed as user_term_output chunks from the PTY read goroutine. The
 // shell runs in the workspace's current working directory at spawn time (the
 // executor has its own mutex, so no turn lock is needed). It is called from the
 // user_term_request handler only — never at connect — so a connection that
 // never uses the terminal panel costs no pty and no shell process.
 func (s *Server) spawnUserTerminal(ws *wsConn, holder *userTermHolder) {
-	if holder.get() != nil {
-		return
+	if ut := holder.get(); ut != nil {
+		// A terminal is already held. Drop it if it is dead but its exit
+		// goroutine has not reaped it yet (the holder is cleared there), so the
+		// request starts a fresh shell; otherwise answer the request
+		// idempotently instead of staying silent.
+		//
+		// Silence here left the client's tab on "starting…" for good: it
+		// re-asks whenever it does not believe a shell is up (a lost
+		// user_term_opened frame, a restart after a failed spawn), so the
+		// request must always settle that state. terminalUserEnsure documents
+		// exactly this contract ("the server already has one — it answers with
+		// user_term_opened again"), and the shell's own exit frame still
+		// follows from the exit goroutine when it ends.
+		select {
+		case <-ut.Done():
+			holder.clear(ut)
+			ut = nil
+		default:
+		}
+		if ut != nil {
+			writeUserTermOpened(ws, ut)
+			return
+		}
 	}
 	wd := s.ws.Exec.GetWorkingDir()
 	ut, err := startUserTerminal(wd, func(chunk string) {
@@ -47,9 +81,14 @@ func (s *Server) spawnUserTerminal(ws *wsConn, holder *userTermHolder) {
 	// held, and the loser is closed here.
 	if !holder.trySet(ut) {
 		_ = ut.Close()
+		// Losing the claim means another terminal is the connection's live one:
+		// report THAT one, so the request still settles the client's state.
+		if cur := holder.get(); cur != nil {
+			writeUserTermOpened(ws, cur)
+		}
 		return
 	}
-	_ = ws.writeJSON(WSMessage{Type: "user_term_opened", Content: ut.Title(), WorkingDir: wd})
+	writeUserTermOpened(ws, ut)
 	go func() {
 		<-ut.Done()
 		code := ut.ExitCode()

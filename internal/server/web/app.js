@@ -5045,7 +5045,10 @@
 
         function handleUserTermExit(data) {
 
-            terminalUserExited(data.code || 0);
+            // The content carries the server's explanation ("failed to start
+            // shell: …", "shell exited (N)") — the only place a failed spawn
+            // says why, so the tab shows it instead of a generic status.
+            terminalUserExited(data.code || 0, data.content);
 
         }
 
