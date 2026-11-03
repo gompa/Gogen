@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"gogen/internal/modelinfo"
 )
 
 // TestMain pins a deterministic, config-free shell for the whole package.
@@ -21,5 +23,8 @@ func TestMain(m *testing.M) {
 	if sh := os.Getenv("SHELL"); sh == "" || filepath.Base(sh) != "sh" {
 		_ = os.Setenv("SHELL", "/bin/sh")
 	}
+	// Providers built by these tests would each download the models.dev
+	// catalog; a unit test must not depend on the public registry (see Offline).
+	modelinfo.Offline()
 	os.Exit(m.Run())
 }

@@ -5,6 +5,7 @@
 // The full registry JSON is downloaded at most once per cacheTTL; a restart
 // reuses the on-disk cache while it is younger than that. Lookups are pure
 // in-memory / disk-cache matches and never block on the network.
+// Test binaries call Offline so no unit test reaches the public registry.
 package modelinfo
 
 import (
@@ -16,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gogen/internal/ioutil"
@@ -117,6 +119,22 @@ type Resolver struct {
 	lastFail   time.Time
 	url        string // empty means registryURL; overridden in tests
 }
+
+// offlineRegistry disables the DEFAULT registry download process-wide; see
+// Offline.
+var offlineRegistry atomic.Bool
+
+// Offline stops every Resolver in this process from downloading the models.dev
+// registry: they answer from the on-disk cache when it is fresh and otherwise
+// miss, exactly as they would against an unreachable registry. A resolver
+// pointed at an explicit URL (the tests in this package) is unaffected.
+//
+// Test binaries call this first. A unit test must not depend on the public
+// registry, and every provider a test builds otherwise started its own ~6 MB
+// download and parse — under the race detector that parsing dominated the run
+// (four concurrent catalog unmarshals were in flight when a CI test binary hit
+// its timeout). Call before creating resolvers.
+func Offline() { offlineRegistry.Store(true) }
 
 // CachePath returns <workingDir>/.gogen/models.json for a project-local
 // models.dev registry cache.
@@ -238,6 +256,12 @@ func (r *Resolver) load() error {
 // refreshAsync downloads the registry at most once at a time. Failures leave
 // existing data untouched and apply failBackoff before the next attempt.
 func (r *Resolver) refreshAsync() {
+	// Offline (see Offline): a test binary must never reach the public
+	// registry. Only the default endpoint is suppressed — a resolver pointed at
+	// an explicit URL is a test's own business.
+	if r.url == "" && offlineRegistry.Load() {
+		return
+	}
 	r.mu.Lock()
 	if r.refreshing {
 		r.mu.Unlock()

@@ -3,11 +3,13 @@ package modelinfo
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -699,3 +701,70 @@ func TestNoCachePathPersistsNothing(t *testing.T) {
 		t.Fatalf("resolve after refresh = %+v, %v", lim, err)
 	}
 }
+
+// TestOfflineSuppressesTheDefaultRegistryDownload pins the test-binary opt-out:
+// with Offline set, a resolver whose endpoint is the DEFAULT registry never
+// starts a request, answers "not found" from memory, and does not leave a
+// half-open refresh behind. A resolver with an explicit URL (this package's own
+// tests) keeps fetching, so the opt-out cannot hide a broken fetch path.
+func TestOfflineSuppressesTheDefaultRegistryDownload(t *testing.T) {
+	var calls atomic.Int32
+	counting := func(r *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("{}")),
+			Header:     make(http.Header),
+			Request:    r,
+		}, nil
+	}
+
+	Offline()
+	t.Cleanup(func() { offlineRegistry.Store(false) })
+
+	t.Run("default endpoint never dials", func(t *testing.T) {
+		r := NewResolver("")
+		r.client = &http.Client{Transport: roundTripperFunc(counting)}
+
+		if _, err := r.ResolveContextLimit("https://opencode.ai/zen/v1", "claude-opus-4-8"); err == nil {
+			t.Fatal("offline resolver resolved a limit from an empty registry")
+		}
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			if calls.Load() > 0 {
+				t.Fatalf("offline resolver issued %d request(s) to the registry", calls.Load())
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		r.mu.RLock()
+		refreshing := r.refreshing
+		r.mu.RUnlock()
+		if refreshing {
+			t.Fatal("offline refresh left the in-flight flag set")
+		}
+	})
+
+	t.Run("explicit URL still fetches", func(t *testing.T) {
+		r := NewResolver("")
+		r.url = "https://registry.test/api.json"
+		r.client = &http.Client{Transport: roundTripperFunc(counting)}
+		r.mu.Lock()
+		r.refreshing = false
+		r.mu.Unlock()
+
+		r.refreshAsync()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if calls.Load() > 0 {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Fatal("a resolver with an explicit URL must still fetch while Offline is set")
+	})
+}
+
+// roundTripperFunc adapts a function to http.RoundTripper.
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

@@ -8,6 +8,8 @@ import (
 
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
+
+	"gogen/internal/modelinfo"
 )
 
 // The copy path is the one that shipped: drag to select in the transcript —
@@ -28,8 +30,12 @@ import (
 // TestMain neutralizes the local clipboard for the whole package: the real
 // writer shells out to wl-copy/xclip/xsel, which must never run (nor touch the
 // developer's clipboard) during `go test`. Tests that observe a write stub it.
+// It also takes the whole package offline with respect to the models.dev
+// registry: providers built by these tests otherwise each started a ~6 MB
+// catalog download (see modelinfo.Offline).
 func TestMain(m *testing.M) {
 	writeClipboard = func(string) error { return errors.New("clipboard disabled in tests") }
+	modelinfo.Offline()
 	os.Exit(m.Run())
 }
 
