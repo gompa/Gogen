@@ -748,7 +748,13 @@ func (m *Model) renderSidebar(mainLines int) string {
 	out := make([]string, 0, mainLines)
 	add := func(s string) {
 		if len(out) < mainLines-sidebarBorderLines {
-			out = append(out, s)
+			// singleRow: every entry is ONE panel row by contract (the block
+			// is padded to mainLines and joined beside the chat column, so a
+			// row that split in two would make the frame taller than the
+			// terminal and desync the inline renderer). The rows interpolate
+			// outside text — session labels, working dir, meta — and a label
+			// that arrived with an embedded newline/tab must not wrap here.
+			out = append(out, singleRow(s))
 		}
 	}
 

@@ -555,12 +555,77 @@ func TestSelectionSurvivesStreaming(t *testing.T) {
 		t.Fatalf("selected text = %q, want the original selection", got)
 	}
 
-	// A full rebuild still clears: the rows are replaced, so row coordinates no
-	// longer address the same text.
+	// A full rebuild that leaves the covered rows intact keeps it too: this
+	// path runs at every round boundary and on every mid-line streaming write,
+	// so clearing here was the reason a selection made while a turn streamed
+	// was gone by the time the copy chord was pressed.
 	m.setViewportContent()
-	if m.selection != nil {
-		t.Fatal("selection survived a full transcript rebuild")
+	if m.selection == nil {
+		t.Fatal("selection cleared by a rebuild that did not move its rows")
 	}
+	if got := m.getSelectedText(); got != "first" {
+		t.Fatalf("after rebuild: selected text = %q, want the original selection", got)
+	}
+}
+
+// TestSelectionDroppedWhenRowsMove pins the other half of the rebuild rule:
+// when the rows under the selection no longer hold the text the user picked —
+// wholesale replacement (compaction, session switch), or a re-wrap that moves
+// the text — the highlight is dropped, because its coordinates would address
+// different lines.
+func TestSelectionDroppedWhenRowsMove(t *testing.T) {
+	newModelWithSelection := func(t *testing.T) *Model {
+		t.Helper()
+		m := newQueueTestModel()
+		m.chatLines = []string{"first row", "second row", "third row"}
+		m.SetSize(80, 40)
+		m.selection = &SelectionState{Active: true, StartX: 0, StartY: 1, EndX: 6, EndY: 1}
+		if got, want := m.getSelectedText(), "second"; got != want {
+			t.Fatalf("setup: selected text = %q, want %q", got, want)
+		}
+		return m
+	}
+
+	t.Run("selected row text replaced", func(t *testing.T) {
+		m := newModelWithSelection(t)
+		m.chatLines[1] = "a different line here"
+		m.setViewportContent()
+		if m.selection != nil {
+			t.Fatal("selection kept although the selected row's text changed")
+		}
+	})
+
+	t.Run("transcript replaced wholesale", func(t *testing.T) {
+		m := newModelWithSelection(t)
+		m.chatLines = []string{"compacted summary"}
+		m.setViewportContent()
+		if m.selection != nil {
+			t.Fatal("selection kept although the transcript was replaced")
+		}
+	})
+
+	t.Run("rows shift under the selection", func(t *testing.T) {
+		m := newModelWithSelection(t)
+		// A line inserted above moves every selected row down one.
+		m.chatLines = append([]string{"inserted above"}, m.chatLines...)
+		m.setViewportContent()
+		if m.selection != nil {
+			t.Fatal("selection kept although its rows moved")
+		}
+	})
+
+	t.Run("re-wrap that moves the text", func(t *testing.T) {
+		m := newModelWithSelection(t)
+		// A narrower terminal re-wraps the long row above the selection, so
+		// row 1 is no longer "second row".
+		m.chatLines[0] = "a first row that is long enough to wrap when the terminal gets narrow, repeatedly so"
+		m.setViewportContent()
+		m.SetSize(24, 40)
+		m.setViewportContent()
+		if m.selection != nil {
+			t.Fatal("selection kept although a re-wrap moved its rows")
+		}
+	})
 }
 
 // TestZeroWidthRunesInSelection pins the cell math for combining marks and

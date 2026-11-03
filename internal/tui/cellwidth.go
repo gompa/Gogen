@@ -117,6 +117,60 @@ func truncateCells(s string, width int) string {
 	return b.String()
 }
 
+// isRowBreakingRune reports whether r must not appear inside a single frame
+// row: the C0 controls (except ESC, which starts the SGR styling the renderer
+// writes) and DEL/C1, all of which either move the cursor (LF, CR, and the
+// C1 range, where a terminal may read 0x9B as CSI) or advance it to the next
+// tab stop (TAB), making the painted row disagree with the one the frame
+// budgeted.
+func isRowBreakingRune(r rune) bool {
+	if r == '\x1b' {
+		return false
+	}
+	return r < 0x20 || (r >= 0x7f && r <= 0x9f)
+}
+
+// singleRow makes s safe to render as ONE frame row by replacing the
+// characters that move the cursor or change the row's cell accounting with a
+// space (see isRowBreakingRune). Escape sequences are left alone: styling is
+// the renderer's own.
+//
+// The status bar and the busy strip are single-row BY CONTRACT — SetSize
+// budgets exactly one row for each — and so is every row of the sessions
+// panel. Nothing enforced that on the text they interpolate, though, and
+// those strings come from outside the layout: an error string from the
+// provider, the store, or a tool ("✗ <label>: <err>"), a command's output,
+// the working directory, a session label. A value that arrived with an
+// embedded newline rendered TWO rows where one was budgeted, so the frame
+// came out a row taller than the terminal — the inline renderer scrolled the
+// screen by one, its cell diff no longer matched the real screen, and the
+// composer and status bar appeared twice (duplicated input band) until
+// something forced a full repaint. A TAB is the same failure sideways: the
+// frame's own measure counts it as one cell while the terminal expands it to
+// the next tab stop and soft-wraps the row.
+func singleRow(s string) string {
+	clean := true
+	for _, r := range s {
+		if isRowBreakingRune(r) {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if isRowBreakingRune(r) {
+			b.WriteByte(' ')
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 // padCells returns s padded with spaces to exactly width cells (measured the
 // renderer's way) and truncated when it would overflow. It is the row-filling
 // primitive the viewport and status bar use instead of lipgloss's Width, whose
@@ -152,6 +206,27 @@ func joinVerticalCells(width int, blocks ...string) string {
 		rows[i] = padCells(r, width)
 	}
 	return strings.Join(rows, "\n")
+}
+
+// clampFrameRows trims a rendered frame to at most height rows.
+//
+// It is the last line of defence for the ONE outcome that must never happen:
+// an inline frame taller than the terminal scrolls the screen, after which the
+// renderer's cell diff no longer matches reality and the frame shows ghost or
+// duplicated rows until something forces a full repaint. Every section is
+// budgeted so this never fires in practice; a terminal too short for the
+// chrome (fewer than 3 rows) is the sole arrangement that cannot fit, and
+// there the rows closest to the cursor — the composer and the status bar —
+// are the ones worth keeping, so the trim is from the TOP.
+func clampFrameRows(frame string, height int) string {
+	if height <= 0 {
+		return frame
+	}
+	rows := strings.Split(frame, "\n")
+	if len(rows) <= height {
+		return frame
+	}
+	return strings.Join(rows[len(rows)-height:], "\n")
 }
 
 // joinHorizontalCells places left beside right (top-aligned), padding every

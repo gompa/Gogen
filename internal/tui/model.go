@@ -254,7 +254,17 @@ func (m *Model) setViewportContent() {
 		lineNo += len(lastParts)
 	}
 	m.tocAnchors = anchors
-	m.clearSelection()
+	// Selection: KEEP it when the rows it covers still hold the same text.
+	// This path is not reserved for wholesale replacements — it runs at every
+	// round boundary, on every mid-line streaming write (a growing patch diff)
+	// and on a resize — so clearing unconditionally destroyed a selection the
+	// user had just made while a turn streamed, with the copy still a
+	// keystroke away: "I selected text and copy did nothing". Appends leave
+	// the covered rows byte-identical, so that case is recognized exactly;
+	// a compaction, a session/session-model switch, or a re-wrap that moves
+	// the text still drops the highlight (row coordinates would address
+	// different lines).
+	m.selection = m.selectionAfterRebuild(wrappedParts)
 	// Full re-scan of all wrapped lines. Not actually rare: besides resize,
 	// session restore, and mode changes this runs at every round and turn
 	// end (streaming.go resetStreamState/handleStreamEnd) and on every
@@ -434,13 +444,12 @@ func (m *Model) renderMainColumn() string {
 	// GRAPHEME width, which re-widens any row holding a multi-codepoint
 	// cluster and pushes the frame past the terminal (see
 	// joinVerticalCells).
-	sections := []string{
-		vpView,
-		divider,
-		inputArea,
-		m.renderStatusBar(),
+	sections := []string{vpView}
+	if m.showDivider() {
+		sections = append(sections, divider)
 	}
-	return joinVerticalCells(main, sections...)
+	sections = append(sections, inputArea, m.renderStatusBar())
+	return clampFrameRows(joinVerticalCells(main, sections...), m.height)
 }
 
 // refreshSavedSessions synchronously snapshots the persisted-session

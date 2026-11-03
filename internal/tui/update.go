@@ -459,7 +459,7 @@ func (m *Model) handleKeyMsg(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.statusMsg != "" {
 		m.statusMsg = ""
 	}
-	if key.Matches(msg, m.keys.CopySelection) {
+	if m.matchesCopyChord(msg) {
 		_, cmd := m.copySelection()
 		return m, cmd
 	}

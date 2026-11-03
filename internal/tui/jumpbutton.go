@@ -43,7 +43,9 @@ func (m *Model) jumpButtonSegment() string {
 // column is too narrow for the label (plus the viewport-focus indicator,
 // which owns the same row's right end).
 func (m *Model) jumpButtonZone() (x0, x1 int, ok bool) {
-	if !m.viewDetached || m.modal != ModalNone {
+	if !m.viewDetached || m.modal != ModalNone || !m.showDivider() {
+		// No divider row on a degenerate terminal — the button lives IN it,
+		// so there is nowhere to paint or hit-test (see showDivider).
 		return 0, 0, false
 	}
 	chatW := m.mainWidth()

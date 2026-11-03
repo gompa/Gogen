@@ -48,8 +48,14 @@ func (m *Model) renderStatusBar() string {
 		// (error text can be arbitrary — "✗ Compact failed: …", persist
 		// warnings) would wrap to extra lines, grow the frame past the
 		// terminal, and desync the inline renderer.
+		//
+		// singleRow first: a message carrying a newline (a multi-line
+		// provider body, a tool error, a command's output) would otherwise
+		// render TWO rows off a one-row budget — the same frame growth from
+		// the other direction, and truncateCells does not count a newline
+		// toward the width (see singleRow).
 		avail := max(0, w-2) // -2 for the bar's horizontal padding
-		msg := m.statusMsg
+		msg := singleRow(m.statusMsg)
 		if cellWidth(msg) > avail {
 			msg = truncateCells(msg, avail)
 		}
@@ -68,7 +74,7 @@ func (m *Model) renderStatusBar() string {
 	}
 
 	// Model
-	if model := m.agent.CurrentModel(); model != "" {
+	if model := singleRow(m.agent.CurrentModel()); model != "" {
 		leftParts = append(leftParts, StatusBarDimStyle.Render(model))
 	}
 
@@ -86,7 +92,7 @@ func (m *Model) renderStatusBar() string {
 	// Working directory / global indicator
 	if m.agent.GlobalMode {
 		leftParts = append(leftParts, StatusBarGlobalStyle.Render("🌐 global"))
-	} else if wd := m.agent.WorkingDir; wd != "" {
+	} else if wd := singleRow(m.agent.WorkingDir); wd != "" {
 		leftParts = append(leftParts, StatusBarDimStyle.Render(wd))
 	}
 
@@ -97,7 +103,9 @@ func (m *Model) renderStatusBar() string {
 
 	left := strings.Join(leftParts, " ")
 
-	// Context line (right-aligned)
+	// Context line (right-aligned). singleRow for the same one-row budget:
+	// cellWidth SUMS a multi-line value, so a stray control character would
+	// widen the measured bar AND split it across rows.
 	right := ""
 	if m.contextLine != "" {
 		pct := 0
@@ -110,7 +118,7 @@ func (m *Model) renderStatusBar() string {
 		} else if float64(pct) >= contextmgr.WarnThreshold*100 || m.contextStats.Snapshot.NearCompact {
 			style = StatusBarWarningStyle
 		}
-		right = style.Render(m.contextLine)
+		right = style.Render(singleRow(m.contextLine))
 	}
 
 	// Layout: left and right with padding between. Prefer keeping the context
