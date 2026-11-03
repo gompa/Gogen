@@ -72,12 +72,20 @@ GOTMPDIR_RUN = mkdir -p "$(TEST_SCRATCH)"; \
 	trap 'exit 130' INT; \
 	trap 'exit 143' TERM;
 
+# The race detector's ~10x tax lands almost entirely on internal/agent's
+# tokenizer-heavy compaction tests, which need ~7m on an idle machine — 72% of
+# go test's 10m default, so any slower or busier runner crosses it and dies with
+# "panic: test timed out". Both -race recipes get an explicit budget with room
+# for that slowdown while still bounding a real hang (a stuck test fails at 20m
+# instead of hanging the job).
+RACE_TEST_TIMEOUT := 20m
+
 test:
-	@$(GOTMPDIR_RUN) GOTMPDIR="$$tmp" TMPDIR="$$tmp" go test -race ./...
+	@$(GOTMPDIR_RUN) GOTMPDIR="$$tmp" TMPDIR="$$tmp" go test -race -timeout $(RACE_TEST_TIMEOUT) ./...
 
 # Packages with //go:build debug code (view-drift, profiling, WS stall knobs).
 test-debug:
-	@$(GOTMPDIR_RUN) GOTMPDIR="$$tmp" TMPDIR="$$tmp" go test -race -tags debug ./internal/agent/ ./internal/profiling/ ./internal/server/
+	@$(GOTMPDIR_RUN) GOTMPDIR="$$tmp" TMPDIR="$$tmp" go test -race -timeout $(RACE_TEST_TIMEOUT) -tags debug ./internal/agent/ ./internal/profiling/ ./internal/server/
 
 vet:
 	go vet ./...

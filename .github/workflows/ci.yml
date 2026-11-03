@@ -31,9 +31,14 @@ jobs:
       - name: Tidy
         run: go mod tidy -diff
       - name: Test
+        # -timeout: the race detector's ~10x tax lands almost entirely on
+        # internal/agent's tokenizer-heavy compaction tests, which need ~7m on
+        # an idle machine — 72% of go test's 10m default, so a loaded runner
+        # crosses it and dies with "panic: test timed out" instead of a test
+        # failure. Keep in sync with RACE_TEST_TIMEOUT in the Makefile.
         run: |
           set -o pipefail
-          go test -race ./... 2>&1 | tee go-test.log
+          go test -race -timeout 20m ./... 2>&1 | tee go-test.log
       # A failing test names itself on stdout, but reading a job log needs
       # repository admin: a pull request's author (or a fork) cannot see it.
       # Re-emit the failure lines as annotations, which the checks API serves
@@ -53,7 +58,7 @@ jobs:
       # be compiled and run a third time for no extra coverage.
       - name: Test debug tags (Linux only)
         if: runner.os == 'Linux'
-        run: go test -race -tags debug ./internal/agent/ ./internal/profiling/ ./internal/server/
+        run: go test -race -timeout 20m -tags debug ./internal/agent/ ./internal/profiling/ ./internal/server/
       - name: Vet
         run: go vet ./...
       - name: Staticcheck
