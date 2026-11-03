@@ -569,7 +569,11 @@ func (m *Model) SetSize(width, height int) {
 		bandLines++
 	}
 
-	vpHeight := height - statusBarHeight - bandLines - 1 // -1 for divider
+	dividerRows := 1 // the divider above the input band (see showDivider)
+	if !m.showDivider() {
+		dividerRows = 0
+	}
+	vpHeight := height - statusBarHeight - bandLines - dividerRows
 	if vpHeight < 3 {
 		// Short terminal: shrink the input band before taking rows from
 		// the chat viewport, then floor the viewport at a single row. The
@@ -579,9 +583,9 @@ func (m *Model) SetSize(width, height int) {
 		if minBand := 1 + stripRows; bandLines < minBand {
 			bandLines = minBand
 		}
-		vpHeight = height - statusBarHeight - bandLines - 1
+		vpHeight = height - statusBarHeight - bandLines - dividerRows
 		if vpHeight < 1 {
-			vpHeight = 1 // under ~4 rows nothing fits; best effort
+			vpHeight = 1 // under ~3 rows nothing fits; View clamps the frame
 		}
 		textareaHeight = bandLines - stripRows
 		if textareaHeight < 1 {
@@ -614,6 +618,18 @@ func (m *Model) SetSize(width, height int) {
 	// boundary too, so this must respect a detached reader (followBottom,
 	// not pinFollow) — otherwise every turn end would yank them down.
 	m.followBottom()
+}
+
+// showDivider reports whether the frame has room for the divider row between
+// the transcript and the input band. A terminal shorter than
+// viewport+divider+band+status (4 rows) gives the divider up: the frame must
+// never be taller than the terminal (an over-tall inline frame scrolls the
+// screen and desyncs the renderer's cell diff), and of the four chrome rows
+// the divider is the one whose loss costs nothing structural. SetSize budgets
+// from this and renderMainColumn renders from it — one predicate, the same
+// contract busyStripRows follows.
+func (m *Model) showDivider() bool {
+	return m.height >= 4
 }
 
 // busyStripRows reports how many rows the busy progress strip contributes

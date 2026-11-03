@@ -5,6 +5,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
 	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/x/ansi"
@@ -175,6 +176,28 @@ func (m *Model) finalizeSelection() {
 	}
 }
 
+// matchesCopyChord reports whether msg is the copy chord.
+//
+// It is not just key.Matches: that compares the binding against Key.String(),
+// which returns Key.Text verbatim whenever the terminal filled it in — a chord
+// delivered as {Code:'c', ShiftedCode:'C', Text:"C", Mod: ctrl|shift}
+// stringifies as "C" and silently missed the binding (Key.Keystroke() spells
+// the modifiers out as "ctrl+shift+c"). Matching the keystroke form as well
+// keeps the chord working whatever shape the terminal reports, without
+// widening the binding to any other key.
+func (m *Model) matchesCopyChord(msg tea.KeyPressMsg) bool {
+	if key.Matches(msg, m.keys.CopySelection) {
+		return true
+	}
+	stroke := msg.Keystroke()
+	for _, want := range m.keys.CopySelection.Keys() {
+		if stroke == want {
+			return true
+		}
+	}
+	return false
+}
+
 // copySelection copies the current selection to the clipboard. Returns true
 // if a selection was present, plus a tea.Cmd when copying had to fall back
 // to the terminal (OSC52 via tea.SetClipboard) — the caller must run it.
@@ -185,19 +208,36 @@ func (m *Model) finalizeSelection() {
 func (m *Model) copySelection() (bool, tea.Cmd) {
 	text := m.getSelectedText()
 	if text == "" {
+		// Nothing selected: say so instead of silently doing nothing. This is
+		// the state a copy-key press lands in when the selection was dropped
+		// under a rebuild (see setViewportContent), and the old empty branch
+		// made that indistinguishable from a broken keybinding.
+		m.statusMsg = "No selection — drag to select text, then ctrl+shift+c"
 		return false, nil
 	}
-	if err := clipboard.WriteAll(text); err == nil {
-		m.statusMsg = fmt.Sprintf("✓ Copied %d chars to clipboard", utf8.RuneCountInString(text))
+	return true, m.writeSelection(text)
+}
+
+// writeClipboard is the local-clipboard writer. It is a package variable so
+// tests can stub it: the real one shells out to wl-copy/xclip/xsel, which must
+// not run (and must not touch the developer's clipboard) during `go test`.
+var writeClipboard = clipboard.WriteAll
+
+// writeSelection writes text to the clipboard and reports the outcome on the
+// status line, returning the OSC52 fallback cmd when the local clipboard is
+// unavailable.
+func (m *Model) writeSelection(text string) tea.Cmd {
+	n := utf8.RuneCountInString(text)
+	if err := writeClipboard(text); err == nil {
+		m.statusMsg = fmt.Sprintf("✓ Copied %d chars to clipboard", n)
 		m.clearSelection()
-		return true, nil
+		return nil
 	}
-	// Local clipboard unavailable (headless, SSH without xclip/xsel…):
-	// fall back to OSC52 through bubbletea's built-in support — most modern
-	// terminals (Alacritty, Kitty, iTerm2, GNOME Terminal, Windows
-	// Terminal, …) honor it even over SSH.
-	m.statusMsg = fmt.Sprintf("Sent %d chars to terminal clipboard", utf8.RuneCountInString(text))
-	return true, tea.SetClipboard(text)
+	// Local clipboard unavailable (headless, SSH without wl-copy/xclip/xsel,
+	// a container without the X socket…): fall back to OSC52 through
+	// bubbletea — most modern terminals honor it even over SSH.
+	m.statusMsg = fmt.Sprintf("Sent %d chars to terminal clipboard", n)
+	return tea.SetClipboard(text)
 }
 
 // runeWidth returns the terminal cell width of r: 2 for wide (CJK/emoji), 1 for
@@ -369,6 +409,41 @@ func (m *Model) getSelectedText() string {
 func (m *Model) clearSelection() {
 	m.selection = nil
 	m.selectionYOff = -1
+}
+
+// selectionAfterRebuild reports the selection to KEEP when the viewport's rows
+// have just been replaced by newRows: the same selection when every row it
+// covers still holds the same plain text, nil otherwise.
+//
+// The comparison is what separates "the transcript grew, your selection is
+// still exactly where you made it" — an append, a round boundary, a redundant
+// re-wrap at the same width — from "the rows moved under you": a compaction, a
+// session or model switch, or a resize that re-wrapped the text. Only the
+// first kind may keep the highlight, because only there do the row coordinates
+// still address the text the user picked. Plain text (not the styled row) is
+// compared: a style-only re-render must not drop a selection, while a row
+// whose TEXT changed is no longer what the user selected.
+//
+// Must be called with the OLD rows still published (before SetContentLines).
+func (m *Model) selectionAfterRebuild(newRows []string) *SelectionState {
+	s := m.selection
+	if s == nil || !s.Active {
+		return nil
+	}
+	lo, hi := s.StartY, s.EndY
+	if lo > hi {
+		lo, hi = hi, lo
+	}
+	old := m.viewport.Lines()
+	if lo < 0 || hi >= len(old) || hi >= len(newRows) {
+		return nil
+	}
+	for y := lo; y <= hi; y++ {
+		if stripANSI(old[y]) != stripANSI(newRows[y]) {
+			return nil
+		}
+	}
+	return s
 }
 
 // renderViewportWithSelection renders the viewport content with selection

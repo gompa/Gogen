@@ -103,7 +103,14 @@ func (m *Model) clearProgress() {
 // frame grows past the terminal, soft-wraps, and the composer and status
 // bar end up below the bottom edge. Widths ≤ 0 (literal-built test models
 // before SetSize) are left alone.
+//
+// The line is flattened with singleRow FIRST: the row is one row by budget
+// (SetSize reserves exactly one band row for it), and a label that carried a
+// newline — a tool name from an MCP server, a retry reason quoting a
+// multi-line error — would render two, growing the frame past the terminal
+// and desyncing the inline renderer.
 func (m *Model) fitStripRow(line string) string {
+	line = singleRow(line)
 	w := m.mainWidth()
 	if w <= 0 || cellWidth(line) <= w {
 		return line
