@@ -25,15 +25,23 @@ func TestReadFileRetrySucceedsAfterTransientError(t *testing.T) {
 	path := filepath.Join(dir, "store.json")
 
 	const delay = 50 * time.Millisecond
-	// Create the file well before the second attempt (which fires after the
-	// first delay), so the retry — not the first attempt — is what succeeds.
-	go func() {
-		time.Sleep(delay / 2)
-		_ = os.WriteFile(path, []byte(`{"ok":true}`), 0o600)
-	}()
-
 	calls := 0
-	data, err := readFileRetryWith(path, 8, delay, countTransient(8, &calls))
+	// Publish the file from the transient predicate: that runs synchronously
+	// between the failed first attempt and the retry, which is exactly the
+	// window a concurrent temp-file replace covers. The old goroutine+sleep
+	// version assumed the writer would win a scheduling race against the
+	// first backoff; under a loaded -race suite it regularly did not, so the
+	// second attempt failed too and the test reported calls=2.
+	transient := func(error) bool {
+		calls++
+		if calls == 1 {
+			if err := os.WriteFile(path, []byte(`{"ok":true}`), 0o600); err != nil {
+				t.Fatalf("write retry target: %v", err)
+			}
+		}
+		return true
+	}
+	data, err := readFileRetryWith(path, 8, delay, transient)
 	if err != nil {
 		t.Fatalf("readFileRetryWith: %v (calls=%d)", err, calls)
 	}
