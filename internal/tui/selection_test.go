@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -665,5 +666,153 @@ func TestMapPlainToStyledSkipsOSC(t *testing.T) {
 	got := mapPlainToStyled(5, styled)
 	if got >= len(styled) || styled[got] != 't' {
 		t.Fatalf("mapPlainToStyled(5) = %d (%q), want the 't' of \"text\"", got, styled[got:])
+	}
+}
+
+// selectionScreenModel builds a sized, sidebar-free model whose transcript
+// fills the viewport: every chat line is short enough to stay a single wrapped
+// row, so plain content row i is chat line i.
+func selectionScreenModel(t *testing.T, rows int) *Model {
+	t.Helper()
+	m := newSidebarTestModel(80)
+	m.sidebarVisible = false
+	m.SetSize(80, 24)
+	m.chatLines = nil
+	for i := 0; i < rows; i++ {
+		m.chatLines = append(m.chatLines, fmt.Sprintf("row %03d", i))
+	}
+	m.setViewportContent()
+	m.followBottom()
+	return m
+}
+
+// dragMouse runs a real press → motion → release through the message
+// dispatcher, so the handlers' precedence (rail, jump button, panel) is part
+// of what is under test.
+func dragMouse(m *Model, x0, y0, x1, y1 int) {
+	m.handleMouseMsg(tea.MouseClickMsg{X: x0, Y: y0, Button: tea.MouseLeft})
+	m.handleMouseMsg(tea.MouseMotionMsg{X: x1, Y: y1, Button: tea.MouseLeft})
+	m.handleMouseMsg(tea.MouseReleaseMsg{X: x1, Y: y1, Button: tea.MouseLeft})
+}
+
+// Regression for "selecting near the end of the screen does not work": a drag
+// whose end lands on the chrome rows below the transcript (divider, composer,
+// status bar) must finish on the last VISIBLE line. The row used to be mapped
+// straight into content coordinates, which named a line hidden underneath the
+// input band — the copy silently carried lines the highlight never showed —
+// and when the transcript ended at the bottom of the screen the coordinate was
+// out of range, so the motion was DROPPED: the in-flight selection kept
+// whatever point it had and finalizeSelection threw it away as empty.
+func TestSelectionDragBelowViewportClampsToVisibleRows(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		offset int // -1: follow the live edge
+	}{
+		{name: "following the live edge", offset: -1},
+		{name: "scrolled up into history", offset: 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := selectionScreenModel(t, 100)
+			if tc.offset >= 0 {
+				m.viewport.SetYOffset(tc.offset)
+				m.viewDetached = true
+			}
+			yOff := m.viewport.YOffset
+			lastVisible := yOff + m.viewport.Height - 1
+			if lastVisible >= m.plainLineCount() {
+				t.Fatalf("test setup: %d content rows cannot fill the viewport", m.plainLineCount())
+			}
+			vpHeight := m.viewport.Height
+
+			m.handleMouseMsg(tea.MouseClickMsg{X: 1, Y: 5, Button: tea.MouseLeft})
+			if m.selection == nil {
+				t.Fatal("press inside the viewport did not start a selection")
+			}
+			for y := 6; y < m.height; y++ {
+				m.handleMouseMsg(tea.MouseMotionMsg{X: 6, Y: y, Button: tea.MouseLeft})
+				if m.selection == nil {
+					t.Fatalf("motion at row %d dropped the in-flight selection", y)
+				}
+				// Inside the band the pointer maps 1:1; everything below it
+				// (the divider, composer and status bar) clamps to the last
+				// visible row instead of naming a hidden line.
+				want := yOff + min(y, vpHeight-1)
+				if got := m.selection.EndY; got != want {
+					t.Fatalf("motion at row %d: EndY = %d, want %d (last visible line %d)",
+						y, got, want, lastVisible)
+				}
+			}
+			m.handleMouseMsg(tea.MouseReleaseMsg{X: 6, Y: m.height - 1, Button: tea.MouseLeft})
+
+			if m.selection == nil {
+				t.Fatal("release below the viewport dropped the selection")
+			}
+			selected := strings.Split(m.getSelectedText(), "\n")
+			if want := lastVisible - (yOff + 5) + 1; len(selected) != want {
+				t.Fatalf("selected %d rows, want %d (only the visible ones): %q",
+					len(selected), want, m.getSelectedText())
+			}
+			// The drag ends at content cell 5, so the last visible line
+			// contributes its first five cells: no line beyond it was copied.
+			if got, want := selected[len(selected)-1], "row 0"; got != want {
+				t.Fatalf("last selected row = %q, want %q (the start of the last visible line)", got, want)
+			}
+		})
+	}
+}
+
+// Regression: with a transcript shorter than the viewport the rows below the
+// last line are blank, not out of bounds. A drag that ran into them used to be
+// dropped (the same silent-empty-selection failure), and a press there did
+// nothing at all — a dead zone over the bottom half of the screen.
+func TestSelectionDragIntoBlankTailClampsToEnd(t *testing.T) {
+	m := selectionScreenModel(t, 3)
+	if got := m.viewport.YOffset; got != 0 {
+		t.Fatalf("test setup: YOffset = %d, want 0 (the transcript is shorter than the viewport)", got)
+	}
+	blankRow := m.viewport.Height - 1
+
+	t.Run("press in the blank rows anchors at the end of the text", func(t *testing.T) {
+		m.clearSelection()
+		m.handleMouseMsg(tea.MouseClickMsg{X: 1, Y: blankRow, Button: tea.MouseLeft})
+		if m.selection == nil || !m.selection.Dragging {
+			t.Fatal("press in the blank rows did not start a selection")
+		}
+		if got, want := m.selection.StartY, 2; got != want {
+			t.Fatalf("StartY = %d, want the last line %d", got, want)
+		}
+		// The column still follows the pointer (content cell 0 at terminal
+		// column 1); only the row is clamped, to the end of the text.
+		if got, want := m.selection.StartX, 0; got != want {
+			t.Fatalf("StartX = %d, want %d (the pointer's column)", got, want)
+		}
+		m.clearSelection()
+	})
+
+	t.Run("drag from the text into the blank rows selects to the end", func(t *testing.T) {
+		dragMouse(m, 1, 0, 6, blankRow)
+		if m.selection == nil {
+			t.Fatal("the drag was dropped")
+		}
+		if got, want := m.selection.EndY, 2; got != want {
+			t.Fatalf("EndY = %d, want the last line %d", got, want)
+		}
+		if got, want := m.getSelectedText(), "row 000\nrow 001\nrow 0"; got != want {
+			t.Fatalf("selected text = %q, want %q", got, want)
+		}
+	})
+}
+
+// A press on the chrome rows below the viewport must NOT start a selection:
+// only a drag is clamped into the transcript, so a click on the composer or the
+// status bar stays a click on the chrome.
+func TestPressBelowViewportStartsNoSelection(t *testing.T) {
+	m := selectionScreenModel(t, 100)
+	for y := m.viewport.Height; y < m.height; y++ {
+		m.clearSelection()
+		m.handleMouseMsg(tea.MouseClickMsg{X: 1, Y: y, Button: tea.MouseLeft})
+		if m.selection != nil {
+			t.Fatalf("press at row %d (below the viewport) started a selection", y)
+		}
 	}
 }

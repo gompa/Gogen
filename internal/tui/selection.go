@@ -329,6 +329,11 @@ func cellsToRuneRange(s string, startCell, endCell int) (startRi, endRi int) {
 
 // mouseToContent converts terminal-relative mouse coordinates to
 // content coordinates (line and cell column in the plain wrapped content).
+// Coordinates outside the viewport's visible band are clamped into it: a drag
+// routinely leaves the transcript (down over the divider, composer and status
+// bar, or the blank rows a short transcript leaves at the bottom of the band),
+// and the mapping must land on the nearest line that is actually on screen.
+// Returns (-1, -1) when there is nothing to address.
 func (m *Model) mouseToContent(mouseX, mouseY int) (int, int) {
 	// Chat column starts right of the sessions panel; presses on the panel
 	// itself never select chat text.
@@ -336,14 +341,38 @@ func (m *Model) mouseToContent(mouseX, mouseY int) (int, int) {
 	if mouseX < 0 {
 		return -1, -1
 	}
+	lineCount := m.plainLineCount()
+	if lineCount == 0 {
+		return -1, -1
+	}
+	// Clamp the ROW to the viewport's visible band before it is mapped to a
+	// content line. Without this a drag that ended on the chrome rows below
+	// the transcript named a content line that the reader cannot see (the
+	// transcript continues under the divider, composer and status bar), so a
+	// selection near the bottom of the screen silently covered lines that
+	// were never highlighted, and a drag that ended below the last line was
+	// dropped outright — the final motion event carried no valid point, and
+	// finalizeSelection then threw the whole selection away as empty.
+	if mouseY < 0 {
+		mouseY = 0
+	}
+	if h := m.viewport.Height; h > 0 && mouseY >= h {
+		mouseY = h - 1
+	}
 	// Account for viewport scroll position. While dragging, freeze to the
 	// YOffset captured at press so motion coordinates stay stable.
 	contentY := mouseY + m.viewport.YOffset
 	if m.selection != nil && m.selection.Dragging && m.selectionYOff >= 0 {
 		contentY = mouseY + m.selectionYOff
 	}
-	if contentY < 0 || contentY >= m.plainLineCount() {
-		return -1, -1
+	// Clamp to the transcript itself: rows past the last line (a transcript
+	// shorter than the viewport leaves blank rows) address the end of the
+	// text, like a caret clamped to the end of a document.
+	if contentY >= lineCount {
+		contentY = lineCount - 1
+	}
+	if contentY < 0 {
+		contentY = 0
 	}
 
 	// Account for left padding (ViewportStyle has PaddingLeft(1)) and the

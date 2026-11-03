@@ -167,15 +167,50 @@ func TestTocMouse(t *testing.T) {
 		}
 	})
 
-	t.Run("click in the strip off a dot consumes without jumping", func(t *testing.T) {
+	// The trigger strip is a hover surface; the PRESS belongs to the rail only
+	// on the dot itself. Swallowing every press in the strip turned the chat's
+	// rightmost four columns — the end of every line — into a dead zone where
+	// a text selection could not even start.
+	t.Run("press off a dot falls through to selection", func(t *testing.T) {
 		m.tocHover = true
 		m.viewport.SetYOffset(0)
-		if !m.handleTocMouse(mouseEvent{x: railX, y: 10, button: tea.MouseLeft, kind: mousePress}) {
-			t.Fatal("strip press must be consumed (no selection)")
+		for _, x := range []int{railX - 3, railX - 2, railX - 1, railX} {
+			if m.handleTocMouse(mouseEvent{x: x, y: 10, button: tea.MouseLeft, kind: mousePress}) {
+				t.Fatalf("press at x=%d on a dot-less row must not be consumed", x)
+			}
 		}
 		if m.viewport.YOffset != 0 {
 			t.Fatalf("YOffset = %d, want 0", m.viewport.YOffset)
 		}
+	})
+
+	t.Run("press left of the dot column falls through", func(t *testing.T) {
+		m.viewport.SetYOffset(0)
+		// Row 0 carries the first dot; only the dot's own column (plus one
+		// cell of tolerance) may jump.
+		if m.handleTocMouse(mouseEvent{x: railX - 3, y: 0, button: tea.MouseLeft, kind: mousePress}) {
+			t.Fatal("press two cells left of the dot must not be consumed")
+		}
+		if !m.handleTocMouse(mouseEvent{x: railX - 1, y: 0, button: tea.MouseLeft, kind: mousePress}) {
+			t.Fatal("press within the dot's tolerance must be consumed")
+		}
+	})
+
+	// An in-flight drag owns the pointer: consuming the motion in the strip
+	// froze the selection at the last cell before it, so dragging to the right
+	// edge left the tail of the line out of the copy.
+	t.Run("motion during a drag does not steal the selection", func(t *testing.T) {
+		m.viewport.SetYOffset(0)
+		m.selection = &SelectionState{Active: true, Dragging: true, StartX: 0, StartY: 5, EndX: 5, EndY: 5}
+		m.selectionYOff = 0
+		m.tocHover = true
+		if m.handleTocMouse(mouseEvent{x: railX, y: 5, button: tea.MouseLeft, kind: mouseMotion}) {
+			t.Fatal("motion during a drag must reach the selection handler")
+		}
+		if m.tocHover {
+			t.Fatal("the rail's dots must not cover the dragged-over cells")
+		}
+		m.clearSelection()
 	})
 
 	t.Run("wheel falls through to the viewport", func(t *testing.T) {

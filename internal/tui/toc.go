@@ -133,6 +133,11 @@ func (m *Model) tocJumpNext(next bool) bool {
 // true when the event was consumed (it must not start a text selection).
 // Wheel events always fall through to the viewport (web parity: the rail's
 // wheel chains to the chat below).
+//
+// The wide trigger strip is a HOVER surface only. A press belongs to the rail
+// just on the dot itself (plus one cell of tolerance) — the rest of the strip
+// is ordinary transcript text, and swallowing presses there cost the chat its
+// rightmost four columns as a selection surface on every row.
 func (m *Model) handleTocMouse(ev mouseEvent) bool {
 	if ev.kind == mouseWheelEvent || m.modal != ModalNone {
 		return false
@@ -146,10 +151,20 @@ func (m *Model) handleTocMouse(ev mouseEvent) bool {
 		ev.y >= 0 && ev.y < m.viewport.Height
 	switch ev.kind {
 	case mouseMotion:
+		if m.selection != nil && m.selection.Dragging {
+			// An in-flight drag owns the pointer: consuming the motion here
+			// froze the selection at the last cell before the strip, so
+			// dragging to the right edge — the natural way to select a whole
+			// line — silently left the tail out of the copy. Drop the hover
+			// too: its dots are pasted over the very cells being selected.
+			m.tocHover = false
+			m.tocPreview = -1
+			return false
+		}
 		if inZone {
 			m.tocHover = true
 			m.tocPreview = m.tocAnchorAt(ev.y)
-			return true // the strip never drives selection
+			return true // hovering the strip never drives selection
 		}
 		if m.tocHover || m.tocPreview >= 0 {
 			m.tocHover = false
@@ -157,7 +172,13 @@ func (m *Model) handleTocMouse(ev mouseEvent) bool {
 		}
 		return false
 	case mousePress:
-		if !inZone || ev.button != tea.MouseLeft {
+		if !enabled || ev.button != tea.MouseLeft || ev.y < 0 || ev.y >= m.viewport.Height {
+			return false
+		}
+		// The dot is one cell wide, in the right padding column; one cell of
+		// tolerance to its left keeps it clickable without turning the whole
+		// hover strip into a dead zone for text selection.
+		if ev.x < railCol-1 || ev.x > railCol {
 			return false
 		}
 		if i := m.tocAnchorAt(ev.y); i >= 0 {
@@ -165,8 +186,10 @@ func (m *Model) handleTocMouse(ev mouseEvent) bool {
 			m.viewport.SetYOffset(m.tocAnchors[i].line)
 			m.viewportScrolledByUser()
 			m.tocPreview = -1
+			return true
 		}
-		return true // presses in the strip never start a selection
+		// No dot on this row: an ordinary press that starts a selection.
+		return false
 	}
 	return false
 }
