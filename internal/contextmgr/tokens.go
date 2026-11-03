@@ -1,6 +1,7 @@
 package contextmgr
 
 import (
+	"container/list"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -31,10 +32,109 @@ func WarmTokenizer() {
 	_, _ = getCodec()
 }
 
-// CountTokens returns per-message token counts for the given messages.
-// Token counts are computed fresh each time; the cl100k_base tokenizer
-// is fast enough that a global cache added more complexity than value.
+// Tokenizer memo bounds. The entry count bounds the bookkeeping; the byte
+// count bounds the memory, because a cached key RETAINS its string and a single
+// tool result can be hundreds of KB.
+const (
+	encodeCacheMaxEntries = 512
+	encodeCacheMaxBytes   = 8 << 20
+)
+
+// encodeCache memoizes cl100k_base counts by string.
 //
+// Counting is a pure function of the string, and the same strings are counted
+// again and again: every compaction pass re-counts an unchanged history
+// (CountTokens, EstimateTokens and EstimateToolTokens each build their own
+// per-pass memo, and the agent's per-message cache dies on any rewrite of the
+// message), a long tool result is re-counted at every round boundary, and
+// ContextStats re-counts the whole transcript per probe. Encoding runs at
+// ~5 MB/s (measured on cl100k over filler text), so a 200 KB message costs
+// ~40 ms EVERY time — and ~10x that under the race detector, which taxes
+// tiktoken's allocation-heavy merge loop hardest. That repeat work dominated
+// internal/agent's compaction suite, turning a 43 s package into a 7-minute one
+// that overran CI's per-package timeout.
+//
+// Eviction is FIFO (not LRU) on purpose: a hit must take only the read lock, so
+// a shared cache cannot serialize the counting path. A cache hit is exact — the
+// same string always yields the same count.
+//
+// Lock order: encodeCache.mu is a leaf lock; it is never held across a call
+// that could take another lock (in particular never across Encode).
+type encodeCache struct {
+	mu         sync.RWMutex
+	maxEntries int
+	maxBytes   int
+	entries    map[string]*list.Element // key → FIFO element
+	order      *list.List               // *encodeEntry, oldest first
+	bytes      int                      // sum of len(key) over entries
+}
+
+// encodeEntry is one memoized count.
+type encodeEntry struct {
+	key    string
+	tokens int
+}
+
+// newEncodeCache returns a cache bounded by entries and by key bytes.
+func newEncodeCache(maxEntries, maxBytes int) *encodeCache {
+	return &encodeCache{
+		maxEntries: maxEntries,
+		maxBytes:   maxBytes,
+		entries:    make(map[string]*list.Element),
+		order:      list.New(),
+	}
+}
+
+// lookup returns the memoized count for s, if any.
+func (c *encodeCache) lookup(s string) (int, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	el, ok := c.entries[s]
+	if !ok {
+		return 0, false
+	}
+	return el.Value.(*encodeEntry).tokens, true
+}
+
+// maxKey returns the largest key this cache retains: one bigger than a quarter
+// of the byte budget would evict everything else on its own.
+func (c *encodeCache) maxKey() int {
+	if k := c.maxBytes / 4; k > 0 {
+		return k
+	}
+	return c.maxBytes
+}
+
+// store memoizes tokens for s, evicting the oldest entries until the cache is
+// back inside its bounds. Empty and oversized keys are not retained.
+func (c *encodeCache) store(s string, tokens int) {
+	if s == "" || len(s) > c.maxKey() {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.entries[s]; ok {
+		el.Value.(*encodeEntry).tokens = tokens
+		return
+	}
+	c.entries[s] = c.order.PushBack(&encodeEntry{key: s, tokens: tokens})
+	c.bytes += len(s)
+	for c.order.Len() > c.maxEntries || c.bytes > c.maxBytes {
+		front := c.order.Front()
+		if front == nil {
+			break
+		}
+		evicted := front.Value.(*encodeEntry)
+		c.order.Remove(front)
+		delete(c.entries, evicted.key)
+		c.bytes -= len(evicted.key)
+	}
+}
+
+// tokenMemo is the process-wide tokenizer memo (see encodeCache).
+var tokenMemo = newEncodeCache(encodeCacheMaxEntries, encodeCacheMaxBytes)
+
+// CountTokens returns per-message token counts for the given messages.
 // It resolves the counting strategy once and shares a single memo across the
 // whole slice: repeated strings (system prompt, tool-call names and IDs,
 // repeated argument values) encode once instead of once per message. This is
@@ -42,6 +142,10 @@ func WarmTokenizer() {
 // first probe, compaction republish, session save) should use — looping
 // ComputeMessageTokens per message would resolve the tokenizer and walk the
 // structure once per message with zero cross-message dedup.
+//
+// Counts are also memoized process-wide (see encodeCache), so re-counting a
+// history that did not change — every compaction pass, every probe — costs a
+// map lookup per string instead of a re-encode.
 func CountTokens(messages []llm.Message) []int {
 	if len(messages) == 0 {
 		return nil
@@ -82,8 +186,8 @@ func sortedToolArgKeys(args map[string]any) []string {
 
 // EstimateTokens approximates token count for a message list using cl100k_base
 // (GPT-family). Falls back to a bytes/4 heuristic if the tokenizer is unavailable.
-// No caching; the tokenizer is fast enough for on-demand use. Sums the
-// per-message counts directly (no []int allocation, unlike TokenCounts).
+// Sums the per-message counts directly (no []int allocation, unlike TokenCounts);
+// the underlying counts are memoized process-wide (see encodeCache).
 func (m *Manager) EstimateTokens(messages []llm.Message) int {
 	if len(messages) == 0 {
 		return 0
@@ -181,17 +285,27 @@ func messageCounterFor() messageCounter {
 // exactMessageCounter returns a tokenizer-backed messageCounter, or ok=false
 // when the tokenizer is unavailable. An encode failure for a single string
 // counts that string as 0 tokens rather than failing the whole message.
+//
+// Every exact count in the process funnels through here, which is why the
+// memo lives at this level: it covers CountTokens, EstimateTokens,
+// EstimateToolTokens and ComputeMessageTokens alike.
 func exactMessageCounter() (messageCounter, bool) {
 	c, err := getCodec()
 	if err != nil || c == nil {
 		return nil, false
 	}
 	return func(s string) int {
+		if n, ok := tokenMemo.lookup(s); ok {
+			return n
+		}
 		ids, _, err := c.Encode(s)
 		if err != nil {
+			// Not memoized: an encode failure is not a stable count.
 			return 0
 		}
-		return len(ids)
+		n := len(ids)
+		tokenMemo.store(s, n)
+		return n
 	}, true
 }
 

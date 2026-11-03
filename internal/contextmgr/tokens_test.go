@@ -1,6 +1,7 @@
 package contextmgr
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -259,5 +260,102 @@ func TestReasoningTokensFollowEchoSetting(t *testing.T) {
 	counts := CountTokens([]llm.Message{msg})
 	if counts[0] != withoutReasoning {
 		t.Fatalf("CountTokens = %d, ComputeMessageTokens = %d", counts[0], withoutReasoning)
+	}
+}
+
+// TestEncodeCacheHitIsExact pins the memo's core contract: what a cache hit
+// returns is exactly what the tokenizer would have returned, so memoizing can
+// never change a token count (and therefore never shift a compaction decision).
+func TestEncodeCacheHitIsExact(t *testing.T) {
+	c, err := getCodec()
+	if err != nil || c == nil {
+		t.Skip("tokenizer unavailable")
+	}
+	cache := newEncodeCache(8, 64<<10)
+	for _, s := range []string{"hello world", strings.Repeat("x", 2000), "你好世界"} {
+		ids, _, err := c.Encode(s)
+		if err != nil {
+			t.Fatalf("Encode(%q): %v", s, err)
+		}
+		cache.store(s, len(ids))
+		got, ok := cache.lookup(s)
+		if !ok || got != len(ids) {
+			t.Fatalf("lookup(%q) = %d,%v, want %d,true", s, got, ok, len(ids))
+		}
+	}
+	if _, ok := cache.lookup("never counted"); ok {
+		t.Fatal("lookup returned a hit for a string that was never counted")
+	}
+}
+
+// TestEncodeCacheStaysBounded pins both bounds: the entry count keeps the
+// bookkeeping flat, and the byte count keeps the retained strings (a cached key
+// holds its own bytes alive) inside the memory budget. Oversized keys are
+// refused outright rather than evicting everything else.
+func TestEncodeCacheStaysBounded(t *testing.T) {
+	t.Run("entry count", func(t *testing.T) {
+		cache := newEncodeCache(4, 1<<20)
+		for i := 0; i < 40; i++ {
+			cache.store(fmt.Sprintf("key-%02d", i), i)
+		}
+		if got := cache.order.Len(); got != 4 {
+			t.Fatalf("cached %d entries, want the 4-entry bound", got)
+		}
+		if _, ok := cache.lookup("key-00"); ok {
+			t.Fatal("the oldest entry survived: eviction must drop it first")
+		}
+		if _, ok := cache.lookup("key-39"); !ok {
+			t.Fatal("the newest entry was evicted")
+		}
+	})
+
+	t.Run("byte budget", func(t *testing.T) {
+		const maxBytes = 4 << 10
+		cache := newEncodeCache(1000, maxBytes)
+		payload := strings.Repeat("y", 900) // under maxKey (maxBytes/4)
+		for i := 0; i < 40; i++ {
+			cache.store(string(rune('a'+i))+payload, i)
+		}
+		if cache.bytes > maxBytes {
+			t.Fatalf("cache holds %d bytes, want <= %d", cache.bytes, maxBytes)
+		}
+		if got := cache.order.Len(); got != len(cache.entries) {
+			t.Fatalf("order holds %d entries, map %d", got, len(cache.entries))
+		}
+	})
+
+	t.Run("oversized key is refused", func(t *testing.T) {
+		cache := newEncodeCache(8, 4<<10) // maxKey = 1 KiB
+		cache.store("small", 1)
+		cache.store(strings.Repeat("z", 2<<10), 2)
+		if cache.order.Len() != 1 || cache.bytes != len("small") {
+			t.Fatalf("oversized key entered the cache: %d entries, %d bytes", cache.order.Len(), cache.bytes)
+		}
+	})
+
+	t.Run("empty key is refused", func(t *testing.T) {
+		cache := newEncodeCache(8, 4<<10)
+		cache.store("", 0)
+		if cache.order.Len() != 0 {
+			t.Fatalf("empty key entered the cache: %d entries", cache.order.Len())
+		}
+	})
+}
+
+// TestTokenMemoSurvivesRepeatedCounting covers the path that motivated the
+// memo: re-counting an unchanged history (every compaction pass, every probe)
+// must keep returning the same counts.
+func TestTokenMemoSurvivesRepeatedCounting(t *testing.T) {
+	big := llm.Message{Role: "tool", ToolCallID: "call_1", Content: strings.Repeat("x", 200000)}
+	first := CountTokens([]llm.Message{{Role: "user", Content: "hi"}, big})
+	for i := 0; i < 3; i++ {
+		again := CountTokens([]llm.Message{{Role: "user", Content: "hi"}, big})
+		if again[0] != first[0] || again[1] != first[1] {
+			t.Fatalf("pass %d: counts = %v, want %v (memo must be exact)", i, again, first)
+		}
+	}
+	// And the per-message form agrees with the batched form.
+	if got := ComputeMessageTokens(big); got != first[1] {
+		t.Fatalf("ComputeMessageTokens = %d, CountTokens = %d", got, first[1])
 	}
 }
