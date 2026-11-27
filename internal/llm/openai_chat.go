@@ -647,10 +647,19 @@ func (p *OpenAIProvider) GenerateResponseStream(ctx context.Context, messages []
 			return nil, waitErr
 		}
 		if at.acc.renderedOutput() {
-			// Muted retry: a fresh generation matches the already-rendered
-			// prefix only until it diverges, and the trim contract forbids
-			// splicing two divergent generations into one bubble — so
-			// delivery is buffered and suffix-only.
+			// Muted retry: the client has already rendered a prefix of the
+			// dead attempt, so the retry cannot stream live (its tokens would
+			// interleave with text from another generation). Delivery is
+			// buffered and trimmed at the end by trimRecoveredText, which
+			// drops an EXACT prefix only. A divergent re-generation is
+			// therefore delivered in FULL on top of the already-rendered
+			// text: nothing resets the bubble — no host implements
+			// OnRecoverPartialStream (the TUI and the web sink both wire a
+			// no-op), and firing it here would double-deliver the round-end
+			// events the agent loop owns — so the live pane shows
+			// prefix+regeneration while the transcript keeps only the
+			// recovered generation. TestStreamRetryDivergentTextIsEmittedInFull
+			// pins that.
 			if res, retryErr := p.retryStreamChat(ctx, req, h, at.acc); retryErr == nil {
 				debuglog.Write("llm/stream_recovery", "muted streaming retry recovered the round", "", nil)
 				return res, nil
@@ -1128,12 +1137,15 @@ func (p *OpenAIProvider) handleStreamFallback(ctx context.Context, req *roundReq
 }
 
 // trimRecoveredText drops the portion of a recovered response the client
-// already saw streamed. It trims only when the streamed text is an exact
-// byte prefix of the recovered text; a divergent re-generation is emitted in
-// full so two different answers are never spliced into one bubble. Byte-wise
-// comparison is safe: both strings reached this point via JSON decoding, so
-// they are valid UTF-8 and a byte prefix of one is also a rune-aligned
-// prefix.
+// already saw streamed. It trims only when the streamed text is an exact byte
+// prefix of the recovered text. A divergent re-generation is returned in full:
+// what was already rendered cannot be taken back (no host resets the bubble —
+// see the retry comment in GenerateResponseStream), so the already-streamed
+// prefix stays on screen and the recovered text is appended after it. Only the
+// transcript keeps the recovered generation alone, which is why this trim is
+// best-effort rather than a correctness boundary. Byte-wise comparison is
+// safe: both strings reached this point via JSON decoding, so they are valid
+// UTF-8 and a byte prefix of one is also a rune-aligned prefix.
 func trimRecoveredText(streamed, recovered string) string {
 	if streamed == "" || recovered == "" {
 		return recovered

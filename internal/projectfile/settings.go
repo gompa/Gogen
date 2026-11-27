@@ -148,6 +148,11 @@ var settings = []setting{
 	// --- MCP --------------------------------------------------------------
 	{key: "mcp", env: "GOGEN_MCP", cfg: "MCP", file: "MCP", writer: "MCP", kind: kString},
 	{key: "mcp_tool_mode", env: "GOGEN_MCP_TOOL_MODE", cfg: "MCPToolMode", file: "MCPToolMode", writer: "MCPToolMode", kind: kString, omitDefault: true},
+	// The two settings-modal connection-test bounds (mcp_probe_*): the probe
+	// reads them live from the runtime overlay, so they only need to be read,
+	// merged and saved like any other int.
+	{key: "mcp_probe_timeout_secs", env: "GOGEN_MCP_PROBE_TIMEOUT_SECS", cfg: "MCPProbeTimeoutSecs", file: "MCPProbeTimeoutSecs", writer: "MCPProbeTimeoutSecs", kind: kInt, omitDefault: true},
+	{key: "mcp_probe_max_concurrent", env: "GOGEN_MCP_PROBE_MAX_CONCURRENT", cfg: "MCPProbeMaxConcurrent", file: "MCPProbeMaxConcurrent", writer: "MCPProbeMaxConcurrent", kind: kInt, omitDefault: true},
 	{key: "mcp_servers", cfg: "MCPServers", file: "MCPServers", writer: "MCPServers", kind: kMCPServers, writeSpecial: true},
 
 	// --- web host ---------------------------------------------------------

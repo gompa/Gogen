@@ -569,11 +569,16 @@ func TestSelectionSurvivesStreaming(t *testing.T) {
 	}
 }
 
-// TestSelectionDroppedWhenRowsMove pins the other half of the rebuild rule:
-// when the rows under the selection no longer hold the text the user picked —
-// wholesale replacement (compaction, session switch), or a re-wrap that moves
-// the text — the highlight is dropped, because its coordinates would address
-// different lines.
+// TestSelectionDroppedWhenRowsMove pins the other half of the rebuild rule.
+//
+// A rebuild that MOVED the text but kept it on screen re-anchors the
+// highlight onto the same characters (a line inserted above, a re-wrap that
+// pushes the word to another row): the copy must still yield exactly what the
+// user picked, which is the whole point of keeping it. Only when the picked
+// text is gone or ambiguous (a wholesale replacement — compaction, session
+// switch — or a snippet that now occurs more than once) is the selection
+// dropped, and then the status line reports it instead of leaving the next
+// ctrl+shift+c to land on nothing.
 func TestSelectionDroppedWhenRowsMove(t *testing.T) {
 	newModelWithSelection := func(t *testing.T) *Model {
 		t.Helper()
@@ -594,6 +599,9 @@ func TestSelectionDroppedWhenRowsMove(t *testing.T) {
 		if m.selection != nil {
 			t.Fatal("selection kept although the selected row's text changed")
 		}
+		if !strings.Contains(m.statusMsg, "Selection cleared") {
+			t.Fatalf("status = %q, want a note that the selection was dropped (a silent drop is what made the copy chord look dead)", m.statusMsg)
+		}
 	})
 
 	t.Run("transcript replaced wholesale", func(t *testing.T) {
@@ -605,17 +613,23 @@ func TestSelectionDroppedWhenRowsMove(t *testing.T) {
 		}
 	})
 
-	t.Run("rows shift under the selection", func(t *testing.T) {
+	t.Run("rows shift under the selection — the highlight follows the text", func(t *testing.T) {
 		m := newModelWithSelection(t)
 		// A line inserted above moves every selected row down one.
 		m.chatLines = append([]string{"inserted above"}, m.chatLines...)
 		m.setViewportContent()
-		if m.selection != nil {
-			t.Fatal("selection kept although its rows moved")
+		if m.selection == nil {
+			t.Fatal("selection dropped although its text is still on screen")
+		}
+		if got := m.getSelectedText(); got != "second" {
+			t.Fatalf("re-anchored selection = %q, want the text the user picked (second)", got)
+		}
+		if got, want := m.selection.StartY, 2; got != want {
+			t.Fatalf("re-anchored StartY = %d, want %d (the row the text moved to)", got, want)
 		}
 	})
 
-	t.Run("re-wrap that moves the text", func(t *testing.T) {
+	t.Run("re-wrap that moves the text — the highlight follows the text", func(t *testing.T) {
 		m := newModelWithSelection(t)
 		// A narrower terminal re-wraps the long row above the selection, so
 		// row 1 is no longer "second row".
@@ -623,8 +637,45 @@ func TestSelectionDroppedWhenRowsMove(t *testing.T) {
 		m.setViewportContent()
 		m.SetSize(24, 40)
 		m.setViewportContent()
+		if m.selection == nil {
+			t.Fatal("selection dropped although the re-wrap kept the word on screen")
+		}
+		if got := m.getSelectedText(); got != "second" {
+			t.Fatalf("re-anchored selection = %q, want the text the user picked (second)", got)
+		}
+	})
+
+	t.Run("re-wrap that re-breaks a multi-row selection", func(t *testing.T) {
+		m := newModelWithSelection(t)
+		// A selection spanning two wrapped rows: after a narrower re-wrap the
+		// same characters are still on screen, but their row breaks moved, so
+		// the verbatim anchor is gone. Dropping it is the honest answer —
+		// keeping it would point the highlight at different text.
+		m.chatLines = []string{
+			strings.Repeat("a", 30) + " tail",
+			strings.Repeat("b", 30) + " end",
+		}
+		m.setViewportContent()
+		m.selection = &SelectionState{Active: true, StartX: 0, StartY: 0, EndX: 5, EndY: 1}
+		if got := m.getSelectedText(); got != strings.Repeat("a", 30)+" tail\nbbbbb" {
+			t.Fatalf("setup: selected %q", got)
+		}
+		m.SetSize(24, 40)
+		m.setViewportContent()
 		if m.selection != nil {
-			t.Fatal("selection kept although a re-wrap moved its rows")
+			t.Fatalf("selection kept across a re-break (now %q)", m.getSelectedText())
+		}
+	})
+
+	t.Run("a repeated snippet is not re-anchored", func(t *testing.T) {
+		m := newModelWithSelection(t)
+		// The selected row changed AND its text now occurs twice, so the
+		// anchor would be a guess: drop it rather than highlight the wrong
+		// line.
+		m.chatLines = []string{"first row", "second row again", "second row"}
+		m.setViewportContent()
+		if m.selection != nil {
+			t.Fatalf("selection re-anchored to an ambiguous match (selected %q)", m.getSelectedText())
 		}
 	})
 }

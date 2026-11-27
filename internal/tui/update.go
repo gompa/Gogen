@@ -140,6 +140,13 @@ func (m *Model) handleMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// terminal reporting event types cannot double-trigger actions.
 		return m.handleKeyMsg(msg)
 
+	case tea.PasteMsg:
+		// A bracketed paste is not a KeyPressMsg, so it needs its own route
+		// into the composer (see handlePasteMsg): the generic textarea
+		// fallback at the end of handleMsg is gated on the turn being idle,
+		// which silently dropped every paste while a turn ran.
+		return m.handlePasteMsg(msg)
+
 	// Streaming messages
 	case streamStartMsg:
 		return m.handleStreamStartMsg()
@@ -364,6 +371,12 @@ func (m *Model) handleCompactResultMsg(msg compactResultMsg) (tea.Model, tea.Cmd
 	// Compaction rewrote Messages: rebuild the transcript around the
 	// summary (the old inline path left the pre-compact history on
 	// screen, which no longer matched the agent's state).
+	//
+	// The selection is dropped with the old document: setViewportContent
+	// would otherwise re-anchor a snippet that the summary happens to
+	// contain, keeping a highlight — and a copy — from text that is no
+	// longer on screen.
+	m.clearSelection()
 	m.chatLines = renderMessages(m.agent.Messages, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String(), m.verbose)
 	m.chatLines = append(m.chatLines, SystemStyle.Render(fmt.Sprintf("History compacted (%d messages remaining).", len(m.agent.Messages))))
 	m.setViewportContent()

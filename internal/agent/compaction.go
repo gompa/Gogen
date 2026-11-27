@@ -362,6 +362,14 @@ func (a *Agent) resetCompactionState() {
 	a.compactionGuards.singleSummary = 0
 	a.compactionGuards.condensationKeptRequest = ""
 	a.statsMu.Unlock()
+	// The deterministic state describes the conversation that was just
+	// replaced. The next compaction rebuilds it from the restored/forked
+	// history (a state block carried by a preserved summary is imported by
+	// SessionState.Fold), so resetting here cannot lose durable entries that
+	// still exist in the transcript.
+	if a.SessionState != nil {
+		a.SessionState.Reset()
+	}
 }
 
 // CompactHistory manually compacts conversation history at a task boundary.
@@ -381,6 +389,7 @@ func (a *Agent) CompactHistory(ctx context.Context) error {
 		Pinned:       pinnedSet(a.PinManager),
 		Tools:        a.llmTools(),
 		AllowedTools: a.AllowedToolNames(),
+		State:        a.compactionSessionState(),
 	})
 	if err != nil {
 		return err

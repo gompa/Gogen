@@ -49,7 +49,7 @@ func parseCLIOptions() (cliFlags, string) {
 	flag.StringVar(&opts.url, "url", "", "OpenAI API base URL (e.g. https://api.openai.com/v1)")
 	flag.BoolVar(&opts.global, "global", false, "Run in global mode (ignore project config, use ~/.config/gogen/)")
 	flag.BoolVar(&opts.saveConfig, "save-config", false, "Write effective config to .gogen/gogen.conf and guidelines to .gogen/gogen.md, then exit")
-	flag.BoolVar(&opts.saveConfigSecrets, "save-config-secrets", false, "Include openai_api_key when using --save-config")
+	flag.BoolVar(&opts.saveConfigSecrets, "save-config-secrets", false, "Include secrets (API keys, web/status tokens, MCP env) when using --save-config")
 	flag.StringVar(&opts.prompt, "p", "", "Run a single prompt and exit (non-interactive)")
 	flag.StringVar(&opts.saveConfigPath, "save-config-path", "", "Output path for --save-config config file (default .gogen/gogen.conf)")
 

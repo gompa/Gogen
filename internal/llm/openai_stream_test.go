@@ -1525,3 +1525,63 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 		t.Fatalf("tool name = %q, want list_files", result.ToolCalls[0].Name)
 	}
 }
+
+// TestStreamRetryDivergentTextIsEmittedInFull pins what the recovery ladder
+// actually does when the retry re-generates a DIFFERENT answer than the text
+// already streamed: trimRecoveredText finds no exact prefix to drop, so the
+// whole recovered generation is delivered through OnToken on top of the
+// already-rendered prefix. No host can reset the bubble (the TUI's and the web
+// sink's OnRecoverPartialStream are both no-ops), so this is the behavior, not
+// an accident: the live pane ends up showing prefix+regeneration while the
+// transcript keeps only the recovered generation. If a host ever learns to
+// reset, this test is the one to change.
+func TestStreamRetryDivergentTextIsEmittedInFull(t *testing.T) {
+	t.Parallel()
+	var streamRequests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), `"stream":true`) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			if streamRequests.Add(1) == 1 {
+				// Transient failure after a partial answer…
+				_, _ = w.Write([]byte(`data: {"choices":[{"delta":{"content":"partial "}}]}` + "\n\n" +
+					`data: this is not json` + "\n\n"))
+				return
+			}
+			// …and a retry that generates something else entirely.
+			_, _ = w.Write([]byte(`data: {"choices":[{"delta":{"content":"a different answer"}}]}` + "\n\n" +
+				`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+				"data: [DONE]\n\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"fallback answer"}}]}`))
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(srv)
+	var tokens []string
+	var recovers int
+	result, err := p.GenerateResponseStream(
+		t.Context(),
+		[]Message{{Role: "user", Content: "hi"}},
+		nil,
+		nil,
+		&StreamHandlers{
+			OnToken:                func(token string) { tokens = append(tokens, token) },
+			OnRecoverPartialStream: func() { recovers++ },
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tokens) != 2 || tokens[0] != "partial " || tokens[1] != "a different answer" {
+		t.Fatalf("OnToken fired %v, want [partial  a different answer]: a divergent re-generation is delivered in full after the streamed prefix", tokens)
+	}
+	if recovers != 0 {
+		t.Fatalf("OnRecoverPartialStream fired %d times, want 0: the agent loop owns round-end callbacks", recovers)
+	}
+	if result.Content != "a different answer" {
+		t.Fatalf("result.Content = %q, want only the recovered generation", result.Content)
+	}
+}

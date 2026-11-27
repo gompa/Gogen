@@ -518,13 +518,19 @@ func TestDeepDiveRegionGuards(t *testing.T) {
 	}
 }
 
-// TestDeepDiveProgressRoster pins that the progress summary carries the
-// executed-call roster, so call ids survive the rewrite.
-func TestDeepDiveProgressRoster(t *testing.T) {
+// TestDeepDiveProgressStateManifest pins that the progress summary carries
+// the deterministic state manifest, so the actionable handle (the job id)
+// survives the rewrite while the wire call id does not. The session summary
+// must not carry one: it is kept byte-identical across compactions.
+func TestDeepDiveProgressStateManifest(t *testing.T) {
 	msgs := []llm.Message{
 		{Role: "user", Content: "first"}, bulky("old"), {Role: "user", Content: "the request"},
-		{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "call_9", Name: "background_job"}}},
-		{Role: "tool", ToolCallID: "call_9", Content: "started job bg-3"},
+		{Role: "assistant", ToolCalls: []llm.ToolCall{{
+			ID:   "call_9",
+			Name: "execute_command",
+			Args: map[string]any{"command": "make build", "background": true},
+		}}},
+		{Role: "tool", ToolCallID: "call_9", Content: "Started background job job-bg3.\nCommand: make build"},
 		bulky("more"),
 		{Role: "assistant", Content: "tail one"}, {Role: "assistant", Content: "tail two"},
 	}
@@ -532,8 +538,67 @@ func TestDeepDiveProgressRoster(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(out[3].Content, ProgressSummaryPrefix) || !strings.Contains(out[3].Content, "call_9") {
-		t.Fatalf("progress summary lacks the roster: %s", out[3].Content)
+	if !strings.HasPrefix(out[3].Content, ProgressSummaryPrefix) {
+		t.Fatalf("expected the progress summary at index 3, got %q", out[3].Content)
+	}
+	if !strings.Contains(out[3].Content, StateHeader) || !strings.Contains(out[3].Content, "job-bg3") {
+		t.Fatalf("progress summary lacks the state manifest: %s", out[3].Content)
+	}
+	if strings.Contains(out[3].Content, "call_9") {
+		t.Fatalf("progress manifest carries the wire call id: %s", out[3].Content)
+	}
+	if out[1].Content != SummaryPrefix+"session recap 1" {
+		t.Fatalf("session summary changed shape (cache property): %q", out[1].Content)
+	}
+}
+
+// TestDeepDiveSessionOnlyCarriesStateManifest pins the fallback half of the
+// manifest placement: when the progress region produces no summary (here it is
+// left verbatim, below the minimum size) but the region BEFORE the request is
+// summarized, the session summary must carry the block. Without it a
+// session-region-only compaction wrote no manifest at all, so the job id the
+// summarized span created — and anything else it returned — became
+// unaddressable while the transcript was still live.
+func TestDeepDiveSessionOnlyCarriesStateManifest(t *testing.T) {
+	msgs := []llm.Message{
+		{Role: "user", Content: "first"},
+		bulky("old"),
+		{Role: "assistant", ToolCalls: []llm.ToolCall{{
+			ID:   "call_7",
+			Name: "execute_command",
+			Args: map[string]any{"command": "make build", "background": true},
+		}}},
+		{Role: "tool", ToolCallID: "call_7", Content: "Started background job job-bg7.\nCommand: make build"},
+		{Role: "user", Content: "the request"},
+		// The region since the request is one short message: with the default
+		// minimum size planSegment leaves it verbatim, so no progress summary is
+		// written this round.
+		{Role: "assistant", Content: "ok"},
+		{Role: "assistant", Content: "tail one"},
+		{Role: "assistant", Content: "tail two"},
+	}
+	out, _, err := newDeepDiveManager(&regionProvider{}, false).Compact(context.Background(), msgs, CompactOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(out[1].Content, SummaryPrefix) {
+		t.Fatalf("expected the session summary at index 1, got %q", out[1].Content)
+	}
+	for _, want := range []string{StateHeader, "job-bg7", StateFooter} {
+		if !strings.Contains(out[1].Content, want) {
+			t.Fatalf("session-only compaction lost %q (the summarized job id became unaddressable):\n%s", want, out[1].Content)
+		}
+	}
+	for _, msg := range out {
+		if strings.HasPrefix(msg.Content, ProgressSummaryPrefix) {
+			t.Fatalf("a progress summary was written although the region is under the minimum:\n%s", msg.Content)
+		}
+	}
+	// The manifest never pushes the replacement past the region it replaces:
+	// verify the framed summary stayed smaller than what it replaced.
+	if strings.Contains(out[1].Content, "… more state entries omitted") &&
+		!strings.Contains(out[1].Content, StateFooter) {
+		t.Fatalf("truncated manifest lost its footer:\n%s", out[1].Content)
 	}
 }
 

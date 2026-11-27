@@ -33,6 +33,13 @@ type jsonSniffTransport struct {
 	base http.RoundTripper
 }
 
+// jsonSniffMaxBody bounds how much of a non-JSON-typed response this transport
+// will buffer to inspect. The catalog base URL is user/provider configuration,
+// so a broken or hostile endpoint answering GET /models with a non-JSON media
+// type and an endless body must not be able to grow this process's heap: a
+// real model catalog is a few hundred KiB, so 4 MiB is generous.
+const jsonSniffMaxBody = 4 << 20
+
 func (t *jsonSniffTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := t.base.RoundTrip(req)
 	if err != nil || resp == nil || resp.Header == nil {
@@ -44,11 +51,23 @@ func (t *jsonSniffTransport) RoundTrip(req *http.Request) (*http.Response, error
 	if resp.StatusCode >= 400 || isJSONContentType(resp.Header.Get("Content-Type")) {
 		return resp, nil
 	}
-	body, err := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, jsonSniffMaxBody+1))
 	if err != nil {
+		_ = resp.Body.Close()
 		return nil, err
 	}
+	if len(body) > jsonSniffMaxBody {
+		// Too large to judge. Fail OPEN and non-destructively, the same way
+		// apiErrorBodyTransport handles an oversize error body: splice the
+		// bytes already read back in front of the unread remainder and leave
+		// the Content-Type and ContentLength untouched, so the request behaves
+		// exactly as it would without this transport (the existing
+		// content-type decode error path stays reachable) instead of turning
+		// into a new kind of failure or a truncated body.
+		resp.Body = splicedBody{io.MultiReader(bytes.NewReader(body), resp.Body), resp.Body}
+		return resp, nil
+	}
+	_ = resp.Body.Close()
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	resp.ContentLength = int64(len(body))
 	if json.Valid(bytes.TrimSpace(body)) {

@@ -283,6 +283,18 @@ func (sp *subagentSpawner) runChildTurn(parentCtx context.Context, rt *sessionRu
 	}
 	resCh := make(chan turnResult, 1)
 	go func() {
+		// Panic guard registered FIRST so it runs LAST, after the stream and
+		// turn-lock cleanup below. It also ANSWERS resCh: a silent recovery
+		// would leave the parent turn parked on the receive (or on the drain
+		// after its own cancellation) forever, so the panic becomes the
+		// child's tool result. resCh is buffered, so reporting cannot block
+		// even when the parent has already given up.
+		defer func() {
+			if r := recover(); r != nil {
+				logRecoveredPanic("subagent child turn", r)
+				resCh <- turnResult{err: fmt.Errorf("child agent turn panicked: %v", r)}
+			}
+		}()
 		// Lock FIRST, then register the stream handles: holding turnMu proves
 		// the previous turn's stream has fully ended (end() precedes the turn
 		// unlock), which is the invariant that makes begin() safe from

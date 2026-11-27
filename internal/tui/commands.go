@@ -411,6 +411,10 @@ func cmdSession(m *Model, input, trimmed string) (bool, bool, tea.Cmd) {
 	} else {
 		m.appendChatLine(SystemStyle.Render(result.Output))
 		if len(result.History) > 0 {
+			// A restored history is a different document: drop the selection
+			// rather than let setViewportContent re-anchor it onto a matching
+			// snippet of the conversation that was just replaced.
+			m.clearSelection()
 			m.chatLines = renderMessages(result.History, m.agent.WorkingDir, m.agent.CurrentModel(), m.agent.Mode.String(), m.verbose)
 			m.setViewportContent()
 			m.pinFollow() // restored history starts at the live edge

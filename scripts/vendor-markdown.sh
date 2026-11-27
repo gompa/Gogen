@@ -5,8 +5,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/internal/server/web/vendor"
-MARKED_VERSION="${MARKED_VERSION:-18.1.1}"
-DOMPURIFY_VERSION="${DOMPURIFY_VERSION:-3.4.17}"
+MARKED_VERSION="${MARKED_VERSION:-18.2.1}"
+DOMPURIFY_VERSION="${DOMPURIFY_VERSION:-3.4.18}"
 
 TMP="$(mktemp -d)"
 cleanup() { rm -rf "$TMP"; }

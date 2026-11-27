@@ -12,10 +12,18 @@ import (
 // segmentResult is one deep-dive segment after compaction: its replacement
 // messages, whether a new summary was written, and skip when a summary was
 // written but refused as not smaller (nil when the segment was left alone).
+//
+// recap and tokens carry the written summary's UNFRAMED text and the token
+// weight of the region it replaces, so the caller can re-frame it: the state
+// manifest goes to whichever region actually produced a summary (see
+// compactAroundRequest), and re-framing has to apply the same smaller-summary
+// guard compactSegment applied.
 type segmentResult struct {
 	msgs       []llm.Message
 	summarized bool
 	skip       error
+	recap      string
+	tokens     int
 }
 
 // deepDiveRefusal is a deep-dive compaction that summarized neither region
@@ -39,7 +47,13 @@ func (r deepDiveRefusal) Unwrap() error { return r.error }
 // into the session summary at the next compaction.
 //
 // Each region keeps the single-summary guards: the minimum size unless
-// forced, the smaller-summary guard, and its own executed-call roster. When
+// forced and the smaller-summary guard. The deterministic state manifest is
+// rendered into the progress summary when that region produced one — it is
+// the live region, rewritten on every deep-dive compaction, while the session
+// summary is kept byte-identical (isOnlySummary) so a block there would freeze
+// at the moment it was written. If the progress region produced no summary,
+// the session summary carries the block instead: a session-region-only
+// compaction would otherwise drop every handle it summarized away. When
 // neither region produced a summary, the history comes back unchanged, or
 // refused when a summary was not smaller. A session summary that succeeded
 // is kept when the progress call fails: the work since the request stays
@@ -49,6 +63,15 @@ func (r deepDiveRefusal) Unwrap() error { return r.error }
 // wrote reports whether a summary was written; the input slice is returned
 // when it was not.
 func (m *Manager) compactAroundRequest(ctx context.Context, messages []llm.Message, headIdx, reqIdx, tailStart int, opts CompactOptions) ([]llm.Message, map[int]struct{}, bool, error) {
+	// One state for both regions: the manifest is cumulative, so the session
+	// region's handles must be in it when the progress summary renders it. A
+	// nil State (a direct Manager user) becomes one per-compaction state here
+	// rather than one per segment, so the two regions still share it.
+	state := opts.State
+	if state == nil {
+		state = NewSessionState()
+		opts.State = state
+	}
 	before, sessionErr := m.compactSegment(ctx, messages, headIdx+1, reqIdx, SummaryPrefix, sessionSummaryInstruction, opts)
 	if sessionErr != nil {
 		if ctx.Err() != nil {
@@ -62,6 +85,21 @@ func (m *Manager) compactAroundRequest(ctx context.Context, messages []llm.Messa
 			return nil, nil, false, err
 		}
 		since = segmentResult{msgs: cloneMessages(messages[reqIdx+1 : tailStart])}
+	}
+	// The progress region produced no summary (left verbatim, refused as not
+	// smaller, or the summarizer failed), so this compaction has nowhere live
+	// to render the manifest: without the re-frame below a session-region-only
+	// compaction wrote NO state block at all and every handle the summarized
+	// span created became unaddressable — the exact loss the manifest exists to
+	// prevent, and something the per-region executed-call roster it replaced did
+	// cover. The block is a snapshot from here on (the session region is not
+	// re-summarized until a new request moves it), which is the price of not
+	// dropping the handles; a later progress summary renders a fresh one, and
+	// SessionState.Fold imports the newest block last (see importBlock).
+	if before.summarized && !since.summarized {
+		if framed, gerr := m.frameSegmentSummary(SummaryPrefix, before.recap, before.tokens, state, true); gerr == nil {
+			before.msgs = []llm.Message{framed}
+		}
 	}
 	if !before.summarized && !since.summarized {
 		if sessionErr != nil {
@@ -118,18 +156,48 @@ func (m *Manager) compactSegment(ctx context.Context, messages []llm.Message, st
 	if err != nil {
 		return segmentResult{}, err
 	}
-	recap := summary
-	if roster := buildExecutedCallRoster(seg); roster != "" {
-		recap += "\n\n" + roster
+	// Fold every summarized region into the session state: the cumulative
+	// memory spans both regions. The manifest itself is rendered into the
+	// progress summary — the LIVE region, rewritten on every deep-dive
+	// compaction — because a block written into the session summary freezes
+	// with it (isOnlySummary skips that region from then on), so it would
+	// report live handles as of the moment it was written. When the progress
+	// region produced no summary this call, compactAroundRequest re-frames the
+	// session summary with the block instead: dropping it there would lose
+	// every handle the summarized span created.
+	state := opts.State
+	if state == nil {
+		state = NewSessionState()
 	}
-	framed := llm.Message{Role: "assistant", Content: prefix + recap}
-	if m.requireSummaryShrink {
-		if framedTokens := m.EstimateTokens([]llm.Message{framed}); framedTokens >= segTokens {
-			unchanged.skip = fmt.Errorf("%w (summary %d tokens, region %d tokens)", ErrSummaryNotSmaller, framedTokens, segTokens)
-			return unchanged, nil
+	state.Fold(seg)
+	framed, gerr := m.frameSegmentSummary(prefix, summary, segTokens, state, prefix == ProgressSummaryPrefix)
+	if gerr != nil {
+		unchanged.skip = gerr
+		return unchanged, nil
+	}
+	return segmentResult{msgs: []llm.Message{framed}, summarized: true, recap: summary, tokens: segTokens}, nil
+}
+
+// frameSegmentSummary frames one region's summary into the message that
+// replaces it and, when withState is set, appends the deterministic state
+// manifest. The smaller-summary guard is applied to the RESULT, so an
+// over-long manifest is refused here exactly like an over-long recap (a
+// replacement larger than the region it replaces would break the fit loop's
+// shrinking guarantee).
+func (m *Manager) frameSegmentSummary(prefix, recap string, regionTokens int, state *SessionState, withState bool) (llm.Message, error) {
+	content := prefix + recap
+	if withState {
+		if block := m.renderState(state, stateBudget(regionTokens)); block != "" {
+			content += "\n\n" + block
 		}
 	}
-	return segmentResult{msgs: []llm.Message{framed}, summarized: true}, nil
+	framed := llm.Message{Role: "assistant", Content: content}
+	if m.requireSummaryShrink {
+		if framedTokens := m.EstimateTokens([]llm.Message{framed}); framedTokens >= regionTokens {
+			return llm.Message{}, fmt.Errorf("%w (summary %d tokens, region %d tokens)", ErrSummaryNotSmaller, framedTokens, regionTokens)
+		}
+	}
+	return framed, nil
 }
 
 // segmentPlan is what a deep-dive compaction does with one region: whether

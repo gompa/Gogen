@@ -179,17 +179,21 @@ function fenceCodeInfo(raw) {
             // keeps the block patchable (content after it makes the block
             // fence + more, which needs the full renderer).
             if (i !== lineCount - 1) return null;
-            return { lang: firstFenceWord(open[2]), codeText: raw.slice(codeStart, lineStart) };
+            return { lang: firstFenceWord(open[2]), codeText: raw.slice(codeStart, lineStart), closed: true };
         }
         lineStart += lines[i].length + 1;
     }
-    return { lang: firstFenceWord(open[2]), codeText: rest };
+    return { lang: firstFenceWord(open[2]), codeText: rest, closed: false };
 }
 
 // marked normalizes a fenced code block's content to end with a newline, so
 // the rendered code text is the raw content plus one newline unless it
 // already ends with one (or is empty). Keep the display in exactly that
-// shape so live and single-shot renders stay identical.
+// shape so live and single-shot renders stay identical. marked 18.2 also
+// keeps an extra trailing newline for an UNTERMINATED fence whose raw text
+// ends with a blank line; the streaming splitter adds exactly such a line,
+// and armTailCodePatch drops it so the live block still matches the final
+// single-shot render.
 function fenceDisplayText(codeText) {
     if (codeText === '' || codeText.endsWith('\n')) return codeText;
     return codeText + '\n';
@@ -275,7 +279,13 @@ function armTailCodePatch(node, blockText) {
     }
     const display = fenceDisplayText(info.codeText);
     const current = code.__gogenPlain !== undefined ? code.__gogenPlain : code.textContent;
-    if (current !== display) return;
+    if (current !== display) {
+        // An open fence's raw gets one artificial '\n' from splitStreamBlocks.
+        // marked 18.2 keeps it as an extra trailing newline instead of
+        // normalizing it away; drop it so the live block matches the final
+        // render (and the patcher's bookkeeping stays in sync).
+        if (info.closed || current !== display + '\n' || !trimCodeTrailingNewline(code)) return;
+    }
     code.__gogenPlain = display;
     code.__gogenRaw = info.codeText;
     node._gogenTail = { code, lang: info.lang, rawText: raw, codeText: info.codeText };

@@ -531,13 +531,26 @@ func runtimeSeed(cfg *config.Config) config.Config {
 // GetRuntimeConfig returns a copy of the live-adjustable config overlay.
 // Thread-safe: read by the provider factory, session creation, the config
 // push, and persistence while the settings modal may update it.
+//
+// The MCPServers list is copied as well, not just the struct: mcp_save and
+// mcp_delete edit that list IN PLACE (an indexed store and a re-slice) after
+// the lock is released, so a shared backing array let them write to the live
+// overlay behind runtimeMu's back — racing the persist/broadcast goroutine,
+// which reads the same array through effectiveConfig (a data race, plus a
+// lost or duplicated gogen.conf row). The inner Args/Env of one entry stay
+// shared: no caller mutates them through the snapshot (mcp_save builds a
+// fresh entry and clones Env).
 func (ws *Workspace) GetRuntimeConfig() config.Config {
 	if ws == nil {
 		return config.Config{}
 	}
 	ws.runtimeMu.RLock()
-	defer ws.runtimeMu.RUnlock()
-	return ws.runtime
+	c := ws.runtime
+	if len(c.MCPServers) > 0 {
+		c.MCPServers = append([]config.MCPServerConfig(nil), c.MCPServers...)
+	}
+	ws.runtimeMu.RUnlock()
+	return c
 }
 
 // SetRuntimeConfig replaces the live-adjustable config overlay (the

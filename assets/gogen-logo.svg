@@ -1,0 +1,312 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="440" height="612"
+     viewBox="20 24 220 306" role="img" aria-labelledby="t">
+  <title id="t">GoGen: a gopher, half cyborg</title>
+  <defs>
+    <clipPath id="cBody"><path d="M130,34 C160,34 190,58 206,92 C216,112 218,138 218,162 C218,196 214,234 196,262 C180,288 160,301 130,302 C100.0,301 80.0,288 130.0,302 C46.0,234 42.0,196 64.0,262 C42.0,138 44.0,112 42.0,162 C70.0,58 100.0,34 54.0,92 Z"/></clipPath>
+    <clipPath id="cEarL"><path d="M27,82 A21,23 0 1 0 69,82 A21,23 0 1 0 27,82 Z"/></clipPath>
+    <clipPath id="cEarR"><path d="M191,82 A21,23 0 1 0 233,82 A21,23 0 1 0 191,82 Z"/></clipPath>
+    <clipPath id="cArmL"><path d="M38,244 C28,246 24,258 30,266 C36,274 54,276 60,268 C65,261 58,246 48,242 C44,240 40,242 38,244 Z"/></clipPath>
+    <clipPath id="cArmR"><path d="M222,244 C232,246 236,258 230,266 C224,274 206,276 200,268 C195,261 202,246 212,242 C216,240 220,242 222,244 Z"/></clipPath>
+    <clipPath id="cFootL"><path d="M82,292 C74,300 74,314 86,318 C98,322 112,318 114,308 C116,298 108,290 96,289 C90,288 85,289 82,292 Z"/></clipPath>
+    <clipPath id="cFootR"><path d="M178,292 C186,300 186,314 174,318 C162,322 148,318 146,308 C144,298 152,290 164,289 C170,288 175,289 178,292 Z"/></clipPath>
+    <clipPath id="cMuzzle"><path d="M130,168 C152,168 170,182 170,196 C170,211 152,223 130,223 C108.0,223 90.0,211 130.0,223 C90.0,182 108.0,168 90.0,196 Z"/></clipPath>
+    <clipPath id="cToothL"><path d="M118,207 H121 A7,7 0 0 1 128,214 V233 A7,7 0 0 1 121,240 H118 A7,7 0 0 1 111,233 V214 A7,7 0 0 1 118,207 Z"/></clipPath>
+    <clipPath id="cToothR"><path d="M139,207 H142 A7,7 0 0 1 149,214 V233 A7,7 0 0 1 142,240 H139 A7,7 0 0 1 132,233 V214 A7,7 0 0 1 139,207 Z"/></clipPath>
+    <clipPath id="cEyeL"><path d="M70,126 A26,28 0 1 0 122,126 A26,28 0 1 0 70,126 Z"/></clipPath>
+    <clipPath id="cJaw"><path d="M130,168 C152,168 170,182 170,196 C170,211 152,223 130,223 Z"/></clipPath>
+    <clipPath id="cLens"><path d="M139.5,126.0 A24.5,24.5 0 1 0 188.5,126.0 A24.5,24.5 0 1 0 139.5,126.0 Z"/></clipPath>
+    <clipPath id="cRight"><rect x="130.0" y="-40" width="180" height="420"/></clipPath>
+    <clipPath id="cLeft"><rect x="-40" y="-40" width="170.0" height="420"/></clipPath>
+
+    <linearGradient id="gSteel" x1="130" y1="0" x2="220" y2="0"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#C2D3E3"/>
+      <stop offset="0.12" stop-color="#AEC2D5"/>
+      <stop offset="0.34" stop-color="#8CA1B8"/>
+      <stop offset="0.58" stop-color="#6F8499"/>
+      <stop offset="0.80" stop-color="#57697E"/>
+      <stop offset="1" stop-color="#43556A"/>
+    </linearGradient>
+    <linearGradient id="gSheen" x1="0" y1="20" x2="0" y2="310"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.26"/>
+      <stop offset="0.22" stop-color="#ffffff" stop-opacity="0.05"/>
+      <stop offset="0.58" stop-color="#000000" stop-opacity="0.03"/>
+      <stop offset="1" stop-color="#000000" stop-opacity="0.22"/>
+    </linearGradient>
+    <linearGradient id="gPlate" x1="130" y1="240" x2="210" y2="305"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#63778C"/>
+      <stop offset="0.6" stop-color="#475968"/>
+      <stop offset="1" stop-color="#3C4E60"/>
+    </linearGradient>
+    <linearGradient id="gLimb" x1="0" y1="230" x2="0" y2="320"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#B7C9DA"/>
+      <stop offset="0.5" stop-color="#8296AC"/>
+      <stop offset="1" stop-color="#55687C"/>
+    </linearGradient>
+    <linearGradient id="gJaw" x1="0" y1="168" x2="0" y2="240"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8AA1B6"/>
+      <stop offset="0.5" stop-color="#63778C"/>
+      <stop offset="1" stop-color="#46586A"/>
+    </linearGradient>
+    <linearGradient id="gTooth" x1="132" y1="207" x2="149" y2="240"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F7FBFE"/>
+      <stop offset="0.5" stop-color="#D3E1ED"/>
+      <stop offset="1" stop-color="#A0B3C6"/>
+    </linearGradient>
+    <radialGradient id="gLens" cx="0.38" cy="0.30" r="0.8">
+      <stop offset="0" stop-color="#35576F"/>
+      <stop offset="0.45" stop-color="#142636"/>
+      <stop offset="1" stop-color="#070C12"/>
+    </radialGradient>
+    <radialGradient id="gIris" cx="0.42" cy="0.36" r="0.62">
+      <stop offset="0" stop-color="#FFFAE8"/>
+      <stop offset="0.30" stop-color="#FFD873"/>
+      <stop offset="0.68" stop-color="#FF9A2E"/>
+      <stop offset="1" stop-color="#EE5C0A"/>
+    </radialGradient>
+    <radialGradient id="gHalo">
+      <stop offset="0.35" stop-color="#FFB13A" stop-opacity="0.5"/>
+      <stop offset="1" stop-color="#FFB13A" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="gSeam" x1="0" y1="24" x2="0" y2="310"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFC451" stop-opacity="0.5"/>
+      <stop offset="0.10" stop-color="#FFC451" stop-opacity="1"/>
+      <stop offset="0.55" stop-color="#FFB13A" stop-opacity="1"/>
+      <stop offset="0.92" stop-color="#FFC451" stop-opacity="1"/>
+      <stop offset="1" stop-color="#FFB13A" stop-opacity="0.5"/>
+    </linearGradient>
+    <linearGradient id="gSeamHot" x1="0" y1="24" x2="0" y2="310"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFF6DC" stop-opacity="0.45"/>
+      <stop offset="0.12" stop-color="#FFF6DC" stop-opacity="1"/>
+      <stop offset="0.70" stop-color="#FFF1C8" stop-opacity="0.95"/>
+      <stop offset="1" stop-color="#FFF6DC" stop-opacity="0.45"/>
+    </linearGradient>
+    <linearGradient id="gSpill" x1="114" y1="0" x2="130" y2="0"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFB13A" stop-opacity="0"/>
+      <stop offset="1" stop-color="#FFB13A" stop-opacity="0.07"/>
+    </linearGradient>
+    <pattern id="pBrush" width="5" height="5" patternUnits="userSpaceOnUse"
+             patternTransform="rotate(26)">
+      <line x1="0" y1="0" x2="0" y2="5" stroke="#ffffff" stroke-width="0.7"
+            opacity="0.05"/>
+    </pattern>
+    <filter id="fWide" x="-90%" y="-40%" width="280%" height="180%">
+      <feGaussianBlur stdDeviation="4.2"/>
+    </filter>
+    <filter id="fTight" x="-90%" y="-40%" width="280%" height="180%">
+      <feGaussianBlur stdDeviation="1.4"/>
+    </filter>
+    <filter id="fTiny" x="-90%" y="-90%" width="280%" height="280%">
+      <feGaussianBlur stdDeviation="1.1"/>
+    </filter>
+  </defs>
+
+  <!-- organic left half -->
+  <g id="organic">
+  <!-- ears (behind the head) -->
+  <path d="M27,82 A21,23 0 1 0 69,82 A21,23 0 1 0 27,82 Z" fill="#E8B87A"/><g clip-path="url(#cEarL)"><path d="M27,82 A21,23 0 1 0 69,82 A21,23 0 1 0 27,82 Z" fill="none" stroke="#2E2A2E" stroke-width="5.2" stroke-linejoin="round"/></g>
+  <path d="M39.5,84 A10.5,11.5 0 1 0 60.5,84 A10.5,11.5 0 1 0 39.5,84 Z" fill="#C98F5B"/><g clip-path="url(#cEarL)"><path d="M39.5,84 A10.5,11.5 0 1 0 60.5,84 A10.5,11.5 0 1 0 39.5,84 Z" fill="none" stroke="#2E2A2E" stroke-width="5.2" stroke-linejoin="round"/></g>
+  <path d="M191,82 A21,23 0 1 0 233,82 A21,23 0 1 0 191,82 Z" fill="url(#gSteel)"/><g clip-path="url(#cEarR)"><path d="M191,82 A21,23 0 1 0 233,82 A21,23 0 1 0 191,82 Z" fill="none" stroke="#2E2A2E" stroke-width="5.2" stroke-linejoin="round"/></g>
+  <g clip-path="url(#cEarR)"><path d="M204,84 A10,10.5 0 1 0 224,84 A10,10.5 0 1 0 204,84 Z" fill="none" stroke="#1B2430" stroke-width="2.8" stroke-linejoin="round"/></g>
+
+  <!-- arms and feet (behind the body) -->
+  <path d="M38,244 C28,246 24,258 30,266 C36,274 54,276 60,268 C65,261 58,246 48,242 C44,240 40,242 38,244 Z" fill="#E8B87A"/><g clip-path="url(#cArmL)"><path d="M38,244 C28,246 24,258 30,266 C36,274 54,276 60,268 C65,261 58,246 48,242 C44,240 40,242 38,244 Z" fill="none" stroke="#2E2A2E" stroke-width="5.2" stroke-linejoin="round"/></g>
+  <path d="M82,292 C74,300 74,314 86,318 C98,322 112,318 114,308 C116,298 108,290 96,289 C90,288 85,289 82,292 Z" fill="#E8B87A"/><g clip-path="url(#cFootL)"><path d="M82,292 C74,300 74,314 86,318 C98,322 112,318 114,308 C116,298 108,290 96,289 C90,288 85,289 82,292 Z" fill="none" stroke="#2E2A2E" stroke-width="5.2" stroke-linejoin="round"/></g>
+  <path d="M222,244 C232,246 236,258 230,266 C224,274 206,276 200,268 C195,261 202,246 212,242 C216,240 220,242 222,244 Z" fill="url(#gLimb)"/><g clip-path="url(#cArmR)"><path d="M222,244 C232,246 236,258 230,266 C224,274 206,276 200,268 C195,261 202,246 212,242 C216,240 220,242 222,244 Z" fill="none" stroke="#2E2A2E" stroke-width="5.2" stroke-linejoin="round"/></g>
+  <path d="M178,292 C186,300 186,314 174,318 C162,322 148,318 146,308 C144,298 152,290 164,289 C170,288 175,289 178,292 Z" fill="url(#gLimb)"/><g clip-path="url(#cFootR)"><path d="M178,292 C186,300 186,314 174,318 C162,322 148,318 146,308 C144,298 152,290 164,289 C170,288 175,289 178,292 Z" fill="none" stroke="#2E2A2E" stroke-width="5.2" stroke-linejoin="round"/></g>
+
+  <!-- toe / finger detail -->
+  <g clip-path="url(#cArmL)" stroke="#2E2A2E" stroke-width="2" stroke-linecap="round"
+     fill="none" opacity="0.9">
+    <path d="M44,251 L50,258"/><path d="M52,246 L56,255"/>
+  </g>
+  <g clip-path="url(#cFootL)" stroke="#2E2A2E" stroke-width="2" stroke-linecap="round"
+     fill="none" opacity="0.9">
+    <path d="M92,296 L99,305"/><path d="M103,294 L107,304"/>
+  </g>
+  <g clip-path="url(#cArmR)" stroke="#0E151D" stroke-width="2.2" stroke-linecap="round"
+     fill="none">
+    <path d="M214,250 H226"/><path d="M213,257 H225"/>
+  </g>
+  <g clip-path="url(#cFootR)" stroke="#0E151D" stroke-width="2.2" stroke-linecap="round"
+     fill="none">
+    <path d="M156,296 H172"/><path d="M155,303 H171"/>
+  </g>
+  <!-- body -->
+  <path d="M130,34 C160,34 190,58 206,92 C216,112 218,138 218,162 C218,196 214,234 196,262 C180,288 160,301 130,302 C100.0,301 80.0,288 130.0,302 C46.0,234 42.0,196 64.0,262 C42.0,138 44.0,112 42.0,162 C70.0,58 100.0,34 54.0,92 Z" fill="#E8B87A"/><g clip-path="url(#cBody)"><path d="M130,34 C160,34 190,58 206,92 C216,112 218,138 218,162 C218,196 214,234 196,262 C180,288 160,301 130,302 C100.0,301 80.0,288 130.0,302 C46.0,234 42.0,196 64.0,262 C42.0,138 44.0,112 42.0,162 C70.0,58 100.0,34 54.0,92 Z" fill="none" stroke="#2E2A2E" stroke-width="5.2" stroke-linejoin="round"/></g>
+  <!-- organic eye -->
+  <path d="M70,126 A26,28 0 1 0 122,126 A26,28 0 1 0 70,126 Z" fill="#FFFFFF"/><g clip-path="url(#cEyeL)"><path d="M70,126 A26,28 0 1 0 122,126 A26,28 0 1 0 70,126 Z" fill="none" stroke="#2E2A2E" stroke-width="5.2" stroke-linejoin="round"/></g>
+  <circle cx="96" cy="130" r="11" fill="#2B2320"/>
+  <circle cx="91" cy="124" r="4" fill="#FFFFFF"/>
+  <circle cx="101" cy="136" r="1.8" fill="#FFFFFF" opacity="0.55"/>
+
+  <!-- freckles -->
+  <g fill="#3B2A22" opacity="0.45">
+    <circle cx="60" cy="196" r="1.7"/><circle cx="69" cy="206" r="1.7"/>
+    <circle cx="58" cy="210" r="1.7"/>
+  </g>
+
+  <!-- muzzle + buck teeth (organic side only) -->
+  <g clip-path="url(#cLeft)">
+    <path d="M130,168 C152,168 170,182 170,196 C170,211 152,223 130,223 C108.0,223 90.0,211 130.0,223 C90.0,182 108.0,168 90.0,196 Z" fill="#F7E3C6"/><g clip-path="url(#cMuzzle)"><path d="M130,168 C152,168 170,182 170,196 C170,211 152,223 130,223 C108.0,223 90.0,211 130.0,223 C90.0,182 108.0,168 90.0,196 Z" fill="none" stroke="#2E2A2E" stroke-width="5.2" stroke-linejoin="round"/></g>
+    <path d="M118,207 H121 A7,7 0 0 1 128,214 V233 A7,7 0 0 1 121,240 H118 A7,7 0 0 1 111,233 V214 A7,7 0 0 1 118,207 Z" fill="#FFFFFF"/><g clip-path="url(#cToothL)"><path d="M118,207 H121 A7,7 0 0 1 128,214 V233 A7,7 0 0 1 121,240 H118 A7,7 0 0 1 111,233 V214 A7,7 0 0 1 118,207 Z" fill="none" stroke="#2E2A2E" stroke-width="5.2" stroke-linejoin="round"/></g>
+  </g></g>
+
+  <!-- cybernetic right half -->
+  <g id="cyber">
+  <!-- cybernetic half: brushed steel shell, panels, data trace -->
+  <g clip-path="url(#cBody)"><g clip-path="url(#cRight)">
+    <rect x="129.0" y="-40" width="200" height="420" fill="url(#gSteel)"/>
+    <rect x="129.0" y="-40" width="200" height="420" fill="url(#gSheen)"/>
+    <rect x="129.0" y="-40" width="200" height="420" fill="url(#pBrush)"/>
+    <path d="M130,34 C160,34 190,58 206,92 C216,112 218,138 218,162 C218,196 214,234 196,262 C180,288 160,301 130,302 C100.0,301 80.0,288 130.0,302 C46.0,234 42.0,196 64.0,262 C42.0,138 44.0,112 42.0,162 C70.0,58 100.0,34 54.0,92 Z" fill="none" stroke="#EAF2F9" stroke-width="3" opacity="0.22"
+          transform="translate(-1.4,-1.2)"/>
+
+    <!-- lower chest plate -->
+    <path d="M130,258 C158,264 184,278 198,300 L204,340 H130 Z" fill="url(#gPlate)"/>
+    <path d="M130,258 C158,264 184,278 198,300" fill="none" stroke="#1B2430"
+          stroke-width="2.3" stroke-linecap="round"/>
+    <path d="M130,258 C158,264 184,278 198,300" fill="none" stroke="#DCE8F2"
+          stroke-width="0.8" opacity="0.4" transform="translate(0,1.6)"/>
+    <g fill="#0E151D">
+      <rect x="150" y="272" width="34" height="3.2" rx="1.6"/>
+      <rect x="150" y="281" width="34" height="3.2" rx="1.6"/>
+      <rect x="150" y="290" width="34" height="3.2" rx="1.6"/>
+    </g>
+
+    <!-- brow and cheek seams -->
+    <g fill="none" stroke-linecap="round">
+      <path d="M130,90 C158,78 190,80 210,98" stroke="#1B2430" stroke-width="2.3"/>
+      <path d="M130,90 C158,78 190,80 210,98" stroke="#DCE8F2" stroke-width="0.8"
+            opacity="0.45" transform="translate(0,1.6)"/>
+      <path d="M130,236 C162,246 194,240 212,222" stroke="#1B2430" stroke-width="2.3"/>
+      <path d="M130,236 C162,246 194,240 212,222" stroke="#DCE8F2" stroke-width="0.8"
+            opacity="0.45" transform="translate(0,1.6)"/>
+    </g>
+
+    <!-- data trace -->
+    <path d="M190,150 H206 V176 H196 V206" fill="none" stroke="#6FE0EE"
+          stroke-width="4.2" opacity="0.16" filter="url(#fTiny)"
+          stroke-linejoin="round"/>
+    <path d="M190,150 H206 V176 H196 V206" fill="none" stroke="#6FE0EE"
+          stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/>
+    <circle cx="190" cy="150" r="2.3" fill="#0D141C" stroke="#6FE0EE" stroke-width="1.1"/>
+    <circle cx="196" cy="206" r="2.3" fill="#0D141C" stroke="#6FE0EE" stroke-width="1.1"/>
+
+    <!-- fasteners -->
+    <g>
+      <circle cx="204" cy="102" r="2.6" fill="#5E7387" stroke="#1B2430"
+              stroke-width="0.9"/>
+      <circle cx="204" cy="102" r="0.9" fill="#D3E0EC" opacity="0.85"/>
+      <circle cx="206" cy="218" r="2.6" fill="#5E7387" stroke="#1B2430"
+              stroke-width="0.9"/>
+      <circle cx="206" cy="218" r="0.9" fill="#D3E0EC" opacity="0.85"/>
+      <circle cx="136" cy="242" r="2.6" fill="#5E7387" stroke="#1B2430"
+              stroke-width="0.9"/>
+      <circle cx="136" cy="242" r="0.9" fill="#D3E0EC" opacity="0.85"/>
+      <circle cx="178" cy="86" r="2.6" fill="#5E7387" stroke="#1B2430"
+              stroke-width="0.9"/>
+      <circle cx="178" cy="86" r="0.9" fill="#D3E0EC" opacity="0.85"/>
+    </g>
+  </g></g>
+
+  <!-- silhouette + limb outlines restored over the steel -->
+  <g clip-path="url(#cRight)"><g clip-path="url(#cBody)"><path d="M130,34 C160,34 190,58 206,92 C216,112 218,138 218,162 C218,196 214,234 196,262 C180,288 160,301 130,302 C100.0,301 80.0,288 130.0,302 C46.0,234 42.0,196 64.0,262 C42.0,138 44.0,112 42.0,162 C70.0,58 100.0,34 54.0,92 Z" fill="none" stroke="#2E2A2E" stroke-width="5.2" stroke-linejoin="round"/></g></g>
+
+  <!-- ear: audio sensor grommet -->
+  <g clip-path="url(#cEarR)">
+    <circle cx="212" cy="82" r="8.6" fill="#1B2430" stroke="#2E2A2E" stroke-width="1.4"/>
+    <g fill="none" stroke="#DCE8F2" stroke-width="1.2" opacity="0.6">
+      <circle cx="212" cy="82" r="5.9"/>
+      <circle cx="212" cy="82" r="2.9"/>
+    </g>
+    <circle cx="212" cy="82" r="3.4" fill="#6FE0EE" opacity="0.45"
+            filter="url(#fTiny)"/>
+    <circle cx="212" cy="82" r="1.7" fill="#C9F8FF"/>
+  </g>
+  <!-- camera eye -->
+  <g id="cyber-eye">
+    <circle cx="164.0" cy="126.0" r="31.5" fill="url(#gHalo)" opacity="0.6"/>
+    <circle cx="164.0" cy="126.0" r="29.6" fill="#26313E" stroke="#1B2430"
+            stroke-width="2.2"/>
+    <circle cx="164.0" cy="126.0" r="24.5" fill="url(#gLens)"/>
+    <circle cx="164.0" cy="126.0" r="21" fill="none" stroke="#0A1119"
+            stroke-width="1.3" opacity="0.8"/>
+    <circle cx="164.0" cy="126.0" r="17" fill="none" stroke="#7BEDFF"
+            stroke-width="0.8" opacity="0.28" stroke-dasharray="3 6"/>
+    <path d="M148,108 A24,24 0 0 1 179,110" fill="none" stroke="#ffffff"
+          stroke-width="1.3" opacity="0.3" stroke-linecap="round"/>
+    <g clip-path="url(#cLens)">
+      <circle cx="154.0" cy="132.0" r="14.5" fill="url(#gHalo)"/>
+      <circle cx="154.0" cy="132.0" r="9.4" fill="url(#gIris)"
+              stroke="#FFE0A0" stroke-width="0.8"/>
+      <circle cx="154.0" cy="132.0" r="9.4" fill="none" stroke="#FF8A1E"
+              stroke-width="1.6" opacity="0.72"/>
+      <circle cx="154.0" cy="132.0" r="4" fill="#FFF8E7"/>
+      <circle cx="151.6" cy="129.6" r="1.6" fill="#ffffff"
+              opacity="0.75"/>
+      <circle cx="154.0" cy="132.0" r="11.4" fill="none" stroke="#0B1017"
+              stroke-width="1.3" opacity="0.55"/>
+    </g>
+    <g fill="#5E7387" stroke="#1B2430" stroke-width="0.8">
+      <circle cx="185.5" cy="108.6" r="1.5"/><circle cx="142.5" cy="108.6" r="1.5"/>
+      <circle cx="142.5" cy="143.4" r="1.5"/><circle cx="185.5" cy="143.4" r="1.5"/>
+    </g>
+    <g fill="#DCE8F2" opacity="0.85">
+      <circle cx="185.5" cy="108.6" r="0.55"/><circle cx="142.5" cy="108.6" r="0.55"/>
+      <circle cx="142.5" cy="143.4" r="0.55"/><circle cx="185.5" cy="143.4" r="0.55"/>
+    </g>
+  </g>
+  <!-- machined jaw over the right half of the muzzle -->
+  <path d="M130,168 C152,168 170,182 170,196 C170,211 152,223 130,223 Z" fill="url(#gJaw)"/>
+  <g clip-path="url(#cJaw)"><path d="M130,168 C152,168 170,182 170,196 C170,211 152,223 130,223 Z" fill="none" stroke="#2E2A2E" stroke-width="5.2" stroke-linejoin="round"/></g>
+  <path d="M130,168 C152,168 170,182 170,196" fill="none" stroke="#DCE8F2" stroke-width="0.9" opacity="0.45"/>
+  <g fill="#0E151D">
+    <rect x="149" y="180" width="16" height="3" rx="1.5"/>
+    <rect x="149" y="186.5" width="16" height="3" rx="1.5"/>
+    <rect x="149" y="193" width="16" height="3" rx="1.5"/>
+  </g>
+  <circle cx="163" cy="206" r="2" fill="#FFB13A" opacity="0.5" filter="url(#fTiny)"/>
+  <circle cx="163" cy="206" r="1.2" fill="#FFE9B8"/>
+  <path d="M130,203 H160" stroke="#0B1017" stroke-width="2.2" stroke-linecap="round"/>
+
+  <!-- steel buck tooth, flush with the seam -->
+  <path d="M139,207 H142 A7,7 0 0 1 149,214 V233 A7,7 0 0 1 142,240 H139 A7,7 0 0 1 132,233 V214 A7,7 0 0 1 139,207 Z" fill="url(#gTooth)"/><g clip-path="url(#cToothR)"><path d="M139,207 H142 A7,7 0 0 1 149,214 V233 A7,7 0 0 1 142,240 H139 A7,7 0 0 1 132,233 V214 A7,7 0 0 1 139,207 Z" fill="none" stroke="#2E2A2E" stroke-width="5.2" stroke-linejoin="round"/></g>
+  <path d="M135,212 V235" stroke="#ffffff" stroke-width="1.1" opacity="0.45"
+        stroke-linecap="round"/>
+
+  <!-- nose drawn last so it stays continuous across the seam -->
+  <path d="M130,169 C141,169 147,174 145,182 C143,189 137,191 130,191 C123.0,191 117.0,189 130.0,191 C113.0,174 119.0,169 115.0,182 Z" fill="#3B2A22"/>
+  <path d="M130,169 C141,169 147,174 145,182 C143,189 137,191 130,191 C123.0,191 117.0,189 130.0,191 C113.0,174 119.0,169 115.0,182 Z" fill="none" stroke="#2E2A2E" stroke-width="4.8" stroke-linejoin="round"/>
+  <!-- prompt glyph on the chest plate -->
+  <g fill="none" stroke="#FFB13A" stroke-width="3.2" stroke-linecap="round"
+     stroke-linejoin="round" opacity="0.95">
+    <path d="M146,238 L161,249 L146,260"/>
+    <path d="M167,260 H182"/>
+  </g>
+  <g fill="none" stroke="#FFB13A" stroke-width="5" opacity="0.26"
+     stroke-linecap="round" stroke-linejoin="round" filter="url(#fTiny)">
+    <path d="M146,238 L161,249 L146,260"/>
+    <path d="M167,260 H182"/>
+  </g>
+
+  <!-- glowing seam -->
+  <g id="seam" clip-path="url(#cBody)">
+    <rect x="114" y="24" width="16" height="288" fill="url(#gSpill)"/>
+    <rect x="127.8" y="24" width="6.2" height="288" fill="url(#gSeam)"
+          opacity="0.34" filter="url(#fWide)"/>
+    <rect x="129.1" y="24" width="3.2" height="288" fill="url(#gSeam)"
+          opacity="0.6" filter="url(#fTight)"/>
+    <rect x="129.1" y="24" width="1.7" height="288" fill="#1B2430" opacity="0.85"/>
+    <rect x="129.65" y="24" width="0.9" height="288" fill="url(#gSeamHot)"/>
+    <rect x="130.9" y="30" width="0.6" height="276" fill="#DCE8F2" opacity="0.3"/>
+  </g></g>
+</svg>

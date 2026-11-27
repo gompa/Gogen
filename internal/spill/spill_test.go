@@ -1,6 +1,7 @@
 package spill
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -671,5 +672,87 @@ func TestTargetCapBoundsSpillGrowth(t *testing.T) {
 	}
 	if _, total, ok := tgt.Finish(); ok && total > MaxTargetBytes {
 		t.Fatalf("spilled %d bytes, cap is %d", total, MaxTargetBytes)
+	}
+}
+
+// TestRepointFileCopyFallback pins the copy path: hardlinks are unavailable on
+// cross-device mounts and some filesystems, and the fallback used to read the
+// whole spill file (up to MaxTargetBytes, 64MB) into memory before writing it.
+// The copy is streamed now, so the content must still arrive byte for byte,
+// the target must still be created exclusively, and an existing target must
+// still be returned as-is.
+func TestRepointFileCopyFallback(t *testing.T) {
+	// Force the copy path for the whole test.
+	prev := linkFile
+	linkFile = func(string, string) error { return os.ErrInvalid }
+	t.Cleanup(func() { linkFile = prev })
+
+	s, dir := newTestStore(t)
+	// A few MB: enough that a buffered copy is a real allocation, small enough
+	// to keep the test fast.
+	body := bytes.Repeat([]byte("0123456789abcdef"), 1<<17) // 2 MiB
+	src, err := s.Save("sess-1", "tool", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dst, err := RepointFile(dir, src, "sess-2")
+	if err != nil {
+		t.Fatalf("copy fallback failed: %v", err)
+	}
+	if dst == src {
+		t.Fatalf("repoint did not create a new path (%q)", dst)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("copied %d bytes, want %d identical bytes", len(got), len(body))
+	}
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("copied file perms = %o, want 600", perm)
+	}
+
+	// Idempotent: a second repoint returns the existing path untouched.
+	again, err := RepointFile(dir, src, "sess-2")
+	if err != nil || again != dst {
+		t.Fatalf("second repoint = (%q, %v), want (%q, nil)", again, err, dst)
+	}
+}
+
+// TestRepointFileCopyStreams pins the memory property of the copy fallback:
+// the file is streamed (io.Copy) instead of being read whole with
+// os.ReadFile. A spill file can reach MaxTargetBytes (64MB) and a fork
+// repoints every retained locator, so the buffered version put each one on the
+// heap. TotalAlloc, not HeapAlloc: a freed buffer would look free after a GC.
+func TestRepointFileCopyStreams(t *testing.T) {
+	prev := linkFile
+	linkFile = func(string, string) error { return os.ErrInvalid }
+	t.Cleanup(func() { linkFile = prev })
+
+	s, dir := newTestStore(t)
+	const size = 8 << 20 // 8 MiB
+	body := bytes.Repeat([]byte("spill-data-"), size/len("spill-data-"))
+	src, err := s.Save("sess-1", "tool", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, err := RepointFile(dir, src, "sess-2"); err != nil {
+		t.Fatalf("copy fallback failed: %v", err)
+	}
+	runtime.ReadMemStats(&after)
+	// A streamed copy allocates its buffer (32KB); leave generous headroom for
+	// runtime noise but stay far below the file size, which is what buffers
+	// the whole thing.
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc >= size/4 {
+		t.Fatalf("copy allocated %d bytes for a %d-byte file; it is buffering the whole file", alloc, size)
 	}
 }

@@ -184,6 +184,12 @@ func (m *Model) rebuildTranscriptFrom(a *agent.Agent) {
 	// replaced wholesale, so any live line index would point at the wrong
 	// line (nil agent leaves the empty transcript, same as the join path).
 	m.resetStreamState(false)
+	// A wholesale rebuild is a DIFFERENT document (session switch, restore,
+	// fork, compaction): the selection belongs to the old one, so it is
+	// dropped here rather than re-anchored by text in setViewportContent. A
+	// snippet that happens to survive the reshape must not carry a highlight
+	// — and a copy — from the conversation that is no longer on screen.
+	m.clearSelection()
 	if a == nil {
 		return
 	}
@@ -254,17 +260,26 @@ func (m *Model) setViewportContent() {
 		lineNo += len(lastParts)
 	}
 	m.tocAnchors = anchors
-	// Selection: KEEP it when the rows it covers still hold the same text.
-	// This path is not reserved for wholesale replacements — it runs at every
-	// round boundary, on every mid-line streaming write (a growing patch diff)
-	// and on a resize — so clearing unconditionally destroyed a selection the
-	// user had just made while a turn streamed, with the copy still a
-	// keystroke away: "I selected text and copy did nothing". Appends leave
-	// the covered rows byte-identical, so that case is recognized exactly;
-	// a compaction, a session/session-model switch, or a re-wrap that moves
-	// the text still drops the highlight (row coordinates would address
-	// different lines).
-	m.selection = m.selectionAfterRebuild(wrappedParts)
+	// Selection: KEEP it when the rows it covers still hold the same text,
+	// and re-anchor it by that text when they do not (a rewritten streaming
+	// line, an insert above it). This path is not reserved for wholesale
+	// replacements — it runs at every round boundary, on every mid-line
+	// streaming write (a growing patch diff) and on a resize — so clearing
+	// unconditionally destroyed a selection the user had just made while a
+	// turn streamed, with the copy still a keystroke away: "I selected text
+	// and copy did nothing". Only when the text is gone or ambiguous
+	// (compaction, session/session-model switch, a repeated snippet) is the
+	// highlight dropped — and then the status line says so instead of the
+	// next ctrl+shift+c landing on nothing.
+	if sel := m.selectionAfterRebuild(wrappedParts); sel != nil {
+		m.selection = sel
+	} else if m.selection != nil {
+		// clearSelection, not a bare nil: it also resets selectionYOff (the
+		// frozen scroll offset a drag maps through), which must never outlive
+		// the selection it belongs to.
+		m.clearSelection()
+		m.statusMsg = "Selection cleared (the transcript moved) — drag to select again"
+	}
 	// Full re-scan of all wrapped lines. Not actually rare: besides resize,
 	// session restore, and mode changes this runs at every round and turn
 	// end (streaming.go resetStreamState/handleStreamEnd) and on every
@@ -338,9 +353,23 @@ func (m *Model) View() tea.View {
 	// bell (bellIfBlurred) — it rings only while the window is blurred.
 	v.ReportFocus = true
 
-	// Modal overlay — renders on opaque background so nothing bleeds through
+	// Modal overlay — renders on opaque background so nothing bleeds through.
+	//
+	// The overlay is a DIFFERENT View, but it must carry the same terminal
+	// modes: returning a bare tea.NewView here dropped MouseMode (and focus
+	// reporting) for as long as the modal was up, so the terminal stopped
+	// sending mouse events — including the RELEASE of a drag that was in
+	// flight when the modal appeared. That lost release left the selection
+	// stuck in Dragging (wheel locked, next drag anchored to the old start),
+	// which is one way copy silently stops working. The handler already
+	// refuses to act under an overlay (handleMouseMsg), so keeping reporting
+	// on is safe and keeps the terminal's modes stable across modal
+	// open/close.
 	if m.modal != ModalNone {
-		return tea.NewView(renderModalOverlay(m.renderModal(), m.width, m.height))
+		mv := tea.NewView(renderModalOverlay(m.renderModal(), m.width, m.height))
+		mv.MouseMode = v.MouseMode
+		mv.ReportFocus = v.ReportFocus
+		return mv
 	}
 
 	return v

@@ -9,13 +9,14 @@ import (
 	"gogen/internal/llm"
 )
 
-// TestCompactHistoryKeepsExecutedCallRoster pins the agent-level end-to-end
-// behavior behind the compaction roster: when a background execute call is
-// summarized away, its wire call id and the job id from its result survive in
-// the summary. Without the roster the model would see a condensed span and
-// silently lose the handle it needs to address the running job (background_job
-// wait/list, terminal send) on a later turn.
-func TestCompactHistoryKeepsExecutedCallRoster(t *testing.T) {
+// TestCompactHistoryKeepsSessionStateHandle pins the agent-level end-to-end
+// behavior behind the compaction manifest: when a background execute call is
+// summarized away, the JOB id from its result survives in the summary (the
+// wire call id does not: no tool takes it after the pair is gone). Without
+// the manifest the model would see a condensed span and silently lose the
+// handle it needs to address the running job (background_job wait/list,
+// terminal send) on a later turn.
+func TestCompactHistoryKeepsSessionStateHandle(t *testing.T) {
 	provider := &countingProvider{limit: 20000}
 	ctxMgr := contextmgr.NewManager(provider, contextmgr.Settings{
 		ContextLimit:              20000,
@@ -57,15 +58,17 @@ func TestCompactHistoryKeepsExecutedCallRoster(t *testing.T) {
 		t.Fatal("no compaction summary in history")
 	}
 	for _, want := range []string{
-		"[Executed tool calls in the summarized span — id, tool, result head] — 1 executed",
-		"- call_bg1 execute_command: Started background job job-bg1.",
+		contextmgr.StateHeader,
+		`- job "job-bg1": execute_command "make build"`,
+		`- execute_command "make build" (ok, 1x)`,
+		contextmgr.StateFooter,
 	} {
 		if !strings.Contains(summary, want) {
 			t.Fatalf("summary missing %q:\n%s", want, summary)
 		}
 	}
-	// Only the result head is carried; the full result text stays gone.
-	if strings.Contains(summary, "Command: make build") {
-		t.Fatalf("summary should carry only the result head, got:\n%s", summary)
+	// The wire call id has no consumer after compaction; the job id does.
+	if strings.Contains(summary, "call_bg1") {
+		t.Fatalf("manifest carries the wire call id:\n%s", summary)
 	}
 }

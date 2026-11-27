@@ -19,15 +19,59 @@ const mcpTestTimeout = 90 * time.Second
 // mcpProbeTimeout is the test_mcp deadline. The floor stays mcpTestTimeout
 // (a cold npx download). A server that sets init_timeout_secs higher — a
 // reverse-engineering launcher that spends that budget inside the handshake —
-// must not be reported broken by the shorter hardcoded cap.
-func mcpProbeTimeout(server config.MCPServerConfig) time.Duration {
-	timeout := mcpTestTimeout
-	if server.InitTimeoutSecs > 0 {
-		if d := time.Duration(server.InitTimeoutSecs) * time.Second; d > timeout {
-			timeout = d
-		}
+// must not be reported broken by the shorter floor, but it is still clamped to
+// ceiling.
+//
+// ceiling is the CONFIGURED bound (mcp_probe_timeout_secs, default ten
+// minutes). It exists because init_timeout_secs is CLIENT-SUPPLIED by the
+// settings modal, so without a ceiling a typed 1000000 pinned a throwaway child
+// process (and the probe goroutine holding it) for eleven days. The ceiling
+// only bounds the probe: what a real MCP client honors at runtime is config
+// semantics and is untouched (internal/mcp). A ceiling BELOW the floor is
+// honored — an operator who sets ten seconds wants a probe that fails fast.
+func mcpProbeTimeout(server config.MCPServerConfig, ceiling time.Duration) time.Duration {
+	if ceiling <= 0 {
+		ceiling = config.DefaultMCPProbeTimeoutSecs * time.Second
 	}
-	return timeout
+	deadline := mcpTestTimeout
+	if server.InitTimeoutSecs > 0 {
+		// Clamp the SECONDS before the multiply: a huge client value overflows
+		// time.Duration, and the wrapped negative would silently fall back to
+		// the floor instead of the ceiling.
+		maxSecs := int(ceiling / time.Second)
+		if maxSecs < 1 {
+			maxSecs = 1
+		}
+		deadline = max(deadline, time.Duration(min(server.InitTimeoutSecs, maxSecs))*time.Second)
+	}
+	return min(deadline, ceiling)
+}
+
+// beginMCPProbe reserves one of the limit probe slots, reporting false when
+// they are all taken (the caller answers with a notice instead of spawning
+// another child). limit is the live mcp_probe_max_concurrent (<= 0 = the
+// built-in default), read from the runtime overlay by the caller so a saved
+// change applies to the next test. A counter under a mutex rather than a
+// semaphore channel: the zero value is usable, so a Server built by a test
+// needs no initialization.
+func (s *Server) beginMCPProbe(limit int) bool {
+	limit = config.Effective(limit, config.DefaultMCPProbeMaxConcurrent)
+	s.mcpProbeMu.Lock()
+	defer s.mcpProbeMu.Unlock()
+	if s.mcpProbes >= limit {
+		return false
+	}
+	s.mcpProbes++
+	return true
+}
+
+// endMCPProbe releases a probe slot taken by beginMCPProbe.
+func (s *Server) endMCPProbe() {
+	s.mcpProbeMu.Lock()
+	if s.mcpProbes > 0 {
+		s.mcpProbes--
+	}
+	s.mcpProbeMu.Unlock()
 }
 
 // wsHandleTestMCP runs the MCP connectivity + tools test against a
@@ -42,11 +86,16 @@ func wsHandleTestMCP(req *wsRequest) {
 		return
 	}
 	server := config.MCPServerConfig{Name: mcpReq.Name, Command: mcpReq.Command, Args: mcpReq.Args, Env: mcpReq.Env}
+	// One live read of the runtime overlay per request: it carries the stored
+	// MCP entry AND both probe bounds (mcp_probe_timeout_secs /
+	// mcp_probe_max_concurrent). Reading them here, at call time, is what makes
+	// a saved settings change apply to the NEXT test without a restart —
+	// GetRuntimeConfig is nil-safe for a Server built by a test.
+	rc := s.ws.GetRuntimeConfig()
 	// Testing a registered server by name resolves its STORED command/args/
 	// env from the runtime overlay (the client only sees envSet, never the
 	// env values).
 	if mcpReq.Name != "" && mcpReq.Command == "" {
-		rc := s.ws.GetRuntimeConfig()
 		found := false
 		for _, m := range rc.MCPServers {
 			if m.Name == mcpReq.Name {
@@ -77,12 +126,27 @@ func wsHandleTestMCP(req *wsRequest) {
 		writeNoticeError(ws, "mcp", "Error: MCP server command is required")
 		return
 	}
+	// One throwaway child per probe, so the probe runs in a bare goroutine
+	// only while a slot is free: a client spamming test_mcp otherwise spawns
+	// an unbounded number of processes that outlive the click. The slot cap is
+	// the live mcp_probe_max_concurrent.
+	probeLimit := rc.MCPProbeConcurrency()
+	if !s.beginMCPProbe(probeLimit) {
+		writeNoticeError(ws, "mcp", fmt.Sprintf("Error: %d MCP tests are already running — wait for them to finish", probeLimit))
+		return
+	}
 	go func() {
+		// Panic guard registered FIRST so it runs LAST: the probe slot must be
+		// released (endMCPProbe) even when the probe goroutine panics. The
+		// client gets no mcp_test frame in that case, which beats losing the
+		// process; see recoverGoroutine.
+		defer recoverGoroutine("mcp test")
+		defer s.endMCPProbe()
 		start := time.Now()
 		reply := func(res MCPTestResult) {
 			_ = ws.writeJSON(WSMessage{Type: "mcp_test", MCPTestResult: &res})
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), mcpProbeTimeout(server))
+		ctx, cancel := context.WithTimeout(context.Background(), mcpProbeTimeout(server, rc.MCPProbeTimeoutCeiling()))
 		defer cancel()
 		tools, err := s.mcpTestFn(ctx, server)
 		latency := time.Since(start).Milliseconds()

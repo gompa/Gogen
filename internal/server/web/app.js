@@ -1416,11 +1416,12 @@
         // stamp the wrong bubble.
         const pendingAcks = [];
         // One record per local cancel (cancelActiveTurn), consumed 1:1 by
-        // the "cancelled" frame it produces: the pendingAcks entry of the
-        // cancelled turn, or null when its ack had already arrived. The
-        // record's entry is stale exactly when it is still queued at
-        // frame time — an in-flight ack always arrives before the frame
-        // (same-socket FIFO) and leaves the queue first.
+        // its terminal frame (cancelled or cancel_ack): { entry, sessionId }.
+        // `entry` is the pendingAcks element of the cancelled turn, or null
+        // when its ack had already arrived — stale exactly when still queued
+        // at frame time (an in-flight ack arrives first, same-socket FIFO).
+        // `sessionId` releases the stale-frame guard when no cancelled/
+        // turn_end pair is coming (idle-cancel ack).
         const pendingCancels = [];
         // Which pending entry each send cancelled (the turn that was
         // active when it was sent), for the terminal-frame drop rule in
@@ -1975,6 +1976,13 @@
                 // the pending flag or block the resumed session's
                 // convergence. Cleared when the reply re-keys the pane.
                 ignoreTurnEndsFor: null,
+                // Session whose turn the user cancelled locally and whose
+                // terminal frame has not arrived yet. Live frames already
+                // emitted by that turn can still be queued on the socket
+                // when the click lands; they must not resurrect the busy UI
+                // after the local stop. Cleared by cancelled/turn_end,
+                // cancel_ack (no pair is coming), or a session re-key.
+                cancelPendingFor: null,
                 suppressTurnEnds: 0,
                 pendingSessionResponse: false,
                 pendingResendContent: null,
@@ -2209,6 +2217,28 @@
 
         function touchPaneActivity(pane, type) {
             if (pane && OUTPUT_ACTIVITY_TYPES.has(type)) pane.lastActivity = Date.now();
+        }
+
+        // A local cancel stops the UI immediately, but frames the server
+        // already wrote for that turn can still be in flight on the socket.
+        // They precede the cancelled/turn_end pair, so without a guard a
+        // late thinking/stream frame would re-arm the spinner after the
+        // click and the pair (suppressed by suppressTurnEnds) would leave
+        // it spinning forever. Drop those frames until the turn's terminal
+        // frame arrives. Meta frames (history/config/context) are harmless.
+        const STALE_TURN_FRAME_TYPES = new Set([
+            'compacting', 'thinking', 'waiting', 'thinking_token',
+            'stream', 'stream_stats', 'stream_retry', 'stream_end',
+            'model_used', 'tool_call_start', 'tool_call_delta', 'hist_index',
+            'tool_call', 'tool_execute', 'tool_result',
+            'term_opened', 'term_output', 'term_exit', 'response',
+        ]);
+
+        function clearCancelGuard(sessionId) {
+            if (!sessionId) return;
+            for (const p of panes.values()) {
+                if (p.cancelPendingFor === sessionId) p.cancelPendingFor = null;
+            }
         }
 
         // Apply a session-scoped message to a background pane without touching
@@ -2607,6 +2637,7 @@
         function abortInFlightUI(message) {
             finalizeThinking();
             endStream();
+            clearWaitingPlaceholder();
             setInputProgress(null);
             // Remove waiting spinners on pending cards
             for (const id of Object.keys(pendingToolCards)) {
@@ -2788,8 +2819,13 @@
             // picked up by the markPendingAck of the send that follows
             // (every cancelActiveTurn here precedes one).
             lastCancelTarget = pendingAcks.length ? pendingAcks[pendingAcks.length - 1] : null;
-            pendingCancels.push(lastCancelTarget);
-            ws.send(JSON.stringify({ type: 'cancel', sessionId: activePane().id }));
+            const pane = activePane();
+            pendingCancels.push({ entry: lastCancelTarget, sessionId: pane.id });
+            // Arm the stale-frame guard BEFORE sending: a thinking/stream
+            // frame the server wrote just before the cancel can arrive on
+            // this socket after the click and must not re-arm the spinner.
+            pane.cancelPendingFor = pane.id;
+            ws.send(JSON.stringify({ type: 'cancel', sessionId: pane.id }));
             setTurnActive(false);
             abortInFlightUI(null);
             // The trailing cancelled + turn_end frames for the old turn are
@@ -2810,7 +2846,10 @@
         // focus-pane / rekeySkipped paths) must not call this: their old
         // session's frames still route here and still need their unit.
         function releaseStrandedSuppress(pane) {
-            if (pane) pane.suppressTurnEnds = 0;
+            if (pane) {
+                pane.suppressTurnEnds = 0;
+                pane.cancelPendingFor = null;
+            }
             if (!pane || pane === activePane()) suppressTurnEnds = 0;
         }
 
@@ -4604,6 +4643,15 @@
                     if (data.type === 'session_state') sendSessionDetach(data.sessionId);
                     return; // stale message for a closed session
                 }
+                // Frames emitted before a local cancel can arrive after the
+                // click. Ignore them for that session until its terminal
+                // frame; the terminal itself still runs its normal handler.
+                if (msgPane.cancelPendingFor && data.sessionId === msgPane.cancelPendingFor) {
+                    if (STALE_TURN_FRAME_TYPES.has(data.type)) return;
+                    if (data.type === 'cancelled' || data.type === 'turn_end') {
+                        msgPane.cancelPendingFor = null;
+                    }
+                }
                 // Stamp output recency for BOTH active and background panes
                 // (drives sidebar open-pane order); meta types are no-ops.
                 touchPaneActivity(msgPane, data.type);
@@ -4651,6 +4699,7 @@
                     // after reconnect this pane's own turn_end must count.
                     pane.ignoreTurnEndsFor = null;
                     pane.suppressTurnEnds = 0;
+                    pane.cancelPendingFor = null;
                     pane.pendingSessionResponse = false;
                     pane.pendingResendContent = null;
                     pane.pendingResendImages = null;
@@ -5121,7 +5170,8 @@
             if (suppressTurnEnds <= 0) return;
             suppressTurnEnds--;
             const rec = pendingCancels.shift();
-            if (rec && pendingAcks.includes(rec)) dropPendingAck(rec);
+            if (rec && rec.entry && pendingAcks.includes(rec.entry)) dropPendingAck(rec.entry);
+            if (rec) clearCancelGuard(rec.sessionId);
             lastCancelTarget = null;
         }
 
@@ -5141,7 +5191,7 @@
             // turn, whose un-acked send is the only pending bubble.
             if (suppressTurnEnds > 0) {
                 const rec = pendingCancels.shift();
-                if (rec && pendingAcks.includes(rec)) dropPendingAck(rec);
+                if (rec && rec.entry && pendingAcks.includes(rec.entry)) dropPendingAck(rec.entry);
             } else if (pendingAcks.length === 1) {
                 dropPendingAck(pendingAcks[0]);
             }

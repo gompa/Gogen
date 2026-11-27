@@ -23,25 +23,52 @@ const wsHandlerDrainWait = 2 * time.Second
 // empty" flake; in production it can outlive the shutdown flush it should have
 // been part of.
 //
-// A mutex-polled counter rather than sync.WaitGroup: a handler may be joining
-// (Add) while a waiter is parked at zero, which is the case WaitGroup
-// explicitly forbids.
+// A counted tracker with a zero-crossing broadcast rather than sync.WaitGroup:
+// a handler may be joining (Add) while a waiter is parked at zero, which is the
+// case WaitGroup explicitly forbids — the counter accepts it, and a waiter
+// woken by one crossing simply parks again on the next one. A sync.Cond would
+// need a timed wait it does not provide; the idle channel does (select against
+// a timer) and it releases the waiter on the crossing itself instead of on a
+// 5 ms polling tick.
 type wsHandlerTracker struct {
 	mu sync.Mutex
 	n  int
+	// idle is closed when n reaches 0 and recreated on the 0 -> 1 edge, so a
+	// waiter parked on the previous channel is released exactly once by the
+	// crossing it captured, while the next generation of handlers gets a fresh
+	// channel for the next waiter. Guarded by mu.
+	idle chan struct{}
 }
 
 // enter records a starting handler. Call it after the upgrade succeeded, so a
 // rejected handshake never counts.
+//
+// The 0 -> 1 edge installs a fresh idle channel — the only allocation this
+// tracker makes per drain generation — so the steady state (handlers already
+// live) stays allocation-free.
 func (t *wsHandlerTracker) enter() {
 	t.mu.Lock()
+	if t.n == 0 {
+		t.idle = make(chan struct{})
+	}
 	t.n++
 	t.mu.Unlock()
 }
 
+// leave records a finished handler and releases every waiter parked on the
+// current idle channel when — and only when — the count actually reaches 0.
 func (t *wsHandlerTracker) leave() {
 	t.mu.Lock()
 	t.n--
+	// n == 0 is the crossing; any other value means handlers are still live
+	// and the waiters must stay parked (a straggler must not make them report
+	// a drain that did not happen). A nil idle cannot occur on this path — n
+	// was > 0, so an enter installed the channel — but the guard keeps an
+	// unbalanced leave from panicking on a nil close.
+	if t.n == 0 && t.idle != nil {
+		close(t.idle)
+		t.idle = nil
+	}
 	t.mu.Unlock()
 }
 
@@ -53,19 +80,36 @@ func (t *wsHandlerTracker) live() int {
 }
 
 // wait blocks until no handler is running or the timeout expires, reporting
-// whether the tracker drained. Polling (not a cond var) because the waiters
-// here are shutdown paths with a bounded budget, and a cond would need a
-// timed-wait helper that sync.Cond does not provide.
+// whether the tracker drained. Event-based, not polled: it captures the idle
+// channel in the same critical section that reads the count
+// (capture-then-check), so a leave landing between the two is never missed —
+// the captured channel is already closed and the select returns at once — and
+// the waiter is released the instant the last handler exits instead of on the
+// next 5 ms tick.
+//
+// Why this is race-free: a waiter that captured one generation's channel
+// returns true when that channel is closed, and the channel is closed only by
+// the 0 crossing — exactly the drain it was waiting for. A handler entering
+// afterwards closes nothing (the 0 -> 1 edge creates a NEW channel), so the
+// waiter cannot be released twice and a later waiter parks on the new channel,
+// blocking for the next drain instead of inheriting the previous one. The
+// close happens only under mu, at the single place n becomes 0, so exactly one
+// generation is closed exactly once.
 func (t *wsHandlerTracker) wait(timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for {
-		if t.live() == 0 {
-			return true
-		}
-		if time.Now().After(deadline) {
-			return false
-		}
-		time.Sleep(5 * time.Millisecond)
+	t.mu.Lock()
+	if t.n == 0 {
+		t.mu.Unlock()
+		return true
+	}
+	idle := t.idle
+	t.mu.Unlock()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-idle:
+		return true
+	case <-timer.C:
+		return false
 	}
 }
 

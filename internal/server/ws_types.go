@@ -490,6 +490,13 @@ type WSMessage struct {
 	// effective mode in config pushes. It is part of the fixed request
 	// prefix, so a change applies to NEW sessions only.
 	MCPToolMode string `json:"mcpToolMode,omitempty"`
+	// MCPProbeTimeoutSecs / MCPProbeMaxConcurrent are the test_mcp bounds
+	// (client→server inside ConfigFields; server→client carries the EFFECTIVE
+	// value, so the modal never shows a bare 0 for "use the default"). Both
+	// are applied LIVE: the probe handler reads them from the runtime overlay
+	// when a test runs, so no restart is staged.
+	MCPProbeTimeoutSecs   int `json:"mcpProbeTimeoutSecs,omitempty"`
+	MCPProbeMaxConcurrent int `json:"mcpProbeMaxConcurrent,omitempty"`
 	// MCPOp carries an MCP server-list mutation (mcp_save / mcp_delete,
 	// client→server). The saved list is pushed back as MCPServers.
 	MCPOp *MCPOpRequest `json:"mcpOp,omitempty"`

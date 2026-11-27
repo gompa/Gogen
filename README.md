@@ -41,17 +41,80 @@ It's built to be handed real work:
 
 ## Quick start
 
-### Prerequisites
+### 1. Install the binary
 
-- Go 1.27+
-- A C compiler (for CGO / tree-sitter), e.g. `gcc` on Linux
-- An OpenAI-compatible API key
+Prebuilt binaries for Linux, macOS and Windows are on the
+[releases page](https://github.com/gompa/Gogen/releases), with tree-sitter
+already compiled in. Nothing has to be installed first — no Go toolchain, no
+C compiler. Pick the asset for this machine:
 
-### Build and run
+| Platform | Asset |
+|----------|-------|
+| Linux x86-64 | `gogen-linux-amd64` |
+| Linux arm64 | `gogen-linux-arm64` |
+| macOS Apple Silicon | `gogen-darwin-arm64` |
+| macOS Intel | `gogen-darwin-amd64` |
+| Windows x86-64 | `gogen-windows-amd64.exe` |
+
+Install it as `gogen` in `~/bin` (Linux x86-64 shown; swap the asset name for
+your platform):
 
 ```bash
-go build -o gogen .
-OPENAI_API_KEY=sk-... ./gogen /path/to/project
+mkdir -p ~/bin && cd ~/bin
+curl -fLO https://github.com/gompa/Gogen/releases/latest/download/gogen-linux-amd64
+curl -fLO https://github.com/gompa/Gogen/releases/latest/download/checksums.txt
+grep ' gogen-linux-amd64$' checksums.txt | sha256sum -c -   # macOS: shasum -a 256 -c -
+mv gogen-linux-amd64 gogen
+chmod +x gogen
+```
+
+`releases/latest` always resolves to the newest tag; to pin a version, replace
+`latest` with the tag, e.g. `.../download/v0.0.23/gogen-linux-amd64`.
+
+<details>
+<summary><strong>Windows (PowerShell)</strong></summary>
+
+```powershell
+New-Item -ItemType Directory -Force $HOME\bin | Out-Null
+Invoke-WebRequest https://github.com/gompa/Gogen/releases/latest/download/gogen-windows-amd64.exe -OutFile $HOME\bin\gogen.exe
+[Environment]::SetEnvironmentVariable('Path', "$HOME\bin;" + [Environment]::GetEnvironmentVariable('Path', 'User'), 'User')
+```
+
+Open a new terminal afterwards so `PATH` picks up `$HOME\bin`.
+
+</details>
+
+macOS quarantines downloaded binaries: if Gatekeeper refuses the first run,
+clear the attribute with `xattr -d com.apple.quarantine ~/bin/gogen`.
+
+### 2. Add `~/bin` to your `PATH`
+
+macOS does not put `~/bin` on `PATH` by default, and on Linux only some
+distributions do. Append it to your shell's startup file:
+
+```bash
+# zsh (the default shell on macOS)
+echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
+# bash
+echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+```
+
+Check that it resolves:
+
+```bash
+gogen --help
+```
+
+### 3. Run it
+
+GoGen talks to an OpenAI-compatible API: the official OpenAI endpoint needs a
+key, a local llama.cpp/Ollama server or a proxy needs its base URL instead
+(`--url` or `OPENAI_BASE_URL`, e.g. `gogen --url http://localhost:11434/v1`).
+Point it at the project it should work in:
+
+```bash
+export OPENAI_API_KEY=sk-...
+gogen /path/to/project
 ```
 
 The TUI starts with your project as the working directory. Try prompts like:
@@ -63,34 +126,40 @@ The TUI starts with your project as the working directory. Try prompts like:
 ```
 
 Prefer a browser? Run with `--web` (http://127.0.0.1:8081). For a single
-prompt without any UI, use `-p`. The VS Code plugin starts gogen on a free
-port for that window, and that port is not saved as `web_bind`.
+prompt without any UI, use `-p`. The VS Code sidebar
+([editors/vscode](editors/vscode/README.md)) starts gogen on a free port for
+that window, and that port is not saved as `web_bind`.
 
 ```bash
-OPENAI_API_KEY=sk-... ./gogen --web
-OPENAI_API_KEY=sk-... ./gogen -p "List the top-level packages"
+export OPENAI_API_KEY=sk-...
+gogen --web
+gogen -p "List the top-level packages"
 ```
 
-Non-loopback binds (e.g. `--host 0.0.0.0`) require a token. Without
-`GOGEN_WEB_TOKEN`, one is auto-generated and persisted (`.gogen/web_token`,
-0600) so **logins persist across restarts** — an already-paired device keeps
-its session. Startup prints a short-lived pairing link, the pairing code in
-plain text, and a QR code: the link opens the UI on this machine, the QR
-(encoding the LAN address) logs a phone in on scan. The pairing code is
-ephemeral by design — it expires after 15 minutes and is replaced at every
-server start, so after any restart scan the freshly printed QR; the
-long-lived token itself is never printed or logged. Set `GOGEN_WEB_TOKEN`
-to use your own token:
-
-```bash
-GOGEN_WEB_TOKEN=secret ./gogen --web --host 0.0.0.0
-# then open http://host:8081/?token=secret
-```
+Binding beyond loopback (e.g. `--host 0.0.0.0`) requires an auth token: one
+is generated and persisted on first use, so already-paired devices stay
+logged in across restarts. See [web server](#web-server) for the pairing
+link/QR that startup prints and for `GOGEN_WEB_TOKEN`.
 
 Global mode (use `~/.config/gogen/` instead of project `.gogen/`):
 
 ```bash
-GOGEN_MODE=global ./gogen
+GOGEN_MODE=global gogen
+```
+
+### Build from source
+
+Prerequisites:
+
+- Go 1.27+
+- A C compiler for CGO/tree-sitter, e.g. `gcc` on Linux — or build with
+  `CGO_ENABLED=0` to skip tree-sitter (see below)
+
+```bash
+git clone https://github.com/gompa/Gogen.git
+cd Gogen
+go build -o gogen .
+./gogen /path/to/project
 ```
 
 Build without tree-sitter (smaller binary, no syntax checks or symbol
@@ -155,7 +224,7 @@ $env:PATH = "C:\Program Files\Git\usr\bin;" + $env:PATH
 | `--verbose` | Show full tool output in CLI mode |
 | `-p <prompt>` | Run a single prompt and exit (non-interactive) |
 | `--save-config` | Write effective config to `.gogen/gogen.conf` and guidelines to `.gogen/gogen.md` |
-| `--save-config-secrets` | Include secrets when using `--save-config` (`openai_api_key`, `web_auth_token`, MCP `env`, provider keys) |
+| `--save-config-secrets` | Include secrets when using `--save-config` (`openai_api_key`, `web_auth_token`, `status_display_token`, `web_search_api_key`, MCP `env`, provider `api_key`) |
 | `--save-config-path <file>` | Output path for `--save-config` config file (default `.gogen/gogen.conf`; project mode only — global mode always writes to `~/.config/gogen/config.yaml`) |
 
 The first positional argument is also treated as the working directory (overridden by `--dir`); a second positional argument runs as a single prompt, equivalent to `-p`.
@@ -188,6 +257,8 @@ While in the TUI:
 | `/resume del <id>` | Delete a saved session |
 | `sessions` | Alias for `/resume` (list sessions) |
 | `/fork` | Fork a new session from the last assistant message (`/fork <N>` from message N) |
+| `/open [label]` | Open an additional live session in this TUI and focus it; `/switch` or the sessions panel moves between them |
+| `/switch` | List the live sessions hosted in this TUI; `/switch <n>` focuses one (a turn running in the other keeps going) |
 | `/queue` (or `ctrl+q`) | Show the queued messages for the focused session; `d` removes the selected one, `D` clears the user's queued items, `s` sends the queue after the current round |
 | `/verbose` | Toggle verbose tool output |
 | `/save-config` | Write effective config to `.gogen/gogen.conf` |
@@ -302,7 +373,8 @@ deprecation warning, so existing project files keep working after the rename.
 
 `--save-config` writes pure YAML (no `---` front-matter markers); `on`/`off`
 values may be emitted quoted, which parses identically. Secrets
-(`openai_api_key`, `web_auth_token`, MCP server `env`, provider `api_key`) are
+(`openai_api_key`, `web_auth_token`, `status_display_token`,
+`web_search_api_key`, MCP server `env`, provider `api_key`) are
 omitted unless `--save-config-secrets` is passed, and options equal to their
 built-in default are omitted entirely, so a saved config never bakes in a
 default.
@@ -310,7 +382,7 @@ default.
 Snapshot effective settings:
 
 ```bash
-./gogen --save-config --dir /path/to/project
+gogen --save-config --dir /path/to/project
 ```
 
 ### Project guidelines (`.gogen/gogen.md` or `GOGEN.md`)
@@ -414,7 +486,18 @@ behavior: compaction keeps the first user message and the most recent
 messages verbatim and summarizes everything in between, and the system prompt
 tells the model to pin facts with `context_pin_last` and summarize its
 progress when context gets tight. A summary that replaces one message is
-kept. A tool result or a pin that was larger than that message is still
+kept.
+
+Every compaction summary also carries a deterministic session-state manifest
+(`[Session state — deterministic, regenerated at compaction]`): the live
+handles a later turn can still act on (background jobs, subagents, terminals,
+spill locators), failed operations, touched files, and collapsed operation
+counts. It is built from the session's tool results and completion notices,
+never by the summary model, so an id the recap drops is still there. The
+manifest is cumulative within a session and is written only when compaction
+writes a summary — never per turn, so it does not invalidate the provider's
+prompt cache. Deep dive puts it in the progress summary only: the session
+summary stays byte-identical across compactions. A tool result or a pin that was larger than that message is still
 condensed when the summary has already dropped the estimate under the
 window. A failure of that condensation is not recorded, so a later
 refusal can still condense the message. When the provider refuses and the estimate is still under the
@@ -530,6 +613,16 @@ var win when both are present. Note the semantics change: the old value capped
 total runtime, so an existing `command_timeout_secs: 600` now tolerates 600s
 of silence rather than 600s total.
 
+`execute_command` (foreground and background) runs each command through
+**bash** when `bash` is on `PATH`, and through POSIX `sh` otherwise, so
+bash-only syntax (`[[ ]]`, arrays, `$'…'`, process substitution) works without
+a failed round trip on a machine that has bash. `$0` reports the shell that
+ran (`bash` or `sh`). With `GOGEN_COMMAND_SANDBOX=bwrap`, bash is used only
+when its binary lives under `/usr` or `/bin` — the trees the sandbox
+bind-mounts — because an unbound absolute path (a Nix store, `/opt/homebrew`)
+would not exist inside the sandbox. `bash_persistent` resolves the same way;
+the `terminal` tool is unaffected and starts `$SHELL`, then `/bin/sh`.
+
 ### Global mode
 
 | Variable | Default | Description |
@@ -559,6 +652,8 @@ These can be set in `.gogen/gogen.conf` (or the web settings modal's **Project**
 |----------|---------|-------------|
 | `GOGEN_MCP` | off | Set to `on` to enable MCP (also set `mcp: on` in project config) |
 | `GOGEN_MCP_TOOL_MODE` | `nested` | `nested` exposes every MCP tool through `mcp_list`, `mcp_describe`, and `mcp_call`; `inline` inlines one definition per server tool (also set `mcp_tool_mode` in project config, or in the settings modal's MCP tab — it applies to new sessions) |
+| `GOGEN_MCP_PROBE_TIMEOUT_SECS` | `600` | Ceiling on a settings-modal **Test connection** run (also `mcp_probe_timeout_secs`, or the settings modal's MCP tab). The 90s floor is the cold-`npx` allowance and a server's `init_timeout_secs` may raise the deadline up to this ceiling. `0` keeps the default; values above a day are clamped. Applies to the next test, no restart |
+| `GOGEN_MCP_PROBE_MAX_CONCURRENT` | `2` | How many **Test connection** runs may be in flight at once (also `mcp_probe_max_concurrent`, or the MCP tab). Each test spawns a throwaway server process, so this bounds those processes; a further request is refused with a notice instead of spawning another. `0` keeps the default. Applies to the next test, no restart |
 | `GOGEN_MCP_SERVERS` | *(empty)* | JSON array of `{name, command, args, env, init_timeout_secs, tool_timeout_secs}` (overrides file) |
 | `GOGEN_MCP_EXTRA` | *(empty)* | JSON array in the same shape, appended for this process only. A host uses it for its own server (the VS Code editor bridge). It is not saved. `mcp` off does not start it. A name that is already configured is skipped. |
 
@@ -581,6 +676,15 @@ instead of failing on the first try. The wait is bounded by that server's
 when `init_timeout_secs` is longer than its 90s floor. Set `tool_timeout_secs`
 at least as high as the server's own startup budget (for example a Ghidra
 launch configured for 50 minutes) so GoGen does not end the call first.
+
+The MCP tab's **Test connection** button is bounded separately from the
+client's own deadlines, because the entry's `init_timeout_secs` is typed into
+that form: `mcp_probe_timeout_secs` (default 600) is the ceiling on one test —
+90s floor, raised by `init_timeout_secs` up to the ceiling — and
+`mcp_probe_max_concurrent` (default 2) is how many tests may run at once, since
+each one spawns a throwaway server process. Both are read from the live
+runtime overlay when a test runs, so a saved change applies to the next test
+without a restart.
 
 #### Tool exposure: nested (default) or inline
 
@@ -794,6 +898,22 @@ are live-editable in **Settings → Status display**.
 | `GOGEN_WEB_MAX_ACTIVE_SESSIONS` | `8` | Cap on concurrently active sessions (panes); also `web_max_active_sessions` in `.gogen/gogen.conf` |
 | `GOGEN_WEB_APPROVAL_HOLD_SECS` | `0` | Keep pending delete approvals alive for N seconds after the last client detaches (a reconnecting client is re-notified and can answer); `0` auto-denies immediately on detach. Also `web_approval_hold_secs` in `.gogen/gogen.conf` |
 
+A non-loopback bind (e.g. `--host 0.0.0.0`) requires a token. Without
+`GOGEN_WEB_TOKEN`, one is auto-generated and persisted (`.gogen/web_token`,
+0600) so **logins persist across restarts** — an already-paired device keeps
+its session. Startup prints a short-lived pairing link, the pairing code in
+plain text, and a QR code: the link opens the UI on this machine, the QR
+(encoding the LAN address) logs a phone in on scan. The pairing code is
+ephemeral by design — it expires after 15 minutes and is replaced at every
+server start, so after any restart scan the freshly printed QR; the
+long-lived token itself is never printed or logged. Set `GOGEN_WEB_TOKEN`
+to use your own token:
+
+```bash
+GOGEN_WEB_TOKEN=secret gogen --web --host 0.0.0.0
+# then open http://host:8081/?token=secret
+```
+
 Non-loopback binds without TLS log a warning: the auth token is sent in plain
 text. Set `GOGEN_WEB_TLS_CERT` / `GOGEN_WEB_TLS_KEY` (or the file keys) to
 enable TLS.
@@ -866,11 +986,13 @@ mode it is fixed to the project directory and the input is hidden.
   blocked by a streaming turn.
 - The settings modal is organized into sidebar sections (Editor, Chat,
   Appearance, Agent, Board, Subagents, Project, Automations, Tools, Web,
-  Status display, Context, Security, Sessions, Providers, MCP, Server);
-  opening it auto-selects the
+  Status display, Embeddings, Context, Security, Sessions, Providers, MCP,
+  Server); opening it auto-selects the
   section matching the screen you are on, and manual choices are remembered
   per browser. The **Project** tab holds the `test_command` /
-  `lint_command` overrides (they apply to every session on its next turn).
+  `lint_command` overrides (they apply to every session on its next turn);
+  the **Embeddings** tab holds the code index (`code_index`, provider, model,
+  chunking, watch, rerank) with a **Reindex** button.
 
 #### Board and subagents
 
@@ -936,10 +1058,11 @@ mode it is fixed to the project directory and the input is hidden.
   (`success`, `failed`, or `interrupted` for a child that never reached a
   terminal state). Clicking a
   nested row opens the child as a normal pane (live transcript, Cancel, ✕),
-  which is the escape hatch for a subagent stuck in a loop. The Agent tab's
-  **Default subagent model** picker and the **System prompt** / **Subagent
-  prompt** textareas persist to `.gogen/gogen.conf` and apply to both web and
-  TUI subagents (`subagent_model`, `system_prompt`, `subagent_prompt`). The
+  which is the escape hatch for a subagent stuck in a loop. The **Subagents**
+  tab holds the **Default subagent model** picker and the **Subagent prompt**
+  textarea, the **Agent** tab the **System prompt** textarea; all three
+  persist to `.gogen/gogen.conf` and apply to both web and
+  TUI subagents (`subagent_model`, `subagent_prompt`, `system_prompt`). The
   prompt fields are pre-populated with the effective templates and a "Reset to
   default" button restores the built-in; a value equal to the built-in default
   is treated as unset, so the default text is never baked into the config
@@ -964,13 +1087,13 @@ mode it is fixed to the project directory and the input is hidden.
   line) and the user watches the child pane.
 - **Max concurrent subagents** (`subagent_max_concurrent`, default `4`): caps
   how many subagents may run at the same time for one session, in both the web
-  UI and the TUI. The Agent tab's numeric input live-toggles it like the depth
-  field; spawning beyond the cap is refused with an error the agent can act on
-  (`interrupt_agent` a running child or wait for one to finish). An
+  UI and the TUI. The Subagents tab's numeric input live-toggles it like the
+  depth field; spawning beyond the cap is refused with an error the agent can
+  act on (`interrupt_agent` a running child or wait for one to finish). An
   interrupted (idle) child no longer holds a slot; a separate internal guard
   bounds non-finished children so a spawn+interrupt loop cannot accumulate
   runtimes.
-- **Subagent reasoning effort** (`subagent_thinking_level`): the Agent tab's
+- **Subagent reasoning effort** (`subagent_thinking_level`): the Subagents tab's
   **Subagent reasoning effort** picker sits next to the model picker and is
   model-aware — its options are the selected subagent model's accepted
   values (the active session's model values while the model is "Inherit").
@@ -1002,6 +1125,7 @@ mode it is fixed to the project directory and the input is hidden.
 | `GOGEN_STREAM_RETRY_BACKOFF` | `1s` | Delay before the stream recovery ladder re-requests after a failed stream attempt; doubles per stage (`1s` before the muted streaming retry, `2s` before the non-streaming fallback). An immediate re-request hammers an endpoint that is often busy — the very condition that broke the stream. `0` or `off` retries immediately |
 | `GOGEN_STREAM_STALL` | `10s` | How long a streaming round may see no SSE chunk before the UI switches from "thinking" to a "still waiting on model" label (long prefill or a stalled upstream; informational only — it never interrupts the stream). `0` or `off` disables the signal |
 | `GOGEN_STREAM_DRAIN_GRACE` | `5s` | How long to wait for the promised usage chunk (`stream_options.include_usage`) AFTER the round's finish_reason before treating the round as complete; an endpoint that finishes without usage and holds the connection open would otherwise park the turn until the read idle timeout. `0` or `off` waits for the read idle timeout |
+| `GOGEN_REASONING_STOP_GRACE` | `30s` | How long to wait for content to resume after a reasoning-only `finish_reason="stop"` before treating the response as complete. Two-phase streams (reasoning → content) legitimately continue within the grace, so only a provider that sends the stop and then holds the connection open without `[DONE]` is cut short; otherwise the read would block for the full stream idle timeout. `0` or `off` waits indefinitely |
 | `GOGEN_REASONING_ECHO` | `on` | Whether historical assistant reasoning is re-sent as `reasoning_content` on every request. `off` drops it: reasoning can be a third or more of a long session's payload and chat completions is stateless, so the whole of it is re-uploaded on every round — the bytes shrink and stay byte-stable (nothing is sent, so nothing shifts). The model then no longer sees its own earlier thinking, which is what several providers do by stripping replayed reasoning anyway |
 | `GOGEN_IMAGE_MAX_EDGE` | `1568` | Long-edge pixel budget for attached images (`read_image` and pasted screenshots). Anything larger is downscaled and re-encoded as JPEG at ingest, because every subsequent request re-uploads the image: a 3.5 MB screenshot is ~4.7 MB of base64 **per round**, while vision models resize to roughly this size internally and never see the extra pixels. PNG/JPEG only — WebP/BMP/GIF pass through untouched. `0` or `off` attaches images byte-for-byte |
 
@@ -1019,7 +1143,7 @@ export GOGEN_WEB_SEARCH_API_KEY=BSA...
 export GOGEN_COMMAND_SANDBOX=bwrap
 export GOGEN_PRESERVE_REASONING=on
 
-./gogen
+gogen
 ```
 
 ## Automations
@@ -1090,11 +1214,11 @@ How it works:
   and pid that started it, so a run another live host is executing is left
   alone).
 - **The flag**: `automations: on` (config file, `GOGEN_AUTOMATIONS`, or the
-  web Settings → Agent toggle) gates firing only — the CLI manages records
-  whether or not the flag is on. Automations fire only while a GoGen host
-  is running. Two hosts with the flag on (e.g. TUI and web server) are safe:
-  the claim advances `next_run_at` under the store's cross-process lock, so
-  each occurrence fires exactly once between them.
+  web settings **Automations** tab) gates firing only — the CLI manages
+  records whether or not the flag is on. Automations fire only while a GoGen
+  host is running. Two hosts with the flag on (e.g. TUI and web server) are
+  safe: the claim advances `next_run_at` under the store's cross-process
+  lock, so each occurrence fires exactly once between them.
 - **Web tab**: with the flag on, an **Automations** tab appears in the web
   UI next to Board — the saved jobs with their schedule, next run and last
   status, per-job Edit / Pause / Enable / Delete, an expandable run history
@@ -1112,17 +1236,28 @@ main.go
     ├── projectfile/ — .gogen/gogen.conf and .md file loading/merging/writing
     ├── mcp/         — MCP stdio client and tool registry
     ├── session/     — Conversation persistence (JSON snapshots on disk)
+    ├── subagents/   — Shared subagent lifecycle (web UI and TUI alike)
     ├── skills/      — Skill discovery and loading (project + user dirs)
+    ├── codeindex/   — search_meaning index: chunking, embeddings, .gogen/index
     ├── spill/       — Oversized tool output persisted to .gogen/spill (session-scoped, 0700/0600; the global data dir in global mode) so caps preview instead of losing data
     ├── tui/         — Interactive terminal interface (Bubble Tea)
     ├── config/      — Environment-based configuration
     ├── contextmgr/  — Token-aware context window management and auto-compaction
     ├── llm/         — OpenAI API integration, model-aware token limits
     ├── server/      — WebSocket-based web server
+    ├── statusdisplay/ — LAN status-screen reporter (ttgo/status firmware)
     ├── treesitter/  — Source code parsing, symbol extraction, syntax checking
+    ├── pty/         — PTY sessions behind the terminal tool
     ├── ioutil/      — Atomic file writes and helpers
+    ├── filelock/    — Advisory file locks (automation store, cross-process state)
     ├── randhex/     — Random-hex ID generation (sessions, background jobs, approvals)
     ├── streamutil/  — Token batching for streaming
+    ├── streambuf/   — Round buffers shared by the streaming hosts (TUI, web, VS Code)
+    ├── steerq/      — Per-session steering queue (messages queued during a turn)
+    ├── textutil/    — Rune-budget text clipping shared by the TUI, status display and CLI
+    ├── onoff/       — on/off setting parsing
+    ├── procutil/    — Child-process status helpers (exit code, signal) for background jobs and PTY sessions
+    ├── buildinfo/   — Build identity (User-Agent) from the binary's VCS info
     ├── modelinfo/   — models.dev context limit resolver
     ├── debuglog/    — Structured debug logging
     └── profiling/   — CPU/memory profiling (debug builds)
@@ -1150,6 +1285,7 @@ The agent has access to the following tools:
 | `search_meaning` | Search this folder by meaning when `code_index` is on and an embedding provider is set. `query` is required. `path` is an optional subdirectory. Plan mode allows it. Building the index sends file text to the embedding provider |
 | `find_symbol` | Locate a symbol: `kind=def` (definition) or `refs` (references) |
 | `git` | Git history/status/diff: `action=log`, `status`, `show` (read-only; plan mode) |
+| `git_blame` | Git blame for a file: which commit last modified each line (hash, author, date, content); optional `ref`, and `line_start`/`line_end` together to blame a range of a large file (read-only) |
 | `git_commit` | Commit (requires staged files) |
 | `git_stage` | Stage files (empty = stage all) |
 | `web_search` | Web search (DuckDuckGo Lite; no API key needed) |
@@ -1169,7 +1305,7 @@ The agent has access to the following tools:
 | `interrupt_agent` | Cancel the current main or follow-up turn of a live background subagent; an interrupted main run remains continuable (when `subagent: on`) |
 | `session_rename` | Rename the current session |
 | `context_pin_last` | Pin the last user message to survive compaction |
-| `read_image` | Attach an image to the session context for vision-capable models (png/jpeg/gif/webp up to 3.5 MB; optional `detail=auto|low|high`) |
+| `read_image` | Attach an image to the session context for vision-capable models (png/jpeg/gif/webp up to 3.5 MB; optional `detail=auto\|low\|high`) |
 | `background_job` | Manage a background job (`execute_command background=true`): `action=status` (output tail), `action=wait` (block until it exits; `timeout_ms` default 60s, max 10m — on timeout the job keeps running), `action=cancel`, `action=input` (write to the job's stdin), or `action=list` (every live job in this session) |
 
 With `mcp_tool_mode: nested` (the default) the model also gets `mcp_list`
@@ -1198,7 +1334,7 @@ that):
 make check        # fmt, tidy, tests (incl. -race), vet, staticcheck, vuln,
                   # no-CGO build, web UI lint + tests
 make test         # go test -race ./...
-make test-debug   # debug-tagged packages (view-drift, profiling)
+make test-debug   # debug-tagged packages (view-drift, profiling, server)
 make vet          # go vet ./...
 make staticcheck  # go tool staticcheck ./...
 make build-nocgo  # verify the documented no-tree-sitter build compiles

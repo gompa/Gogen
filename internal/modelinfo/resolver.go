@@ -25,6 +25,9 @@ import (
 
 const (
 	registryURL = "https://models.dev/api.json"
+	// registryMaxBytes caps the registry download (see fetchRemote). The real
+	// registry is a few hundred KiB; anything past this is not a registry.
+	registryMaxBytes = 32 << 20
 	// cacheTTL is how long a loaded registry — in memory, or on disk via the
 	// cache file's mtime — counts as fresh. models.dev only changes when a
 	// provider adds a model or a price, so 6h picks up new entries within a
@@ -327,9 +330,17 @@ func (r *Resolver) fetchRemote() (registry, []byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, nil, fmt.Errorf("models.dev returned status %d", resp.StatusCode)
 	}
-	raw, err := io.ReadAll(resp.Body)
+	// Bound the download: the response is parsed and kept verbatim in memory
+	// for the disk cache, so an unbounded registry (a broken or hostile
+	// endpoint, a proxy error page that never ends) would exhaust the heap.
+	// 32 MiB is ~100x the real registry. An oversized response is a real
+	// error, and the caller keeps whatever cache it already has.
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, registryMaxBytes+1))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("read models.dev registry: %w", err)
+	}
+	if len(raw) > registryMaxBytes {
+		return nil, nil, fmt.Errorf("models.dev registry response exceeds %d bytes; refusing to parse it", registryMaxBytes)
 	}
 	var reg registry
 	if err := json.Unmarshal(raw, &reg); err != nil {

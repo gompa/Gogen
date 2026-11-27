@@ -165,7 +165,7 @@ var builtinToolDefs = []ToolDef{
 		MutatesFS: true,
 	},
 	{
-		Definition: toolDef("execute_command", "Run a shell command (destructive patterns blocked).",
+		Definition: toolDef("execute_command", "Run a shell command through bash (POSIX sh when bash is not installed); destructive patterns blocked.",
 			toolSchema(map[string]any{
 				"command":    toolProp("string", "Command"),
 				"background": toolProp("boolean", "Run in the background; poll/cancel via background_job (default false)"),

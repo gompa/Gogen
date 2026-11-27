@@ -916,6 +916,13 @@ type CompactOptions struct {
 	// summarization request then cannot reuse the turn's cache).
 	Tools        []llm.Tool
 	AllowedTools map[string]struct{}
+
+	// State is the session-scoped deterministic memory. The manager folds the
+	// summarized span into it and renders it into the summary. A nil State
+	// gets a fresh, per-call state (direct Manager users): the manifest is
+	// then built from this span only. The agent passes one persistent State
+	// per session so the manifest is cumulative across compactions.
+	State *SessionState
 }
 
 // Compact replaces the middle of canonical history with an LLM-generated
@@ -933,11 +940,11 @@ type CompactOptions struct {
 // whether the request itself has to be summarized. A caller whose result
 // still does not fit asks for the single summary with SingleSummary.
 //
-// A deterministic executed-call roster is appended to the summary content:
-// one line per tool call in the summarized middle, carrying the call id, the
-// tool name, and the first line of the matching result (see
-// buildExecutedCallRoster), so the model's recap cannot drop the ids a later
-// turn needs to address results.
+// A deterministic session-state manifest is appended to the summary content:
+// live/recoverable handles (jobs, subagents, terminals, spill locators),
+// failed operations, touched files, and collapsed operation outcomes (see
+// state.go). The manifest is model-independent, so the recap cannot drop the
+// ids a later turn needs to address results.
 //
 // The smaller-summary guard (ErrSummaryNotSmaller) refuses a compaction whose
 // framed summary is not strictly smaller than the region it replaces. No-op
@@ -1052,14 +1059,21 @@ func (m *Manager) compactPinned(ctx context.Context, messages []llm.Message, kee
 		return nil, nil, err
 	}
 
-	// Deterministic executed-call index appended after the model's recap: the
-	// recap can drop call ids and the handles returned in tool results
-	// (background job ids above all), and a later turn must still be able to
-	// address them (background_job status/list, send_message, spill
-	// retrieval). See buildExecutedCallRoster.
+	// Deterministic session state appended after the model's recap: the recap
+	// can drop the handles returned in tool results (background job ids above
+	// all), and a later turn must still be able to address them
+	// (background_job status/list, send_message, spill retrieval). The state
+	// is folded even when the smaller-summary guard below refuses the
+	// compaction: the messages stay in history and the folded set makes the
+	// re-fold idempotent.
+	state := opts.State
+	if state == nil {
+		state = NewSessionState()
+	}
+	state.Fold(middle)
 	recap := summary
-	if roster := buildExecutedCallRoster(middle); roster != "" {
-		recap += "\n\n" + roster
+	if block := m.renderState(state, stateBudget(middleTokens)); block != "" {
+		recap += "\n\n" + block
 	}
 
 	// Smaller-summary guard: refuse a compaction whose framed summary is not
@@ -1070,8 +1084,9 @@ func (m *Manager) compactPinned(ctx context.Context, messages []llm.Message, kee
 	// every accepted iteration strictly shrinks. The guard applies to the
 	// flattened-text fallback as well: a depth-capped truncated echo of the
 	// middle is exactly what it refuses. The framed content INCLUDES the
-	// executed-call roster, so the index cannot push the replacement past
-	// the size of the region it replaces.
+	// deterministic state manifest, whose budget (stateBudget) is a quarter
+	// of the middle, so it cannot push the replacement past the size of the
+	// region it replaces.
 	if m.requireSummaryShrink {
 		framed := llm.Message{Role: "assistant", Content: SummaryPrefix + recap}
 		if framedTokens := m.EstimateTokens([]llm.Message{framed}); framedTokens >= middleTokens {
@@ -1366,9 +1381,13 @@ func (m *Manager) summarizeMiddle(ctx context.Context, viewPrefix, prefix, middl
 	req := make([]llm.Message, 0, len(viewPrefix)+len(prefix)+len(middle)+1)
 	// Summarization requests must not carry user images: the summary model
 	// may not support vision, and image bytes are irrelevant to a recap.
-	req = append(req, stripImages(viewPrefix)...)
-	req = append(req, stripImages(prefix)...)
-	req = append(req, stripImages(middle)...)
+	// Strip any previous deterministic state block before the request is
+	// built: the model must summarize the conversation, not re-summarize the
+	// machine text. stripStateBlocks returns the input slice when nothing
+	// changed, so the common path allocates nothing.
+	req = append(req, stripImages(stripStateBlocks(viewPrefix))...)
+	req = append(req, stripImages(stripStateBlocks(prefix))...)
+	req = append(req, stripImages(stripStateBlocks(middle))...)
 	req = append(req, instruction)
 	// Count the request exactly once and reuse the count for the budget
 	// check and both debuglog entries. (The map literal passed to
@@ -1663,12 +1682,15 @@ func (m *Manager) CondensedReplacementTokens(msg llm.Message) (tokens int, trunc
 }
 
 func writeMessageForSummary(b *strings.Builder, msg llm.Message, maxToolBytes int, toolNames map[string]string) {
+	// A previous summary's state block is machine text, not conversation: the
+	// flattened fallback must not make the model re-summarize it.
+	content := StripStateBlock(msg.Content)
 	switch msg.Role {
 	case "user":
-		fmt.Fprintf(b, "USER: %s\n", msg.Content)
+		fmt.Fprintf(b, "USER: %s\n", content)
 	case "assistant":
-		if msg.Content != "" {
-			fmt.Fprintf(b, "ASSISTANT: %s\n", msg.Content)
+		if content != "" {
+			fmt.Fprintf(b, "ASSISTANT: %s\n", content)
 		} else if msg.Refusal != "" {
 			fmt.Fprintf(b, "ASSISTANT REFUSAL: %s\n", msg.Refusal)
 		}
@@ -1676,7 +1698,6 @@ func writeMessageForSummary(b *strings.Builder, msg llm.Message, maxToolBytes in
 			fmt.Fprintf(b, "TOOL CALL: %s(%v)\n", tc.Name, tc.Args)
 		}
 	case "tool":
-		content := msg.Content
 		if maxToolBytes > 0 && len(content) > maxToolBytes {
 			content = Truncate(content, maxToolBytes, TruncateOptions{
 				Marker: fmt.Sprintf(" …(%d chars total)", len(msg.Content)),
@@ -1688,130 +1709,6 @@ func writeMessageForSummary(b *strings.Builder, msg llm.Message, maxToolBytes in
 		}
 		fmt.Fprintf(b, "TOOL RESULT (%s): %s\n", label, content)
 	}
-}
-
-// executedCallRosterHeader introduces the deterministic executed-call index
-// that compactPinned appends to every summary. The wording is part of the
-// persisted transcript (a later compaction sees the roster inside the
-// previous summary's content), so treat it as a format.
-const executedCallRosterHeader = "[Executed tool calls in the summarized span — id, tool, result head]"
-
-// maxCallRosterHeadBytes caps the result-head portion of one roster entry.
-// The head is the first non-empty line of the tool result — where tools put
-// their returned handles (background job ids, subagent ids, terminal sends,
-// spill locators) — so the cap only trims unusually long lines.
-const maxCallRosterHeadBytes = 160
-
-// maxCallRosterBytes bounds the whole roster. Without it an extreme middle
-// (a huge run of tiny calls) could make the replacement larger than the
-// region it replaces: the smaller-summary guard would then refuse every
-// compaction and the conversation could not shrink at the hard window. A
-// roster over the cap stops early and names the number of calls omitted.
-const maxCallRosterBytes = 8 * 1024
-
-// buildExecutedCallRoster renders the deterministic executed-call index
-// appended to a compaction summary. The model's recap may drop call-level
-// detail — and with it the ids a later turn needs to address results
-// (background job ids above all, plus subagent ids, terminal sends, and
-// spill locators) — so the roster is generated from the summarized messages,
-// never by the model: one line per tool call in the middle, in model order,
-// carrying the wire call id, the tool name, and the first line of the
-// matching tool result. Call ids are never truncated.
-//
-// The roster is part of the framed summary the smaller-summary guard
-// measures (see compactPinned), so it can never silently push the
-// replacement past the size of the region it replaces.
-func buildExecutedCallRoster(middle []llm.Message) string {
-	return buildExecutedCallRosterBudget(middle, maxCallRosterBytes)
-}
-
-// buildExecutedCallRosterBudget is buildExecutedCallRoster with an explicit
-// byte budget: the omission path is only reachable with a budget far below
-// the const, so tests drive it directly.
-func buildExecutedCallRosterBudget(middle []llm.Message, budget int) string {
-	heads := resultHeadsByCallID(middle)
-	entries := make([]string, 0, len(middle))
-	for _, msg := range middle {
-		if msg.Role != "assistant" {
-			continue
-		}
-		for _, tc := range msg.ToolCalls {
-			entries = append(entries, callRosterEntry(tc, heads[tc.ID]))
-		}
-	}
-	if len(entries) == 0 {
-		return ""
-	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "%s — %d executed\n", executedCallRosterHeader, len(entries))
-	for i, entry := range entries {
-		line := "- " + entry + "\n"
-		if i > 0 && b.Len()+len(line) > budget {
-			fmt.Fprintf(&b, "- … %d more executed call(s) omitted\n", len(entries)-i)
-			break
-		}
-		b.WriteString(line)
-	}
-	return b.String()
-}
-
-// resultHeadsByCallID maps each call id to the first non-empty line of its
-// tool result. The first result wins (a duplicated id is protocol-invalid
-// and the roster only needs one head).
-func resultHeadsByCallID(middle []llm.Message) map[string]string {
-	var heads map[string]string
-	for _, msg := range middle {
-		if msg.Role != "tool" || msg.ToolCallID == "" {
-			continue
-		}
-		if heads == nil {
-			heads = make(map[string]string)
-		}
-		if _, seen := heads[msg.ToolCallID]; seen {
-			continue
-		}
-		heads[msg.ToolCallID] = firstResultLine(msg.Content)
-	}
-	return heads
-}
-
-// firstResultLine returns the first non-empty line of a tool result,
-// rune-safe capped at maxCallRosterHeadBytes. Whitespace-only lines are
-// skipped so a result that opens with a blank line still contributes its
-// handle.
-func firstResultLine(content string) string {
-	for len(content) > 0 {
-		line := content
-		if i := strings.IndexByte(content, '\n'); i >= 0 {
-			line, content = content[:i], content[i+1:]
-		} else {
-			content = ""
-		}
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		return Truncate(line, maxCallRosterHeadBytes, TruncateOptions{Marker: "…"})
-	}
-	return ""
-}
-
-// callRosterEntry renders one executed call as "id name: result-head". The
-// placeholders keep a malformed call (missing id or name) listable instead
-// of silently dropped from the index.
-func callRosterEntry(tc llm.ToolCall, head string) string {
-	id := tc.ID
-	if id == "" {
-		id = "unknown-id"
-	}
-	name := tc.Name
-	if name == "" {
-		name = "unknown-tool"
-	}
-	if head == "" {
-		return id + " " + name
-	}
-	return id + " " + name + ": " + head
 }
 
 // cloneMessage deep-copies the persisted parts of a message so compaction can

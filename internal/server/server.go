@@ -184,10 +184,28 @@ type Server struct {
 	// process is spawned.
 	mcpTestFn func(ctx context.Context, server config.MCPServerConfig) ([]llm.Tool, error)
 
+	// mcpProbeMu guards mcpProbes, the number of test_mcp probes in flight.
+	// Each probe spawns a throwaway child process, so the count is capped by
+	// the live mcp_probe_max_concurrent (beginMCPProbe takes it as an
+	// argument, read from the runtime overlay per request); the mutex is a
+	// leaf lock, held only for the counter update, never across the probe
+	// itself.
+	mcpProbeMu sync.Mutex
+	mcpProbes  int
+
 	// reviewTrigger owns the auto-review state (the per-start mutex). nil
 	// until installReviewAgent first runs; the trigger itself re-checks
 	// the review-agent feature flag on every fire.
-	reviewTrigger *boardReviewTrigger
+	//
+	// reviewTriggerMu guards the pointer's lazy install: settings saves run
+	// installReviewAgent off the read loop (persistAndBroadcast →
+	// applyBoardManagerToAll), so two concurrent saves did an unsynchronized
+	// read-modify-write and could build two triggers. Leaf lock: held only
+	// across the nil check and SetOnReviewNeeded, which takes the board
+	// manager's lock; nothing takes them the other way (the review hook fires
+	// outside the manager lock — see boardReviewTrigger.startMu).
+	reviewTriggerMu sync.Mutex
+	reviewTrigger   *boardReviewTrigger
 
 	// automations owns the automation scheduler lifecycle (see
 	// automation_sched.go): started with Start / the settings toggle,

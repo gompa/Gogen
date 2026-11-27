@@ -665,13 +665,12 @@ func (a *Agent) toolCallsParallelEligible(toolCalls []llm.ToolCall) bool {
 	if len(toolCalls) < 2 {
 		return false
 	}
-	if a.MCPRegistry != nil {
-		if names := a.MCPRegistry.ToolNames(); names != nil {
-			for _, tc := range toolCalls {
-				if _, ok := names[tc.Name]; ok {
-					return false
-				}
-			}
+	for _, tc := range toolCalls {
+		// Membership test, not enumeration: ToolNames() copies the whole
+		// registered-name map, and this scan runs once per round on every
+		// multi-call turn — the per-call cost HasTool was added to remove.
+		if a.mcpRegistryHas(tc.Name) {
+			return false
 		}
 	}
 	for _, tc := range toolCalls {

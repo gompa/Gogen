@@ -10,6 +10,73 @@ import (
 	tea "charm.land/bubbletea/v2"
 )
 
+// pasteStartMarker is the bracketed-paste start sequence (CSI 200~).
+//
+// The input decoder normally consumes it and emits paste events, so finding it
+// INSIDE a PasteMsg means the decoder was already collecting an unterminated
+// paste: after a paste start every event is appended to its paste buffer and
+// only the end marker (CSI 201~) clears it. A very large paste can lose that
+// end marker — the tty input queue overruns, or a terminal's "paste N lines?"
+// confirmation aborts the write after its start marker — and from then on
+// nothing reaches the app until some later paste's end marker arrives. That
+// later paste is delivered as ONE PasteMsg holding the stale buffer, then the
+// marker, then the text the user just pasted, so keeping only the text after
+// the LAST marker recovers the paste instead of inserting stale bytes as
+// garbage (and, because its end marker arrives, it also un-sticks the decoder).
+const pasteStartMarker = "\x1b[200~"
+
+// recoverStuckPaste strips the stale prefix of a paste that was captured after
+// a lost paste end marker (see pasteStartMarker). Ordinary content — including
+// a literal "200~" without the ESC — is returned unchanged.
+func recoverStuckPaste(content string) string {
+	if i := strings.LastIndex(content, pasteStartMarker); i >= 0 {
+		return content[i+len(pasteStartMarker):]
+	}
+	return content
+}
+
+// handlePasteMsg inserts pasted (bracketed-paste) text into the composer.
+//
+// A paste arrives as its own message type, not as a KeyPressMsg, so it never
+// reached handleInputKey. It used to fall through to the textarea update at the
+// end of handleMsg, which is gated on `!(streaming || compacting)`: while a
+// turn or a compaction ran, the composer still accepted typing but every paste
+// was dropped silently — the composer looked editable and paste did nothing.
+// A paste is text input, so it now follows the typed-text rules instead: a
+// modal swallows it, a paste while the transcript has focus moves focus back to
+// the composer (the same rule the printable-character fallback in
+// handleViewportKey uses), and a running turn is allowed because Enter queues
+// the message.
+//
+// The sidebar swallows a paste only while it is actually rendered: on a narrow
+// terminal it auto-hides and focus can stay on it, and handleKeyMsg falls back
+// to the composer for that case (see the FocusSidebar branch) — a paste must
+// take the same path or typing works there and pasting silently does not.
+func (m *Model) handlePasteMsg(msg tea.PasteMsg) (tea.Model, tea.Cmd) {
+	if m.modal != ModalNone {
+		return m, nil
+	}
+	switch {
+	case m.focus == FocusViewport:
+		m.focus = FocusInput
+	case m.focus == FocusSidebar && m.sidebarOffsetX() == 0:
+		m.focus = FocusInput
+	}
+	if m.focus != FocusInput {
+		return m, nil
+	}
+	text := recoverStuckPaste(msg.Content)
+	if text == "" {
+		return m, nil
+	}
+	// Pasted text is input, so it clears the transient status line exactly like
+	// a key press does (see handleKeyMsg).
+	m.statusMsg = ""
+	var cmd tea.Cmd
+	m.textarea, cmd = m.textarea.Update(tea.PasteMsg{Content: text})
+	return m, tea.Batch(cmd, m.textarea.Focus())
+}
+
 // handleInputKey dispatches key events when the input textarea has focus.
 func (m *Model) handleInputKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m2, cmd, ok := m.handleInputHelpKey(msg); ok {

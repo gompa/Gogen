@@ -476,3 +476,71 @@ func TestAtomicWriterFollowsSymlink(t *testing.T) {
 		t.Fatalf("target content = %q (%v), want the new bytes", body, err)
 	}
 }
+
+// TestEffectivePerm pins the permission rule: an existing mode is preserved so
+// a rewrite cannot destroy execute bits, but a request that only removes
+// read/write bits (a secret written with 0o600 over a pre-existing 0o644 file)
+// is honored instead of silently leaving the file readable by other local
+// users. No request can make the result more permissive than the file already
+// was.
+func TestEffectivePerm(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("chmod not reliable on Windows")
+	}
+	tests := []struct {
+		name     string
+		existing os.FileMode // 0 means "file does not exist"
+		request  os.FileMode
+		want     os.FileMode
+	}{
+		{name: "new file gets the requested perm", request: 0o600, want: 0o600},
+		{name: "new file keeps a loose requested perm", request: 0o644, want: 0o644},
+		{name: "looser existing file tightened by a secret write", existing: 0o644, request: 0o600, want: 0o600},
+		{name: "looser existing file tightened to owner-only exec", existing: 0o755, request: 0o700, want: 0o700},
+		{name: "tighter existing file is not loosened", existing: 0o600, request: 0o644, want: 0o600},
+		{name: "tighter existing file is not loosened to group read", existing: 0o640, request: 0o644, want: 0o640},
+		{name: "execute bits survive an equal perm", existing: 0o755, request: 0o755, want: 0o755},
+		{name: "execute bits survive a looser perm", existing: 0o755, request: 0o644, want: 0o755},
+		// A group/other WRITE bit makes the request a tightening, and the
+		// tightening must still not destroy the execute bits: the agent's write
+		// default (0o644) over a shared 0o775 script used to come out 0o644.
+		{name: "execute bits survive a group-writable tightening", existing: 0o775, request: 0o644, want: 0o755},
+		{name: "execute bits survive a world-writable tightening", existing: 0o777, request: 0o644, want: 0o755},
+		// A request that names an execute bit is a deliberate mode, not the
+		// write default: it is used as it stands.
+		{name: "an explicit execute-bit mode is honored", existing: 0o775, request: 0o700, want: 0o700},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "target")
+			if tt.existing != 0 {
+				if err := os.WriteFile(path, []byte("old"), tt.existing); err != nil {
+					t.Fatal(err)
+				}
+				// Chmod explicitly: the process umask strips group/other write
+				// from Create's mode, so 0o775 would otherwise start as 0o755
+				// and the group-writable cases would test nothing.
+				if err := os.Chmod(path, tt.existing); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := effectivePerm(path, tt.request); got.Perm() != tt.want {
+				t.Fatalf("effectivePerm(existing=%v, request=%v) = %v, want %v", tt.existing, tt.request, got.Perm(), tt.want)
+			}
+			// The same rule must hold end-to-end through the atomic write.
+			if err := WriteFileAtomic(path, []byte("new"), tt.request); err != nil {
+				t.Fatalf("WriteFileAtomic: %v", err)
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := info.Mode().Perm(); got != tt.want {
+				t.Fatalf("after WriteFileAtomic(perm=%v) mode = %o, want %o", tt.request, got, tt.want)
+			}
+			if body, err := os.ReadFile(path); err != nil || string(body) != "new" {
+				t.Fatalf("content = %q (%v), want %q", body, err, "new")
+			}
+		})
+	}
+}

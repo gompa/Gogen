@@ -54,11 +54,56 @@ func (e *Executor) BuildCommand(ctx context.Context, command string) (*exec.Cmd,
 	return cmd, nil
 }
 
+// shellName returns the shell binary execute_command runs a command string
+// through: bash when it is on PATH, POSIX sh otherwise.
+//
+// bash is preferred because the agent writes bash-flavoured lines ([[ ]],
+// arrays, $'…', process substitution) and a dash/sh that rejects them costs a
+// round trip plus a "the shell is sh, not bash" complaint. sh stays the
+// fallback so a minimal image (Alpine, BusyBox, a distroless build container)
+// still runs commands; the persistent shell resolves the same way
+// (persistentShellExecutable).
+//
+// The NAME is returned rather than the resolved path: exec.CommandContext
+// performs its own LookPath, so argv[0] stays "bash"/"sh" — what a command
+// reading $0 expects — instead of an absolute path.
+func shellName() string {
+	if _, err := exec.LookPath("bash"); err == nil {
+		return "bash"
+	}
+	return "sh"
+}
+
+// sandboxShellName is shellName for a command that runs INSIDE the bwrap
+// sandbox. bwrap bind-mounts only /usr, /bin, /lib, /lib64 and /etc, so a bash
+// living anywhere else (a Nix store path, /opt/homebrew) does not exist in the
+// sandbox namespace: passing "bash" there fails the exec, where the old
+// unconditional "sh" worked. Prefer bash only when its RESOLVED path is under
+// a bind-mounted root.
+func sandboxShellName() string {
+	path, err := exec.LookPath("bash")
+	if err != nil {
+		return "sh"
+	}
+	return sandboxShellFor(path)
+}
+
+// sandboxShellFor is the decision half of sandboxShellName, split out so the
+// bound-root rule is testable without writing to /usr/bin.
+func sandboxShellFor(resolvedBash string) string {
+	for _, root := range []string{"/usr/", "/bin/"} {
+		if strings.HasPrefix(resolvedBash, root) {
+			return "bash"
+		}
+	}
+	return "sh"
+}
+
 func (e *Executor) buildShellCommand(ctx context.Context, command string) (*exec.Cmd, error) {
 	sandbox := strings.ToLower(strings.TrimSpace(e.sandbox()))
 	switch sandbox {
 	case "", "off":
-		return exec.CommandContext(ctx, "sh", "-c", command), nil
+		return exec.CommandContext(ctx, shellName(), "-c", command), nil
 	case "bwrap":
 		path, err := exec.LookPath("bwrap")
 		if err != nil {
@@ -90,14 +135,15 @@ func (e *Executor) buildShellCommand(ctx context.Context, command string) (*exec
 			"--ro-bind-try", "/etc", "/etc",
 			"--bind", wd, wd,
 			"--chdir", wd,
-			"sh", "-c", command,
+			sandboxShellName(), "-c", command,
 		), nil
 	default:
 		return nil, fmt.Errorf("unknown command_sandbox %q (use \"off\" or \"bwrap\")", e.sandbox())
 	}
 }
 
-// runCommand executes a command string through the system shell (sh -c) and
+// runCommand executes a command string through the system shell — bash when
+// it is on PATH, POSIX sh otherwise (see shellName) — and
 // returns the final error: guard/sandbox failures raw, execution failures
 // wrapped with "execution error:" — the exact shapes ExecuteCommand has
 // always produced. runCommand is the platform seam: Windows executes the

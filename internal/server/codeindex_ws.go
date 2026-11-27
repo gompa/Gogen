@@ -27,6 +27,10 @@ func wsHandleReindexCode(req *wsRequest) {
 		run = req.target.agent.ReindexCode
 	}
 	go func() {
+		// Panic guard registered FIRST so it runs LAST (after cancel below):
+		// the rebuild parses the working tree, and a panic in it must not take
+		// the process down. See recoverGoroutine.
+		defer recoverGoroutine("code index reindex")
 		ctx, cancel := context.WithTimeout(context.Background(), reindexTimeout)
 		defer cancel()
 		if ws.done != nil {

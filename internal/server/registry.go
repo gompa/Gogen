@@ -909,6 +909,52 @@ type sessionRegistry struct {
 	// (the cap-eviction tail cancels those through evictHook). Set once at
 	// construction; nil when the host has no such work.
 	bgWorkHook func(sessionID string) bool
+
+	// change is the broadcast for everything first() depends on: register
+	// (including its cap evictions), remove and setDefault close the current
+	// channel and install a fresh one, so a waiter learns the exact moment the
+	// registry changed instead of re-probing first() on a timer. The /ws
+	// handshake's attach retry is that waiter: it re-evaluates first() only
+	// when a runtime left the registry, joined it, or the order moved.
+	//
+	// changeMu guards the swap and is a LEAF lock — never held while
+	// acquiring r.mu, turnMu, clientsMu or deliverMu (remove() calls
+	// notifyChanged with r.mu held, exactly as it already calls
+	// rt.notifyTurnReleased there, and nothing acquires r.mu while holding
+	// changeMu). Same shape as sessionRuntime.turnRelease/turnReleaseMu, so
+	// the package has one broadcast idiom, not two.
+	changeMu sync.Mutex
+	change   chan struct{}
+}
+
+// notifyChanged broadcasts a registry-membership change by closing the
+// current channel and installing a fresh one, so every current waiter wakes
+// while a waiter that arrives later parks on the new channel. Closing (rather
+// than a buffered send) is what makes it a broadcast: several handshakes may
+// be retrying at once.
+func (r *sessionRegistry) notifyChanged() {
+	r.changeMu.Lock()
+	// nil-safe: registries built as bare struct literals (tests) never ran
+	// newSessionRegistry, so install the channel on first use.
+	if r.change != nil {
+		close(r.change)
+	}
+	r.change = make(chan struct{})
+	r.changeMu.Unlock()
+}
+
+// changeChan returns the current membership-broadcast channel. A waiter
+// captures it BEFORE re-probing (first() + attach): a change that lands
+// between the failed attach and the wait closes the captured channel, so the
+// wake-up is never missed — the same capture-then-check rule as
+// turnReleaseChan.
+func (r *sessionRegistry) changeChan() chan struct{} {
+	r.changeMu.Lock()
+	defer r.changeMu.Unlock()
+	if r.change == nil {
+		r.change = make(chan struct{})
+	}
+	return r.change
 }
 
 // keepsBackgroundWork reports whether evicting rt would destroy background
@@ -1057,6 +1103,13 @@ func (r *sessionRegistry) register(id string, rt *sessionRuntime) []string {
 	r.agents[id] = rt
 	r.order = append(r.order, id)
 	r.mu.Unlock()
+	// Membership changed: the new registration and any cap-evicted victims
+	// left/entered the map under the lock above. Broadcast AFTER releasing
+	// r.mu (the flush loop below can block on a stuck socket, and a waiter
+	// woken here only needs first(), which the lock above already updated).
+	// This is what lets the /ws handshake's attach retry re-evaluate first()
+	// when the runtime it found was evicted for the record it is loading.
+	r.notifyChanged()
 	for i, victim := range victims {
 		// Persist any UNSAVED state before eviction (FlushPending writes only
 		// when the session is dirty). FlushSession would force a write on a
@@ -1343,6 +1396,12 @@ func (r *sessionRegistry) remove(id string) {
 	// release the lock themselves (releaseTurn), so this is redundant there —
 	// harmless, since notifyTurnReleased always installs a fresh channel.
 	rt.notifyTurnReleased()
+	// The id left the map: release the /ws handshake's attach retry, which
+	// found this runtime through first() and had the attach REFUSED (a claimed
+	// close or the evicted flag above). This is the wake-up that replaced its
+	// 25 ms re-probe timer — see ws_upgrade.go's handshake. Called with r.mu
+	// held (changeMu is a leaf, same as the turn-release broadcast above).
+	r.notifyChanged()
 	// Drop the per-parent delivery backlog: it is keyed by session id and would
 	// otherwise keep a deleted session's undrained messages reachable for the
 	// life of the process (and re-target them if the id were ever reused).
@@ -1367,6 +1426,11 @@ func (r *sessionRegistry) setDefault(id string) {
 		}
 	}
 	r.order = append([]string{id}, order...)
+	// The order is an input of first(): a handshake retry parked on the
+	// membership broadcast may now have a different (attachable) candidate at
+	// the front, so release it instead of making it wait out its deadline.
+	// Reached with r.mu held — notifyChanged is a leaf, see its doc.
+	r.notifyChanged()
 }
 
 // first returns the first registered runtime (the default session).

@@ -990,6 +990,7 @@ func (a *Agent) compactNoTail(ctx context.Context, opts contextmgr.CompactOption
 	opts.Keep = contextmgr.NoTailKeep
 	opts.Tools = a.llmTools()
 	opts.AllowedTools = a.AllowedToolNames()
+	opts.State = a.compactionSessionState()
 	compacted, newPins, err := a.Context.Compact(ctx, a.Messages, opts)
 	if err != nil {
 		return false, err
@@ -1652,6 +1653,7 @@ func (a *Agent) compactToFit(ctx context.Context, pinned map[int]struct{}, count
 			Keep:         keepOpt,
 			Tools:        a.llmTools(),
 			AllowedTools: a.AllowedToolNames(),
+			State:        a.compactionSessionState(),
 		})
 		plain := false
 		if err != nil {

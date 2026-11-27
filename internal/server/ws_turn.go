@@ -62,6 +62,11 @@ func (s *Server) handleWSCompact(ws *wsConn, _ *http.Request, rt *sessionRuntime
 	compactCtx, compactCancel := context.WithCancel(context.Background())
 	errCh := rt.stream.begin(compactCancel)
 	go func() {
+		// Panic guard registered FIRST so it runs LAST, after every cleanup
+		// defer below: a panicking compact must still reset the turn state,
+		// release the turn lock, and clear the stream handles (see
+		// recoverGoroutine).
+		defer recoverGoroutine("web compact")
 		// Defers run LIFO, mirroring startTurn's goroutine: the turn-state
 		// reset + turn_end broadcast (both while the lock is still held — a
 		// new turn must never see a stale turnActive/turnOwner, and turn_end
@@ -256,6 +261,9 @@ func (s *Server) preprocessWSUserMessage(ws *wsConn, r *http.Request, rt *sessio
 
 	if sel, isModels := agent.ParseModelsCommand(msg.Content); isModels && sel == "" {
 		go func(content string) {
+			// The catalog fetch below hits the network and parses the reply:
+			// a panic there must not take the process down with it.
+			defer recoverGoroutine("models command")
 			a := rt.agent
 			out, _, err := a.HandleModelsCommand(r.Context(), content)
 			resp := WSMessage{Type: "response", Content: out}
@@ -311,6 +319,12 @@ func (rt *sessionRuntime) startTurnWithResult(owner *wsConn, content string, ima
 	streamCtx, streamCancel := context.WithCancel(context.Background())
 	errCh := rt.stream.begin(streamCancel)
 	go func(content string, images []llm.ImageInput, turnCtx context.Context, done chan error, onResult func(string, error)) {
+		// Panic guard registered FIRST so it runs LAST, after every cleanup
+		// defer below (and after runTurnBody's own defers, which clear the
+		// turn state and broadcast turn_end): a panic mid-turn must not leave
+		// the session holding a turn lock nobody releases. See
+		// recoverGoroutine.
+		defer recoverGoroutine("web turn")
 		// Defers run LIFO, so the cleanup executes in this order:
 		// setTurnActive(false) → turn_end broadcast (both inside
 		// runTurnBody, while the lock is still held) → done → stream.end()

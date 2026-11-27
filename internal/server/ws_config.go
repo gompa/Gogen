@@ -113,6 +113,9 @@ func (s *Server) maybeProbeReasoningEfforts(ctx context.Context, a *agent.Agent)
 		return
 	}
 	go func() {
+		// The probe fetches and parses the provider's reasoning-effort
+		// catalog: a panic there must not take the process down with it.
+		defer recoverGoroutine("reasoning efforts probe")
 		// The session's routing key, not the bare ID: the probe must target
 		// the endpoint that actually serves the model (a model another
 		// provider also lists must not be probed on the default endpoint).

@@ -768,3 +768,61 @@ func TestOfflineSuppressesTheDefaultRegistryDownload(t *testing.T) {
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestFetchRemoteBoundsRegistryDownload pins the read bound on the registry
+// download: the body is parsed and then kept verbatim in memory for the disk
+// cache, so an endpoint that answers with an endless (or simply enormous) body
+// must be refused instead of buffered to the process heap limit. A refused
+// fetch is an error, which leaves the caller's existing cache in place.
+func TestFetchRemoteBoundsRegistryDownload(t *testing.T) {
+	// registryPayload pads a minimal valid registry out to size with trailing
+	// whitespace (json.Unmarshal accepts it).
+	registryPayload := func(size int) []byte {
+		const base = `{"example":{"id":"example","models":{}}}`
+		out := make([]byte, size)
+		copy(out, base)
+		for i := len(base); i < size; i++ {
+			out[i] = ' '
+		}
+		return out
+	}
+	tests := []struct {
+		name    string
+		size    int
+		wantErr bool
+	}{
+		{name: "registry under the cap is parsed", size: 1 << 10},
+		{name: "registry over the cap is refused", size: registryMaxBytes + 1, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payload := registryPayload(tt.size)
+			r := NewResolver("")
+			r.url = "https://registry.example/api.json"
+			r.client = &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode:    http.StatusOK,
+					Header:        http.Header{},
+					Body:          io.NopCloser(bytes.NewReader(payload)),
+					ContentLength: int64(len(payload)),
+				}, nil
+			})}
+			_, raw, err := r.fetchRemote()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected an error for a %d-byte registry", tt.size)
+				}
+				if !strings.Contains(err.Error(), "exceeds") {
+					t.Fatalf("error = %v, want an oversized-response error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("fetchRemote: %v", err)
+			}
+			if len(raw) != tt.size {
+				t.Fatalf("raw registry = %d bytes, want %d", len(raw), tt.size)
+			}
+		})
+	}
+}

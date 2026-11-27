@@ -9,12 +9,22 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 )
 
-// embedHTTP is the client for embeddings requests. The context cancels the
-// call; there is no separate short timeout, because a local model can take
-// longer than a catalog probe.
-var embedHTTP = &http.Client{}
+// embedRequestTimeout bounds one embeddings/rerank request. It is NOT a
+// latency target — a local model may legitimately spend minutes on a large
+// batch, so it stays generous.
+//
+// It exists because not every caller supplies a deadline: the code-index
+// filesystem watch embeds changed files under WithCancel(Background) while
+// holding the index lock, so an endpoint that accepts the connection and never
+// answers froze the index (searches, rebuilds, search_meaning) for the rest of
+// the session. A caller with its own context still cancels sooner.
+const embedRequestTimeout = 10 * time.Minute
+
+// embedHTTP is the client for embeddings and rerank requests.
+var embedHTTP = &http.Client{Timeout: embedRequestTimeout}
 
 type embeddingResponse struct {
 	Data []struct {

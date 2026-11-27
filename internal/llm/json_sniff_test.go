@@ -1,9 +1,11 @@
 package llm
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -144,4 +146,94 @@ func listModelsFromServer(t *testing.T, baseURL string) ([]catalogModel, error) 
 		modelClient: make(map[ModelRef]*openai.Client),
 	}
 	return p.listModels(context.Background())
+}
+
+// stubRoundTripper returns a fixed response, letting the sniff transport be
+// exercised directly (no network, and no 4 MiB round trip for the cap cases).
+type stubRoundTripper struct{ resp *http.Response }
+
+func (s stubRoundTripper) RoundTrip(*http.Request) (*http.Response, error) { return s.resp, nil }
+
+// TestJSONSniffBoundsBufferedBody pins the read bound on the catalog
+// transport: the base URL is user/provider configuration, so an endpoint that
+// answers GET /models with a non-JSON media type and an endless body could
+// otherwise buffer it to the heap limit and OOM the process. A body under the
+// cap is still normalized; one over it is passed through untouched (header,
+// ContentLength, and the full body remain readable), so the decode error the
+// request would have produced without this transport is preserved.
+func TestJSONSniffBoundsBufferedBody(t *testing.T) {
+	// jsonPayload pads valid JSON out to size with trailing whitespace, which
+	// json.Valid accepts.
+	jsonPayload := func(size int) []byte {
+		const base = `{"object":"list","data":[]}`
+		out := make([]byte, size)
+		copy(out, base)
+		for i := len(base); i < size; i++ {
+			out[i] = ' '
+		}
+		return out
+	}
+	tests := []struct {
+		name        string
+		contentType string
+		body        []byte
+		wantType    string
+		wantBody    []byte
+	}{
+		{
+			name:        "small valid JSON is normalized",
+			contentType: "text/plain; charset=utf-8",
+			body:        jsonPayload(64),
+			wantType:    "application/json",
+		},
+		{
+			name:        "small non-JSON keeps its header",
+			contentType: "text/html",
+			body:        []byte("<html>gateway error</html>"),
+			wantType:    "text/html",
+		},
+		{
+			name:        "oversized body is passed through untouched",
+			contentType: "text/plain; charset=utf-8",
+			body:        jsonPayload(jsonSniffMaxBody + 1024),
+			wantType:    "text/plain; charset=utf-8",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			orig := make([]byte, len(tt.body))
+			copy(orig, tt.body)
+			resp := &http.Response{
+				StatusCode:    http.StatusOK,
+				Header:        http.Header{"Content-Type": []string{tt.contentType}},
+				Body:          io.NopCloser(bytes.NewReader(orig)),
+				ContentLength: int64(len(orig)),
+			}
+			tr := &jsonSniffTransport{base: stubRoundTripper{resp: resp}}
+			req, err := http.NewRequest(http.MethodGet, "https://catalog.example/models", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := tr.RoundTrip(req)
+			if err != nil {
+				t.Fatalf("RoundTrip: %v", err)
+			}
+			if ct := got.Header.Get("Content-Type"); ct != tt.wantType {
+				t.Fatalf("Content-Type = %q, want %q", ct, tt.wantType)
+			}
+			if got.ContentLength != int64(len(orig)) {
+				t.Fatalf("ContentLength = %d, want %d", got.ContentLength, len(orig))
+			}
+			body, err := io.ReadAll(got.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+			if !bytes.Equal(body, orig) {
+				t.Fatalf("body not preserved: got %d bytes, want %d", len(body), len(orig))
+			}
+			if err := got.Body.Close(); err != nil {
+				t.Fatalf("close body: %v", err)
+			}
+		})
+	}
 }

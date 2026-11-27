@@ -54,6 +54,8 @@ type FileConfig struct {
 	DebugSession              string                `yaml:"debug_session"`
 	MCP                       string                `yaml:"mcp"`
 	MCPToolMode               string                `yaml:"mcp_tool_mode"`
+	MCPProbeTimeoutSecs       int                   `yaml:"mcp_probe_timeout_secs"`
+	MCPProbeMaxConcurrent     int                   `yaml:"mcp_probe_max_concurrent"`
 	DebugCompareMessages      bool                  `yaml:"debug_compare_messages"`
 	MCPServers                []MCPServerEntry      `yaml:"mcp_servers"`
 	OpenAIProviders           []OpenAIProviderEntry `yaml:"openai_providers"`

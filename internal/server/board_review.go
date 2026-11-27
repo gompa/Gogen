@@ -48,6 +48,13 @@ func (s *Server) installReviewAgent() {
 	if bm == nil {
 		return
 	}
+	// The install is a read-modify-write of s.reviewTrigger, and it runs off
+	// the read loop (persistAndBroadcast → applyBoardManagerToAll): two
+	// settings saves in flight together raced it and could each build a
+	// trigger, leaving the manager hooked to one of them. The mutex makes the
+	// install idempotent for real.
+	s.reviewTriggerMu.Lock()
+	defer s.reviewTriggerMu.Unlock()
 	if s.reviewTrigger == nil {
 		s.reviewTrigger = &boardReviewTrigger{s: s}
 	}

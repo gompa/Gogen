@@ -3,6 +3,7 @@ package server
 import (
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -533,6 +534,100 @@ func TestEffectiveConfigOverlaysRuntime(t *testing.T) {
 	if s.config.CommandSafetyMode != "" || s.config.WebBind != "" {
 		t.Fatalf("startup config mutated: %+v", s.config)
 	}
+}
+
+// TestGetRuntimeConfigMCPListIsACopy pins the snapshot contract mcp_save and
+// mcp_delete depend on: both edit the returned MCPServers list IN PLACE (an
+// indexed store, a re-slice) after GetRuntimeConfig released runtimeMu, so a
+// shared backing array would mutate the live overlay behind the lock and
+// race the persist/broadcast goroutine.
+func TestGetRuntimeConfigMCPListIsACopy(t *testing.T) {
+	newWS := func() *Workspace {
+		ws := &Workspace{}
+		ws.SetRuntimeConfig(config.Config{MCPServers: []config.MCPServerConfig{
+			{Name: "a", Command: "cmd-a"},
+			{Name: "b", Command: "cmd-b"},
+			{Name: "c", Command: "cmd-c"},
+		}})
+		return ws
+	}
+	wantNames := func(t *testing.T, ws *Workspace) []string {
+		t.Helper()
+		got := ws.GetRuntimeConfig().MCPServers
+		names := make([]string, 0, len(got))
+		for _, m := range got {
+			names = append(names, m.Name)
+		}
+		return names
+	}
+	tests := []struct {
+		name   string
+		mutate func(snap []config.MCPServerConfig) []config.MCPServerConfig
+	}{
+		{
+			name: "indexed store",
+			mutate: func(snap []config.MCPServerConfig) []config.MCPServerConfig {
+				snap[0] = config.MCPServerConfig{Name: "edited", Command: "x"}
+				return snap
+			},
+		},
+		{
+			name: "delete re-slice",
+			mutate: func(snap []config.MCPServerConfig) []config.MCPServerConfig {
+				return append(snap[:0], snap[1:]...)
+			},
+		},
+		{
+			name: "append",
+			mutate: func(snap []config.MCPServerConfig) []config.MCPServerConfig {
+				return append(snap, config.MCPServerConfig{Name: "d", Command: "cmd-d"})
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ws := newWS()
+			_ = tc.mutate(ws.GetRuntimeConfig().MCPServers)
+			if got := wantNames(t, ws); len(got) != 3 || got[0] != "a" || got[1] != "b" || got[2] != "c" {
+				t.Fatalf("overlay servers = %v after an unsaved edit, want [a b c]", got)
+			}
+		})
+	}
+}
+
+// TestGetRuntimeConfigMCPListEditConcurrentReads is the -race guard for the
+// same contract: the mcp_save/mcp_delete read-modify-write runs off the read
+// loop while the persist/broadcast goroutine reads the list through
+// effectiveConfig.
+func TestGetRuntimeConfigMCPListEditConcurrentReads(t *testing.T) {
+	dir := t.TempDir()
+	s, _, _ := newContinuationServer(t, newBlockingStub(), dir)
+	s.ws.SetRuntimeConfig(config.Config{MCPServers: []config.MCPServerConfig{
+		{Name: "a", Command: "cmd-a"},
+		{Name: "b", Command: "cmd-b"},
+	}})
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { // writer: the handler's get-modify-set
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			r := s.ws.GetRuntimeConfig()
+			if len(r.MCPServers) > 0 {
+				r.MCPServers[0] = config.MCPServerConfig{Name: "edited", Command: "x"}
+			}
+			s.ws.SetRuntimeConfig(r)
+		}
+	}()
+	go func() { // reader: the persistence projection
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			if eff := s.effectiveConfig(); eff != nil && len(eff.MCPServers) > 0 {
+				_ = eff.MCPServers[0].Name
+			}
+		}
+	}()
+	wg.Wait()
 }
 
 // TestWorkspaceRuntimeSeed pins the overlay seeding: nil cfg → zero config,

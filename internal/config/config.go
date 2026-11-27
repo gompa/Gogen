@@ -116,13 +116,17 @@ func Effective(v, def int) int {
 
 // MCP tool exposure modes (mcp_tool_mode).
 const (
-	// MCPToolModeNested exposes every MCP server tool through the single
-	// `mcp` gateway tool (list/describe/call) instead of inlining one
-	// definition per server tool. The model-facing tool set then has a fixed
-	// size and fixed bytes no matter how many servers connect — which is
-	// what keeps the request prefix stable for provider prompt caching — and
-	// a large catalog (a reverse-engineering server publishes dozens of
-	// tools) costs one definition instead of dozens.
+	// MCPToolModeNested exposes every MCP server tool through three fixed
+	// gateway tools — `mcp_list` (find a tool), `mcp_describe` (its argument
+	// schema), and `mcp_call` (run it) — instead of inlining one definition
+	// per server tool. Three tools, not one tool with an action enum: smaller
+	// models drop a required discriminator and nest the whole call under a
+	// parameter named arguments, because that word is already the tool-call
+	// envelope (see internal/agent/mcp_tool.go). The model-facing tool set
+	// then has a fixed size and fixed bytes no matter how many servers
+	// connect — which is what keeps the request prefix stable for provider
+	// prompt caching — and a large catalog (a reverse-engineering server
+	// publishes dozens of tools) costs one definition instead of dozens.
 	MCPToolModeNested = "nested"
 	// MCPToolModeInline inlines every discovered MCP tool definition, the
 	// historical behavior. Cheapest for a model with one or two extra tools
@@ -132,6 +136,25 @@ const (
 	// DefaultMCPToolMode is nested: the fixed tool surface and stable prefix
 	// win by default, and inline stays available as the opt-out.
 	DefaultMCPToolMode = MCPToolModeNested
+	// DefaultMCPProbeTimeoutSecs is the hard ceiling on a settings-modal MCP
+	// connection test (mcp_probe_timeout_secs), in seconds. The probe's FLOOR
+	// is the server's cold-npx allowance (90s): `npx -y <package>` has to
+	// download the package before it answers at all, so a shorter bound
+	// reported a working server as broken. Ten minutes is generous for a cold
+	// launcher while keeping a stuck probe recoverable; the ceiling also only
+	// bounds the PROBE — what a real MCP client honors at runtime is
+	// init_timeout_secs/tool_timeout_secs and is untouched.
+	DefaultMCPProbeTimeoutSecs = 600
+	// DefaultMCPProbeMaxConcurrent bounds the throwaway child processes the
+	// settings modal may have running at once (mcp_probe_max_concurrent):
+	// each test spawns one, and the WS handler is reachable as fast as a
+	// client can send messages.
+	DefaultMCPProbeMaxConcurrent = 2
+	// maxMCPProbeTimeoutSecs bounds the CONFIGURED probe ceiling. A typed
+	// value beyond a day is clamped there, so the seconds→time.Duration
+	// multiply below cannot overflow into a negative (which would resolve to
+	// the floor, i.e. the opposite of what was asked).
+	maxMCPProbeTimeoutSecs = 24 * 60 * 60
 )
 
 // MCPServerConfig describes one MCP stdio server entry. Tags cover both the
@@ -226,6 +249,18 @@ type Config struct {
 	// server tool). Resolved once at session construction: the value is part
 	// of the fixed request prefix and must not change mid-session.
 	MCPToolMode string
+	// MCPProbeTimeoutSecs is the ceiling, in seconds, on a settings-modal MCP
+	// connection test (0 = DefaultMCPProbeTimeoutSecs). A server's
+	// init_timeout_secs may raise the probe deadline up to this value.
+	// Restart-scoping is deliberately avoided: the probe handler reads the
+	// live runtime overlay when the test runs, so a saved change applies to
+	// the next test.
+	MCPProbeTimeoutSecs int
+	// MCPProbeMaxConcurrent caps concurrent settings-modal MCP connection
+	// tests (0 = DefaultMCPProbeMaxConcurrent). Each test spawns a throwaway
+	// child process, so this is the bound on those processes. Live like the
+	// timeout.
+	MCPProbeMaxConcurrent int
 	// OpenAIProviders lists additional registered OpenAI-compatible API
 	// providers (see OpenAIProviderConfig). Empty means only the legacy
 	// OpenAIKey/OpenAIModel/OpenAIURL default profile exists.
@@ -475,6 +510,8 @@ func Defaults() Config {
 		DebugSession:              "",
 		MCP:                       "off",
 		MCPToolMode:               DefaultMCPToolMode,
+		MCPProbeTimeoutSecs:       DefaultMCPProbeTimeoutSecs,
+		MCPProbeMaxConcurrent:     DefaultMCPProbeMaxConcurrent,
 		DebugCompareMessages:      false,
 		WebBind:                   "127.0.0.1:8081",
 		WebAllowedOrigins:         "",
@@ -552,6 +589,30 @@ func (c *Config) MCPNested() bool {
 		return true
 	}
 	return !strings.EqualFold(strings.TrimSpace(c.MCPToolMode), MCPToolModeInline)
+}
+
+// MCPProbeTimeoutCeiling returns the effective ceiling on a settings-modal MCP
+// connection test. Zero (unset) means DefaultMCPProbeTimeoutSecs; an absurd
+// configured value is clamped to a day so the seconds→Duration multiply stays
+// exact (see maxMCPProbeTimeoutSecs). A value below one second cannot be
+// expressed — the ceiling is a duration in whole seconds.
+func (c *Config) MCPProbeTimeoutCeiling() time.Duration {
+	secs := DefaultMCPProbeTimeoutSecs
+	if c != nil {
+		secs = Effective(c.MCPProbeTimeoutSecs, DefaultMCPProbeTimeoutSecs)
+	}
+	secs = min(secs, maxMCPProbeTimeoutSecs)
+	secs = max(secs, 1)
+	return time.Duration(secs) * time.Second
+}
+
+// MCPProbeConcurrency returns the effective cap on concurrent settings-modal
+// MCP connection tests. Zero (unset) means DefaultMCPProbeMaxConcurrent.
+func (c *Config) MCPProbeConcurrency() int {
+	if c == nil {
+		return DefaultMCPProbeMaxConcurrent
+	}
+	return Effective(c.MCPProbeMaxConcurrent, DefaultMCPProbeMaxConcurrent)
 }
 
 // MCPServersToStart is the server list the manager spawns. Host servers are

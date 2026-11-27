@@ -547,6 +547,11 @@ func RewriteLocators(s string, resolve func(path string) (string, bool)) string 
 	return b.String()
 }
 
+// linkFile is the hardlink call RepointFile tries before falling back to a
+// copy. A package variable so tests can force the copy path (cross-device
+// mounts and exotic filesystems produce it in the field, not on a test host).
+var linkFile = os.Link
+
 // RepointFile links a spilled file into toSessionID's spill dir (same base
 // name) and returns the new path. Used when a session is forked: the
 // forked transcript references the ORIGINAL session's spill files, which
@@ -585,19 +590,23 @@ func RepointFile(workingDir, oldPath, toSessionID string) (string, error) {
 	if err := os.MkdirAll(newDir, 0o700); err != nil {
 		return "", err
 	}
-	if err := os.Link(absOld, newPath); err == nil {
+	if err := linkFile(absOld, newPath); err == nil {
 		return newPath, nil
 	}
 	// Hardlinks unavailable (cross-device mount, exotic filesystem): copy.
-	data, err := os.ReadFile(absOld)
+	// Streamed, not read into memory first: a spill file can be up to
+	// MaxTargetBytes (64MB) and the repoint runs once per retained locator
+	// during a fork, so buffering each one put the whole file on the heap.
+	src, err := os.Open(absOld)
 	if err != nil {
 		return "", err
 	}
+	defer src.Close()
 	f, err := os.OpenFile(newPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return "", err
 	}
-	_, werr := f.Write(data)
+	_, werr := io.Copy(f, src)
 	cerr := f.Close()
 	if werr != nil || cerr != nil {
 		// Remove the partial copy: a truncated file at newPath would satisfy

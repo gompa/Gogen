@@ -171,16 +171,18 @@ type configYAML struct {
 	// from the settings modal, and used to be MISSING here: a save rewrote the
 	// config without those keys, silently erasing the user's choices (and the
 	// search API key, which --save-config-secrets must persist).
-	WebFetch             string                        `yaml:"web_fetch,omitempty"`
-	WebSearch            string                        `yaml:"web_search,omitempty"`
-	WebSearchBackend     string                        `yaml:"web_search_backend,omitempty"`
-	WebSearchAPIKey      string                        `yaml:"web_search_api_key,omitempty"`
-	WebAllowedDomains    string                        `yaml:"web_allowed_domains,omitempty"`
-	WebFetchMode         string                        `yaml:"web_fetch_mode,omitempty"`
-	MCPToolMode          string                        `yaml:"mcp_tool_mode,omitempty"`
-	DebugCompareMessages bool                          `yaml:"debug_compare_messages,omitempty"`
-	MCPServers           []config.MCPServerConfig      `yaml:"mcp_servers,omitempty"`
-	OpenAIProviders      []config.OpenAIProviderConfig `yaml:"openai_providers,omitempty"`
+	WebFetch              string                        `yaml:"web_fetch,omitempty"`
+	WebSearch             string                        `yaml:"web_search,omitempty"`
+	WebSearchBackend      string                        `yaml:"web_search_backend,omitempty"`
+	WebSearchAPIKey       string                        `yaml:"web_search_api_key,omitempty"`
+	WebAllowedDomains     string                        `yaml:"web_allowed_domains,omitempty"`
+	WebFetchMode          string                        `yaml:"web_fetch_mode,omitempty"`
+	MCPToolMode           string                        `yaml:"mcp_tool_mode,omitempty"`
+	MCPProbeTimeoutSecs   int                           `yaml:"mcp_probe_timeout_secs,omitempty"`
+	MCPProbeMaxConcurrent int                           `yaml:"mcp_probe_max_concurrent,omitempty"`
+	DebugCompareMessages  bool                          `yaml:"debug_compare_messages,omitempty"`
+	MCPServers            []config.MCPServerConfig      `yaml:"mcp_servers,omitempty"`
+	OpenAIProviders       []config.OpenAIProviderConfig `yaml:"openai_providers,omitempty"`
 }
 
 // buildConfigYAML renders the effective config as a YAML document. Secrets

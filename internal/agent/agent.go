@@ -10,11 +10,12 @@ import (
 // the agent loop, persistence, and feature tools need.
 //
 // The unexported state is grouped into embedded domain structs
-// (sessionPersist, sessionStats, compactionState, backgroundState,
-// featureWiring, subagentWiring, toolRegistry, turnCounters, turnYield,
-// sessionMeta), defined in the matching domain files; their fields
-// are promoted, so a.field access is unchanged. New per-session
-// state belongs in a domain group, not a flat field here.
+// (sessionPersist, sessionStats, sessionMemory, compactionState,
+// backgroundState, featureWiring, subagentWiring, toolRegistry,
+// turnCounters, turnYield, sessionMeta, terminalState), defined in the
+// matching domain files; their fields are promoted, so a.field access is
+// unchanged. New per-session state belongs in a domain group, not a flat
+// field here.
 type Agent struct {
 	Provider llm.LLMProvider
 	Executor *Executor
@@ -91,6 +92,7 @@ type Agent struct {
 	// Domain state groups (embedded; fields promoted onto Agent).
 	sessionPersist
 	sessionStats
+	sessionMemory
 	compactionState
 	backgroundState
 	featureWiring
@@ -113,6 +115,7 @@ func NewAgent(provider llm.LLMProvider, executor *Executor, ctxMgr *contextmgr.M
 		GlobalMode:    false,
 		ThinkingLevel: ThinkingOff,
 		toolRegistry:  toolRegistry{toolHandlers: BuiltinToolHandlers()},
+		sessionMemory: sessionMemory{SessionState: newSessionState()},
 	}
 }
 

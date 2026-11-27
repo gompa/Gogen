@@ -82,25 +82,30 @@ type featureTool struct {
 // by the callers: a registry tool with the same name wins everywhere
 // (explicit user configuration), in both the definition list and
 // execution.
+//
+// The definitions come from the frozen values in featuretool_defs.go: this
+// function runs many times per round (llmTools, allowsTool per candidate
+// name, AllowedToolNames, featureToolFor per tool call), so it must not
+// rebuild the JSON schemas on every call.
 func (a *Agent) featureTools() []featureTool {
 	var out []featureTool
 	if a.BoardEnabled() && a.BoardManager() != nil {
 		// D7: the board tool is plan-mode unrestricted (the coordination
 		// exception, like todo) — an agent may update the board in plan
 		// mode so it can mark items for review.
-		out = append(out, featureTool{Name: "board", Definition: boardToolDef(), Handler: handleBoard, PlanAllowed: true})
+		out = append(out, featureTool{Name: "board", Definition: boardTool, Handler: handleBoard, PlanAllowed: true})
 	}
 	if a.SubagentsEnabled() && a.SubagentSpawner() != nil {
 		cs := a.continuableSpawner()
-		out = append(out, featureTool{Name: "subagent", Definition: subagentToolDef(cs != nil, a.SubagentMaxConcurrent()), Handler: handleSubagent})
+		out = append(out, featureTool{Name: "subagent", Definition: precomputedSubagentToolDef(cs != nil, a.SubagentMaxConcurrent()), Handler: handleSubagent})
 		if cs != nil {
 			out = append(out,
-				featureTool{Name: "subagent_fork", Definition: subagentForkToolDef(), Handler: handleSubagentFork},
-				featureTool{Name: "list_agents", Definition: listAgentsToolDef(), Handler: handleListAgents},
-				featureTool{Name: "get_agent_result", Definition: getAgentResultToolDef(), Handler: handleGetAgentResult},
-				featureTool{Name: "wait_agent", Definition: waitAgentToolDef(), Handler: handleWaitAgent},
-				featureTool{Name: "send_message", Definition: sendMessageToolDef(), Handler: handleSendMessage},
-				featureTool{Name: "interrupt_agent", Definition: interruptAgentToolDef(), Handler: handleInterruptAgent},
+				featureTool{Name: "subagent_fork", Definition: subagentForkTool, Handler: handleSubagentFork},
+				featureTool{Name: "list_agents", Definition: listAgentsTool, Handler: handleListAgents},
+				featureTool{Name: "get_agent_result", Definition: getAgentResultTool, Handler: handleGetAgentResult},
+				featureTool{Name: "wait_agent", Definition: waitAgentTool, Handler: handleWaitAgent},
+				featureTool{Name: "send_message", Definition: sendMessageTool, Handler: handleSendMessage},
+				featureTool{Name: "interrupt_agent", Definition: interruptAgentTool, Handler: handleInterruptAgent},
 			)
 		}
 	}
@@ -108,7 +113,7 @@ func (a *Agent) featureTools() []featureTool {
 		// D-skill: skill list/read are read-only, so the skill tool is
 		// plan-mode allowed like the board (the model can consult skills
 		// while planning).
-		out = append(out, featureTool{Name: "skill", Definition: skillsToolDef(), Handler: handleSkill, PlanAllowed: true})
+		out = append(out, featureTool{Name: "skill", Definition: skillTool, Handler: handleSkill, PlanAllowed: true})
 	}
 	if a.TerminalEnabled() {
 		// Persistent terminal: one owner-scoped PTY tool with an action enum
@@ -117,15 +122,15 @@ func (a *Agent) featureTools() []featureTool {
 		// state), so neither sets PlanAllowed. Ordered so the model-facing
 		// definition list is deterministic.
 		out = append(out,
-			featureTool{Name: "terminal", Definition: terminalToolDef(), Handler: handleTerminal},
-			featureTool{Name: "bash_persistent", Definition: bashPersistentToolDef(), Handler: handleBashPersistent},
+			featureTool{Name: "terminal", Definition: terminalTool, Handler: handleTerminal},
+			featureTool{Name: "bash_persistent", Definition: bashPersistentTool, Handler: handleBashPersistent},
 		)
 	}
 	if a.CodeIndexEnabled() && codeIndexProviderSet(a.codeIndexCfg()) {
 		// Plan mode may search. The only writes are under .gogen/index.
 		out = append(out, featureTool{
 			Name:        "search_meaning",
-			Definition:  searchMeaningToolDef(),
+			Definition:  searchMeaningTool,
 			Handler:     handleSearchMeaning,
 			PlanAllowed: true,
 		})
@@ -135,7 +140,7 @@ func (a *Agent) featureTools() []featureTool {
 		// only, matching the plan-mode gate on inlined MCP tools (isMCPTool).
 		// The definitions are constant, so the request prefix stays
 		// byte-stable across turns and sessions.
-		out = append(out, mcpGatewayFeatureTools()...)
+		out = append(out, mcpGatewayTools...)
 	}
 	return out
 }

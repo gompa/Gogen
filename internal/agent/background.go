@@ -645,7 +645,7 @@ const defaultBackgroundOutputCap = 256 * 1024
 // exit code and output. The window must comfortably outlive a compaction:
 // a job started before the middle of the history was summarized is still
 // addressable afterwards via background_job (action=list/status), so the
-// model can re-correlate it from the summary's executed-call roster. After
+// model can re-correlate it from the summary's session-state manifest. After
 // the window the reaper removes it, bounding memory on long-lived sessions
 // (each job keeps an outputBuffer tail); defaultMaxFinishedBackgroundJobs
 // remains the harder bound. The Agent.bgRetain field overrides it

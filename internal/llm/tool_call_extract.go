@@ -164,9 +164,9 @@ func renumberExtractedToolCalls(toolCalls []ToolCall) {
 	for i := range toolCalls {
 		toolCalls[i].Index = i
 		// Unique per batch, not per index: a fixed "tc_extracted_<i>" collided
-		// across rounds, so history carried duplicate tool-call IDs — the
-		// tool-result roster then matched the wrong results ("first result
-		// wins") and strict providers reject the request outright.
+		// across rounds, so history carried duplicate tool-call IDs — any
+		// id-keyed index then matched the wrong results ("first result wins")
+		// and strict providers reject the request outright.
 		toolCalls[i].ID = randhex.ID(8, "tc_")
 	}
 }

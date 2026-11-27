@@ -747,6 +747,35 @@ func buildConfigFields() map[string]fieldSpec {
 		add(f)
 	}
 
+	// The test_mcp probe bounds. Both are LIVE without an applyLive sweep:
+	// wsHandleTestMCP reads them from the runtime overlay at call time, so a
+	// saved change applies to the NEXT connection test (no restart). Both push
+	// the EFFECTIVE value — 0 in the overlay means "use the built-in default",
+	// so the modal shows the resolved number rather than a bare 0.
+	{
+		f := intSpec("mcpProbeTimeoutSecs",
+			func(r *config.Config) *int { return &r.MCPProbeTimeoutSecs },
+			func(m *WSMessage) *int { return &m.MCPProbeTimeoutSecs })
+		f.normalize = nonNegInt("mcpProbeTimeoutSecs")
+		f.project = func(r *config.Config, m *WSMessage) {
+			m.MCPProbeTimeoutSecs = int(r.MCPProbeTimeoutCeiling() / time.Second)
+		}
+		f.msgGet = func(m *WSMessage) any { return m.MCPProbeTimeoutSecs }
+		f.sample = 300
+		add(f)
+	}
+
+	{
+		f := intSpec("mcpProbeMaxConcurrent",
+			func(r *config.Config) *int { return &r.MCPProbeMaxConcurrent },
+			func(m *WSMessage) *int { return &m.MCPProbeMaxConcurrent })
+		f.normalize = nonNegInt("mcpProbeMaxConcurrent")
+		f.project = func(r *config.Config, m *WSMessage) { m.MCPProbeMaxConcurrent = r.MCPProbeConcurrency() }
+		f.msgGet = func(m *WSMessage) any { return m.MCPProbeMaxConcurrent }
+		f.sample = 4
+		add(f)
+	}
+
 	{
 		f := strSpec("mcp",
 			func(r *config.Config) *string { return &r.MCP },

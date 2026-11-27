@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPostEmbeddings(t *testing.T) {
@@ -101,5 +102,23 @@ func TestPostRerank(t *testing.T) {
 	defer bad.Close()
 	if _, err := PostRerank(context.Background(), bad.URL+"/v1", "", "bge", "q", []string{"a"}); err == nil || !strings.Contains(err.Error(), "rerank response") {
 		t.Fatalf("bad body err = %v", err)
+	}
+}
+
+// TestEmbedClientHasAGenerousTimeout pins the client-side bound the
+// context-less callers rely on: the code-index watch embeds changed files under
+// WithCancel(Background) while holding the index lock, so without a timeout an
+// endpoint that accepts the connection and never answers froze the index for
+// the rest of the session. It must stay generous (a local model can take
+// minutes) — a short value would report a working endpoint as broken.
+func TestEmbedClientHasAGenerousTimeout(t *testing.T) {
+	if embedHTTP.Timeout <= 0 {
+		t.Fatal("embedHTTP has no Timeout: a watch-path embeddings call can block forever")
+	}
+	if embedHTTP.Timeout < 2*time.Minute {
+		t.Fatalf("embedHTTP.Timeout = %v, too short for a local embeddings model", embedHTTP.Timeout)
+	}
+	if embedHTTP.Timeout%time.Minute != 0 {
+		t.Fatalf("embedHTTP.Timeout = %v, want a whole number of minutes (the value is documented in minutes)", embedHTTP.Timeout)
 	}
 }

@@ -156,6 +156,9 @@ func wsHandleTestProvider(req *wsRequest) {
 		return
 	}
 	go func() {
+		// The probe builds a provider from client-supplied config and hits its
+		// endpoint; a panic there must not take the process down with it.
+		defer recoverGoroutine("provider test")
 		start := time.Now()
 		reply := func(res ProviderTestResult) {
 			_ = ws.writeJSON(WSMessage{Type: "provider_test", ProviderTest: &res})

@@ -11,10 +11,17 @@ import (
 )
 
 // WriteFileAtomic writes content to a file atomically using a temp file + rename.
-// It creates parent directories as needed, preserves existing file permissions
-// when overwriting, and handles unsupported chmod gracefully on some filesystems.
-// The temp file is fsynced before the rename and the containing directory is
-// fsynced after it, so the new content survives a crash or power loss.
+// It creates parent directories as needed and handles unsupported chmod
+// gracefully on some filesystems. The temp file is fsynced before the rename
+// and the containing directory is fsynced after it, so the new content survives
+// a crash or power loss.
+//
+// Permissions (see effectivePerm): a new file gets perm; when the target
+// already exists its mode is preserved, EXCEPT that a perm which adds no new
+// permission bit and drops at least one read/write bit (0o600 over an existing
+// 0o644, i.e. a call that asks for a tighter file) is honored. A perm can
+// therefore never make the file more permissive than it already was, and
+// execute bits survive every overwrite that does not name one of its own.
 func WriteFileAtomic(path string, content []byte, perm os.FileMode) error {
 	return writeFileSync(path, content, perm, false)
 }
@@ -62,8 +69,9 @@ func writeFileSync(path string, content []byte, perm os.FileMode, skipFSync bool
 // a []byte, so the file never has to exist on the heap.
 //
 // Parent directories are created when the writer is constructed and an
-// existing target file's mode is preserved. Commit fsyncs the temp file before
-// the rename and the containing directory after it (the durability contract
+// existing target file's mode is preserved — a perm that tightens read/write
+// bits is honored, see effectivePerm. Commit fsyncs the temp file before the
+// rename and the containing directory after it (the durability contract
 // documented on WriteFileAtomic). Abort — or letting the writer go without
 // Commit — closes and removes the temp file, leaving any existing target
 // untouched.
@@ -76,7 +84,9 @@ type AtomicWriter struct {
 }
 
 // NewAtomicWriter creates a temp file in path's directory (creating parent
-// directories as needed) ready to receive the atomic write. Call Commit to
+// directories as needed) ready to receive the atomic write. perm follows the
+// WriteFileAtomic rule: a new file gets it, and an existing target keeps its
+// mode unless perm is a genuine tightening (see effectivePerm). Call Commit to
 // publish it or Abort to discard it.
 func NewAtomicWriter(path string, perm os.FileMode) (*AtomicWriter, error) {
 	return newAtomicWriter(path, perm, false)
@@ -94,11 +104,7 @@ func newAtomicWriter(path string, perm os.FileMode, skipFSync bool) (*AtomicWrit
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
-	// Preserve the existing file mode when overwriting, so execute bits
-	// on scripts are not destroyed.
-	if info, err := os.Stat(path); err == nil {
-		perm = info.Mode()
-	}
+	perm = effectivePerm(path, perm)
 	tmp, err := os.CreateTemp(dir, ".gogen-write-*")
 	if err != nil {
 		return nil, err
@@ -122,6 +128,44 @@ func newAtomicWriter(path string, perm os.FileMode, skipFSync bool) (*AtomicWrit
 		})
 	}
 	return w, nil
+}
+
+// effectivePerm resolves the mode for the temp file that will replace path.
+// A new target gets perm verbatim (parent directories stay 0755). For an
+// existing target the old mode is preserved, so a rewrite never destroys a
+// script's execute bits — EXCEPT when perm is a genuine tightening: it grants
+// no permission the file does not already have, and it drops at least one
+// read/write bit. WriteFileAtomic(path, secret, 0o600) over a pre-existing
+// 0o644 file used to keep 0o644 and leave the secret world-readable; the
+// rule here honors that request while a same-or-looser perm (0o644 over an
+// existing 0o755 script) still preserves the old mode. No perm can ever make
+// the file more permissive than it already was. Directory creation above is
+// unaffected (0755).
+func effectivePerm(path string, perm os.FileMode) os.FileMode {
+	info, err := os.Stat(path)
+	if err != nil {
+		return perm
+	}
+	existing := info.Mode()
+	requested, have := perm.Perm(), existing.Perm()
+	// A request that adds any bit is not a tightening, and one that removes
+	// only execute bits is exactly the preservation case documented above.
+	if requested&^have != 0 || have&^requested&0o666 == 0 {
+		return existing
+	}
+	// A genuine tightening: take the requested read/write bits, but keep the
+	// execute bits the file already has unless the request names an execute bit
+	// of its own. Returning requested alone lost them whenever the tightening
+	// came from a group/other WRITE bit — a 0o775 script rewritten with the
+	// agent's write default (0o644) came out non-executable, which is the exact
+	// damage this rule exists to prevent. A request that names an execute bit is
+	// a deliberate mode (0o700 over an existing 0o755 drops group/other exec on
+	// purpose) and is used as it stands.
+	out := requested
+	if requested&0o111 == 0 {
+		out |= have & 0o111
+	}
+	return out
 }
 
 // Write implements io.Writer, appending to the temp file.

@@ -223,6 +223,9 @@ func wsHandleListModels(req *wsRequest) {
 	rt := target
 	ctx := r.Context()
 	go func() {
+		// The catalog fetch hits the provider endpoint and parses the reply:
+		// a panic there must not take the process down with it.
+		defer recoverGoroutine("list models")
 		models, err := rt.agent.ListModels(ctx)
 		if err != nil {
 			writeNoticeError(ws, "models", fmt.Sprintf("Error: %v", err))

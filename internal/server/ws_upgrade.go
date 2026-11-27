@@ -80,7 +80,14 @@ func (s *Server) upgradeWS(w http.ResponseWriter, r *http.Request) (*upgradedWS,
 	conn, err := upg.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("upgrade error: %v", err)
-		release()
+		// release is nil when there is no connection limiter (nil server /
+		// test fixture): the slot was never taken, so there is nothing to give
+		// back — and an unconditional call panicked on a server that merely
+		// refused a non-websocket request. The cleanup below guards it the same
+		// way.
+		if release != nil {
+			release()
+		}
 		return nil, errWSUpgrade
 	}
 	s.registerWSConn(conn)
@@ -153,9 +160,21 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	// the last pane was explicitly closed (session_close) or the last client
 	// detached from an idle session (orphan eviction) — and bootstrapping
 	// gives the connection and any legacy id-less message a target.
+	// The retry waits on the registry's membership broadcast rather than
+	// re-probing first() on a timer: the runtime it found is unregistered
+	// within its drain window (≤ wsStreamDrainWait plus the flush), and that
+	// removal is exactly the event that can produce a different first(). The
+	// 25 ms sleep this replaces woke far more often than the registry changes
+	// and still added up to a tick of latency to the handshake.
 	deadline := time.Now().Add(5 * time.Second)
+	var timeout <-chan time.Time // armed on the first refusal, fires at the deadline
 	var pane *sessionRuntime
 	for {
+		// Capture the membership signal BEFORE re-probing: a runtime that left
+		// the registry between the refused attach below and the wait would
+		// otherwise let us park on a signal that already fired
+		// (capture-then-check, the same rule as tryAcquireTurn).
+		changed := s.registry.changeChan()
 		pane = s.registry.first()
 		if pane == nil {
 			pane = s.createBootstrapSession()
@@ -167,14 +186,28 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 		if s.attachSession(ws, r, pane, true, nil) {
 			break
 		}
-		if time.Now().After(deadline) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			// Pathological: every candidate stayed claimed for the whole
 			// deadline. Fail the handshake the same way a missing session
 			// does — the client's reconnect logic retries.
 			_ = ws.writeJSON(WSMessage{Type: "response", Content: "Error: no session available"})
 			return
 		}
-		time.Sleep(25 * time.Millisecond)
+		if timeout == nil {
+			timer := time.NewTimer(remaining)
+			defer timer.Stop()
+			timeout = timer.C
+		}
+		select {
+		case <-changed:
+			// A runtime left (or joined) the registry: re-evaluate first().
+		case <-timeout:
+			// Budget spent. A change may have landed in the same instant, so
+			// let the loop make the one last attempt the polled version made
+			// after its post-attach deadline check; the remaining check above
+			// then fails the handshake.
+		}
 	}
 	// (the current pane plus any background panes) — WITHOUT cancelling any
 	// turn (the turn is owned by the runtime, so disconnecting never kills

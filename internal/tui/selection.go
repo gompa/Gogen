@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -47,6 +48,23 @@ type SelectionState struct {
 	StartY   int  // line in plain content (0-based)
 	EndX     int
 	EndY     int
+
+	// text caches the plain text of a FINALIZED selection (captured by
+	// finalizeSelection). A rebuild re-anchors by it instead of re-slicing
+	// the covered rows on every streaming batch: with a large selection and
+	// a tool line streaming above it, that slice would run tens of times a
+	// second. It is an anchor hint, never the copy source — the copy always
+	// reads the rows the highlight is drawn on.
+	//
+	// The anchor is the covered rows joined by '\n' with EVERY row emitting
+	// its separator, blank rows included (selectionAnchorText), because
+	// reanchorSelection searches the new rows' joined text: the anchor must
+	// have the same row layout. The copy output (getSelectedText) drops blank
+	// rows instead, and the two differ by exactly those separators — so
+	// anchoring on the copy text made a selection spanning a blank row search
+	// "…\n…" inside a window holding "…\n\n…", never match, and drop the
+	// highlight while the text was still on screen.
+	text string
 }
 
 // mouseEventKind identifies which bubbletea v2 mouse message a mouseEvent
@@ -120,6 +138,16 @@ func (m *Model) handleActiveSelectionMouse(ev mouseEvent, vpHeight int) bool {
 	case m.selection.Dragging && ev.kind == mouseRelease:
 		m.finalizeSelection()
 		return true
+	case m.selection.Dragging && ev.button == tea.MouseLeft && ev.kind == mousePress:
+		// A left PRESS while the drag is still marked live means the drag's
+		// RELEASE never arrived: the pointer left the window mid-drag, the
+		// terminal dropped the event, or a modal was up when it happened.
+		// Ignoring the press left Dragging set indefinitely — the wheel
+		// stayed locked and the next drag kept the stale anchor, so the first
+		// selection after a lost release copied the wrong range (or nothing).
+		// A press is a fresh anchor, so restart here instead.
+		m.clearSelection()
+		return m.startSelectionAt(ev, vpHeight)
 	case ev.button == tea.MouseRight && (ev.kind == mousePress || ev.kind == mouseRelease):
 		m.clearSelection()
 		m.statusMsg = ""
@@ -172,6 +200,10 @@ func (m *Model) finalizeSelection() {
 		m.clearSelection()
 		m.statusMsg = ""
 	} else {
+		// The anchor is the row-joined form, not the copy form: a blank row
+		// inside the selection must keep its separator or reanchorSelection
+		// searches a string the new rows can never contain.
+		m.selection.text = m.selectionAnchorText()
 		m.statusMsg = fmt.Sprintf("Selected %d chars — ctrl+shift+c to copy", utf8.RuneCountInString(text))
 	}
 }
@@ -185,13 +217,21 @@ func (m *Model) finalizeSelection() {
 // the modifiers out as "ctrl+shift+c"). Matching the keystroke form as well
 // keeps the chord working whatever shape the terminal reports, without
 // widening the binding to any other key.
+//
+// The keystroke comparison is case-insensitive because the letter's case is
+// not part of the chord: terminals that report the SHIFTED code as the main
+// code (kitty's "C" alternate key used alone, xterm's modifyOtherKeys with the
+// shifted code point — CSI 67;6u and CSI 27;6;67~) spell it "ctrl+shift+C",
+// and a case-sensitive compare made the copy key dead on those terminals while
+// the highlight was on screen. Folding only the case cannot steal another
+// chord: ctrl+c (cancel) has no shift bit and is matched before this.
 func (m *Model) matchesCopyChord(msg tea.KeyPressMsg) bool {
 	if key.Matches(msg, m.keys.CopySelection) {
 		return true
 	}
 	stroke := msg.Keystroke()
 	for _, want := range m.keys.CopySelection.Keys() {
-		if stroke == want {
+		if stroke == want || strings.EqualFold(stroke, want) {
 			return true
 		}
 	}
@@ -235,8 +275,13 @@ func (m *Model) writeSelection(text string) tea.Cmd {
 	}
 	// Local clipboard unavailable (headless, SSH without wl-copy/xclip/xsel,
 	// a container without the X socket…): fall back to OSC52 through
-	// bubbletea — most modern terminals honor it even over SSH.
-	m.statusMsg = fmt.Sprintf("Sent %d chars to terminal clipboard", n)
+	// bubbletea — most modern terminals honor it even over SSH. OSC52 has no
+	// delivery ack and plenty of terminals drop it (disabled by policy, tmux
+	// without passthrough, a payload over the terminal's size cap), so the
+	// message says which path was taken instead of claiming success: a
+	// "copied" line followed by an empty paste is exactly the confusing
+	// report this status line exists to rule out.
+	m.statusMsg = fmt.Sprintf("Sent %d chars to the terminal clipboard (OSC52) — it may be ignored", n)
 	return tea.SetClipboard(text)
 }
 
@@ -394,8 +439,23 @@ func (m *Model) mouseToContent(mouseX, mouseY int) (int, int) {
 }
 
 // getSelectedText returns the plain text currently selected, or "" if
-// nothing is selected. StartX/EndX are cell columns.
-func (m *Model) getSelectedText() string {
+// nothing is selected. StartX/EndX are cell columns. Rows that contribute no
+// picked cell (a blank transcript row, a row whose selected cells are all
+// blank) emit no separator: the copy is the picked characters, not the layout
+// around them.
+func (m *Model) getSelectedText() string { return m.selectionText(false) }
+
+// selectionAnchorText returns the same selection as the exact row-joined text
+// it covers: every covered row emits its '\n' separator even when it
+// contributes no picked cell, so the result has one line per row and can be
+// compared against the joined text reanchorSelection builds from the new rows
+// (see SelectionState.text).
+func (m *Model) selectionAnchorText() string { return m.selectionText(true) }
+
+// selectionText builds the selection's plain text. joinBlankRows selects the
+// anchor form (one line per covered row) over the copy form (blank rows
+// skipped).
+func (m *Model) selectionText(joinBlankRows bool) string {
 	if m.selection == nil || m.plainLineCount() == 0 {
 		return ""
 	}
@@ -424,6 +484,13 @@ func (m *Model) getSelectedText() string {
 			le = endX
 		}
 		chunk := sliceByCells(line, ls, le)
+		if joinBlankRows {
+			if y > startY {
+				b.WriteByte('\n')
+			}
+			b.WriteString(chunk)
+			continue
+		}
 		if chunk != "" {
 			if b.Len() > 0 {
 				b.WriteByte('\n')
@@ -440,18 +507,24 @@ func (m *Model) clearSelection() {
 	m.selectionYOff = -1
 }
 
+// reanchorWindow bounds the row window reanchorSelection scans on either side
+// of the selection. Rows only move by an insert/delete above or by a re-wrap,
+// so a match that is further away than this is not the text the user picked.
+const reanchorWindow = 64
+
 // selectionAfterRebuild reports the selection to KEEP when the viewport's rows
 // have just been replaced by newRows: the same selection when every row it
-// covers still holds the same plain text, nil otherwise.
+// covers still holds the same plain text, or — when a row's text changed — the
+// same TEXT re-anchored to the rows that now hold it (reanchorSelection). Nil
+// when neither works, i.e. the text is gone or ambiguous.
 //
-// The comparison is what separates "the transcript grew, your selection is
-// still exactly where you made it" — an append, a round boundary, a redundant
-// re-wrap at the same width — from "the rows moved under you": a compaction, a
-// session or model switch, or a resize that re-wrapped the text. Only the
-// first kind may keep the highlight, because only there do the row coordinates
-// still address the text the user picked. Plain text (not the styled row) is
-// compared: a style-only re-render must not drop a selection, while a row
-// whose TEXT changed is no longer what the user selected.
+// The exact comparison is what separates "the transcript grew, your selection
+// is still exactly where you made it" — an append, a round boundary, a
+// redundant re-wrap at the same width — from "the rows moved under you": a
+// compaction, a session or model switch, or a resize that re-wrapped the text.
+// Plain text (not the styled row) is compared: a style-only re-render must not
+// drop a selection, while a row whose TEXT changed is no longer what the user
+// selected.
 //
 // Must be called with the OLD rows still published (before SetContentLines).
 func (m *Model) selectionAfterRebuild(newRows []string) *SelectionState {
@@ -464,15 +537,122 @@ func (m *Model) selectionAfterRebuild(newRows []string) *SelectionState {
 		lo, hi = hi, lo
 	}
 	old := m.viewport.Lines()
-	if lo < 0 || hi >= len(old) || hi >= len(newRows) {
+	if lo < 0 || hi >= len(old) {
 		return nil
 	}
-	for y := lo; y <= hi; y++ {
+	same := hi < len(newRows)
+	for y := lo; same && y <= hi; y++ {
 		if stripANSI(old[y]) != stripANSI(newRows[y]) {
-			return nil
+			same = false
 		}
 	}
-	return s
+	if same {
+		return s
+	}
+	// A live drag cannot be re-anchored: its end point is driven by the
+	// pointer, and the frozen scroll offset it maps through belongs to the
+	// old rows.
+	if s.Dragging {
+		return nil
+	}
+	return m.reanchorSelection(newRows)
+}
+
+// reanchorSelection maps the current (finalized) selection onto newRows by its
+// TEXT: the rows it covered changed — a rewritten streaming line (a tool call's
+// growing args, a patch diff), a row inserted or dropped above it, or a resize
+// that re-wrapped the paragraph — but the characters the user picked are still
+// on screen, so the highlight and the copy can follow them instead of being
+// dropped. That silent drop is what made ctrl+shift+c "sometimes do nothing"
+// while the text was still visible.
+//
+// Conservative by design: the text must occur EXACTLY ONCE inside a bounded
+// window around the old position. A repeated snippet (a common log line, an
+// empty selection) is left alone — guessing which copy the user meant would
+// highlight the wrong line, and a wrong copy is worse than a reported drop.
+//
+// Must be called with the OLD rows still published (before SetContentLines).
+func (m *Model) reanchorSelection(newRows []string) *SelectionState {
+	s := m.selection
+	text := s.text
+	if text == "" {
+		// No cached anchor (a selection finalized by an older path): build the
+		// row-joined form, never the copy form — see SelectionState.text.
+		text = m.selectionAnchorText()
+	}
+	if text == "" || len(newRows) == 0 {
+		return nil
+	}
+	lo, hi := s.StartY, s.EndY
+	if lo > hi {
+		lo, hi = hi, lo
+	}
+	from := max(0, lo-reanchorWindow)
+	to := min(len(newRows)-1, hi+reanchorWindow)
+	if to < from {
+		return nil
+	}
+
+	// Join the window's plain rows, remembering where each row starts so a
+	// byte offset in the joined string can be mapped back to (row, cell).
+	rows := make([]string, 0, to-from+1)
+	starts := make([]int, 0, to-from+1)
+	var joined strings.Builder
+	for y := from; y <= to; y++ {
+		if y > from {
+			joined.WriteByte('\n')
+		}
+		starts = append(starts, joined.Len())
+		plain := stripANSI(newRows[y])
+		rows = append(rows, plain)
+		joined.WriteString(plain)
+	}
+	content := joined.String()
+
+	at := strings.Index(content, text)
+	if at < 0 {
+		return nil
+	}
+	// Unique match only: a second occurrence makes the anchor a guess.
+	if strings.Contains(content[at+1:], text) {
+		return nil
+	}
+
+	startY, startX, ok := reanchorPoint(rows, starts, content, at)
+	if !ok {
+		return nil
+	}
+	endY, endX, ok := reanchorPoint(rows, starts, content, at+len(text))
+	if !ok {
+		return nil
+	}
+	out := *s
+	out.StartY, out.StartX = from+startY, startX
+	out.EndY, out.EndX = from+endY, endX
+	return &out
+}
+
+// reanchorPoint maps a byte offset in the joined window text back to a row
+// index within the window and a CELL column in that row. An offset sitting on
+// a row separator belongs to the end of the row before it (the offset just
+// past the last character of that row), which is where a selection ending at a
+// row boundary ends.
+func reanchorPoint(rows []string, starts []int, content string, off int) (row, cell int, ok bool) {
+	if off < 0 || off > len(content) {
+		return 0, 0, false
+	}
+	// Last row whose start is <= off: the row containing the offset.
+	i := sort.Search(len(starts), func(i int) bool { return starts[i] > off }) - 1
+	if i < 0 {
+		i = 0
+	}
+	row = i
+	within := off - starts[i]
+	if within > len(rows[i]) {
+		// The offset sits on the separator after this row.
+		within = len(rows[i])
+	}
+	return row, cellWidth(rows[i][:within]), true
 }
 
 // renderViewportWithSelection renders the viewport content with selection
