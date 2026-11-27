@@ -13,7 +13,10 @@ require (
 	github.com/creack/pty v1.1.24
 	github.com/ericchiang/css v1.4.0
 	github.com/fsnotify/fsnotify v1.10.1
-	github.com/gorilla/websocket v1.5.3
+	// Pinned above the newest tag (v1.5.3) on purpose: this commit carries the
+	// fix for GO-2026-6278 (weak PRNG for the WebSocket mask key), which has no
+	// tagged release yet. Drop the pin once v1.5.4 ships.
+	github.com/gorilla/websocket v1.5.4-0.20240701034025-d67f41855da4
 	github.com/gortexhq/tree-sitter-dockerfile v0.1.0
 	github.com/makiuchi-d/gozxing v0.1.1
 	github.com/openai/openai-go/v3 v3.108.0
