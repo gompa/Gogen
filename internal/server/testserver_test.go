@@ -57,6 +57,14 @@ func drainServer(s *Server) {
 	// goroutines were joined above — no handler can launch another one now.
 	s.waitPersistsWithin(2 * time.Second)
 	s.stopAutomations()
+	// Wait for the sweep loop to exit. Scheduler.Stop is deliberately
+	// non-blocking, but a sweep already in progress holds the automation
+	// store's lock file OPEN for its read-modify-write; Windows cannot unlink
+	// an open file, so the caller's t.TempDir() removal of the config dir
+	// (where the global automation store lives) fails with "directory not
+	// empty". The automations WS tests sweep every 10ms, making a teardown
+	// mid-sweep the common case.
+	waitAutomationSweepStopped(s, 2*time.Second)
 	s.ShutdownSessions()
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -91,5 +99,30 @@ func drainServer(s *Server) {
 			rt.drainTurnLock(wsStreamDrainWait)
 			s.registry.evictRuntime(rt)
 		}
+	}
+}
+
+// waitAutomationSweepStopped waits up to d for the automation scheduler's
+// sweep loop to exit after stopAutomations, reporting whether it did. The
+// loop's Done channel closes only after the in-flight sweep (and its store
+// lock) is released; a nil scheduler or one that was never started returns
+// true immediately. Best-effort like the rest of the drain: a loop wedged on
+// a store lock costs the window once.
+func waitAutomationSweepStopped(s *Server, d time.Duration) bool {
+	s.automations.mu.Lock()
+	sched := s.automations.sched
+	s.automations.mu.Unlock()
+	if sched == nil {
+		return true
+	}
+	done := sched.Done()
+	if done == nil {
+		return true
+	}
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
 	}
 }

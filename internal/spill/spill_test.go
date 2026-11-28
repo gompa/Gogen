@@ -710,12 +710,14 @@ func TestRepointFileCopyFallback(t *testing.T) {
 	if !bytes.Equal(got, body) {
 		t.Fatalf("copied %d bytes, want %d identical bytes", len(got), len(body))
 	}
-	info, err := os.Stat(dst)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Fatalf("copied file perms = %o, want 600", perm)
+	if runtime.GOOS != "windows" { // Windows does not honor POSIX mode bits
+		info, err := os.Stat(dst)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Fatalf("copied file perms = %o, want 600", perm)
+		}
 	}
 
 	// Idempotent: a second repoint returns the existing path untouched.

@@ -1,11 +1,14 @@
 package server
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"gogen/internal/automation"
+	"gogen/internal/filelock"
 )
 
 // fakeAutomationFire records fired automations; each fire completes
@@ -150,6 +153,54 @@ func TestAutomationsToggleViaConfigWS(t *testing.T) {
 	// config + live flag overlay) carries the toggle.
 	if eff := s.effectiveConfig(); eff != nil && eff.Automations != "off" {
 		t.Fatalf("effective config automations = %q, want off after the toggle-off", eff.Automations)
+	}
+}
+
+// TestDrainWaitsForAutomationSweep pins the teardown wait added for the
+// Windows CI flake: Scheduler.Stop is non-blocking, so a sweep already inside
+// the store's lock-file read-modify-write keeps the lock file OPEN. Windows
+// cannot unlink an open file, and the caller's t.TempDir() removal of the
+// config dir (the global automation store lives there) then failed with
+// "directory not empty". Holding the lock out-of-band parks the loop — its
+// startup MarkInterruptedRuns needs the same lock — so the wait must time out
+// while it is held and join the loop once it is released. Deterministic on
+// every OS: the check is the loop's exit, not the platform's unlink behavior.
+func TestDrainWaitsForAutomationSweep(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	storeDir := automation.DefaultDir()
+	if err := os.MkdirAll(storeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hold, err := filelock.Acquire(filepath.Join(storeDir, automation.LockFile))
+	if err != nil {
+		t.Fatalf("hold store lock: %v", err)
+	}
+	held := true
+	release := func() {
+		if !held {
+			return
+		}
+		held = false
+		if err := hold.Release(); err != nil {
+			t.Fatalf("release store lock: %v", err)
+		}
+	}
+	t.Cleanup(release)
+
+	stub := newBlockingStub()
+	s, _, _ := newContinuationServer(t, stub, t.TempDir())
+	s.setAutomationFire(nil, storeDir)
+	s.ws.SetAutomationsEnabled(true)
+	s.startAutomations()
+
+	// The loop is parked on the held lock, so a stop cannot let it exit yet.
+	s.stopAutomations()
+	if waitAutomationSweepStopped(s, 100*time.Millisecond) {
+		t.Fatal("sweep loop reported exited while the store lock was held")
+	}
+	release()
+	if !waitAutomationSweepStopped(s, 5*time.Second) {
+		t.Fatal("sweep loop did not exit after the store lock was released")
 	}
 }
 
